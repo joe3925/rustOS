@@ -4,6 +4,7 @@ use crate::drivers::interrupt_index::LocalApic;
 use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, APIC,
 };
+use crate::drivers::timer_driver::NUM_CORES;
 use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::InterruptGuard;
@@ -109,8 +110,9 @@ impl Scheduler {
             all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
             cores: IrqSafeRwLock::new(Vec::new()),
             domains: DomainMaster::new(
-                alloc::vec![build_fifo_domain(MAX_CPUS)].into_boxed_slice(),
-                MAX_CPUS,
+                alloc::vec![build_fifo_domain(NUM_CORES.load(Ordering::Relaxed))]
+                    .into_boxed_slice(),
+                NUM_CORES.load(Ordering::Relaxed),
             ),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
@@ -228,12 +230,7 @@ impl Scheduler {
 
         let id = self.register_task(task.clone());
         let domain = self.domains.get(task.domain_id());
-        let target_cpu = domain.enqueue(
-            task,
-            EnqueueReason::New,
-            self.new_task_placement_start(),
-            cpu::get_cycles(),
-        );
+        let target_cpu = domain.enqueue(task, EnqueueReason::New, self.new_task_placement_start());
         self.kick_remote_core(target_cpu);
         id
     }
@@ -319,11 +316,12 @@ impl Scheduler {
                     }
 
                     let hint_cpu = task.target_cpu();
-                    let now_cycles = cpu::get_cycles();
-                    self.commit_pending_migration(task, current_cpu_id(), now_cycles);
+                    if task.has_pending_sched_binding() {
+                        self.commit_pending_migration(task, current_cpu_id(), cpu::get_cycles());
+                    }
+
                     let domain = self.domains.get(task.domain_id());
-                    let target_cpu =
-                        domain.enqueue(task.clone(), EnqueueReason::Wakeup, hint_cpu, now_cycles);
+                    let target_cpu = domain.enqueue(task.clone(), EnqueueReason::Wakeup, hint_cpu);
                     self.kick_remote_core(target_cpu);
 
                     return;
@@ -540,7 +538,6 @@ impl Scheduler {
                             cand.clone(),
                             EnqueueReason::Migrated,
                             cand.target_cpu(),
-                            now_cycles,
                         );
                         self.kick_remote_core(target_cpu);
                         continue;
@@ -584,12 +581,8 @@ impl Scheduler {
         if outcome == SwitchOutOutcome::StillRunnable && task.has_pending_sched_binding() {
             if self.commit_pending_migration(task, cpu_id, now_cycles) {
                 let domain = self.domains.get(task.domain_id());
-                let target_cpu = domain.enqueue(
-                    task.clone(),
-                    EnqueueReason::Migrated,
-                    task.target_cpu(),
-                    now_cycles,
-                );
+                let target_cpu =
+                    domain.enqueue(task.clone(), EnqueueReason::Migrated, task.target_cpu());
                 self.kick_remote_core(target_cpu);
                 return;
             }

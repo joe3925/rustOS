@@ -91,6 +91,9 @@ pub struct TaskRef {
     /// Lazy domain migration target. The scheduler commits this at a point
     /// where the task is not owned by an old-domain run queue.
     pending_sched_binding: Mutex<Option<TaskSchedBinding>>,
+
+    /// Fast negative check for the common path where no lazy migration exists.
+    pending_sched_binding_present: AtomicBool,
 }
 
 /// Handle type used throughout the scheduler
@@ -212,16 +215,26 @@ impl TaskRef {
         }
 
         *pending = Some(sched_binding);
+        self.pending_sched_binding_present
+            .store(true, Ordering::Release);
         Ok(())
     }
 
     #[inline(always)]
     pub(crate) fn has_pending_sched_binding(&self) -> bool {
-        self.pending_sched_binding.lock().is_some()
+        self.pending_sched_binding_present.load(Ordering::Acquire)
     }
 
     pub(crate) fn take_pending_sched_binding(&self) -> Option<TaskSchedBinding> {
-        self.pending_sched_binding.lock().take()
+        if !self.has_pending_sched_binding() {
+            return None;
+        }
+
+        let mut pending = self.pending_sched_binding.lock();
+        let binding = pending.take();
+        self.pending_sched_binding_present
+            .store(false, Ordering::Release);
+        binding
     }
 
     pub(crate) fn replace_sched_binding(
@@ -392,6 +405,7 @@ impl Task {
             tls_thread_pointer: AtomicU64::new(0),
             sched_binding: RwLock::new(sched_binding),
             pending_sched_binding: Mutex::new(None),
+            pending_sched_binding_present: AtomicBool::new(false),
         })
     }
 
@@ -478,6 +492,7 @@ impl Task {
             tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
             sched_binding: RwLock::new(sched_binding),
             pending_sched_binding: Mutex::new(None),
+            pending_sched_binding_present: AtomicBool::new(false),
         })
     }
 

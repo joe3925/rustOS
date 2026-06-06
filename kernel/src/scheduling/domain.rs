@@ -93,13 +93,7 @@ pub trait DomainOps: Send + Sync {
     fn name(&self) -> &'static str;
     fn contains_cpu(&self, cpu_id: usize) -> bool;
 
-    fn enqueue(
-        &self,
-        task: TaskHandle,
-        reason: EnqueueReason,
-        hint_cpu: usize,
-        now_cycles: u64,
-    ) -> usize;
+    fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize;
 
     fn on_switch_out(
         &self,
@@ -123,53 +117,10 @@ pub trait SchedulerClass: Send + Sync + 'static {
         per_cpu: &[Option<Self::CpuState>],
         cpus: &CpuSet,
         task: &TaskHandle,
-        task_state: &Self::TaskState,
+        _task_state: &Self::TaskState,
         reason: EnqueueReason,
         hint_cpu: usize,
-        now_cycles: u64,
-    ) -> Option<usize> {
-        let _ = (task, task_state, reason, now_cycles);
-
-        let n = crate::scheduling::scheduler::SCHEDULER.num_cores();
-        if n == 0 {
-            return None;
-        }
-
-        let first = hint_cpu % n;
-        if cpus.contains(first) {
-            if let Some(Some(cpu)) = per_cpu.get(first) {
-                if self.effective_load(first, cpu) == 0 {
-                    return Some(first);
-                }
-            }
-        }
-
-        let mut best = None;
-        let mut best_load = usize::MAX;
-
-        for offset in 0..n {
-            let cpu_id = (hint_cpu + offset) % n;
-            if !cpus.contains(cpu_id) {
-                continue;
-            }
-
-            let Some(Some(cpu)) = per_cpu.get(cpu_id) else {
-                continue;
-            };
-
-            let load = self.effective_load(cpu_id, cpu);
-            if load < best_load {
-                best = Some(cpu_id);
-                best_load = load;
-
-                if load == 0 {
-                    break;
-                }
-            }
-        }
-
-        best
-    }
+    ) -> Option<usize>;
 
     fn enqueue(
         &self,
@@ -258,13 +209,7 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
         self.cpus.contains(cpu_id)
     }
 
-    fn enqueue(
-        &self,
-        task: TaskHandle,
-        reason: EnqueueReason,
-        hint_cpu: usize,
-        now_cycles: u64,
-    ) -> usize {
+    fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize {
         task.with_class_state(self.id, |task_state: &C::TaskState| {
             let cpu_id = self
                 .class
@@ -275,7 +220,6 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
                     task_state,
                     reason,
                     hint_cpu,
-                    now_cycles,
                 )
                 .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name));
 
@@ -330,9 +274,9 @@ pub struct DomainMaster {
 }
 
 impl DomainMaster {
-    pub fn new(domains: Box<[Box<dyn DomainOps>]>, max_cpus: usize) -> Self {
-        let mut per_cpu_cursor = Vec::with_capacity(max_cpus);
-        for _ in 0..max_cpus {
+    pub fn new(domains: Box<[Box<dyn DomainOps>]>, cpu_count: usize) -> Self {
+        let mut per_cpu_cursor = Vec::with_capacity(cpu_count);
+        for _ in 0..cpu_count {
             per_cpu_cursor.push(AtomicUsize::new(0));
         }
 

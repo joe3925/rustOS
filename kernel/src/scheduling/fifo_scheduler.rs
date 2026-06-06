@@ -1,12 +1,11 @@
 use crate::scheduling::domain::{
-    CpuSet, Domain, DomainId, DomainOps, EnqueueReason, SchedulerClass, SwitchOutOutcome,
-    TaskSchedBinding,
+    CpuSet, DomainId, DomainOps, EnqueueReason, SchedulerClass, SwitchOutOutcome, TaskSchedBinding,
 };
 use crate::scheduling::state::SchedState;
 use crate::scheduling::task::TaskHandle;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Mutex;
 
@@ -50,35 +49,57 @@ impl FifoCpuState {
     }
 }
 
-pub struct FifoTaskState {
-    pub enqueue_seq: AtomicU64,
-}
-
-impl FifoTaskState {
-    fn new() -> Self {
-        Self {
-            enqueue_seq: AtomicU64::new(0),
-        }
-    }
-}
-
 pub fn new_fifo_task_binding() -> TaskSchedBinding {
-    TaskSchedBinding::new(FIFO_DOMAIN_ID, FifoTaskState::new())
+    TaskSchedBinding::new(FIFO_DOMAIN_ID, ())
 }
 
-pub fn build_fifo_domain(max_cpus: usize) -> Box<dyn DomainOps> {
-    let mut per_cpu = Vec::with_capacity(max_cpus);
-    for _ in 0..max_cpus {
+pub fn build_fifo_domain(cpu_count: usize) -> Box<dyn DomainOps> {
+    let mut per_cpu = Vec::with_capacity(cpu_count);
+    for _ in 0..cpu_count {
         per_cpu.push(Some(FifoCpuState::new()));
     }
 
-    Box::new(Domain::new(
+    Box::new(FifoDomain::new(
         FIFO_DOMAIN_ID,
         "fifo",
         CpuSet::all(),
         FifoClass::new(),
         per_cpu.into_boxed_slice(),
     ))
+}
+
+pub struct FifoDomain {
+    id: DomainId,
+    name: &'static str,
+    cpus: CpuSet,
+    class: FifoClass,
+    per_cpu: Box<[Option<FifoCpuState>]>,
+}
+
+impl FifoDomain {
+    fn new(
+        id: DomainId,
+        name: &'static str,
+        cpus: CpuSet,
+        class: FifoClass,
+        per_cpu: Box<[Option<FifoCpuState>]>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            cpus,
+            class,
+            per_cpu,
+        }
+    }
+
+    #[inline(always)]
+    fn cpu_state(&self, cpu_id: usize) -> &FifoCpuState {
+        self.per_cpu
+            .get(cpu_id)
+            .and_then(Option::as_ref)
+            .unwrap_or_else(|| panic!("domain {} has no cpu state for cpu {}", self.name, cpu_id))
+    }
 }
 
 #[inline(always)]
@@ -195,18 +216,16 @@ fn steal_youngest_runnable(src_cpu_id: usize, src_cpu: &FifoCpuState) -> Option<
 
 impl SchedulerClass for FifoClass {
     type CpuState = FifoCpuState;
-    type TaskState = FifoTaskState;
+    type TaskState = ();
 
     fn enqueue(
         &self,
         cpu_id: usize,
         cpu: &Self::CpuState,
         task: TaskHandle,
-        task_state: &Self::TaskState,
+        _task_state: &Self::TaskState,
         reason: EnqueueReason,
     ) {
-        task_state.enqueue_seq.fetch_add(1, Ordering::Relaxed);
-
         match reason {
             EnqueueReason::Preempted | EnqueueReason::Yielded | EnqueueReason::Migrated => {
                 push_runqueue_or_panic(cpu_id, cpu, task);
@@ -214,7 +233,84 @@ impl SchedulerClass for FifoClass {
             EnqueueReason::New | EnqueueReason::Wakeup => enqueue_inbound(cpu_id, cpu, task),
         }
     }
+    fn select_cpu(
+        &self,
+        per_cpu: &[Option<Self::CpuState>],
+        cpus: &CpuSet,
+        _task: &TaskHandle,
+        _task_state: &Self::TaskState,
+        reason: EnqueueReason,
+        hint_cpu: usize,
+    ) -> Option<usize> {
+        const LOAD_WEIGHT: isize = 100;
+        const IDLE_BONUS: isize = 150;
+        const WAKEUP_LAST_CPU_BONUS: isize = 120;
+        const HINT_CPU_BONUS: isize = 40;
+        const NEW_TASK_IDLE_BONUS: isize = 80;
 
+        let n = crate::scheduling::scheduler::SCHEDULER.num_cores();
+
+        if matches!(
+            reason,
+            EnqueueReason::Preempted | EnqueueReason::Yielded | EnqueueReason::Migrated
+        ) {
+            if hint_cpu < n
+                && cpus.contains(hint_cpu)
+                && per_cpu.get(hint_cpu).is_some_and(Option::is_some)
+            {
+                return Some(hint_cpu);
+            }
+        }
+
+        let mut best_cpu = None;
+        let mut best_score = isize::MAX;
+        let mut best_load = usize::MAX;
+
+        for cpu_id in 0..n {
+            if !cpus.contains(cpu_id) {
+                continue;
+            }
+
+            let Some(Some(cpu)) = per_cpu.get(cpu_id) else {
+                continue;
+            };
+
+            let load = cpu.load.load(Ordering::Acquire);
+            let idle = crate::scheduling::scheduler::SCHEDULER.cpu_is_idle(cpu_id);
+
+            let mut score = load as isize * LOAD_WEIGHT;
+
+            if idle {
+                score -= IDLE_BONUS;
+            }
+
+            match reason {
+                EnqueueReason::Wakeup => {
+                    if cpu_id == hint_cpu {
+                        score -= WAKEUP_LAST_CPU_BONUS;
+                    }
+                }
+                EnqueueReason::New => {
+                    if idle {
+                        score -= NEW_TASK_IDLE_BONUS;
+                    }
+                }
+                _ => {}
+            }
+
+            if cpu_id == hint_cpu {
+                score -= HINT_CPU_BONUS;
+            }
+
+            if score < best_score || (score == best_score && load < best_load) {
+                best_cpu = Some(cpu_id);
+                best_score = score;
+                best_load = load;
+            }
+        }
+
+        best_cpu
+    }
     fn pick_next(
         &self,
         cpu_id: usize,
@@ -357,5 +453,73 @@ impl SchedulerClass for FifoClass {
             push_runqueue_or_panic(min_idx, min_cpu, task);
             crate::scheduling::scheduler::SCHEDULER.kick_remote_core(min_idx);
         }
+    }
+}
+
+impl DomainOps for FifoDomain {
+    #[inline(always)]
+    fn id(&self) -> DomainId {
+        self.id
+    }
+
+    #[inline(always)]
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[inline(always)]
+    fn contains_cpu(&self, cpu_id: usize) -> bool {
+        self.cpus.contains(cpu_id)
+    }
+
+    fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize {
+        let task_state = ();
+        let cpu_id = self
+            .class
+            .select_cpu(
+                &self.per_cpu,
+                &self.cpus,
+                &task,
+                &task_state,
+                reason,
+                hint_cpu,
+            )
+            .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name));
+
+        task.set_target_cpu(cpu_id);
+        self.class
+            .enqueue(cpu_id, self.cpu_state(cpu_id), task, &task_state, reason);
+        cpu_id
+    }
+
+    fn on_switch_out(
+        &self,
+        task: &TaskHandle,
+        cpu_id: usize,
+        now_cycles: u64,
+        outcome: SwitchOutOutcome,
+    ) {
+        let task_state = ();
+        self.class.on_switch_out(
+            cpu_id,
+            self.cpu_state(cpu_id),
+            task,
+            &task_state,
+            now_cycles,
+            outcome,
+        );
+
+        if outcome == SwitchOutOutcome::Terminated {
+            self.class.on_task_exit(task, &task_state);
+        }
+    }
+
+    fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
+        self.class
+            .pick_next(cpu_id, self.cpu_state(cpu_id), now_cycles)
+    }
+
+    fn maybe_balance(&self, now_tick: usize) {
+        self.class.maybe_balance(&self.per_cpu, now_tick);
     }
 }
