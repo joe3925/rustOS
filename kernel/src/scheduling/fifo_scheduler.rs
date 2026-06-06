@@ -75,7 +75,7 @@ pub fn build_fifo_domain(max_cpus: usize) -> Box<dyn DomainOps> {
     Box::new(Domain::new(
         FIFO_DOMAIN_ID,
         "fifo",
-        CpuSet::All,
+        CpuSet::all(),
         FifoClass::new(),
         per_cpu.into_boxed_slice(),
     ))

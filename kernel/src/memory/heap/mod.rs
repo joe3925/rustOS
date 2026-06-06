@@ -29,7 +29,7 @@ use x86_64::VirtAddr;
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
 #[cfg(feature = "allocator-buddy")]
 pub const HEAP_SIZE: u64 = Size1GiB::SIZE * 4;
-pub const BOOTSTRAP_HEAP_SIZE: u64 = Size2MiB::SIZE * 5;
+pub const BOOTSTRAP_HEAP_SIZE: u64 = Size2MiB::SIZE * 32;
 
 #[cfg(feature = "allocator-mimalloc")]
 pub const MIMALLOC_HEAP_START: usize = HEAP_START + BOOTSTRAP_HEAP_SIZE as usize;

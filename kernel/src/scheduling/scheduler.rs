@@ -9,8 +9,8 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::InterruptGuard;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
-use crate::scheduling::domain::DomainMaster;
-use crate::scheduling::fifo_scheduler::build_fifo_domain;
+use crate::scheduling::domain::{DomainMaster, EnqueueReason, SwitchOutOutcome, TaskSchedBinding};
+use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding};
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::CurrentTask;
@@ -29,6 +29,16 @@ use lazy_static::lazy_static;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
+
+pub fn default_task_sched_binding() -> TaskSchedBinding {
+    new_fifo_task_binding()
+}
+
+#[derive(Debug)]
+pub enum TaskMigrationError {
+    TaskNotFound(u64),
+    PendingMigration(u64),
+}
 
 pub struct KernelFpuGuard {
     saved_task: Option<TaskHandle>,
@@ -218,7 +228,12 @@ impl Scheduler {
 
         let id = self.register_task(task.clone());
         let domain = self.domains.get(task.domain_id());
-        let target_cpu = domain.enqueue_new(task);
+        let target_cpu = domain.enqueue(
+            task,
+            EnqueueReason::New,
+            self.new_task_placement_start(),
+            cpu::get_cycles(),
+        );
         self.kick_remote_core(target_cpu);
         id
     }
@@ -261,6 +276,28 @@ impl Scheduler {
         }
     }
 
+    pub fn migrate_task_domain(
+        &self,
+        id: u64,
+        sched_binding: TaskSchedBinding,
+    ) -> Result<(), TaskMigrationError> {
+        let _ = self.domains.get(sched_binding.domain_id());
+
+        let Some(task) = self.get_task_by_id(id) else {
+            return Err(TaskMigrationError::TaskNotFound(id));
+        };
+
+        if task.set_pending_sched_binding(sched_binding).is_err() {
+            return Err(TaskMigrationError::PendingMigration(id));
+        }
+
+        if task.sched_state() == SchedState::Blocked {
+            self.commit_pending_migration(&task, current_cpu_id(), cpu::get_cycles());
+        }
+
+        Ok(())
+    }
+
     pub fn unpark(&self, task: &TaskHandle) {
         task.grant_permit();
 
@@ -282,8 +319,11 @@ impl Scheduler {
                     }
 
                     let hint_cpu = task.target_cpu();
+                    let now_cycles = cpu::get_cycles();
+                    self.commit_pending_migration(task, current_cpu_id(), now_cycles);
                     let domain = self.domains.get(task.domain_id());
-                    let target_cpu = domain.enqueue_wakeup(task.clone(), hint_cpu);
+                    let target_cpu =
+                        domain.enqueue(task.clone(), EnqueueReason::Wakeup, hint_cpu, now_cycles);
                     self.kick_remote_core(target_cpu);
 
                     return;
@@ -401,7 +441,7 @@ impl Scheduler {
     ) -> Option<TaskHandle> {
         let mut sched_state = core.sched_lock.write();
         let previous = sched_state.current.take();
-        let mut requeue_previous = None;
+        let mut switch_out_previous = None;
 
         if let Some(prev) = previous {
             let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
@@ -430,36 +470,54 @@ impl Scheduler {
                 match prev.sched_state() {
                     SchedState::Running | SchedState::Runnable => {
                         prev.set_sched_state(SchedState::Runnable);
-                        requeue_previous = Some(prev.clone());
+                        switch_out_previous = Some((prev.clone(), SwitchOutOutcome::StillRunnable));
                     }
                     SchedState::Parking => {
                         if prev.consume_permit() {
                             prev.set_sched_state(SchedState::Runnable);
-                            requeue_previous = Some(prev.clone());
+                            switch_out_previous =
+                                Some((prev.clone(), SwitchOutOutcome::StillRunnable));
                         } else if prev
                             .cas_sched_state(SchedState::Parking, SchedState::Blocked)
                             .is_ok()
-                            && prev.consume_permit()
-                            && prev
-                                .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
-                                .is_ok()
                         {
-                            requeue_previous = Some(prev.clone());
+                            if prev.consume_permit()
+                                && prev
+                                    .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
+                                    .is_ok()
+                            {
+                                switch_out_previous =
+                                    Some((prev.clone(), SwitchOutOutcome::StillRunnable));
+                            } else {
+                                switch_out_previous =
+                                    Some((prev.clone(), SwitchOutOutcome::Blocking));
+                            }
+                        } else {
+                            switch_out_previous = match prev.sched_state() {
+                                SchedState::Running | SchedState::Runnable => {
+                                    Some((prev.clone(), SwitchOutOutcome::StillRunnable))
+                                }
+                                SchedState::Parking | SchedState::Blocked => {
+                                    Some((prev.clone(), SwitchOutOutcome::Blocking))
+                                }
+                                SchedState::Terminated => {
+                                    Some((prev.clone(), SwitchOutOutcome::Terminated))
+                                }
+                            };
                         }
                     }
-                    SchedState::Blocked => {}
+                    SchedState::Blocked => {
+                        switch_out_previous = Some((prev.clone(), SwitchOutOutcome::Blocking));
+                    }
                     SchedState::Terminated => {
-                        let domain = self.domains.get(prev.domain_id());
-                        domain.on_task_exit(&prev);
-                        self.unregister_task(&prev);
+                        switch_out_previous = Some((prev.clone(), SwitchOutOutcome::Terminated));
                     }
                 }
             }
         }
 
-        if let Some(prev) = requeue_previous {
-            let domain = self.domains.get(prev.domain_id());
-            domain.requeue_preempted(prev, cpu_id, now_cycles);
+        if let Some((prev, outcome)) = switch_out_previous {
+            self.handle_switch_out(&prev, cpu_id, now_cycles, outcome);
         }
 
         loop {
@@ -470,14 +528,24 @@ impl Scheduler {
 
             match cand.sched_state() {
                 SchedState::Terminated => {
-                    let domain = self.domains.get(cand.domain_id());
-                    domain.on_task_exit(&cand);
-                    self.unregister_task(&cand);
+                    self.handle_switch_out(&cand, cpu_id, now_cycles, SwitchOutOutcome::Terminated);
                     continue;
                 }
                 SchedState::Parking => continue,
                 SchedState::Blocked => continue,
                 SchedState::Runnable | SchedState::Running => {
+                    if self.commit_pending_migration(&cand, cpu_id, now_cycles) {
+                        let domain = self.domains.get(cand.domain_id());
+                        let target_cpu = domain.enqueue(
+                            cand.clone(),
+                            EnqueueReason::Migrated,
+                            cand.target_cpu(),
+                            now_cycles,
+                        );
+                        self.kick_remote_core(target_cpu);
+                        continue;
+                    }
+
                     cand.set_sched_state(SchedState::Running);
 
                     {
@@ -504,6 +572,46 @@ impl Scheduler {
         sched_state.current = Some(core.idle_task.clone());
         core.current.store(&core.idle_task);
         Some(core.idle_task.clone())
+    }
+
+    fn handle_switch_out(
+        &self,
+        task: &TaskHandle,
+        cpu_id: usize,
+        now_cycles: u64,
+        outcome: SwitchOutOutcome,
+    ) {
+        if outcome == SwitchOutOutcome::StillRunnable && task.has_pending_sched_binding() {
+            if self.commit_pending_migration(task, cpu_id, now_cycles) {
+                let domain = self.domains.get(task.domain_id());
+                let target_cpu = domain.enqueue(
+                    task.clone(),
+                    EnqueueReason::Migrated,
+                    task.target_cpu(),
+                    now_cycles,
+                );
+                self.kick_remote_core(target_cpu);
+                return;
+            }
+        }
+
+        let domain = self.domains.get(task.domain_id());
+        domain.on_switch_out(task, cpu_id, now_cycles, outcome);
+
+        if outcome == SwitchOutOutcome::Terminated {
+            self.unregister_task(task);
+        }
+    }
+
+    fn commit_pending_migration(&self, task: &TaskHandle, cpu_id: usize, now_cycles: u64) -> bool {
+        let Some(new_binding) = task.take_pending_sched_binding() else {
+            return false;
+        };
+
+        let old_domain = self.domains.get(task.domain_id());
+        old_domain.on_switch_out(task, cpu_id, now_cycles, SwitchOutOutcome::Migrated);
+        drop(task.replace_sched_binding(new_binding));
+        true
     }
 
     #[inline(always)]

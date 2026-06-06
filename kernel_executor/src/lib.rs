@@ -7,8 +7,8 @@ extern crate std;
 mod domain;
 pub mod global_async;
 pub mod platform;
-pub mod runtime;
 mod round_robin;
+pub mod runtime;
 mod sync;
 
 #[cfg(all(test, not(any(loom, feature = "loom"))))]

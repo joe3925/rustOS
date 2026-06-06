@@ -4,9 +4,9 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
-use kernel_executor::global_async::{DomainId, KERNEL_NORMAL_DOMAIN};
+use kernel_executor::global_async::{ExecutorDomainId, KERNEL_NORMAL_EXECUTOR_DOMAIN};
 
-use crate::scheduling::runtime::runtime::spawn_detached_in_domain;
+use crate::scheduling::runtime::runtime::spawn_detached_in_executor_domain;
 use crate::structs::bounded_mpmc::{
     bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender,
 };
@@ -19,7 +19,7 @@ use super::io_request::{
 
 pub struct CompletionQueue {
     pub owner_pid: u64,
-    pub bound_domain: DomainId,
+    pub bound_executor_domain: ExecutorDomainId,
     pub request_capacity: usize,
     pub completion_capacity: usize,
     pub flags: u64,
@@ -34,7 +34,7 @@ impl core::fmt::Debug for CompletionQueue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CompletionQueue")
             .field("owner_pid", &self.owner_pid)
-            .field("bound_domain", &self.bound_domain)
+            .field("bound_executor_domain", &self.bound_executor_domain)
             .field("request_capacity", &self.request_capacity)
             .field("completion_capacity", &self.completion_capacity)
             .field("flags", &self.flags)
@@ -68,7 +68,7 @@ impl CompletionQueue {
 
         Ok(Arc::new(Self {
             owner_pid,
-            bound_domain: KERNEL_NORMAL_DOMAIN,
+            bound_executor_domain: KERNEL_NORMAL_EXECUTOR_DOMAIN,
             request_capacity,
             completion_capacity,
             flags,
@@ -104,7 +104,7 @@ impl CompletionQueue {
             inner: op.into_future(),
         };
 
-        spawn_detached_in_domain(self.bound_domain, future);
+        spawn_detached_in_executor_domain(self.bound_executor_domain, future);
         Ok(request_id)
     }
 

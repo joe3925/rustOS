@@ -108,7 +108,11 @@ impl Vfs {
     #[inline]
     fn alloc_vh(&self) -> u64 {
         let v = self.next_vh.fetch_add(1, Ordering::AcqRel);
-        if v == 0 { 1 } else { v }
+        if v == 0 {
+            1
+        } else {
+            v
+        }
     }
 
     fn resolve_path(&self, user_path: Path) -> Result<(String, Path), FileStatus> {

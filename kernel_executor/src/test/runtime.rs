@@ -9,12 +9,14 @@ use std::task::Wake;
 use std::time::{Duration, Instant};
 
 use crate::global_async::{
-    DomainClass, DomainConfig, DomainId, GlobalAsyncExecutor, KERNEL_NORMAL_DOMAIN,
-    SimpleRoundRobinScheduler, SubmitErrorKind, WeightedDeficitRoundRobinScheduler,
+    ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId, ExecutorSubmitErrorKind,
+    GlobalAsyncExecutor, SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler,
+    KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 use crate::runtime::ffi_spawn::kernel_spawn_ffi_internal;
 use crate::runtime::runtime::{
-    block_on, spawn, spawn_detached, spawn_detached_in_domain, spawn_in_domain, JoinAll,
+    block_on, spawn, spawn_detached, spawn_detached_in_executor_domain, spawn_in_executor_domain,
+    JoinAll,
 };
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, INLINE_FUTURE_SIZE, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::FutureExt;
@@ -276,7 +278,11 @@ impl<T> Future for ControlledFuture<T> {
         let this = self.get_mut();
         if this.ready.load(Ordering::Acquire) {
             this.completed.fetch_add(1, Ordering::AcqRel);
-            Poll::Ready(this.value.take().expect("controlled future polled after ready"))
+            Poll::Ready(
+                this.value
+                    .take()
+                    .expect("controlled future polled after ready"),
+            )
         } else {
             *this
                 .child_waker
@@ -588,12 +594,7 @@ fn arc_fallback_joinhandle_completion_uses_latest_registered_waiter() {
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
     let future = LargeControlledFuture {
-        inner: ControlledFuture::new(
-            ready.clone(),
-            child_waker.clone(),
-            completed,
-            100usize,
-        ),
+        inner: ControlledFuture::new(ready.clone(), child_waker.clone(), completed, 100usize),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
     let mut handle = spawn(future);
@@ -1014,7 +1015,7 @@ fn compatibility_submit_routes_through_kernel_normal_domain() {
     super::init_threaded_runtime();
 
     let before = GlobalAsyncExecutor::global()
-        .domain_stats(KERNEL_NORMAL_DOMAIN)
+        .executor_domain_stats(KERNEL_NORMAL_EXECUTOR_DOMAIN)
         .expect("kernel normal domain missing");
     let counter = Arc::new(AtomicUsize::new(0));
     let ctx = Arc::as_ptr(&counter) as usize;
@@ -1026,29 +1027,29 @@ fn compatibility_submit_routes_through_kernel_normal_domain() {
     });
 
     let after = GlobalAsyncExecutor::global()
-        .domain_stats(KERNEL_NORMAL_DOMAIN)
+        .executor_domain_stats(KERNEL_NORMAL_EXECUTOR_DOMAIN)
         .expect("kernel normal domain missing");
     assert!(after.submitted >= before.submitted + 1);
     assert!(after.completed >= before.completed + 1);
 }
 
 #[test]
-fn submit_to_domain_executes_work_and_updates_domain_stats() {
+fn submit_to_executor_domain_executes_work_and_updates_executor_domain_stats() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
     let jobs = super::stress_task_count(16);
     let counter = Arc::new(AtomicUsize::new(0));
     let ctx = Arc::as_ptr(&counter) as usize;
-    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
-        class: DomainClass::Driver,
+    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+        class: ExecutorDomainClass::Driver,
         max_queued: jobs * 2,
         quantum: 2,
-        ..DomainConfig::default()
+        ..ExecutorDomainConfig::default()
     });
 
     for _ in 0..jobs {
-        GlobalAsyncExecutor::global().submit_to_domain(domain_id, increment_counter, ctx);
+        GlobalAsyncExecutor::global().submit_to_executor_domain(domain_id, increment_counter, ctx);
     }
 
     super::wait_until(Duration::from_secs(10), || {
@@ -1056,9 +1057,9 @@ fn submit_to_domain_executes_work_and_updates_domain_stats() {
     });
 
     let stats = GlobalAsyncExecutor::global()
-        .domain_stats(domain_id)
+        .executor_domain_stats(domain_id)
         .expect("custom domain missing");
-    assert_eq!(stats.class, DomainClass::Driver);
+    assert_eq!(stats.class, ExecutorDomainClass::Driver);
     assert!(stats.submitted >= jobs);
     assert!(stats.completed >= jobs);
     assert_eq!(stats.queued_count, 0);
@@ -1082,16 +1083,20 @@ fn hot_domain_can_run_multiple_active_pumps() {
         release: AtomicBool::new(false),
     });
     let ctx = Arc::as_ptr(&state) as usize;
-    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
-        class: DomainClass::KernelNormal,
+    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+        class: ExecutorDomainClass::KernelNormal,
         max_active: expected_concurrency,
         max_queued: jobs,
         quantum: 1,
-        ..DomainConfig::default()
+        ..ExecutorDomainConfig::default()
     });
 
     for _ in 0..jobs {
-        GlobalAsyncExecutor::global().submit_to_domain(domain_id, blocking_domain_counter, ctx);
+        GlobalAsyncExecutor::global().submit_to_executor_domain(
+            domain_id,
+            blocking_domain_counter,
+            ctx,
+        );
     }
 
     let start = Instant::now();
@@ -1119,50 +1124,50 @@ fn invalid_domain_submission_fails_without_panicking() {
     super::init_threaded_runtime();
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let invalid = DomainId::from_parts(0x00FF_FFFF, 1);
+    let invalid = ExecutorDomainId::from_parts(0x00FF_FFFF, 1);
     let err = GlobalAsyncExecutor::global()
-        .try_submit_to_domain(invalid, increment_counter, Arc::as_ptr(&counter) as usize)
+        .try_submit_to_executor_domain(invalid, increment_counter, Arc::as_ptr(&counter) as usize)
         .expect_err("invalid domain unexpectedly accepted work");
 
-    assert_eq!(err.kind, SubmitErrorKind::InvalidDomain);
+    assert_eq!(err.kind, ExecutorSubmitErrorKind::InvalidDomain);
     assert_eq!(counter.load(Ordering::Acquire), 0);
 }
 
 #[test]
-fn spawn_in_domain_completes_joinhandle() {
+fn spawn_in_executor_domain_completes_joinhandle() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
-        class: DomainClass::KernelHigh,
+    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+        class: ExecutorDomainClass::KernelHigh,
         max_queued: 128,
-        ..DomainConfig::default()
+        ..ExecutorDomainConfig::default()
     });
 
-    let value = block_on(async { spawn_in_domain(domain_id, async { 1234usize }).await });
+    let value = block_on(async { spawn_in_executor_domain(domain_id, async { 1234usize }).await });
     assert_eq!(value, 1234);
 
     super::wait_until(Duration::from_secs(10), || {
         GlobalAsyncExecutor::global()
-            .domain_stats(domain_id)
+            .executor_domain_stats(domain_id)
             .is_some_and(|stats| stats.completed >= 1)
     });
 }
 
 #[test]
-fn spawn_detached_in_domain_executes_work() {
+fn spawn_detached_in_executor_domain_executes_work() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
-        class: DomainClass::KernelBackground,
+    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+        class: ExecutorDomainClass::KernelBackground,
         max_queued: 128,
-        ..DomainConfig::default()
+        ..ExecutorDomainConfig::default()
     });
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_for_task = counter.clone();
 
-    spawn_detached_in_domain(domain_id, async move {
+    spawn_detached_in_executor_domain(domain_id, async move {
         counter_for_task.fetch_add(1, Ordering::AcqRel);
     });
 
@@ -1172,7 +1177,7 @@ fn spawn_detached_in_domain_executes_work() {
 
     super::wait_until(Duration::from_secs(10), || {
         GlobalAsyncExecutor::global()
-            .domain_stats(domain_id)
+            .executor_domain_stats(domain_id)
             .is_some_and(|stats| stats.completed >= 1)
     });
 }
@@ -1182,9 +1187,8 @@ fn executor_runs_with_simple_round_robin_scheduler_policy() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
-    GlobalAsyncExecutor::global().replace_scheduler_for_tests(Box::new(
-        SimpleRoundRobinScheduler::new(),
-    ));
+    GlobalAsyncExecutor::global()
+        .replace_scheduler_for_tests(Box::new(SimpleRoundRobinScheduler::new()));
 
     let counter = Arc::new(AtomicUsize::new(0));
     let ctx = Arc::as_ptr(&counter) as usize;
@@ -1194,9 +1198,8 @@ fn executor_runs_with_simple_round_robin_scheduler_policy() {
         counter.load(Ordering::Acquire) == 1
     });
 
-    GlobalAsyncExecutor::global().replace_scheduler_for_tests(Box::new(
-        WeightedDeficitRoundRobinScheduler::new(),
-    ));
+    GlobalAsyncExecutor::global()
+        .replace_scheduler_for_tests(Box::new(WeightedDeficitRoundRobinScheduler::new()));
 }
 
 // This test covers the global executor handoff where work is submitted by jobs

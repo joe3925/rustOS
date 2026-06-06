@@ -1,8 +1,12 @@
 use crate::scheduling::task::TaskHandle;
+use crate::util::MAX_CPUS;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+const CPU_SET_WORD_BITS: usize = u64::BITS as usize;
+const CPU_SET_WORDS: usize = (MAX_CPUS + CPU_SET_WORD_BITS - 1) / CPU_SET_WORD_BITS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainId(pub u16);
@@ -21,19 +25,66 @@ pub enum SwitchOutOutcome {
     StillRunnable,
     Blocking,
     Terminated,
+    Migrated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CpuSet {
-    All,
+pub struct CpuSet {
+    words: [u64; CPU_SET_WORDS],
 }
 
 impl CpuSet {
-    #[inline(always)]
-    pub fn contains(&self, _cpu_id: usize) -> bool {
-        match self {
-            CpuSet::All => true,
+    pub const fn all() -> Self {
+        Self {
+            words: [u64::MAX; CPU_SET_WORDS],
         }
+    }
+
+    pub const fn empty() -> Self {
+        Self {
+            words: [0; CPU_SET_WORDS],
+        }
+    }
+
+    pub fn single(cpu_id: usize) -> Self {
+        let mut set = Self::empty();
+        set.insert(cpu_id);
+        set
+    }
+
+    pub fn range(start: usize, end_exclusive: usize) -> Self {
+        let mut set = Self::empty();
+        let mut cpu = start;
+        while cpu < end_exclusive.min(MAX_CPUS) {
+            set.insert(cpu);
+            cpu += 1;
+        }
+        set
+    }
+
+    pub fn insert(&mut self, cpu_id: usize) {
+        if cpu_id >= MAX_CPUS {
+            return;
+        }
+
+        self.words[cpu_id / CPU_SET_WORD_BITS] |= 1u64 << (cpu_id % CPU_SET_WORD_BITS);
+    }
+
+    pub fn remove(&mut self, cpu_id: usize) {
+        if cpu_id >= MAX_CPUS {
+            return;
+        }
+
+        self.words[cpu_id / CPU_SET_WORD_BITS] &= !(1u64 << (cpu_id % CPU_SET_WORD_BITS));
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, cpu_id: usize) -> bool {
+        if cpu_id >= MAX_CPUS {
+            return false;
+        }
+
+        (self.words[cpu_id / CPU_SET_WORD_BITS] & (1u64 << (cpu_id % CPU_SET_WORD_BITS))) != 0
     }
 }
 
@@ -42,22 +93,83 @@ pub trait DomainOps: Send + Sync {
     fn name(&self) -> &'static str;
     fn contains_cpu(&self, cpu_id: usize) -> bool;
 
-    fn enqueue_new(&self, task: TaskHandle) -> usize;
+    fn enqueue(
+        &self,
+        task: TaskHandle,
+        reason: EnqueueReason,
+        hint_cpu: usize,
+        now_cycles: u64,
+    ) -> usize;
 
-    fn enqueue_wakeup(&self, task: TaskHandle, hint_cpu: usize) -> usize;
-
-    fn requeue_preempted(&self, task: TaskHandle, cpu_id: usize, now_cycles: u64);
+    fn on_switch_out(
+        &self,
+        task: &TaskHandle,
+        cpu_id: usize,
+        now_cycles: u64,
+        outcome: SwitchOutOutcome,
+    );
 
     fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle>;
 
     fn maybe_balance(&self, now_tick: usize);
-
-    fn on_task_exit(&self, task: &TaskHandle);
 }
 
 pub trait SchedulerClass: Send + Sync + 'static {
     type CpuState: Send + Sync + 'static;
     type TaskState: Send + Sync + 'static;
+
+    fn select_cpu(
+        &self,
+        per_cpu: &[Option<Self::CpuState>],
+        cpus: &CpuSet,
+        task: &TaskHandle,
+        task_state: &Self::TaskState,
+        reason: EnqueueReason,
+        hint_cpu: usize,
+        now_cycles: u64,
+    ) -> Option<usize> {
+        let _ = (task, task_state, reason, now_cycles);
+
+        let n = crate::scheduling::scheduler::SCHEDULER.num_cores();
+        if n == 0 {
+            return None;
+        }
+
+        let first = hint_cpu % n;
+        if cpus.contains(first) {
+            if let Some(Some(cpu)) = per_cpu.get(first) {
+                if self.effective_load(first, cpu) == 0 {
+                    return Some(first);
+                }
+            }
+        }
+
+        let mut best = None;
+        let mut best_load = usize::MAX;
+
+        for offset in 0..n {
+            let cpu_id = (hint_cpu + offset) % n;
+            if !cpus.contains(cpu_id) {
+                continue;
+            }
+
+            let Some(Some(cpu)) = per_cpu.get(cpu_id) else {
+                continue;
+            };
+
+            let load = self.effective_load(cpu_id, cpu);
+            if load < best_load {
+                best = Some(cpu_id);
+                best_load = load;
+
+                if load == 0 {
+                    break;
+                }
+            }
+        }
+
+        best
+    }
 
     fn enqueue(
         &self,
@@ -128,56 +240,6 @@ impl<C: SchedulerClass> Domain<C> {
             .and_then(Option::as_ref)
             .unwrap_or_else(|| panic!("domain {} has no cpu state for cpu {}", self.name, cpu_id))
     }
-
-    #[inline(always)]
-    fn task_state<'a>(&self, task: &'a TaskHandle) -> &'a C::TaskState {
-        assert_eq!(
-            task.domain_id(),
-            self.id,
-            "task scheduled through non-owning domain"
-        );
-
-        let ptr = task.class_state();
-        unsafe { ptr.cast::<C::TaskState>().as_ref() }
-    }
-
-    fn choose_least_loaded_cpu(&self, hint: usize) -> usize {
-        let n = crate::scheduling::scheduler::SCHEDULER.num_cores();
-        if n == 0 {
-            return 0;
-        }
-
-        let first = hint % n;
-        if self.contains_cpu(first) {
-            let cpu = self.cpu_state(first);
-            if self.class.effective_load(first, cpu) == 0 {
-                return first;
-            }
-        }
-
-        let mut best = first;
-        let mut best_load = None;
-
-        for k in 0..n {
-            let i = (hint + k) % n;
-            if !self.contains_cpu(i) {
-                continue;
-            }
-
-            let cpu = self.cpu_state(i);
-            let load = self.class.effective_load(i, cpu);
-            if best_load.is_none_or(|cur| load < cur) {
-                best_load = Some(load);
-                best = i;
-
-                if load == 0 {
-                    break;
-                }
-            }
-        }
-
-        best
-    }
 }
 
 impl<C: SchedulerClass> DomainOps for Domain<C> {
@@ -196,42 +258,60 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
         self.cpus.contains(cpu_id)
     }
 
-    fn enqueue_new(&self, task: TaskHandle) -> usize {
-        let start = crate::scheduling::scheduler::SCHEDULER.new_task_placement_start();
-        let cpu_id = self.choose_least_loaded_cpu(start);
-        task.set_target_cpu(cpu_id);
-        self.class.enqueue(
-            cpu_id,
-            self.cpu_state(cpu_id),
-            task.clone(),
-            self.task_state(&task),
-            EnqueueReason::New,
-        );
-        cpu_id
+    fn enqueue(
+        &self,
+        task: TaskHandle,
+        reason: EnqueueReason,
+        hint_cpu: usize,
+        now_cycles: u64,
+    ) -> usize {
+        task.with_class_state(self.id, |task_state: &C::TaskState| {
+            let cpu_id = self
+                .class
+                .select_cpu(
+                    &self.per_cpu,
+                    &self.cpus,
+                    &task,
+                    task_state,
+                    reason,
+                    hint_cpu,
+                    now_cycles,
+                )
+                .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name));
+
+            task.set_target_cpu(cpu_id);
+            self.class.enqueue(
+                cpu_id,
+                self.cpu_state(cpu_id),
+                task.clone(),
+                task_state,
+                reason,
+            );
+            cpu_id
+        })
     }
 
-    fn enqueue_wakeup(&self, task: TaskHandle, hint_cpu: usize) -> usize {
-        let cpu_id = self.choose_least_loaded_cpu(hint_cpu);
-        task.set_target_cpu(cpu_id);
-        self.class.enqueue(
-            cpu_id,
-            self.cpu_state(cpu_id),
-            task.clone(),
-            self.task_state(&task),
-            EnqueueReason::Wakeup,
-        );
-        cpu_id
-    }
+    fn on_switch_out(
+        &self,
+        task: &TaskHandle,
+        cpu_id: usize,
+        now_cycles: u64,
+        outcome: SwitchOutOutcome,
+    ) {
+        task.with_class_state(self.id, |task_state: &C::TaskState| {
+            self.class.on_switch_out(
+                cpu_id,
+                self.cpu_state(cpu_id),
+                task,
+                task_state,
+                now_cycles,
+                outcome,
+            );
 
-    fn requeue_preempted(&self, task: TaskHandle, cpu_id: usize, now_cycles: u64) {
-        self.class.on_switch_out(
-            cpu_id,
-            self.cpu_state(cpu_id),
-            &task,
-            self.task_state(&task),
-            now_cycles,
-            SwitchOutOutcome::StillRunnable,
-        );
+            if outcome == SwitchOutOutcome::Terminated {
+                self.class.on_task_exit(task, task_state);
+            }
+        });
     }
 
     fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
@@ -241,10 +321,6 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
 
     fn maybe_balance(&self, now_tick: usize) {
         self.class.maybe_balance(&self.per_cpu, now_tick);
-    }
-
-    fn on_task_exit(&self, task: &TaskHandle) {
-        self.class.on_task_exit(task, self.task_state(task));
     }
 }
 

@@ -4,8 +4,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
-use crate::scheduling::fifo_scheduler::new_fifo_task_binding;
-use crate::scheduling::scheduler::task_return_trampoline;
+use crate::scheduling::scheduler::{default_task_sched_binding, task_return_trampoline};
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
 use crate::vec::Vec;
@@ -13,7 +12,6 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::naked_asm;
-use core::ptr::NonNull;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
@@ -87,8 +85,12 @@ pub struct TaskRef {
     /// Scheduler-restored kernel TLS pointer for this task.
     pub tls_thread_pointer: AtomicU64,
 
-    /// Immutable scheduler-domain binding and erased scheduler-class state.
-    sched_binding: TaskSchedBinding,
+    /// Active scheduler-domain binding and erased scheduler-class state.
+    sched_binding: RwLock<TaskSchedBinding>,
+
+    /// Lazy domain migration target. The scheduler commits this at a point
+    /// where the task is not owned by an old-domain run queue.
+    pending_sched_binding: Mutex<Option<TaskSchedBinding>>,
 }
 
 /// Handle type used throughout the scheduler
@@ -180,12 +182,54 @@ impl TaskRef {
 
     #[inline(always)]
     pub fn domain_id(&self) -> DomainId {
-        self.sched_binding.domain_id()
+        self.sched_binding.read().domain_id()
     }
 
     #[inline(always)]
-    pub(crate) fn class_state(&self) -> NonNull<()> {
-        self.sched_binding.class_state()
+    pub(crate) fn with_class_state<T, R>(
+        &self,
+        expected_domain: DomainId,
+        f: impl FnOnce(&T) -> R,
+    ) -> R {
+        let binding = self.sched_binding.read();
+        assert_eq!(
+            binding.domain_id(),
+            expected_domain,
+            "task scheduled through non-owning domain"
+        );
+
+        let ptr = binding.class_state();
+        f(unsafe { ptr.cast::<T>().as_ref() })
+    }
+
+    pub(crate) fn set_pending_sched_binding(
+        &self,
+        sched_binding: TaskSchedBinding,
+    ) -> Result<(), TaskSchedBinding> {
+        let mut pending = self.pending_sched_binding.lock();
+        if pending.is_some() {
+            return Err(sched_binding);
+        }
+
+        *pending = Some(sched_binding);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_pending_sched_binding(&self) -> bool {
+        self.pending_sched_binding.lock().is_some()
+    }
+
+    pub(crate) fn take_pending_sched_binding(&self) -> Option<TaskSchedBinding> {
+        self.pending_sched_binding.lock().take()
+    }
+
+    pub(crate) fn replace_sched_binding(
+        &self,
+        sched_binding: TaskSchedBinding,
+    ) -> TaskSchedBinding {
+        let mut active = self.sched_binding.write();
+        core::mem::replace(&mut *active, sched_binding)
     }
 
     /// Attempt to grow the kernel stack by one page.
@@ -274,6 +318,26 @@ impl Task {
         stack_pointer: VirtAddr,
         parent_pid: u64,
     ) -> TaskHandle {
+        Self::new_user_mode_with_sched_binding(
+            entry_point,
+            context,
+            stack_size,
+            name,
+            stack_pointer,
+            parent_pid,
+            default_task_sched_binding(),
+        )
+    }
+
+    pub fn new_user_mode_with_sched_binding(
+        entry_point: TaskEntry,
+        context: usize,
+        stack_size: u64,
+        name: String,
+        stack_pointer: VirtAddr,
+        parent_pid: u64,
+        sched_binding: TaskSchedBinding,
+    ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
         let cpu_id = get_cpu_info()
             .get_feature_info()
@@ -326,7 +390,8 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size),
             tls_thread_pointer: AtomicU64::new(0),
-            sched_binding: new_fifo_task_binding(),
+            sched_binding: RwLock::new(sched_binding),
+            pending_sched_binding: Mutex::new(None),
         })
     }
 
@@ -336,6 +401,24 @@ impl Task {
         stack_size: StackSize,
         name: String,
         parent_pid: u64,
+    ) -> TaskHandle {
+        Self::new_kernel_mode_with_sched_binding(
+            entry_point,
+            context,
+            stack_size,
+            name,
+            parent_pid,
+            default_task_sched_binding(),
+        )
+    }
+
+    pub fn new_kernel_mode_with_sched_binding(
+        entry_point: TaskEntry,
+        context: usize,
+        stack_size: StackSize,
+        name: String,
+        parent_pid: u64,
+        sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
         let cpu_id = get_cpu_info()
@@ -393,7 +476,8 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size.as_bytes()),
             tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
-            sched_binding: new_fifo_task_binding(),
+            sched_binding: RwLock::new(sched_binding),
+            pending_sched_binding: Mutex::new(None),
         })
     }
 
