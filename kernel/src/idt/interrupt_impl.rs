@@ -8,8 +8,9 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
-    DropHook, IrqBorrowedHandle, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta, IrqSafeMutex,
-    IrqSafeRwLock, IrqWaitResult, WaitState, Waiter, WaiterPtr,
+    AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta,
+    IrqSafeRwLock, IrqWaitResult, WaiterSlot, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET,
+    WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING,
 };
 use spin::{Mutex, Once};
 use x86_64::structures::idt::InterruptStackFrame;
@@ -112,7 +113,7 @@ pub(crate) trait IrqHandleOps {
     fn ensure_signal_exactly_one(&self, meta: IrqMeta);
     fn signal_n(&self, meta: IrqMeta, n: usize) -> usize;
     fn signal_all(&self, meta: IrqMeta) -> usize;
-    fn cancel_waiter(&self, waiter: WaiterPtr);
+    fn cancel_waiter(&self, slot: usize);
     fn set_user_ctx(&self, v: usize);
     fn user_ctx(&self) -> usize;
 }
@@ -128,34 +129,21 @@ impl IrqHandleOps for IrqHandleInner {
             return;
         }
 
-        let mut st = self.state.lock();
-        st.pending_signals = 0;
+        self.pending_signals.store(0, Ordering::Release);
 
-        while let Some(waiter_ptr) = st.pop_waiter() {
-            let waiter = unsafe { waiter_ptr.as_ref() };
-            waiter.enqueued.store(false, Ordering::Release);
-            waiter.store_result(IrqWaitResult::closed());
-            waiter.wake_by_ref();
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::closed()) {
+                waker.wake_by_ref();
+            }
         }
     }
 
     fn signal_one(&self, meta: IrqMeta) {
-        if self.is_closed() {
-            return;
-        }
-
-        let mut st = self.state.lock();
-        st.last_meta = meta;
-
-        let Some(waiter_ptr) = st.pop_waiter() else {
-            st.pending_signals = st.pending_signals.saturating_add(1);
-            return;
-        };
-
-        let waiter = unsafe { waiter_ptr.as_ref() };
-        waiter.enqueued.store(false, Ordering::Release);
-        waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-        waiter.wake_by_ref();
+        let _ = self.signal_n(meta, 1);
     }
 
     fn ensure_signal_exactly_one(&self, meta: IrqMeta) {
@@ -163,18 +151,36 @@ impl IrqHandleOps for IrqHandleInner {
             return;
         }
 
-        let mut st = self.state.lock();
-        st.last_meta = meta;
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
 
-        let Some(waiter_ptr) = st.pop_waiter() else {
-            st.pending_signals = 1;
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) {
+                waker.wake_by_ref();
+            }
+
+            self.signal_phase.fetch_add(1, Ordering::AcqRel);
+            self.signal_active.fetch_sub(1, Ordering::AcqRel);
             return;
-        };
+        }
 
-        let waiter = unsafe { waiter_ptr.as_ref() };
-        waiter.enqueued.store(false, Ordering::Release);
-        waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-        waiter.wake_by_ref();
+        let _ = self
+            .pending_signals
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                if pending == 0 {
+                    Some(1)
+                } else {
+                    Some(pending)
+                }
+            });
+
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
@@ -182,26 +188,36 @@ impl IrqHandleOps for IrqHandleInner {
             return 0;
         }
 
-        let mut st = self.state.lock();
-        st.last_meta = meta;
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
 
-        let mut woken = 0;
+        let mut signaled = 0;
 
-        while woken < n {
-            let Some(waiter_ptr) = st.pop_waiter() else {
-                st.pending_signals = st.pending_signals.saturating_add(n - woken);
+        for slot in &self.waiters {
+            if signaled == n {
                 break;
+            }
+
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
             };
 
-            let waiter = unsafe { waiter_ptr.as_ref() };
-            waiter.enqueued.store(false, Ordering::Release);
-            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-            waiter.wake_by_ref();
+            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) {
+                waker.wake_by_ref();
+            }
 
-            woken += 1;
+            signaled += 1;
         }
 
-        woken
+        if signaled < n {
+            self.pending_signals
+                .fetch_add(n - signaled, Ordering::AcqRel);
+        }
+
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
+        signaled
     }
 
     fn signal_all(&self, meta: IrqMeta) -> usize {
@@ -209,36 +225,37 @@ impl IrqHandleOps for IrqHandleInner {
             return 0;
         }
 
-        let mut st = self.state.lock();
-        st.last_meta = meta;
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
 
-        let mut woken = 0;
+        let mut signaled = 0;
 
-        while let Some(waiter_ptr) = st.pop_waiter() {
-            let waiter = unsafe { waiter_ptr.as_ref() };
-            waiter.enqueued.store(false, Ordering::Release);
-            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-            waiter.wake_by_ref();
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
 
-            woken += 1;
+            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) {
+                waker.wake_by_ref();
+            }
+
+            signaled += 1;
         }
 
-        if woken == 0 {
-            st.pending_signals = st.pending_signals.saturating_add(1);
+        if signaled == 0 {
+            self.pending_signals.fetch_add(1, Ordering::AcqRel);
         }
 
-        woken
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
+        signaled
     }
 
-    fn cancel_waiter(&self, waiter_ptr: WaiterPtr) {
-        let mut st = self.state.lock();
-        let waiter = unsafe { waiter_ptr.as_ref() };
-
-        if waiter.enqueued.swap(false, Ordering::AcqRel) {
-            st.remove_waiter(waiter_ptr);
+    fn cancel_waiter(&self, slot: usize) {
+        if let Some(waiter) = self.waiters.get(slot) {
+            waiter.cancel();
         }
-
-        waiter.clear();
     }
 
     fn set_user_ctx(&self, v: usize) {
@@ -250,44 +267,145 @@ impl IrqHandleOps for IrqHandleInner {
     }
 }
 
+fn alloc_waiter_slot(handle: &IrqHandleInner) -> Option<usize> {
+    for (i, slot) in handle.waiters.iter().enumerate() {
+        if slot.try_alloc() {
+            return Some(i);
+        }
+    }
+
+    None
+}
+
+fn next_waiter_ticket(handle: &IrqHandleInner) -> usize {
+    let ticket = handle
+        .waiter_ticket
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+        & WAITER_MAX_TICKET;
+
+    if ticket == 0 {
+        1
+    } else {
+        ticket
+    }
+}
+
+fn try_consume_pending(handle: &IrqHandleInner) -> Option<IrqWaitResult> {
+    loop {
+        let pending = handle.pending_signals.load(Ordering::Acquire);
+
+        if pending == 0 {
+            return None;
+        }
+
+        if handle
+            .pending_signals
+            .compare_exchange(pending, pending - 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let meta = handle.last_meta.load(Ordering::Acquire);
+            return Some(IrqWaitResult::ok_n(meta, 1));
+        }
+    }
+}
+
+fn poll_slot(handle: &IrqHandleInner, slot_index: usize, cx: &Context<'_>) -> Poll<IrqWaitResult> {
+    let Some(slot) = handle.waiters.get(slot_index) else {
+        return Poll::Ready(IrqWaitResult::closed());
+    };
+
+    if let Some(result) = slot.take_signaled() {
+        return Poll::Ready(result);
+    }
+
+    match slot.state() {
+        WAITER_WAITING => {
+            if handle.is_closed() {
+                slot.cancel();
+                return Poll::Ready(IrqWaitResult::closed());
+            }
+
+            if handle.pending_signals.load(Ordering::Acquire) == 0 {
+                return Poll::Pending;
+            }
+
+            if !slot.try_withdraw_waiting() {
+                return Poll::Pending;
+            }
+        }
+
+        WAITER_CLAIMED => return Poll::Pending,
+
+        WAITER_SIGNALED => {
+            if let Some(result) = slot.take_signaled() {
+                return Poll::Ready(result);
+            }
+
+            return Poll::Pending;
+        }
+
+        WAITER_FREE => return Poll::Ready(IrqWaitResult::rescue()),
+
+        WAITER_PREPARING => {}
+
+        _ => return Poll::Ready(IrqWaitResult::rescue()),
+    }
+
+    slot.set_preparing();
+    slot.set_waker_exclusive(cx.waker());
+
+    if handle.is_closed() {
+        slot.cancel();
+        return Poll::Ready(IrqWaitResult::closed());
+    }
+
+    if let Some(result) = try_consume_pending(handle) {
+        slot.cancel();
+        return Poll::Ready(result);
+    }
+
+    let phase_before = handle.signal_phase.load(Ordering::Acquire);
+    let ticket = next_waiter_ticket(handle);
+    slot.publish(ticket);
+    let phase_after = handle.signal_phase.load(Ordering::Acquire);
+
+    if phase_before != phase_after
+        || handle.signal_active.load(Ordering::Acquire) != 0
+        || handle.pending_signals.load(Ordering::Acquire) != 0
+    {
+        cx.waker().wake_by_ref();
+    }
+
+    Poll::Pending
+}
+
 pub(crate) fn create_irq_handle_inner(drop_hook: DropHook) -> NonNull<IrqHandleInner> {
     let inner = Box::new(IrqHandleInner {
         drop_hook: Mutex::new(Some(drop_hook)),
         closed: AtomicBool::new(false),
         user_ctx: AtomicUsize::new(0),
-        state: IrqSafeMutex::new(WaitState::new()),
+        pending_signals: AtomicUsize::new(0),
+        signal_phase: AtomicUsize::new(0),
+        signal_active: AtomicUsize::new(0),
+        waiter_ticket: AtomicUsize::new(0),
+        last_meta: AtomicIrqMeta::new(),
+        waiters: core::array::from_fn(|_| WaiterSlot::new()),
     });
 
     unsafe { NonNull::new_unchecked(Box::into_raw(inner)) }
 }
 
 pub(crate) fn irq_wait_future(handle: &IrqHandle) -> IrqWaitFuture {
-    let waiter = Box::new(Waiter::new());
-    let waiter = unsafe { WaiterPtr::from_raw(Box::into_raw(waiter)) };
-
     IrqWaitFuture {
         handle: *handle,
-        test_wakeup: AtomicUsize::new(0),
-        waiter: Some(waiter),
+        slot: None,
     }
 }
 
 pub struct IrqWaitFuture {
     handle: IrqHandle,
-    test_wakeup: AtomicUsize,
-    waiter: Option<WaiterPtr>,
-}
-
-impl IrqWaitFuture {
-    fn free_waiter(&mut self) {
-        let Some(waiter) = self.waiter.take() else {
-            return;
-        };
-
-        unsafe {
-            drop(Box::from_raw(waiter.as_ptr()));
-        }
-    }
+    slot: Option<usize>,
 }
 
 impl Future for IrqWaitFuture {
@@ -296,62 +414,40 @@ impl Future for IrqWaitFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        let Some(waiter_ptr) = this.waiter else {
-            return Poll::Ready(IrqWaitResult::closed());
-        };
-
         let Some(poll) = irq_manager().with_handle(this.handle, |handle| {
-            let waiter = unsafe { waiter_ptr.as_ref() };
-            let mut st = handle.state.lock();
-
-            if let Some(r) = waiter.take_result() {
-                this.free_waiter();
-                return Poll::Ready(r);
-            }
-
-            if this.test_wakeup.load(Ordering::Relaxed) > 500_000_000 {
-                if waiter.enqueued.swap(false, Ordering::AcqRel) {
-                    st.remove_waiter(waiter_ptr);
-                }
-
-                waiter.clear();
-                this.free_waiter();
-                return Poll::Ready(IrqWaitResult::rescue());
-            }
-
             if handle.is_closed() {
-                if waiter.enqueued.swap(false, Ordering::AcqRel) {
-                    st.remove_waiter(waiter_ptr);
-                }
-
-                waiter.clear();
-                this.free_waiter();
                 return Poll::Ready(IrqWaitResult::closed());
             }
 
-            waiter.set_waker(cx.waker());
+            if let Some(slot) = this.slot {
+                let poll = poll_slot(handle, slot, cx);
 
-            if st.pending_signals > 0 {
-                st.pending_signals -= 1;
-                let meta = st.last_meta;
-
-                if waiter.enqueued.swap(false, Ordering::AcqRel) {
-                    st.remove_waiter(waiter_ptr);
+                if matches!(poll, Poll::Ready(_)) {
+                    this.slot = None;
                 }
 
-                waiter.clear();
-                this.free_waiter();
-                return Poll::Ready(IrqWaitResult::ok_n(meta, 1));
+                return poll;
             }
 
-            if !waiter.enqueued.swap(true, Ordering::AcqRel) {
-                st.push_waiter(waiter_ptr);
+            if let Some(result) = try_consume_pending(handle) {
+                return Poll::Ready(result);
             }
 
-            this.test_wakeup.fetch_add(1, Ordering::Relaxed);
-            Poll::Pending
+            let Some(slot) = alloc_waiter_slot(handle) else {
+                return Poll::Ready(IrqWaitResult::rescue());
+            };
+
+            this.slot = Some(slot);
+
+            let poll = poll_slot(handle, slot, cx);
+
+            if matches!(poll, Poll::Ready(_)) {
+                this.slot = None;
+            }
+
+            poll
         }) else {
-            this.free_waiter();
+            this.slot = None;
             return Poll::Ready(IrqWaitResult::closed());
         };
 
@@ -361,15 +457,13 @@ impl Future for IrqWaitFuture {
 
 impl Drop for IrqWaitFuture {
     fn drop(&mut self) {
-        let Some(waiter) = self.waiter else {
+        let Some(slot) = self.slot.take() else {
             return;
         };
 
         let _ = irq_manager().with_handle(self.handle, |handle| {
-            handle.cancel_waiter(waiter);
+            handle.cancel_waiter(slot);
         });
-
-        self.free_waiter();
     }
 }
 
@@ -765,7 +859,6 @@ impl IrqManager {
     }
 
     fn dispatch(&self, vector: u8, frame: &mut InterruptStackFrame) {
-        let _guard = InterruptGuard::new();
         let cpu = current_cpu_id() as u32;
         let slot = &self.vectors[vector as usize];
         let regs = slot.regs.read();
@@ -911,7 +1004,7 @@ pub fn irq_signal_all(handle: &IrqHandle, meta: IrqMeta) {
 }
 
 pub unsafe fn irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
-    let Some(inner) = handle.as_ref() else {
+    let Some(inner) = (unsafe { handle.as_ref() }) else {
         return;
     };
 
@@ -919,7 +1012,7 @@ pub unsafe fn irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
 }
 
 pub unsafe fn irq_borrowed_ensure_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
-    let Some(inner) = handle.as_ref() else {
+    let Some(inner) = (unsafe { handle.as_ref() }) else {
         return;
     };
 
@@ -927,7 +1020,7 @@ pub unsafe fn irq_borrowed_ensure_signal(handle: IrqBorrowedHandle, meta: IrqMet
 }
 
 pub unsafe fn irq_borrowed_signal_n(handle: IrqBorrowedHandle, meta: IrqMeta, n: u32) {
-    let Some(inner) = handle.as_ref() else {
+    let Some(inner) = (unsafe { handle.as_ref() }) else {
         return;
     };
 
@@ -935,7 +1028,7 @@ pub unsafe fn irq_borrowed_signal_n(handle: IrqBorrowedHandle, meta: IrqMeta, n:
 }
 
 pub unsafe fn irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta) {
-    let Some(inner) = handle.as_ref() else {
+    let Some(inner) = (unsafe { handle.as_ref() }) else {
         return;
     };
 
@@ -953,17 +1046,54 @@ pub fn irq_free_vector(vector: u8) -> bool {
 pub const SCHED_IPI_VECTOR: u8 = 0xF2;
 pub const TLB_FLUSH_VECTOR: u8 = 0xF3;
 
-pub struct InterruptGuard {}
+pub struct InterruptGuard {
+    was_in_interrupt: bool,
+}
 
 impl InterruptGuard {
     pub fn new() -> Self {
-        current_is_in_interrupt_atomic().store(true, Ordering::Relaxed);
-        InterruptGuard {}
+        let was_in_interrupt = current_is_in_interrupt_atomic().swap(true, Ordering::AcqRel);
+        InterruptGuard { was_in_interrupt }
+    }
+
+    #[inline(always)]
+    pub fn is_outermost(&self) -> bool {
+        !self.was_in_interrupt
     }
 }
 
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
-        current_is_in_interrupt_atomic().store(false, Ordering::Relaxed);
+        if !self.was_in_interrupt {
+            current_is_in_interrupt_atomic().store(false, Ordering::Release);
+        }
+    }
+}
+
+pub struct NestedInterruptEnableGuard {
+    disable_on_drop: bool,
+}
+
+impl NestedInterruptEnableGuard {
+    #[inline(always)]
+    pub fn new() -> Self {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+
+        if !was_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+
+        Self {
+            disable_on_drop: !was_enabled,
+        }
+    }
+}
+
+impl Drop for NestedInterruptEnableGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.disable_on_drop {
+            x86_64::instructions::interrupts::disable();
+        }
     }
 }

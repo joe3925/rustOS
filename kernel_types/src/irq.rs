@@ -1,12 +1,33 @@
 use alloc::collections::VecDeque;
-use core::mem::ManuallyDrop;
+use core::cell::UnsafeCell;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use core::task::Waker;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use x86_64::instructions::interrupts;
+
+pub type IrqContextQuery = extern "win64" fn() -> bool;
+
+static IRQ_CONTEXT_QUERY: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_irq_context_query(query: IrqContextQuery) {
+    IRQ_CONTEXT_QUERY.store(query as usize, Ordering::Release);
+}
+
+#[inline(always)]
+fn in_interrupt_context() -> bool {
+    let query = IRQ_CONTEXT_QUERY.load(Ordering::Acquire);
+
+    if query == 0 {
+        return false;
+    }
+
+    let query: IrqContextQuery = unsafe { core::mem::transmute(query) };
+    query()
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +179,322 @@ impl Default for IrqWaitResult {
     }
 }
 
+#[repr(C)]
+pub struct AtomicIrqMeta {
+    tag: AtomicU64,
+    data0: AtomicU64,
+    data1: AtomicU64,
+    data2: AtomicU64,
+}
+
+impl AtomicIrqMeta {
+    pub const fn new() -> Self {
+        Self {
+            tag: AtomicU64::new(0),
+            data0: AtomicU64::new(0),
+            data1: AtomicU64::new(0),
+            data2: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn store(&self, meta: IrqMeta, order: Ordering) {
+        self.data0.store(meta.data[0], Ordering::Relaxed);
+        self.data1.store(meta.data[1], Ordering::Relaxed);
+        self.data2.store(meta.data[2], Ordering::Relaxed);
+        self.tag.store(meta.tag, order);
+    }
+
+    #[inline]
+    pub fn load(&self, order: Ordering) -> IrqMeta {
+        let tag = self.tag.load(order);
+
+        IrqMeta {
+            tag,
+            data: [
+                self.data0.load(Ordering::Relaxed),
+                self.data1.load(Ordering::Relaxed),
+                self.data2.load(Ordering::Relaxed),
+            ],
+        }
+    }
+}
+
+pub const MAX_WAITERS_PER_HANDLE: usize = 128;
+
+pub const WAITER_FREE: usize = 0;
+pub const WAITER_PREPARING: usize = 1;
+pub const WAITER_WAITING: usize = 2;
+pub const WAITER_CLAIMED: usize = 3;
+pub const WAITER_SIGNALED: usize = 4;
+
+pub const WAITER_STATE_MASK: usize = 0b111;
+pub const WAITER_TICKET_SHIFT: usize = 3;
+pub const WAITER_MAX_TICKET: usize = usize::MAX >> WAITER_TICKET_SHIFT;
+
+#[inline]
+pub const fn waiter_word(state: usize, ticket: usize) -> usize {
+    (ticket << WAITER_TICKET_SHIFT) | state
+}
+
+#[inline]
+pub const fn waiter_state(word: usize) -> usize {
+    word & WAITER_STATE_MASK
+}
+
+#[inline]
+pub const fn waiter_ticket(word: usize) -> usize {
+    word >> WAITER_TICKET_SHIFT
+}
+
+#[repr(C)]
+pub struct WaiterSlot {
+    word: AtomicUsize,
+    abandoned: AtomicBool,
+    result: UnsafeCell<MaybeUninit<IrqWaitResult>>,
+    waker: UnsafeCell<Option<Waker>>,
+}
+
+unsafe impl Send for WaiterSlot {}
+unsafe impl Sync for WaiterSlot {}
+
+impl WaiterSlot {
+    pub const fn new() -> Self {
+        Self {
+            word: AtomicUsize::new(waiter_word(WAITER_FREE, 0)),
+            abandoned: AtomicBool::new(false),
+            result: UnsafeCell::new(MaybeUninit::uninit()),
+            waker: UnsafeCell::new(None),
+        }
+    }
+
+    #[inline]
+    pub fn state(&self) -> usize {
+        waiter_state(self.word.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    pub fn try_alloc(&self) -> bool {
+        self.word
+            .compare_exchange(
+                waiter_word(WAITER_FREE, 0),
+                waiter_word(WAITER_PREPARING, 0),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    pub fn set_preparing(&self) {
+        self.word
+            .store(waiter_word(WAITER_PREPARING, 0), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn publish(&self, ticket: usize) {
+        self.word
+            .store(waiter_word(WAITER_WAITING, ticket), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn try_withdraw_waiting(&self) -> bool {
+        let word = self.word.load(Ordering::Acquire);
+
+        if waiter_state(word) != WAITER_WAITING {
+            return false;
+        }
+
+        self.word
+            .compare_exchange(
+                word,
+                waiter_word(WAITER_PREPARING, 0),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    pub fn try_claim_for_signal(&self) -> Option<usize> {
+        let word = self.word.load(Ordering::Acquire);
+
+        if waiter_state(word) != WAITER_WAITING {
+            return None;
+        }
+
+        let ticket = waiter_ticket(word);
+
+        if ticket == 0 {
+            return None;
+        }
+
+        self.word
+            .compare_exchange(
+                word,
+                waiter_word(WAITER_CLAIMED, ticket),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(waiter_ticket)
+    }
+
+    #[inline]
+    pub fn complete_claimed(&self, ticket: usize, result: IrqWaitResult) -> Option<Waker> {
+        unsafe {
+            (*self.result.get()).write(result);
+        }
+
+        let waker = unsafe { (*self.waker.get()).clone() };
+
+        self.word
+            .store(waiter_word(WAITER_SIGNALED, ticket), Ordering::Release);
+
+        if self.abandoned.swap(false, Ordering::AcqRel) {
+            self.cleanup_signaled(ticket);
+            return None;
+        }
+
+        waker
+    }
+
+    #[inline]
+    pub fn cleanup_signaled(&self, ticket: usize) {
+        if self
+            .word
+            .compare_exchange(
+                waiter_word(WAITER_SIGNALED, ticket),
+                waiter_word(WAITER_PREPARING, 0),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        unsafe {
+            let _ = (*self.result.get()).assume_init_read();
+            let _ = (*self.waker.get()).take();
+        }
+
+        self.word
+            .store(waiter_word(WAITER_FREE, 0), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn take_signaled(&self) -> Option<IrqWaitResult> {
+        let word = self.word.load(Ordering::Acquire);
+
+        if waiter_state(word) != WAITER_SIGNALED {
+            return None;
+        }
+
+        let ticket = waiter_ticket(word);
+
+        if self
+            .word
+            .compare_exchange(
+                word,
+                waiter_word(WAITER_PREPARING, 0),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        let result = unsafe { (*self.result.get()).assume_init_read() };
+
+        unsafe {
+            let _ = (*self.waker.get()).take();
+        }
+
+        self.word
+            .store(waiter_word(WAITER_FREE, 0), Ordering::Release);
+
+        if ticket == 0 {
+            return None;
+        }
+
+        Some(result)
+    }
+
+    #[inline]
+    pub fn set_waker_exclusive(&self, waker: &Waker) {
+        unsafe {
+            *self.waker.get() = Some(waker.clone());
+        }
+    }
+
+    #[inline]
+    pub fn clear_waker_exclusive(&self) {
+        unsafe {
+            let _ = (*self.waker.get()).take();
+        }
+    }
+
+    #[inline]
+    pub fn cancel(&self) {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+
+            match waiter_state(word) {
+                WAITER_FREE => return,
+
+                WAITER_PREPARING => {
+                    self.clear_waker_exclusive();
+                    self.word
+                        .store(waiter_word(WAITER_FREE, 0), Ordering::Release);
+                    return;
+                }
+
+                WAITER_WAITING => {
+                    if self
+                        .word
+                        .compare_exchange(
+                            word,
+                            waiter_word(WAITER_PREPARING, 0),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    self.clear_waker_exclusive();
+                    self.word
+                        .store(waiter_word(WAITER_FREE, 0), Ordering::Release);
+                    return;
+                }
+
+                WAITER_CLAIMED => {
+                    self.abandoned.store(true, Ordering::Release);
+
+                    let after = self.word.load(Ordering::Acquire);
+
+                    if waiter_state(after) == WAITER_SIGNALED {
+                        self.cleanup_signaled(waiter_ticket(after));
+                    }
+
+                    return;
+                }
+
+                WAITER_SIGNALED => {
+                    self.abandoned.store(true, Ordering::Release);
+                    self.cleanup_signaled(waiter_ticket(word));
+                    return;
+                }
+
+                _ => return,
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct WaiterPtr {
     ptr: NonNull<Waiter>,
@@ -233,6 +570,7 @@ impl Waiter {
 
     pub fn wake_by_ref(&self) {
         let g = self.waker.lock();
+
         if let Some(w) = g.as_ref() {
             w.wake_by_ref();
         }
@@ -280,7 +618,13 @@ pub struct IrqHandleInner {
     pub drop_hook: Mutex<Option<DropHook>>,
     pub closed: AtomicBool,
     pub user_ctx: AtomicUsize,
-    pub state: IrqSafeMutex<WaitState>,
+
+    pub pending_signals: AtomicUsize,
+    pub signal_phase: AtomicUsize,
+    pub signal_active: AtomicUsize,
+    pub waiter_ticket: AtomicUsize,
+    pub last_meta: AtomicIrqMeta,
+    pub waiters: [WaiterSlot; MAX_WAITERS_PER_HANDLE],
 }
 
 #[repr(C)]
@@ -328,6 +672,7 @@ impl<T> IrqSafeMutex<T> {
     #[inline(always)]
     pub fn lock(&self) -> IrqSafeMutexGuard<'_, T> {
         let restore_interrupts = interrupts::are_enabled();
+        let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
@@ -341,7 +686,7 @@ impl<T> IrqSafeMutex<T> {
                 };
             }
 
-            if restore_interrupts {
+            if wait_with_hlt {
                 interrupts::enable_and_hlt();
             } else {
                 core::hint::spin_loop();
@@ -427,6 +772,7 @@ impl<T> IrqSafeRwLock<T> {
     #[inline(always)]
     pub fn read(&self) -> IrqSafeRwLockReadGuard<'_, T> {
         let restore_interrupts = interrupts::are_enabled();
+        let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
@@ -440,7 +786,7 @@ impl<T> IrqSafeRwLock<T> {
                 };
             }
 
-            if restore_interrupts {
+            if wait_with_hlt {
                 interrupts::enable_and_hlt();
             } else {
                 core::hint::spin_loop();
@@ -474,6 +820,7 @@ impl<T> IrqSafeRwLock<T> {
     #[inline(always)]
     pub fn write(&self) -> IrqSafeRwLockWriteGuard<'_, T> {
         let restore_interrupts = interrupts::are_enabled();
+        let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
@@ -487,7 +834,7 @@ impl<T> IrqSafeRwLock<T> {
                 };
             }
 
-            if restore_interrupts {
+            if wait_with_hlt {
                 interrupts::enable_and_hlt();
             } else {
                 core::hint::spin_loop();

@@ -7,7 +7,7 @@ use crate::drivers::interrupt_index::{
 use crate::drivers::timer_driver::NUM_CORES;
 use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::idt::InterruptGuard;
+use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::domain::{DomainMaster, EnqueueReason, SwitchOutOutcome, TaskSchedBinding};
@@ -241,6 +241,27 @@ impl Scheduler {
         }
 
         if let Some(core) = self.core(cpu) {
+            let in_interrupt = current_is_in_interrupt_atomic().load(Ordering::Acquire);
+
+            if in_interrupt {
+                let Some(apic) = APIC.try_lock() else {
+                    return;
+                };
+
+                if let Some(a) = apic.as_ref() {
+                    unsafe {
+                        a.lapic.send_ipi(
+                            IpiDest::ApicId(core.lapic_id),
+                            IpiKind::Fixed {
+                                vector: SCHED_IPI_VECTOR,
+                            },
+                        )
+                    }
+                }
+
+                return;
+            }
+
             unsafe {
                 if let Some(a) = APIC.lock().as_ref() {
                     a.lapic.send_ipi(
@@ -303,6 +324,7 @@ impl Scheduler {
             return;
         }
 
+        let in_interrupt = current_is_in_interrupt_atomic().load(Ordering::Acquire);
         let mut spins: u32 = 0;
 
         loop {
@@ -316,7 +338,7 @@ impl Scheduler {
                     }
 
                     let hint_cpu = task.target_cpu();
-                    if task.has_pending_sched_binding() {
+                    if task.has_pending_sched_binding() && !in_interrupt {
                         self.commit_pending_migration(task, current_cpu_id(), cpu::get_cycles());
                     }
 
@@ -720,8 +742,14 @@ pub extern "win64" fn ipi_handler_c(state: *mut State) {
         return;
     }
 
+    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+        send_eoi(SCHED_IPI_VECTOR);
+        return;
+    }
+
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
+    let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = current_cpu_id();
 
     SCHEDULER.on_ipi(state, cpu_id);
@@ -733,8 +761,13 @@ pub extern "win64" fn yield_handler_c(state: *mut State) {
         return;
     }
 
+    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+        return;
+    }
+
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
+    let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = current_cpu_id();
 
     SCHEDULER.on_timer_tick(state, cpu_id);

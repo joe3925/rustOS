@@ -1,5 +1,5 @@
 use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
-use crate::idt::InterruptGuard;
+use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
 use kernel_routing::println;
 
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
@@ -38,8 +38,14 @@ pub extern "win64" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let guard = InterruptGuard::new();
+
+    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+        return;
+    }
+
+    let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
+    let _nested_interrupts = NestedInterruptEnableGuard::new();
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();
     bench_submit_interrupt_sample_current_core(unsafe { &*state });

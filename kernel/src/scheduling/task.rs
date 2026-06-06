@@ -87,6 +87,7 @@ pub struct TaskRef {
 
     /// Active scheduler-domain binding and erased scheduler-class state.
     sched_binding: RwLock<TaskSchedBinding>,
+    active_domain_id: AtomicU32,
 
     /// Lazy domain migration target. The scheduler commits this at a point
     /// where the task is not owned by an old-domain run queue.
@@ -185,7 +186,7 @@ impl TaskRef {
 
     #[inline(always)]
     pub fn domain_id(&self) -> DomainId {
-        self.sched_binding.read().domain_id()
+        DomainId(self.active_domain_id.load(Ordering::Acquire) as u16)
     }
 
     #[inline(always)]
@@ -241,8 +242,12 @@ impl TaskRef {
         &self,
         sched_binding: TaskSchedBinding,
     ) -> TaskSchedBinding {
+        let new_domain_id = sched_binding.domain_id();
         let mut active = self.sched_binding.write();
-        core::mem::replace(&mut *active, sched_binding)
+        let old = core::mem::replace(&mut *active, sched_binding);
+        self.active_domain_id
+            .store(new_domain_id.0 as u32, Ordering::Release);
+        old
     }
 
     /// Attempt to grow the kernel stack by one page.
@@ -389,6 +394,8 @@ impl Task {
             last_cpu: AtomicUsize::new(usize::MAX),
         };
 
+        let active_domain_id = sched_binding.domain_id();
+
         Arc::new(TaskRef {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
@@ -404,6 +411,7 @@ impl Task {
             stack_size: AtomicU64::new(stack_size),
             tls_thread_pointer: AtomicU64::new(0),
             sched_binding: RwLock::new(sched_binding),
+            active_domain_id: AtomicU32::new(active_domain_id.0 as u32),
             pending_sched_binding: Mutex::new(None),
             pending_sched_binding_present: AtomicBool::new(false),
         })
@@ -476,6 +484,8 @@ impl Task {
             last_cpu: AtomicUsize::new(usize::MAX),
         };
 
+        let active_domain_id = sched_binding.domain_id();
+
         Arc::new(TaskRef {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
@@ -491,6 +501,7 @@ impl Task {
             stack_size: AtomicU64::new(stack_size.as_bytes()),
             tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
             sched_binding: RwLock::new(sched_binding),
+            active_domain_id: AtomicU32::new(active_domain_id.0 as u32),
             pending_sched_binding: Mutex::new(None),
             pending_sched_binding_present: AtomicBool::new(false),
         })
