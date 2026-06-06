@@ -9,6 +9,8 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::InterruptGuard;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
+use crate::scheduling::domain::DomainMaster;
+use crate::scheduling::fifo_scheduler::build_fifo_domain;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::CurrentTask;
@@ -17,22 +19,16 @@ pub use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
 use crate::scheduling::task::{idle_task, Task, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
 use crate::scheduling::tls;
-use crate::util::KERNEL_INITIALIZED;
+use crate::util::{KERNEL_INITIALIZED, MAX_CPUS};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
-use spin::Mutex;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
-const BALANCE_INTERVAL_TICKS: usize = 150;
-const RUNQ_CAP: usize = 4096;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
-
-type SchedulerQueue = BoundedMpmcQueue<TaskHandle>;
 
 pub struct KernelFpuGuard {
     saved_task: Option<TaskHandle>,
@@ -76,31 +72,21 @@ impl Drop for KernelFpuGuard {
 
 pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
-    run_queue: SchedulerQueue,
-    inbound_queue: SchedulerQueue,
     idle_task: TaskHandle,
     current: CurrentTask,
     lapic_id: u8,
-    load: AtomicUsize,
 }
 
 struct SchedulerState {
     current: Option<TaskHandle>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InboundDrain {
-    Available,
-    Contended,
-}
-
 pub struct Scheduler {
     all_tasks: TaskTable,
     cores: IrqSafeRwLock<Vec<Arc<CoreScheduler>>>,
+    domains: DomainMaster,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
-    last_balance_tick: AtomicUsize,
-    balance_lock: Mutex<()>,
 }
 
 lazy_static! {
@@ -112,10 +98,12 @@ impl Scheduler {
         Self {
             all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
             cores: IrqSafeRwLock::new(Vec::new()),
+            domains: DomainMaster::new(
+                alloc::vec![build_fifo_domain(MAX_CPUS)].into_boxed_slice(),
+                MAX_CPUS,
+            ),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
-            last_balance_tick: AtomicUsize::new(0),
-            balance_lock: Mutex::new(()),
         }
     }
 
@@ -137,12 +125,9 @@ impl Scheduler {
 
         Arc::new(CoreScheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
-            run_queue: SchedulerQueue::new(RUNQ_CAP),
-            inbound_queue: SchedulerQueue::new(RUNQ_CAP),
             idle_task: idle.clone(),
             current: CurrentTask::new(&idle),
             lapic_id,
-            load: AtomicUsize::new(0),
         })
     }
 
@@ -158,6 +143,12 @@ impl Scheduler {
             "cpu ids must be contiguous (got {}, expected next {})",
             cpu_id,
             cores.len()
+        );
+        assert!(
+            cpu_id < MAX_CPUS,
+            "cpu id {} exceeds scheduler domain cpu capacity {}",
+            cpu_id,
+            MAX_CPUS
         );
 
         let lapic_id = get_current_logical_id();
@@ -226,27 +217,13 @@ impl Scheduler {
         }
 
         let id = self.register_task(task.clone());
-        let best_cpu = self.choose_core_for_new_task(n);
-        task.set_target_cpu(best_cpu);
-        self.enqueue_inbound(best_cpu, task);
-        self.kick_remote_core(best_cpu);
+        let domain = self.domains.get(task.domain_id());
+        let target_cpu = domain.enqueue_new(task);
+        self.kick_remote_core(target_cpu);
         id
     }
 
-    fn enqueue_inbound(&self, cpu: usize, task: TaskHandle) {
-        let Some(core) = self.core(cpu) else {
-            panic!("enqueue_inbound: cpu {} not initialized", cpu);
-        };
-
-        Self::reserve_queue_load_or_panic(cpu, &core.load, "inbound queue");
-
-        if core.inbound_queue.try_push(task).is_err() {
-            core.load.fetch_sub(1, Ordering::Release);
-            panic!("inbound queue overflow on cpu {}", cpu);
-        }
-    }
-
-    fn kick_remote_core(&self, cpu: usize) {
+    pub(crate) fn kick_remote_core(&self, cpu: usize) {
         if cpu == current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return;
         }
@@ -262,66 +239,6 @@ impl Scheduler {
                     )
                 }
             }
-        }
-    }
-
-    #[inline(always)]
-    fn reserve_queue_load_or_panic(cpu: usize, load: &AtomicUsize, queue_name: &str) {
-        if load
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
-            .is_err()
-        {
-            panic!("{queue_name} load overflow on cpu {cpu}");
-        }
-    }
-
-    #[inline(always)]
-    fn push_runqueue_or_panic(
-        cpu: usize,
-        queue: &SchedulerQueue,
-        load: &AtomicUsize,
-        task: TaskHandle,
-    ) {
-        Self::reserve_queue_load_or_panic(cpu, load, "run queue");
-
-        if queue.try_push(task).is_err() {
-            load.fetch_sub(1, Ordering::Release);
-            panic!("run queue overflow on cpu {cpu}");
-        }
-    }
-
-    fn choose_core_for_new_task(&self, n: usize) -> usize {
-        let start = (self.next_task_id.load(Ordering::Relaxed) as usize) % n;
-        let mut best = start;
-        let mut best_load: Option<usize> = None;
-
-        for k in 0..n {
-            let i = (start + k) % n;
-            let Some(load) = self.core_effective_load(i) else {
-                continue;
-            };
-
-            if best_load.is_none_or(|b| load < b) {
-                best_load = Some(load);
-                best = i;
-
-                if load == 0 {
-                    break;
-                }
-            }
-        }
-
-        best
-    }
-
-    fn core_effective_load(&self, i: usize) -> Option<usize> {
-        let core = self.core(i)?;
-        let queue_load = core.load.load(Ordering::Acquire);
-
-        if core.current.is_task(&core.idle_task) {
-            Some(queue_load)
-        } else {
-            Some(queue_load.saturating_add(1))
         }
     }
 
@@ -364,23 +281,10 @@ impl Scheduler {
                         continue;
                     }
 
-                    let target = task.target_cpu();
-                    let best_cpu = if target < n {
-                        let target_load = self.core_effective_load(target).unwrap_or(usize::MAX);
-
-                        if target_load == 0 {
-                            target
-                        } else {
-                            self.find_least_loaded_cpu(n, target)
-                        }
-                    } else {
-                        self.find_least_loaded_cpu(n, 0)
-                    };
-
-                    task.set_target_cpu(best_cpu);
-
-                    self.enqueue_inbound(best_cpu, task.clone());
-                    self.kick_remote_core(best_cpu);
+                    let hint_cpu = task.target_cpu();
+                    let domain = self.domains.get(task.domain_id());
+                    let target_cpu = domain.enqueue_wakeup(task.clone(), hint_cpu);
+                    self.kick_remote_core(target_cpu);
 
                     return;
                 }
@@ -401,42 +305,6 @@ impl Scheduler {
                 }
             }
         }
-    }
-
-    fn find_least_loaded_cpu(&self, n: usize, hint: usize) -> usize {
-        let best = hint % n;
-
-        if let Some(load) = self.core_effective_load(best) {
-            if load == 0 {
-                return best;
-            }
-        }
-
-        let mut best = best;
-        let mut best_load = self.core_effective_load(best);
-
-        for k in 1..n {
-            let i = (hint + k) % n;
-            let Some(load) = self.core_effective_load(i) else {
-                continue;
-            };
-
-            let take = match best_load {
-                Some(cur) => load < cur,
-                None => true,
-            };
-
-            if take {
-                best_load = Some(load);
-                best = i;
-
-                if load == 0 {
-                    break;
-                }
-            }
-        }
-
-        best
     }
 
     pub fn park_current(&self, _reason: BlockReason) {
@@ -524,52 +392,6 @@ impl Scheduler {
         prev_task
     }
 
-    fn drain_inbound_to_runqueue(&self, cpu_id: usize, core: &Arc<CoreScheduler>) -> InboundDrain {
-        loop {
-            if core.run_queue.len() >= RUNQ_CAP {
-                return InboundDrain::Available;
-            }
-
-            let Ok(task) = core.inbound_queue.try_pop_wait_free() else {
-                return InboundDrain::Available;
-            };
-
-            match core.run_queue.try_push(task) {
-                Ok(()) => {}
-                Err(BoundedMpmcPushError::Full(task)) => {
-                    if core.inbound_queue.try_push(task).is_err() {
-                        panic!("failed to restore inbound task on cpu {}", cpu_id);
-                    }
-
-                    return InboundDrain::Available;
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn pop_queued_task(
-        core: &Arc<CoreScheduler>,
-        inbound_drain: InboundDrain,
-    ) -> Option<TaskHandle> {
-        if let Ok(task) = core.run_queue.try_pop_wait_free() {
-            core.load.fetch_sub(1, Ordering::Release);
-            return Some(task);
-        }
-
-        if inbound_drain == InboundDrain::Contended {
-            return None;
-        }
-
-        if let Ok(task) = core.inbound_queue.try_pop_wait_free() {
-            core.load.fetch_sub(1, Ordering::Release);
-            Some(task)
-        } else {
-            None
-        }
-    }
-
     fn schedule_next(
         &self,
         cpu_id: usize,
@@ -627,26 +449,29 @@ impl Scheduler {
                     }
                     SchedState::Blocked => {}
                     SchedState::Terminated => {
+                        let domain = self.domains.get(prev.domain_id());
+                        domain.on_task_exit(&prev);
                         self.unregister_task(&prev);
                     }
                 }
             }
         }
 
-        let inbound_drain = self.drain_inbound_to_runqueue(cpu_id, core);
-
         if let Some(prev) = requeue_previous {
-            Self::push_runqueue_or_panic(cpu_id, &core.run_queue, &core.load, prev);
+            let domain = self.domains.get(prev.domain_id());
+            domain.requeue_preempted(prev, cpu_id, now_cycles);
         }
 
         loop {
-            let cand = match Self::pop_queued_task(core, inbound_drain) {
+            let cand = match self.domains.pick_next(cpu_id, now_cycles) {
                 Some(task) => task,
                 None => break,
             };
 
             match cand.sched_state() {
                 SchedState::Terminated => {
+                    let domain = self.domains.get(cand.domain_id());
+                    domain.on_task_exit(&cand);
                     self.unregister_task(&cand);
                     continue;
                 }
@@ -710,151 +535,39 @@ impl Scheduler {
 
     pub fn maybe_balance(&self) {
         let current_tick = TIMER.load(Ordering::Relaxed);
-        let last = self.last_balance_tick.load(Ordering::Relaxed);
-
-        if current_tick.wrapping_sub(last) < BALANCE_INTERVAL_TICKS {
-            return;
-        }
-
-        let Some(_guard) = self.balance_lock.try_lock() else {
-            return;
-        };
-
-        self.last_balance_tick
-            .store(current_tick, Ordering::Relaxed);
-        self.balance();
-    }
-
-    fn steal_youngest_runnable(
-        &self,
-        cpu_id: usize,
-        core: &Arc<CoreScheduler>,
-    ) -> Option<TaskHandle> {
-        let _state = core.sched_lock.write();
-
-        loop {
-            let len = core.run_queue.len();
-
-            if len == 0 {
-                return None;
-            }
-
-            let mut rotated = 0usize;
-
-            while rotated + 1 < len {
-                let Ok(task) = core.run_queue.try_pop_wait_free() else {
-                    return None;
-                };
-
-                if core.run_queue.try_push(task).is_err() {
-                    panic!("run queue rotation overflow on cpu {}", cpu_id);
-                }
-
-                rotated += 1;
-            }
-
-            let Ok(task) = core.run_queue.try_pop_wait_free() else {
-                return None;
-            };
-
-            core.load.fetch_sub(1, Ordering::Release);
-
-            match task.sched_state() {
-                SchedState::Terminated => {
-                    self.unregister_task(&task);
-                }
-                SchedState::Parking | SchedState::Blocked => {}
-                SchedState::Runnable | SchedState::Running => {
-                    return Some(task);
-                }
-            }
-        }
-    }
-
-    fn balance(&self) {
-        let n = self.num_cores.load(Ordering::Acquire);
-
-        if n < 2 {
-            return;
-        }
-
-        for i in 0..n {
-            if let Some(core) = self.core(i) {
-                self.drain_inbound_to_runqueue(i, &core);
-            }
-        }
-
-        loop {
-            let mut min_idx = 0;
-            let mut min_load = usize::MAX;
-
-            for i in 0..n {
-                let Some(load) = self.core_effective_load(i) else {
-                    continue;
-                };
-
-                if load < min_load {
-                    min_idx = i;
-                    min_load = load;
-                }
-            }
-
-            if min_load == usize::MAX {
-                break;
-            }
-
-            let mut max_idx = 0;
-            let mut max_stealable = 0usize;
-
-            for i in 0..n {
-                if i == min_idx {
-                    continue;
-                }
-
-                let Some(core) = self.core(i) else {
-                    continue;
-                };
-
-                let stealable = core.run_queue.len();
-
-                if stealable > max_stealable {
-                    max_stealable = stealable;
-                    max_idx = i;
-                }
-            }
-
-            if max_stealable == 0 {
-                break;
-            }
-
-            let Some(max_load) = self.core_effective_load(max_idx) else {
-                break;
-            };
-
-            if max_load <= min_load + 1 {
-                break;
-            }
-
-            let Some(max_core) = self.core(max_idx) else {
-                break;
-            };
-
-            let Some(task) = self.steal_youngest_runnable(max_idx, &max_core) else {
-                break;
-            };
-
-            let Some(min_core) = self.core(min_idx) else {
-                break;
-            };
-
-            task.set_target_cpu(min_idx);
-            Self::push_runqueue_or_panic(min_idx, &min_core.run_queue, &min_core.load, task);
-            self.kick_remote_core(min_idx);
-        }
+        self.domains.maybe_balance(current_tick);
     }
 
     pub fn num_cores(&self) -> usize {
         self.num_cores.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn new_task_placement_start(&self) -> usize {
+        let n = self.num_cores.load(Ordering::Acquire);
+        if n == 0 {
+            0
+        } else {
+            self.next_task_id.load(Ordering::Relaxed) as usize % n
+        }
+    }
+
+    pub(crate) fn cpu_is_idle(&self, cpu_id: usize) -> bool {
+        self.core(cpu_id)
+            .is_some_and(|core| core.current.is_task(&core.idle_task))
+    }
+
+    pub(crate) fn with_core_sched_lock<R>(
+        &self,
+        cpu_id: usize,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let core = self.core(cpu_id)?;
+        let _state = core.sched_lock.write();
+        Some(f())
+    }
+
+    pub(crate) fn unregister_task_from_domain(&self, task: &TaskHandle) {
+        self.unregister_task(task);
     }
 
     #[inline(always)]

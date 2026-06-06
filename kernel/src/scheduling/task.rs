@@ -3,6 +3,8 @@ use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
+use crate::scheduling::domain::{DomainId, TaskSchedBinding};
+use crate::scheduling::fifo_scheduler::new_fifo_task_binding;
 use crate::scheduling::scheduler::task_return_trampoline;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
@@ -11,6 +13,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::naked_asm;
+use core::ptr::NonNull;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
@@ -83,6 +86,9 @@ pub struct TaskRef {
 
     /// Scheduler-restored kernel TLS pointer for this task.
     pub tls_thread_pointer: AtomicU64,
+
+    /// Immutable scheduler-domain binding and erased scheduler-class state.
+    sched_binding: TaskSchedBinding,
 }
 
 /// Handle type used throughout the scheduler
@@ -170,6 +176,16 @@ impl TaskRef {
     #[inline(always)]
     pub fn set_task_id(&self, id: u64) {
         self.id.store(id, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn domain_id(&self) -> DomainId {
+        self.sched_binding.domain_id()
+    }
+
+    #[inline(always)]
+    pub(crate) fn class_state(&self) -> NonNull<()> {
+        self.sched_binding.class_state()
     }
 
     /// Attempt to grow the kernel stack by one page.
@@ -310,6 +326,7 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size),
             tls_thread_pointer: AtomicU64::new(0),
+            sched_binding: new_fifo_task_binding(),
         })
     }
 
@@ -376,6 +393,7 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size.as_bytes()),
             tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
+            sched_binding: new_fifo_task_binding(),
         })
     }
 
