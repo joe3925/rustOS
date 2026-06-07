@@ -6,19 +6,20 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::future::Future;
 use core::marker::PhantomData;
-use core::mem;
-use core::mem::MaybeUninit;
+use core::mem::{self, MaybeUninit};
 use core::pin::Pin;
-use core::ptr::{self, null_mut};
+use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+#[cfg(feature = "async-ffi-slab")]
+use crate::fixed_slab::{StaticBytePool64, StaticObjectPool, USIZE_BITS};
 
 #[cfg(feature = "macros")]
 #[cfg_attr(docsrs, doc(cfg(feature = "macros")))]
 pub use macros::async_ffi;
 
 pub const ABI_VERSION: u32 = 2;
-const ASYNC_FFI_SLAB_WORDS: usize = ASYNC_FFI_SLAB_SLOTS.div_ceil(USIZE_BITS);
 
 const SLAB_ALIGN: usize = 64;
 const SLAB_CHECKS: bool = cfg!(debug_assertions);
@@ -27,118 +28,8 @@ const fn sel(b: bool) -> usize {
     if b { 1 } else { 0 }
 }
 
-#[repr(C, align(64))]
-struct CachelineAtomicUsize {
-    v: AtomicUsize,
-}
-
-impl CachelineAtomicUsize {
-    const fn new(v: usize) -> Self {
-        Self {
-            v: AtomicUsize::new(v),
-        }
-    }
-}
-
-const USIZE_BITS: usize = usize::BITS as usize;
-
-#[repr(C, align(64))]
-#[repr(C, align(64))]
-struct BitmapFreelist<const N: usize, const W: usize> {
-    words: [AtomicUsize; W],
-}
-
-impl<const N: usize, const W: usize> BitmapFreelist<N, W> {
-    const fn new() -> Self {
-        Self {
-            words: [const { AtomicUsize::new(0) }; W],
-        }
-    }
-
-    #[inline(always)]
-    fn push(&self, idx: usize) {
-        debug_assert!(!SLAB_CHECKS || idx < N);
-        let wi = idx / USIZE_BITS;
-        let bi = idx % USIZE_BITS;
-        debug_assert!(!SLAB_CHECKS || wi < W);
-        let mask = 1usize << bi;
-
-        let prev = self.words[wi].fetch_or(mask, Ordering::Release);
-        debug_assert!(!SLAB_CHECKS || (prev & mask) == 0, "double free");
-    }
-
-    #[inline(always)]
-    fn pop(&self) -> Option<usize> {
-        let mut wi = 0usize;
-
-        while wi < W {
-            let w = &self.words[wi];
-            let mut cur = w.load(Ordering::Relaxed);
-
-            while cur != 0 {
-                let bit = cur.trailing_zeros() as usize;
-                let mask = 1usize << bit;
-                let new = cur & !mask;
-
-                match w.compare_exchange_weak(cur, new, Ordering::Acquire, Ordering::Relaxed) {
-                    Ok(_) => {
-                        let idx = wi * USIZE_BITS + bit;
-                        if idx < N {
-                            return Some(idx);
-                        } else {
-                            // This can only happen in the last word when N is not word-aligned.
-                            // Clear stray bits by continuing; allocator will never hand out idx>=N again.
-                            cur = new;
-                            continue;
-                        }
-                    }
-                    Err(v) => cur = v,
-                }
-            }
-
-            wi += 1;
-        }
-
-        None
-    }
-}
-
-/// Allocate a slot index.
-///
-/// Strategy:
-/// 1) Try to pop from the bitmap of freed slots.
-/// 2) If empty, bump the watermark to allocate a fresh slot.
-#[inline(always)]
-fn slot_alloc<const N: usize, const W: usize>(
-    free: &BitmapFreelist<N, W>,
-    watermark: &AtomicUsize,
-) -> Option<usize> {
-    if let Some(i) = free.pop() {
-        return Some(i);
-    }
-
-    loop {
-        let wm = watermark.load(Ordering::Relaxed);
-        if wm >= N {
-            if let Some(i) = free.pop() {
-                return Some(i);
-            }
-            return None;
-        }
-
-        match watermark.compare_exchange_weak(wm, wm + 1, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Some(wm),
-            Err(_) => core::hint::spin_loop(),
-        }
-    }
-}
-
-#[inline(always)]
-fn slot_free<const N: usize, const W: usize>(free: &BitmapFreelist<N, W>, idx: usize) {
-    free.push(idx);
-}
-
-// ---------- slots selection ----------
+#[cfg(feature = "async-ffi-slab")]
+const ASYNC_FFI_SLAB_WORDS: usize = ASYNC_FFI_SLAB_SLOTS.div_ceil(USIZE_BITS);
 
 const SLOTS_SEL: usize = sel(cfg!(feature = "async-ffi-slab-slots-16"))
     + sel(cfg!(feature = "async-ffi-slab-slots-32"))
@@ -175,8 +66,6 @@ const ASYNC_FFI_SLAB_SLOTS: usize = if cfg!(feature = "async-ffi-slab-slots-16")
     1024
 };
 
-// ---------- slot-bytes selection ----------
-
 const SLOT_BYTES_SEL: usize = sel(cfg!(feature = "async-ffi-slab-slot-bytes-256"))
     + sel(cfg!(feature = "async-ffi-slab-slot-bytes-512"))
     + sel(cfg!(feature = "async-ffi-slab-slot-bytes-1k"))
@@ -209,8 +98,6 @@ const ASYNC_FFI_SLAB_SLOT_BYTES: usize = if cfg!(feature = "async-ffi-slab-slot-
     1024
 };
 
-// ---------- derived + compile-time checks ----------
-
 const _: () = {
     if SLOTS_SEL > 1 {
         panic!(
@@ -218,6 +105,7 @@ const _: () = {
 If you are overriding defaults, set default-features = false on the dependency."
         );
     }
+
     if SLOT_BYTES_SEL > 1 {
         panic!(
             "Enable at most one async-ffi-slab-slot-bytes-* feature. \
@@ -228,55 +116,42 @@ If you are overriding defaults, set default-features = false on the dependency."
     if ASYNC_FFI_SLAB_SLOTS == 0 {
         panic!("ASYNC_FFI_SLAB_SLOTS must be non-zero.");
     }
+
     if ASYNC_FFI_SLAB_SLOT_BYTES == 0 {
         panic!("ASYNC_FFI_SLAB_SLOT_BYTES must be non-zero.");
     }
+
     if !ASYNC_FFI_SLAB_SLOT_BYTES.is_multiple_of(SLAB_ALIGN) {
         panic!("async-ffi slab slot bytes must be a multiple of SLAB_ALIGN (64).");
     }
+
     if ASYNC_FFI_SLAB_SLOTS > (usize::MAX / ASYNC_FFI_SLAB_SLOT_BYTES) {
         panic!("async-ffi slab total bytes overflow.");
     }
 };
 
-const ASYNC_FFI_SLAB_TOTAL_BYTES: usize = ASYNC_FFI_SLAB_SLOTS * ASYNC_FFI_SLAB_SLOT_BYTES;
 const ASYNC_FFI_FUTURE_SLOT_BYTES: usize = ASYNC_FFI_SLAB_SLOT_BYTES;
 
-#[repr(C, align(64))]
-struct AlignedFutureBuf {
-    buf: [u8; ASYNC_FFI_SLAB_TOTAL_BYTES],
-}
+#[cfg(feature = "async-ffi-slab")]
+static FUTURE_POOL: StaticBytePool64<
+    ASYNC_FFI_SLAB_SLOTS,
+    ASYNC_FFI_SLAB_WORDS,
+    ASYNC_FFI_FUTURE_SLOT_BYTES,
+> = StaticBytePool64::new();
 
-// -- FUTURE SLAB --
 #[cfg(feature = "async-ffi-slab")]
-static FUTURE_FREE: BitmapFreelist<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS> =
-    BitmapFreelist::new();
-#[cfg(feature = "async-ffi-slab")]
-static FUTURE_WATERMARK: CachelineAtomicUsize = CachelineAtomicUsize::new(0);
-#[cfg(feature = "async-ffi-slab")]
-static mut FUTURE_SLAB_BUF: AlignedFutureBuf = AlignedFutureBuf {
-    buf: [0; ASYNC_FFI_SLAB_TOTAL_BYTES],
-};
+static WAKER_TO_FFI_POOL: StaticObjectPool<
+    RustWakerBox,
+    ASYNC_FFI_SLAB_SLOTS,
+    ASYNC_FFI_SLAB_WORDS,
+> = StaticObjectPool::new();
 
-// -- WAKER_TO_FFI SLAB --
 #[cfg(feature = "async-ffi-slab")]
-static WAKER_TO_FFI_FREE: BitmapFreelist<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS> =
-    BitmapFreelist::new();
-#[cfg(feature = "async-ffi-slab")]
-static WAKER_TO_FFI_WATERMARK: CachelineAtomicUsize = CachelineAtomicUsize::new(0);
-#[cfg(feature = "async-ffi-slab")]
-static mut WAKER_TO_FFI_SLAB: [MaybeUninit<RustWakerBox>; ASYNC_FFI_SLAB_SLOTS] =
-    [const { MaybeUninit::uninit() }; ASYNC_FFI_SLAB_SLOTS];
-
-// -- FFI_TO_WAKER SLAB --
-#[cfg(feature = "async-ffi-slab")]
-static FFI_TO_WAKER_FREE: BitmapFreelist<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS> =
-    BitmapFreelist::new();
-#[cfg(feature = "async-ffi-slab")]
-static FFI_TO_WAKER_WATERMARK: CachelineAtomicUsize = CachelineAtomicUsize::new(0);
-#[cfg(feature = "async-ffi-slab")]
-static mut FFI_TO_WAKER_SLAB: [MaybeUninit<FfiWakerBox>; ASYNC_FFI_SLAB_SLOTS] =
-    [const { MaybeUninit::uninit() }; ASYNC_FFI_SLAB_SLOTS];
+static FFI_TO_WAKER_POOL: StaticObjectPool<
+    FfiWakerBox,
+    ASYNC_FFI_SLAB_SLOTS,
+    ASYNC_FFI_SLAB_WORDS,
+> = StaticObjectPool::new();
 
 #[repr(C)]
 pub struct FfiPoll<T> {
@@ -329,7 +204,7 @@ impl<T> From<Poll<T>> for FfiPoll<T> {
         }
     }
 }
-
+unsafe impl Sync for FfiWakerVTable {}
 #[repr(C)]
 pub struct FfiWakerVTable {
     pub clone: unsafe extern "win64" fn(*const ()) -> FfiWaker,
@@ -337,7 +212,8 @@ pub struct FfiWakerVTable {
     pub wake_by_ref: unsafe extern "win64" fn(*const ()),
     pub drop: unsafe extern "win64" fn(*const ()),
 }
-
+unsafe impl Send for FfiWaker {}
+unsafe impl Sync for FfiWaker {}
 #[repr(C)]
 pub struct FfiWaker {
     pub data: *const (),
@@ -434,16 +310,8 @@ where
         let size = mem::size_of::<FutureBox<F>>();
         let align = mem::align_of::<FutureBox<F>>();
 
-        if size <= ASYNC_FFI_FUTURE_SLOT_BYTES
-            && align <= SLAB_ALIGN
-            && let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
-                &FUTURE_FREE,
-                &FUTURE_WATERMARK.v,
-            )
-        {
-            let buf_base = core::ptr::addr_of_mut!(FUTURE_SLAB_BUF.buf) as *mut u8;
-            let slot = buf_base.add(i * ASYNC_FFI_FUTURE_SLOT_BYTES);
-            data_ptr = slot as *mut FutureBox<F>;
+        if let Some(slot) = FUTURE_POOL.try_alloc_raw(size, align) {
+            data_ptr = slot.as_ptr().cast::<FutureBox<F>>();
 
             let f = fut.take().unwrap();
             ptr::write(data_ptr, FutureBox { future: f });
@@ -487,6 +355,7 @@ where
         let w = ffi_waker_to_waker(&*waker);
         let mut cx = Context::from_waker(&w);
         let p = Future::poll(Pin::new_unchecked(&mut (*fb).future), &mut cx);
+
         FfiPoll::from(p)
     }
 }
@@ -500,20 +369,13 @@ where
 
         #[cfg(feature = "async-ffi-slab")]
         {
-            let base = core::ptr::addr_of!(FUTURE_SLAB_BUF.buf) as *const u8 as usize;
-            let end = base + ASYNC_FFI_SLAB_TOTAL_BYTES;
-            let p = fb as usize;
+            if SLAB_CHECKS && FUTURE_POOL.contains(fb as *const u8) {
+                debug_assert!(FUTURE_POOL.index_of(fb as *const u8).is_some_and(|_| {
+                    (fb as usize).is_multiple_of(mem::align_of::<FutureBox<F>>())
+                }));
+            }
 
-            if p >= base && p < end {
-                let off = p - base;
-                if SLAB_CHECKS {
-                    debug_assert!(off.is_multiple_of(ASYNC_FFI_FUTURE_SLOT_BYTES));
-                }
-                let idx = off / ASYNC_FFI_FUTURE_SLOT_BYTES;
-
-                ptr::drop_in_place(fb);
-                slot_free::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(&FUTURE_FREE, idx);
-
+            if FUTURE_POOL.dealloc(fb) {
                 return;
             }
         }
@@ -539,23 +401,12 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
     let mut ptr_box: *mut RustWakerBox = ptr::null_mut();
 
     #[cfg(feature = "async-ffi-slab")]
-    unsafe {
-        if let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
-            &WAKER_TO_FFI_FREE,
-            &WAKER_TO_FFI_WATERMARK.v,
-        ) {
-            let slab_base =
-                core::ptr::addr_of_mut!(WAKER_TO_FFI_SLAB) as *mut MaybeUninit<RustWakerBox>;
-            ptr_box = slab_base.add(i) as *mut RustWakerBox;
-
-            let ww = w.take().unwrap();
-            ptr::write(
-                ptr_box,
-                RustWakerBox {
-                    refs: AtomicUsize::new(1),
-                    waker: ww,
-                },
-            );
+    {
+        if let Some(p) = WAKER_TO_FFI_POOL.try_alloc(RustWakerBox {
+            refs: AtomicUsize::new(1),
+            waker: w.take().unwrap(),
+        }) {
+            ptr_box = p.as_ptr();
         }
     }
 
@@ -565,6 +416,7 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
             refs: AtomicUsize::new(1),
             waker: ww,
         });
+
         ptr_box = Box::into_raw(boxed);
     }
 
@@ -577,7 +429,9 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
 unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
     unsafe {
         let b = data as *const RustWakerBox;
+
         (*b).refs.fetch_add(1, Ordering::Relaxed);
+
         FfiWaker {
             data,
             vtable: &RUST_WAKER_BOX_VTABLE,
@@ -588,6 +442,7 @@ unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
 unsafe extern "win64" fn rust_waker_box_wake(data: *const ()) {
     unsafe {
         let b = data as *const RustWakerBox;
+
         (*b).waker.wake_by_ref();
         rust_waker_box_drop(data);
     }
@@ -596,6 +451,7 @@ unsafe extern "win64" fn rust_waker_box_wake(data: *const ()) {
 unsafe extern "win64" fn rust_waker_box_wake_by_ref(data: *const ()) {
     unsafe {
         let b = data as *const RustWakerBox;
+
         (*b).waker.wake_by_ref();
     }
 }
@@ -603,24 +459,14 @@ unsafe extern "win64" fn rust_waker_box_wake_by_ref(data: *const ()) {
 unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) {
     unsafe {
         let b = data as *mut RustWakerBox;
+
         if (*b).refs.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
 
         #[cfg(feature = "async-ffi-slab")]
         {
-            let base =
-                core::ptr::addr_of!(WAKER_TO_FFI_SLAB) as *const MaybeUninit<RustWakerBox> as usize;
-            let end = base + mem::size_of::<[MaybeUninit<RustWakerBox>; ASYNC_FFI_SLAB_SLOTS]>();
-            let p = b as usize;
-
-            if p >= base && p < end {
-                const SLOT_SIZE: usize = mem::size_of::<MaybeUninit<RustWakerBox>>();
-                let idx = (p - base) / SLOT_SIZE;
-
-                ptr::drop_in_place(b);
-                slot_free::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(&WAKER_TO_FFI_FREE, idx);
-
+            if WAKER_TO_FFI_POOL.dealloc(b) {
                 return;
             }
         }
@@ -645,22 +491,12 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
     let mut ptr_box: *mut FfiWakerBox = ptr::null_mut();
 
     #[cfg(feature = "async-ffi-slab")]
-    unsafe {
-        if let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
-            &FFI_TO_WAKER_FREE,
-            &FFI_TO_WAKER_WATERMARK.v,
-        ) {
-            let slab_base =
-                core::ptr::addr_of_mut!(FFI_TO_WAKER_SLAB) as *mut MaybeUninit<FfiWakerBox>;
-            ptr_box = slab_base.add(i) as *mut FfiWakerBox;
-
-            ptr::write(
-                ptr_box,
-                FfiWakerBox {
-                    refs: AtomicUsize::new(1),
-                    waker: w.clone(),
-                },
-            );
+    {
+        if let Some(p) = FFI_TO_WAKER_POOL.try_alloc(FfiWakerBox {
+            refs: AtomicUsize::new(1),
+            waker: w.clone(),
+        }) {
+            ptr_box = p.as_ptr();
         }
     }
 
@@ -669,6 +505,7 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
             refs: AtomicUsize::new(1),
             waker: w.clone(),
         });
+
         ptr_box = Box::into_raw(boxed);
     }
 
@@ -683,6 +520,7 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
 unsafe fn ffi_waker_box_raw_clone(data: *const ()) -> RawWaker {
     unsafe {
         let b = data as *const FfiWakerBox;
+
         (*b).refs.fetch_add(1, Ordering::Relaxed);
         RawWaker::new(data, &FFI_WAKER_BOX_RAW_VTABLE)
     }
@@ -698,6 +536,7 @@ unsafe fn ffi_waker_box_raw_wake(data: *const ()) {
 unsafe fn ffi_waker_box_raw_wake_by_ref(data: *const ()) {
     unsafe {
         let b = data as *const FfiWakerBox;
+
         (*b).waker.wake_by_ref();
     }
 }
@@ -705,23 +544,14 @@ unsafe fn ffi_waker_box_raw_wake_by_ref(data: *const ()) {
 unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
     unsafe {
         let b = data as *mut FfiWakerBox;
+
         if (*b).refs.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
 
         #[cfg(feature = "async-ffi-slab")]
         {
-            let base =
-                core::ptr::addr_of!(FFI_TO_WAKER_SLAB) as *const MaybeUninit<FfiWakerBox> as usize;
-            let end = base + mem::size_of::<[MaybeUninit<FfiWakerBox>; ASYNC_FFI_SLAB_SLOTS]>();
-            let p = b as usize;
-
-            if p >= base && p < end {
-                const SLOT_SIZE: usize = mem::size_of::<MaybeUninit<FfiWakerBox>>();
-                let idx = (p - base) / SLOT_SIZE;
-
-                ptr::drop_in_place(b);
-                slot_free::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(&FFI_TO_WAKER_FREE, idx);
+            if FFI_TO_WAKER_POOL.dealloc(b) {
                 return;
             }
         }
@@ -744,19 +574,16 @@ impl<'a, T> BorrowingFfiFuture<'a, T> {
         unsafe { (self.poll_fn)(self.data, waker) }
     }
 
-    /// Wrap an owned `FfiFuture` while tying it to a borrow lifetime.
-    /// This preserves the original drop function so resources are freed
-    /// when the borrowing future is dropped or completes.
     pub fn from_owned_ffi<'b>(mut fut: FfiFuture<T>) -> BorrowingFfiFuture<'b, T> {
         let data_ptr = fut.data.take().unwrap_or(ptr::null_mut());
-        let out = BorrowingFfiFuture {
+
+        BorrowingFfiFuture {
             abi_version: fut.abi_version,
             data: data_ptr,
             poll_fn: fut.poll_fn,
             drop_fn: Some(fut.drop_fn),
             _pd: PhantomData,
-        };
-        out
+        }
     }
 }
 
@@ -785,6 +612,7 @@ where
     F: Future,
 {
     let p = unsafe { Pin::get_unchecked_mut(fut) as *mut F };
+
     BorrowingFfiFuture {
         abi_version: ABI_VERSION,
         data: p as *mut (),
@@ -810,6 +638,7 @@ where
         let w = ffi_waker_to_waker(&*waker);
         let mut cx = Context::from_waker(&w);
         let p = Future::poll(Pin::new_unchecked(&mut *f), &mut cx);
+
         FfiPoll::from(p)
     }
 }
@@ -821,6 +650,7 @@ impl<'a, T> Future for BorrowingFfiFuture<'a, T> {
         let this = unsafe { self.get_unchecked_mut() };
         let ffi_waker = cx.waker().clone().into_ffi();
         let p = unsafe { (this.poll_fn)(this.data, &ffi_waker as *const FfiWaker) };
+
         match unsafe { p.into_poll() } {
             Poll::Pending => Poll::Pending,
             Poll::Ready(v) => {
@@ -830,6 +660,7 @@ impl<'a, T> Future for BorrowingFfiFuture<'a, T> {
                         this.data = ptr::null_mut();
                     }
                 }
+
                 Poll::Ready(v)
             }
         }
@@ -858,6 +689,7 @@ impl<T> Future for FfiFuture<T> {
 
         let ffi_waker = cx.waker().clone().into_ffi();
         let p = unsafe { (this.poll_fn)(ptr, &ffi_waker as *const FfiWaker) };
+
         match unsafe { p.into_poll() } {
             Poll::Pending => Poll::Pending,
             Poll::Ready(v) => {

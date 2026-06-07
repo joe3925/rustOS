@@ -13,7 +13,6 @@ extern crate alloc;
 extern crate self as kernel_types;
 
 pub use prost::Message as ProstMessage;
-
 pub mod async_ffi;
 pub mod async_types;
 pub mod bench_archive;
@@ -21,6 +20,7 @@ pub mod benchmark;
 pub mod bounded_mpmc;
 pub mod device;
 pub mod dma;
+pub mod fixed_slab;
 pub mod fs;
 pub mod io;
 pub mod irq;
