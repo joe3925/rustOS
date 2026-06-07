@@ -1074,7 +1074,7 @@ fn flush_current_tlb_shootdown_request() {
 
 extern "win64" fn tlb_flush_ipi() {
     let _guard = InterruptGuard::new();
-    let _nested_interrupts = NestedInterruptEnableGuard::new();
+    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     flush_current_tlb_shootdown_request();
     let cpu = current_cpu_id();
     if cpu < MAX_CPUS {

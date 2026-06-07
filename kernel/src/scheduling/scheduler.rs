@@ -7,8 +7,8 @@ use crate::drivers::interrupt_index::{
 use crate::drivers::timer_driver::NUM_CORES;
 use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
 use crate::idt::SCHED_IPI_VECTOR;
+use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::domain::{DomainMaster, EnqueueReason, SwitchOutOutcome, TaskSchedBinding};
 use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding};
@@ -749,7 +749,7 @@ pub extern "win64" fn ipi_handler_c(state: *mut State) {
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
-    let _nested_interrupts = NestedInterruptEnableGuard::new();
+    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = current_cpu_id();
 
     SCHEDULER.on_ipi(state, cpu_id);
@@ -767,7 +767,7 @@ pub extern "win64" fn yield_handler_c(state: *mut State) {
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
-    let _nested_interrupts = NestedInterruptEnableGuard::new();
+    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = current_cpu_id();
 
     SCHEDULER.on_timer_tick(state, cpu_id);

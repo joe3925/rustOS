@@ -45,7 +45,7 @@ pub extern "win64" fn timer_interrupt_handler_c(state: *mut State) {
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
-    let _nested_interrupts = NestedInterruptEnableGuard::new();
+    // let _nested_interrupts = NestedInterruptEnableGuard::new();
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();
     bench_submit_interrupt_sample_current_core(unsafe { &*state });
