@@ -614,7 +614,7 @@ impl<T> IoHandler<T> {
 pub trait DeviceRead {
     const DEPTH: u32 = 0;
 
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Read<'data>>,
         len: usize,
@@ -624,7 +624,7 @@ pub trait DeviceRead {
 pub trait DeviceWrite {
     const DEPTH: u32 = 0;
 
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Write<'data>>,
         len: usize,
@@ -634,7 +634,7 @@ pub trait DeviceWrite {
 pub trait DeviceFlush {
     const DEPTH: u32 = 0;
 
-    extern "win64" fn handler<'req, 'b>(
+    extern "C" fn handler<'req, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Flush>,
     ) -> FfiFuture<DriverStep>;
@@ -643,7 +643,7 @@ pub trait DeviceFlush {
 pub trait DeviceFlushDirty {
     const DEPTH: u32 = 0;
 
-    extern "win64" fn handler<'req, 'b>(
+    extern "C" fn handler<'req, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FlushDirty>,
     ) -> FfiFuture<DriverStep>;
@@ -652,7 +652,7 @@ pub trait DeviceFlushDirty {
 pub trait DeviceFlushOwner {
     const DEPTH: u32 = 0;
 
-    extern "win64" fn handler<'req, 'b>(
+    extern "C" fn handler<'req, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FlushOwner>,
     ) -> FfiFuture<DriverStep>;
@@ -661,7 +661,7 @@ pub trait DeviceFlushOwner {
 pub trait DeviceControlHandler {
     const DEPTH: u32 = 0;
 
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
     ) -> FfiFuture<DriverStep>;
@@ -682,67 +682,67 @@ pub trait FileSystem {
     const APPEND_DEPTH: u32 = 0;
     const ZERO_RANGE_DEPTH: u32 = 0;
 
-    extern "win64" fn open<'req, 'data, 'b>(
+    extern "C" fn open<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsOpen>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn close<'req, 'data, 'b>(
+    extern "C" fn close<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsClose>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn read<'req, 'data, 'b>(
+    extern "C" fn read<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsRead>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn write<'req, 'data, 'b>(
+    extern "C" fn write<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsWrite>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn flush<'req, 'data, 'b>(
+    extern "C" fn flush<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsFlush>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn seek<'req, 'data, 'b>(
+    extern "C" fn seek<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsSeek>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn create<'req, 'data, 'b>(
+    extern "C" fn create<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsCreate>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn rename<'req, 'data, 'b>(
+    extern "C" fn rename<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsRename>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn read_dir<'req, 'data, 'b>(
+    extern "C" fn read_dir<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsReadDir>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn get_info<'req, 'data, 'b>(
+    extern "C" fn get_info<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsGetInfo>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn set_len<'req, 'data, 'b>(
+    extern "C" fn set_len<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsSetLen>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn append<'req, 'data, 'b>(
+    extern "C" fn append<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsAppend>>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "win64" fn zero_range<'req, 'data, 'b>(
+    extern "C" fn zero_range<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, FsRequest<'data, FsZeroRange>>,
     ) -> FfiFuture<DriverStep>;

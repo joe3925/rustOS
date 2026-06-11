@@ -9,7 +9,7 @@ use core::task::{Context, Poll, Waker};
 use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use x86_64::instructions::interrupts;
 
-pub type IrqContextQuery = extern "win64" fn() -> bool;
+pub type IrqContextQuery = extern "C" fn() -> bool;
 
 static IRQ_CONTEXT_QUERY: AtomicUsize = AtomicUsize::new(0);
 
@@ -51,7 +51,7 @@ impl IrqHandle {
 
 pub type IrqBorrowedHandle = *const IrqHandleInner;
 
-pub type IrqIsrFn = extern "win64" fn(
+pub type IrqIsrFn = extern "C" fn(
     vector: u8,
     cpu: u32,
     frame: &mut x86_64::structures::idt::InterruptStackFrame,
@@ -630,12 +630,12 @@ pub struct IrqHandleInner {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DropHook {
-    pub func: extern "win64" fn(usize),
+    pub func: extern "C" fn(usize),
     pub arg: usize,
 }
 
 impl DropHook {
-    pub const fn new(func: extern "win64" fn(usize), arg: usize) -> Self {
+    pub const fn new(func: extern "C" fn(usize), arg: usize) -> Self {
         Self { func, arg }
     }
 

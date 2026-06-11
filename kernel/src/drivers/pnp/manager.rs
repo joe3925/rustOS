@@ -1,7 +1,7 @@
 use super::driver_index::{self as idx, HwIndex};
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::object_manager::{ObjRef, Object, ObjectPayload, OBJECT_MANAGER};
+use crate::object_manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
 use core::ptr::addr_of;
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;
@@ -13,7 +13,8 @@ use crate::scheduling::runtime::runtime::spawn_detached;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use kernel_types::ClassAddCallback;
 use kernel_types::device::{
     DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
     DriverRuntime, DriverState, StackLayer,
@@ -25,7 +26,6 @@ use kernel_types::pnp::{
 };
 use kernel_types::request::{DeviceControl, Pnp, Request, RequestData, RequestHandle, RequestKind};
 use kernel_types::status::{Data, DriverStatus, RegError};
-use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
 
 #[repr(C)]
@@ -570,7 +570,7 @@ impl PnpManager {
         }
         let m = rt.module.read();
         if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "DriverEntry") {
-            let entry: unsafe extern "win64" fn(&Arc<DriverObject>) -> DriverStatus =
+            let entry: unsafe extern "C" fn(&Arc<DriverObject>) -> DriverStatus =
                 unsafe { core::mem::transmute((m.image_base.as_u64() + *rva as u64) as *const ()) };
             let st = unsafe { entry(drv) };
             match st {
@@ -791,7 +791,7 @@ impl PnpManager {
         }
     }
 
-    pub extern "win64" fn start_io(req: &mut Request<Pnp<'_>>, context: usize) -> DriverStatus {
+    pub extern "C" fn start_io(req: &mut Request<Pnp<'_>>, context: usize) -> DriverStatus {
         if context == 0 {
             return DriverStatus::InvalidParameter;
         }
@@ -833,7 +833,7 @@ impl PnpManager {
         DriverStatus::Success
     }
 
-    pub extern "win64" fn process_enumerated_children(
+    pub extern "C" fn process_enumerated_children(
         req: &mut Request<Pnp<'_>>,
         context: usize,
     ) -> DriverStatus {

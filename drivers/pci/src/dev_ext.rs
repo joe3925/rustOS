@@ -571,7 +571,7 @@ struct WaitCtx {
     blob: UnsafeCell<Vec<u8>>,
 }
 
-extern "win64" fn on_complete(req: &mut Request<Pnp<'_>>, ctx: usize) -> DriverStatus {
+extern "C" fn on_complete(req: &mut Request<Pnp<'_>>, ctx: usize) -> DriverStatus {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
     if let Some(v) = req.body.request.data_out_ref().view::<Vec<u8>>() {

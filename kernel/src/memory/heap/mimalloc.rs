@@ -1,7 +1,7 @@
 use crate::cpu;
 use crate::memory::heap::{
-    mimalloc_arena_size, mimalloc_heap_end, MIMALLOC_ARENA_START, MIMALLOC_HEAP_START,
-    MIMALLOC_OS_HEAP_SIZE,
+    MIMALLOC_ARENA_START, MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE, mimalloc_arena_size,
+    mimalloc_heap_end,
 };
 use crate::memory::paging::paging::unmap_range_unchecked;
 use crate::structs::linked_list::{LinkedList, ListNode};
@@ -12,10 +12,10 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
+use x86_64::VirtAddr;
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::structures::paging::PageTableFlags;
-use x86_64::VirtAddr;
 
 const PAGE_SIZE: usize = 4096;
 const MIMALLOC_STATS_ENABLED: bool = false;
@@ -659,7 +659,15 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
         });
 
         if let Err(e) = res {
-            crate::println!("MIMALLOC COMMIT FAILED: address={:p}, size={}, commit_start={:#x}, commit_size={}, flags={:?}, reason=Page mapping failed ({:?})", addr, size, run_addr, run_size, flags, e);
+            crate::println!(
+                "MIMALLOC COMMIT FAILED: address={:p}, size={}, commit_start={:#x}, commit_size={}, flags={:?}, reason=Page mapping failed ({:?})",
+                addr,
+                size,
+                run_addr,
+                run_size,
+                flags,
+                e
+            );
             mimalloc_record_commit_cycles(start_cycles);
             return false;
         }

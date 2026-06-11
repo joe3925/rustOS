@@ -46,7 +46,7 @@ mod structs;
 mod sync_platform;
 mod syscalls;
 mod util;
-use crate::util::{panic_common, KERNEL_INITIALIZED};
+use crate::util::{KERNEL_INITIALIZED, panic_common};
 
 use alloc::{format, vec};
 use core::panic::PanicInfo;
@@ -54,9 +54,9 @@ use core::ptr::{addr_of_mut, copy_nonoverlapping};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_abi::{
     BootInfo, FrameBuffer, KernelSection, KernelSections, KernelSymbol, KernelSymbolString,
-    KernelSymbols, MemoryRegion, MemoryRegionKind, MemoryRegions, Optional,
-    MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
-    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES,
+    KernelSymbols, MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
+    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, MemoryRegion, MemoryRegionKind,
+    MemoryRegions, Optional,
 };
 use kernel_abi::{RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION};
 use lazy_static::lazy_static;
@@ -83,7 +83,7 @@ fn panic(info: &PanicInfo) -> ! {
     panic_common(MOD_NAME, info)
 }
 #[no_mangle]
-pub extern "win64" fn kernel_pe_entry(boot_info: *const BootInfo) -> ! {
+pub extern "C" fn kernel_pe_entry(boot_info: *const BootInfo) -> ! {
     if boot_info.is_null() {
         panic!("kernel_pe_entry received a null boot info pointer");
     }
@@ -302,7 +302,7 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     }
 }
 
-pub extern "win64" fn function(x: i64) -> i64 {
+pub extern "C" fn function(x: i64) -> i64 {
     (x - 10) / 10
 }
 #[cfg(test)]

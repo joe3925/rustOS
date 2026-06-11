@@ -2,12 +2,12 @@ use crate::{
     global_async::{
         DestroyExecutorDomainResult, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
         ExecutorDomainState, ExecutorDomainTable, ExecutorSubmitErrorKind,
-        SimpleRoundRobinScheduler, WorkItem, KERNEL_NORMAL_EXECUTOR_DOMAIN,
+        KERNEL_NORMAL_EXECUTOR_DOMAIN, SimpleRoundRobinScheduler, WorkItem,
     },
     round_robin::{ScheduledDomain, SchedulerPolicy, WeightedDeficitRoundRobinScheduler},
 };
 
-extern "win64" fn noop(_ctx: usize) {}
+extern "C" fn noop(_ctx: usize) {}
 
 fn item() -> WorkItem {
     WorkItem {

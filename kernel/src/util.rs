@@ -4,17 +4,17 @@ use crate::benchmarking::BenchWindow;
 use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
-use crate::drivers::interrupt_index::{
-    apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns, calibrate_tsc, current_cpu_id,
-    current_is_in_interrupt_atomic, get_current_logical_id, init_percpu_gs, wait_using_pit_50ms,
-    ApicImpl, IpiDest, IpiKind, LocalApic,
-};
 use crate::drivers::interrupt_index::{APIC, PICS};
+use crate::drivers::interrupt_index::{
+    ApicImpl, IpiDest, IpiKind, LocalApic, apic_calibrate_ticks_per_ns_via_wait,
+    apic_program_period_ns, calibrate_tsc, current_cpu_id, current_is_in_interrupt_atomic,
+    get_current_logical_id, init_percpu_gs, wait_using_pit_50ms,
+};
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::NUM_CORES;
-use crate::executable::program::{Program, PROGRAM_MANAGER};
+use crate::executable::program::{PROGRAM_MANAGER, Program};
 use crate::exports::EXPORTS;
-use crate::file_system::file_provider::{install_file_provider, ProviderKind};
+use crate::file_system::file_provider::{ProviderKind, install_file_provider};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
@@ -35,7 +35,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
-use crate::{cpu, println, BOOT_INFO, BOOT_INFO_INITIALIZED};
+use crate::{BOOT_INFO, BOOT_INFO_INITIALIZED, cpu, println};
 use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -55,9 +55,9 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
+use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::idt::InterruptDescriptorTable;
-use x86_64::VirtAddr;
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
@@ -194,7 +194,7 @@ pub unsafe fn init() {
         asm!("hlt");
     }
 }
-pub extern "win64" fn kernel_main(ctx: usize) {
+pub extern "C" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
     resize_bitmap_for_ram(boot_usable_bytes()).expect(&format!(
         "Failed to resize phys frame bitmap to capacity {}",
@@ -236,7 +236,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 }
 #[no_mangle]
 #[inline(never)]
-pub extern "win64" fn trigger_guard_page_overflow() -> ! {
+pub extern "C" fn trigger_guard_page_overflow() -> ! {
     let task = SCHEDULER
         .get_current_task(current_cpu_id())
         .expect("no current task");
@@ -260,7 +260,7 @@ fn halt_loop() -> ! {
     }
 }
 #[no_mangle]
-pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
+pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
         halt_loop()
     }
@@ -308,7 +308,7 @@ pub extern "C" fn trigger_stack_overflow() {
 
 #[no_mangle]
 #[inline(never)]
-pub extern "win64" fn trigger_triple_fault() -> ! {
+pub extern "C" fn trigger_triple_fault() -> ! {
     static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
     x86_64::instructions::interrupts::disable();
@@ -345,7 +345,7 @@ pub fn test_full_heap() {
     );
 }
 
-pub extern "win64" fn random_number() -> u64 {
+pub extern "C" fn random_number() -> u64 {
     let mut rng = Random::new(cpu::get_cycles());
     rng.next_u64()
 }
@@ -477,7 +477,7 @@ unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zer
     TLS_TEST_ZERO_BYTES = zero_bytes;
 }
 
-extern "win64" fn kernel_tls_self_test_worker(_ctx: usize) {
+extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
     let expected = unsafe { tls_test_snapshot() };
     if expected != (TLS_TEMPLATE_U64, TLS_TEMPLATE_BYTES, 0, [0; 16]) {
         TLS_SELF_TEST_RESULT.store(TLS_SELF_TEST_FAIL, Ordering::Release);

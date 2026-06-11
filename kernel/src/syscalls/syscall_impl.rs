@@ -1,6 +1,6 @@
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::executable::program::{
-    Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
+    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
 };
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
 
-use crate::object_manager::{Object, ObjectPayload, TaskQueueRef, OBJECT_MANAGER};
+use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload, TaskQueueRef};
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let path = alloc::format!("\\Process\\{}", pid);
@@ -261,7 +261,7 @@ fn resolve_completion_queue(
                 ErrClass::Common,
                 CommonErr::InvalidHandle as u16,
                 handle as u32,
-            ))
+            ));
         }
     };
 
@@ -538,7 +538,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
                 ErrClass::Common,
                 CommonErr::InvalidHandle as u16,
                 task_handle as u32,
-            )
+            );
         }
     };
     let th = match &obj.payload {
@@ -548,7 +548,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
                 ErrClass::Common,
                 CommonErr::InvalidHandle as u16,
                 task_handle as u32,
-            )
+            );
         }
     };
     let _ = th.inner.read().parent_pid != caller_pid;
@@ -574,7 +574,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
                 ErrClass::Program,
                 ProgErr::NotFound as u16,
                 caller_pid as u32,
-            )
+            );
         }
     };
     let managed = { caller.read().managed_threads.lock().len() };
@@ -592,7 +592,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     };
     let task = Task::new_user_mode(
         // TODO: check this
-        unsafe { *(entry as *const extern "win64" fn(usize)) },
+        unsafe { *(entry as *const extern "C" fn(usize)) },
         0,
         stack_size,
         format!("{} Worker {}", caller.read().title, managed),
@@ -842,7 +842,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
                 ErrClass::Program,
                 ProgErr::NotFound as u16,
                 sender_pid as u32,
-            )
+            );
         }
     };
     let sender_obj = ensure_process_object(sender_pid, &sender_prog);
@@ -885,7 +885,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
                 ErrClass::Program,
                 ProgErr::NotFound as u16,
                 caller_pid as u32,
-            )
+            );
         }
     };
 
@@ -936,7 +936,11 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
                 match &o.payload {
                     ObjectPayload::Queue(q) => Some(q.clone()),
                     _ => {
-                        return make_err(ErrClass::Route, RouteErr::UnsupportedTargetType as u16, 0)
+                        return make_err(
+                            ErrClass::Route,
+                            RouteErr::UnsupportedTargetType as u16,
+                            0,
+                        );
                     }
                 }
             } else {
@@ -951,7 +955,11 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
                 match &o.payload {
                     ObjectPayload::Thread(t) => t.clone(),
                     _ => {
-                        return make_err(ErrClass::Route, RouteErr::UnsupportedTargetType as u16, 0)
+                        return make_err(
+                            ErrClass::Route,
+                            RouteErr::UnsupportedTargetType as u16,
+                            0,
+                        );
                     }
                 }
             };
@@ -992,7 +1000,7 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
                 ErrClass::Program,
                 ProgErr::NotFound as u16,
                 caller_pid as u32,
-            )
+            );
         }
     };
 
@@ -1025,7 +1033,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
                 ErrClass::Program,
                 ProgErr::NotFound as u16,
                 caller_pid as u32,
-            )
+            );
         }
     };
 
@@ -1105,7 +1113,7 @@ pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
                 ErrClass::Program,
                 ProgErr::NotFound as u16,
                 caller_pid as u32,
-            )
+            );
         }
     };
 
@@ -1124,7 +1132,7 @@ pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
                     ErrClass::Common,
                     CommonErr::InvalidHandle as u16,
                     target_prog as u32,
-                )
+                );
             }
         }
     };

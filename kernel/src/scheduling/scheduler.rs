@@ -1,8 +1,8 @@
 use crate::cpu;
-use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::drivers::interrupt_index::LocalApic;
+use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::drivers::interrupt_index::{
-    current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, APIC,
+    APIC, IpiDest, IpiKind, current_cpu_id, get_current_logical_id, send_eoi,
 };
 use crate::drivers::timer_driver::NUM_CORES;
 use crate::drivers::timer_driver::TIMER;
@@ -18,7 +18,7 @@ use crate::scheduling::task::CurrentTask;
 use crate::scheduling::task::TaskError;
 pub use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
-use crate::scheduling::task::{idle_task, Task, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
+use crate::scheduling::task::{IDLE_MAGIC_LOWER, IDLE_UUID_UPPER, Task, idle_task};
 use crate::scheduling::tls;
 use crate::util::{KERNEL_INITIALIZED, MAX_CPUS};
 use alloc::sync::Arc;
@@ -737,7 +737,7 @@ impl Scheduler {
 }
 
 #[no_mangle]
-pub extern "win64" fn ipi_handler_c(state: *mut State) {
+pub extern "C" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -756,7 +756,7 @@ pub extern "win64" fn ipi_handler_c(state: *mut State) {
 }
 
 #[no_mangle]
-pub extern "win64" fn yield_handler_c(state: *mut State) {
+pub extern "C" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -780,7 +780,7 @@ pub extern "C" fn ipi_eoi_only() {
 
 #[unsafe(naked)]
 #[no_mangle]
-pub extern "win64" fn ipi_entry() {
+pub extern "C" fn ipi_entry() {
     naked_asm!(
         "/* {upper} {lower} {eoi_only} */",
         "cli",
@@ -838,7 +838,7 @@ pub extern "win64" fn ipi_entry() {
 }
 
 #[unsafe(naked)]
-pub extern "win64" fn yield_interrupt_entry() {
+pub extern "C" fn yield_interrupt_entry() {
     naked_asm!(
         "cli",
         "push r15","push r14","push r13","push r12",
@@ -865,7 +865,7 @@ pub extern "win64" fn yield_interrupt_entry() {
 }
 
 #[unsafe(naked)]
-pub extern "win64" fn task_return_trampoline() -> ! {
+pub extern "C" fn task_return_trampoline() -> ! {
     naked_asm!(
         "cld",
         "sub rsp, 8",
@@ -875,7 +875,7 @@ pub extern "win64" fn task_return_trampoline() -> ! {
     );
 }
 
-pub extern "win64" fn kernel_task_end() -> ! {
+pub extern "C" fn kernel_task_end() -> ! {
     crate::memory::heap::mimalloc_thread_done();
 
     interrupts::without_interrupts(|| {

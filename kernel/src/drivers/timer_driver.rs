@@ -34,7 +34,7 @@ pub struct TimerDebug {
     pub did_sched: bool,
 }
 #[no_mangle]
-pub extern "win64" fn timer_interrupt_handler_c(state: *mut State) {
+pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -67,7 +67,7 @@ pub fn set_num_cores(n: usize) {
 }
 
 #[unsafe(naked)]
-pub extern "win64" fn timer_interrupt_entry() {
+pub extern "C" fn timer_interrupt_entry() {
     naked_asm!(
         "cli",
         "push r15","push r14","push r13","push r12",

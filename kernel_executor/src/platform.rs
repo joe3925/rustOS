@@ -1,6 +1,6 @@
 use spin::Once;
 
-pub type JobFn = extern "win64" fn(usize);
+pub type JobFn = extern "C" fn(usize);
 
 #[derive(Clone, Copy)]
 pub struct Job {

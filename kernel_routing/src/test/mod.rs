@@ -57,7 +57,7 @@ fn device_with_pnp(vtable: PnpVtable) -> Arc<DeviceObject> {
     DeviceObject::new(DeviceInit::with_pnp(Some(vtable)))
 }
 
-extern "win64" fn read_handler(
+extern "C" fn read_handler(
     _dev: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_, Read<'_>>,
     len: usize,
@@ -73,7 +73,7 @@ extern "win64" fn read_handler(
     .into_ffi()
 }
 
-extern "win64" fn write_handler(
+extern "C" fn write_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Write<'_>>,
     _len: usize,
@@ -81,7 +81,7 @@ extern "win64" fn write_handler(
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }
 
-extern "win64" fn continue_handler(
+extern "C" fn continue_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Read<'_>>,
     _len: usize,
@@ -92,7 +92,7 @@ extern "win64" fn continue_handler(
 struct TestRead;
 
 impl DeviceRead for TestRead {
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Read<'data>>,
         len: usize,
@@ -104,7 +104,7 @@ impl DeviceRead for TestRead {
 struct ContinueRead;
 
 impl DeviceRead for ContinueRead {
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Read<'data>>,
         len: usize,
@@ -116,7 +116,7 @@ impl DeviceRead for ContinueRead {
 struct TestWrite;
 
 impl DeviceWrite for TestWrite {
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Write<'data>>,
         len: usize,
@@ -125,7 +125,7 @@ impl DeviceWrite for TestWrite {
     }
 }
 
-extern "win64" fn not_implemented_pnp(
+extern "C" fn not_implemented_pnp(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Pnp<'_>>,
 ) -> FfiFuture<DriverStep> {
@@ -134,12 +134,12 @@ extern "win64" fn not_implemented_pnp(
 
 static COMPLETION_SUM: AtomicUsize = AtomicUsize::new(0);
 
-extern "win64" fn completion_success(_request: &mut Request<Dummy>, ctx: usize) -> DriverStatus {
+extern "C" fn completion_success(_request: &mut Request<Dummy>, ctx: usize) -> DriverStatus {
     COMPLETION_SUM.fetch_add(ctx, Ordering::AcqRel);
     DriverStatus::Success
 }
 
-extern "win64" fn completion_timeout(_request: &mut Request<Dummy>, ctx: usize) -> DriverStatus {
+extern "C" fn completion_timeout(_request: &mut Request<Dummy>, ctx: usize) -> DriverStatus {
     COMPLETION_SUM.fetch_add(ctx, Ordering::AcqRel);
     DriverStatus::Timeout
 }

@@ -1,6 +1,6 @@
 use alloc::boxed::Box;
 use core::marker::PhantomData;
-use core::mem::{forget, transmute_copy, ManuallyDrop};
+use core::mem::{ManuallyDrop, forget, transmute_copy};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use crate::platform::JobFn;
@@ -90,25 +90,25 @@ unsafe fn drop_waker<T: TaskPoll + 'static>(ptr: *const ()) {
     drop(Arc::from_raw(untag_ptr::<T>(ptr)));
 }
 
-unsafe extern "win64" fn clone_ctx<T: TaskPoll + 'static>(ptr: *const ()) {
+unsafe extern "C" fn clone_ctx<T: TaskPoll + 'static>(ptr: *const ()) {
     Arc::increment_strong_count(untag_ptr::<T>(ptr));
 }
 
-unsafe extern "win64" fn drop_ctx<T: TaskPoll + 'static>(ctx: usize) {
+unsafe extern "C" fn drop_ctx<T: TaskPoll + 'static>(ctx: usize) {
     drop(Arc::from_raw(untag_ptr::<T>(ctx as *const ())));
 }
 
-extern "win64" fn wake_waker_trampoline(ctx: usize) {
+extern "C" fn wake_waker_trampoline(ctx: usize) {
     // ctx holds Box<Waker>
     let w = unsafe { &*(ctx as *const Waker) };
     w.wake_by_ref();
 }
 
-unsafe extern "win64" fn drop_waker_ctx(ctx: usize) {
+unsafe extern "C" fn drop_waker_ctx(ctx: usize) {
     drop(Box::from_raw(ctx as *mut Waker));
 }
 
-extern "win64" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
+extern "C" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
     // Borrow the continuation's ref without consuming it. run_continuation
     // will call drop_fn to release the ref after we return.
     let arc = ManuallyDrop::new(unsafe { Arc::from_raw(untag_ptr::<T>(ctx as *const ())) });
@@ -135,8 +135,8 @@ extern "win64" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
 pub struct TaskWakerVtable {
     pub raw: RawWakerVTable,
     pub inline_poll: JobFn,
-    pub clone_ctx: unsafe extern "win64" fn(*const ()),
-    pub drop_ctx: unsafe extern "win64" fn(usize),
+    pub clone_ctx: unsafe extern "C" fn(*const ()),
+    pub drop_ctx: unsafe extern "C" fn(usize),
 }
 
 static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -184,7 +184,7 @@ unsafe fn slab_drop_waker(_ptr: *const ()) {
     // No-op — slot lifetime is managed by structural anchor refs, not waker clones.
 }
 
-unsafe extern "win64" fn drop_slab_ctx(ctx: usize) {
+unsafe extern "C" fn drop_slab_ctx(ctx: usize) {
     if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(ctx) {
         get_task_slab().decrement_ref(shard_idx, local_idx, generation);
     }
@@ -235,7 +235,7 @@ unsafe fn joinable_slab_drop_waker(_ptr: *const ()) {
     // No-op — slot lifetime is managed by structural anchor refs, not waker clones
 }
 
-unsafe extern "win64" fn drop_joinable_slab_ctx(ctx: usize) {
+unsafe extern "C" fn drop_joinable_slab_ctx(ctx: usize) {
     if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(ctx) {
         get_task_slab().decrement_joinable_ref(shard_idx, local_idx, generation);
     }

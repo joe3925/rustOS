@@ -5,24 +5,23 @@ use crate::drivers::timer_driver::NUM_CORES;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard, TLB_FLUSH_VECTOR};
 use crate::util::MAX_CPUS;
 use crate::{
+    KERNEL_INITIALIZED,
     cpu::get_cpu_info,
-    drivers::interrupt_index::{current_cpu_id, send_eoi, APIC},
+    drivers::interrupt_index::{APIC, current_cpu_id, send_eoi},
     memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper},
     util::boot_info,
-    KERNEL_INITIALIZED,
 };
 use core::arch::naked_asm;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
 use x86_64::{
-    instructions,
+    PhysAddr, VirtAddr, instructions,
     structures::paging::{
-        mapper::{MapToError, MapperFlush},
         FrameAllocator, Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size1GiB, Size2MiB,
         Size4KiB,
+        mapper::{MapToError, MapperFlush},
     },
-    PhysAddr, VirtAddr,
 };
 
 const TLB_SHOOTDOWN_MODE_FULL: usize = 0;
@@ -367,7 +366,7 @@ pub const fn align_up_2mib(x: u64) -> u64 {
 /// SAFETY: Does not check the kernel range allocator before mapping the requested range.
 /// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
 /// The best way to do this is to reserve the range you want to map manually.
-pub unsafe extern "win64" fn identity_map_page(
+pub unsafe extern "C" fn identity_map_page(
     phys_addr: PhysAddr,
     range: usize,
     flags: PageTableFlags,
@@ -1072,7 +1071,7 @@ fn flush_current_tlb_shootdown_request() {
     flush_tlb_ranges_or_all(ranges);
 }
 
-extern "win64" fn tlb_flush_ipi() {
+extern "C" fn tlb_flush_ipi() {
     let _guard = InterruptGuard::new();
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
     flush_current_tlb_shootdown_request();
@@ -1084,7 +1083,7 @@ extern "win64" fn tlb_flush_ipi() {
     send_eoi(TLB_FLUSH_VECTOR);
 }
 #[unsafe(naked)]
-pub extern "win64" fn tlb_flush_entry() {
+pub extern "C" fn tlb_flush_entry() {
     naked_asm!(
         "cli",
         "push r15","push r14","push r13","push r12",

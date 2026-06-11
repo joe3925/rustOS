@@ -208,7 +208,7 @@ impl DeviceControlHandler for Fat32RootIo {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, fs_device_add);
     init_logger();
     let mut init = DeviceInit::new();
@@ -234,7 +234,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     DriverStatus::Success
 }
 
-pub extern "win64" fn fs_device_add(
+pub extern "C" fn fs_device_add(
     _driver: &Arc<DriverObject>,
     _dev_init: &mut DeviceInit,
 ) -> DriverStep {

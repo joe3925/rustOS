@@ -19,13 +19,13 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     println!("BaseBusDriver: DriverEntry called.\n");
     driver_set_evt_device_add(driver, bus_driver_device_add);
     DriverStatus::Success
 }
 
-pub extern "win64" fn bus_driver_device_add(
+pub extern "C" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStep {

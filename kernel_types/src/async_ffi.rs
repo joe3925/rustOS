@@ -207,10 +207,10 @@ impl<T> From<Poll<T>> for FfiPoll<T> {
 unsafe impl Sync for FfiWakerVTable {}
 #[repr(C)]
 pub struct FfiWakerVTable {
-    pub clone: unsafe extern "win64" fn(*const ()) -> FfiWaker,
-    pub wake: unsafe extern "win64" fn(*const ()),
-    pub wake_by_ref: unsafe extern "win64" fn(*const ()),
-    pub drop: unsafe extern "win64" fn(*const ()),
+    pub clone: unsafe extern "C" fn(*const ()) -> FfiWaker,
+    pub wake: unsafe extern "C" fn(*const ()),
+    pub wake_by_ref: unsafe extern "C" fn(*const ()),
+    pub drop: unsafe extern "C" fn(*const ()),
 }
 unsafe impl Send for FfiWaker {}
 unsafe impl Sync for FfiWaker {}
@@ -247,8 +247,8 @@ impl FfiWaker {
 pub struct FfiFuture<T> {
     pub abi_version: u32,
     pub data: Option<*mut ()>,
-    pub poll_fn: unsafe extern "win64" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
-    pub drop_fn: unsafe extern "win64" fn(*mut ()),
+    pub poll_fn: unsafe extern "C" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
+    pub drop_fn: unsafe extern "C" fn(*mut ()),
 }
 
 unsafe impl<T: Send> Send for FfiFuture<T> {}
@@ -339,10 +339,7 @@ where
     future: F,
 }
 
-unsafe extern "win64" fn future_box_poll<F>(
-    data: *mut (),
-    waker: *const FfiWaker,
-) -> FfiPoll<F::Output>
+unsafe extern "C" fn future_box_poll<F>(data: *mut (), waker: *const FfiWaker) -> FfiPoll<F::Output>
 where
     F: Future,
 {
@@ -360,7 +357,7 @@ where
     }
 }
 
-unsafe extern "win64" fn future_box_drop<F>(data: *mut ())
+unsafe extern "C" fn future_box_drop<F>(data: *mut ())
 where
     F: Future,
 {
@@ -426,7 +423,7 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
     }
 }
 
-unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
+unsafe extern "C" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
     unsafe {
         let b = data as *const RustWakerBox;
 
@@ -439,7 +436,7 @@ unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
     }
 }
 
-unsafe extern "win64" fn rust_waker_box_wake(data: *const ()) {
+unsafe extern "C" fn rust_waker_box_wake(data: *const ()) {
     unsafe {
         let b = data as *const RustWakerBox;
 
@@ -448,7 +445,7 @@ unsafe extern "win64" fn rust_waker_box_wake(data: *const ()) {
     }
 }
 
-unsafe extern "win64" fn rust_waker_box_wake_by_ref(data: *const ()) {
+unsafe extern "C" fn rust_waker_box_wake_by_ref(data: *const ()) {
     unsafe {
         let b = data as *const RustWakerBox;
 
@@ -456,7 +453,7 @@ unsafe extern "win64" fn rust_waker_box_wake_by_ref(data: *const ()) {
     }
 }
 
-unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) {
+unsafe extern "C" fn rust_waker_box_drop(data: *const ()) {
     unsafe {
         let b = data as *mut RustWakerBox;
 
@@ -564,8 +561,8 @@ unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
 pub struct BorrowingFfiFuture<'a, T> {
     pub abi_version: u32,
     pub data: *mut (),
-    pub poll_fn: unsafe extern "win64" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
-    pub drop_fn: Option<unsafe extern "win64" fn(*mut ())>,
+    pub poll_fn: unsafe extern "C" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
+    pub drop_fn: Option<unsafe extern "C" fn(*mut ())>,
     _pd: PhantomData<&'a mut ()>,
 }
 
@@ -622,7 +619,7 @@ where
     }
 }
 
-unsafe extern "win64" fn borrowing_future_poll<F>(
+unsafe extern "C" fn borrowing_future_poll<F>(
     data: *mut (),
     waker: *const FfiWaker,
 ) -> FfiPoll<F::Output>

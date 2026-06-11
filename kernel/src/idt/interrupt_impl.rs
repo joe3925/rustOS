@@ -9,14 +9,14 @@ use core::task::{Context, Poll};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
     AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta,
-    IrqSafeRwLock, IrqWaitResult, WaiterSlot, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET,
-    WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING,
+    IrqSafeRwLock, IrqWaitResult, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET, WAITER_PREPARING,
+    WAITER_SIGNALED, WAITER_WAITING, WaiterSlot,
 };
 use spin::{Mutex, Once};
 use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::drivers;
-use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
+use crate::drivers::interrupt_index::{APIC, current_cpu_id, get_current_logical_id, send_eoi};
 
 const MAX_HANDLERS_PER_VECTOR: usize = 4;
 const MAX_TOTAL_REGISTRATIONS: usize = 64;
@@ -26,7 +26,7 @@ const RESERVED_ID: usize = usize::MAX;
 const NO_VECTOR: usize = usize::MAX;
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_create(drop_hook: DropHook) -> IrqHandle {
+pub extern "C" fn irq_handle_create(drop_hook: DropHook) -> IrqHandle {
     let ptr = create_irq_handle_inner(drop_hook);
 
     match irq_manager().install_handle(NO_VECTOR, ptr) {
@@ -42,20 +42,20 @@ pub extern "win64" fn irq_handle_create(drop_hook: DropHook) -> IrqHandle {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_clone(h: &IrqHandle) -> IrqHandle {
+pub extern "C" fn irq_handle_clone(h: &IrqHandle) -> IrqHandle {
     *h
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_drop(_h: IrqHandle) {}
+pub extern "C" fn irq_handle_drop(_h: IrqHandle) {}
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_unregister(h: &IrqHandle) {
+pub extern "C" fn irq_handle_unregister(h: &IrqHandle) {
     irq_manager().unregister_handle(*h);
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_is_closed(h: &IrqHandle) -> bool {
+pub extern "C" fn irq_handle_is_closed(h: &IrqHandle) -> bool {
     if h.is_null() {
         return true;
     }
@@ -66,39 +66,36 @@ pub extern "win64" fn irq_handle_is_closed(h: &IrqHandle) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_set_user_ctx(h: &IrqHandle, v: usize) {
+pub extern "C" fn irq_handle_set_user_ctx(h: &IrqHandle, v: usize) {
     let _ = irq_manager().with_handle(*h, |inner| {
         inner.set_user_ctx(v);
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_get_user_ctx(h: &IrqHandle) -> usize {
+pub extern "C" fn irq_handle_get_user_ctx(h: &IrqHandle) -> usize {
     irq_manager()
         .with_handle(*h, |inner| inner.user_ctx())
         .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_signal_one(h: &IrqHandle, meta: IrqMeta) {
+pub extern "C" fn irq_handle_signal_one(h: &IrqHandle, meta: IrqMeta) {
     irq_signal(h, meta);
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_signal_exactly_one(h: &IrqHandle, meta: IrqMeta) {
+pub extern "C" fn irq_handle_signal_exactly_one(h: &IrqHandle, meta: IrqMeta) {
     irq_signal_exactly(h, meta);
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_signal_n(h: &IrqHandle, meta: IrqMeta, n: u32) {
+pub extern "C" fn irq_handle_signal_n(h: &IrqHandle, meta: IrqMeta, n: u32) {
     irq_signal_n(h, meta, n);
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn irq_handle_wait_ffi(
-    h: &IrqHandle,
-    _meta: IrqMeta,
-) -> FfiFuture<IrqWaitResult> {
+pub extern "C" fn irq_handle_wait_ffi(h: &IrqHandle, _meta: IrqMeta) -> FfiFuture<IrqWaitResult> {
     irq_wait_future(h).into_ffi()
 }
 
@@ -172,11 +169,7 @@ impl IrqHandleOps for IrqHandleInner {
         let _ = self
             .pending_signals
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                if pending == 0 {
-                    Some(1)
-                } else {
-                    Some(pending)
-                }
+                if pending == 0 { Some(1) } else { Some(pending) }
             });
 
         self.signal_phase.fetch_add(1, Ordering::AcqRel);
@@ -284,11 +277,7 @@ fn next_waiter_ticket(handle: &IrqHandleInner) -> usize {
         .wrapping_add(1)
         & WAITER_MAX_TICKET;
 
-    if ticket == 0 {
-        1
-    } else {
-        ticket
-    }
+    if ticket == 0 { 1 } else { ticket }
 }
 
 fn try_consume_pending(handle: &IrqHandleInner) -> Option<IrqWaitResult> {
@@ -478,7 +467,7 @@ struct IrqReg {
 unsafe impl Send for IrqReg {}
 unsafe impl Sync for IrqReg {}
 
-extern "win64" fn dummy_isr(
+extern "C" fn dummy_isr(
     _: u8,
     _: u32,
     _: &mut InterruptStackFrame,
@@ -885,7 +874,7 @@ fn null_handle() -> IrqHandle {
     IrqHandle::null()
 }
 
-extern "win64" fn dummy_drop(_: usize) {}
+extern "C" fn dummy_drop(_: usize) {}
 
 pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     if vector == 0x80 {
@@ -934,11 +923,7 @@ fn vector_to_gsi(vector: u8) -> Option<u8> {
     let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
     let gsi = vector.wrapping_sub(base);
 
-    if gsi < 64 {
-        Some(gsi)
-    } else {
-        None
-    }
+    if gsi < 64 { Some(gsi) } else { None }
 }
 
 pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {

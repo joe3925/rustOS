@@ -24,9 +24,7 @@ use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
 use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
-use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IoBuffer, IoBufferPageFrame, ToDevice,
-};
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, IoBufferPageFrame, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
 use kernel_api::kernel_types::irq::IrqMeta;
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -194,7 +192,7 @@ fn write_buffer_cursor<'a>(
 
 /// IDE interrupt service routine.
 /// `ctx` = I/O base port address, used to read the status register and clear the IRQ.
-extern "win64" fn ide_isr(
+extern "C" fn ide_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
@@ -412,12 +410,12 @@ impl DeviceControlHandler for IdePdoIo {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, ide_device_add);
     DriverStatus::Success
 }
 
-pub extern "win64" fn ide_device_add(
+pub extern "C" fn ide_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {

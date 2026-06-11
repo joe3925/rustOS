@@ -324,7 +324,7 @@ impl DmaSegmentLayout {
     }
 }
 
-pub type DmaUnmapFn = extern "win64" fn(&Arc<DeviceObject>, usize);
+pub type DmaUnmapFn = extern "C" fn(&Arc<DeviceObject>, usize);
 
 #[repr(C)]
 struct DmaDropContext {

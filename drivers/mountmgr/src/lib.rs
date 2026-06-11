@@ -95,7 +95,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, volclass_device_add);
 
     let mut init = DeviceInit::new();
@@ -109,7 +109,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     DriverStatus::Success
 }
 
-pub extern "win64" fn volclass_device_add(
+pub extern "C" fn volclass_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {

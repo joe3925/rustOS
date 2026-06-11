@@ -12,8 +12,8 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
+use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::{
@@ -21,13 +21,13 @@ use kernel_types::memory::{
 };
 use kernel_types::status::{LoadError, PageMapError};
 use spin::rwlock::RwLock;
+use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTable, PhysFrame};
-use x86_64::VirtAddr;
 
-use super::program::{Program, PROGRAM_MANAGER};
+use super::program::{PROGRAM_MANAGER, Program};
 
 pub struct PELoader {
     buffer: Box<[u8]>,
@@ -281,7 +281,7 @@ impl PELoader {
             )
         } {
             Err(PageMapError::Page4KiB(MapToError::FrameAllocationFailed)) => {
-                return Err(LoadError::NoMemory)
+                return Err(LoadError::NoMemory);
             }
             Err(_) => (),
             Ok(_) => (),
@@ -290,7 +290,7 @@ impl PELoader {
         let thread = Task::new_user_mode(
             unsafe {
                 *(((self.pe.entry as i64 + self.current_base.as_u64() as i64) as usize)
-                    as *const extern "win64" fn(usize))
+                    as *const extern "C" fn(usize))
             },
             0,
             stack_size,

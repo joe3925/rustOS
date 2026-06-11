@@ -21,10 +21,10 @@ use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::IoTarget;
+use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushOwner, DeviceRead, DeviceWrite,
 };
-use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::DeviceRelationType;
@@ -476,12 +476,12 @@ async fn forward_no_buffer_write(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, vol_device_add);
     DriverStatus::Success
 }
 
-pub extern "win64" fn vol_device_add(
+pub extern "C" fn vol_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
@@ -948,6 +948,3 @@ async fn vol_pdo_query_resources<'a, 'b>(
 
     DriverStep::complete(status)
 }
-
-
-

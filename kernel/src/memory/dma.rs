@@ -32,8 +32,8 @@
 //   - unregister while mappings are live
 // - Add backend-specific tests for Intel VT-d and AMD-Vi invalidation behavior.
 //
+use crate::drivers::ACPI::{ACPI_TABLES, ACPIImpl};
 use crate::drivers::pnp::device::DevNodeExt;
-use crate::drivers::ACPI::{ACPIImpl, ACPI_TABLES};
 use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
 use alloc::collections::BTreeMap;
@@ -42,11 +42,11 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::{
-    BorrowedDmaMapping, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped,
-    DmaMappingStrategy, DmaPciDeviceIdentity, IoBuffer, IoBufferDmaSegment, IoBufferPageFrame,
-    PhysFramed, ToDevice, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
-    DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, IOBUFFER_INLINE_SEGMENT_CAPACITY,
-    IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE,
+    BorrowedDmaMapping, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
+    DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, DmaDeviceHandle, DmaDeviceState, DmaMapError,
+    DmaMapped, DmaMappingStrategy, DmaPciDeviceIdentity, IOBUFFER_INLINE_SEGMENT_CAPACITY,
+    IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer, IoBufferDmaSegment,
+    IoBufferPageFrame, PhysFramed, ToDevice,
 };
 use kernel_types::status::DriverStatus;
 use raw_cpuid::CpuId;
@@ -454,7 +454,7 @@ fn prepare_dma_mapping(
     })
 }
 
-extern "win64" fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
+extern "C" fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
     let m = manager();
     let mut state = m.state.lock();
     let Some(pending) = state.pending_unmaps.remove(&(cookie as u64)) else {

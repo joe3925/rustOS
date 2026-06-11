@@ -4,11 +4,11 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender};
-use crate::mpmc::{mpmc_channel, Receiver, RecvError, Sender, TryRecvError};
+use crate::bounded_mpmc::{BoundedReceiver, BoundedSendError, BoundedSender, bounded_mpmc_channel};
+use crate::mpmc::{Receiver, RecvError, Sender, TryRecvError, mpmc_channel};
 use crate::platform::Platform;
 
-pub type JobFn = extern "win64" fn(usize);
+pub type JobFn = extern "C" fn(usize);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Job {
@@ -16,8 +16,8 @@ pub struct Job {
     pub a: usize,
 }
 
-impl From<(extern "win64" fn(usize), usize)> for Job {
-    fn from(job: (extern "win64" fn(usize), usize)) -> Self {
+impl From<(extern "C" fn(usize), usize)> for Job {
+    fn from(job: (extern "C" fn(usize), usize)) -> Self {
         Job { f: job.0, a: job.1 }
     }
 }
@@ -322,7 +322,7 @@ where
     }
 }
 
-extern "win64" fn worker_entry<P, Q>(ctx: usize)
+extern "C" fn worker_entry<P, Q>(ctx: usize)
 where
     P: Platform,
     Q: JobQueue<P>,

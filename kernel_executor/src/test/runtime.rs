@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::future::Future;
-use core::mem::{align_of, size_of, ManuallyDrop};
+use core::mem::{ManuallyDrop, align_of, size_of};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use crate::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId, ExecutorSubmitErrorKind,
-    GlobalAsyncExecutor, SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler,
-    KERNEL_NORMAL_EXECUTOR_DOMAIN,
+    GlobalAsyncExecutor, KERNEL_NORMAL_EXECUTOR_DOMAIN, SimpleRoundRobinScheduler,
+    WeightedDeficitRoundRobinScheduler,
 };
 use crate::runtime::ffi_spawn::kernel_spawn_ffi_internal;
 use crate::runtime::runtime::{
-    block_on, spawn, spawn_detached, spawn_detached_in_executor_domain, spawn_in_executor_domain,
-    JoinAll,
+    JoinAll, block_on, spawn, spawn_detached, spawn_detached_in_executor_domain,
+    spawn_in_executor_domain,
 };
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, INLINE_FUTURE_SIZE, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::FutureExt;
@@ -321,12 +321,12 @@ struct DomainConcurrencyState {
     release: AtomicBool,
 }
 
-extern "win64" fn increment_counter(ctx: usize) {
+extern "C" fn increment_counter(ctx: usize) {
     let counter = unsafe { &*(ctx as *const AtomicUsize) };
     counter.fetch_add(1, Ordering::AcqRel);
 }
 
-extern "win64" fn blocking_domain_counter(ctx: usize) {
+extern "C" fn blocking_domain_counter(ctx: usize) {
     let state = unsafe { &*(ctx as *const DomainConcurrencyState) };
     let running = state.running.fetch_add(1, Ordering::AcqRel) + 1;
     state.max_running.fetch_max(running, Ordering::AcqRel);
@@ -339,7 +339,7 @@ extern "win64" fn blocking_domain_counter(ctx: usize) {
     state.completed.fetch_add(1, Ordering::AcqRel);
 }
 
-extern "win64" fn recursive_submit_counter(ctx: usize) {
+extern "C" fn recursive_submit_counter(ctx: usize) {
     let state = unsafe { &*(ctx as *const RecursiveSubmitState) };
     state.completed.fetch_add(1, Ordering::AcqRel);
 

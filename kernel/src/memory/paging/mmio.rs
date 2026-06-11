@@ -2,15 +2,15 @@ use spin::Mutex;
 
 use kernel_types::status::PageMapError;
 use x86_64::{
-    structures::paging::{Mapper as _, Page, PageTableFlags, Size1GiB, Size2MiB, Size4KiB},
     PhysAddr, VirtAddr,
+    structures::paging::{Mapper as _, Page, PageTableFlags, Size1GiB, Size2MiB, Size4KiB},
 };
 
 use crate::{
     cpu::get_cpu_info,
     memory::paging::{
         frame_alloc::BootInfoFrameAllocator,
-        paging::{align_up_4k, map_contiguous_physical_range, TlbFlush},
+        paging::{TlbFlush, align_up_4k, map_contiguous_physical_range},
         tables::init_mapper,
         virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range},
     },
@@ -44,7 +44,7 @@ fn choose_mmio_va_alignment(aligned_phys: u64, total_size: u64, supports_1g: boo
     KIB4
 }
 
-pub extern "win64" fn map_mmio_region(
+pub extern "C" fn map_mmio_region(
     mmio_base: PhysAddr,
     mmio_size: u64,
 ) -> Result<VirtAddr, PageMapError> {
@@ -62,7 +62,7 @@ pub extern "win64" fn map_mmio_region(
     map_mmio_region_aligned(mmio_base, mmio_size, va_align)
 }
 
-pub extern "win64" fn map_mmio_region_aligned(
+pub extern "C" fn map_mmio_region_aligned(
     mmio_base: PhysAddr,
     mmio_size: u64,
     va_alignment: u64,

@@ -16,14 +16,14 @@ pub struct Dpc {
     pub arg: usize,
 }
 
-pub type DpcFn = extern "win64" fn(usize);
+pub type DpcFn = extern "C" fn(usize);
 
 lazy_static::lazy_static! {
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
 
 impl PnpManager {
-    pub fn queue_dpc(&self, func: extern "win64" fn(usize), arg: usize) {
+    pub fn queue_dpc(&self, func: extern "C" fn(usize), arg: usize) {
         GLOBAL_DPCQ.lock().push_back(Dpc { func, arg });
         spawn_detached(PNP_MANAGER.run_one_dpc());
     }

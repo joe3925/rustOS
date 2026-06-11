@@ -2,13 +2,13 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::format_ident;
 use quote::quote;
-use syn::parse::{Parse, ParseStream};
-use syn::visit::Visit;
 use syn::Data;
 use syn::DeriveInput;
+use syn::parse::{Parse, ParseStream};
+use syn::visit::Visit;
 use syn::{
-    parse_macro_input, FnArg, GenericParam, ImplItemFn, ItemFn, Pat, ReturnType, Token, Type,
-    WhereClause,
+    FnArg, GenericParam, ImplItemFn, ItemFn, Pat, ReturnType, Token, Type, WhereClause,
+    parse_macro_input,
 };
 
 #[derive(Default)]
@@ -321,7 +321,7 @@ fn request_view_case_items(
         #[allow(non_camel_case_types)]
         #[doc(hidden)]
         trait #case_ident<'__request_payload_data> {
-            unsafe extern "win64" fn request_payload_view_case(
+            unsafe extern "C" fn request_payload_view_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts>;
@@ -329,7 +329,7 @@ fn request_view_case_items(
 
         impl #impl_generics_with_data #case_ident<'__request_payload_data> for #ident #ty_generics #base_where_clause {
             #[inline]
-            default unsafe extern "win64" fn request_payload_view_case(
+            default unsafe extern "C" fn request_payload_view_case(
                 _target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
@@ -344,7 +344,7 @@ fn request_view_case_items(
             #(#source_predicates,)*
         {
             #[inline]
-            unsafe extern "win64" fn request_payload_view_case(
+            unsafe extern "C" fn request_payload_view_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
@@ -415,12 +415,12 @@ fn request_into_case_items(
         #[allow(non_camel_case_types)]
         #[doc(hidden)]
         trait #case_ident<'__request_payload_data> {
-            unsafe extern "win64" fn can_request_payload_into_case(
+            unsafe extern "C" fn can_request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> bool;
 
-            unsafe extern "win64" fn request_payload_into_case(
+            unsafe extern "C" fn request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
                 out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
@@ -429,7 +429,7 @@ fn request_into_case_items(
 
         impl #impl_generics_with_data #case_ident<'__request_payload_data> for #ident #ty_generics #base_where_clause {
             #[inline]
-            default unsafe extern "win64" fn can_request_payload_into_case(
+            default unsafe extern "C" fn can_request_payload_into_case(
                 _target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> bool {
@@ -437,7 +437,7 @@ fn request_into_case_items(
             }
 
             #[inline]
-            default unsafe extern "win64" fn request_payload_into_case(
+            default unsafe extern "C" fn request_payload_into_case(
                 _target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
                 _out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
@@ -453,7 +453,7 @@ fn request_into_case_items(
             #(#source_predicates,)*
         {
             #[inline]
-            unsafe extern "win64" fn can_request_payload_into_case(
+            unsafe extern "C" fn can_request_payload_into_case(
                 target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> bool {
@@ -461,7 +461,7 @@ fn request_into_case_items(
             }
 
             #[inline]
-            unsafe extern "win64" fn request_payload_into_case(
+            unsafe extern "C" fn request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
                 out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
@@ -624,7 +624,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
     } else {
         quote! {
             #[inline]
-            unsafe extern "win64" fn shared_view_raw_parts(
+            unsafe extern "C" fn shared_view_raw_parts(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
@@ -649,7 +649,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
     } else {
         quote! {
             #[inline]
-            unsafe extern "win64" fn mut_view_raw_parts(
+            unsafe extern "C" fn mut_view_raw_parts(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
@@ -674,7 +674,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
     } else {
         quote! {
             #[inline]
-            unsafe extern "win64" fn can_into_request_data(
+            unsafe extern "C" fn can_into_request_data(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> bool {
@@ -693,7 +693,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             }
 
             #[inline]
-            unsafe extern "win64" fn into_request_data(
+            unsafe extern "C" fn into_request_data(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
                 out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
@@ -725,12 +725,12 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             const RUNTIME_TAG: u64 = ::kernel_types::request::type_tag::<Self>();
 
             #[inline]
-            extern "win64" fn static_size() -> ::core::option::Option<usize> {
+            extern "C" fn static_size() -> ::core::option::Option<usize> {
                 ::core::option::Option::Some(::core::mem::size_of::<Self>())
             }
 
             #[inline]
-            extern "win64" fn shared_raw_parts(
+            extern "C" fn shared_raw_parts(
                 payload: &Self,
             ) -> ::kernel_types::request::RequestPayloadRawParts {
                 ::kernel_types::request::RequestPayloadRawParts {
@@ -741,7 +741,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             }
 
             #[inline]
-            extern "win64" fn mut_raw_parts(
+            extern "C" fn mut_raw_parts(
                 payload: &mut Self,
             ) -> ::kernel_types::request::RequestPayloadRawParts {
                 ::kernel_types::request::RequestPayloadRawParts {
@@ -752,14 +752,14 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             }
 
             #[inline]
-            unsafe extern "win64" fn shared_from_raw_parts<'payload>(
+            unsafe extern "C" fn shared_from_raw_parts<'payload>(
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> &'payload Self {
                 unsafe { &*(parts.data as *const Self) }
             }
 
             #[inline]
-            unsafe extern "win64" fn mut_from_raw_parts<'payload>(
+            unsafe extern "C" fn mut_from_raw_parts<'payload>(
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> &'payload mut Self {
                 unsafe { &mut *(parts.data as *mut Self) }
@@ -905,9 +905,9 @@ fn validate_function(sig: &syn::Signature) -> syn::Result<()> {
                         continue;
                     }
                     return Err(syn::Error::new_spanned(
-                    ty_ref,
-                    "#[request_handler] handler parameters must be owned types; only &Arc<T> references are allowed",
-                ));
+                        ty_ref,
+                        "#[request_handler] handler parameters must be owned types; only &Arc<T> references are allowed",
+                    ));
                 }
 
                 if !matches!(*pat_ty.pat, Pat::Ident(_)) {
@@ -952,7 +952,7 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
 
     // Remove async keyword
     sig.asyncness = None;
-    sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
+    sig.abi = Some(syn::parse_str("extern \"C\"").expect("Failed to parse C ABI"));
 
     // Set the return type to FfiFuture<DriverStep>
     sig.output = syn::parse_quote!(
@@ -995,7 +995,7 @@ fn transform_impl_function(func: &mut ImplItemFn) -> TokenStream2 {
     let obj_expr = choose_object_id_expr(sig);
 
     sig.asyncness = None;
-    sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
+    sig.abi = Some(syn::parse_str("extern \"C\"").expect("Failed to parse C ABI"));
     sig.output = syn::parse_quote!(
         -> ::kernel_api::async_ffi::FfiFuture< ::kernel_api::pnp::DriverStep>
     );
@@ -1212,7 +1212,7 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
 
     normalize_exception_state_param(&mut func.sig);
     func.sig.ident = inner_ident.clone();
-    func.sig.abi = Some(syn::parse_quote!(extern "win64"));
+    func.sig.abi = Some(syn::parse_quote!(extern "C"));
 
     let inner_sig = &func.sig;
     let body = &func.block;
@@ -1220,7 +1220,7 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
     let wrapper = if has_error_code {
         quote! {
             #[unsafe(naked)]
-            #vis extern "win64" fn #wrapper_ident() {
+            #vis extern "C" fn #wrapper_ident() {
                 ::core::arch::naked_asm!(
                     "cli",
 
@@ -1286,7 +1286,7 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
     } else {
         quote! {
             #[unsafe(naked)]
-            #vis extern "win64" fn #wrapper_ident() {
+            #vis extern "C" fn #wrapper_ident() {
                 ::core::arch::naked_asm!(
                     "cli",
 

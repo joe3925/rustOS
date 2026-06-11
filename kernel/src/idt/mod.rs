@@ -1,8 +1,8 @@
 use core::arch::naked_asm;
 
 use spin::Once;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 use crate::drivers::interrupt_index::InterruptIndex;
 use crate::drivers::timer_driver::timer_interrupt_entry;
@@ -12,7 +12,7 @@ use crate::gdt::{
     YIELD_IST_INDEX,
 };
 use crate::memory::paging::paging::tlb_flush_entry;
-use crate::scheduling::scheduler::{ipi_entry, yield_interrupt_entry, KernelFpuGuard};
+use crate::scheduling::scheduler::{KernelFpuGuard, ipi_entry, yield_interrupt_entry};
 mod interrupt_impl;
 pub use interrupt_impl::*;
 
@@ -22,7 +22,7 @@ pub use interrupt_impl::*;
 
 const IRQ_SAVED_GPR_BYTES: usize = 15 * 8;
 
-extern "win64" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
+extern "C" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
     let interrupt_guard = InterruptGuard::new();
     let _fpu_guard = interrupt_guard.is_outermost().then(KernelFpuGuard::new);
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
@@ -33,7 +33,7 @@ extern "win64" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStack
 macro_rules! gen_irq_stub {
     ($name:ident, $vec:expr) => {
         #[unsafe(naked)]
-        extern "win64" fn $name() {
+        extern "C" fn $name() {
             naked_asm!(
                 "cli",
                 "push r15","push r14","push r13","push r12",
@@ -64,7 +64,7 @@ macro_rules! gen_irq_stub {
 macro_rules! gen_irq_stubs {
     ($(($name:ident, $vec:expr)),+ $(,)?) => {
         $(gen_irq_stub!($name, $vec);)+
-        type IrqStub = extern "win64" fn();
+        type IrqStub = extern "C" fn();
         const IRQ_VECTOR_STUBS: &[(u8, IrqStub)] = &[ $(($vec, $name)),+ ];
     };
 }
@@ -284,7 +284,7 @@ gen_irq_stubs!(
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
-type ExceptionHandler = extern "win64" fn();
+type ExceptionHandler = extern "C" fn();
 
 fn exception_handler_addr(handler: ExceptionHandler) -> VirtAddr {
     VirtAddr::new(handler as *const () as u64)

@@ -3,33 +3,33 @@ use crate::runtime::task::TaskPoll;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::marker::PhantomData;
-use core::mem::{align_of, size_of, ManuallyDrop};
+use core::mem::{ManuallyDrop, align_of, size_of};
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
+pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
-use crate::platform::{platform, Job};
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::platform::{Job, platform};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, Ordering};
 
-use super::slab::{get_task_slab, INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
+use super::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE, get_task_slab};
 use super::task::{FutureTask, JoinableTask};
 
-pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
+pub(crate) fn submit_global(trampoline: extern "C" fn(usize), ctx: usize) {
     GlobalAsyncExecutor::global().submit(trampoline, ctx);
 }
 
 pub(crate) fn submit_global_to_executor_domain(
     domain_id: ExecutorDomainId,
-    trampoline: extern "win64" fn(usize),
+    trampoline: extern "C" fn(usize),
     ctx: usize,
 ) {
     GlobalAsyncExecutor::global().submit_to_executor_domain(domain_id, trampoline, ctx);
 }
 
-pub(crate) fn submit_blocking(trampoline: extern "win64" fn(usize), ctx: usize) {
+pub(crate) fn submit_blocking(trampoline: extern "C" fn(usize), ctx: usize) {
     platform().submit_blocking(Job {
         f: trampoline,
         a: ctx,
@@ -44,7 +44,7 @@ pub fn yield_now() {
     platform().yield_now();
 }
 
-pub extern "win64" fn try_steal_blocking_one() -> bool {
+pub extern "C" fn try_steal_blocking_one() -> bool {
     platform().try_steal_blocking_one()
 }
 

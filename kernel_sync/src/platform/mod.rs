@@ -15,7 +15,7 @@ pub enum ParkReason {
     IrqWait = 9,
 }
 
-pub type ThreadEntry = extern "win64" fn(usize);
+pub type ThreadEntry = extern "C" fn(usize);
 
 /// Static platform binding used by the sync primitives.
 ///

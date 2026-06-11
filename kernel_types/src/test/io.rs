@@ -10,7 +10,7 @@ use crate::pnp::DriverStep;
 use crate::request::{DeviceControl, Flush, Read, RequestData, RequestHandle, Write};
 use crate::status::DriverStatus;
 
-extern "win64" fn read_handler(
+extern "C" fn read_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Read<'_>>,
     len: usize,
@@ -25,7 +25,7 @@ extern "win64" fn read_handler(
     .into_ffi()
 }
 
-extern "win64" fn write_handler(
+extern "C" fn write_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Write<'_>>,
     _len: usize,
@@ -33,14 +33,14 @@ extern "win64" fn write_handler(
     async { DriverStep::Continue }.into_ffi()
 }
 
-extern "win64" fn device_control_handler(
+extern "C" fn device_control_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, DeviceControl<'_>>,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }
 
-extern "win64" fn flush_handler(
+extern "C" fn flush_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Flush>,
 ) -> FfiFuture<DriverStep> {
@@ -52,7 +52,7 @@ struct TestRead;
 impl DeviceRead for TestRead {
     const DEPTH: u32 = 1;
 
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Read<'data>>,
         len: usize,
@@ -64,7 +64,7 @@ impl DeviceRead for TestRead {
 struct TestWrite;
 
 impl DeviceWrite for TestWrite {
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Write<'data>>,
         len: usize,
@@ -76,7 +76,7 @@ impl DeviceWrite for TestWrite {
 struct TestFlush;
 
 impl DeviceFlush for TestFlush {
-    extern "win64" fn handler<'req, 'b>(
+    extern "C" fn handler<'req, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Flush>,
     ) -> FfiFuture<DriverStep> {
@@ -87,7 +87,7 @@ impl DeviceFlush for TestFlush {
 struct TestDeviceControl;
 
 impl DeviceControlHandler for TestDeviceControl {
-    extern "win64" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, DeviceControl<'data>>,
     ) -> FfiFuture<DriverStep> {

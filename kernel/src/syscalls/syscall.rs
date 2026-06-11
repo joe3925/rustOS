@@ -6,9 +6,9 @@ use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
+use x86_64::VirtAddr;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
-use x86_64::VirtAddr;
 
 pub fn syscall_init() {
     let gdt = PER_CPU_GDT.lock();
@@ -175,7 +175,7 @@ const SYSCALL_TABLE: &[Handler] = &[
 ];
 
 #[no_mangle]
-pub extern "win64" fn syscall_handler(frame: &mut SyscallFrame) {
+pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
     let _fpu_guard = KernelFpuGuard::new();
     let num = frame.rax as usize;
     // stack args start immediately after the pushed register block

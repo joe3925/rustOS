@@ -1,6 +1,6 @@
-use crate::platform::{platform, Job};
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::platform::{Job, platform};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Once;
 
@@ -10,17 +10,17 @@ use crate::round_robin::SchedulerPolicy;
 use alloc::boxed::Box;
 
 pub use crate::domain::{
-    DestroyExecutorDomainError, DestroyExecutorDomainResult, ExecutorAdmissionPolicy,
-    ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
-    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable, ExecutorSubmitError,
-    ExecutorSubmitErrorKind, GlobalExecutorStats, DRIVER_EXECUTOR_DOMAIN,
+    DRIVER_EXECUTOR_DOMAIN, DestroyExecutorDomainError, DestroyExecutorDomainResult,
+    ExecutorAdmissionPolicy, ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig,
+    ExecutorDomainId, ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable,
+    ExecutorSubmitError, ExecutorSubmitErrorKind, GlobalExecutorStats,
     KERNEL_BACKGROUND_EXECUTOR_DOMAIN, KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 
 #[cfg(test)]
 pub use crate::round_robin::{SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler};
 
-pub type Trampoline = extern "win64" fn(usize);
+pub type Trampoline = extern "C" fn(usize);
 
 #[repr(align(64))]
 pub(crate) struct CacheAligned(pub(crate) AtomicUsize);
@@ -377,6 +377,6 @@ impl GlobalAsyncExecutor {
 }
 
 #[inline(never)]
-pub extern "win64" fn pump_trampoline(_ctx: usize) {
+pub extern "C" fn pump_trampoline(_ctx: usize) {
     GlobalAsyncExecutor::global().pump();
 }

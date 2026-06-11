@@ -207,7 +207,7 @@ impl<R: Send + 'static> Future for BlockingJoin<R> {
     }
 }
 
-pub extern "win64" fn blocking_trampoline<F, R>(ctx: usize)
+pub extern "C" fn blocking_trampoline<F, R>(ctx: usize)
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -342,7 +342,7 @@ mod tests {
 mod loom_tests {
     use super::*;
     use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use crate::sync::{exhaustive_model, Arc};
+    use crate::sync::{Arc, exhaustive_model};
     use core::mem::ManuallyDrop;
     use core::task::{RawWaker, RawWakerVTable, Waker};
 

@@ -4,7 +4,7 @@ use crate::sync::spin_loop;
 
 use super::super::runtime::submit_global;
 use super::slot::{JoinableSlot, NotifyResult, SlabSlot, TaskSlot};
-use super::task_slab::{get_task_slab, TaskSlab};
+use super::task_slab::{TaskSlab, get_task_slab};
 
 const PTR_TAG_DETACHED: usize = 0b01;
 const PTR_TAG_JOINABLE: usize = 0b11;
@@ -76,7 +76,7 @@ pub fn is_joinable_slab_ptr(ptrv: usize) -> bool {
 trait SlabTaskKind {
     type Slot: SlabSlot;
 
-    const TRAMPOLINE: extern "win64" fn(usize);
+    const TRAMPOLINE: extern "C" fn(usize);
 
     fn encode(shard_idx: u8, local_idx: u16, generation: u32) -> usize;
     fn decode(ctx: usize) -> Option<(usize, usize, u32)>;
@@ -102,7 +102,7 @@ struct DetachedSlabTask;
 impl SlabTaskKind for DetachedSlabTask {
     type Slot = TaskSlot;
 
-    const TRAMPOLINE: extern "win64" fn(usize) = slab_poll_trampoline;
+    const TRAMPOLINE: extern "C" fn(usize) = slab_poll_trampoline;
 
     #[inline]
     fn encode(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
@@ -151,7 +151,7 @@ struct JoinableSlabTask;
 impl SlabTaskKind for JoinableSlabTask {
     type Slot = JoinableSlot;
 
-    const TRAMPOLINE: extern "win64" fn(usize) = joinable_slab_poll_trampoline;
+    const TRAMPOLINE: extern "C" fn(usize) = joinable_slab_poll_trampoline;
 
     #[inline]
     fn encode(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
@@ -256,7 +256,7 @@ where
 }
 
 #[inline(never)]
-pub extern "win64" fn slab_poll_trampoline(ctx: usize) {
+pub extern "C" fn slab_poll_trampoline(ctx: usize) {
     poll_slab_task::<DetachedSlabTask>(ctx);
 }
 
@@ -265,7 +265,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
 }
 
 #[inline(never)]
-pub extern "win64" fn joinable_slab_poll_trampoline(ctx: usize) {
+pub extern "C" fn joinable_slab_poll_trampoline(ctx: usize) {
     poll_slab_task::<JoinableSlabTask>(ctx);
 }
 

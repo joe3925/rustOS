@@ -2,12 +2,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_types::status::PageMapError;
 use x86_64::{
+    PhysAddr, VirtAddr,
     registers::control::Cr3,
     structures::paging::{
         FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PageTableIndex, PhysFrame,
         Size4KiB,
     },
-    PhysAddr, VirtAddr,
 };
 
 use crate::{memory::paging::virt_tracker::allocate_auto_kernel_range_mapped, util::boot_info};
@@ -57,7 +57,7 @@ unsafe fn read_pte(mem_offset: u64, table_phys: u64, index: usize) -> u64 {
 }
 
 #[inline(always)]
-pub(crate) extern "win64" fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr> {
+pub(crate) extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr> {
     let virt = addr.as_u64();
     let cr3_phys = Cr3::read().0.start_address().as_u64();
     let mem_offset = boot_info().physical_memory_offset.into_option().unwrap();

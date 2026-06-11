@@ -218,12 +218,12 @@ impl Default for DiskExt {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, disk_device_add);
     DriverStatus::Success
 }
 
-pub extern "win64" fn disk_device_add(
+pub extern "C" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> kernel_api::pnp::DriverStep {

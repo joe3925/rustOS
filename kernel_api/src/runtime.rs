@@ -86,7 +86,7 @@ static BLOCK_ON_WAKER_VTABLE: FfiWakerVTable = FfiWakerVTable {
     drop: block_on_waker_drop,
 };
 
-unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
+unsafe extern "C" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
     Arc::increment_strong_count(data as *const BlockOnThreadState);
     FfiWaker {
         data,
@@ -94,17 +94,17 @@ unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
     }
 }
 
-unsafe extern "win64" fn block_on_waker_wake(data: *const ()) {
+unsafe extern "C" fn block_on_waker_wake(data: *const ()) {
     let state = Arc::from_raw(data as *const BlockOnThreadState);
     state.mark_ready();
 }
 
-unsafe extern "win64" fn block_on_waker_wake_by_ref(data: *const ()) {
+unsafe extern "C" fn block_on_waker_wake_by_ref(data: *const ()) {
     let state = &*(data as *const BlockOnThreadState);
     state.mark_ready();
 }
 
-unsafe extern "win64" fn block_on_waker_drop(data: *const ()) {
+unsafe extern "C" fn block_on_waker_drop(data: *const ()) {
     drop(Arc::from_raw(data as *const BlockOnThreadState));
 }
 /// Minimal blocking join handle executed on the kernel blocking pool.
@@ -158,7 +158,7 @@ impl<R> Future for BlockingJoin<R> {
     }
 }
 
-extern "win64" fn blocking_trampoline<F, R>(ctx: usize)
+extern "C" fn blocking_trampoline<F, R>(ctx: usize)
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,

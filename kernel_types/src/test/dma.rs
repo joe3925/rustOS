@@ -9,7 +9,7 @@ use crate::dma::{
 
 static UNMAP_COOKIE_SUM: AtomicUsize = AtomicUsize::new(0);
 
-extern "win64" fn record_unmap(_dev: &Arc<DeviceObject>, cookie: usize) {
+extern "C" fn record_unmap(_dev: &Arc<DeviceObject>, cookie: usize) {
     UNMAP_COOKIE_SUM.fetch_add(cookie, Ordering::AcqRel);
 }
 

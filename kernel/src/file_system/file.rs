@@ -5,8 +5,8 @@ use crate::benchmarking::bench_runtime_executor_async;
 use crate::benchmarking::used_memory;
 use crate::benchmarking::yield_once;
 
-use crate::benchmarking::bench_c_drive_io;
 use crate::benchmarking::BenchWindow;
+use crate::benchmarking::bench_c_drive_io;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::static_handlers::print;
 use crate::util::trigger_triple_fault;
@@ -25,13 +25,13 @@ use kernel_types::{
 use rand_core::block;
 
 use crate::file_system::file_provider::provider;
-use crate::scheduling::runtime::runtime::spawn;
 use crate::scheduling::runtime::runtime::JoinAll;
+use crate::scheduling::runtime::runtime::spawn;
 
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
     drivers::interrupt_index::wait_duration,
-    file_system::file_provider::{self, install_file_provider, ProviderKind},
+    file_system::file_provider::{self, ProviderKind, install_file_provider},
     memory::paging::frame_alloc::USED_MEMORY,
     println,
     registry::rebind_and_persist_after_provider_switch,
@@ -49,7 +49,7 @@ pub struct File {
 }
 
 impl File {
-    pub extern "win64" fn remove_drive_from_path(path: &str) -> &str {
+    pub extern "C" fn remove_drive_from_path(path: &str) -> &str {
         let b = path.as_bytes();
         if b.len() >= 2 && b[1] == b':' {
             &path[2..]
@@ -58,7 +58,7 @@ impl File {
         }
     }
 
-    pub extern "win64" fn remove_file_from_path(path: &str) -> &str {
+    pub extern "C" fn remove_file_from_path(path: &str) -> &str {
         let parent = path.rsplit_once('\\').map_or("", |(parent, _)| parent);
         if parent.is_empty() || parent == "\\\\" {
             "\\"
@@ -67,7 +67,7 @@ impl File {
         }
     }
 
-    pub extern "win64" fn get_drive_letter(path: &[u8]) -> Option<String> {
+    pub extern "C" fn get_drive_letter(path: &[u8]) -> Option<String> {
         if path.len() >= 3
             && (path[0] as char).is_ascii_alphabetic()
             && path[1] == b':'
@@ -79,7 +79,7 @@ impl File {
         }
     }
 
-    pub extern "win64" fn check_path(path: &str) -> Result<(), FileStatus> {
+    pub extern "C" fn check_path(path: &str) -> Result<(), FileStatus> {
         let sanitized = Self::remove_drive_from_path(path);
         let parts = sanitized.trim_matches('\\').split('\\');
         for comp in parts {

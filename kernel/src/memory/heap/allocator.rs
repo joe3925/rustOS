@@ -211,7 +211,7 @@ impl Drop for ParallelCtxTaskArg {
     }
 }
 
-extern "win64" fn parallel_worker(ctx: usize) {
+extern "C" fn parallel_worker(ctx: usize) {
     let ctx = unsafe { Box::from_raw(ctx as *mut ParallelCtx) };
 
     while !ctx.gate.load(Ordering::Acquire) {

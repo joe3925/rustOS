@@ -338,12 +338,12 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, virtio_device_add);
     DriverStatus::Success
 }
 
-pub extern "win64" fn virtio_device_add(
+pub extern "C" fn virtio_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
@@ -362,7 +362,7 @@ pub extern "win64" fn virtio_device_add(
     DriverStep::complete(DriverStatus::Success)
 }
 
-extern "win64" fn virtio_isr(
+extern "C" fn virtio_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
@@ -384,7 +384,7 @@ extern "win64" fn virtio_isr(
     }
 }
 
-extern "win64" fn virtio_msix_isr(
+extern "C" fn virtio_msix_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,

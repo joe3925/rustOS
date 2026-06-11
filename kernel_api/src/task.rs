@@ -1,7 +1,7 @@
 use alloc::string::String;
 use kernel_types::status::TaskError;
 
-pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64 {
+pub fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64 {
     unsafe { kernel_sys::create_kernel_task(entry, ctx, name) }
 }
 

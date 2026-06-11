@@ -89,12 +89,12 @@ impl core::fmt::Debug for InlineBuffer {
 }
 
 /// Dropper function signature - only does drop_in_place, never deallocates
-type DropperFn = extern "win64" fn(*mut u8);
+type DropperFn = extern "C" fn(*mut u8);
 type RequestPayloadViewFn =
-    unsafe extern "win64" fn(u64, RequestPayloadRawParts) -> Option<RequestPayloadRawParts>;
-type RequestPayloadCanIntoFn = unsafe extern "win64" fn(u64, RequestPayloadRawParts) -> bool;
+    unsafe extern "C" fn(u64, RequestPayloadRawParts) -> Option<RequestPayloadRawParts>;
+type RequestPayloadCanIntoFn = unsafe extern "C" fn(u64, RequestPayloadRawParts) -> bool;
 type RequestPayloadIntoFn<'data> =
-    unsafe extern "win64" fn(u64, RequestPayloadRawParts, *mut RequestData<'data>) -> bool;
+    unsafe extern "C" fn(u64, RequestPayloadRawParts, *mut RequestData<'data>) -> bool;
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be used as RequestPayload without an outer layout guarantee",
     label = "missing outer layout guarantee for `{Self}`",
@@ -137,34 +137,34 @@ pub unsafe trait RequestPayload<'data>: Send + 'data {
     const RUNTIME_TAG: u64;
 
     #[inline]
-    extern "win64" fn runtime_tag() -> u64 {
+    extern "C" fn runtime_tag() -> u64 {
         Self::RUNTIME_TAG
     }
 
     /// Static byte size for nominal sized payloads.
     #[inline]
-    extern "win64" fn static_size() -> Option<usize> {
+    extern "C" fn static_size() -> Option<usize> {
         None
     }
 
     /// Erase a shared borrow into raw transport parts.
-    extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts;
+    extern "C" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts;
 
     /// Erase a mutable borrow into raw transport parts.
-    extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts;
+    extern "C" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts;
 
     /// Rebuild a shared view from erased raw transport parts.
-    unsafe extern "win64" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self;
+    unsafe extern "C" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self;
 
     /// Rebuild a mutable view from erased raw transport parts.
-    unsafe extern "win64" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self;
+    unsafe extern "C" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self;
 
     /// Try to project this concrete payload into a shared target payload view.
     ///
     /// The default implementation exposes no coercions. Derives may override
     /// this through `#[request_view(Source => Target)]` helper attributes.
     #[inline]
-    unsafe extern "win64" fn shared_view_raw_parts(
+    unsafe extern "C" fn shared_view_raw_parts(
         _target_tag: u64,
         _parts: RequestPayloadRawParts,
     ) -> Option<RequestPayloadRawParts> {
@@ -176,7 +176,7 @@ pub unsafe trait RequestPayload<'data>: Send + 'data {
     /// The default implementation exposes no coercions. Derives may override
     /// this through `#[request_view_mut(Source => Target)]` helper attributes.
     #[inline]
-    unsafe extern "win64" fn mut_view_raw_parts(
+    unsafe extern "C" fn mut_view_raw_parts(
         _target_tag: u64,
         _parts: RequestPayloadRawParts,
     ) -> Option<RequestPayloadRawParts> {
@@ -193,7 +193,7 @@ pub unsafe trait RequestPayload<'data>: Send + 'data {
     /// `out` must be valid for writes. Implementations must only write to `out`
     /// and consume `parts` when returning `true`.
     #[inline]
-    unsafe extern "win64" fn into_request_data(
+    unsafe extern "C" fn into_request_data(
         _target_tag: u64,
         _parts: RequestPayloadRawParts,
         _out: *mut RequestData<'data>,
@@ -207,7 +207,7 @@ pub unsafe trait RequestPayload<'data>: Send + 'data {
     /// The default implementation exposes no conversions. Derives may override
     /// this through `#[request_into(Source => Target)]` helper attributes.
     #[inline]
-    unsafe extern "win64" fn can_into_request_data(
+    unsafe extern "C" fn can_into_request_data(
         _target_tag: u64,
         _parts: RequestPayloadRawParts,
     ) -> bool {
@@ -266,14 +266,14 @@ where
 {
 }
 
-unsafe extern "win64" fn no_payload_view(
+unsafe extern "C" fn no_payload_view(
     _target_tag: u64,
     _parts: RequestPayloadRawParts,
 ) -> Option<RequestPayloadRawParts> {
     None
 }
 
-unsafe extern "win64" fn no_payload_into<'data>(
+unsafe extern "C" fn no_payload_into<'data>(
     _target_tag: u64,
     _parts: RequestPayloadRawParts,
     _out: *mut RequestData<'data>,
@@ -281,10 +281,7 @@ unsafe extern "win64" fn no_payload_into<'data>(
     false
 }
 
-unsafe extern "win64" fn no_payload_can_into(
-    _target_tag: u64,
-    _parts: RequestPayloadRawParts,
-) -> bool {
+unsafe extern "C" fn no_payload_can_into(_target_tag: u64, _parts: RequestPayloadRawParts) -> bool {
     false
 }
 
@@ -294,12 +291,12 @@ macro_rules! impl_nominal_request_payload {
             const RUNTIME_TAG: u64 = type_tag::<Self>();
 
             #[inline]
-            extern "win64" fn static_size() -> Option<usize> {
+            extern "C" fn static_size() -> Option<usize> {
                 Some(size_of::<Self>())
             }
 
             #[inline]
-            extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+            extern "C" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
                 RequestPayloadRawParts {
                     data: payload as *const Self as *mut u8,
                     metadata: 0,
@@ -308,7 +305,7 @@ macro_rules! impl_nominal_request_payload {
             }
 
             #[inline]
-            extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+            extern "C" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
                 RequestPayloadRawParts {
                     data: payload as *mut Self as *mut u8,
                     metadata: 0,
@@ -317,14 +314,14 @@ macro_rules! impl_nominal_request_payload {
             }
 
             #[inline]
-            unsafe extern "win64" fn shared_from_raw_parts<'a>(
+            unsafe extern "C" fn shared_from_raw_parts<'a>(
                 parts: RequestPayloadRawParts,
             ) -> &'a Self {
                 unsafe { &*(parts.data as *const Self) }
             }
 
             #[inline]
-            unsafe extern "win64" fn mut_from_raw_parts<'a>(
+            unsafe extern "C" fn mut_from_raw_parts<'a>(
                 parts: RequestPayloadRawParts,
             ) -> &'a mut Self {
                 unsafe { &mut *(parts.data as *mut Self) }
@@ -337,7 +334,7 @@ unsafe impl<'data> RequestPayload<'data> for [u8] {
     const RUNTIME_TAG: u64 = type_tag::<[u8]>();
 
     #[inline]
-    extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+    extern "C" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
         RequestPayloadRawParts {
             data: payload.as_ptr() as *mut u8,
             metadata: payload.len(),
@@ -346,7 +343,7 @@ unsafe impl<'data> RequestPayload<'data> for [u8] {
     }
 
     #[inline]
-    extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+    extern "C" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
         RequestPayloadRawParts {
             data: payload.as_mut_ptr(),
             metadata: payload.len(),
@@ -355,12 +352,12 @@ unsafe impl<'data> RequestPayload<'data> for [u8] {
     }
 
     #[inline]
-    unsafe extern "win64" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+    unsafe extern "C" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
         unsafe { core::slice::from_raw_parts(parts.data as *const u8, parts.metadata) }
     }
 
     #[inline]
-    unsafe extern "win64" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+    unsafe extern "C" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
         unsafe { core::slice::from_raw_parts_mut(parts.data, parts.metadata) }
     }
 }
@@ -369,7 +366,7 @@ unsafe impl<'data> RequestPayload<'data> for str {
     const RUNTIME_TAG: u64 = type_tag::<str>();
 
     #[inline]
-    extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+    extern "C" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
         let bytes = payload.as_bytes();
         RequestPayloadRawParts {
             data: bytes.as_ptr() as *mut u8,
@@ -379,7 +376,7 @@ unsafe impl<'data> RequestPayload<'data> for str {
     }
 
     #[inline]
-    extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+    extern "C" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
         RequestPayloadRawParts {
             data: payload.as_ptr() as *mut u8,
             metadata: payload.len(),
@@ -388,13 +385,13 @@ unsafe impl<'data> RequestPayload<'data> for str {
     }
 
     #[inline]
-    unsafe extern "win64" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+    unsafe extern "C" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
         let bytes = unsafe { core::slice::from_raw_parts(parts.data as *const u8, parts.metadata) };
         unsafe { core::str::from_utf8_unchecked(bytes) }
     }
 
     #[inline]
-    unsafe extern "win64" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+    unsafe extern "C" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
         let bytes = unsafe { core::slice::from_raw_parts_mut(parts.data, parts.metadata) };
         unsafe { core::str::from_utf8_unchecked_mut(bytes) }
     }
@@ -667,7 +664,7 @@ pub enum RequestDataError {
     ConversionFailed,
 }
 /// No-op dropper for raw bytes or empty data
-extern "win64" fn noop_dropper(_: *mut u8) {}
+extern "C" fn noop_dropper(_: *mut u8) {}
 
 impl<'data> RequestData<'data> {
     pub fn empty() -> Self {
@@ -716,7 +713,7 @@ impl<'data> RequestData<'data> {
         let align = align_of::<T>();
 
         /// Typed dropper that only runs T's destructor (no deallocation)
-        extern "win64" fn typed_dropper<T>(ptr: *mut u8) {
+        extern "C" fn typed_dropper<T>(ptr: *mut u8) {
             unsafe { core::ptr::drop_in_place(ptr as *mut T) };
         }
 
@@ -1519,7 +1516,7 @@ impl<K: RequestKind> Drop for Request<K> {
 }
 type CompletionEntry<K> = (CompletionRoutine<K>, usize);
 
-extern "win64" fn chained_completion<K: RequestKind>(
+extern "C" fn chained_completion<K: RequestKind>(
     req: &mut Request<K>,
     _ctx: usize,
 ) -> DriverStatus {

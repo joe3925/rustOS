@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::test::{wait_until, P};
+use crate::test::{P, wait_until};
 use crate::{BoundedThreadPool, Job, SubmitError, ThreadPool};
 
-extern "win64" fn increment(context: usize) {
+extern "C" fn increment(context: usize) {
     let counter = unsafe { &*(context as *const AtomicUsize) };
     counter.fetch_add(1, Ordering::SeqCst);
 }
@@ -13,7 +13,7 @@ struct BlockingJob {
     release: AtomicBool,
 }
 
-extern "win64" fn block_until_released(context: usize) {
+extern "C" fn block_until_released(context: usize) {
     let job = unsafe { &*(context as *const BlockingJob) };
     job.started.store(true, Ordering::SeqCst);
     while !job.release.load(Ordering::SeqCst) {

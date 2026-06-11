@@ -49,101 +49,99 @@ use crate::request::{
 };
 use crate::status::DriverStatus;
 pub const PHYSICAL_MEMORY_OFFSET: VirtAddr = VirtAddr::new(0xFFFF_8000_0000_0000);
-pub type EvtDriverDeviceAdd = extern "win64" fn(
-    driver: &Arc<device::DriverObject>,
-    init: &mut device::DeviceInit,
-) -> DriverStep;
+pub type EvtDriverDeviceAdd =
+    extern "C" fn(driver: &Arc<device::DriverObject>, init: &mut device::DeviceInit) -> DriverStep;
 pub type EvtDriverUnload =
-    extern "win64" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
+    extern "C" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
-pub type EvtIoRead = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtIoRead = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Read<'data>>,
     usize,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoWrite = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtIoWrite = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Write<'data>>,
     usize,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoDeviceControl = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtIoDeviceControl = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlush = for<'req, 'b> extern "win64" fn(
+pub type EvtIoFlush = for<'req, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Flush>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlushDirty = for<'req, 'b> extern "win64" fn(
+pub type EvtIoFlushDirty = for<'req, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, FlushDirty>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlushOwner = for<'req, 'b> extern "win64" fn(
+pub type EvtIoFlushOwner = for<'req, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, FlushOwner>,
 ) -> FfiFuture<DriverStep>;
 
-pub type EvtFsOpen = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsOpen = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsOpen>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsClose = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsClose = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsClose>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsRead = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsRead = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsRead>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsWrite = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsWrite = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsWrite>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsFlush = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsFlush = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsFlush>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsSeek = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsSeek = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsSeek>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsCreate = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsCreate = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsCreate>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsRename = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsRename = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsRename>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsReadDir = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsReadDir = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsReadDir>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsGetInfo = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsGetInfo = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsGetInfo>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsSetLen = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsSetLen = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsSetLen>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsAppend = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsAppend = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsAppend>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsZeroRange = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtFsZeroRange = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Fs<'data, FsZeroRange>>,
 ) -> FfiFuture<DriverStep>;
 
-pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
+pub type ClassAddCallback = extern "C" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 pub type CompletionRoutine<K: RequestKind> =
-    extern "win64" fn(request: &mut Request<K>, context: usize) -> DriverStatus;
-pub type PnpMinorCallback = for<'req, 'data, 'b> extern "win64" fn(
+    extern "C" fn(request: &mut Request<K>, context: usize) -> DriverStatus;
+pub type PnpMinorCallback = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> FfiFuture<DriverStep>;
-pub type DpcFn = extern "win64" fn(usize);
+pub type DpcFn = extern "C" fn(usize);
 
 #[unsafe(export_name = "_fltused")]
 static _FLTUSED: i32 = 0;

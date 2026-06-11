@@ -15,8 +15,8 @@ use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
-    DeviceFlush, DeviceFlushDirty, DeviceRead, DeviceWrite, DiskInfo, GptHeader,
-    GptPartitionEntry, PartitionInfo,
+    DeviceFlush, DeviceFlushDirty, DeviceRead, DeviceWrite, DiskInfo, GptHeader, GptPartitionEntry,
+    PartitionInfo,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
@@ -43,12 +43,12 @@ fn panic(info: &PanicInfo) -> ! {
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 #[unsafe(no_mangle)]
-pub unsafe extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub unsafe extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, partmgr_device_add);
     DriverStatus::Success
 }
 
-pub extern "win64" fn partmgr_device_add(
+pub extern "C" fn partmgr_device_add(
     _driver: &Arc<DriverObject>,
     init: &mut DeviceInit,
 ) -> DriverStep {

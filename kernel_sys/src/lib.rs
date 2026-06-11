@@ -35,7 +35,7 @@ use kernel_types::status::{
 use kernel_types::{ClassAddCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverUnload};
 
 #[link(name = "kernel")]
-unsafe extern "win64" {
+unsafe extern "C" {
     // Memory / Core
     pub fn kernel_alloc(layout: Layout) -> *mut u8;
     pub fn kernel_free(ptr: *mut u8, layout: Layout);
@@ -49,7 +49,7 @@ unsafe extern "win64" {
     pub fn stopwatch_new() -> Stopwatch;
     pub fn elapsed(s: &Stopwatch) -> Duration;
     // Tasking
-    pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64;
+    pub fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
     pub fn pnp_queue_dpc(func: DpcFn, arg: usize);
     pub fn try_steal_blocking_one() -> bool;
@@ -239,11 +239,11 @@ unsafe extern "win64" {
     // Async Runtime (global)
     pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
     pub fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()>;
-    pub fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize);
+    pub fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usize);
     pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
     pub fn kernel_block_on_ffi(fut: FfiFuture<()>);
     pub fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState>;
-    pub fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(usize), ctx: usize);
+    pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize);
 
     // Routing FFI (sync - for kernel_routing crate)
     pub fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget>;

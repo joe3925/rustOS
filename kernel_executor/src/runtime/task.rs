@@ -365,7 +365,7 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
 }
 
 #[inline(never)]
-pub extern "win64" fn poll_trampoline<T: TaskPoll>(ctx: usize) {
+pub extern "C" fn poll_trampoline<T: TaskPoll>(ctx: usize) {
     let task = unsafe { Arc::from_raw(ctx as *const T) };
     task.poll_once();
 }
@@ -374,7 +374,7 @@ pub extern "win64" fn poll_trampoline<T: TaskPoll>(ctx: usize) {
 mod loom_tests {
     use super::*;
     use crate::sync::atomic::{AtomicU8, Ordering};
-    use crate::sync::{exhaustive_model, Arc};
+    use crate::sync::{Arc, exhaustive_model};
 
     // Models the wake-vs-pending-poll race used by both FutureTask and
     // JoinableTask. No interleaving may leave the task IDLE after a wake raced

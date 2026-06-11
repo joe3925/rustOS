@@ -11,13 +11,13 @@ use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
     benchmarking::{
-        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
+        BenchSpanGuard, BenchWindow, bench_log_span_end, bench_span_guard, bench_submit_rip_sample,
     },
     console::CONSOLE,
     drivers::{
+        ACPI::{ACPI_TABLES, ACPIImpl},
         interrupt_index::{self, current_cpu_id, get_current_logical_id},
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
-        ACPI::{ACPIImpl, ACPI_TABLES},
     },
     file_system::{
         file::{self, File},
@@ -54,6 +54,7 @@ use alloc::{
     vec::Vec,
 };
 use kernel_types::{
+    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
     async_ffi::{FfiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
@@ -70,79 +71,74 @@ use kernel_types::{
     request::{DeviceControl, RequestHandle, RequestKind},
     runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
-    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
 use x86_64::VirtAddr;
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn create_kernel_task(
-    entry: extern "win64" fn(usize),
-    ctx: usize,
-    name: String,
-) -> u64 {
+pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64 {
     let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge2M, name, 0);
     SCHEDULER.add_task(task)
 }
 
-pub unsafe extern "win64" fn park_self_and_yield() {
+pub unsafe extern "C" fn park_self_and_yield() {
     // TODO:
     todo!()
 }
-pub extern "win64" fn get_current_lapic_id() -> usize {
+pub extern "C" fn get_current_lapic_id() -> usize {
     get_current_logical_id() as usize
 }
 
-pub extern "win64" fn wake_task(id: u64) {
+pub extern "C" fn wake_task(id: u64) {
     if let Some(task) = SCHEDULER.get_task_by_id(id) {
         SCHEDULER.unpark(&task);
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
+pub extern "C" fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
     SCHEDULER.delete_task(id)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_alloc(layout: Layout) -> *mut u8 {
+pub extern "C" fn kernel_alloc(layout: Layout) -> *mut u8 {
     unsafe { GlobalAlloc::alloc(&crate::memory::heap::ALLOCATOR, layout) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
+pub extern "C" fn kernel_free(ptr: *mut u8, layout: Layout) {
     unsafe {
         GlobalAlloc::dealloc(&crate::memory::heap::ALLOCATOR, ptr, layout);
     };
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
+pub extern "C" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     irq_register(vector, isr, ctx)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
+pub extern "C" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     irq_register_gsi(gsi, isr, ctx)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_alloc_vector() -> i32 {
+pub extern "C" fn kernel_irq_alloc_vector() -> i32 {
     irq_alloc_vector().map(|v| v as i32).unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_free_vector(vector: u8) -> bool {
+pub extern "C" fn kernel_irq_free_vector(vector: u8) -> bool {
     irq_free_vector(vector)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "win64" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
+pub unsafe extern "C" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
     unsafe {
         irq_borrowed_signal(handle, meta);
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "win64" fn kernel_irq_borrowed_ensure_signal(
+pub unsafe extern "C" fn kernel_irq_borrowed_ensure_signal(
     handle: IrqBorrowedHandle,
     meta: IrqMeta,
 ) {
@@ -152,7 +148,7 @@ pub unsafe extern "win64" fn kernel_irq_borrowed_ensure_signal(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "win64" fn kernel_irq_borrowed_signal_n(
+pub unsafe extern "C" fn kernel_irq_borrowed_signal_n(
     handle: IrqBorrowedHandle,
     meta: IrqMeta,
     n: u32,
@@ -163,16 +159,13 @@ pub unsafe extern "win64" fn kernel_irq_borrowed_signal_n(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "win64" fn kernel_irq_borrowed_signal_all(
-    handle: IrqBorrowedHandle,
-    meta: IrqMeta,
-) {
+pub unsafe extern "C" fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta) {
     unsafe {
         irq_borrowed_signal_all(handle, meta);
     }
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_dma_register_pci_pdo(
+pub extern "C" fn kernel_dma_register_pci_pdo(
     pdo: &Arc<DeviceObject>,
     identity: DmaPciDeviceIdentity,
 ) -> DriverStatus {
@@ -180,21 +173,21 @@ pub extern "win64" fn kernel_dma_register_pci_pdo(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_dma_open_device_handle(
+pub extern "C" fn kernel_dma_open_device_handle(
     device: &Arc<DeviceObject>,
 ) -> Result<DmaDeviceHandle, DriverStatus> {
     dma::open_device_handle(device)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_dma_query_device_state(
+pub extern "C" fn kernel_dma_query_device_state(
     device: &Arc<DeviceObject>,
 ) -> Option<DmaDeviceState> {
     dma::query_device_state(device)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_dma_map_buffer<'a>(
+pub extern "C" fn kernel_dma_map_buffer<'a>(
     device: &Arc<DeviceObject>,
     buffer: IoBuffer<'a, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
@@ -206,14 +199,14 @@ pub extern "win64" fn kernel_dma_map_buffer<'a>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_dma_unmap_buffer<'a>(
+pub extern "C" fn kernel_dma_unmap_buffer<'a>(
     buffer: IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
 ) -> IoBuffer<'a, PhysFramed, ToDevice> {
     dma::unmap_buffer(buffer)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
+pub extern "C" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
     device: &Arc<DeviceObject>,
     buffer: &'map IoBuffer<'buffer, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
@@ -222,11 +215,11 @@ pub extern "win64" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_apic_cpu_ids() -> Vec<u8> {
+pub extern "C" fn kernel_apic_cpu_ids() -> Vec<u8> {
     interrupt_index::apic_logical_ids()
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn print(str: &str) {
+pub extern "C" fn print(str: &str) {
     CONSOLE.lock().print(str.as_bytes());
 }
 #[unsafe(no_mangle)]
@@ -234,19 +227,19 @@ pub fn routing_print_impl(s: &str) {
     CONSOLE.lock().print(s.as_bytes());
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn wait_duration(time: Duration) {
+pub extern "C" fn wait_duration(time: Duration) {
     interrupt_index::wait_duration(time);
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn stopwatch_new() -> Stopwatch {
+pub extern "C" fn stopwatch_new() -> Stopwatch {
     Stopwatch::start()
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn elapsed(s: &Stopwatch) -> Duration {
+pub extern "C" fn elapsed(s: &Stopwatch) -> Duration {
     s.elapsed()
 }
 #[no_mangle]
-pub extern "win64" fn file_open(
+pub extern "C" fn file_open(
     path: &Path,
     flags: &[OpenFlags],
 ) -> FfiFuture<Result<File, FileStatus>> {
@@ -257,28 +250,28 @@ pub extern "win64" fn file_open(
 }
 
 #[no_mangle]
-pub extern "win64" fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>> {
+pub extern "C" fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>> {
     let path = path.clone();
 
     async move { File::list_dir(&path).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
+pub extern "C" fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
     let path = path.clone();
 
     async move { File::remove_dir(&path).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
+pub extern "C" fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
     let path = path.clone();
 
     async move { File::make_dir(&path).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>> {
+pub extern "C" fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>> {
     let key_path = key_path.to_string();
     let name = name.to_string();
 
@@ -286,7 +279,7 @@ pub extern "win64" fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Opt
 }
 
 #[no_mangle]
-pub extern "win64" fn reg_set_value(
+pub extern "C" fn reg_set_value(
     key_path: &str,
     name: &str,
     data: Data,
@@ -298,21 +291,21 @@ pub extern "win64" fn reg_set_value(
 }
 
 #[no_mangle]
-pub extern "win64" fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>> {
+pub extern "C" fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>> {
     let path = path.to_string();
 
     async move { reg::create_key(path).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>> {
+pub extern "C" fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>> {
     let path = path.to_string();
 
     async move { reg::delete_key(path.as_str()).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn reg_delete_value(
+pub extern "C" fn reg_delete_value(
     key_path: &str,
     name: &str,
 ) -> FfiFuture<Result<bool, RegError>> {
@@ -323,24 +316,24 @@ pub extern "win64" fn reg_delete_value(
 }
 
 #[no_mangle]
-pub extern "win64" fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
+pub extern "C" fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
     let base_path = base_path.to_string();
 
     async move { reg::list_keys(base_path.as_str()).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
+pub extern "C" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
     let base_path = base_path.to_string();
 
     async move { reg::list_values(base_path.as_str()).await }.into_ffi()
 }
 
-pub extern "win64" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
+pub extern "C" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
     ACPI_TABLES.get_tables()
 }
 
-pub extern "win64" fn pnp_create_pdo(
+pub extern "C" fn pnp_create_pdo(
     parent_devnode: &Arc<DevNode>,
     name: String,
     instance_path: String,
@@ -350,13 +343,13 @@ pub extern "win64" fn pnp_create_pdo(
     PNP_MANAGER.create_child_devnode_and_pdo(parent_devnode, name, instance_path, ids, class)
 }
 
-pub extern "win64" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>> {
+pub extern "C" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>> {
     let dn = dn.clone();
 
     async move { PNP_MANAGER.bind_and_start(&dn).await }.into_ffi()
 }
 
-pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget> {
+pub extern "C" fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget> {
     PNP_MANAGER.get_device_target(instance_path)
 }
 
@@ -435,19 +428,19 @@ where
         .await
 }
 
-pub extern "win64" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
+pub extern "C" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
     PNP_MANAGER.queue_dpc(func, arg)
 }
 
-pub extern "win64" fn driver_get_name(driver: &Arc<DriverObject>) -> String {
+pub extern "C" fn driver_get_name(driver: &Arc<DriverObject>) -> String {
     driver.driver_name.clone()
 }
 
-pub extern "win64" fn driver_get_flags(driver: &Arc<DriverObject>) -> u32 {
+pub extern "C" fn driver_get_flags(driver: &Arc<DriverObject>) -> u32 {
     driver.flags
 }
 
-pub extern "win64" fn driver_set_evt_device_add(
+pub extern "C" fn driver_set_evt_device_add(
     driver: &Arc<DriverObject>,
     callback: EvtDriverDeviceAdd,
 ) {
@@ -455,7 +448,7 @@ pub extern "win64" fn driver_set_evt_device_add(
     driver_mut.evt_device_add = Some(callback);
 }
 
-pub extern "win64" fn driver_set_evt_driver_unload(
+pub extern "C" fn driver_set_evt_driver_unload(
     driver: &Arc<DriverObject>,
     callback: EvtDriverUnload,
 ) {
@@ -463,11 +456,11 @@ pub extern "win64" fn driver_set_evt_driver_unload(
     driver_mut.evt_driver_unload = Some(callback);
 }
 
-pub extern "win64" fn get_rsdp() -> u64 {
+pub extern "C" fn get_rsdp() -> u64 {
     boot_info().rsdp_addr.into_option().unwrap()
 }
 
-pub extern "win64" fn pnp_create_child_devnode_and_pdo_with_init(
+pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(
     parent: &Arc<DevNode>,
     name: String,
     instance_path: String,
@@ -486,7 +479,7 @@ pub extern "win64" fn pnp_create_child_devnode_and_pdo_with_init(
 }
 
 #[no_mangle]
-pub extern "win64" fn InvalidateDeviceRelations(
+pub extern "C" fn InvalidateDeviceRelations(
     device: &Arc<DeviceObject>,
     relation: DeviceRelationType,
 ) -> FfiFuture<DriverStatus> {
@@ -506,7 +499,7 @@ pub extern "win64" fn InvalidateDeviceRelations(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_create_symlink(
+pub extern "C" fn pnp_create_symlink(
     link_path: String,
     target_path: String,
 ) -> Result<(), OmError> {
@@ -514,7 +507,7 @@ pub extern "win64" fn pnp_create_symlink(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_replace_symlink(
+pub extern "C" fn pnp_replace_symlink(
     link_path: String,
     target_path: String,
 ) -> Result<(), OmError> {
@@ -522,7 +515,7 @@ pub extern "win64" fn pnp_replace_symlink(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_create_device_symlink_top(
+pub extern "C" fn pnp_create_device_symlink_top(
     instance_path: String,
     link_path: String,
 ) -> Result<(), OmError> {
@@ -530,19 +523,19 @@ pub extern "win64" fn pnp_create_device_symlink_top(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
+pub extern "C" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
     match PNP_MANAGER.remove_symlink(link_path) {
         Ok(()) => DriverStatus::Success,
         Err(_) => DriverStatus::NoSuchDevice,
     }
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>> {
+pub extern "C" fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>> {
     async move { PNP_MANAGER.load_service(&name).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_create_control_device_with_init(
+pub extern "C" fn pnp_create_control_device_with_init(
     name: String,
     init: DeviceInit,
 ) -> Arc<DeviceObject> {
@@ -551,7 +544,7 @@ pub extern "win64" fn pnp_create_control_device_with_init(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_create_control_device_and_link(
+pub extern "C" fn pnp_create_control_device_and_link(
     name: String,
     init: DeviceInit,
     link_path: String,
@@ -560,7 +553,7 @@ pub extern "win64" fn pnp_create_control_device_and_link(
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_add_class_listener(
+pub extern "C" fn pnp_add_class_listener(
     class: String,
     callback: ClassAddCallback,
     dev_obj: &Arc<DeviceObject>,
@@ -569,7 +562,7 @@ pub extern "win64" fn pnp_add_class_listener(
 }
 
 #[no_mangle]
-pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
+pub extern "C" fn pnp_create_devnode_over_pdo_with_function(
     parent_dn: &Arc<DevNode>,
     instance_path: String,
     ids: DeviceIds,
@@ -601,20 +594,20 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
 static BLOCKING_INIT: Once = Once::new();
 
 #[no_mangle]
-pub unsafe extern "win64" fn task_yield() {
+pub unsafe extern "C" fn task_yield() {
     interrupts::without_interrupts(|| {
         unsafe { asm!("int 0x80") };
     });
 }
 
-pub unsafe extern "win64" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>> {
+pub unsafe extern "C" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>> {
     file::switch_to_vfs().into_ffi()
 }
 
 /// Notify VFS that a drive label has been published.
 /// Called by mount manager when a new label symlink is created.
 #[no_mangle]
-pub extern "win64" fn vfs_notify_label_published(
+pub extern "C" fn vfs_notify_label_published(
     label_ptr: *const u8,
     label_len: usize,
     symlink_ptr: *const u8,
@@ -639,7 +632,7 @@ pub extern "win64" fn vfs_notify_label_published(
 /// Notify VFS that a drive label has been unpublished.
 /// Called by mount manager when a label symlink is removed.
 #[no_mangle]
-pub extern "win64" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize) {
+pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize) {
     if label_ptr.is_null() {
         return;
     }
@@ -653,35 +646,35 @@ pub extern "win64" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_l
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
+pub extern "C" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
     scheduling::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()> {
+pub extern "C" fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()> {
     let handle = kernel_spawn(fut);
     handle.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_spawn_detached_ffi(fut: FfiFuture<()>) {
+pub extern "C" fn kernel_spawn_detached_ffi(fut: FfiFuture<()>) {
     kernel_spawn_detached(async move {
         fut.await;
     });
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_block_on_ffi(fut: FfiFuture<()>) {
+pub extern "C" fn kernel_block_on_ffi(fut: FfiFuture<()>) {
     kernel_block_on(fut);
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState> {
+pub extern "C" fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState> {
     scheduling::tls::current_block_on_thread_state()
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(usize), ctx: usize) {
+pub extern "C" fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize) {
     // Wrap the raw trampoline in the kernel-side blocking executor
     kernel_spawn_blocking(move || {
         (trampoline)(ctx);
@@ -689,12 +682,12 @@ pub extern "win64" fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(us
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize) {
+pub extern "C" fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usize) {
     GlobalAsyncExecutor::global().submit(trampoline, ctx);
 }
 
 #[no_mangle]
-pub extern "win64" fn kernel_async_set_parallelism(n: usize) {
+pub extern "C" fn kernel_async_set_parallelism(n: usize) {
     todo!();
 }
 
@@ -706,7 +699,7 @@ fn bench_windows() -> &'static Mutex<BTreeMap<u32, BenchWindow>> {
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle {
+pub extern "C" fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle {
     let w = BenchWindow::new(cfg);
     let id = NEXT_BENCH_WINDOW.fetch_add(1, Ordering::Relaxed);
     bench_windows().lock().insert(id, w);
@@ -714,12 +707,12 @@ pub extern "win64" fn bench_kernel_window_create(cfg: BenchWindowConfig) -> Benc
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool {
+pub extern "C" fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool {
     bench_windows().lock().remove(&handle.0).is_some()
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool {
+pub extern "C" fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool {
     let w = bench_windows().lock().get(&handle.0).cloned();
     if let Some(w) = w {
         w.start();
@@ -730,7 +723,7 @@ pub extern "win64" fn bench_kernel_window_start(handle: BenchWindowHandle) -> bo
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool {
+pub extern "C" fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool {
     let w = bench_windows().lock().get(&handle.0).cloned();
     if let Some(w) = w {
         w.stop();
@@ -741,7 +734,7 @@ pub extern "win64" fn bench_kernel_window_stop(handle: BenchWindowHandle) -> boo
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool> {
+pub extern "C" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool> {
     let w = bench_windows().lock().get(&handle.0).cloned();
     async move {
         if let Some(w) = w {
@@ -755,7 +748,7 @@ pub extern "win64" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> 
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_submit_rip_sample(
+pub extern "C" fn bench_kernel_submit_rip_sample(
     core: BenchCoreId,
     rip: u64,
     stack_ptr: *const u64,
@@ -771,7 +764,7 @@ pub extern "win64" fn bench_kernel_submit_rip_sample(
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_span_begin(
+pub extern "C" fn bench_kernel_span_begin(
     tag: BenchTag,
     object_id: BenchObjectId,
 ) -> BenchSpanGuard {
@@ -779,7 +772,7 @@ pub extern "win64" fn bench_kernel_span_begin(
 }
 
 #[no_mangle]
-pub extern "win64" fn bench_kernel_span_end(
+pub extern "C" fn bench_kernel_span_end(
     span_id: BenchSpanId,
     tag: BenchTag,
     object_id: BenchObjectId,
@@ -788,11 +781,11 @@ pub extern "win64" fn bench_kernel_span_end(
 }
 
 #[no_mangle]
-pub extern "win64" fn get_current_cpu_id() -> usize {
+pub extern "C" fn get_current_cpu_id() -> usize {
     current_cpu_id()
 }
 #[no_mangle]
-pub extern "win64" fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+pub extern "C" fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     mmio::unmap_mmio_region(base, size)
 }
 
@@ -823,14 +816,14 @@ pub fn routing_get_stack_top_from_weak_impl(
     stack_top.or_else(|| dn.get_pdo())
 }
 
-// FFI exports for drivers (extern "win64" ABI)
+// FFI exports for drivers (extern "C" ABI)
 #[no_mangle]
-pub extern "win64" fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget> {
+pub extern "C" fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget> {
     routing_resolve_path_to_device_impl(path)
 }
 
 #[no_mangle]
-pub extern "win64" fn routing_get_stack_top_from_weak(
+pub extern "C" fn routing_get_stack_top_from_weak(
     dev_node_weak: &alloc::sync::Weak<DevNode>,
 ) -> Option<Arc<DeviceObject>> {
     routing_get_stack_top_from_weak_impl(dev_node_weak)
