@@ -9,7 +9,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 kernel_macros = { path = "../kernel_macros" }
-x86_64 = { version = "0.15.2", default-features = false, features = [
+x86_64 = { version = "0.15.2", optional = true, default-features = false, features = [
     "instructions",
 ] }
 strum = { version = "0.24", default-features = false, features = ["derive"] }
@@ -26,6 +26,8 @@ array-init = "2.0.0"
 prost = { version = "0.14.3", default-features = false, features = ["derive"] }
 
 [features]
+default = ["x86_64-compat"]
+x86_64-compat = ["dep:x86_64"]
 macros = []
 hosted-tests = []
 

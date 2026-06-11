@@ -7,9 +7,9 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
-    AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta,
-    IrqSafeRwLock, IrqWaitResult, WaiterSlot, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET,
-    WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING,
+    AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqFrame, IrqHandle, IrqHandleInner, IrqIsrFn,
+    IrqMeta, IrqSafeRwLock, IrqWaitResult, WaiterSlot, WAITER_CLAIMED, WAITER_FREE,
+    WAITER_MAX_TICKET, WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING,
 };
 use spin::{Mutex, Once};
 
@@ -856,6 +856,7 @@ impl IrqManager {
         let regs = slot.regs.read();
 
         for r in regs.iter() {
+            let frame = unsafe { &mut *(frame as *mut InterruptFrame as *mut IrqFrame) };
             let claimed = (r.isr)(vector, cpu, frame, r.handle.as_ptr(), r.ctx);
 
             if claimed {
@@ -1019,8 +1020,8 @@ pub struct InterruptGuard {
 
 impl InterruptGuard {
     pub fn new() -> Self {
-        let was_in_interrupt = irq_platform::current_is_in_interrupt_atomic()
-            .swap(true, Ordering::AcqRel);
+        let was_in_interrupt =
+            irq_platform::current_is_in_interrupt_atomic().swap(true, Ordering::AcqRel);
         InterruptGuard { was_in_interrupt }
     }
 

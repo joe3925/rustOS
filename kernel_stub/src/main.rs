@@ -4,18 +4,22 @@
 
 extern crate alloc;
 
+mod arch;
+
 use alloc::alloc::{GlobalAlloc, Layout};
+use arch::{
+    enter_kernel_pe, init_mapper, validate_kernel_machine, FrameAllocator, Mapper, OffsetPageTable,
+    Page, PageTableFlags, PhysAddr, PhysFrame, Port, Size4KiB, TranslateError, VirtAddr,
+};
 use bootloader_api::config::Mapping;
 use bootloader_api::info::{
     MemoryRegion as BootMemoryRegion, MemoryRegionKind as BootMemoryRegionKind,
 };
 use bootloader_api::{entry_point, BootInfo as BootloaderBootInfo, BootloaderConfig};
-use core::arch::asm;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{addr_of_mut, copy_nonoverlapping};
 use goblin::pe::data_directories::DataDirectory;
-use goblin::pe::header::COFF_MACHINE_X86_64;
 use goblin::pe::optional_header::MAGIC_64;
 use goblin::pe::section_table::{SectionTable, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 use goblin::pe::PE;
@@ -27,13 +31,6 @@ use kernel_abi::{
     MAX_KERNEL_SYMBOL_STRING_BYTES, PHYSICAL_MEMORY_OFFSET, RUSTOS_BOOT_INFO_MAGIC,
     RUSTOS_BOOT_INFO_VERSION, STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
 };
-use x86_64::instructions::{hlt, port::Port};
-use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{
-    mapper::TranslateError, FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
-    PageTableFlags, PhysFrame, Size4KiB,
-};
-use x86_64::{PhysAddr, VirtAddr};
 
 const KERNEL_PE: &[u8] = include_bytes!(env!("KERNEL_PE_PATH"));
 const PAGE_SIZE: u64 = 0x1000;
@@ -145,21 +142,6 @@ struct LoadedKernel {
     section_count: usize,
 }
 
-unsafe fn enter_kernel_pe(entry: u64, boot_info: *const BootInfo) -> ! {
-    unsafe {
-        asm!(
-            "cld",
-            "and rsp, -16",
-            "sub rsp, 40",
-            "mov qword ptr [rsp], 0",
-            "jmp rax",
-            in("rax") entry,
-            in("rcx") boot_info,
-            options(noreturn)
-        )
-    }
-}
-
 fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
     init_serial();
     serial_println("kernel_stub: loading embedded PE kernel");
@@ -233,9 +215,7 @@ fn validate_kernel_pe(pe: &PE<'_>) -> Result<(), &'static str> {
     if !pe.is_64 || opt.standard_fields.magic != MAGIC_64 {
         return Err("kernel_stub: kernel PE must be PE32+");
     }
-    if pe.header.coff_header.machine != COFF_MACHINE_X86_64 {
-        return Err("kernel_stub: kernel PE machine is not x86_64");
-    }
+    validate_kernel_machine(pe.header.coff_header.machine)?;
     if pe.image_base != KERNEL_PE_BASE || opt.windows_fields.image_base != KERNEL_PE_BASE {
         return Err("kernel_stub: kernel PE preferred base does not match the kernel layout");
     }
@@ -832,18 +812,6 @@ fn record_allocated_frame(phys: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-unsafe fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
-    let level_4_table = active_level_4_table(physical_memory_offset);
-    OffsetPageTable::new(level_4_table, physical_memory_offset)
-}
-
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
-    let (level_4_table_frame, _) = Cr3::read();
-    let phys = level_4_table_frame.start_address();
-    let virt = physical_memory_offset + phys.as_u64();
-    &mut *virt.as_mut_ptr()
-}
-
 fn align_up_4k(value: u64) -> u64 {
     (value + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
@@ -906,7 +874,5 @@ fn fatal(message: &'static str) -> ! {
 }
 
 fn halt_loop() -> ! {
-    loop {
-        hlt();
-    }
+    arch::halt()
 }

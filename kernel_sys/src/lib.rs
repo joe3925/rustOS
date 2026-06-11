@@ -22,9 +22,7 @@ use kernel_types::irq::{DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMet
 use kernel_types::object_manager::OmError;
 use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
 
-use x86_64::addr::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::PageTableFlags;
-
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
@@ -107,27 +105,27 @@ unsafe extern "C" {
     // Paging / VMM
     pub fn allocate_auto_kernel_range_mapped(
         size: u64,
-        flags: PageTableFlags,
+        flags: PageFlags,
     ) -> Result<VirtAddr, PageMapError>;
     pub fn allocate_auto_kernel_range_mapped_contiguous(
         size: u64,
-        flags: PageTableFlags,
+        flags: PageFlags,
     ) -> Result<VirtAddr, PageMapError>;
     pub fn allocate_kernel_range_mapped(
         base: u64,
         size: u64,
-        flags: PageTableFlags,
+        flags: PageFlags,
     ) -> Result<VirtAddr, PageMapError>;
     pub fn deallocate_kernel_range(addr: VirtAddr, size: u64);
     pub fn unmap_range(virtual_addr: VirtAddr, size: u64);
-    pub fn identity_map_page(frame_addr: PhysAddr, flags: PageTableFlags);
+    pub fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags);
     pub fn map_mmio_region(mmio_base: PhysAddr, mmio_size: u64) -> Result<VirtAddr, PageMapError>;
     pub fn unmap_mmio_region(mmio_base: VirtAddr, mmio_size: u64) -> Result<(), PageMapError>;
 
     // Registry (async FFI)
     pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
     pub fn reg_set_value(key_path: &str, name: &str, data: Data)
-    -> FfiFuture<Result<(), RegError>>;
+        -> FfiFuture<Result<(), RegError>>;
     pub fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>>;
     pub fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>>;
     pub fn reg_delete_value(key_path: &str, name: &str) -> FfiFuture<Result<bool, RegError>>;
@@ -188,7 +186,7 @@ unsafe extern "C" {
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
     pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit)
-    -> Arc<DeviceObject>;
+        -> Arc<DeviceObject>;
 
     pub fn pnp_create_control_device_and_link(
         name: String,

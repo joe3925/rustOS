@@ -19,12 +19,12 @@ use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::{
     Module, PeExportInfo, PeImportInfo, PeInfo, PePdbFormat, PePdbInfo, PeSectionInfo,
 };
-use kernel_types::status::{LoadError, PageMapError};
+use kernel_types::status::{LoadError, PageMapError, PageMapFailure};
 use spin::rwlock::RwLock;
 
 use crate::arch::control::Cr3;
 use crate::arch::interrupts;
-use crate::arch::paging::{MapToError, PageTable, PhysFrame};
+use crate::arch::paging::{PageTable, PhysFrame};
 use crate::arch::VirtAddr;
 
 use super::program::{Program, PROGRAM_MANAGER};
@@ -170,7 +170,7 @@ impl PELoader {
             title,
             image_path: self.path.clone(),
             parent_pid: program.pid,
-            image_base: self.current_base,
+            image_base: self.current_base.into(),
             symbols: exports.clone(),
             pe_info: Some(pe_info),
         };
@@ -280,7 +280,7 @@ impl PELoader {
                 (image_size + 0x1000 + stack_size + heap_size) as usize,
             )
         } {
-            Err(PageMapError::Page4KiB(MapToError::FrameAllocationFailed)) => {
+            Err(PageMapError::Page4KiB(PageMapFailure::FrameAllocationFailed)) => {
                 return Err(LoadError::NoMemory);
             }
             Err(_) => (),
@@ -466,7 +466,7 @@ impl PELoader {
             subsystem: windows.subsystem,
             dll_characteristics: windows.dll_characteristics,
             preferred_image_base: windows.image_base,
-            loaded_image_base: self.current_base,
+            loaded_image_base: self.current_base.into(),
             entry_rva: self.pe.entry,
             size_of_image: windows.size_of_image,
             size_of_headers: windows.size_of_headers,

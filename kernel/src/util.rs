@@ -20,7 +20,7 @@ use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::memory::heap::{init_heap, HEAP_SIZE};
+use crate::memory::heap::{heap_capacity_bytes, init_heap};
 use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
@@ -30,7 +30,7 @@ use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
-use crate::scheduling::scheduler::{task_name_panic, SCHEDULER};
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
@@ -47,9 +47,9 @@ use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel_abi::BootInfo;
 use kernel_types::benchmark::BenchWindowConfig;
+use kernel_types::dma::set_dma_page_table_root_query;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;
-use kernel_types::request::{BorrowedHandle, RequestDataView, RequestHandle, RequestType};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
@@ -68,6 +68,10 @@ pub static BOOTSET: &[BootPkg] = boot_packages![
 ];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
+
+extern "C" fn current_page_table_root() -> u64 {
+    Cr3::read().0.start_address().as_u64()
+}
 // lazy_static! {
 //     pub static ref DRIVE_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
 //         name: "drive",
@@ -135,6 +139,7 @@ pub unsafe fn init() {
         load_idt();
 
         init_kernel_cr3();
+        set_dma_page_table_root_query(current_page_table_root);
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();
@@ -191,7 +196,7 @@ pub unsafe fn init() {
         asm!("hlt");
     }
 }
-pub extern "win64" fn kernel_main(ctx: usize) {
+pub extern "C" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
@@ -211,7 +216,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         title: "kernel.exe".into(),
         image_path: Path::from_string(""),
         parent_pid: 0,
-        image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
+        image_base: VirtAddr::new(0xFFFF_8500_0000_0000).into(),
         symbols: EXPORTS.to_vec(),
         pe_info: None,
     }))]);
@@ -367,7 +372,7 @@ pub fn trigger_breakpoint() {
 
 pub fn test_full_heap() {
     let time = Stopwatch::start();
-    let element_count = (HEAP_SIZE as usize / 4) / size_of::<u64>();
+    let element_count = (heap_capacity_bytes() as usize / 4) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
     for i in 0..element_count {
@@ -518,7 +523,7 @@ unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zer
     TLS_TEST_ZERO_BYTES = zero_bytes;
 }
 
-extern "win64" fn kernel_tls_self_test_worker(_ctx: usize) {
+extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
     let expected = unsafe { tls_test_snapshot() };
     if expected != (TLS_TEMPLATE_U64, TLS_TEMPLATE_BYTES, 0, [0; 16]) {
         TLS_SELF_TEST_RESULT.store(TLS_SELF_TEST_FAIL, Ordering::Release);

@@ -19,7 +19,9 @@ kernel_sys = { path = "../kernel_sys" }
 kernel_routing = { path = "../kernel_routing" }
 libm = { version = "0.2", default-features = false }
 [features]
-default = ["async-ffi-slab-default"]
+default = ["arch-x86_64", "async-ffi-slab-default"]
+
+arch-x86_64 = []
 
 async-ffi-slab-default = ["async-ffi-slab"]
 

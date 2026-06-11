@@ -1,9 +1,9 @@
+use crate::arch::MAX_CPUS;
 use crate::drivers::interrupt_index::IpiDest;
 use crate::drivers::interrupt_index::IpiKind;
 use crate::drivers::interrupt_index::LocalApic;
 use crate::drivers::timer_driver::NUM_CORES;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard, TLB_FLUSH_VECTOR};
-use crate::util::MAX_CPUS;
 use crate::{
     cpu::get_cpu_info,
     drivers::interrupt_index::{current_cpu_id, send_eoi, APIC},
@@ -156,7 +156,7 @@ where
                             rollback_allocated_range_mapping(mapper, fa, addr, mapped);
                         }
                     }
-                    return Err(PageMapError::Page1GiB(e));
+                    return Err(PageMapError::Page1GiB(e.into()));
                 }
             };
         }
@@ -186,7 +186,7 @@ where
                             rollback_allocated_range_mapping(mapper, fa, addr, mapped);
                         }
                     }
-                    return Err(PageMapError::Page2MiB(e));
+                    return Err(PageMapError::Page2MiB(e.into()));
                 }
             };
         }
@@ -202,7 +202,7 @@ where
                         rollback_allocated_range_mapping(mapper, fa, addr, mapped);
                     }
                 }
-                return Err(PageMapError::Page4KiB(e));
+                return Err(PageMapError::Page4KiB(e.into()));
             }
         }
         cur += 0x1000;
@@ -499,7 +499,7 @@ where
                     unsafe {
                         rollback_existing_range_mapping(mapper, frame_allocator, virt_base, mapped);
                     }
-                    return Err(PageMapError::Page1GiB(e));
+                    return Err(PageMapError::Page1GiB(e.into()));
                 }
             }
         }
@@ -530,7 +530,7 @@ where
                     unsafe {
                         rollback_existing_range_mapping(mapper, frame_allocator, virt_base, mapped);
                     }
-                    return Err(PageMapError::Page2MiB(e));
+                    return Err(PageMapError::Page2MiB(e.into()));
                 }
             }
         }
@@ -555,7 +555,7 @@ where
                 unsafe {
                     rollback_existing_range_mapping(mapper, frame_allocator, virt_base, mapped);
                 }
-                return Err(PageMapError::Page4KiB(e));
+                return Err(PageMapError::Page4KiB(e.into()));
             }
         }
     }
@@ -752,7 +752,7 @@ where
                     frame_allocator
                         .deallocate_frame(PhysFrame::<Size2MiB>::containing_address(free_phys));
                 }
-                return Err(PageMapError::Page2MiB(e));
+                return Err(PageMapError::Page2MiB(e.into()));
             }
         }
     }
@@ -816,7 +816,7 @@ where
                         frame_cache,
                     );
                 }
-                return Err(PageMapError::Page2MiB(e));
+                return Err(PageMapError::Page2MiB(e.into()));
             }
         }
     }

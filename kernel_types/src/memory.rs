@@ -1,6 +1,6 @@
 use alloc::{string::String, vec::Vec};
-use x86_64::VirtAddr;
 
+use crate::arch::VirtAddr;
 use crate::fs::Path;
 
 #[repr(C)]

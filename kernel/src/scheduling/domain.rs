@@ -1,5 +1,5 @@
+use crate::arch::MAX_CPUS;
 use crate::scheduling::task::TaskHandle;
-use crate::util::MAX_CPUS;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::NonNull;

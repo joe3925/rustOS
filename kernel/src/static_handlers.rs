@@ -5,7 +5,7 @@ use core::{
 };
 use kernel_types::object_manager::OmError;
 
-use crate::arch::{interrupts, syscalls, VirtAddr};
+use crate::arch::{interrupts, syscalls};
 use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
@@ -52,6 +52,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use kernel_types::arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
 use kernel_types::{
     async_ffi::{FfiFuture, FutureExt},
     benchmark::{
@@ -783,8 +784,64 @@ pub extern "C" fn get_current_cpu_id() -> usize {
     current_cpu_id()
 }
 #[no_mangle]
-pub extern "C" fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
-    mmio::unmap_mmio_region(base, size)
+pub extern "C" fn allocate_auto_kernel_range_mapped(
+    size: u64,
+    flags: PageFlags,
+) -> Result<AbiVirtAddr, PageMapError> {
+    crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped(size, flags.into())
+        .map(Into::into)
+}
+
+#[no_mangle]
+pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
+    size: u64,
+    flags: PageFlags,
+) -> Result<AbiVirtAddr, PageMapError> {
+    crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous(
+        size,
+        flags.into(),
+    )
+    .map(Into::into)
+}
+
+#[no_mangle]
+pub extern "C" fn allocate_kernel_range_mapped(
+    base: u64,
+    size: u64,
+    flags: PageFlags,
+) -> Result<AbiVirtAddr, PageMapError> {
+    crate::memory::paging::virt_tracker::allocate_kernel_range_mapped(base, size, flags.into())
+        .map(Into::into)
+}
+
+#[no_mangle]
+pub extern "C" fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64) {
+    crate::memory::paging::virt_tracker::deallocate_kernel_range(addr.into(), size)
+}
+
+#[no_mangle]
+pub extern "C" fn unmap_range(virtual_addr: AbiVirtAddr, size: u64) {
+    crate::memory::paging::virt_tracker::unmap_range(virtual_addr.into(), size)
+}
+
+#[no_mangle]
+pub extern "C" fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
+    let _ = unsafe {
+        crate::memory::paging::paging::identity_map_page(frame_addr.into(), 0x1000, flags.into())
+    };
+}
+
+#[no_mangle]
+pub extern "C" fn map_mmio_region(
+    mmio_base: AbiPhysAddr,
+    mmio_size: u64,
+) -> Result<AbiVirtAddr, PageMapError> {
+    mmio::map_mmio_region(mmio_base.into(), mmio_size).map(Into::into)
+}
+
+#[no_mangle]
+pub extern "C" fn unmap_mmio_region(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
+    mmio::unmap_mmio_region(base.into(), size)
 }
 
 // ============================================================================

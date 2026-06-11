@@ -8,6 +8,8 @@ pub use kernel_types::{async_ffi, device, request, status};
 pub use kernel_routing;
 pub use kernel_types;
 
+pub mod arch;
+#[cfg(feature = "arch-x86_64")]
 pub use x86_64;
 
 pub use acpi;

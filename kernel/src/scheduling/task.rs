@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize
 use kernel_types::status::PageMapError;
 use spin::Mutex;
 use spin::RwLock;
-pub type TaskEntry = extern "C" fn(usize);
+pub type TaskEntry = crate::arch::scheduling::TaskEntry;
 
 const PAGE_SIZE: u64 = 4096;
 const C_SHADOW_SPACE_BYTES: u64 = 32;

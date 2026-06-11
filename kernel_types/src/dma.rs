@@ -5,10 +5,29 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_macros::RequestPayload;
-use x86_64::registers::control::Cr3;
 
 use crate::device::DeviceObject;
+
+pub type DmaPageTableRootQuery = extern "C" fn() -> u64;
+
+static DMA_PAGE_TABLE_ROOT_QUERY: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_dma_page_table_root_query(query: DmaPageTableRootQuery) {
+    DMA_PAGE_TABLE_ROOT_QUERY.store(query as usize, Ordering::Release);
+}
+
+fn current_page_table_root() -> Option<u64> {
+    let query = DMA_PAGE_TABLE_ROOT_QUERY.load(Ordering::Acquire);
+
+    if query == 0 {
+        return None;
+    }
+
+    let query: DmaPageTableRootQuery = unsafe { core::mem::transmute(query) };
+    Some(query())
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -437,7 +456,7 @@ fn is_valid_frame_size(byte_len: u64) -> bool {
 
 fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> {
     let virt = virt_addr as u64;
-    let cr3_phys = Cr3::read().0.start_address().as_u64();
+    let cr3_phys = current_page_table_root()?;
 
     unsafe {
         let pml4e = read_pte(cr3_phys, p4_index(virt));

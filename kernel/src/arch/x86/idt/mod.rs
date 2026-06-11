@@ -57,7 +57,11 @@ pub(crate) mod irq_platform {
         let base = InterruptIndex::Timer.as_u8();
         let gsi = vector.wrapping_sub(base);
 
-        if gsi < MAX_GSI { Some(gsi) } else { None }
+        if gsi < MAX_GSI {
+            Some(gsi)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn current_cpu_id() -> u32 {

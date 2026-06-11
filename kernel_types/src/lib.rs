@@ -13,6 +13,7 @@ extern crate alloc;
 extern crate self as kernel_types;
 
 pub use prost::Message as ProstMessage;
+pub mod arch;
 pub mod async_ffi;
 pub mod async_types;
 pub mod bench_archive;
@@ -37,8 +38,8 @@ mod test;
 use alloc::sync::Arc;
 pub use kernel_macros::RequestPayload;
 pub use request::{RequestPayload, RequestPayloadInto};
-use x86_64::VirtAddr;
 
+use crate::arch::VirtAddr;
 use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;

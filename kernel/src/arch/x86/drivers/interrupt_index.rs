@@ -374,6 +374,22 @@ extern "C" fn current_is_in_interrupt() -> bool {
     current_is_in_interrupt_atomic().load(Ordering::Acquire)
 }
 
+extern "C" fn irq_interrupts_enabled() -> bool {
+    x86_64::instructions::interrupts::are_enabled()
+}
+
+extern "C" fn irq_interrupts_disable() {
+    x86_64::instructions::interrupts::disable();
+}
+
+extern "C" fn irq_interrupts_enable() {
+    x86_64::instructions::interrupts::enable();
+}
+
+extern "C" fn irq_interrupts_enable_and_hlt() {
+    x86_64::instructions::interrupts::enable_and_hlt();
+}
+
 #[inline(always)]
 pub fn is_in_interrupt_atomic_for(lapic_id: u32) -> &'static AtomicBool {
     &alloc_or_get_percpu_for(lapic_id).is_in_interrupt
@@ -1012,6 +1028,12 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
     }
     set_gs_bases(ptr);
     kernel_types::irq::set_irq_context_query(current_is_in_interrupt);
+    kernel_types::irq::set_irq_interrupt_control(
+        irq_interrupts_enabled,
+        irq_interrupts_disable,
+        irq_interrupts_enable,
+        irq_interrupts_enable_and_hlt,
+    );
     p
 }
 

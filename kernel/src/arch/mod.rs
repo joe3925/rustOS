@@ -15,3 +15,6 @@ pub use x86::{PhysAddr, VirtAddr};
 
 #[cfg(feature = "arch-x86_64")]
 pub use x86::{align_up, control, idt_types, instructions, interrupts, paging, PageFlags};
+
+#[cfg(feature = "arch-x86_64")]
+pub use x86::MAX_CPUS;

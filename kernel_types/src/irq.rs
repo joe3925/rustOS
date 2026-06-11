@@ -7,14 +7,31 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use x86_64::instructions::interrupts;
 
 pub type IrqContextQuery = extern "C" fn() -> bool;
+pub type IrqInterruptsEnabled = extern "C" fn() -> bool;
+pub type IrqInterruptsSet = extern "C" fn();
 
 static IRQ_CONTEXT_QUERY: AtomicUsize = AtomicUsize::new(0);
+static IRQ_INTERRUPTS_ENABLED: AtomicUsize = AtomicUsize::new(0);
+static IRQ_INTERRUPTS_DISABLE: AtomicUsize = AtomicUsize::new(0);
+static IRQ_INTERRUPTS_ENABLE: AtomicUsize = AtomicUsize::new(0);
+static IRQ_INTERRUPTS_ENABLE_AND_HLT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_irq_context_query(query: IrqContextQuery) {
     IRQ_CONTEXT_QUERY.store(query as usize, Ordering::Release);
+}
+
+pub fn set_irq_interrupt_control(
+    enabled: IrqInterruptsEnabled,
+    disable: IrqInterruptsSet,
+    enable: IrqInterruptsSet,
+    enable_and_hlt: IrqInterruptsSet,
+) {
+    IRQ_INTERRUPTS_ENABLED.store(enabled as usize, Ordering::Release);
+    IRQ_INTERRUPTS_DISABLE.store(disable as usize, Ordering::Release);
+    IRQ_INTERRUPTS_ENABLE.store(enable as usize, Ordering::Release);
+    IRQ_INTERRUPTS_ENABLE_AND_HLT.store(enable_and_hlt as usize, Ordering::Release);
 }
 
 #[inline(always)]
@@ -27,6 +44,55 @@ fn in_interrupt_context() -> bool {
 
     let query: IrqContextQuery = unsafe { core::mem::transmute(query) };
     query()
+}
+
+#[inline(always)]
+fn interrupts_enabled() -> bool {
+    let enabled = IRQ_INTERRUPTS_ENABLED.load(Ordering::Acquire);
+
+    if enabled == 0 {
+        return false;
+    }
+
+    let enabled: IrqInterruptsEnabled = unsafe { core::mem::transmute(enabled) };
+    enabled()
+}
+
+#[inline(always)]
+fn interrupts_disable() {
+    let disable = IRQ_INTERRUPTS_DISABLE.load(Ordering::Acquire);
+
+    if disable == 0 {
+        return;
+    }
+
+    let disable: IrqInterruptsSet = unsafe { core::mem::transmute(disable) };
+    disable();
+}
+
+#[inline(always)]
+fn interrupts_enable() {
+    let enable = IRQ_INTERRUPTS_ENABLE.load(Ordering::Acquire);
+
+    if enable == 0 {
+        return;
+    }
+
+    let enable: IrqInterruptsSet = unsafe { core::mem::transmute(enable) };
+    enable();
+}
+
+#[inline(always)]
+fn interrupts_enable_and_hlt() {
+    let enable_and_hlt = IRQ_INTERRUPTS_ENABLE_AND_HLT.load(Ordering::Acquire);
+
+    if enable_and_hlt == 0 {
+        core::hint::spin_loop();
+        return;
+    }
+
+    let enable_and_hlt: IrqInterruptsSet = unsafe { core::mem::transmute(enable_and_hlt) };
+    enable_and_hlt();
 }
 
 #[repr(C)]
@@ -51,10 +117,15 @@ impl IrqHandle {
 
 pub type IrqBorrowedHandle = *const IrqHandleInner;
 
+#[repr(C)]
+pub struct IrqFrame {
+    _private: [usize; 0],
+}
+
 pub type IrqIsrFn = extern "C" fn(
     vector: u8,
     cpu: u32,
-    frame: &mut x86_64::structures::idt::InterruptStackFrame,
+    frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool;
@@ -671,12 +742,12 @@ impl<T> IrqSafeMutex<T> {
 
     #[inline(always)]
     pub fn lock(&self) -> IrqSafeMutexGuard<'_, T> {
-        let restore_interrupts = interrupts::are_enabled();
+        let restore_interrupts = interrupts_enabled();
         let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
-                interrupts::disable();
+                interrupts_disable();
             }
 
             if let Some(guard) = self.inner.try_lock() {
@@ -687,7 +758,7 @@ impl<T> IrqSafeMutex<T> {
             }
 
             if wait_with_hlt {
-                interrupts::enable_and_hlt();
+                interrupts_enable_and_hlt();
             } else {
                 core::hint::spin_loop();
             }
@@ -696,10 +767,10 @@ impl<T> IrqSafeMutex<T> {
 
     #[inline(always)]
     pub fn try_lock(&self) -> Option<IrqSafeMutexGuard<'_, T>> {
-        let restore_interrupts = interrupts::are_enabled();
+        let restore_interrupts = interrupts_enabled();
 
         if restore_interrupts {
-            interrupts::disable();
+            interrupts_disable();
         }
 
         match self.inner.try_lock() {
@@ -709,7 +780,7 @@ impl<T> IrqSafeMutex<T> {
             }),
             None => {
                 if restore_interrupts {
-                    interrupts::enable();
+                    interrupts_enable();
                 }
 
                 None
@@ -742,7 +813,7 @@ impl<'a, T> Drop for IrqSafeMutexGuard<'a, T> {
         }
 
         if self.restore_interrupts {
-            interrupts::enable();
+            interrupts_enable();
         }
     }
 }
@@ -771,12 +842,12 @@ impl<T> IrqSafeRwLock<T> {
 
     #[inline(always)]
     pub fn read(&self) -> IrqSafeRwLockReadGuard<'_, T> {
-        let restore_interrupts = interrupts::are_enabled();
+        let restore_interrupts = interrupts_enabled();
         let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
-                interrupts::disable();
+                interrupts_disable();
             }
 
             if let Some(guard) = self.inner.try_read() {
@@ -787,7 +858,7 @@ impl<T> IrqSafeRwLock<T> {
             }
 
             if wait_with_hlt {
-                interrupts::enable_and_hlt();
+                interrupts_enable_and_hlt();
             } else {
                 core::hint::spin_loop();
             }
@@ -796,10 +867,10 @@ impl<T> IrqSafeRwLock<T> {
 
     #[inline(always)]
     pub fn try_read(&self) -> Option<IrqSafeRwLockReadGuard<'_, T>> {
-        let restore_interrupts = interrupts::are_enabled();
+        let restore_interrupts = interrupts_enabled();
 
         if restore_interrupts {
-            interrupts::disable();
+            interrupts_disable();
         }
 
         match self.inner.try_read() {
@@ -809,7 +880,7 @@ impl<T> IrqSafeRwLock<T> {
             }),
             None => {
                 if restore_interrupts {
-                    interrupts::enable();
+                    interrupts_enable();
                 }
 
                 None
@@ -819,12 +890,12 @@ impl<T> IrqSafeRwLock<T> {
 
     #[inline(always)]
     pub fn write(&self) -> IrqSafeRwLockWriteGuard<'_, T> {
-        let restore_interrupts = interrupts::are_enabled();
+        let restore_interrupts = interrupts_enabled();
         let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
-                interrupts::disable();
+                interrupts_disable();
             }
 
             if let Some(guard) = self.inner.try_write() {
@@ -835,7 +906,7 @@ impl<T> IrqSafeRwLock<T> {
             }
 
             if wait_with_hlt {
-                interrupts::enable_and_hlt();
+                interrupts_enable_and_hlt();
             } else {
                 core::hint::spin_loop();
             }
@@ -844,10 +915,10 @@ impl<T> IrqSafeRwLock<T> {
 
     #[inline(always)]
     pub fn try_write(&self) -> Option<IrqSafeRwLockWriteGuard<'_, T>> {
-        let restore_interrupts = interrupts::are_enabled();
+        let restore_interrupts = interrupts_enabled();
 
         if restore_interrupts {
-            interrupts::disable();
+            interrupts_disable();
         }
 
         match self.inner.try_write() {
@@ -857,7 +928,7 @@ impl<T> IrqSafeRwLock<T> {
             }),
             None => {
                 if restore_interrupts {
-                    interrupts::enable();
+                    interrupts_enable();
                 }
 
                 None
@@ -883,7 +954,7 @@ impl<'a, T> Drop for IrqSafeRwLockReadGuard<'a, T> {
         }
 
         if self.restore_interrupts {
-            interrupts::enable();
+            interrupts_enable();
         }
     }
 }
@@ -912,7 +983,7 @@ impl<'a, T> Drop for IrqSafeRwLockWriteGuard<'a, T> {
         }
 
         if self.restore_interrupts {
-            interrupts::enable();
+            interrupts_enable();
         }
     }
 }

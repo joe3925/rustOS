@@ -453,7 +453,7 @@ impl Program {
 
             if have.eq_ignore_ascii_case(want) {
                 if let Some((_, rva)) = m.symbols.iter().find(|(name, _)| name == symbol_name) {
-                    return Ok(m.image_base + *rva as u64);
+                    return Ok((m.image_base + *rva as u64).into());
                 }
             }
         }

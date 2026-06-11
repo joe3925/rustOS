@@ -3,8 +3,6 @@ use bincode::{Decode, Encode};
 use core::convert::Infallible;
 use core::fmt;
 use core::ops::{ControlFlow, FromResidual, Residual, Try};
-use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{Size1GiB, Size2MiB, Size4KiB};
 
 #[repr(i32)]
 #[derive(Debug, Clone, Eq)]
@@ -217,27 +215,72 @@ impl From<LoadError> for DriverError {
 #[derive(Debug)]
 #[repr(u32)]
 pub enum PageMapError {
-    Page4KiB(MapToError<Size4KiB>),
-    Page2MiB(MapToError<Size2MiB>),
-    Page1GiB(MapToError<Size1GiB>),
+    Page4KiB(PageMapFailure),
+    Page2MiB(PageMapFailure),
+    Page1GiB(PageMapFailure),
     TranslationFailed(),
     NoMemory(),
     NoMemoryMap(),
 }
 
-impl From<MapToError<Size4KiB>> for PageMapError {
-    fn from(e: MapToError<Size4KiB>) -> Self {
-        PageMapError::Page4KiB(e)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PageMapFailure {
+    FrameAllocationFailed,
+    PageAlreadyMapped,
+    ParentEntryHugePage,
+}
+
+#[cfg(feature = "x86_64-compat")]
+impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size4KiB>>
+    for PageMapError
+{
+    fn from(
+        e: x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size4KiB>,
+    ) -> Self {
+        PageMapError::Page4KiB(PageMapFailure::from(e))
     }
 }
-impl From<MapToError<Size2MiB>> for PageMapError {
-    fn from(e: MapToError<Size2MiB>) -> Self {
-        PageMapError::Page2MiB(e)
+
+#[cfg(feature = "x86_64-compat")]
+impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size2MiB>>
+    for PageMapError
+{
+    fn from(
+        e: x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size2MiB>,
+    ) -> Self {
+        PageMapError::Page2MiB(PageMapFailure::from(e))
     }
 }
-impl From<MapToError<Size1GiB>> for PageMapError {
-    fn from(e: MapToError<Size1GiB>) -> Self {
-        PageMapError::Page1GiB(e)
+
+#[cfg(feature = "x86_64-compat")]
+impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size1GiB>>
+    for PageMapError
+{
+    fn from(
+        e: x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size1GiB>,
+    ) -> Self {
+        PageMapError::Page1GiB(PageMapFailure::from(e))
+    }
+}
+
+#[cfg(feature = "x86_64-compat")]
+impl<S> From<x86_64::structures::paging::mapper::MapToError<S>> for PageMapFailure
+where
+    S: x86_64::structures::paging::page::PageSize,
+{
+    fn from(e: x86_64::structures::paging::mapper::MapToError<S>) -> Self {
+        match e {
+            x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed => {
+                PageMapFailure::FrameAllocationFailed
+            }
+            x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_) => {
+                PageMapFailure::PageAlreadyMapped
+            }
+            x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage => {
+                PageMapFailure::ParentEntryHugePage
+            }
+        }
     }
 }
 

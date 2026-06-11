@@ -1,4 +1,5 @@
 use crate::arch::scheduling::idle_task;
+use crate::arch::MAX_CPUS;
 use crate::arch::{control::Cr3, interrupts};
 use crate::cpu;
 use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
@@ -22,7 +23,7 @@ use crate::scheduling::task::TaskError;
 pub use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
 use crate::scheduling::tls;
-use crate::util::{KERNEL_INITIALIZED, MAX_CPUS};
+use crate::util::KERNEL_INITIALIZED;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
