@@ -1,24 +1,24 @@
+use crate::arch::paging::PageTableFlags;
+use crate::arch::scheduling::task_return_trampoline;
+use crate::arch::VirtAddr;
 use crate::cpu::get_cpu_info;
 use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
-use crate::memory::paging::stack::{StackSize, allocate_kernel_stack, deallocate_kernel_stack};
+use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
-use crate::scheduling::scheduler::{default_task_sched_binding, task_return_trampoline};
+use crate::scheduling::scheduler::default_task_sched_binding;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
 use crate::vec::Vec;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::arch::naked_asm;
 use core::sync::atomic::AtomicPtr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
 use spin::Mutex;
 use spin::RwLock;
-use x86_64::VirtAddr;
-use x86_64::structures::paging::PageTableFlags;
 pub type TaskEntry = extern "C" fn(usize);
 
 const PAGE_SIZE: u64 = 4096;
@@ -907,7 +907,11 @@ impl TaskTable {
         slot.state.store(TASK_SLOT_EMPTY, Ordering::Release);
         self.free_hint.store(idx, Ordering::Release);
 
-        if p.is_null() { None } else { Some(p) }
+        if p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
     }
 
     pub(crate) fn reap_retired(&self) {
@@ -944,8 +948,4 @@ impl TaskTable {
             }
         }
     }
-}
-#[unsafe(naked)]
-pub(crate) extern "C" fn idle_task(_ctx: usize) {
-    naked_asm!("3:", "hlt", "jmp 3b",);
 }

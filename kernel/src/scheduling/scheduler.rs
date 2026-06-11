@@ -1,8 +1,10 @@
+use crate::arch::scheduling::idle_task;
+use crate::arch::{control::Cr3, interrupts};
 use crate::cpu;
-use crate::drivers::interrupt_index::LocalApic;
 use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
+use crate::drivers::interrupt_index::LocalApic;
 use crate::drivers::interrupt_index::{
-    APIC, IpiDest, IpiKind, current_cpu_id, get_current_logical_id, send_eoi,
+    current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, APIC,
 };
 use crate::drivers::timer_driver::NUM_CORES;
 use crate::drivers::timer_driver::TIMER;
@@ -15,20 +17,17 @@ use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::CurrentTask;
+use crate::scheduling::task::Task;
 use crate::scheduling::task::TaskError;
 pub use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
-use crate::scheduling::task::{IDLE_MAGIC_LOWER, IDLE_UUID_UPPER, Task, idle_task};
 use crate::scheduling::tls;
 use crate::util::{KERNEL_INITIALIZED, MAX_CPUS};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
-use x86_64::instructions::interrupts;
-use x86_64::registers::control::Cr3;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
 
 pub fn default_task_sched_binding() -> TaskSchedBinding {
@@ -368,7 +367,7 @@ impl Scheduler {
     }
 
     pub fn park_current(&self, _reason: BlockReason) {
-        if !x86_64::instructions::interrupts::are_enabled() {
+        if !interrupts::are_enabled() {
             panic!("Attempt to park with interrupts disabled, this will always cause a deadlock");
         }
 
@@ -776,103 +775,6 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
 #[no_mangle]
 pub extern "C" fn ipi_eoi_only() {
     crate::drivers::interrupt_index::send_eoi(SCHED_IPI_VECTOR);
-}
-
-#[unsafe(naked)]
-#[no_mangle]
-pub extern "C" fn ipi_entry() {
-    naked_asm!(
-        "/* {upper} {lower} {eoi_only} */",
-        "cli",
-        "push rax",
-        "mov  rax, {upper}",
-        "cmp  r10, rax",
-        "jne  9f",
-        "mov  rax, {lower}",
-        "cmp  r11, rax",
-        "jne  9f",
-        "pop  rax",
-
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-
-        "mov  rcx, rsp",
-        "mov  rbx, rsp",
-        "cld",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {handler}",
-        "mov  rsp, rbx",
-
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
-        "iretq",
-
-        "9:",
-        "pop  rax",
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-        "cld",
-        "mov  rbx, rsp",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {eoi_only}",
-        "mov  rsp, rbx",
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
-        "iretq",
-
-        upper = const IDLE_UUID_UPPER,
-        lower = const IDLE_MAGIC_LOWER,
-        handler = sym ipi_handler_c,
-        eoi_only = sym ipi_eoi_only,
-    );
-}
-
-#[unsafe(naked)]
-pub extern "C" fn yield_interrupt_entry() {
-    naked_asm!(
-        "cli",
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-
-        "mov  rcx, rsp",
-        "mov  rbx, rsp",
-        "cld",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {handler}",
-        "mov  rsp, rbx",
-
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
-        "iretq",
-
-        handler = sym yield_handler_c,
-    );
-}
-
-#[unsafe(naked)]
-pub extern "C" fn task_return_trampoline() -> ! {
-    naked_asm!(
-        "cld",
-        "sub rsp, 8",
-        "mov qword ptr [rsp], 0",
-        "jmp {task_end}",
-        task_end = sym kernel_task_end,
-    );
 }
 
 pub extern "C" fn kernel_task_end() -> ! {

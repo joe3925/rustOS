@@ -49,7 +49,8 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::ProstMessage;
 use serde_json::{json, Value};
 use spin::{Mutex, Once};
-use x86_64::instructions::interrupts;
+
+use crate::arch::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
 pub const BENCH_ENABLED: bool = false;
 
@@ -3366,20 +3367,7 @@ fn print_cycles_per(name: &str, total: u64, count: usize) {
 
 #[inline(always)]
 fn rdtsc_ordered() -> u64 {
-    let low: u32;
-    let high: u32;
-
-    unsafe {
-        core::arch::asm!(
-            "lfence",
-            "rdtsc",
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    ((high as u64) << 32) | low as u64
+    cpu::get_ordered_cycles()
 }
 // =====================
 // Config

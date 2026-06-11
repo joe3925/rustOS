@@ -9,9 +9,9 @@ use core::task::{Context, Poll, Waker};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::status::FileStatus;
 use spin::Mutex;
-use x86_64::instructions::interrupts;
-use x86_64::registers::control::Cr3;
 
+use crate::arch::control::Cr3;
+use crate::arch::interrupts;
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;

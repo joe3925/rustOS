@@ -1,23 +1,22 @@
 use core::{
     alloc::{GlobalAlloc, Layout},
-    arch::asm,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 use kernel_types::object_manager::OmError;
-use x86_64::instructions::interrupts;
 
+use crate::arch::{interrupts, syscalls, VirtAddr};
 use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
     benchmarking::{
-        BenchSpanGuard, BenchWindow, bench_log_span_end, bench_span_guard, bench_submit_rip_sample,
+        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
     },
     console::CONSOLE,
     drivers::{
-        ACPI::{ACPI_TABLES, ACPIImpl},
         interrupt_index::{self, current_cpu_id, get_current_logical_id},
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
+        ACPI::{ACPIImpl, ACPI_TABLES},
     },
     file_system::{
         file::{self, File},
@@ -54,7 +53,6 @@ use alloc::{
     vec::Vec,
 };
 use kernel_types::{
-    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
     async_ffi::{FfiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
@@ -71,9 +69,9 @@ use kernel_types::{
     request::{DeviceControl, RequestHandle, RequestKind},
     runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
+    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
-use x86_64::VirtAddr;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64 {
@@ -596,7 +594,7 @@ static BLOCKING_INIT: Once = Once::new();
 #[no_mangle]
 pub unsafe extern "C" fn task_yield() {
     interrupts::without_interrupts(|| {
-        unsafe { asm!("int 0x80") };
+        unsafe { syscalls::task_yield_interrupt() };
     });
 }
 

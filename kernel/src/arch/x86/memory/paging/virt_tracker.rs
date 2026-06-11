@@ -3,8 +3,8 @@ use crate::{
         constants::{MANAGED_KERNEL_RANGE_END, MANAGED_KERNEL_RANGE_START},
         frame_alloc::BootInfoFrameAllocator,
         paging::{
-            TlbFlush, align_up_4k, map_contiguous_physical_range, map_range_with_huge_pages,
-            unmap_range_impl,
+            align_up_4k, map_contiguous_physical_range, map_range_with_huge_pages,
+            unmap_range_impl, TlbFlush,
         },
         tables::init_mapper,
     },
@@ -16,8 +16,8 @@ use core::sync::atomic::AtomicUsize;
 use kernel_types::status::PageMapError;
 use lazy_static::lazy_static;
 use x86_64::{
-    PhysAddr, VirtAddr,
     structures::paging::{PageTableFlags, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
 };
 
 pub(crate) const MAX_PENDING_FREES: usize = 64;

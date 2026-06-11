@@ -10,7 +10,8 @@ name = "kernel"
 path = "src/main.rs"
 
 [features]
-default = ["allocator-mimalloc"]
+default = ["allocator-mimalloc", "arch-x86_64"]
+arch-x86_64 = []
 allocator-mimalloc = []
 allocator-buddy = []
 

@@ -11,14 +11,14 @@ use kernel_types::status::LoadError::NoSuchSymbol;
 use kernel_types::{device::ModuleHandle, fs::Path, memory::PeInfo, status::PageMapError};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
-use x86_64::{
-    instructions::hlt,
-    registers::control::Cr3,
-    structures::paging::{PageTableFlags, PhysFrame},
-    VirtAddr,
-};
 
 use crate::{
+    arch::{
+        control::Cr3,
+        interrupts,
+        paging::{PageTableFlags, PhysFrame},
+        VirtAddr,
+    },
     executable::pe_loadable::PELoader,
     memory::paging::paging::map_range_with_huge_pages,
     object_manager::{Object, ObjectPayload, OBJECT_MANAGER},
@@ -255,7 +255,7 @@ impl Program {
 
         let old_cr3 = Cr3::read();
 
-        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        interrupts::without_interrupts(|| unsafe {
             Cr3::write(self.cr3, old_cr3.1);
         });
 
@@ -334,7 +334,7 @@ impl Program {
 
         let old_cr3 = Cr3::read();
 
-        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        interrupts::without_interrupts(|| unsafe {
             Cr3::write(self.cr3, old_cr3.1);
         });
 
@@ -415,7 +415,7 @@ impl Program {
         let managed = self.managed_threads.lock();
 
         loop {
-            hlt();
+            interrupts::hlt();
 
             let mut running = managed.len() + 1;
 
@@ -576,7 +576,7 @@ impl ProgramManager {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         prog.pid = pid;
         if let Some(ref mut task) = prog.main_thread {
-            x86_64::instructions::interrupts::without_interrupts(move || {
+            interrupts::without_interrupts(move || {
                 task.inner.write().parent_pid = pid;
             });
         }

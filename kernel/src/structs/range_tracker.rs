@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use spin::{Mutex, MutexGuard};
-use x86_64::VirtAddr;
+
+use crate::arch::VirtAddr;
 
 pub struct AllocationIter<'a> {
     guard: MutexGuard<'a, Vec<(u64, u64)>>,

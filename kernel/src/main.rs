@@ -24,18 +24,16 @@
 
 extern crate alloc;
 
-pub mod gdt;
-mod idt;
+mod arch;
 
 mod benchmarking;
 mod console;
-mod cpu;
 mod crt;
 mod drivers;
-mod exception_handlers;
 mod executable;
 mod exports;
 mod file_system;
+mod idt;
 mod memory;
 mod object_manager;
 mod profiling;
@@ -46,7 +44,9 @@ mod structs;
 mod sync_platform;
 mod syscalls;
 mod util;
-use crate::util::{KERNEL_INITIALIZED, panic_common};
+pub(crate) use arch::{cpu, exception_handlers, gdt};
+
+use crate::util::{panic_common, KERNEL_INITIALIZED};
 
 use alloc::{format, vec};
 use core::panic::PanicInfo;
@@ -54,9 +54,9 @@ use core::ptr::{addr_of_mut, copy_nonoverlapping};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_abi::{
     BootInfo, FrameBuffer, KernelSection, KernelSections, KernelSymbol, KernelSymbolString,
-    KernelSymbols, MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
-    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, MemoryRegion, MemoryRegionKind,
-    MemoryRegions, Optional,
+    KernelSymbols, MemoryRegion, MemoryRegionKind, MemoryRegions, Optional,
+    MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
+    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES,
 };
 use kernel_abi::{RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION};
 use lazy_static::lazy_static;

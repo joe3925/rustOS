@@ -2,15 +2,15 @@ use spin::Mutex;
 
 use kernel_types::status::PageMapError;
 use x86_64::{
-    PhysAddr, VirtAddr,
     structures::paging::{Mapper as _, Page, PageTableFlags, Size1GiB, Size2MiB, Size4KiB},
+    PhysAddr, VirtAddr,
 };
 
 use crate::{
     cpu::get_cpu_info,
     memory::paging::{
         frame_alloc::BootInfoFrameAllocator,
-        paging::{TlbFlush, align_up_4k, map_contiguous_physical_range},
+        paging::{align_up_4k, map_contiguous_physical_range, TlbFlush},
         tables::init_mapper,
         virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range},
     },

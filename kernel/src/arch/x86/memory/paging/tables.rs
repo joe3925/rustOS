@@ -2,12 +2,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_types::status::PageMapError;
 use x86_64::{
-    PhysAddr, VirtAddr,
     registers::control::Cr3,
     structures::paging::{
         FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PageTableIndex, PhysFrame,
         Size4KiB,
     },
+    PhysAddr, VirtAddr,
 };
 
 use crate::{memory::paging::virt_tracker::allocate_auto_kernel_range_mapped, util::boot_info};

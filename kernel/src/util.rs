@@ -4,26 +4,25 @@ use crate::benchmarking::BenchWindow;
 use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
-use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::interrupt_index::{
-    ApicImpl, IpiDest, IpiKind, LocalApic, apic_calibrate_ticks_per_ns_via_wait,
-    apic_program_period_ns, calibrate_tsc, current_cpu_id, current_is_in_interrupt_atomic,
-    get_current_logical_id, init_percpu_gs, wait_using_pit_50ms,
+    apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns, calibrate_tsc, current_cpu_id,
+    current_is_in_interrupt_atomic, get_current_logical_id, init_percpu_gs, wait_using_pit_50ms,
+    ApicImpl, IpiDest, IpiKind, LocalApic,
 };
+use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::NUM_CORES;
-use crate::executable::program::{PROGRAM_MANAGER, Program};
+use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file_provider::{ProviderKind, install_file_provider};
+use crate::file_system::file_provider::{install_file_provider, ProviderKind};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::memory::heap::{heap_capacity_bytes, init_heap};
+use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
-use crate::memory::paging::frame_alloc::{boot_usable_bytes, resize_bitmap_for_ram};
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -31,12 +30,11 @@ use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::{task_name_panic, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
-use crate::{BOOT_INFO, BOOT_INFO_INITIALIZED, cpu, println};
-use alloc::format;
+use crate::{cpu, println, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -51,21 +49,20 @@ use kernel_abi::BootInfo;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;
+use kernel_types::request::{BorrowedHandle, RequestDataView, RequestHandle, RequestType};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
-use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::idt::InterruptDescriptorTable;
-
+use x86_64::VirtAddr;
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 500000;
-pub const MAX_CPUS: usize = 256;
+pub const APIC_START_PERIOD: u64 = 250000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -194,14 +191,10 @@ pub unsafe fn init() {
         asm!("hlt");
     }
 }
-pub extern "C" fn kernel_main(ctx: usize) {
+pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
-    resize_bitmap_for_ram(boot_usable_bytes()).expect(&format!(
-        "Failed to resize phys frame bitmap to capacity {}",
-        boot_usable_bytes()
-    ));
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire), 1_000_000);
+    GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let mut program = Program::new(
@@ -236,7 +229,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
 }
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn trigger_guard_page_overflow() -> ! {
+pub extern "win64" fn trigger_guard_page_overflow() -> ! {
     let task = SCHEDULER
         .get_current_task(current_cpu_id())
         .expect("no current task");
@@ -260,7 +253,7 @@ fn halt_loop() -> ! {
     }
 }
 #[no_mangle]
-pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
+pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
         halt_loop()
     }
@@ -282,17 +275,65 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
         None => false,
     };
     if is_owner {
-        unsafe {
-            if let Some(a) = APIC.lock().as_ref() {
-                a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi)
-            }
-        }
         println!("=== KERNEL PANIC [{}] ===", mod_name);
         println!(
             "is in interrupt: {:#?}",
             current_is_in_interrupt_atomic().load(Ordering::Relaxed)
         );
         println!("{}", info);
+
+        // let dump = dump_scheduler();
+        // println!("--- Running tasks at panic ---");
+        // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+        //     if let Some(task) = slot {
+        //         let name = unsafe { task_name_panic(task) };
+        //         println!(
+        //             "  CPU {}: \"{}\" (id={})",
+        //             cpu_id,
+        //             name,
+        //             task.id.load(Ordering::Relaxed)
+        //         );
+        //     } else {
+        //         println!("  CPU {}: <idle>", cpu_id);
+        //     }
+        // }
+        // println!("--- Tasks in run queue and ipi queue ---");
+        // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
+        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+        //     println!(
+        //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
+        //         cpu_id, some_count, queue.captured, queue.total_before_drain
+        //     );
+        // }
+
+        // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
+        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+        //     println!(
+        //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
+        //         cpu_id, some_count, queue.captured, queue.total_before_drain
+        //     );
+        // }
+        // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+        //     match task {
+        //         Some(task) => {
+        //             let stack_size = task.stack_size.load(core::sync::atomic::Ordering::Acquire);
+        //             let guard_page = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
+
+        //             println!(
+        //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
+        //                 cpu_id, stack_size, guard_page
+        //             );
+        //         }
+        //         None => {
+        //             println!("  CPU {}: current_task=None", cpu_id);
+        //         }
+        //     }
+        // }
+        unsafe {
+            if let Some(a) = APIC.lock().as_ref() {
+                a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi)
+            }
+        }
 
         halt_loop()
     } else {
@@ -308,7 +349,7 @@ pub extern "C" fn trigger_stack_overflow() {
 
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn trigger_triple_fault() -> ! {
+pub extern "win64" fn trigger_triple_fault() -> ! {
     static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
     x86_64::instructions::interrupts::disable();
@@ -326,7 +367,7 @@ pub fn trigger_breakpoint() {
 
 pub fn test_full_heap() {
     let time = Stopwatch::start();
-    let element_count = (heap_capacity_bytes() as usize / 4) / size_of::<u64>();
+    let element_count = (HEAP_SIZE as usize / 4) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
     for i in 0..element_count {
@@ -345,7 +386,7 @@ pub fn test_full_heap() {
     );
 }
 
-pub extern "C" fn random_number() -> u64 {
+pub extern "win64" fn random_number() -> u64 {
     let mut rng = Random::new(cpu::get_cycles());
     rng.next_u64()
 }
@@ -477,7 +518,7 @@ unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zer
     TLS_TEST_ZERO_BYTES = zero_bytes;
 }
 
-extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
+extern "win64" fn kernel_tls_self_test_worker(_ctx: usize) {
     let expected = unsafe { tls_test_snapshot() };
     if expected != (TLS_TEMPLATE_U64, TLS_TEMPLATE_BYTES, 0, [0; 16]) {
         TLS_SELF_TEST_RESULT.store(TLS_SELF_TEST_FAIL, Ordering::Release);

@@ -2,8 +2,8 @@ use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
-use x86_64::instructions::interrupts::without_interrupts;
 
+use crate::arch::interrupts::without_interrupts;
 use crate::memory::heap::HEAP_START;
 
 #[cfg(feature = "allocator-buddy")]

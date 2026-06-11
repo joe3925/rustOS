@@ -1,7 +1,7 @@
 use crate::cpu;
 use crate::memory::heap::{
-    MIMALLOC_ARENA_START, MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE, mimalloc_arena_size,
-    mimalloc_heap_end,
+    mimalloc_arena_size, mimalloc_heap_end, MIMALLOC_ARENA_START, MIMALLOC_HEAP_START,
+    MIMALLOC_OS_HEAP_SIZE,
 };
 use crate::memory::paging::paging::unmap_range_unchecked;
 use crate::structs::linked_list::{LinkedList, ListNode};
@@ -12,10 +12,10 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
-use x86_64::VirtAddr;
-use x86_64::align_up;
-use x86_64::instructions::interrupts::without_interrupts;
-use x86_64::structures::paging::PageTableFlags;
+
+use crate::arch::interrupts::without_interrupts;
+use crate::arch::paging::PageTableFlags;
+use crate::arch::{align_up, interrupts, VirtAddr};
 
 const PAGE_SIZE: usize = 4096;
 const MIMALLOC_STATS_ENABLED: bool = false;
@@ -647,7 +647,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
 
         let run_addr = tracker.track_start + run_start * MIMALLOC_COMMIT_GRANULARITY;
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
-        let start_addr = x86_64::VirtAddr::new(run_addr as u64);
+        let start_addr = VirtAddr::new(run_addr as u64);
 
         let res = without_interrupts(|| {
             crate::memory::paging::paging::map_fresh_kernel_range_no_flush(
@@ -842,8 +842,8 @@ pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}
 
 #[no_mangle]
 pub extern "C" fn rustos_mi_thread_yield() {
-    if x86_64::instructions::interrupts::are_enabled() {
-        x86_64::instructions::hlt();
+    if interrupts::are_enabled() {
+        interrupts::hlt();
     } else {
         core::hint::spin_loop();
     }

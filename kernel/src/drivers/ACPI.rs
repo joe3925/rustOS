@@ -7,7 +7,8 @@ use alloc::alloc::Global;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
-use x86_64::{PhysAddr, VirtAddr};
+
+use crate::arch::{PhysAddr, VirtAddr};
 
 lazy_static! {
     pub static ref ACPI_TABLES: ACPI = ACPI::new();

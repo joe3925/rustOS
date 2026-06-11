@@ -14,6 +14,10 @@ pub fn mimalloc_thread_done() {
     ALLOCATOR.mimalloc_thread_done();
 }
 
+use crate::arch::{
+    paging::{PageSize, PageTableFlags, Size1GiB, Size2MiB},
+    VirtAddr,
+};
 use crate::memory::heap::allocator::KernelAllocator;
 #[cfg(feature = "allocator-mimalloc")]
 use crate::memory::paging::frame_alloc::boot_usable_bytes;
@@ -23,8 +27,6 @@ use crate::memory::paging::tables::init_mapper;
 use crate::util::boot_info;
 #[cfg(feature = "allocator-mimalloc")]
 use core::sync::atomic::{AtomicUsize, Ordering};
-use x86_64::structures::paging::{PageSize, PageTableFlags, Size1GiB, Size2MiB};
-use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
 #[cfg(feature = "allocator-buddy")]

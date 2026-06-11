@@ -1,9 +1,27 @@
+use core::arch::asm;
 use core::arch::x86_64::_rdtsc;
 use raw_cpuid::{CpuId, CpuIdReaderNative};
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
 pub fn get_cycles() -> u64 {
     unsafe { _rdtsc() }
+}
+
+pub fn get_ordered_cycles() -> u64 {
+    let low: u32;
+    let high: u32;
+
+    unsafe {
+        asm!(
+            "lfence",
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    ((high as u64) << 32) | low as u64
 }
 pub fn wait_cycle(cycles: u128) {
     let start = get_cycles() as u128;

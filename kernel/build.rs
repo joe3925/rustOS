@@ -92,7 +92,7 @@ impl ImportLibTool {
         lib_out: &PathBuf,
     ) -> Result<std::process::ExitStatus, std::io::Error> {
         match self {
-            Self::LlvmDlltool => Command::new(self.name())
+            Self::LlvmDlltool => tool_command(self.name())
                 .arg("-d")
                 .arg(def_path)
                 .arg("-l")
@@ -100,13 +100,13 @@ impl ImportLibTool {
                 .arg("-m")
                 .arg("i386:x86-64")
                 .status(),
-            Self::LlvmLib => Command::new(self.name())
+            Self::LlvmLib => tool_command(self.name())
                 .arg("/NOLOGO")
                 .arg(format!("/DEF:{}", def_path.display()))
                 .arg(format!("/MACHINE:{}", machine_from_target(target)))
                 .arg(format!("/OUT:{}", lib_out.display()))
                 .status(),
-            Self::LldLink => Command::new(self.name())
+            Self::LldLink => tool_command(self.name())
                 .arg("/lib")
                 .arg("/NOLOGO")
                 .arg(format!("/DEF:{}", def_path.display()))
@@ -219,7 +219,7 @@ impl MsvcLibTool {
         objects: &[PathBuf],
         lib_out: &PathBuf,
     ) -> Result<std::process::ExitStatus, std::io::Error> {
-        let mut command = Command::new(self.name());
+        let mut command = tool_command(self.name());
 
         match self {
             Self::LlvmLib => {
@@ -242,7 +242,9 @@ fn main() {
     let target = env::var("TARGET").unwrap();
 
     emit_kernel_pe_link_args(&target);
-    compile_mimalloc(&manifest_dir, &target, &out_dir).expect("Failed to compile mimalloc");
+    if env::var_os("CARGO_FEATURE_ALLOCATOR_MIMALLOC").is_some() {
+        compile_mimalloc(&manifest_dir, &target, &out_dir).expect("Failed to compile mimalloc");
+    }
 
     let exports_path = manifest_dir.join("src").join("exports.rs");
     println!("cargo:rerun-if-changed={}", exports_path.display());
@@ -267,6 +269,58 @@ fn main() {
     fs::copy(&lib_out, &shared_lib).expect("Failed to copy kernel.lib to target/");
 
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn tool_command(name: &str) -> Command {
+    find_tool(name)
+        .map(Command::new)
+        .unwrap_or_else(|| Command::new(name))
+}
+
+fn find_tool(name: &str) -> Option<PathBuf> {
+    if let Some(path) = find_tool_in_path(name) {
+        return Some(path);
+    }
+
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let sysroot = String::from_utf8_lossy(&output.stdout);
+    let rustlib = PathBuf::from(sysroot.trim()).join("lib").join("rustlib");
+    let entries = fs::read_dir(rustlib).ok()?;
+
+    for entry in entries.flatten() {
+        let bin = entry.path().join("bin");
+        let gcc_ld = bin.join("gcc-ld").join(name);
+        if gcc_ld.is_file() {
+            return Some(gcc_ld);
+        }
+
+        let direct = bin.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+    }
+
+    None
+}
+
+fn find_tool_in_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 fn emit_kernel_pe_link_args(target: &str) {

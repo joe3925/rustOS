@@ -12,8 +12,8 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use goblin::pe::PE;
 use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+use goblin::pe::PE;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::{
@@ -21,13 +21,13 @@ use kernel_types::memory::{
 };
 use kernel_types::status::{LoadError, PageMapError};
 use spin::rwlock::RwLock;
-use x86_64::VirtAddr;
-use x86_64::instructions::interrupts;
-use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{PageTable, PhysFrame};
 
-use super::program::{PROGRAM_MANAGER, Program};
+use crate::arch::control::Cr3;
+use crate::arch::interrupts;
+use crate::arch::paging::{MapToError, PageTable, PhysFrame};
+use crate::arch::VirtAddr;
+
+use super::program::{Program, PROGRAM_MANAGER};
 
 pub struct PELoader {
     buffer: Box<[u8]>,
