@@ -27,7 +27,7 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
     kernel_types::{io::DeviceControlHandler, pnp::DeviceIds, request::RequestData},
-    memory::unmap_mmio_region,
+    memory::{unmap_mmio_region, VirtAddr},
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -185,7 +185,7 @@ fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
 
 #[derive(Clone, Copy)]
 struct MapToUnmap {
-    base: kernel_api::x86_64::VirtAddr,
+    base: VirtAddr,
     size: u64,
 }
 
@@ -193,7 +193,7 @@ struct MapToUnmap {
 struct BusWork {
     seg: McfgSegment,
     bus: u8,
-    bus_base: kernel_api::x86_64::VirtAddr,
+    bus_base: VirtAddr,
 }
 
 pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {

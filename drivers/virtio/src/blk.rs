@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::dma::{IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBufferDmaSegment};
-use kernel_api::x86_64::VirtAddr;
+use kernel_api::memory::VirtAddr;
 
 use crate::dma_region::ContiguousDmaRegion;
 use crate::pci;

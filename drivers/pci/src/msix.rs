@@ -3,11 +3,10 @@ use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 use kernel_api::device::DeviceObject;
-use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
+use kernel_api::memory::{map_mmio_region, unmap_mmio_region, PhysAddr, VirtAddr};
 use kernel_api::pnp::DriverStep;
 use kernel_api::request::{DeviceControl, RequestHandle};
 use kernel_api::status::DriverStatus;
-use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 use crate::dev_ext::{BarKind, PciPdoExt};
 

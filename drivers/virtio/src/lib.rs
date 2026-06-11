@@ -44,10 +44,10 @@ use kernel_api::kernel_types::dma::{
 use kernel_api::kernel_types::io::{
     DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo,
 };
-use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
+use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
-use kernel_api::memory::unmap_mmio_region;
+use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -58,7 +58,6 @@ use kernel_api::runtime::KernelStopwatch;
 use kernel_api::runtime::spawn_detached;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::panic_common;
-use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::{Mutex, RwLock};
 use temp_benchmark::{
@@ -365,7 +364,7 @@ pub extern "C" fn virtio_device_add(
 extern "C" fn virtio_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
@@ -387,7 +386,7 @@ extern "C" fn virtio_isr(
 extern "C" fn virtio_msix_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
     _ctx: usize,
 ) -> bool {
@@ -474,7 +473,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
     };
 
     let cfg_base = match kernel_api::memory::map_mmio_region(
-        kernel_api::x86_64::PhysAddr::new(cfg_phys),
+        PhysAddr::new(cfg_phys),
         cfg_len,
     ) {
         Ok(va) => va,

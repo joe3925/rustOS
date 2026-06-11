@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use kernel_sys::KernelAcpiHandler;
 
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_types::fdt::FdtHeader;
 use kernel_types::io::IoTarget;
 use kernel_types::status::{DriverError, DriverStatus};
 use kernel_types::{ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload};
@@ -141,4 +142,15 @@ pub fn driver_set_evt_driver_unload(driver: &Arc<DriverObject>, callback: EvtDri
 
 pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>> {
     unsafe { kernel_sys::get_acpi_tables() }
+}
+
+pub fn get_rsdp() -> Option<u64> {
+    match unsafe { kernel_sys::get_rsdp() } {
+        0 => None,
+        addr => Some(addr),
+    }
+}
+
+pub fn get_device_tree_blob() -> Option<*const FdtHeader> {
+    unsafe { kernel_sys::get_device_tree_blob() }
 }

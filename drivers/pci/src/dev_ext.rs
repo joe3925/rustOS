@@ -7,7 +7,7 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::device::DeviceObject;
-use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
+use kernel_api::memory::{map_mmio_region, unmap_mmio_region, PhysAddr, VirtAddr};
 use kernel_api::request::{Pnp, Request, RequestData, RequestHandle};
 use kernel_api::status::{DriverStatus, PageMapError};
 
@@ -16,10 +16,7 @@ use kernel_api::pnp::{
     pnp_forward_request_to_next_lower,
 };
 
-use kernel_api::{
-    println,
-    x86_64::{PhysAddr, VirtAddr},
-};
+use kernel_api::println;
 use spin::{Mutex, Once, RwLock};
 
 const PCI_CFG1_ADDR: u16 = 0xCF8;

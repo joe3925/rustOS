@@ -743,7 +743,6 @@ impl<T> IrqSafeMutex<T> {
     #[inline(always)]
     pub fn lock(&self) -> IrqSafeMutexGuard<'_, T> {
         let restore_interrupts = interrupts_enabled();
-        let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
@@ -757,11 +756,7 @@ impl<T> IrqSafeMutex<T> {
                 };
             }
 
-            if wait_with_hlt {
-                interrupts_enable_and_hlt();
-            } else {
-                core::hint::spin_loop();
-            }
+            core::hint::spin_loop();
         }
     }
 
@@ -843,7 +838,6 @@ impl<T> IrqSafeRwLock<T> {
     #[inline(always)]
     pub fn read(&self) -> IrqSafeRwLockReadGuard<'_, T> {
         let restore_interrupts = interrupts_enabled();
-        let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
@@ -857,11 +851,7 @@ impl<T> IrqSafeRwLock<T> {
                 };
             }
 
-            if wait_with_hlt {
-                interrupts_enable_and_hlt();
-            } else {
-                core::hint::spin_loop();
-            }
+            core::hint::spin_loop();
         }
     }
 
@@ -891,7 +881,6 @@ impl<T> IrqSafeRwLock<T> {
     #[inline(always)]
     pub fn write(&self) -> IrqSafeRwLockWriteGuard<'_, T> {
         let restore_interrupts = interrupts_enabled();
-        let wait_with_hlt = restore_interrupts && !in_interrupt_context();
 
         loop {
             if restore_interrupts {
@@ -905,11 +894,7 @@ impl<T> IrqSafeRwLock<T> {
                 };
             }
 
-            if wait_with_hlt {
-                interrupts_enable_and_hlt();
-            } else {
-                core::hint::spin_loop();
-            }
+            core::hint::spin_loop();
         }
     }
 

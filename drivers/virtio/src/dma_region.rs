@@ -8,9 +8,8 @@ use kernel_api::kernel_types::dma::{
 };
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
-    unmap_range,
+    unmap_range, VirtAddr,
 };
-use kernel_api::x86_64::VirtAddr;
 
 const MAX_DMA_MAP_BYTES: usize = IOBUFFER_MAX_PAGE_CAPACITY * IOBUFFER_PAGE_SIZE;
 

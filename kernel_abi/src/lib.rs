@@ -3,7 +3,7 @@
 use core::{ops, slice};
 
 pub const RUSTOS_BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_5045;
-pub const RUSTOS_BOOT_INFO_VERSION: u32 = 2;
+pub const RUSTOS_BOOT_INFO_VERSION: u32 = 3;
 
 pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 pub const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
@@ -33,6 +33,7 @@ pub struct BootInfo {
     pub physical_memory_offset: Optional<u64>,
     pub recursive_index: Optional<u16>,
     pub rsdp_addr: Optional<u64>,
+    pub fdt_header: Optional<*const FdtHeader>,
     pub tls_template: Optional<TlsTemplate>,
     pub pe_tls_directory: Optional<PeTlsDirectory>,
     pub kernel_imports: KernelSymbols,
@@ -65,6 +66,7 @@ impl BootInfo {
             physical_memory_offset: Optional::None,
             recursive_index: Optional::None,
             rsdp_addr: Optional::None,
+            fdt_header: Optional::None,
             tls_template: Optional::None,
             pe_tls_directory: Optional::None,
             kernel_imports: KernelSymbols {
@@ -92,6 +94,21 @@ impl BootInfo {
             stub_size: 0,
         }
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FdtHeader {
+    pub magic: u32,
+    pub totalsize: u32,
+    pub off_dt_struct: u32,
+    pub off_dt_strings: u32,
+    pub off_mem_rsvmap: u32,
+    pub version: u32,
+    pub last_comp_version: u32,
+    pub boot_cpuid_phys: u32,
+    pub size_dt_strings: u32,
+    pub size_dt_struct: u32,
 }
 
 #[derive(Debug)]

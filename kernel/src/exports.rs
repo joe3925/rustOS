@@ -28,6 +28,7 @@ export! {
     try_steal_blocking_one,
     get_rsdp,
     get_acpi_tables,
+    get_device_tree_blob,
     task_yield,
     allocate_auto_kernel_range_mapped,
     allocate_auto_kernel_range_mapped_contiguous,

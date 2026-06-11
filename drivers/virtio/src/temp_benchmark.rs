@@ -16,13 +16,12 @@ use kernel_api::kernel_types::dma::{
 };
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
-    unmap_range,
+    unmap_range, VirtAddr,
 };
 use kernel_api::pnp::pnp_send_request;
 use kernel_api::request::{Read, RequestHandle, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::status::DriverStatus;
-use kernel_api::x86_64::VirtAddr;
 use spin::Mutex;
 pub const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 pub const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;

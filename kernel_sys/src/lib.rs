@@ -24,6 +24,7 @@ use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
 
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_types::fdt::FdtHeader;
 use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
@@ -42,6 +43,7 @@ unsafe extern "C" {
     pub fn random_number() -> u64;
     pub fn wait_duration(time: Duration);
     pub fn get_rsdp() -> u64;
+    pub fn get_device_tree_blob() -> Option<*const FdtHeader>;
     pub unsafe fn get_current_cpu_id() -> usize;
     pub unsafe fn get_current_lapic_id() -> usize;
     pub fn stopwatch_new() -> Stopwatch;

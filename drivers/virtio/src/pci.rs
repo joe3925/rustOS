@@ -1,8 +1,7 @@
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
-use kernel_api::memory::map_mmio_region;
+use kernel_api::memory::{map_mmio_region, PhysAddr, VirtAddr};
 use kernel_api::pnp::ResourceKind;
-use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 /// Volatile reads/writes that remain defined on unaligned PCI/virtio registers.
 #[repr(C, packed)]

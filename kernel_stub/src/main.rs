@@ -433,6 +433,7 @@ fn build_handoff(
             physical_memory_offset: Optional::Some(PHYSICAL_MEMORY_OFFSET),
             recursive_index: translate_optional(boot_info.recursive_index),
             rsdp_addr: translate_optional(boot_info.rsdp_addr),
+            fdt_header: Optional::None,
             tls_template: Optional::None,
             pe_tls_directory,
             kernel_imports: KernelSymbols {

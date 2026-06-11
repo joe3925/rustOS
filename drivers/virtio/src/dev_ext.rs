@@ -7,7 +7,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::util::get_current_lapic_id;
-use kernel_api::x86_64::VirtAddr;
+use kernel_api::memory::VirtAddr;
 use spin::{Mutex, Once, RwLock, RwLockReadGuard};
 
 use crate::blk::BlkIoSlots;

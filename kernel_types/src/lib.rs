@@ -21,6 +21,7 @@ pub mod benchmark;
 pub mod bounded_mpmc;
 pub mod device;
 pub mod dma;
+pub mod fdt;
 pub mod fixed_slab;
 pub mod fs;
 pub mod io;

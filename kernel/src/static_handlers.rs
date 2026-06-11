@@ -63,6 +63,7 @@ use kernel_types::{
         DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
         DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
     },
+    fdt::FdtHeader,
     fs::{OpenFlags, Path},
     io::IoTarget,
     irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta},
@@ -332,6 +333,13 @@ pub extern "C" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
     ACPI_TABLES.get_tables()
 }
 
+pub extern "C" fn get_device_tree_blob() -> Option<*const FdtHeader> {
+    boot_info()
+        .fdt_header
+        .into_option()
+        .map(|ptr| ptr.cast::<FdtHeader>())
+}
+
 pub extern "C" fn pnp_create_pdo(
     parent_devnode: &Arc<DevNode>,
     name: String,
@@ -456,7 +464,7 @@ pub extern "C" fn driver_set_evt_driver_unload(
 }
 
 pub extern "C" fn get_rsdp() -> u64 {
-    boot_info().rsdp_addr.into_option().unwrap()
+    boot_info().rsdp_addr.into_option().unwrap_or(0)
 }
 
 pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(

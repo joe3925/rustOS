@@ -125,6 +125,7 @@ unsafe fn copy_boot_info(src: &BootInfo) {
         physical_memory_offset: src.physical_memory_offset,
         recursive_index: src.recursive_index,
         rsdp_addr: src.rsdp_addr,
+        fdt_header: src.fdt_header,
         tls_template: src.tls_template,
         pe_tls_directory: src.pe_tls_directory,
         kernel_imports,

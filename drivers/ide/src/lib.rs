@@ -26,7 +26,7 @@ use kernel_api::irq::{
 use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, IoBufferPageFrame, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
-use kernel_api::kernel_types::irq::IrqMeta;
+use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
@@ -195,7 +195,7 @@ fn write_buffer_cursor<'a>(
 extern "C" fn ide_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
