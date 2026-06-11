@@ -3,7 +3,8 @@ use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
-use crate::scheduling::scheduler::task_return_trampoline;
+use crate::scheduling::domain::{DomainId, TaskSchedBinding};
+use crate::scheduling::scheduler::{default_task_sched_binding, task_return_trampoline};
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
 use crate::vec::Vec;
@@ -83,6 +84,17 @@ pub struct TaskRef {
 
     /// Scheduler-restored kernel TLS pointer for this task.
     pub tls_thread_pointer: AtomicU64,
+
+    /// Active scheduler-domain binding and erased scheduler-class state.
+    sched_binding: RwLock<TaskSchedBinding>,
+    active_domain_id: AtomicU32,
+
+    /// Lazy domain migration target. The scheduler commits this at a point
+    /// where the task is not owned by an old-domain run queue.
+    pending_sched_binding: Mutex<Option<TaskSchedBinding>>,
+
+    /// Fast negative check for the common path where no lazy migration exists.
+    pending_sched_binding_present: AtomicBool,
 }
 
 /// Handle type used throughout the scheduler
@@ -172,6 +184,72 @@ impl TaskRef {
         self.id.store(id, Ordering::Relaxed);
     }
 
+    #[inline(always)]
+    pub fn domain_id(&self) -> DomainId {
+        DomainId(self.active_domain_id.load(Ordering::Acquire) as u16)
+    }
+
+    #[inline(always)]
+    pub(crate) fn with_class_state<T, R>(
+        &self,
+        expected_domain: DomainId,
+        f: impl FnOnce(&T) -> R,
+    ) -> R {
+        let binding = self.sched_binding.read();
+        assert_eq!(
+            binding.domain_id(),
+            expected_domain,
+            "task scheduled through non-owning domain"
+        );
+
+        let ptr = binding.class_state();
+        f(unsafe { ptr.cast::<T>().as_ref() })
+    }
+
+    pub(crate) fn set_pending_sched_binding(
+        &self,
+        sched_binding: TaskSchedBinding,
+    ) -> Result<(), TaskSchedBinding> {
+        let mut pending = self.pending_sched_binding.lock();
+        if pending.is_some() {
+            return Err(sched_binding);
+        }
+
+        *pending = Some(sched_binding);
+        self.pending_sched_binding_present
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_pending_sched_binding(&self) -> bool {
+        self.pending_sched_binding_present.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_pending_sched_binding(&self) -> Option<TaskSchedBinding> {
+        if !self.has_pending_sched_binding() {
+            return None;
+        }
+
+        let mut pending = self.pending_sched_binding.lock();
+        let binding = pending.take();
+        self.pending_sched_binding_present
+            .store(false, Ordering::Release);
+        binding
+    }
+
+    pub(crate) fn replace_sched_binding(
+        &self,
+        sched_binding: TaskSchedBinding,
+    ) -> TaskSchedBinding {
+        let new_domain_id = sched_binding.domain_id();
+        let mut active = self.sched_binding.write();
+        let old = core::mem::replace(&mut *active, sched_binding);
+        self.active_domain_id
+            .store(new_domain_id.0 as u32, Ordering::Release);
+        old
+    }
+
     /// Attempt to grow the kernel stack by one page.
     ///
     /// Called from the page-fault handler without holding `inner` — safe
@@ -258,6 +336,26 @@ impl Task {
         stack_pointer: VirtAddr,
         parent_pid: u64,
     ) -> TaskHandle {
+        Self::new_user_mode_with_sched_binding(
+            entry_point,
+            context,
+            stack_size,
+            name,
+            stack_pointer,
+            parent_pid,
+            default_task_sched_binding(),
+        )
+    }
+
+    pub fn new_user_mode_with_sched_binding(
+        entry_point: TaskEntry,
+        context: usize,
+        stack_size: u64,
+        name: String,
+        stack_pointer: VirtAddr,
+        parent_pid: u64,
+        sched_binding: TaskSchedBinding,
+    ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
         let cpu_id = get_cpu_info()
             .get_feature_info()
@@ -296,6 +394,8 @@ impl Task {
             last_cpu: AtomicUsize::new(usize::MAX),
         };
 
+        let active_domain_id = sched_binding.domain_id();
+
         Arc::new(TaskRef {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
@@ -310,6 +410,10 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size),
             tls_thread_pointer: AtomicU64::new(0),
+            sched_binding: RwLock::new(sched_binding),
+            active_domain_id: AtomicU32::new(active_domain_id.0 as u32),
+            pending_sched_binding: Mutex::new(None),
+            pending_sched_binding_present: AtomicBool::new(false),
         })
     }
 
@@ -319,6 +423,24 @@ impl Task {
         stack_size: StackSize,
         name: String,
         parent_pid: u64,
+    ) -> TaskHandle {
+        Self::new_kernel_mode_with_sched_binding(
+            entry_point,
+            context,
+            stack_size,
+            name,
+            parent_pid,
+            default_task_sched_binding(),
+        )
+    }
+
+    pub fn new_kernel_mode_with_sched_binding(
+        entry_point: TaskEntry,
+        context: usize,
+        stack_size: StackSize,
+        name: String,
+        parent_pid: u64,
+        sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
         let cpu_id = get_cpu_info()
@@ -362,6 +484,8 @@ impl Task {
             last_cpu: AtomicUsize::new(usize::MAX),
         };
 
+        let active_domain_id = sched_binding.domain_id();
+
         Arc::new(TaskRef {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
@@ -376,6 +500,10 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size.as_bytes()),
             tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
+            sched_binding: RwLock::new(sched_binding),
+            active_domain_id: AtomicU32::new(active_domain_id.0 as u32),
+            pending_sched_binding: Mutex::new(None),
+            pending_sched_binding_present: AtomicBool::new(false),
         })
     }
 

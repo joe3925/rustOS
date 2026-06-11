@@ -413,7 +413,9 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     spawn_detached(async move {
         loop {
             bench_async_vs_sync_call_latency_async().await;
-            //bench_c_drive_io_async(true).await;
+            bench_runtime_executor_async().await;
+            bench_c_drive_io_async(true).await;
+            test_full_heap_parallel();
         }
         // loop {
         //     bench_c_drive_io_async().await;

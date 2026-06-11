@@ -44,8 +44,7 @@ use kernel_types::device::DeviceObject;
 use kernel_types::dma::{
     BorrowedDmaMapping, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped,
     DmaMappingStrategy, DmaPciDeviceIdentity, IoBuffer, IoBufferDmaSegment, IoBufferPageFrame,
-    PhysFramed, ToDevice,
-    DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
+    PhysFramed, ToDevice, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
     DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, IOBUFFER_INLINE_SEGMENT_CAPACITY,
     IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE,
 };
@@ -1930,5 +1929,3 @@ const IVRS_DEVICE_EXT_SELECT: u8 = 0x46;
 const IVRS_DEVICE_EXT_START_RANGE: u8 = 0x47;
 const IVRS_DEVICE_SPECIAL: u8 = 0x48;
 const IVRS_DEVICE_ACPI_HID: u8 = 0xF0;
-
-

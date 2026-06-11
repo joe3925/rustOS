@@ -2,7 +2,7 @@ use crate::drivers::interrupt_index::IpiDest;
 use crate::drivers::interrupt_index::IpiKind;
 use crate::drivers::interrupt_index::LocalApic;
 use crate::drivers::timer_driver::NUM_CORES;
-use crate::idt::TLB_FLUSH_VECTOR;
+use crate::idt::{InterruptGuard, NestedInterruptEnableGuard, TLB_FLUSH_VECTOR};
 use crate::util::MAX_CPUS;
 use crate::{
     cpu::get_cpu_info,
@@ -1073,6 +1073,8 @@ fn flush_current_tlb_shootdown_request() {
 }
 
 extern "win64" fn tlb_flush_ipi() {
+    let _guard = InterruptGuard::new();
+    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     flush_current_tlb_shootdown_request();
     let cpu = current_cpu_id();
     if cpu < MAX_CPUS {

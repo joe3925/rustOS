@@ -23,7 +23,9 @@ pub use interrupt_impl::*;
 const IRQ_SAVED_GPR_BYTES: usize = 15 * 8;
 
 extern "win64" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
-    let _fpu_guard = KernelFpuGuard::new();
+    let interrupt_guard = InterruptGuard::new();
+    let _fpu_guard = interrupt_guard.is_outermost().then(KernelFpuGuard::new);
+    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let frame = unsafe { &mut *frame };
     irq_dispatch(vector, frame);
 }

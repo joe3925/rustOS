@@ -370,6 +370,10 @@ pub fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
     &current_percpu().is_in_interrupt
 }
 
+extern "win64" fn current_is_in_interrupt() -> bool {
+    current_is_in_interrupt_atomic().load(Ordering::Acquire)
+}
+
 #[inline(always)]
 pub fn is_in_interrupt_atomic_for(lapic_id: u32) -> &'static AtomicBool {
     &alloc_or_get_percpu_for(lapic_id).is_in_interrupt
@@ -1007,6 +1011,7 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
         (*(ptr as *mut PerCpu)).tls_array_pointer = 0;
     }
     set_gs_bases(ptr);
+    kernel_types::irq::set_irq_context_query(current_is_in_interrupt);
     p
 }
 

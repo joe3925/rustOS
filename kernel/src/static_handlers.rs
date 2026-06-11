@@ -61,8 +61,7 @@ use kernel_types::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::{
         DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
-        DmaPciDeviceIdentity, IoBuffer, ToDevice,
-        PhysFramed,
+        DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
     },
     fs::{OpenFlags, Path},
     io::IoTarget,

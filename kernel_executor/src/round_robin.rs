@@ -1,40 +1,40 @@
 use alloc::collections::VecDeque;
 
-use crate::domain::{DomainId, DomainTable};
+use crate::domain::{ExecutorDomainId, ExecutorDomainTable};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScheduledDomain {
-    pub domain_id: DomainId,
+    pub domain_id: ExecutorDomainId,
     pub budget: usize,
 }
 
 pub trait SchedulerPolicy: Send {
-    fn on_domain_runnable(&mut self, domain_id: DomainId);
-    fn pick_next_domain(&mut self, domain_table: &DomainTable) -> Option<ScheduledDomain>;
+    fn on_domain_runnable(&mut self, domain_id: ExecutorDomainId);
+    fn pick_next_domain(&mut self, domain_table: &ExecutorDomainTable) -> Option<ScheduledDomain>;
     fn on_domain_ran(
         &mut self,
-        domain_table: &DomainTable,
-        domain_id: DomainId,
+        domain_table: &ExecutorDomainTable,
+        domain_id: ExecutorDomainId,
         ran_count: usize,
         still_runnable: bool,
     );
-    fn on_domain_empty(&mut self, domain_id: DomainId);
-    fn on_domain_rejected(&mut self, domain_id: DomainId);
+    fn on_domain_empty(&mut self, domain_id: ExecutorDomainId);
+    fn on_domain_rejected(&mut self, domain_id: ExecutorDomainId);
     fn runnable_len(&self) -> usize;
 }
 
-fn push_unique(queue: &mut VecDeque<DomainId>, domain_id: DomainId) {
+fn push_unique(queue: &mut VecDeque<ExecutorDomainId>, domain_id: ExecutorDomainId) {
     if !queue.iter().any(|queued| *queued == domain_id) {
         queue.push_back(domain_id);
     }
 }
 
-fn remove_all(queue: &mut VecDeque<DomainId>, domain_id: DomainId) {
+fn remove_all(queue: &mut VecDeque<ExecutorDomainId>, domain_id: ExecutorDomainId) {
     queue.retain(|queued| *queued != domain_id);
 }
 
 pub struct SimpleRoundRobinScheduler {
-    runnable: VecDeque<DomainId>,
+    runnable: VecDeque<ExecutorDomainId>,
 }
 
 impl SimpleRoundRobinScheduler {
@@ -52,11 +52,11 @@ impl Default for SimpleRoundRobinScheduler {
 }
 
 impl SchedulerPolicy for SimpleRoundRobinScheduler {
-    fn on_domain_runnable(&mut self, domain_id: DomainId) {
+    fn on_domain_runnable(&mut self, domain_id: ExecutorDomainId) {
         push_unique(&mut self.runnable, domain_id);
     }
 
-    fn pick_next_domain(&mut self, domain_table: &DomainTable) -> Option<ScheduledDomain> {
+    fn pick_next_domain(&mut self, domain_table: &ExecutorDomainTable) -> Option<ScheduledDomain> {
         let attempts = self.runnable.len();
         let mut checked = 0usize;
 
@@ -67,7 +67,7 @@ impl SchedulerPolicy for SimpleRoundRobinScheduler {
 
             checked += 1;
 
-            let Some(domain) = domain_table.get_domain(domain_id) else {
+            let Some(domain) = domain_table.get_executor_domain(domain_id) else {
                 continue;
             };
 
@@ -92,8 +92,8 @@ impl SchedulerPolicy for SimpleRoundRobinScheduler {
 
     fn on_domain_ran(
         &mut self,
-        _domain_table: &DomainTable,
-        domain_id: DomainId,
+        _domain_table: &ExecutorDomainTable,
+        domain_id: ExecutorDomainId,
         _ran_count: usize,
         still_runnable: bool,
     ) {
@@ -104,11 +104,11 @@ impl SchedulerPolicy for SimpleRoundRobinScheduler {
         }
     }
 
-    fn on_domain_empty(&mut self, domain_id: DomainId) {
+    fn on_domain_empty(&mut self, domain_id: ExecutorDomainId) {
         remove_all(&mut self.runnable, domain_id);
     }
 
-    fn on_domain_rejected(&mut self, _domain_id: DomainId) {}
+    fn on_domain_rejected(&mut self, _domain_id: ExecutorDomainId) {}
 
     fn runnable_len(&self) -> usize {
         self.runnable.len()
@@ -116,7 +116,7 @@ impl SchedulerPolicy for SimpleRoundRobinScheduler {
 }
 
 pub struct WeightedDeficitRoundRobinScheduler {
-    runnable: VecDeque<DomainId>,
+    runnable: VecDeque<ExecutorDomainId>,
 }
 
 impl WeightedDeficitRoundRobinScheduler {
@@ -134,11 +134,11 @@ impl Default for WeightedDeficitRoundRobinScheduler {
 }
 
 impl SchedulerPolicy for WeightedDeficitRoundRobinScheduler {
-    fn on_domain_runnable(&mut self, domain_id: DomainId) {
+    fn on_domain_runnable(&mut self, domain_id: ExecutorDomainId) {
         push_unique(&mut self.runnable, domain_id);
     }
 
-    fn pick_next_domain(&mut self, domain_table: &DomainTable) -> Option<ScheduledDomain> {
+    fn pick_next_domain(&mut self, domain_table: &ExecutorDomainTable) -> Option<ScheduledDomain> {
         let attempts = self.runnable.len();
         let mut checked = 0usize;
 
@@ -149,7 +149,7 @@ impl SchedulerPolicy for WeightedDeficitRoundRobinScheduler {
 
             checked += 1;
 
-            let Some(domain) = domain_table.get_domain(domain_id) else {
+            let Some(domain) = domain_table.get_executor_domain(domain_id) else {
                 continue;
             };
 
@@ -174,8 +174,8 @@ impl SchedulerPolicy for WeightedDeficitRoundRobinScheduler {
 
     fn on_domain_ran(
         &mut self,
-        domain_table: &DomainTable,
-        domain_id: DomainId,
+        domain_table: &ExecutorDomainTable,
+        domain_id: ExecutorDomainId,
         ran_count: usize,
         still_runnable: bool,
     ) {
@@ -185,16 +185,16 @@ impl SchedulerPolicy for WeightedDeficitRoundRobinScheduler {
             remove_all(&mut self.runnable, domain_id);
         }
 
-        if let Some(domain) = domain_table.get_domain(domain_id) {
+        if let Some(domain) = domain_table.get_executor_domain(domain_id) {
             domain.spend_deficit(ran_count.max(1));
         }
     }
 
-    fn on_domain_empty(&mut self, domain_id: DomainId) {
+    fn on_domain_empty(&mut self, domain_id: ExecutorDomainId) {
         remove_all(&mut self.runnable, domain_id);
     }
 
-    fn on_domain_rejected(&mut self, _domain_id: DomainId) {}
+    fn on_domain_rejected(&mut self, _domain_id: ExecutorDomainId) {}
 
     fn runnable_len(&self) -> usize {
         self.runnable.len()

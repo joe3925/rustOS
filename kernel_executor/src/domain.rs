@@ -26,9 +26,9 @@ const MAX_DOMAIN_SLOTS: usize = DOMAIN_CHUNK_SIZE * MAX_DOMAIN_CHUNKS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct DomainId(u64);
+pub struct ExecutorDomainId(u64);
 
-impl DomainId {
+impl ExecutorDomainId {
     pub const fn from_parts(slot: u32, generation: u32) -> Self {
         Self(((generation as u64) << 32) | slot as u64)
     }
@@ -50,16 +50,18 @@ impl DomainId {
     }
 }
 
-pub const KERNEL_HIGH_DOMAIN: DomainId = DomainId::from_parts(KERNEL_HIGH_SLOT, BUILTIN_GENERATION);
-pub const DRIVER_DOMAIN: DomainId = DomainId::from_parts(DRIVER_SLOT, BUILTIN_GENERATION);
-pub const KERNEL_NORMAL_DOMAIN: DomainId =
-    DomainId::from_parts(KERNEL_NORMAL_SLOT, BUILTIN_GENERATION);
-pub const KERNEL_BACKGROUND_DOMAIN: DomainId =
-    DomainId::from_parts(KERNEL_BACKGROUND_SLOT, BUILTIN_GENERATION);
+pub const KERNEL_HIGH_EXECUTOR_DOMAIN: ExecutorDomainId =
+    ExecutorDomainId::from_parts(KERNEL_HIGH_SLOT, BUILTIN_GENERATION);
+pub const DRIVER_EXECUTOR_DOMAIN: ExecutorDomainId =
+    ExecutorDomainId::from_parts(DRIVER_SLOT, BUILTIN_GENERATION);
+pub const KERNEL_NORMAL_EXECUTOR_DOMAIN: ExecutorDomainId =
+    ExecutorDomainId::from_parts(KERNEL_NORMAL_SLOT, BUILTIN_GENERATION);
+pub const KERNEL_BACKGROUND_EXECUTOR_DOMAIN: ExecutorDomainId =
+    ExecutorDomainId::from_parts(KERNEL_BACKGROUND_SLOT, BUILTIN_GENERATION);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum DomainClass {
+pub enum ExecutorDomainClass {
     KernelHigh = 0,
     Driver = 1,
     KernelNormal = 2,
@@ -67,24 +69,24 @@ pub enum DomainClass {
     KernelBackground = 4,
 }
 
-impl DomainClass {
+impl ExecutorDomainClass {
     pub const fn default_weight(self) -> usize {
         match self {
-            DomainClass::KernelHigh => 8,
-            DomainClass::Driver => 6,
-            DomainClass::KernelNormal => 4,
-            DomainClass::ProcessIo => 3,
-            DomainClass::KernelBackground => 1,
+            ExecutorDomainClass::KernelHigh => 8,
+            ExecutorDomainClass::Driver => 6,
+            ExecutorDomainClass::KernelNormal => 4,
+            ExecutorDomainClass::ProcessIo => 3,
+            ExecutorDomainClass::KernelBackground => 1,
         }
     }
 
     pub const fn default_quantum(self) -> usize {
         match self {
-            DomainClass::KernelHigh => 8,
-            DomainClass::Driver => 6,
-            DomainClass::KernelNormal => 4,
-            DomainClass::ProcessIo => 4,
-            DomainClass::KernelBackground => 1,
+            ExecutorDomainClass::KernelHigh => 8,
+            ExecutorDomainClass::Driver => 6,
+            ExecutorDomainClass::KernelNormal => 4,
+            ExecutorDomainClass::ProcessIo => 4,
+            ExecutorDomainClass::KernelBackground => 1,
         }
     }
 
@@ -92,63 +94,63 @@ impl DomainClass {
         let cpu_count = cpu_count.max(1);
 
         match self {
-            DomainClass::KernelHigh => cpu_count,
-            DomainClass::Driver => (cpu_count / 2).max(1),
-            DomainClass::KernelNormal => cpu_count,
-            DomainClass::ProcessIo => (cpu_count / 4).max(1),
-            DomainClass::KernelBackground => 1,
+            ExecutorDomainClass::KernelHigh => cpu_count,
+            ExecutorDomainClass::Driver => (cpu_count / 2).max(1),
+            ExecutorDomainClass::KernelNormal => cpu_count,
+            ExecutorDomainClass::ProcessIo => (cpu_count / 4).max(1),
+            ExecutorDomainClass::KernelBackground => 1,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum DomainState {
+pub enum ExecutorDomainState {
     Active = 0,
     Draining = 1,
     Dead = 2,
 }
 
-impl DomainState {
+impl ExecutorDomainState {
     const fn from_u8(value: u8) -> Self {
         match value {
-            0 => DomainState::Active,
-            1 => DomainState::Draining,
-            _ => DomainState::Dead,
+            0 => ExecutorDomainState::Active,
+            1 => ExecutorDomainState::Draining,
+            _ => ExecutorDomainState::Dead,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum AdmissionPolicy {
+pub enum ExecutorAdmissionPolicy {
     RejectWhenFull = 0,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct DomainConfig {
-    pub class: DomainClass,
+pub struct ExecutorDomainConfig {
+    pub class: ExecutorDomainClass,
     pub max_active: usize,
     pub max_queued: usize,
     pub quantum: usize,
     pub weight: usize,
-    pub admission_policy: AdmissionPolicy,
+    pub admission_policy: ExecutorAdmissionPolicy,
 }
 
-impl DomainConfig {
-    pub fn for_class(class: DomainClass, cpu_count: usize, max_queued: usize) -> Self {
+impl ExecutorDomainConfig {
+    pub fn for_class(class: ExecutorDomainClass, cpu_count: usize, max_queued: usize) -> Self {
         Self {
             class,
             max_active: class.default_max_active(cpu_count),
             max_queued,
             quantum: class.default_quantum(),
             weight: class.default_weight(),
-            admission_policy: AdmissionPolicy::RejectWhenFull,
+            admission_policy: ExecutorAdmissionPolicy::RejectWhenFull,
         }
     }
 
     pub fn kernel_normal(cpu_count: usize, max_queued: usize) -> Self {
-        Self::for_class(DomainClass::KernelNormal, cpu_count, max_queued)
+        Self::for_class(ExecutorDomainClass::KernelNormal, cpu_count, max_queued)
     }
 
     fn normalized(mut self) -> Self {
@@ -160,14 +162,14 @@ impl DomainConfig {
     }
 }
 
-impl Default for DomainConfig {
+impl Default for ExecutorDomainConfig {
     fn default() -> Self {
         Self::kernel_normal(1, 1024)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubmitErrorKind {
+pub enum ExecutorSubmitErrorKind {
     ExecutorUninitialized,
     InvalidDomain,
     StaleDomain,
@@ -177,14 +179,18 @@ pub enum SubmitErrorKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct SubmitError {
-    pub kind: SubmitErrorKind,
-    pub domain_id: DomainId,
+pub struct ExecutorSubmitError {
+    pub kind: ExecutorSubmitErrorKind,
+    pub domain_id: ExecutorDomainId,
     pub work_item: WorkItem,
 }
 
-impl SubmitError {
-    pub(crate) fn new(kind: SubmitErrorKind, domain_id: DomainId, work_item: WorkItem) -> Self {
+impl ExecutorSubmitError {
+    pub(crate) fn new(
+        kind: ExecutorSubmitErrorKind,
+        domain_id: ExecutorDomainId,
+        work_item: WorkItem,
+    ) -> Self {
         Self {
             kind,
             domain_id,
@@ -198,29 +204,29 @@ impl SubmitError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DestroyDomainError {
+pub enum DestroyExecutorDomainError {
     InvalidDomain,
     StaleDomain,
     BuiltinDomain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DestroyDomainResult {
+pub enum DestroyExecutorDomainResult {
     Destroyed,
     Draining,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct DomainStats {
-    pub domain_id: DomainId,
+pub struct ExecutorDomainStats {
+    pub domain_id: ExecutorDomainId,
     pub generation: u32,
-    pub class: DomainClass,
-    pub state: DomainState,
+    pub class: ExecutorDomainClass,
+    pub state: ExecutorDomainState,
     pub queued_count: usize,
     pub active_count: usize,
     pub max_active: usize,
     pub max_queued: usize,
-    pub admission_policy: AdmissionPolicy,
+    pub admission_policy: ExecutorAdmissionPolicy,
     pub quantum: usize,
     pub weight: usize,
     pub deficit: usize,
@@ -237,7 +243,7 @@ pub struct DomainStats {
 pub struct GlobalExecutorStats {
     pub active_pumps: usize,
     pub max_pumps: usize,
-    pub runnable_domain_count: usize,
+    pub runnable_executor_domain_count: usize,
     pub domain_count: usize,
     pub total_submissions: usize,
     pub total_rejections: usize,
@@ -332,10 +338,10 @@ impl ShardedQueues {
 }
 
 pub struct ExecutorDomain {
-    id: DomainId,
+    id: ExecutorDomainId,
     generation: u32,
-    class: DomainClass,
-    admission_policy: AdmissionPolicy,
+    class: ExecutorDomainClass,
+    admission_policy: ExecutorAdmissionPolicy,
     queues: ShardedQueues,
 
     state: AtomicU8,
@@ -360,7 +366,7 @@ pub struct ExecutorDomain {
 }
 
 impl ExecutorDomain {
-    fn new(id: DomainId, config: DomainConfig, shards: usize) -> Self {
+    fn new(id: ExecutorDomainId, config: ExecutorDomainConfig, shards: usize) -> Self {
         let config = config.normalized();
 
         Self {
@@ -370,7 +376,7 @@ impl ExecutorDomain {
             admission_policy: config.admission_policy,
             queues: ShardedQueues::new(shards, config.max_queued),
 
-            state: AtomicU8::new(DomainState::Active as u8),
+            state: AtomicU8::new(ExecutorDomainState::Active as u8),
             max_queued: config.max_queued,
 
             scheduled_count: CacheAligned(AtomicUsize::new(0)),
@@ -406,16 +412,16 @@ impl ExecutorDomain {
         self.scheduled_count.0.store(0, Ordering::Release);
     }
 
-    pub fn id(&self) -> DomainId {
+    pub fn id(&self) -> ExecutorDomainId {
         self.id
     }
 
-    pub fn class(&self) -> DomainClass {
+    pub fn class(&self) -> ExecutorDomainClass {
         self.class
     }
 
-    pub fn state(&self) -> DomainState {
-        DomainState::from_u8(self.state.load(Ordering::Acquire))
+    pub fn state(&self) -> ExecutorDomainState {
+        ExecutorDomainState::from_u8(self.state.load(Ordering::Acquire))
     }
 
     pub fn quantum(&self) -> usize {
@@ -443,7 +449,7 @@ impl ExecutorDomain {
     }
 
     pub fn is_runnable_for_policy(&self) -> bool {
-        self.state() != DomainState::Dead && self.has_queued_work()
+        self.state() != ExecutorDomainState::Dead && self.has_queued_work()
     }
 
     pub fn is_at_active_limit(&self) -> bool {
@@ -486,20 +492,24 @@ impl ExecutorDomain {
 
     fn try_submit_work(
         &self,
-        domain_id: DomainId,
+        domain_id: ExecutorDomainId,
         work_item: WorkItem,
-    ) -> Result<bool, SubmitError> {
+    ) -> Result<bool, ExecutorSubmitError> {
         match self.state() {
-            DomainState::Active => {}
-            DomainState::Draining => {
+            ExecutorDomainState::Active => {}
+            ExecutorDomainState::Draining => {
                 return Err(self.reject_submit(
-                    SubmitErrorKind::DomainDraining,
+                    ExecutorSubmitErrorKind::DomainDraining,
                     domain_id,
                     work_item,
                 ));
             }
-            DomainState::Dead => {
-                return Err(self.reject_submit(SubmitErrorKind::DomainDead, domain_id, work_item));
+            ExecutorDomainState::Dead => {
+                return Err(self.reject_submit(
+                    ExecutorSubmitErrorKind::DomainDead,
+                    domain_id,
+                    work_item,
+                ));
             }
         }
 
@@ -513,21 +523,21 @@ impl ExecutorDomain {
                 Ok(previous) => previous,
                 Err(_) => {
                     return Err(self.reject_submit(
-                        SubmitErrorKind::DomainFull,
+                        ExecutorSubmitErrorKind::DomainFull,
                         domain_id,
                         work_item,
                     ));
                 }
             };
 
-        if self.state() != DomainState::Active {
+        if self.state() != ExecutorDomainState::Active {
             self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
 
             return Err(self.reject_submit(
                 match self.state() {
-                    DomainState::Active => SubmitErrorKind::DomainFull,
-                    DomainState::Draining => SubmitErrorKind::DomainDraining,
-                    DomainState::Dead => SubmitErrorKind::DomainDead,
+                    ExecutorDomainState::Active => ExecutorSubmitErrorKind::DomainFull,
+                    ExecutorDomainState::Draining => ExecutorSubmitErrorKind::DomainDraining,
+                    ExecutorDomainState::Dead => ExecutorSubmitErrorKind::DomainDead,
                 },
                 domain_id,
                 work_item,
@@ -536,7 +546,11 @@ impl ExecutorDomain {
 
         if let Err(work_item) = self.queues.try_push(work_item) {
             self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
-            return Err(self.reject_submit(SubmitErrorKind::DomainFull, domain_id, work_item));
+            return Err(self.reject_submit(
+                ExecutorSubmitErrorKind::DomainFull,
+                domain_id,
+                work_item,
+            ));
         }
 
         self.submitted.0.fetch_add(1, Ordering::Relaxed);
@@ -609,30 +623,31 @@ impl ExecutorDomain {
     #[cold]
     fn reject_submit(
         &self,
-        kind: SubmitErrorKind,
-        domain_id: DomainId,
+        kind: ExecutorSubmitErrorKind,
+        domain_id: ExecutorDomainId,
         work_item: WorkItem,
-    ) -> SubmitError {
+    ) -> ExecutorSubmitError {
         self.record_rejection();
-        SubmitError::new(kind, domain_id, work_item)
+        ExecutorSubmitError::new(kind, domain_id, work_item)
     }
 
     fn move_to_draining(&self) {
         let _ = self.state.compare_exchange(
-            DomainState::Active as u8,
-            DomainState::Draining as u8,
+            ExecutorDomainState::Active as u8,
+            ExecutorDomainState::Draining as u8,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
     }
 
     fn move_to_dead(&self) {
-        self.state.store(DomainState::Dead as u8, Ordering::Release);
+        self.state
+            .store(ExecutorDomainState::Dead as u8, Ordering::Release);
         self.clear_runnable();
     }
 
     pub(crate) fn maybe_finish_draining(&self) {
-        if self.state() == DomainState::Draining
+        if self.state() == ExecutorDomainState::Draining
             && self.queued_count() == 0
             && self.active_count() == 0
         {
@@ -640,8 +655,8 @@ impl ExecutorDomain {
         }
     }
 
-    pub fn stats(&self) -> DomainStats {
-        DomainStats {
+    pub fn stats(&self) -> ExecutorDomainStats {
+        ExecutorDomainStats {
             domain_id: self.id,
             generation: self.generation,
             class: self.class,
@@ -709,13 +724,13 @@ impl DomainChunk {
     }
 }
 
-pub struct DomainTable {
+pub struct ExecutorDomainTable {
     shards: usize,
     next_slot: AtomicUsize,
     chunks: [AtomicPtr<DomainChunk>; MAX_DOMAIN_CHUNKS],
 }
 
-impl DomainTable {
+impl ExecutorDomainTable {
     pub(crate) fn new(shards: usize, max_work_items: usize) -> Self {
         let table = Self {
             shards: shards.max(1),
@@ -725,19 +740,31 @@ impl DomainTable {
 
         table.install_builtin(
             KERNEL_HIGH_SLOT,
-            DomainConfig::for_class(DomainClass::KernelHigh, shards, max_work_items),
+            ExecutorDomainConfig::for_class(
+                ExecutorDomainClass::KernelHigh,
+                shards,
+                max_work_items,
+            ),
         );
         table.install_builtin(
             DRIVER_SLOT,
-            DomainConfig::for_class(DomainClass::Driver, shards, max_work_items),
+            ExecutorDomainConfig::for_class(ExecutorDomainClass::Driver, shards, max_work_items),
         );
         table.install_builtin(
             KERNEL_NORMAL_SLOT,
-            DomainConfig::for_class(DomainClass::KernelNormal, shards, max_work_items),
+            ExecutorDomainConfig::for_class(
+                ExecutorDomainClass::KernelNormal,
+                shards,
+                max_work_items,
+            ),
         );
         table.install_builtin(
             KERNEL_BACKGROUND_SLOT,
-            DomainConfig::for_class(DomainClass::KernelBackground, shards, max_work_items),
+            ExecutorDomainConfig::for_class(
+                ExecutorDomainClass::KernelBackground,
+                shards,
+                max_work_items,
+            ),
         );
 
         table
@@ -820,9 +847,9 @@ impl DomainTable {
         Some(unsafe { &(*chunk).slots[idx] })
     }
 
-    fn install_builtin(&self, slot_idx: u32, config: DomainConfig) {
+    fn install_builtin(&self, slot_idx: u32, config: ExecutorDomainConfig) {
         let slot_idx = slot_idx as usize;
-        let id = DomainId::from_parts(slot_idx as u32, BUILTIN_GENERATION);
+        let id = ExecutorDomainId::from_parts(slot_idx as u32, BUILTIN_GENERATION);
         let slot = self.get_or_create_slot(slot_idx);
 
         slot.state.store(DOMAIN_SLOT_RESERVED, Ordering::Release);
@@ -838,7 +865,7 @@ impl DomainTable {
         self.publish_slot_count(slot_idx + 1);
     }
 
-    pub fn create_domain(&self, config: DomainConfig) -> DomainId {
+    pub fn create_executor_domain(&self, config: ExecutorDomainConfig) -> ExecutorDomainId {
         let config = config.normalized();
 
         if let Some((idx, slot)) = self.reserve_reusable_slot() {
@@ -899,9 +926,14 @@ impl DomainTable {
         None
     }
 
-    fn install_user_domain(&self, idx: usize, slot: &DomainSlot, config: DomainConfig) -> DomainId {
+    fn install_user_domain(
+        &self,
+        idx: usize,
+        slot: &DomainSlot,
+        config: ExecutorDomainConfig,
+    ) -> ExecutorDomainId {
         let generation = slot.generation.load(Ordering::Acquire).max(1) as u32;
-        let id = DomainId::from_parts(idx as u32, generation);
+        let id = ExecutorDomainId::from_parts(idx as u32, generation);
 
         let domain = Arc::new(ExecutorDomain::new(id, config, self.shards));
         let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
@@ -912,30 +944,30 @@ impl DomainTable {
         id
     }
 
-    pub fn destroy_domain(
+    pub fn destroy_executor_domain(
         &self,
-        domain_id: DomainId,
-    ) -> Result<DestroyDomainResult, DestroyDomainError> {
+        domain_id: ExecutorDomainId,
+    ) -> Result<DestroyExecutorDomainResult, DestroyExecutorDomainError> {
         let slot = self
             .get_existing_slot(domain_id.slot() as usize)
-            .ok_or(DestroyDomainError::InvalidDomain)?;
+            .ok_or(DestroyExecutorDomainError::InvalidDomain)?;
 
         let slot_state = slot.state.load(Ordering::Acquire);
 
         if slot_state == DOMAIN_SLOT_BUILTIN {
-            return Err(DestroyDomainError::BuiltinDomain);
+            return Err(DestroyExecutorDomainError::BuiltinDomain);
         }
 
         if slot_state != DOMAIN_SLOT_ACTIVE {
-            return Err(DestroyDomainError::InvalidDomain);
+            return Err(DestroyExecutorDomainError::InvalidDomain);
         }
 
         if slot.generation() != domain_id.generation() {
-            return Err(DestroyDomainError::StaleDomain);
+            return Err(DestroyExecutorDomainError::StaleDomain);
         }
 
-        let Some(domain) = self.get_domain(domain_id) else {
-            return Err(DestroyDomainError::InvalidDomain);
+        let Some(domain) = self.get_executor_domain(domain_id) else {
+            return Err(DestroyExecutorDomainError::InvalidDomain);
         };
 
         if domain.queued_count() == 0 && domain.active_count() == 0 {
@@ -951,7 +983,7 @@ impl DomainTable {
                 )
                 .is_err()
             {
-                return Err(DestroyDomainError::InvalidDomain);
+                return Err(DestroyExecutorDomainError::InvalidDomain);
             }
 
             slot.domain.store(ptr::null_mut(), Ordering::Release);
@@ -961,14 +993,14 @@ impl DomainTable {
                 .store(next_generation as usize, Ordering::Release);
             slot.state.store(DOMAIN_SLOT_EMPTY, Ordering::Release);
 
-            return Ok(DestroyDomainResult::Destroyed);
+            return Ok(DestroyExecutorDomainResult::Destroyed);
         }
 
         domain.move_to_draining();
-        Ok(DestroyDomainResult::Draining)
+        Ok(DestroyExecutorDomainResult::Draining)
     }
 
-    pub fn get_domain(&self, domain_id: DomainId) -> Option<Arc<ExecutorDomain>> {
+    pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
         if !domain_id.is_valid() {
             return None;
         }
@@ -1009,12 +1041,12 @@ impl DomainTable {
 
     fn resolve_submit_domain(
         &self,
-        domain_id: DomainId,
+        domain_id: ExecutorDomainId,
         work_item: WorkItem,
-    ) -> Result<Arc<ExecutorDomain>, SubmitError> {
+    ) -> Result<Arc<ExecutorDomain>, ExecutorSubmitError> {
         if !domain_id.is_valid() {
             return Err(Self::invalid_submit(
-                SubmitErrorKind::InvalidDomain,
+                ExecutorSubmitErrorKind::InvalidDomain,
                 domain_id,
                 work_item,
             ));
@@ -1022,7 +1054,7 @@ impl DomainTable {
 
         let Some(slot) = self.get_existing_slot(domain_id.slot() as usize) else {
             return Err(Self::invalid_submit(
-                SubmitErrorKind::InvalidDomain,
+                ExecutorSubmitErrorKind::InvalidDomain,
                 domain_id,
                 work_item,
             ));
@@ -1032,7 +1064,7 @@ impl DomainTable {
 
         if slot.generation() != domain_id.generation() {
             return Err(Self::invalid_submit(
-                SubmitErrorKind::StaleDomain,
+                ExecutorSubmitErrorKind::StaleDomain,
                 domain_id,
                 work_item,
             ));
@@ -1040,15 +1072,15 @@ impl DomainTable {
 
         if slot_state != DOMAIN_SLOT_ACTIVE && slot_state != DOMAIN_SLOT_BUILTIN {
             return Err(Self::invalid_submit(
-                SubmitErrorKind::InvalidDomain,
+                ExecutorSubmitErrorKind::InvalidDomain,
                 domain_id,
                 work_item,
             ));
         }
 
-        let Some(domain) = self.get_domain(domain_id) else {
+        let Some(domain) = self.get_executor_domain(domain_id) else {
             return Err(Self::invalid_submit(
-                SubmitErrorKind::InvalidDomain,
+                ExecutorSubmitErrorKind::InvalidDomain,
                 domain_id,
                 work_item,
             ));
@@ -1059,18 +1091,18 @@ impl DomainTable {
 
     #[cold]
     fn invalid_submit(
-        kind: SubmitErrorKind,
-        domain_id: DomainId,
+        kind: ExecutorSubmitErrorKind,
+        domain_id: ExecutorDomainId,
         work_item: WorkItem,
-    ) -> SubmitError {
-        SubmitError::new(kind, domain_id, work_item)
+    ) -> ExecutorSubmitError {
+        ExecutorSubmitError::new(kind, domain_id, work_item)
     }
 
-    pub(crate) fn submit_to_domain(
+    pub(crate) fn submit_to_executor_domain(
         &self,
-        domain_id: DomainId,
+        domain_id: ExecutorDomainId,
         work_item: WorkItem,
-    ) -> Result<DomainSubmitOutcome, SubmitError> {
+    ) -> Result<DomainSubmitOutcome, ExecutorSubmitError> {
         let domain = self.resolve_submit_domain(domain_id, work_item)?;
         let became_runnable = domain.try_submit_work(domain_id, work_item)?;
 
@@ -1103,6 +1135,6 @@ impl DomainTable {
 
 #[derive(Debug)]
 pub(crate) struct DomainSubmitOutcome {
-    pub(crate) domain_id: DomainId,
+    pub(crate) domain_id: ExecutorDomainId,
     pub(crate) became_runnable: bool,
 }

@@ -10,10 +10,11 @@ use crate::round_robin::SchedulerPolicy;
 use alloc::boxed::Box;
 
 pub use crate::domain::{
-    AdmissionPolicy, DestroyDomainError, DestroyDomainResult, DomainClass, DomainConfig, DomainId,
-    DomainState, DomainStats, DomainTable, ExecutorDomain, GlobalExecutorStats, SubmitError,
-    SubmitErrorKind, DRIVER_DOMAIN, KERNEL_BACKGROUND_DOMAIN, KERNEL_HIGH_DOMAIN,
-    KERNEL_NORMAL_DOMAIN,
+    DestroyExecutorDomainError, DestroyExecutorDomainResult, ExecutorAdmissionPolicy,
+    ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
+    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable, ExecutorSubmitError,
+    ExecutorSubmitErrorKind, GlobalExecutorStats, DRIVER_EXECUTOR_DOMAIN,
+    KERNEL_BACKGROUND_EXECUTOR_DOMAIN, KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 
 #[cfg(test)]
@@ -34,7 +35,7 @@ pub struct WorkItem {
 const MAX_SHARDS: usize = 32;
 
 struct DomainRunQueue {
-    queue: BoundedMpmcQueue<DomainId>,
+    queue: BoundedMpmcQueue<ExecutorDomainId>,
 }
 
 impl DomainRunQueue {
@@ -45,7 +46,7 @@ impl DomainRunQueue {
     }
 
     #[inline]
-    fn push(&self, domain_id: DomainId) {
+    fn push(&self, domain_id: ExecutorDomainId) {
         match self.queue.try_push(domain_id) {
             Ok(()) => {}
             Err(BoundedMpmcPushError::Full(_)) => {
@@ -56,7 +57,7 @@ impl DomainRunQueue {
     }
 
     #[inline]
-    fn pop(&self) -> Option<DomainId> {
+    fn pop(&self) -> Option<ExecutorDomainId> {
         self.queue.try_pop()
     }
 
@@ -67,14 +68,14 @@ impl DomainRunQueue {
 }
 
 struct ExecutorRuntime {
-    domains: DomainTable,
+    domains: ExecutorDomainTable,
     run_queue: DomainRunQueue,
 }
 
 impl ExecutorRuntime {
     fn new(shards: usize, max_work_items: usize) -> Self {
         Self {
-            domains: DomainTable::new(shards, max_work_items),
+            domains: ExecutorDomainTable::new(shards, max_work_items),
             run_queue: DomainRunQueue::new(max_work_items),
         }
     }
@@ -117,7 +118,7 @@ impl GlobalAsyncExecutor {
         platform().init_blocking(shards);
         platform().init_runtime(shards, shards);
 
-        if self.runnable_domain_count() != 0 {
+        if self.runnable_executor_domain_count() != 0 {
             self.try_schedule();
         }
     }
@@ -137,29 +138,41 @@ impl GlobalAsyncExecutor {
 
     #[inline]
     pub fn try_submit(&self, trampoline: Trampoline, ctx: usize) -> Result<(), WorkItem> {
-        self.try_submit_to_domain(KERNEL_NORMAL_DOMAIN, trampoline, ctx)
-            .map_err(SubmitError::into_work_item)
+        self.try_submit_to_executor_domain(KERNEL_NORMAL_EXECUTOR_DOMAIN, trampoline, ctx)
+            .map_err(ExecutorSubmitError::into_work_item)
     }
 
     #[inline]
-    pub fn submit_to_domain(&self, domain_id: DomainId, trampoline: Trampoline, ctx: usize) {
-        self.try_submit_to_domain(domain_id, trampoline, ctx)
+    pub fn submit_to_executor_domain(
+        &self,
+        domain_id: ExecutorDomainId,
+        trampoline: Trampoline,
+        ctx: usize,
+    ) {
+        self.try_submit_to_executor_domain(domain_id, trampoline, ctx)
             .expect("failed to submit to executor domain")
     }
 
-    pub fn try_submit_to_domain(
+    pub fn try_submit_to_executor_domain(
         &self,
-        domain_id: DomainId,
+        domain_id: ExecutorDomainId,
         trampoline: Trampoline,
         ctx: usize,
-    ) -> Result<(), SubmitError> {
+    ) -> Result<(), ExecutorSubmitError> {
         let work_item = WorkItem { trampoline, ctx };
 
         let runtime = self.runtime.get().ok_or_else(|| {
-            SubmitError::new(SubmitErrorKind::ExecutorUninitialized, domain_id, work_item)
+            ExecutorSubmitError::new(
+                ExecutorSubmitErrorKind::ExecutorUninitialized,
+                domain_id,
+                work_item,
+            )
         })?;
 
-        let outcome = match runtime.domains.submit_to_domain(domain_id, work_item) {
+        let outcome = match runtime
+            .domains
+            .submit_to_executor_domain(domain_id, work_item)
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.total_rejections.0.fetch_add(1, Ordering::Relaxed);
@@ -169,30 +182,34 @@ impl GlobalAsyncExecutor {
 
         self.total_submissions.0.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(domain) = runtime.domains.get_domain(outcome.domain_id) {
+        if let Some(domain) = runtime.domains.get_executor_domain(outcome.domain_id) {
             self.schedule_domain_if_needed(runtime, outcome.domain_id, &domain);
         }
 
         Ok(())
     }
 
-    pub fn create_domain(&self, config: DomainConfig) -> DomainId {
-        self.runtime().domains.create_domain(config)
+    pub fn create_executor_domain(&self, config: ExecutorDomainConfig) -> ExecutorDomainId {
+        self.runtime().domains.create_executor_domain(config)
     }
 
-    pub fn destroy_domain(
+    pub fn destroy_executor_domain(
         &self,
-        domain_id: DomainId,
-    ) -> Result<DestroyDomainResult, DestroyDomainError> {
-        self.runtime().domains.destroy_domain(domain_id)
+        domain_id: ExecutorDomainId,
+    ) -> Result<DestroyExecutorDomainResult, DestroyExecutorDomainError> {
+        self.runtime().domains.destroy_executor_domain(domain_id)
     }
 
-    pub fn get_domain(&self, domain_id: DomainId) -> Option<Arc<ExecutorDomain>> {
-        self.runtime().domains.get_domain(domain_id)
+    pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
+        self.runtime().domains.get_executor_domain(domain_id)
     }
 
-    pub fn domain_stats(&self, domain_id: DomainId) -> Option<DomainStats> {
-        self.get_domain(domain_id).map(|domain| domain.stats())
+    pub fn executor_domain_stats(
+        &self,
+        domain_id: ExecutorDomainId,
+    ) -> Option<ExecutorDomainStats> {
+        self.get_executor_domain(domain_id)
+            .map(|domain| domain.stats())
     }
 
     pub fn stats(&self) -> GlobalExecutorStats {
@@ -201,7 +218,7 @@ impl GlobalAsyncExecutor {
         GlobalExecutorStats {
             active_pumps: self.active_pumps.0.load(Ordering::Acquire),
             max_pumps: self.max_pumps.0.load(Ordering::Acquire),
-            runnable_domain_count: runtime.run_queue.len(),
+            runnable_executor_domain_count: runtime.run_queue.len(),
             domain_count: runtime.domains.domain_count(),
             total_submissions: self.total_submissions.0.load(Ordering::Relaxed),
             total_rejections: self.total_rejections.0.load(Ordering::Relaxed),
@@ -209,7 +226,7 @@ impl GlobalAsyncExecutor {
         }
     }
 
-    pub fn runnable_domain_count(&self) -> usize {
+    pub fn runnable_executor_domain_count(&self) -> usize {
         let Some(runtime) = self.runtime.get() else {
             return 0;
         };
@@ -224,7 +241,7 @@ impl GlobalAsyncExecutor {
     fn schedule_domain_if_needed(
         &self,
         runtime: &ExecutorRuntime,
-        domain_id: DomainId,
+        domain_id: ExecutorDomainId,
         domain: &ExecutorDomain,
     ) {
         if !domain.is_schedulable_for_policy() {
@@ -276,7 +293,7 @@ impl GlobalAsyncExecutor {
                 break;
             };
 
-            let Some(domain) = runtime.domains.get_domain(domain_id) else {
+            let Some(domain) = runtime.domains.get_executor_domain(domain_id) else {
                 continue;
             };
 
@@ -309,7 +326,7 @@ impl GlobalAsyncExecutor {
 
         self.exit_pump();
 
-        if self.runnable_domain_count() != 0 {
+        if self.runnable_executor_domain_count() != 0 {
             self.try_schedule();
         }
     }
@@ -347,7 +364,7 @@ impl GlobalAsyncExecutor {
     fn after_domain_batch(
         &self,
         runtime: &ExecutorRuntime,
-        domain_id: DomainId,
+        domain_id: ExecutorDomainId,
         domain: &ExecutorDomain,
         ran_count: usize,
     ) {

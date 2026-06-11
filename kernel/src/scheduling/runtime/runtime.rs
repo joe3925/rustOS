@@ -93,6 +93,6 @@ pub use exec_runtime::spawn;
 pub use exec_runtime::spawn_blocking;
 pub use exec_runtime::spawn_blocking_many;
 pub use exec_runtime::spawn_detached;
-pub use exec_runtime::spawn_detached_in_domain;
+pub use exec_runtime::spawn_detached_in_executor_domain;
 pub use exec_runtime::try_steal_blocking_one;
 pub use exec_runtime::JoinAll;

@@ -125,7 +125,10 @@ fn blocking_join_pending_poll_wakes_registered_waiter_on_completion() {
     });
 
     let waiter = WakeSignal::new();
-    assert!(matches!(poll_once(&mut join, &waiter.waker()), Poll::Pending));
+    assert!(matches!(
+        poll_once(&mut join, &waiter.waker()),
+        Poll::Pending
+    ));
 
     release.store(true, Ordering::Release);
     assert!(
