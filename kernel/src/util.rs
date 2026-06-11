@@ -47,7 +47,6 @@ use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel_abi::BootInfo;
 use kernel_types::benchmark::BenchWindowConfig;
-use kernel_types::dma::set_dma_page_table_root_query;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;
 use rand_core::{RngCore, SeedableRng};
@@ -150,7 +149,6 @@ pub unsafe fn init() {
         load_idt();
 
         init_kernel_cr3();
-        set_dma_page_table_root_query(current_page_table_root);
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();

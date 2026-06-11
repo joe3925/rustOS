@@ -19,14 +19,14 @@
       // "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/acpi.dll\"",
       // "target modules load --file \"acpi.dll\" .text 0xffff90000341d000",
 
-      // "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/pci.dll\"",
-      // "target modules load --file \"pci.dll\" .text 0xffff90000449e000",
+      "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/pci.dll\"",
+      "target modules load --file \"pci.dll\" .text 0xffff900004c85000",
 
       // "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/i8042.dll\"",
       // "target modules load --file \"i8042.dll\" .text 0xffff9000048b0000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/virtio.dll\"",
-      "target modules load --file \"virtio.dll\" .text 0xffff90002a201000",
+      "target modules load --file \"virtio.dll\" .text 0xffff900015601000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/disk.dll\"",
       "target modules load --file \"disk.dll\" .text 0xffff90002a63d000",
