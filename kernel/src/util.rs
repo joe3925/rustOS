@@ -22,7 +22,9 @@ use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{heap_capacity_bytes, init_heap};
 use crate::memory::iommu::init_iommu;
-use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::frame_alloc::{
+    boot_usable_bytes, resize_bitmap_for_ram, BootInfoFrameAllocator,
+};
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -156,7 +158,6 @@ pub unsafe fn init() {
         syscall_init();
         init_dma_manager();
         init_iommu();
-
         // TSC calibration
         let tsc_start = cpu::get_cycles();
         wait_using_pit_50ms();
@@ -207,6 +208,10 @@ pub unsafe fn init() {
 }
 pub extern "C" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
+    resize_bitmap_for_ram(boot_usable_bytes()).expect(&alloc::format!(
+        "Failed to resize phys frame bitmap to capacity {}",
+        boot_usable_bytes()
+    ));
     init_executor_platform();
     GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
@@ -243,7 +248,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
 }
 #[no_mangle]
 #[inline(never)]
-pub extern "win64" fn trigger_guard_page_overflow() -> ! {
+pub extern "C" fn trigger_guard_page_overflow() -> ! {
     let task = SCHEDULER
         .get_current_task(current_cpu_id())
         .expect("no current task");
@@ -267,7 +272,7 @@ fn halt_loop() -> ! {
     }
 }
 #[no_mangle]
-pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
+pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
         halt_loop()
     }
@@ -363,7 +368,7 @@ pub extern "C" fn trigger_stack_overflow() {
 
 #[no_mangle]
 #[inline(never)]
-pub extern "win64" fn trigger_triple_fault() -> ! {
+pub extern "C" fn trigger_triple_fault() -> ! {
     static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
     x86_64::instructions::interrupts::disable();
@@ -400,7 +405,7 @@ pub fn test_full_heap() {
     );
 }
 
-pub extern "win64" fn random_number() -> u64 {
+pub extern "C" fn random_number() -> u64 {
     let mut rng = Random::new(cpu::get_cycles());
     rng.next_u64()
 }
