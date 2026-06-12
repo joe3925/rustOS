@@ -85,8 +85,12 @@ pub unsafe extern "C" fn park_self_and_yield() {
     // TODO:
     todo!()
 }
+pub extern "C" fn get_current_platform_cpu_id() -> usize {
+    crate::platform::current_logical_id()
+}
+
 pub extern "C" fn get_current_lapic_id() -> usize {
-    get_current_logical_id() as usize
+    get_current_platform_cpu_id()
 }
 
 pub extern "C" fn wake_task(id: u64) {
@@ -215,8 +219,13 @@ pub extern "C" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
 }
 
 #[no_mangle]
+pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
+    crate::platform::cpu_topology_ids()
+}
+
+#[no_mangle]
 pub extern "C" fn kernel_apic_cpu_ids() -> Vec<u8> {
-    interrupt_index::apic_logical_ids()
+    kernel_platform_cpu_ids()
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
@@ -228,7 +237,7 @@ pub fn routing_print_impl(s: &str) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn wait_duration(time: Duration) {
-    interrupt_index::wait_duration(time);
+    crate::platform::wait_duration(time);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn stopwatch_new() -> Stopwatch {
@@ -602,7 +611,7 @@ static BLOCKING_INIT: Once = Once::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn task_yield() {
-    interrupts::without_interrupts(|| {
+    crate::platform::with_interrupts_disabled(|| {
         unsafe { syscalls::task_yield_interrupt() };
     });
 }
@@ -789,7 +798,7 @@ pub extern "C" fn bench_kernel_span_end(
 
 #[no_mangle]
 pub extern "C" fn get_current_cpu_id() -> usize {
-    current_cpu_id()
+    crate::platform::current_cpu_id()
 }
 #[no_mangle]
 pub extern "C" fn allocate_auto_kernel_range_mapped(

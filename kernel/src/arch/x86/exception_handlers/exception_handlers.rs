@@ -181,10 +181,7 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
                         unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
                         panic!(
                             "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",
-                            error_code,
-                            fault,
-                            gp,
-                            *stack_frame
+                            error_code, fault, gp, *stack_frame
                         );
                     }
                 }

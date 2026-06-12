@@ -66,7 +66,9 @@ pub async fn root_query_devrels<'req, 'data, 'b>(
 
     if get_rsdp().is_some() {
         ensure_acpi_node(&root_dn);
-    } else if get_device_tree_blob().is_some() {
+    }
+
+    if get_device_tree_blob().is_some() {
         ensure_device_tree_node(&root_dn);
     }
 

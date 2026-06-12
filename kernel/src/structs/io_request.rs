@@ -10,12 +10,11 @@ use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::status::FileStatus;
 use spin::Mutex;
 
-use crate::arch::control::Cr3;
-use crate::arch::interrupts;
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::object_manager::{Object, ObjectPayload, OBJECT_MANAGER};
+use crate::platform;
 use crate::util::generate_guid;
 
 pub type RequestId = u64;
@@ -615,15 +614,15 @@ fn user_ptr_range_ok(addr: u64, bytes: usize) -> bool {
 
 fn with_process_cr3<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
     let process_cr3 = owner.read().cr3;
-    let old = Cr3::read();
+    let old = platform::current_address_space_root();
 
-    interrupts::without_interrupts(|| {
+    platform::with_interrupts_disabled(|| {
         unsafe {
-            Cr3::write(process_cr3, old.1);
+            platform::switch_address_space_root(process_cr3);
         }
         let result = f();
         unsafe {
-            Cr3::write(old.0, old.1);
+            platform::switch_address_space_root(old);
         }
         result
     })

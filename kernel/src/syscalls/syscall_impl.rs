@@ -1,6 +1,6 @@
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::executable::program::{
-    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
+    Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
 
-use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload, TaskQueueRef};
+use crate::object_manager::{Object, ObjectPayload, TaskQueueRef, OBJECT_MANAGER};
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let path = alloc::format!("\\Process\\{}", pid);

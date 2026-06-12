@@ -1,5 +1,5 @@
 use kernel_types::status::PageMapError;
-use x86_64::{structures::paging::PageTableFlags, VirtAddr};
+use x86_64::{VirtAddr, structures::paging::PageTableFlags};
 
 use crate::memory::paging::{
     paging::{align_up_4k, map_kernel_range},
@@ -52,11 +52,7 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
 
     let map_bytes = {
         let b = align_up_4k(size.as_bytes());
-        if b > max_stack {
-            max_stack
-        } else {
-            b
-        }
+        if b > max_stack { max_stack } else { b }
     };
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;

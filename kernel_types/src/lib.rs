@@ -29,6 +29,7 @@ pub mod irq;
 pub mod memory;
 pub mod object_manager;
 pub mod pnp;
+pub mod port;
 pub mod request;
 pub mod runtime;
 pub mod status;
@@ -154,6 +155,7 @@ pub extern "system" fn __CxxFrameHandler3(_: *mut u8, _: *mut u8, _: *mut u8, _:
     unimplemented!()
 }
 
+#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __chkstk() {
@@ -179,6 +181,7 @@ pub unsafe extern "C" fn __chkstk() {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __chkstk_ms() {

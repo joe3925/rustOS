@@ -224,9 +224,7 @@ impl AmdViBackend {
         if let Err(err) = submit_serialized(unit, &[invalidate_pages_cmd(domain.domain_id)]) {
             println!(
                 "iommu: AMD-Vi invalidate failed after unmap for segment {} requester {:#06x}: {:?}",
-                domain.segment,
-                domain.requester_id,
-                err
+                domain.segment, domain.requester_id, err
             );
         }
     }

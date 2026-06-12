@@ -121,15 +121,7 @@ impl IntelVtdBackend {
             let fsts = unsafe { read_reg32(reg_va, FSTS_REG) };
             println!(
                 "iommu: Intel VT-d up at {:#x}, segment={}, ver={:#x} cap={:#x} ecap={:#x} iro={:#x} mgaw={} nd={} fsts={:#x}",
-                unit.register_base,
-                unit.segment,
-                ver,
-                cap,
-                ecap,
-                iro,
-                mgaw,
-                nd,
-                fsts
+                unit.register_base, unit.segment, ver, cap, ecap, iro, mgaw, nd, fsts
             );
 
             units.push(VtdUnit {

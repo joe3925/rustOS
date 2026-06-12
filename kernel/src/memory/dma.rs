@@ -32,8 +32,8 @@
 //   - unregister while mappings are live
 // - Add backend-specific tests for Intel VT-d and AMD-Vi invalidation behavior.
 //
-use crate::drivers::ACPI::{ACPI_TABLES, ACPIImpl};
 use crate::drivers::pnp::device::DevNodeExt;
+use crate::drivers::ACPI::{ACPIImpl, ACPI_TABLES};
 use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
 use alloc::collections::BTreeMap;
@@ -42,11 +42,11 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::{
-    BorrowedDmaMapping, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
-    DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, DmaDeviceHandle, DmaDeviceState, DmaMapError,
-    DmaMapped, DmaMappingStrategy, DmaPciDeviceIdentity, IOBUFFER_INLINE_SEGMENT_CAPACITY,
-    IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer, IoBufferDmaSegment,
-    IoBufferPageFrame, PhysFramed, ToDevice,
+    BorrowedDmaMapping, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped,
+    DmaMappingStrategy, DmaPciDeviceIdentity, IoBuffer, IoBufferDmaSegment, IoBufferPageFrame,
+    PhysFramed, ToDevice, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
+    DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, IOBUFFER_INLINE_SEGMENT_CAPACITY,
+    IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE,
 };
 use kernel_types::status::DriverStatus;
 use raw_cpuid::CpuId;
@@ -951,8 +951,7 @@ struct DmaManager {
 
 impl DmaManager {
     fn new() -> Self {
-        let tables = ACPI_TABLES.get_tables();
-        let platform = Arc::new(discover_platform_iommu(tables.as_ref()));
+        let platform = Arc::new(crate::platform::discover_required_device_mmu());
         Self {
             platform,
             state: Mutex::new(DmaManagerState::new()),
@@ -1294,7 +1293,10 @@ pub enum AmdIvhdDeviceEntry {
         raw: Vec<u8>,
     },
 }
-fn discover_platform_iommu(tables: &AcpiTables<ACPIImpl>) -> PlatformIommuInfo {
+pub(crate) fn discover_platform_iommu() -> PlatformIommuInfo {
+    let tables = ACPI_TABLES.get_tables();
+    let tables = tables.as_ref();
+
     match detect_boot_iommu_vendor() {
         BootIommuVendor::Intel => PlatformIommuInfo::Intel(parse_intel_dmar(tables)),
         BootIommuVendor::Amd => PlatformIommuInfo::Amd(parse_amd_ivrs(tables)),

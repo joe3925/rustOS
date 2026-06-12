@@ -2,12 +2,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_types::status::PageMapError;
 use x86_64::{
+    PhysAddr, VirtAddr,
     registers::control::Cr3,
     structures::paging::{
         FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PageTableIndex, PhysFrame,
         Size4KiB,
     },
-    PhysAddr, VirtAddr,
 };
 
 use crate::{memory::paging::virt_tracker::allocate_auto_kernel_range_mapped, util::boot_info};
@@ -23,86 +23,14 @@ pub fn kernel_cr3() -> PhysFrame<Size4KiB> {
     PhysFrame::containing_address(x86_64::PhysAddr::new(KERNEL_CR3_U64.load(Ordering::SeqCst)))
 }
 
-const PRESENT: u64 = 1 << 0;
-const HUGE_PAGE: u64 = 1 << 7;
-
-const ADDR_MASK_4K: u64 = 0x000f_ffff_ffff_f000;
-const ADDR_MASK_2M: u64 = 0x000f_ffff_ffe0_0000;
-const ADDR_MASK_1G: u64 = 0x000f_ffff_c000_0000;
-
-#[inline(always)]
-fn p4_index(addr: u64) -> usize {
-    ((addr >> 39) & 0x1ff) as usize
-}
-
-#[inline(always)]
-fn p3_index(addr: u64) -> usize {
-    ((addr >> 30) & 0x1ff) as usize
-}
-
-#[inline(always)]
-fn p2_index(addr: u64) -> usize {
-    ((addr >> 21) & 0x1ff) as usize
-}
-
-#[inline(always)]
-fn p1_index(addr: u64) -> usize {
-    ((addr >> 12) & 0x1ff) as usize
-}
-
-#[inline(always)]
-unsafe fn read_pte(mem_offset: u64, table_phys: u64, index: usize) -> u64 {
-    let table = (mem_offset + table_phys) as *const u64;
-    unsafe { core::ptr::read(table.add(index)) }
-}
-
 #[inline(always)]
 pub(crate) extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr> {
-    let virt = addr.as_u64();
-    let cr3_phys = Cr3::read().0.start_address().as_u64();
     let mem_offset = boot_info().physical_memory_offset.into_option().unwrap();
-
-    unsafe {
-        let pml4e = read_pte(mem_offset, cr3_phys, p4_index(virt));
-        if pml4e & PRESENT == 0 {
-            return None;
-        }
-
-        let pdpt_phys = pml4e & ADDR_MASK_4K;
-        let pdpte = read_pte(mem_offset, pdpt_phys, p3_index(virt));
-        if pdpte & PRESENT == 0 {
-            return None;
-        }
-
-        if pdpte & HUGE_PAGE != 0 {
-            let base = pdpte & ADDR_MASK_1G;
-            let offset = virt & ((1 << 30) - 1);
-            return Some(PhysAddr::new(base + offset));
-        }
-
-        let pd_phys = pdpte & ADDR_MASK_4K;
-        let pde = read_pte(mem_offset, pd_phys, p2_index(virt));
-        if pde & PRESENT == 0 {
-            return None;
-        }
-
-        if pde & HUGE_PAGE != 0 {
-            let base = pde & ADDR_MASK_2M;
-            let offset = virt & ((1 << 21) - 1);
-            return Some(PhysAddr::new(base + offset));
-        }
-
-        let pt_phys = pde & ADDR_MASK_4K;
-        let pte = read_pte(mem_offset, pt_phys, p1_index(virt));
-        if pte & PRESENT == 0 {
-            return None;
-        }
-
-        let base = pte & ADDR_MASK_4K;
-        let offset = virt & 0xfff;
-
-        Some(PhysAddr::new(base + offset))
-    }
+    kernel_types::arch::translate_current_virtual_address(
+        kernel_types::arch::VirtAddr::new(mem_offset),
+        kernel_types::arch::VirtAddr::new(addr.as_u64()),
+    )
+    .map(|translation| PhysAddr::new(translation.phys_addr.as_u64()))
 }
 fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
     let (table_frame, _) = Cr3::read();

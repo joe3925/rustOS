@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::async_types::AsyncMutex;
-use kernel_api::x86_64::instructions::port::Port;
+use kernel_api::kernel_types::port::Port;
 
 #[repr(C)]
 pub struct Ports {

@@ -3,6 +3,7 @@ pub mod exception_handlers;
 pub mod gdt;
 pub mod idt;
 pub mod memory;
+pub mod platform;
 pub(crate) mod scheduling;
 
 pub mod drivers {
@@ -69,6 +70,7 @@ pub mod paging {
     };
 }
 
+pub use platform::X86Platform as PlatformImpl;
 pub use x86_64::align_up;
 pub use x86_64::structures::paging::PageTableFlags as PageFlags;
 pub use x86_64::{PhysAddr, VirtAddr};

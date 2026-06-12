@@ -6,7 +6,7 @@ use spin::{Mutex, Once};
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::{PhysAddr, VirtAddr};
 
-use crate::memory::dma::{platform_iommu_info, PlatformIommuInfo};
+use crate::memory::dma::{PlatformIommuInfo, platform_iommu_info};
 use crate::memory::paging::tables::virt_to_phys;
 use crate::memory::paging::virt_tracker::{
     allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous,

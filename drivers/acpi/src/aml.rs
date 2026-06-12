@@ -13,6 +13,7 @@ use kernel_api::device::DevNode;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::port::Port;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
@@ -25,7 +26,6 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::request::{Pnp, RequestHandle};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
-use kernel_api::x86_64::instructions::port::Port;
 use spin::Mutex;
 pub const PAGE_SIZE: usize = 4096;
 #[repr(C)]

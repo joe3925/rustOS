@@ -9,7 +9,7 @@ pub use kernel_routing;
 pub use kernel_types;
 
 pub mod arch;
-#[cfg(feature = "arch-x86_64")]
+#[cfg(target_arch = "x86_64")]
 pub use x86_64;
 
 pub use acpi;

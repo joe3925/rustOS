@@ -22,10 +22,9 @@ use kernel_types::memory::{
 use kernel_types::status::{LoadError, PageMapError, PageMapFailure};
 use spin::rwlock::RwLock;
 
-use crate::arch::control::Cr3;
-use crate::arch::interrupts;
 use crate::arch::paging::{PageTable, PhysFrame};
 use crate::arch::VirtAddr;
+use crate::platform;
 
 use super::program::{Program, PROGRAM_MANAGER};
 
@@ -193,27 +192,27 @@ impl PELoader {
         }
 
         let new_cr3 = program.cr3;
-        let old_cr3 = Cr3::read();
+        let old_cr3 = platform::current_address_space_root();
 
         let (handle, _exports, _image_size) = {
-            unsafe { Cr3::write(new_cr3, old_cr3.1) };
+            unsafe { platform::switch_address_space_root(new_cr3) };
             let r = self.map_into_program(program);
-            unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+            unsafe { platform::switch_address_space_root(old_cr3) };
             r?
         };
 
-        unsafe { Cr3::write(new_cr3, old_cr3.1) };
+        unsafe { platform::switch_address_space_root(new_cr3) };
         let r = self.patch_imports_sync(program);
-        unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+        unsafe { platform::switch_address_space_root(old_cr3) };
         r?;
 
         Ok(handle)
     }
     /// Loads the PE into memory and prepares it for execution.
     pub async fn load(&mut self) -> Result<u64, LoadError> {
-        let were_enabled = interrupts::are_enabled();
+        let were_enabled = platform::interrupts_enabled();
         if were_enabled {
-            interrupts::disable();
+            platform::disable_interrupts();
         }
         if self.pe.is_lib {
             return Err(LoadError::IsNotExecutable);
@@ -251,9 +250,9 @@ impl PELoader {
         let image_size = opt_hdr.windows_fields.size_of_image as u64;
 
         let new_frame = PhysFrame::containing_address(table_phys);
-        let old_cr3 = Cr3::read();
+        let old_cr3 = platform::current_address_space_root();
 
-        unsafe { Cr3::write(new_frame, old_cr3.1) };
+        unsafe { platform::switch_address_space_root(new_frame) };
 
         let stack_size = opt_hdr.windows_fields.size_of_stack_reserve;
         let stack_addr = self.current_base + image_size + 0x1000 + stack_size;
@@ -310,14 +309,14 @@ impl PELoader {
         let _ = self.resolve_imports(&mut program).await;
         let _ = self.patch_imports(&mut program);
 
-        unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+        unsafe { platform::switch_address_space_root(old_cr3) };
 
         let pid = PROGRAM_MANAGER.add_program(program);
         {
             PROGRAM_MANAGER.start_pid(pid);
         }
         if were_enabled {
-            interrupts::enable();
+            platform::enable_interrupts();
         }
 
         Ok(pid)

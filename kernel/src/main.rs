@@ -36,6 +36,7 @@ mod file_system;
 mod idt;
 mod memory;
 mod object_manager;
+mod platform;
 mod profiling;
 mod registry;
 mod scheduling;

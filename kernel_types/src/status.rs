@@ -231,7 +231,7 @@ pub enum PageMapFailure {
     ParentEntryHugePage,
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size4KiB>>
     for PageMapError
 {
@@ -242,7 +242,7 @@ impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::pag
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size2MiB>>
     for PageMapError
 {
@@ -253,7 +253,7 @@ impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::pag
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size1GiB>>
     for PageMapError
 {
@@ -264,7 +264,7 @@ impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::pag
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl<S> From<x86_64::structures::paging::mapper::MapToError<S>> for PageMapFailure
 where
     S: x86_64::structures::paging::page::PageSize,

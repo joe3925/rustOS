@@ -9,7 +9,6 @@ mod dev_ext;
 mod msix;
 
 use alloc::{sync::Arc, vec::Vec};
-use core::arch::asm;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
@@ -27,7 +26,7 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
     kernel_types::{io::DeviceControlHandler, pnp::DeviceIds, request::RequestData},
-    memory::{unmap_mmio_region, VirtAddr},
+    memory::{VirtAddr, unmap_mmio_region},
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,

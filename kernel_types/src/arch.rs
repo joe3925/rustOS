@@ -1,5 +1,39 @@
 use core::ops::{Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, Not, Sub};
 
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64.rs"]
+pub mod x86;
+
+#[cfg(target_arch = "x86_64")]
+pub type ActivePlatform = x86::X86Platform;
+
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("kernel_types does not have an implementation for this target architecture");
+
+pub trait Platform {
+    const NAME: &'static str;
+}
+
+pub trait AddressSpacePlatform: Platform {
+    fn current_page_table_root() -> Option<PhysAddr>;
+
+    fn translate_virtual_address(
+        physical_memory_offset: VirtAddr,
+        page_table_root: PhysAddr,
+        virt_addr: VirtAddr,
+    ) -> Option<PageTranslation>;
+}
+
+pub trait PortIoPlatform: Platform {
+    unsafe fn read_port_u8(port: u16) -> u8;
+    unsafe fn read_port_u16(port: u16) -> u16;
+    unsafe fn read_port_u32(port: u16) -> u32;
+
+    unsafe fn write_port_u8(port: u16, value: u8);
+    unsafe fn write_port_u16(port: u16, value: u16);
+    unsafe fn write_port_u32(port: u16, value: u32);
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtAddr(u64);
@@ -135,42 +169,76 @@ pub const SIZE_4KIB: u64 = 4 * 1024;
 pub const SIZE_2MIB: u64 = 2 * 1024 * 1024;
 pub const SIZE_1GIB: u64 = 1024 * 1024 * 1024;
 
-#[cfg(feature = "x86_64-compat")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageTranslation {
+    pub phys_addr: PhysAddr,
+    pub byte_len: u64,
+    pub offset: u64,
+}
+
+#[inline]
+pub fn current_page_table_root() -> Option<PhysAddr> {
+    <ActivePlatform as AddressSpacePlatform>::current_page_table_root()
+}
+
+#[inline]
+pub fn translate_virtual_address(
+    physical_memory_offset: VirtAddr,
+    page_table_root: PhysAddr,
+    virt_addr: VirtAddr,
+) -> Option<PageTranslation> {
+    <ActivePlatform as AddressSpacePlatform>::translate_virtual_address(
+        physical_memory_offset,
+        page_table_root,
+        virt_addr,
+    )
+}
+
+#[inline]
+pub fn translate_current_virtual_address(
+    physical_memory_offset: VirtAddr,
+    virt_addr: VirtAddr,
+) -> Option<PageTranslation> {
+    let page_table_root = current_page_table_root()?;
+    translate_virtual_address(physical_memory_offset, page_table_root, virt_addr)
+}
+
+#[cfg(target_arch = "x86_64")]
 impl From<x86_64::VirtAddr> for VirtAddr {
     fn from(value: x86_64::VirtAddr) -> Self {
         Self::new(value.as_u64())
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<VirtAddr> for x86_64::VirtAddr {
     fn from(value: VirtAddr) -> Self {
         x86_64::VirtAddr::new(value.as_u64())
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<x86_64::PhysAddr> for PhysAddr {
     fn from(value: x86_64::PhysAddr) -> Self {
         Self::new(value.as_u64())
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<PhysAddr> for x86_64::PhysAddr {
     fn from(value: PhysAddr) -> Self {
         x86_64::PhysAddr::new(value.as_u64())
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<x86_64::structures::paging::PageTableFlags> for PageFlags {
     fn from(value: x86_64::structures::paging::PageTableFlags) -> Self {
         Self::from_bits_truncate(value.bits())
     }
 }
 
-#[cfg(feature = "x86_64-compat")]
+#[cfg(target_arch = "x86_64")]
 impl From<PageFlags> for x86_64::structures::paging::PageTableFlags {
     fn from(value: PageFlags) -> Self {
         x86_64::structures::paging::PageTableFlags::from_bits_truncate(value.bits())

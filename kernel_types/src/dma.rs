@@ -5,10 +5,9 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_macros::RequestPayload;
-use x86_64::registers::control::Cr3;
 
+use crate::arch::{self, VirtAddr};
 use crate::device::DeviceObject;
 
 #[repr(transparent)]
@@ -395,39 +394,6 @@ struct VirtualFrameTranslation {
     offset: u64,
 }
 
-const PRESENT: u64 = 1 << 0;
-const HUGE_PAGE: u64 = 1 << 7;
-
-const ADDR_MASK_4K: u64 = 0x000f_ffff_ffff_f000;
-const ADDR_MASK_2M: u64 = 0x000f_ffff_ffe0_0000;
-const ADDR_MASK_1G: u64 = 0x000f_ffff_c000_0000;
-
-#[inline(always)]
-fn p4_index(addr: u64) -> usize {
-    ((addr >> 39) & 0x1ff) as usize
-}
-
-#[inline(always)]
-fn p3_index(addr: u64) -> usize {
-    ((addr >> 30) & 0x1ff) as usize
-}
-
-#[inline(always)]
-fn p2_index(addr: u64) -> usize {
-    ((addr >> 21) & 0x1ff) as usize
-}
-
-#[inline(always)]
-fn p1_index(addr: u64) -> usize {
-    ((addr >> 12) & 0x1ff) as usize
-}
-
-#[inline]
-unsafe fn read_pte(table_phys: u64, index: usize) -> u64 {
-    let table = (crate::PHYSICAL_MEMORY_OFFSET.as_u64() + table_phys) as *const u64;
-    unsafe { core::ptr::read(table.add(index)) }
-}
-
 #[inline]
 fn is_valid_frame_size(byte_len: u64) -> bool {
     matches!(
@@ -437,59 +403,16 @@ fn is_valid_frame_size(byte_len: u64) -> bool {
 }
 
 fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> {
-    let virt = virt_addr as u64;
-    let cr3_phys = Cr3::read().0.start_address().as_u64();
-    //let cr3_phys = current_page_table_root()?;
+    let translated = arch::translate_current_virtual_address(
+        crate::PHYSICAL_MEMORY_OFFSET,
+        VirtAddr::new(virt_addr as u64),
+    )?;
 
-    unsafe {
-        let pml4e = read_pte(cr3_phys, p4_index(virt));
-        if pml4e & PRESENT == 0 {
-            return None;
-        }
-
-        let pdpt_phys = pml4e & ADDR_MASK_4K;
-        let pdpte = read_pte(pdpt_phys, p3_index(virt));
-        if pdpte & PRESENT == 0 {
-            return None;
-        }
-
-        if pdpte & HUGE_PAGE != 0 {
-            let offset = virt & (IOBUFFER_FRAME_SIZE_1GIB - 1);
-            return Some(VirtualFrameTranslation {
-                phys_addr: pdpte & ADDR_MASK_1G,
-                byte_len: IOBUFFER_FRAME_SIZE_1GIB,
-                offset,
-            });
-        }
-
-        let pd_phys = pdpte & ADDR_MASK_4K;
-        let pde = read_pte(pd_phys, p2_index(virt));
-        if pde & PRESENT == 0 {
-            return None;
-        }
-
-        if pde & HUGE_PAGE != 0 {
-            let offset = virt & (IOBUFFER_FRAME_SIZE_2MIB - 1);
-            return Some(VirtualFrameTranslation {
-                phys_addr: pde & ADDR_MASK_2M,
-                byte_len: IOBUFFER_FRAME_SIZE_2MIB,
-                offset,
-            });
-        }
-
-        let pt_phys = pde & ADDR_MASK_4K;
-        let pte = read_pte(pt_phys, p1_index(virt));
-        if pte & PRESENT == 0 {
-            return None;
-        }
-
-        let offset = virt & (IOBUFFER_FRAME_SIZE_4KIB - 1);
-        Some(VirtualFrameTranslation {
-            phys_addr: pte & ADDR_MASK_4K,
-            byte_len: IOBUFFER_FRAME_SIZE_4KIB,
-            offset,
-        })
-    }
+    Some(VirtualFrameTranslation {
+        phys_addr: translated.phys_addr.as_u64() - translated.offset,
+        byte_len: translated.byte_len,
+        offset: translated.offset,
+    })
 }
 
 fn describe_virtual_buffer_to_frames(

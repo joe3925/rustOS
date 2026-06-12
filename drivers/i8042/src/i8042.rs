@@ -1,3 +1,5 @@
+use kernel_api::kernel_types::port::Port;
+
 const I8042_DATA: u16 = 0x60;
 const I8042_STS: u16 = 0x64;
 const I8042_CMD: u16 = 0x64;
@@ -6,27 +8,12 @@ const STS_OBF: u8 = 1 << 0;
 const STS_IBF: u8 = 1 << 1;
 
 unsafe fn inb(p: u16) -> u8 {
-    unsafe {
-        let v: u8;
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!("in al, dx", in("dx") p, out("al") v, options(nomem, nostack, preserves_flags));
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = p;
-            v = 0;
-        }
-        v
-    }
+    let mut port = Port::<u8>::new(p);
+    unsafe { port.read() }
 }
 unsafe fn outb(p: u16, v: u8) {
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!("out dx, al", in("dx") p, in("al") v, options(nomem, nostack, preserves_flags));
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (p, v);
-        }
-    }
+    let mut port = Port::<u8>::new(p);
+    unsafe { port.write(v) }
 }
 
 unsafe fn wait_ibf_clear(timeout_iters: u32) -> bool {

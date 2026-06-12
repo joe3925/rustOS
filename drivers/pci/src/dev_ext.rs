@@ -3,11 +3,11 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::device::DeviceObject;
-use kernel_api::memory::{map_mmio_region, unmap_mmio_region, PhysAddr, VirtAddr};
+use kernel_api::kernel_types::port::Port;
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::request::{Pnp, Request, RequestData, RequestHandle};
 use kernel_api::status::{DriverStatus, PageMapError};
 
@@ -693,28 +693,14 @@ fn cfg1_addr(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
 
 #[inline]
 unsafe fn outl(port: u16, val: u32) {
-    unsafe {
-        asm!(
-            "out dx, eax",
-            in("dx") port,
-            in("eax") val,
-            options(nostack, preserves_flags)
-        );
-    }
+    let mut port = Port::<u32>::new(port);
+    unsafe { port.write(val) }
 }
 
 #[inline]
 unsafe fn inl(port: u16) -> u32 {
-    unsafe {
-        let v: u32;
-        asm!(
-            "in eax, dx",
-            in("dx") port,
-            out("eax") v,
-            options(nostack, preserves_flags)
-        );
-        v
-    }
+    let mut port = Port::<u32>::new(port);
+    unsafe { port.read() }
 }
 
 #[inline]

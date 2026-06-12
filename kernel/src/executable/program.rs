@@ -13,15 +13,11 @@ use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 
 use crate::{
-    arch::{
-        control::Cr3,
-        interrupts,
-        paging::{PageTableFlags, PhysFrame},
-        VirtAddr,
-    },
+    arch::{paging::PageTableFlags, VirtAddr},
     executable::pe_loadable::PELoader,
     memory::paging::paging::map_range_with_huge_pages,
     object_manager::{Object, ObjectPayload, OBJECT_MANAGER},
+    platform::{self, AddressSpaceRoot},
     scheduling::task::TaskHandle,
     util::generate_guid,
 };
@@ -203,7 +199,7 @@ pub struct Program {
     pub main_thread: Option<TaskHandle>,
     pub managed_threads: Mutex<Vec<TaskHandle>>,
     pub modules: RwLock<Vec<ModuleHandle>>,
-    pub cr3: PhysFrame,
+    pub cr3: AddressSpaceRoot,
     pub tracker: Arc<RangeTracker>,
 
     pub handle_table: RwLock<HandleTable>,
@@ -220,7 +216,7 @@ impl Program {
         title: String,
         image_path: Path,
         image_base: VirtAddr,
-        cr3: PhysFrame,
+        cr3: AddressSpaceRoot,
         tracker: Arc<RangeTracker>,
     ) -> Self {
         let working_dir = image_path.parent().unwrap_or(image_path.clone());
@@ -253,10 +249,10 @@ impl Program {
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
 
-        let old_cr3 = Cr3::read();
+        let old_cr3 = platform::current_address_space_root();
 
-        interrupts::without_interrupts(|| unsafe {
-            Cr3::write(self.cr3, old_cr3.1);
+        platform::with_interrupts_disabled(|| unsafe {
+            platform::switch_address_space_root(self.cr3);
         });
 
         let res = (|| {
@@ -284,7 +280,7 @@ impl Program {
         })();
 
         unsafe {
-            Cr3::write(old_cr3.0, old_cr3.1);
+            platform::switch_address_space_root(old_cr3);
         }
 
         res
@@ -293,8 +289,8 @@ impl Program {
         let start = virt_addr;
         let end = virt_addr + size as u64;
 
-        let old_cr3 = Cr3::read();
-        Cr3::write(self.cr3, old_cr3.1);
+        let old_cr3 = platform::current_address_space_root();
+        platform::switch_address_space_root(self.cr3);
 
         let result = (|| {
             let boot_info = boot_info();
@@ -321,7 +317,7 @@ impl Program {
             Ok(())
         })();
 
-        Cr3::write(old_cr3.0, old_cr3.1);
+        platform::switch_address_space_root(old_cr3);
         result
     }
     pub fn virtual_map_auto_alloc(&self, size: usize) -> Result<VirtAddr, PageMapError> {
@@ -332,10 +328,10 @@ impl Program {
             .ok_or(PageMapError::NoMemory())?;
         let end = start + size as u64;
 
-        let old_cr3 = Cr3::read();
+        let old_cr3 = platform::current_address_space_root();
 
-        interrupts::without_interrupts(|| unsafe {
-            Cr3::write(self.cr3, old_cr3.1);
+        platform::with_interrupts_disabled(|| unsafe {
+            platform::switch_address_space_root(self.cr3);
         });
 
         let boot_info = boot_info();
@@ -359,7 +355,7 @@ impl Program {
             )?;
         }
         unsafe {
-            Cr3::write(old_cr3.0, old_cr3.1);
+            platform::switch_address_space_root(old_cr3);
         }
 
         Ok(start)
@@ -415,7 +411,7 @@ impl Program {
         let managed = self.managed_threads.lock();
 
         loop {
-            interrupts::hlt();
+            platform::enable_interrupts_and_halt();
 
             let mut running = managed.len() + 1;
 
@@ -576,7 +572,7 @@ impl ProgramManager {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         prog.pid = pid;
         if let Some(ref mut task) = prog.main_thread {
-            interrupts::without_interrupts(move || {
+            platform::with_interrupts_disabled(move || {
                 task.inner.write().parent_pid = pid;
             });
         }

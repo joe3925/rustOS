@@ -28,6 +28,7 @@ use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, IoBufferPag
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::port::Port;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
@@ -38,7 +39,6 @@ use kernel_api::request::{DeviceControl, Pnp, Read, RequestHandle, RequestKind, 
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
-use kernel_api::x86_64::instructions::port::Port;
 
 use dev_ext::{ControllerState, DevExt, Ports};
 

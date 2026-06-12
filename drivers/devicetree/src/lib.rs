@@ -17,8 +17,9 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{fdt::FdtHeader, pnp::DeviceIds},
     pnp::{
-        DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, QueryIdType, ResourceKind,
-        driver_set_evt_device_add, get_device_tree_blob,
+        DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, QueryIdType,
+        ResourceDescriptor, driver_set_evt_device_add, encode_resource_descriptors,
+        get_device_tree_blob,
         pnp_create_child_devnode_and_pdo_with_init,
     },
     request::{Pnp, RequestData, RequestHandle},
@@ -385,24 +386,13 @@ fn sanitize_instance_component(s: &str) -> String {
 }
 
 fn resources_for_node(parent: &Node, node: &Node) -> Vec<u8> {
-    let mut entries = Vec::<(u32, u32, u64, u64)>::new();
+    let mut entries = Vec::<ResourceDescriptor>::new();
     append_reg_entries(&mut entries, parent, node);
     append_interrupt_entries(&mut entries, node);
-
-    let mut out = Vec::with_capacity(12 + entries.len() * 24);
-    out.extend_from_slice(b"RSRC");
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (kind, index, start, length) in entries {
-        out.extend_from_slice(&kind.to_le_bytes());
-        out.extend_from_slice(&index.to_le_bytes());
-        out.extend_from_slice(&start.to_le_bytes());
-        out.extend_from_slice(&length.to_le_bytes());
-    }
-    out
+    encode_resource_descriptors(&entries)
 }
 
-fn append_reg_entries(entries: &mut Vec<(u32, u32, u64, u64)>, parent: &Node, node: &Node) {
+fn append_reg_entries(entries: &mut Vec<ResourceDescriptor>, parent: &Node, node: &Node) {
     let Some(raw) = node.prop_raw("reg") else {
         return;
     };
@@ -424,13 +414,13 @@ fn append_reg_entries(entries: &mut Vec<(u32, u32, u64, u64)>, parent: &Node, no
         let Some(length) = read_cells(raw, offset + address_cells * 4, size_cells) else {
             return;
         };
-        entries.push((ResourceKind::Memory as u32, index, start, length));
+        entries.push(ResourceDescriptor::memory(index, start, length));
         offset += entry_bytes;
         index += 1;
     }
 }
 
-fn append_interrupt_entries(entries: &mut Vec<(u32, u32, u64, u64)>, node: &Node) {
+fn append_interrupt_entries(entries: &mut Vec<ResourceDescriptor>, node: &Node) {
     let Some(raw) = node.prop_raw("interrupts") else {
         return;
     };
@@ -444,7 +434,7 @@ fn append_interrupt_entries(entries: &mut Vec<(u32, u32, u64, u64)>, node: &Node
             raw[offset + 2],
             raw[offset + 3],
         ]);
-        entries.push((ResourceKind::Interrupt as u32, index, irq as u64, 0));
+        entries.push(ResourceDescriptor::interrupt(index, irq as u64));
         offset += 4;
         index += 1;
     }

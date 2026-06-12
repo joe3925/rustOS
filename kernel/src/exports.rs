@@ -39,6 +39,7 @@ export! {
     map_mmio_region,
     unmap_mmio_region,
     get_current_cpu_id,
+    get_current_platform_cpu_id,
     get_current_lapic_id,
 
     kernel_alloc,
@@ -119,6 +120,7 @@ export! {
     bench_kernel_window_destroy,
     bench_kernel_window_create,
 
+    kernel_platform_cpu_ids,
     kernel_apic_cpu_ids,
 
     routing_resolve_path_to_device,

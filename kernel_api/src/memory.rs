@@ -18,7 +18,6 @@ static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 pub use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 pub use kernel_types::status::PageMapError;
-use kernel_types::PHYSICAL_MEMORY_OFFSET;
 
 pub type PageTableFlags = PageFlags;
 
@@ -63,5 +62,14 @@ pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
 
 #[inline(always)]
 pub fn virt_to_phys(to_phys: VirtAddr) -> Option<PhysAddr> {
-    crate::arch::virt_to_phys(PHYSICAL_MEMORY_OFFSET, to_phys)
+    #[cfg(target_arch = "x86_64")]
+    {
+        return crate::arch::virt_to_phys(kernel_types::PHYSICAL_MEMORY_OFFSET, to_phys);
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = to_phys;
+        None
+    }
 }

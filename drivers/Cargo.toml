@@ -18,7 +18,6 @@ members = [
 resolver = "2"
 [workspace.dependencies]
 kernel_api = { path = "../kernel_api", default-features = false, features = [
-    "arch-x86_64",
     "async-ffi-slab",
     "async-ffi-slab-slots-256",
     "async-ffi-slab-slot-bytes-8k",

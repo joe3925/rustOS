@@ -10,7 +10,7 @@ members = [
     "kernel_sync",
     "xtask",
 ]
-exclude = ["rustos-api", "kernel"]
+exclude = ["rustos-api", "kernel", "kernel_api", "kernel_sys", "kernel_types"]
 resolver = "2"
 
 [profile.dev]

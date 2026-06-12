@@ -1,6 +1,5 @@
 use crate::arch::scheduling::idle_task;
 use crate::arch::MAX_CPUS;
-use crate::arch::{control::Cr3, interrupts};
 use crate::cpu;
 use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::drivers::interrupt_index::LocalApic;
@@ -13,6 +12,7 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
 use crate::memory::paging::stack::StackSize;
+use crate::platform;
 use crate::scheduling::domain::{DomainMaster, EnqueueReason, SwitchOutOutcome, TaskSchedBinding};
 use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding};
 use crate::scheduling::runtime::runtime::yield_now;
@@ -368,7 +368,7 @@ impl Scheduler {
     }
 
     pub fn park_current(&self, _reason: BlockReason) {
-        if !interrupts::are_enabled() {
+        if !platform::interrupts_enabled() {
             panic!("Attempt to park with interrupts disabled, this will always cause a deadlock");
         }
 
@@ -638,7 +638,7 @@ impl Scheduler {
         let pid = task_handle.inner.read().parent_pid;
 
         if let Some(program) = PROGRAM_MANAGER.get(pid) {
-            unsafe { Cr3::write(program.read().cr3, Cr3::read().1) };
+            unsafe { platform::switch_address_space_root(program.read().cr3) };
         } else {
             let id = task_handle.task_id();
             let _ = self.delete_task(id);
@@ -781,7 +781,7 @@ pub extern "C" fn ipi_eoi_only() {
 pub extern "C" fn kernel_task_end() -> ! {
     crate::memory::heap::mimalloc_thread_done();
 
-    interrupts::without_interrupts(|| {
+    platform::with_interrupts_disabled(|| {
         let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
         task.terminate();
     });

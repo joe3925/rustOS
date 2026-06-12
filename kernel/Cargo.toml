@@ -10,8 +10,7 @@ name = "kernel"
 path = "src/main.rs"
 
 [features]
-default = ["allocator-mimalloc", "arch-x86_64"]
-arch-x86_64 = []
+default = ["allocator-mimalloc"]
 allocator-mimalloc = []
 allocator-buddy = []
 
@@ -52,7 +51,6 @@ buddy_system_allocator = "0.11.0"
 toml = { version = "0.9.5", default-features = false, features = ["parse"] }
 libm = { version = "0.2", default-features = false }
 kernel_types = { path = "../kernel_types", default-features = false, features = [
-    "x86_64-compat",
     "async-ffi-slab",
     "async-ffi-slab-slots-512",
     "async-ffi-slab-slot-bytes-64k",

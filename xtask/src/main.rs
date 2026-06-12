@@ -7,6 +7,30 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_GDB_PORT: u16 = 1234;
+const ACTIVE_PLATFORM: PlatformConfig = PlatformConfig {
+    kernel_target_json: "x86_64-rustos-kernel.json",
+    kernel_target_dir: "x86_64-rustos-kernel",
+    stub_target: "x86_64-unknown-none",
+    stub_rustflags_env: "CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS",
+    import_library_machine: "/MACHINE:X64",
+    qemu_cpu: "qemu64,+apic,+acpi",
+    qemu_machine: "q35",
+    qemu_iommu_default: "amd-iommu,dma-remap=on,dma-translation=on",
+    qemu_iommu_whpx: "intel-iommu,intremap=off",
+};
+
+struct PlatformConfig {
+    kernel_target_json: &'static str,
+    kernel_target_dir: &'static str,
+    stub_target: &'static str,
+    stub_rustflags_env: &'static str,
+    import_library_machine: &'static str,
+    qemu_cpu: &'static str,
+    qemu_machine: &'static str,
+    qemu_iommu_default: &'static str,
+    qemu_iommu_whpx: &'static str,
+}
+
 fn main() {
     if let Err(err) = try_main() {
         eprintln!("error: {err}");
@@ -149,8 +173,8 @@ fn usage() -> String {
         "  cargo run -p xtask -- qemu [--debug] [--detach] [--no-build] [--dry-run] [--release] [--gdb-port PORT]",
         "",
         "environment:",
-        "  RUSTOS_QEMU       path to qemu-system-x86_64",
-        "  RUSTOS_OVMF_CODE  path to OVMF/EDK2 x86_64 code firmware",
+        "  RUSTOS_QEMU       path to the active platform QEMU executable",
+        "  RUSTOS_OVMF_CODE  path to the active platform firmware",
         "  OVMF_CODE         fallback firmware path",
         "  RUSTOS_DISK       path to an existing system disk image",
         "  RUSTOS_DISK_FORMAT disk format for RUSTOS_DISK, e.g. raw or vhdx",
@@ -194,7 +218,7 @@ fn run_qemu(root: &Path, options: QemuOptions) -> Result<(), String> {
 fn build_boot_image(root: &Path, release: bool) -> Result<(), String> {
     let kernel_dir = root.join("kernel");
     let profile = profile(release);
-    let target_json = root.join("x86_64-rustos-kernel.json");
+    let target_json = root.join(ACTIVE_PLATFORM.kernel_target_json);
 
     let mut kernel = cargo(&kernel_dir);
     kernel
@@ -211,7 +235,7 @@ fn build_boot_image(root: &Path, release: bool) -> Result<(), String> {
 
     let kernel_pe = root
         .join("target")
-        .join("x86_64-rustos-kernel")
+        .join(ACTIVE_PLATFORM.kernel_target_dir)
         .join(profile)
         .join("kernel.exe");
 
@@ -224,13 +248,10 @@ fn build_boot_image(root: &Path, release: bool) -> Result<(), String> {
         "-p",
         "kernel_stub",
         "--target",
-        "x86_64-unknown-none",
+        ACTIVE_PLATFORM.stub_target,
     ])
     .args(build_std_args())
-    .env(
-        "CARGO_TARGET_X86_64_UNKNOWN_NONE_RUSTFLAGS",
-        kernel_stub_rustflags(),
-    )
+    .env(ACTIVE_PLATFORM.stub_rustflags_env, kernel_stub_rustflags())
     .env("KERNEL_PE_PATH", &kernel_pe);
 
     if release {
@@ -241,7 +262,7 @@ fn build_boot_image(root: &Path, release: bool) -> Result<(), String> {
 
     let stub_image = root
         .join("target")
-        .join("x86_64-unknown-none")
+        .join(ACTIVE_PLATFORM.stub_target)
         .join(profile)
         .join("kernel_stub");
 
@@ -294,7 +315,7 @@ fn ensure_kernel_import_library(root: &Path) -> Result<(), String> {
         .arg("/lib")
         .arg("/NOLOGO")
         .arg(format!("/DEF:{}", def_path.display()))
-        .arg("/MACHINE:X64")
+        .arg(ACTIVE_PLATFORM.import_library_machine)
         .arg(format!("/OUT:{}", kernel_lib.display()))
         .current_dir(root);
 
@@ -485,7 +506,10 @@ fn find_qemu() -> Result<PathBuf, String> {
         }
     }
 
-    Err("could not find qemu-system-x86_64; set RUSTOS_QEMU to the QEMU executable".to_string())
+    Err(
+        "could not find QEMU for the active platform; set RUSTOS_QEMU to the QEMU executable"
+            .to_string(),
+    )
 }
 
 fn qemu_fallback_paths() -> Vec<PathBuf> {
@@ -543,8 +567,7 @@ fn find_ovmf_code(root: &Path, qemu: &Path) -> Result<PathBuf, String> {
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| {
-            "could not find OVMF/EDK2 x86_64 firmware; set RUSTOS_OVMF_CODE or OVMF_CODE"
-                .to_string()
+            "could not find OVMF/EDK2 firmware; set RUSTOS_OVMF_CODE or OVMF_CODE".to_string()
         })
 }
 
@@ -663,9 +686,9 @@ fn qemu_args(
         "-m".into(),
         memory.into(),
         "-cpu".into(),
-        "qemu64,+apic,+acpi".into(),
+        ACTIVE_PLATFORM.qemu_cpu.into(),
         "-machine".into(),
-        "q35".into(),
+        ACTIVE_PLATFORM.qemu_machine.into(),
         "-accel".into(),
         accel.clone().into(),
         "-smp".into(),
@@ -725,9 +748,9 @@ fn qemu_supports_accel(qemu: &Path, accel: &str) -> bool {
 
 fn qemu_iommu_device(accel: &str) -> &'static str {
     if accel == "whpx" {
-        "intel-iommu,intremap=off"
+        ACTIVE_PLATFORM.qemu_iommu_whpx
     } else {
-        "amd-iommu,dma-remap=on,dma-translation=on"
+        ACTIVE_PLATFORM.qemu_iommu_default
     }
 }
 

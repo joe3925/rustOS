@@ -135,6 +135,49 @@ pub enum ResourceKind {
     MsixCapability = 6,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceDescriptor {
+    pub kind: ResourceKind,
+    pub index: u32,
+    pub start: u64,
+    pub length: u64,
+}
+
+impl ResourceDescriptor {
+    pub const fn memory(index: u32, start: u64, length: u64) -> Self {
+        Self {
+            kind: ResourceKind::Memory,
+            index,
+            start,
+            length,
+        }
+    }
+
+    pub const fn interrupt(index: u32, irq: u64) -> Self {
+        Self {
+            kind: ResourceKind::Interrupt,
+            index,
+            start: irq,
+            length: 0,
+        }
+    }
+}
+
+pub fn encode_resource_descriptors(resources: &[ResourceDescriptor]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + resources.len() * 24);
+    out.extend_from_slice(b"RSRC");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(resources.len() as u32).to_le_bytes());
+    for resource in resources {
+        out.extend_from_slice(&(resource.kind as u32).to_le_bytes());
+        out.extend_from_slice(&resource.index.to_le_bytes());
+        out.extend_from_slice(&resource.start.to_le_bytes());
+        out.extend_from_slice(&resource.length.to_le_bytes());
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum BootType {

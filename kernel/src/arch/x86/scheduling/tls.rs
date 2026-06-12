@@ -1,6 +1,6 @@
 use crate::drivers::interrupt_index::PERCPU_TLS_ARRAY_POINTER_OFF;
 use crate::util::boot_info;
-use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use alloc::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::fmt;

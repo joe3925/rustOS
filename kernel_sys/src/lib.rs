@@ -45,6 +45,7 @@ unsafe extern "C" {
     pub fn get_rsdp() -> u64;
     pub fn get_device_tree_blob() -> Option<*const FdtHeader>;
     pub unsafe fn get_current_cpu_id() -> usize;
+    pub unsafe fn get_current_platform_cpu_id() -> usize;
     pub unsafe fn get_current_lapic_id() -> usize;
     pub fn stopwatch_new() -> Stopwatch;
     pub fn elapsed(s: &Stopwatch) -> Duration;
@@ -218,6 +219,7 @@ unsafe extern "C" {
     ) -> FfiFuture<DriverStatus>;
 
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
+    pub fn kernel_platform_cpu_ids() -> Vec<u8>;
     pub fn kernel_apic_cpu_ids() -> Vec<u8>;
 
     // Bench (drivers)
