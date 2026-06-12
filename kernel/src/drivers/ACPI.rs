@@ -6,13 +6,9 @@ use acpi::{AcpiHandler, AcpiTables, InterruptModel, PhysicalMapping, PlatformInf
 use alloc::alloc::Global;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
-use lazy_static::lazy_static;
 
 use crate::arch::{PhysAddr, VirtAddr};
 
-lazy_static! {
-    pub static ref ACPI_TABLES: ACPI = ACPI::new();
-}
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct Xsdp {
@@ -27,27 +23,21 @@ pub struct Xsdp {
     pub extended_checksum: u8,
     pub reserved: [u8; 3],
 }
-unsafe impl Send for ACPI {}
-unsafe impl Sync for ACPI {}
-pub struct ACPI {
+unsafe impl Send for AcpiFirmware {}
+unsafe impl Sync for AcpiFirmware {}
+pub struct AcpiFirmware {
     tables: Arc<AcpiTables<ACPIImpl>>,
 }
-impl ACPI {
-    pub fn new() -> Self {
+impl AcpiFirmware {
+    pub fn from_boot_info() -> Option<Self> {
         let handler = ACPIImpl::new();
-        if boot_info().rsdp_addr.into_option().is_none() {
-            panic!("RSDP was not supplied by bootloader");
-        }
-        let tables = unsafe {
-            AcpiTables::from_rsdp(
-                handler,
-                boot_info().rsdp_addr.into_option().unwrap() as usize,
-            )
-            .expect("failed to parse ACPI")
-        };
+        let rsdp = boot_info().rsdp_addr.into_option()?;
+        let tables =
+            unsafe { AcpiTables::from_rsdp(handler, rsdp as usize).expect("failed to parse ACPI") };
         let arc_tab = Arc::new(tables);
-        ACPI { tables: arc_tab }
+        Some(AcpiFirmware { tables: arc_tab })
     }
+
     pub fn get_interrupt_model(&self) -> Option<Apic<'_, Global>> {
         let platform_info = self.tables.platform_info().ok()?;
         match &platform_info.interrupt_model {
@@ -60,6 +50,10 @@ impl ACPI {
     }
     pub fn get_tables(&self) -> Arc<AcpiTables<ACPIImpl>> {
         self.tables.clone()
+    }
+
+    pub fn into_tables(self) -> Arc<AcpiTables<ACPIImpl>> {
+        self.tables
     }
 }
 unsafe impl Send for ACPIImpl {}

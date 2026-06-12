@@ -1,23 +1,21 @@
-use crate::KERNEL_INITIALIZED;
 use crate::cpu::{self, get_cpu_info};
-use crate::drivers::ACPI::ACPI_TABLES;
 use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
 use crate::drivers::timer_driver::set_num_cores;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
+use crate::machine::MachineInterruptInfo;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
-use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
+use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::tables::virt_to_phys;
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{CORE_LOCK, CPU_ID, INIT_LOCK, boot_info};
-use acpi::platform::interrupt::Apic;
-use alloc::alloc::Global;
+use crate::util::{boot_info, CORE_LOCK, CPU_ID, INIT_LOCK};
+use crate::KERNEL_INITIALIZED;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -30,8 +28,8 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::sgdt;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::DescriptorTablePointer;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame};
+use x86_64::structures::DescriptorTablePointer;
 use x86_64::{PhysAddr, VirtAddr};
 
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
@@ -591,13 +589,11 @@ pub fn apic_logical_ids() -> Vec<u8> {
     let mut ids = Vec::new();
     ids.push(get_current_logical_id());
 
-    if let Some(pi) = ACPI_TABLES.get_plat_info() {
-        if let Some(proc_info) = pi.processor_info {
-            for ap in proc_info.application_processors.iter() {
-                let id = ap.local_apic_id as u8;
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
+    if let Some(info) = crate::machine::machine_info().interrupt_info() {
+        for ap in info.application_processors.iter() {
+            let id = ap.local_apic_id as u8;
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
     }
@@ -786,7 +782,7 @@ impl IoApic for Ioapic {
     }
 }
 pub struct ApicImpl {
-    pub apic_info: Apic<'static, Global>,
+    pub apic_info: MachineInterruptInfo,
     pub lapic: Lapic,
     pub ioapic: Ioapic,
 }
@@ -800,11 +796,15 @@ impl ApicImpl {
             return Err(NotAvailable);
         }
 
-        let model = ACPI_TABLES.get_interrupt_model().ok_or(BadInterruptModel)?;
+        let model = crate::machine::machine_info()
+            .interrupt_info()
+            .ok_or(NoACPI)?
+            .clone();
         let lapic =
             Lapic::new(PhysAddr::new(model.local_apic_address)).map_err(|_| BadInterruptModel)?;
-        let ioapic = Ioapic::new(PhysAddr::new(model.io_apics[0].address as u64))
-            .map_err(|_| BadInterruptModel)?;
+        let ioapic_info = model.io_apics.first().ok_or(BadInterruptModel)?;
+        let ioapic =
+            Ioapic::new(PhysAddr::new(ioapic_info.address)).map_err(|_| BadInterruptModel)?;
 
         Ok(Self {
             apic_info: model,
@@ -853,9 +853,7 @@ impl ApicImpl {
     }
 
     pub fn start_aps(&self) {
-        let plat = ACPI_TABLES.get_plat_info().expect("bad interrupt model");
-        let proc = plat.processor_info.expect("bad interrupt model");
-        let apics = proc.application_processors;
+        let apics = &self.apic_info.application_processors;
 
         let ap_count = apics.len();
         set_num_cores(ap_count + 1);

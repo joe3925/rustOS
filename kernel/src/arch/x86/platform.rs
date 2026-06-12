@@ -5,15 +5,15 @@ use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::PhysFrame;
 
 use crate::drivers::interrupt_index::{
-    APIC, APIC_START_PERIOD, ApicImpl, IpiDest, IpiKind, LocalApic, PICS,
     apic_calibrate_ticks_per_ns_via_wait, apic_logical_ids, apic_program_period_ns, calibrate_tsc,
     current_cpu_id as x86_current_cpu_id, current_is_in_interrupt_atomic,
     get_current_logical_id as x86_current_logical_id, init_percpu_gs,
-    wait_duration as x86_wait_duration, wait_using_pit_50ms,
+    wait_duration as x86_wait_duration, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
+    APIC, APIC_START_PERIOD, PICS,
 };
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
-use crate::memory::dma::{PlatformIommuInfo, discover_platform_iommu};
+use crate::memory::dma::PlatformIommuInfo;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::platform::{
     AddressSpacePlatform, CpuPlatform, DeviceMmuPlatform, InterruptPlatform, Platform,
@@ -170,6 +170,6 @@ impl AddressSpacePlatform for X86Platform {
 
 impl DeviceMmuPlatform for X86Platform {
     fn discover_required_device_mmu() -> PlatformIommuInfo {
-        discover_platform_iommu()
+        crate::machine::machine_info().discover_required_device_mmu()
     }
 }

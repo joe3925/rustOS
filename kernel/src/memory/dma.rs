@@ -33,7 +33,7 @@
 // - Add backend-specific tests for Intel VT-d and AMD-Vi invalidation behavior.
 //
 use crate::drivers::pnp::device::DevNodeExt;
-use crate::drivers::ACPI::{ACPIImpl, ACPI_TABLES};
+use crate::drivers::ACPI::ACPIImpl;
 use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
 use alloc::collections::BTreeMap;
@@ -1293,10 +1293,9 @@ pub enum AmdIvhdDeviceEntry {
         raw: Vec<u8>,
     },
 }
-pub(crate) fn discover_platform_iommu() -> PlatformIommuInfo {
-    let tables = ACPI_TABLES.get_tables();
-    let tables = tables.as_ref();
-
+pub(crate) fn discover_platform_iommu_from_acpi(
+    tables: &AcpiTables<ACPIImpl>,
+) -> PlatformIommuInfo {
     match detect_boot_iommu_vendor() {
         BootIommuVendor::Intel => PlatformIommuInfo::Intel(parse_intel_dmar(tables)),
         BootIommuVendor::Amd => PlatformIommuInfo::Amd(parse_amd_ivrs(tables)),

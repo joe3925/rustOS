@@ -34,6 +34,7 @@ mod executable;
 mod exports;
 mod file_system;
 mod idt;
+mod machine;
 mod memory;
 mod object_manager;
 mod platform;

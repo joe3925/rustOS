@@ -16,7 +16,7 @@ use crate::{
     drivers::{
         interrupt_index::{self, current_cpu_id, get_current_logical_id},
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
-        ACPI::{ACPIImpl, ACPI_TABLES},
+        ACPI::ACPIImpl,
     },
     file_system::{
         file::{self, File},
@@ -339,14 +339,14 @@ pub extern "C" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<Strin
 }
 
 pub extern "C" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
-    ACPI_TABLES.get_tables()
+    crate::machine::machine_info()
+        .firmware()
+        .acpi_tables()
+        .expect("ACPI tables were not supplied by bootloader")
 }
 
 pub extern "C" fn get_device_tree_blob() -> Option<*const FdtHeader> {
-    boot_info()
-        .fdt_header
-        .into_option()
-        .map(|ptr| ptr.cast::<FdtHeader>())
+    crate::machine::machine_info().firmware().fdt_header()
 }
 
 pub extern "C" fn pnp_create_pdo(
