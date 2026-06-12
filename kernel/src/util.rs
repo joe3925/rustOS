@@ -6,28 +6,28 @@ use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::NUM_CORES;
-use crate::executable::program::{PROGRAM_MANAGER, Program};
+use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file_provider::{ProviderKind, install_file_provider};
+use crate::file_system::file_provider::{install_file_provider, ProviderKind};
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{heap_capacity_bytes, init_heap};
 use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::{
-    BootInfoFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram,
+    boot_usable_bytes, resize_bitmap_for_ram, BootInfoFrameAllocator,
 };
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
-use crate::platform::{CpuPlatform, TimerPlatform, current_cpu_id};
+use crate::platform::{current_cpu_id, CpuPlatform, TimerPlatform};
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
-use crate::{BOOT_INFO, BOOT_INFO_INITIALIZED, cpu, println};
+use crate::{cpu, println, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -46,8 +46,10 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
-use x86_64::VirtAddr;
+#[cfg(target_arch = "x86_64")]
 use x86_64::structures::idt::InterruptDescriptorTable;
+#[cfg(target_arch = "x86_64")]
+use x86_64::VirtAddr;
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
@@ -322,18 +324,33 @@ pub extern "C" fn trigger_stack_overflow() {
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn trigger_triple_fault() -> ! {
-    static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
-    crate::platform::disable_interrupts();
-    unsafe {
-        EMPTY_IDT.load();
-        asm!("ud2", options(noreturn));
+        crate::platform::disable_interrupts();
+        unsafe {
+            EMPTY_IDT.load();
+            asm!("ud2", options(noreturn));
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        crate::platform::disable_interrupts();
+        loop {
+            core::hint::spin_loop()
+        }
     }
 }
 
 pub fn trigger_breakpoint() {
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         asm!("int 3");
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // No-op or trigger other architecture breakpoint
     }
 }
 

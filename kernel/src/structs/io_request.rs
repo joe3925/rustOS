@@ -612,7 +612,7 @@ fn user_ptr_range_ok(addr: u64, bytes: usize) -> bool {
             .is_some_and(|end| is_user_addr(end - 1))
 }
 
-fn with_process_cr3<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
+fn with_process_address_space<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
     let process_cr3 = owner.read().cr3;
     let old = platform::current_address_space_root();
 
@@ -633,7 +633,7 @@ fn copy_to_user_bytes(owner: &ProgramHandle, dst: u64, bytes: &[u8]) -> Result<(
         return Err(IO_STATUS_INVALID_PARAMETER);
     }
 
-    with_process_cr3(owner, || unsafe {
+    with_process_address_space(owner, || unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
     });
 
@@ -646,7 +646,7 @@ fn copy_to_user_value<T: Clone>(owner: &ProgramHandle, dst: u64, value: &T) -> R
     }
 
     let cloned = value.clone();
-    with_process_cr3(owner, || unsafe {
+    with_process_address_space(owner, || unsafe {
         core::ptr::write_unaligned(dst as *mut T, cloned);
     });
 

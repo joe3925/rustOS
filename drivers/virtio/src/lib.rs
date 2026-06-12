@@ -472,10 +472,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
         }
     };
 
-    let cfg_base = match kernel_api::memory::map_mmio_region(
-        PhysAddr::new(cfg_phys),
-        cfg_len,
-    ) {
+    let cfg_base = match kernel_api::memory::map_mmio_region(PhysAddr::new(cfg_phys), cfg_len) {
         Ok(va) => va,
         Err(_) => {
             println!("virtio-blk: failed to map PCI config space");
@@ -1065,17 +1062,25 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 #[inline]
 fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags)
-        );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let lo: u32;
+        let hi: u32;
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        ((hi as u64) << 32) | (lo as u64)
     }
-    ((hi as u64) << 32) | (lo as u64)
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // TODO: implement standard cross-platform timestamp retrieval
+        0
+    }
 }
 
 #[request_handler]

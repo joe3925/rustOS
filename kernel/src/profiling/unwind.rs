@@ -393,6 +393,7 @@ fn push_frame(out: &mut CapturedCallchain, pc: u64) {
 }
 
 fn classify_pc(pc: u64) -> u32 {
+    #[cfg(target_arch = "x86_64")]
     if is_registered_pe_pc(pc) {
         return BENCH_FRAME_KIND_PE_X64;
     }
@@ -403,6 +404,7 @@ fn classify_pc(pc: u64) -> u32 {
 fn unwind_one(ctx: &mut UnwindContext, bounds: StackBounds) -> u32 {
     let control_pc = ctx.control_pc();
 
+    #[cfg(target_arch = "x86_64")]
     if is_registered_pe_pc(control_pc) {
         return unwind_pe_x64(ctx, bounds, control_pc);
     }
@@ -424,6 +426,7 @@ fn is_registered_pe_pc(pc: u64) -> bool {
         .any(|module| pc >= module.image_base && pc < module.image_end)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn unwind_pe_x64(ctx: &mut UnwindContext, bounds: StackBounds, control_pc: u64) -> u32 {
     let Some(modules) = PE_UNWIND_MODULES.try_read() else {
         let status = BENCH_UNWIND_STATUS_NO_UNWIND_INFO | BENCH_UNWIND_STATUS_LEAF_FALLBACK;
