@@ -1,5 +1,6 @@
 use crate::structs::range_tracker::RangeTracker;
 use alloc::sync::Arc;
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaPciDeviceIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,14 +50,6 @@ pub struct DeviceMmuBackendInfo {
     pub public_vendor_code: u8,
     pub name: &'static str,
     pub capabilities: DeviceMmuCapabilities,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceMmuPlatformDeviceIdentity {
-    pub firmware_node: u64,
-    pub iommu_id_base: u32,
-    pub iommu_id_count: u32,
-    pub flags: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

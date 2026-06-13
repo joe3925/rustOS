@@ -14,6 +14,7 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
     DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
@@ -93,6 +94,10 @@ unsafe extern "C" {
     pub fn kernel_dma_register_pci_pdo(
         pdo: &Arc<DeviceObject>,
         identity: DmaPciDeviceIdentity,
+    ) -> DriverStatus;
+    pub fn kernel_dma_register_platform_pdo(
+        pdo: &Arc<DeviceObject>,
+        identity: DeviceMmuPlatformDeviceIdentity,
     ) -> DriverStatus;
     pub fn kernel_dma_open_device_handle(
         device: &Arc<DeviceObject>,

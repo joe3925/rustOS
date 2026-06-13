@@ -27,7 +27,13 @@ pub struct DmaPciDeviceIdentity {
     pub reserved: u16,
     pub config_space_phys: u64,
 }
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceMmuPlatformDeviceIdentity {
+    pub firmware_node: u64,
+    pub iommu_id_base: u32,
+    pub iommu_id_count: u32,
+    pub flags: u32,
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DmaDeviceState {

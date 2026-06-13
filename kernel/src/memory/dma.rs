@@ -1,8 +1,17 @@
+use crate::drivers::pnp::device::DevNodeExt;
+use crate::memory::device_mmu::DeviceMmuAttachment;
+use crate::memory::device_mmu::DeviceMmuDeviceIdentity;
+use crate::memory::device_mmu::DeviceMmuDomain;
+use crate::memory::device_mmu::DeviceMmuError;
+use crate::memory::device_mmu::DeviceMmuMapPermissions;
+use crate::memory::device_mmu::DeviceMmuSystem;
+use crate::memory::device_mmu::MappingRecord;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::BorrowedDmaMapping;
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaDeviceHandle;
 use kernel_types::dma::DmaDeviceState;
 use kernel_types::dma::DmaMapError;
@@ -21,16 +30,6 @@ use kernel_types::dma::IOBUFFER_PAGE_SIZE;
 use kernel_types::status::DriverStatus;
 use spin::Mutex;
 use spin::Once;
-
-use crate::drivers::pnp::device::DevNodeExt;
-use crate::memory::device_mmu::DeviceMmuAttachment;
-use crate::memory::device_mmu::DeviceMmuDeviceIdentity;
-use crate::memory::device_mmu::DeviceMmuDomain;
-use crate::memory::device_mmu::DeviceMmuError;
-use crate::memory::device_mmu::DeviceMmuMapPermissions;
-use crate::memory::device_mmu::DeviceMmuSystem;
-use crate::memory::device_mmu::MappingRecord;
-
 static DMA_MANAGER: Once<DmaManager> = Once::new();
 
 pub fn init_dma_manager() {
@@ -40,7 +39,12 @@ pub fn init_dma_manager() {
 pub fn register_pci_pdo(pdo: &Arc<DeviceObject>, identity: DmaPciDeviceIdentity) -> DriverStatus {
     manager().register_pci_pdo(pdo, identity)
 }
-
+pub fn register_platform_pdo(
+    pdo: &Arc<DeviceObject>,
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> DriverStatus {
+    manager().register_platform_pdo(pdo, identity)
+}
 pub fn open_device_handle(device: &Arc<DeviceObject>) -> Result<DmaDeviceHandle, DriverStatus> {
     manager().open_device_handle(device)
 }
@@ -923,7 +927,29 @@ impl DmaManager {
 
         DriverStatus::Success
     }
+    fn register_platform_pdo(
+        &self,
+        pdo: &Arc<DeviceObject>,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> DriverStatus {
+        if identity.translation_id_count == 0 {
+            return DriverStatus::InvalidParameter;
+        }
 
+        let key = device_key(pdo);
+        let mut state = self.state.lock();
+
+        state.devices.insert(
+            key,
+            Arc::new(RegisteredDmaDevice {
+                pdo: Arc::downgrade(pdo),
+                identity: RegisteredDmaIdentity::Platform(identity),
+                runtime: Mutex::new(RegisteredDmaRuntime::new()),
+            }),
+        );
+
+        DriverStatus::Success
+    }
     fn open_device_handle(
         &self,
         device: &Arc<DeviceObject>,
@@ -1145,12 +1171,14 @@ impl RegisteredDmaRuntime {
 #[derive(Clone, Copy)]
 enum RegisteredDmaIdentity {
     Pci(DmaPciDeviceIdentity),
+    Platform(DeviceMmuPlatformDeviceIdentity),
 }
 
 impl RegisteredDmaIdentity {
     fn device_mmu_identity(self) -> DeviceMmuDeviceIdentity {
         match self {
             Self::Pci(identity) => DeviceMmuDeviceIdentity::Pci(identity),
+            Self::Platform(identity) => DeviceMmuDeviceIdentity::Platform(identity),
         }
     }
 }

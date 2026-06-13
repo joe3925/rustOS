@@ -16,6 +16,12 @@ pub fn register_pci_pdo(
 ) -> DriverStatus {
     unsafe { kernel_sys::kernel_dma_register_pci_pdo(pdo, identity) }
 }
+pub fn register_platform_pdo(
+    pdo: &Arc<DeviceObject>,
+    identity: dma::DeviceMmuPlatformDeviceIdentity,
+) -> DriverStatus {
+    unsafe { kernel_sys::kernel_dma_register_platform_pdo(pdo, identity) }
+}
 
 pub fn open_device_handle(
     device: &Arc<DeviceObject>,

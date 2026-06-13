@@ -3,6 +3,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::object_manager::OmError;
 
 use crate::arch::{interrupts, syscalls};
@@ -199,7 +200,13 @@ pub extern "C" fn kernel_dma_register_pci_pdo(
 ) -> DriverStatus {
     dma::register_pci_pdo(pdo, identity)
 }
-
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_dma_register_platform_pdo(
+    pdo: &Arc<DeviceObject>,
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> DriverStatus {
+    dma::register_platform_pdo(pdo, identity)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_open_device_handle(
     device: &Arc<DeviceObject>,
