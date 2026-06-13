@@ -28,55 +28,23 @@ pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 pub const AMD_IR: u64 = 1 << 61;
 pub const AMD_IW: u64 = 1 << 62;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Once;
+
 const IOMMU_TABLE_ARENA_SIZE: u64 = 8 * 1024 * 1024;
 const IOMMU_TABLE_PAGE_SIZE: u64 = 0x1000;
 
-static IOMMU_TABLE_ARENA: Mutex<IommuTableArena> = Mutex::new(IommuTableArena::empty());
-
-struct IommuTableArena {
+struct IommuTableArenaInfo {
     phys_base: u64,
     virt_base: u64,
     size: u64,
-    next: u64,
 }
 
-impl IommuTableArena {
-    const fn empty() -> Self {
-        Self {
-            phys_base: 0,
-            virt_base: 0,
-            size: 0,
-            next: 0,
-        }
-    }
-
-    fn contains_phys(&self, phys: u64) -> bool {
-        self.size != 0 && phys >= self.phys_base && phys < self.phys_base + self.size
-    }
-
-    fn virt_for_phys<T>(&self, phys: u64) -> Option<*mut T> {
-        if !self.contains_phys(phys) {
-            return None;
-        }
-        Some((self.virt_base + (phys - self.phys_base)) as *mut T)
-    }
-
-    fn alloc_page(&mut self) -> Option<(u64, *mut u64)> {
-        let next = self.next.checked_add(IOMMU_TABLE_PAGE_SIZE)?;
-        if next > self.size {
-            return None;
-        }
-
-        let phys = self.phys_base + self.next;
-        let ptr = (self.virt_base + self.next) as *mut u64;
-        self.next = next;
-        Some((phys, ptr))
-    }
-}
+static IOMMU_TABLE_ARENA_INFO: Once<IommuTableArenaInfo> = Once::new();
+static IOMMU_TABLE_NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub fn init_table_arena() -> Result<(), IommuError> {
-    let mut arena = IOMMU_TABLE_ARENA.lock();
-    if arena.size != 0 {
+    if IOMMU_TABLE_ARENA_INFO.is_completed() {
         return Ok(());
     }
 
@@ -85,21 +53,23 @@ pub fn init_table_arena() -> Result<(), IommuError> {
         .map_err(|_| IommuError::NoBackingFrame)?;
     let (_, phys) = virt_to_phys(virt).ok_or(IommuError::NoBackingFrame)?;
 
-    *arena = IommuTableArena {
+    IOMMU_TABLE_ARENA_INFO.call_once(|| IommuTableArenaInfo {
         phys_base: phys.as_u64(),
         virt_base: virt.as_u64(),
         size: IOMMU_TABLE_ARENA_SIZE,
-        next: 0,
-    };
+    });
+
     Ok(())
 }
 
-#[inline]
+#[inline(always)]
 pub(crate) unsafe fn phys_to_mut<T>(phys: u64) -> *mut T {
-    IOMMU_TABLE_ARENA
-        .lock()
-        .virt_for_phys::<T>(phys)
-        .expect("IOMMU table physical address is outside the table arena")
+    let arena = IOMMU_TABLE_ARENA_INFO.get().unwrap();
+
+    debug_assert!(phys >= arena.phys_base);
+    debug_assert!(phys < arena.phys_base + arena.size);
+
+    (arena.virt_base + (phys - arena.phys_base)) as *mut T
 }
 
 #[inline]
@@ -122,7 +92,16 @@ fn iova_index(iova: u64, level: u32) -> usize {
 
 /// Allocate one 4 KiB frame for a page-table level and zero it.
 pub fn alloc_pt_frame_phys() -> Option<u64> {
-    let (phys, ptr) = IOMMU_TABLE_ARENA.lock().alloc_page()?;
+    let arena = IOMMU_TABLE_ARENA_INFO.get()?;
+
+    let offset = IOMMU_TABLE_NEXT.fetch_add(IOMMU_TABLE_PAGE_SIZE, Ordering::SeqCst);
+    if offset + IOMMU_TABLE_PAGE_SIZE > arena.size {
+        return None;
+    }
+
+    let phys = arena.phys_base + offset;
+    let ptr = (arena.virt_base + offset) as *mut u64;
+
     unsafe {
         for i in 0..512 {
             ptr.add(i).write_volatile(0);
@@ -135,7 +114,203 @@ pub fn alloc_pt_frame_phys() -> Option<u64> {
 /// AMD `IR`/`IW`) on top of the shared `P | R/W` flags. Interior frames
 /// allocated on the way down are intentionally not reported — see the
 /// module docstring.
-#[inline]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IommuMapPermissions {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl IommuMapPermissions {
+    pub(crate) fn amd_flags(self) -> u64 {
+        let mut f = PTE_P;
+        if matches!(self, Self::Read | Self::ReadWrite) {
+            f |= AMD_IR;
+        }
+        if matches!(self, Self::Write | Self::ReadWrite) {
+            f |= AMD_IW;
+        }
+        f
+    }
+
+    pub(crate) fn intel_flags(self) -> u64 {
+        let mut f = PTE_P;
+        if matches!(self, Self::Read | Self::ReadWrite) {
+            f |= 1;
+        } // R
+        if matches!(self, Self::Write | Self::ReadWrite) {
+            f |= 2;
+        } // W
+        f
+    }
+}
+
+pub fn map_range(
+    root_phys: u64,
+    iova: u64,
+    phys: u64,
+    len: u64,
+    permissions: IommuMapPermissions,
+) -> Result<(), IommuError> {
+    let mut cur_iova = iova;
+    let mut cur_phys = phys;
+    let mut remaining = len;
+
+    let is_amd = matches!(super::backend(), Some(super::IommuBackend::Amd(_)));
+
+    let interior_flags = |level: u32| -> u64 {
+        if is_amd {
+            permissions.amd_flags() | (((level - 1) as u64) << 9)
+        } else {
+            PTE_P | PTE_RW
+        }
+    };
+
+    let leaf_flags = |level: u32| -> u64 {
+        let mut flags = if is_amd {
+            let mut f = permissions.amd_flags();
+            if level > 1 {
+                f |= 0 << 9; // Next Level = 0 for large pages
+            }
+            f
+        } else {
+            let mut f = permissions.intel_flags();
+            if level > 1 {
+                f |= 1 << 7; // PS bit
+            }
+            f
+        };
+        flags
+    };
+
+    while remaining > 0 {
+        if remaining >= 1024 * 1024 * 1024
+            && (cur_iova & ((1024 * 1024 * 1024) - 1)) == 0
+            && (cur_phys & ((1024 * 1024 * 1024) - 1)) == 0
+        {
+            ensure_iommu_1gib_mapped(root_phys, cur_iova, cur_phys, remaining, permissions)?;
+            cur_iova += 1024 * 1024 * 1024;
+            cur_phys += 1024 * 1024 * 1024;
+            remaining -= 1024 * 1024 * 1024;
+        } else if remaining >= 2 * 1024 * 1024
+            && (cur_iova & ((2 * 1024 * 1024) - 1)) == 0
+            && (cur_phys & ((2 * 1024 * 1024) - 1)) == 0
+        {
+            ensure_iommu_2mib_mapped(root_phys, cur_iova, cur_phys, remaining, permissions)?;
+            cur_iova += 2 * 1024 * 1024;
+            cur_phys += 2 * 1024 * 1024;
+            remaining -= 2 * 1024 * 1024;
+        } else {
+            map_4k(
+                root_phys,
+                cur_iova,
+                cur_phys,
+                interior_flags,
+                leaf_flags(1),
+                PTE_P,
+            )?;
+            cur_iova += 4096;
+            cur_phys += 4096;
+            remaining -= 4096;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn ensure_iommu_2mib_mapped(
+    root_phys: u64,
+    iova: u64,
+    phys: u64,
+    _len: u64,
+    permissions: IommuMapPermissions,
+) -> Result<(), IommuError> {
+    let is_amd = matches!(super::backend(), Some(super::IommuBackend::Amd(_)));
+
+    let interior_flags = |level: u32| -> u64 {
+        if is_amd {
+            permissions.amd_flags() | (((level - 1) as u64) << 9)
+        } else {
+            PTE_P | PTE_RW
+        }
+    };
+
+    let mut leaf = if is_amd {
+        permissions.amd_flags() | (0 << 9)
+    } else {
+        permissions.intel_flags() | (1 << 7)
+    };
+
+    let mut table_phys = root_phys;
+    for lvl in (3..=4).rev() {
+        let idx = iova_index(iova, lvl);
+        let entry = read_entry(table_phys, idx);
+
+        if entry & PTE_P == 0 {
+            let new_table = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
+            let new_entry = (new_table & PTE_ADDR_MASK) | interior_flags(lvl);
+            write_entry(table_phys, idx, new_entry);
+            table_phys = new_table;
+        } else {
+            table_phys = entry & PTE_ADDR_MASK;
+        }
+    }
+
+    let idx = iova_index(iova, 2);
+    let entry = read_entry(table_phys, idx);
+    if entry & PTE_P == 0 {
+        write_entry(table_phys, idx, (phys & PTE_ADDR_MASK) | leaf);
+    }
+
+    Ok(())
+}
+
+pub fn ensure_iommu_1gib_mapped(
+    root_phys: u64,
+    iova: u64,
+    phys: u64,
+    _len: u64,
+    permissions: IommuMapPermissions,
+) -> Result<(), IommuError> {
+    let is_amd = matches!(super::backend(), Some(super::IommuBackend::Amd(_)));
+
+    let interior_flags = |level: u32| -> u64 {
+        if is_amd {
+            permissions.amd_flags() | (((level - 1) as u64) << 9)
+        } else {
+            PTE_P | PTE_RW
+        }
+    };
+
+    let mut leaf = if is_amd {
+        permissions.amd_flags() | (0 << 9)
+    } else {
+        permissions.intel_flags() | (1 << 7)
+    };
+
+    let mut table_phys = root_phys;
+    let lvl = 4;
+    let idx = iova_index(iova, lvl);
+    let entry = read_entry(table_phys, idx);
+
+    if entry & PTE_P == 0 {
+        let new_table = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
+        let new_entry = (new_table & PTE_ADDR_MASK) | interior_flags(lvl);
+        write_entry(table_phys, idx, new_entry);
+        table_phys = new_table;
+    } else {
+        table_phys = entry & PTE_ADDR_MASK;
+    }
+
+    let idx = iova_index(iova, 3);
+    let entry = read_entry(table_phys, idx);
+    if entry & PTE_P == 0 {
+        write_entry(table_phys, idx, (phys & PTE_ADDR_MASK) | leaf);
+    }
+
+    Ok(())
+}
+
 pub fn map_4k<F: Fn(u32) -> u64>(
     root_phys: u64,
     iova: u64,

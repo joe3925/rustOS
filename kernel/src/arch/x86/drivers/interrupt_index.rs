@@ -6,7 +6,7 @@ use crate::drivers::timer_driver::set_num_cores;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::machine::MachineInterruptInfo;
-use crate::memory::paging::mmio::map_mmio_region;
+use crate::memory::paging::mmio::map_physical_pages;
 use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::tables::virt_to_phys;
@@ -638,7 +638,12 @@ pub struct Lapic {
 
 impl Lapic {
     pub fn new(phys: PhysAddr) -> Result<Self, ()> {
-        let virt = map_mmio_region(phys, 0x1000).map_err(|_| ())?;
+        let virt = map_physical_pages(
+            phys,
+            0x1000,
+            kernel_types::memory::PhysicalMappingCache::Uncached,
+        )
+        .map_err(|_| ())?;
         Ok(Self { base_addr: virt })
     }
 
@@ -740,7 +745,12 @@ pub struct Ioapic {
 
 impl Ioapic {
     pub fn new(phys: PhysAddr) -> Result<Self, ()> {
-        let virt = map_mmio_region(phys, 0x2048).map_err(|_| ())?;
+        let virt = map_physical_pages(
+            phys,
+            0x2048,
+            kernel_types::memory::PhysicalMappingCache::Uncached,
+        )
+        .map_err(|_| ())?;
         Ok(Self { base_addr: virt })
     }
 

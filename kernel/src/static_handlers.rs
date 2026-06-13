@@ -849,21 +849,28 @@ pub extern "C" fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
 }
 
 #[no_mangle]
-pub extern "C" fn map_mmio_region(
-    mmio_base: AbiPhysAddr,
-    mmio_size: u64,
+pub extern "C" fn map_physical_pages(
+    phys: AbiPhysAddr,
+    size: u64,
+    cache: kernel_types::memory::PhysicalMappingCache,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    mmio::map_mmio_region(mmio_base.into(), mmio_size).map(Into::into)
+    mmio::map_physical_pages(phys.into(), size, cache).map(Into::into)
 }
 
 #[no_mangle]
-pub extern "C" fn unmap_mmio_region(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
-    mmio::unmap_mmio_region(base.into(), size)
+pub extern "C" fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
+    mmio::unmap_physical_pages(base.into(), size)
 }
 
 #[no_mangle]
 pub extern "C" fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
     crate::memory::paging::tables::virt_to_phys(addr.into()).map(|(size, phys)| (size, phys.into()))
+}
+
+#[no_mangle]
+pub extern "C" fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
+    crate::memory::paging::tables::resolve_virtual_range_frame(addr.into())
+        .map(|(size, phys)| (size, phys.into()))
 }
 
 // ============================================================================

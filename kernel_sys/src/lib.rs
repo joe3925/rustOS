@@ -122,9 +122,14 @@ unsafe extern "C" {
     pub fn deallocate_kernel_range(addr: VirtAddr, size: u64);
     pub fn unmap_range(virtual_addr: VirtAddr, size: u64);
     pub fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags);
-    pub fn map_mmio_region(mmio_base: PhysAddr, mmio_size: u64) -> Result<VirtAddr, PageMapError>;
-    pub fn unmap_mmio_region(mmio_base: VirtAddr, mmio_size: u64) -> Result<(), PageMapError>;
+    pub fn map_physical_pages(
+        phys: PhysAddr,
+        size: u64,
+        cache: kernel_types::memory::PhysicalMappingCache,
+    ) -> Result<VirtAddr, PageMapError>;
+    pub fn unmap_physical_pages(virt: VirtAddr, size: u64) -> Result<(), PageMapError>;
     pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+    pub fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
 
     // Registry (async FFI)
     pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
@@ -267,8 +272,12 @@ impl acpi::AcpiHandler for KernelAcpiHandler {
         size: usize,
     ) -> PhysicalMapping<Self, T> {
         let virt_addr = unsafe {
-            crate::map_mmio_region(PhysAddr::new(physical_address as u64), size as u64)
-                .expect("failed to map io space for ACPI")
+            crate::map_physical_pages(
+                PhysAddr::new(physical_address as u64),
+                size as u64,
+                kernel_types::memory::PhysicalMappingCache::Uncached,
+            )
+            .expect("failed to map io space for ACPI")
         };
 
         unsafe {

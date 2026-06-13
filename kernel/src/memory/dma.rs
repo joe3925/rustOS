@@ -717,23 +717,15 @@ fn map_phys_run_to_iova(
     phys_base: u64,
     page_count: usize,
 ) -> Result<(), DmaMapError> {
-    let mut pfns = [0u64; IOBUFFER_MAX_PAGE_CAPACITY];
-    let mut mapped = 0usize;
-
-    while mapped < page_count {
-        let chunk_pages = (page_count - mapped).min(IOBUFFER_MAX_PAGE_CAPACITY);
-        for (idx, pfn) in pfns[..chunk_pages].iter_mut().enumerate() {
-            *pfn = (phys_base + ((mapped + idx) * IOBUFFER_PAGE_SIZE) as u64) >> 12;
-        }
-        iommu::map_pages(
-            domain,
-            iova_base + (mapped * IOBUFFER_PAGE_SIZE) as u64,
-            &pfns[..chunk_pages],
-        )
-        .map_err(map_iommu_error)?;
-        mapped += chunk_pages;
-    }
-
+    let len = page_count as u64 * IOBUFFER_PAGE_SIZE as u64;
+    iommu::page_table::map_range(
+        domain.root_phys,
+        iova_base,
+        phys_base,
+        len,
+        iommu::page_table::IommuMapPermissions::ReadWrite,
+    )
+    .map_err(map_iommu_error)?;
     Ok(())
 }
 

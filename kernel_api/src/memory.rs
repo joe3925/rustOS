@@ -17,15 +17,29 @@ unsafe impl GlobalAlloc for KernelAllocator {
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 pub use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+pub use kernel_types::memory::PhysicalMappingCache;
 pub use kernel_types::status::PageMapError;
 
 pub type PageTableFlags = PageFlags;
 
-pub fn map_mmio_region(base: PhysAddr, size: u64) -> Result<VirtAddr, PageMapError> {
-    unsafe { kernel_sys::map_mmio_region(base, size) }
+pub fn map_physical_pages(
+    phys: PhysAddr,
+    size: u64,
+    cache: PhysicalMappingCache,
+) -> Result<VirtAddr, PageMapError> {
+    unsafe { kernel_sys::map_physical_pages(phys, size, cache) }
 }
+
+pub fn unmap_physical_pages(virt: VirtAddr, size: u64) -> Result<(), PageMapError> {
+    unsafe { kernel_sys::unmap_physical_pages(virt, size) }
+}
+
+pub fn map_mmio_region(base: PhysAddr, size: u64) -> Result<VirtAddr, PageMapError> {
+    map_physical_pages(base, size, PhysicalMappingCache::Uncached)
+}
+
 pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
-    unsafe { kernel_sys::unmap_mmio_region(base, size) }
+    unmap_physical_pages(base, size)
 }
 
 pub unsafe fn unmap_range(addr: VirtAddr, size: u64) {

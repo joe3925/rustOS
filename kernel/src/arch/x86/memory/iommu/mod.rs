@@ -70,7 +70,7 @@ fn domains() -> &'static Mutex<BTreeMap<usize, Arc<IommuDomain>>> {
 }
 
 #[inline]
-fn backend() -> Option<&'static IommuBackend> {
+pub(crate) fn backend() -> Option<&'static IommuBackend> {
     IOMMU_BACKEND.get().and_then(|b| b.as_ref())
 }
 

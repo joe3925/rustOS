@@ -1,4 +1,4 @@
-use crate::memory::paging::mmio::{map_mmio_region, unmap_mmio_region};
+use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
 use crate::util::boot_info;
 use acpi;
 use acpi::platform::interrupt::Apic;
@@ -72,8 +72,12 @@ impl AcpiHandler for ACPIImpl {
         physical_address: usize,
         size: usize,
     ) -> PhysicalMapping<Self, T> {
-        let virt_addr = map_mmio_region(PhysAddr::new(physical_address as u64), size as u64)
-            .expect("failed to map io space for ACPI");
+        let virt_addr = map_physical_pages(
+            PhysAddr::new(physical_address as u64),
+            size as u64,
+            kernel_types::memory::PhysicalMappingCache::Uncached,
+        )
+        .expect("Failed to map physical region for ACPI");
         PhysicalMapping::new(
             physical_address,
             NonNull::new(virt_addr.as_mut_ptr()).unwrap(),
@@ -84,7 +88,7 @@ impl AcpiHandler for ACPIImpl {
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        let _ = unmap_mmio_region(
+        let _ = unmap_physical_pages(
             VirtAddr::new(region.virtual_start().as_ptr() as u64),
             region.region_length() as u64,
         );

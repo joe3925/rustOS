@@ -20,7 +20,11 @@ fn device() -> Arc<DeviceObject> {
 #[test]
 fn physical_iobuffer_validates_frame_layout_and_iterates_regions() {
     let frames = [
-        IoBufferPageFrame::new(0x2000, IOBUFFER_FRAME_SIZE_4KIB),
+        IoBufferPageFrame::new(
+            0x2000,
+            IOBUFFER_FRAME_SIZE_4KIB,
+            crate::arch::VirtAddr::new(0),
+        ),
         IoBufferPageFrame::new(0x3000, IOBUFFER_FRAME_SIZE_4KIB),
         IoBufferPageFrame::new(0x9000, IOBUFFER_FRAME_SIZE_4KIB),
     ];

@@ -13,7 +13,7 @@ use crate::memory::dma::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo};
 use crate::memory::iommu::alloc_zeroed_pages_contiguous;
 use crate::memory::iommu::domain::{IommuDomain, IommuError};
 use crate::memory::iommu::page_table::{self, AMD_IR, AMD_IW, PTE_ADDR_MASK, PTE_P};
-use crate::memory::paging::mmio::map_mmio_region;
+use crate::memory::paging::mmio::map_physical_pages;
 use crate::println;
 
 const DEV_TAB_BAR: usize = 0x0000;
@@ -82,9 +82,13 @@ impl AmdViBackend {
         let iova_end = calc_iova_end(info.virtual_address_size);
 
         for unit in &info.remapper_units {
-            let reg_va = map_mmio_region(PhysAddr::new(unit.register_base), 0x3000)
-                .map_err(|_| IommuError::HardwareError)?
-                .as_mut_ptr::<u8>();
+            let reg_va = map_physical_pages(
+                PhysAddr::new(unit.register_base),
+                0x3000,
+                kernel_types::memory::PhysicalMappingCache::Uncached,
+            )
+            .map_err(|_| IommuError::HardwareError)?
+            .as_mut_ptr::<u8>();
             let ext_features = unsafe { read_reg64(reg_va, EXT_FEATURE_REG) };
             require_host_dma_translation(unit.register_base, ext_features);
 

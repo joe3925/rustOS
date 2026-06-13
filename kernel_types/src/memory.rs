@@ -4,6 +4,14 @@ use crate::arch::VirtAddr;
 use crate::fs::Path;
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhysicalMappingCache {
+    Cached,
+    WriteCombining,
+    Uncached,
+}
+
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct PeInfo {
     pub is_64: bool,

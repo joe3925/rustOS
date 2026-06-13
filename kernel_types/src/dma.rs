@@ -158,30 +158,21 @@ impl sealed::WritableDirection for Bidirectional {}
 pub struct IoBufferPageFrame {
     pub phys_addr: u64,
     pub byte_len: u64,
-    /// Base virtual address for this physical frame, if it has virtual backing
-    /// in the current address space.
-    pub virt_addr: Option<usize>,
+    /// Cached CPU virtual address for this physical frame.
+    pub cpu_addr: crate::arch::VirtAddr,
 }
 
 impl IoBufferPageFrame {
-    pub const fn new(phys_addr: u64, byte_len: u64) -> Self {
+    pub const fn new(phys_addr: u64, byte_len: u64, cpu_addr: crate::arch::VirtAddr) -> Self {
         Self {
             phys_addr,
             byte_len,
-            virt_addr: None,
+            cpu_addr,
         }
     }
 
-    pub const fn with_virtual(phys_addr: u64, byte_len: u64, virt_addr: usize) -> Self {
-        Self {
-            phys_addr,
-            byte_len,
-            virt_addr: Some(virt_addr),
-        }
-    }
-
-    pub fn virtual_address(&self) -> Option<usize> {
-        self.virt_addr
+    pub fn cpu_address(&self) -> crate::arch::VirtAddr {
+        self.cpu_addr
     }
 }
 
@@ -284,7 +275,8 @@ pub enum IoBufferError {
     },
 }
 
-const EMPTY_PAGE_FRAME: IoBufferPageFrame = IoBufferPageFrame::new(0, 0);
+const EMPTY_PAGE_FRAME: IoBufferPageFrame =
+    IoBufferPageFrame::new(0, 0, crate::arch::VirtAddr::new(0));
 const EMPTY_DMA_SEGMENT: IoBufferDmaSegment = IoBufferDmaSegment {
     dma_addr: 0,
     byte_len: 0,
@@ -438,7 +430,7 @@ fn is_valid_frame_size(byte_len: u64) -> bool {
 }
 
 fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> {
-    let (frame_size, phys_addr) = resolve_virtual_address(VirtAddr::new(virt_addr as u64))?;
+    let (frame_size, phys_addr) = resolve_virtual_range_frame(VirtAddr::new(virt_addr as u64))?;
 
     if !is_valid_frame_size(frame_size) {
         return None;
@@ -460,17 +452,17 @@ fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> 
 }
 
 #[cfg(any(test, feature = "hosted-tests"))]
-fn resolve_virtual_address(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     Some((IOBUFFER_FRAME_SIZE_4KIB, PhysAddr::new(addr.as_u64())))
 }
 
 #[cfg(not(any(test, feature = "hosted-tests")))]
-fn resolve_virtual_address(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     unsafe extern "C" {
-        fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+        fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     }
 
-    unsafe { virt_to_phys(addr) }
+    unsafe { resolve_virtual_range_frame(addr) }
 }
 fn describe_virtual_buffer_to_frames(
     virt_addr: usize,
@@ -503,10 +495,11 @@ fn describe_virtual_buffer_to_frames(
             first_frame_offset = translated.offset as usize;
         }
 
-        frames.push(IoBufferPageFrame::with_virtual(
+        let current_base_va = current - translated.offset as usize;
+        frames.push(IoBufferPageFrame::new(
             translated.phys_addr,
             translated.byte_len,
-            current - translated.offset as usize,
+            crate::arch::VirtAddr::new(current_base_va as u64),
         ));
 
         frame_count += 1;
@@ -1246,9 +1239,12 @@ impl<'a> IoBufferRepr<'a> {
     ) -> Result<Self, IoBufferError> {
         validate_physical_frames(frame_offset, byte_len, frames)?;
         let virtual_addr = frames.first().and_then(|frame| {
-            frame
-                .virtual_address()
-                .and_then(|addr| addr.checked_add(frame_offset))
+            let va = frame.cpu_address().as_u64();
+            if va == 0 {
+                None
+            } else {
+                Some((va as usize).checked_add(frame_offset)?)
+            }
         });
         let extent = IoBufferExtent::new(virtual_addr, frame_offset, byte_len, 0, frames.len());
         Self::new_physical_extents(frames, &[extent])
@@ -1764,4 +1760,84 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> fmt::Debug
             .field("mapped", &self.inner.mapped_by.is_some())
             .finish()
     }
+}
+
+pub fn copy_from_io_buffer_frames(
+    frames: &[IoBufferPageFrame],
+    buffer_offset: usize,
+    dst: *mut u8,
+    len: usize,
+) -> bool {
+    let mut done = 0;
+    let mut remaining = len;
+    let mut current_offset = buffer_offset;
+
+    for frame in frames {
+        if remaining == 0 {
+            break;
+        }
+
+        let frame_len = frame.byte_len as usize;
+        if current_offset >= frame_len {
+            current_offset -= frame_len;
+            continue;
+        }
+
+        let frame_remaining = frame_len - current_offset;
+        let n = core::cmp::min(frame_remaining, remaining);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (frame.cpu_address().as_u64() + current_offset as u64) as *const u8,
+                dst.add(done),
+                n,
+            );
+        }
+
+        done += n;
+        remaining -= n;
+        current_offset = 0;
+    }
+
+    remaining == 0
+}
+
+pub fn copy_to_io_buffer_frames(
+    frames: &[IoBufferPageFrame],
+    buffer_offset: usize,
+    src: *const u8,
+    len: usize,
+) -> bool {
+    let mut done = 0;
+    let mut remaining = len;
+    let mut current_offset = buffer_offset;
+
+    for frame in frames {
+        if remaining == 0 {
+            break;
+        }
+
+        let frame_len = frame.byte_len as usize;
+        if current_offset >= frame_len {
+            current_offset -= frame_len;
+            continue;
+        }
+
+        let frame_remaining = frame_len - current_offset;
+        let n = core::cmp::min(frame_remaining, remaining);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.add(done),
+                (frame.cpu_address().as_u64() + current_offset as u64) as *mut u8,
+                n,
+            );
+        }
+
+        done += n;
+        remaining -= n;
+        current_offset = 0;
+    }
+
+    remaining == 0
 }

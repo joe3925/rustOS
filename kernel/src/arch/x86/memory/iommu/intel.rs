@@ -13,7 +13,7 @@ use x86_64::{PhysAddr, VirtAddr};
 use crate::memory::dma::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo};
 use crate::memory::iommu::domain::{IommuDomain, IommuError};
 use crate::memory::iommu::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
-use crate::memory::paging::mmio::{map_mmio_region, unmap_mmio_region};
+use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
 use crate::println;
 
 const VER_REG: usize = 0x00;
@@ -73,9 +73,13 @@ impl IntelVtdBackend {
     pub fn init(info: &IntelPlatformIommuInfo) -> Result<Self, IommuError> {
         let mut units = Vec::with_capacity(info.remapper_units.len());
         for unit in &info.remapper_units {
-            let reg_va = map_mmio_region(PhysAddr::new(unit.register_base), 0x1000)
-                .map_err(|_| IommuError::HardwareError)?
-                .as_mut_ptr::<u8>();
+            let reg_va = map_physical_pages(
+                PhysAddr::new(unit.register_base),
+                0x1000,
+                kernel_types::memory::PhysicalMappingCache::Uncached,
+            )
+            .map_err(|_| IommuError::HardwareError)?
+            .as_mut_ptr::<u8>();
 
             let cap = unsafe { read_reg64(reg_va, CAP_REG) };
             let ecap = unsafe { read_reg64(reg_va, ECAP_REG) };
@@ -389,12 +393,16 @@ fn find_parent_bridge(ecam_base: u64, start_bus: u8, target_bus: u8) -> Option<P
     let mut found = None;
     for bus in start_bus..target_bus {
         let bus_pa = PhysAddr::new(ecam_base + ((bus as u64) << 20));
-        let Ok(bus_va) = map_mmio_region(bus_pa, 1 << 20) else {
+        let Ok(bus_va) = map_physical_pages(
+            bus_pa,
+            1 << 20,
+            kernel_types::memory::PhysicalMappingCache::Uncached,
+        ) else {
             continue;
         };
 
         let candidate = scan_bus_for_parent_bridge(bus_va, target_bus);
-        let _ = unmap_mmio_region(bus_va, 1 << 20);
+        let _ = unmap_physical_pages(bus_va, 1 << 20);
 
         if let Some(parent) = candidate {
             if found.is_some() {

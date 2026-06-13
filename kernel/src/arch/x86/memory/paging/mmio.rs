@@ -1,5 +1,6 @@
 use spin::Mutex;
 
+use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 use x86_64::{
     structures::paging::{Mapper as _, Page, PageTableFlags, Size1GiB, Size2MiB, Size4KiB},
@@ -44,14 +45,25 @@ fn choose_mmio_va_alignment(aligned_phys: u64, total_size: u64, supports_1g: boo
     KIB4
 }
 
-pub extern "C" fn map_mmio_region(
-    mmio_base: PhysAddr,
-    mmio_size: u64,
+fn cache_to_flags(cache: PhysicalMappingCache) -> PageTableFlags {
+    match cache {
+        PhysicalMappingCache::Cached => PageTableFlags::empty(),
+        PhysicalMappingCache::WriteCombining => {
+            PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH
+        }
+        PhysicalMappingCache::Uncached => PageTableFlags::NO_CACHE,
+    }
+}
+
+pub extern "C" fn map_physical_pages(
+    phys: PhysAddr,
+    size: u64,
+    cache: PhysicalMappingCache,
 ) -> Result<VirtAddr, PageMapError> {
-    let phys_addr = mmio_base.as_u64();
+    let phys_addr = phys.as_u64();
     let off = phys_addr & 0xFFF;
     let aligned_phys = phys_addr - off;
-    let total_size = align_up_4k(mmio_size + off);
+    let total_size = align_up_4k(size + off);
 
     let supports_1g = get_cpu_info()
         .get_extended_processor_and_feature_identifiers()
@@ -59,27 +71,28 @@ pub extern "C" fn map_mmio_region(
         .has_1gib_pages();
 
     let va_align = choose_mmio_va_alignment(aligned_phys, total_size, supports_1g);
-    map_mmio_region_aligned(mmio_base, mmio_size, va_align)
+    map_physical_pages_aligned(phys, size, va_align, cache)
 }
 
-pub extern "C" fn map_mmio_region_aligned(
-    mmio_base: PhysAddr,
-    mmio_size: u64,
+pub extern "C" fn map_physical_pages_aligned(
+    phys: PhysAddr,
+    size: u64,
     va_alignment: u64,
+    cache: PhysicalMappingCache,
 ) -> Result<VirtAddr, PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
-    if mmio_size == 0 {
+    if size == 0 {
         return Err(PageMapError::TranslationFailed());
     }
     if !is_valid_mmio_va_alignment(va_alignment) {
         return Err(PageMapError::TranslationFailed());
     }
 
-    let phys_addr = mmio_base.as_u64();
+    let phys_addr = phys.as_u64();
     let off = phys_addr & 0xFFF;
     let aligned_phys = phys_addr - off;
-    let total_size = align_up_4k(mmio_size + off);
+    let total_size = align_up_4k(size + off);
 
     let virtual_addr = allocate_auto_kernel_range_aligned(total_size, va_alignment)
         .ok_or(PageMapError::NoMemory())?;
@@ -92,7 +105,7 @@ pub extern "C" fn map_mmio_region_aligned(
     let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+    let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | cache_to_flags(cache);
     if let Err(err) = unsafe {
         map_contiguous_physical_range(
             &mut mapper,
@@ -111,7 +124,7 @@ pub extern "C" fn map_mmio_region_aligned(
     Ok(VirtAddr::new(virtual_addr.as_u64() + off))
 }
 
-pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+pub fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
     if size == 0 {
