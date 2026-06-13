@@ -9,7 +9,7 @@ use kernel_types::dma::DmaPciDeviceIdentity;
 use spin::Mutex;
 use x86_64::PhysAddr;
 
-use crate::memory::dma::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo};
+use super::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo};
 use crate::memory::iommu::alloc_zeroed_pages_contiguous;
 use crate::memory::iommu::domain::{IommuDomain, IommuError};
 use crate::memory::iommu::page_table::{self, AMD_IR, AMD_IW, PTE_ADDR_MASK, PTE_P};

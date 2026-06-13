@@ -1,5 +1,5 @@
 use crate::drivers::ACPI::{ACPIImpl, AcpiFirmware};
-use crate::memory::dma::PlatformIommuInfo;
+use crate::memory::device_mmu::DeviceMmuSystem;
 use crate::util::boot_info;
 use acpi::AcpiTables;
 use alloc::sync::Arc;
@@ -37,14 +37,6 @@ impl MachineInfo {
 
     pub fn interrupt_info(&self) -> Option<&MachineInterruptInfo> {
         self.interrupt_info.as_ref()
-    }
-
-    pub fn discover_required_device_mmu(&self) -> PlatformIommuInfo {
-        let tables = self
-            .firmware()
-            .acpi_tables()
-            .expect("mandatory IOMMU policy: ACPI tables are unavailable");
-        crate::memory::dma::discover_platform_iommu_from_acpi(tables.as_ref())
     }
 }
 

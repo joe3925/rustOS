@@ -10,7 +10,7 @@ use kernel_types::dma::DmaPciDeviceIdentity;
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
-use crate::memory::dma::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo};
+use super::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo};
 use crate::memory::iommu::domain::{IommuDomain, IommuError};
 use crate::memory::iommu::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
 use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};

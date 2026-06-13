@@ -1,11 +1,11 @@
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use spin::Mutex;
-use x86_64::instructions::port::Port;
-use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::PhysFrame;
-
+use crate::machine::MachineInfo;
+use crate::memory::device_mmu::{
+    DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
+};
+use crate::memory::iommu::X86DeviceMmu;
 use kernel_types::irq::{
     MsiMessage, MsiRequest, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
 };
@@ -15,6 +15,10 @@ use kernel_types::{
     memory::PhysicalMappingCache,
     status::PageMapError,
 };
+use spin::Mutex;
+use x86_64::instructions::port::Port;
+use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::PhysFrame;
 
 use crate::arch::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_logical_ids, apic_program_period_ns, calibrate_tsc,
@@ -27,7 +31,6 @@ use crate::arch::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TI
 use crate::arch::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
-use crate::memory::dma::PlatformIommuInfo;
 use crate::platform::{
     AddressSpacePlatform, CpuPlatform, DeviceMmuPlatform, InterruptPlatform, PagingPlatform,
     PciConfigPlatform, Platform, TimerPlatform,
@@ -411,7 +414,17 @@ impl PciConfigPlatform for X86Platform {
 }
 
 impl DeviceMmuPlatform for X86Platform {
-    fn discover_required_device_mmu() -> PlatformIommuInfo {
-        crate::machine::machine_info().discover_required_device_mmu()
+    fn discover_device_mmu(
+        machine: &MachineInfo,
+    ) -> DeviceMmuDiscoveryResult<Option<DeviceMmuSystem>> {
+        let Some(tables) = machine.firmware().acpi_tables() else {
+            return Ok(None);
+        };
+
+        let Some(backend) = X86DeviceMmu::try_init_from_acpi(tables.as_ref())? else {
+            return Ok(None);
+        };
+
+        Ok(Some(DeviceMmuSystem::from_backend(backend)))
     }
 }

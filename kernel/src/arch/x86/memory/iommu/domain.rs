@@ -1,27 +1,8 @@
-use alloc::collections::BTreeMap;
-use spin::Mutex;
+use crate::memory::device_mmu::{DeviceMmuError, MappingRecord};
 
-use crate::structs::range_tracker::RangeTracker;
+pub type IommuError = DeviceMmuError;
 
-#[derive(Debug, Clone, Copy)]
-pub enum IommuError {
-    NoBackingFrame,
-    IovaSpaceExhausted,
-    NotMapped,
-    HardwareError,
-    Unsupported,
-}
-
-/// One record per call to `map_buffer` segment installer. Used by the
-/// unmap path to walk pages and clear leaf PTEs. Deliberately lean —
-/// four `u64`s — so a `BTreeMap` of these scales with device count
-/// without meaningful per-mapping overhead.
-#[derive(Debug, Clone, Copy)]
-pub struct MappingRecord {
-    pub iova_base: u64,
-    pub page_count: u32,
-    pub is_identity: bool,
-}
+pub const X86_IOVA_START: u64 = 0x1_0000_0000;
 
 pub struct IommuDomain {
     pub root_phys: u64,
@@ -29,10 +10,8 @@ pub struct IommuDomain {
     pub segment: u16,
     pub requester_id: u16,
     pub remapper_index: u32,
-    pub iova_tracker: RangeTracker,
-    /// Mapping records keyed by IOVA base. Populated by `map_buffer`
-    /// strategy paths and drained by `unmap_buffer`.
-    pub mappings: Mutex<BTreeMap<u64, MappingRecord>>,
+    pub iova_start: u64,
+    pub iova_end: u64,
 }
 
 impl IommuDomain {
@@ -44,36 +23,37 @@ impl IommuDomain {
         remapper_index: u32,
         iova_end: u64,
     ) -> Self {
-        // IOVA allocations start above 4 GiB to sidestep legacy ISA DMA and
-        // leave the low window for firmware-reserved / identity regions.
         Self {
             root_phys,
             domain_id,
             segment,
             requester_id,
             remapper_index,
-            iova_tracker: RangeTracker::new(0x1_0000_0000, iova_end),
-            mappings: Mutex::new(BTreeMap::new()),
+            iova_start: X86_IOVA_START,
+            iova_end,
         }
     }
 
     #[inline]
-    pub fn alloc_iova(&self, size: u64) -> Option<u64> {
-        self.iova_tracker.alloc_auto(size).map(|va| va.as_u64())
+    pub fn contains_iova_range(&self, iova: u64, len: u64) -> bool {
+        let Some(end) = iova.checked_add(len) else {
+            return false;
+        };
+
+        iova >= self.iova_start && end <= self.iova_end
     }
 
     #[inline]
-    pub fn free_iova(&self, base: u64, size: u64) {
-        self.iova_tracker.dealloc(base, size);
-    }
-
-    #[inline]
-    pub fn record(&self, rec: MappingRecord) {
-        self.mappings.lock().insert(rec.iova_base, rec);
-    }
-
-    #[inline]
-    pub fn take(&self, iova_base: u64) -> Option<MappingRecord> {
-        self.mappings.lock().remove(&iova_base)
+    pub fn mapping_record(
+        &self,
+        iova_base: u64,
+        page_count: u32,
+        is_identity: bool,
+    ) -> MappingRecord {
+        MappingRecord {
+            iova_base,
+            page_count,
+            is_identity,
+        }
     }
 }

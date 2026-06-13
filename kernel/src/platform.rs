@@ -1,6 +1,9 @@
 use alloc::vec::Vec;
 
-use crate::memory::dma::PlatformIommuInfo;
+use crate::machine::MachineInfo;
+use crate::memory::device_mmu::{
+    DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
+};
 use kernel_types::arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
 use kernel_types::irq::{MsiMessage, MsiRequest};
 use kernel_types::memory::PhysicalMappingCache;
@@ -66,25 +69,32 @@ pub trait PagingPlatform: Platform {
         size: u64,
         flags: PageFlags,
     ) -> Result<AbiVirtAddr, PageMapError>;
+
     fn allocate_auto_kernel_range_mapped_contiguous(
         size: u64,
         flags: PageFlags,
     ) -> Result<AbiVirtAddr, PageMapError>;
+
     fn allocate_kernel_range_mapped(
         base: u64,
         size: u64,
         flags: PageFlags,
     ) -> Result<AbiVirtAddr, PageMapError>;
+
     fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64);
     fn unmap_range(virtual_addr: AbiVirtAddr, size: u64);
     fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags);
+
     fn map_physical_pages(
         phys: AbiPhysAddr,
         size: u64,
         cache: PhysicalMappingCache,
     ) -> Result<AbiVirtAddr, PageMapError>;
+
     fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError>;
+
     fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)>;
+
     fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)>;
 }
 
@@ -94,7 +104,9 @@ pub trait PciConfigPlatform: Platform {
 }
 
 pub trait DeviceMmuPlatform: Platform {
-    fn discover_required_device_mmu() -> PlatformIommuInfo;
+    fn discover_device_mmu(
+        machine: &MachineInfo,
+    ) -> DeviceMmuDiscoveryResult<Option<DeviceMmuSystem>>;
 }
 
 pub fn current_cpu_id() -> usize {
@@ -289,6 +301,35 @@ pub fn write_pci_config_u32(address: PciConfigAddress, value: u32) -> bool {
     <ActivePlatform as PciConfigPlatform>::write_pci_config_u32(address, value)
 }
 
-pub fn discover_required_device_mmu() -> PlatformIommuInfo {
-    <ActivePlatform as DeviceMmuPlatform>::discover_required_device_mmu()
+pub fn discover_device_mmu(
+    machine: &MachineInfo,
+) -> DeviceMmuDiscoveryResult<Option<DeviceMmuSystem>> {
+    <ActivePlatform as DeviceMmuPlatform>::discover_device_mmu(machine)
+}
+
+pub fn discover_required_device_mmu(machine: &MachineInfo) -> DeviceMmuSystem {
+    match discover_device_mmu(machine) {
+        Ok(Some(device_mmu)) => device_mmu,
+        Ok(None) => {
+            panic!("mandatory device-MMU policy: no device-MMU was discovered for this platform")
+        }
+        Err(DeviceMmuDiscoveryError::FirmwareUnavailable) => {
+            panic!("mandatory device-MMU policy: required firmware tables were unavailable")
+        }
+        Err(DeviceMmuDiscoveryError::NotPresent) => {
+            panic!("mandatory device-MMU policy: device-MMU is not present")
+        }
+        Err(DeviceMmuDiscoveryError::Unsupported) => {
+            panic!("mandatory device-MMU policy: discovered device-MMU is unsupported")
+        }
+        Err(DeviceMmuDiscoveryError::MalformedFirmware) => {
+            panic!("mandatory device-MMU policy: firmware device-MMU tables are malformed")
+        }
+        Err(DeviceMmuDiscoveryError::Backend(err)) => {
+            panic!(
+                "mandatory device-MMU policy: device-MMU backend initialization failed: {:?}",
+                err
+            )
+        }
+    }
 }

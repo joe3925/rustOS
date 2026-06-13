@@ -151,44 +151,27 @@ pub fn map_range(
     phys: u64,
     len: u64,
     permissions: IommuMapPermissions,
+    format: X86IommuPageTableFormat,
 ) -> Result<(), IommuError> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    if (iova & 0xFFF) != 0 || (phys & 0xFFF) != 0 || (len & 0xFFF) != 0 {
+        return Err(IommuError::InvalidRange);
+    }
+
     let mut cur_iova = iova;
     let mut cur_phys = phys;
     let mut remaining = len;
-
-    let is_amd = matches!(super::backend(), Some(super::IommuBackend::Amd(_)));
-
-    let interior_flags = |level: u32| -> u64 {
-        if is_amd {
-            permissions.amd_flags() | (((level - 1) as u64) << 9)
-        } else {
-            PTE_P | PTE_RW
-        }
-    };
-
-    let leaf_flags = |level: u32| -> u64 {
-        let mut flags = if is_amd {
-            let mut f = permissions.amd_flags();
-            if level > 1 {
-                f |= 0 << 9; // Next Level = 0 for large pages
-            }
-            f
-        } else {
-            let mut f = permissions.intel_flags();
-            if level > 1 {
-                f |= 1 << 7; // PS bit
-            }
-            f
-        };
-        flags
-    };
 
     while remaining > 0 {
         if remaining >= 1024 * 1024 * 1024
             && (cur_iova & ((1024 * 1024 * 1024) - 1)) == 0
             && (cur_phys & ((1024 * 1024 * 1024) - 1)) == 0
         {
-            ensure_iommu_1gib_mapped(root_phys, cur_iova, cur_phys, remaining, permissions)?;
+            ensure_iommu_1gib_mapped(root_phys, cur_iova, cur_phys, permissions, format)?;
+
             cur_iova += 1024 * 1024 * 1024;
             cur_phys += 1024 * 1024 * 1024;
             remaining -= 1024 * 1024 * 1024;
@@ -196,7 +179,8 @@ pub fn map_range(
             && (cur_iova & ((2 * 1024 * 1024) - 1)) == 0
             && (cur_phys & ((2 * 1024 * 1024) - 1)) == 0
         {
-            ensure_iommu_2mib_mapped(root_phys, cur_iova, cur_phys, remaining, permissions)?;
+            ensure_iommu_2mib_mapped(root_phys, cur_iova, cur_phys, permissions, format)?;
+
             cur_iova += 2 * 1024 * 1024;
             cur_phys += 2 * 1024 * 1024;
             remaining -= 2 * 1024 * 1024;
@@ -205,10 +189,11 @@ pub fn map_range(
                 root_phys,
                 cur_iova,
                 cur_phys,
-                interior_flags,
-                leaf_flags(1),
-                PTE_P,
+                |level| format.interior_flags(permissions, level),
+                format.leaf_flags(permissions, 1),
+                format.present_mask(),
             )?;
+
             cur_iova += 4096;
             cur_phys += 4096;
             remaining -= 4096;
@@ -222,33 +207,25 @@ pub fn ensure_iommu_2mib_mapped(
     root_phys: u64,
     iova: u64,
     phys: u64,
-    _len: u64,
     permissions: IommuMapPermissions,
+    format: X86IommuPageTableFormat,
 ) -> Result<(), IommuError> {
-    let is_amd = matches!(super::backend(), Some(super::IommuBackend::Amd(_)));
+    const SIZE_2MIB: u64 = 2 * 1024 * 1024;
 
-    let interior_flags = |level: u32| -> u64 {
-        if is_amd {
-            permissions.amd_flags() | (((level - 1) as u64) << 9)
-        } else {
-            PTE_P | PTE_RW
-        }
-    };
-
-    let mut leaf = if is_amd {
-        permissions.amd_flags() | (0 << 9)
-    } else {
-        permissions.intel_flags() | (1 << 7)
-    };
+    if (iova & (SIZE_2MIB - 1)) != 0 || (phys & (SIZE_2MIB - 1)) != 0 {
+        return Err(IommuError::InvalidRange);
+    }
 
     let mut table_phys = root_phys;
+
     for lvl in (3..=4).rev() {
         let idx = iova_index(iova, lvl);
         let entry = read_entry(table_phys, idx);
 
-        if entry & PTE_P == 0 {
+        if entry & format.present_mask() == 0 {
             let new_table = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
-            let new_entry = (new_table & PTE_ADDR_MASK) | interior_flags(lvl);
+            let new_entry = (new_table & PTE_ADDR_MASK) | format.interior_flags(permissions, lvl);
+
             write_entry(table_phys, idx, new_entry);
             table_phys = new_table;
         } else {
@@ -258,8 +235,10 @@ pub fn ensure_iommu_2mib_mapped(
 
     let idx = iova_index(iova, 2);
     let entry = read_entry(table_phys, idx);
-    if entry & PTE_P == 0 {
-        write_entry(table_phys, idx, (phys & PTE_ADDR_MASK) | leaf);
+
+    if entry & format.present_mask() == 0 {
+        let leaf = (phys & PTE_ADDR_MASK) | format.leaf_flags(permissions, 2);
+        write_entry(table_phys, idx, leaf);
     }
 
     Ok(())
@@ -269,33 +248,24 @@ pub fn ensure_iommu_1gib_mapped(
     root_phys: u64,
     iova: u64,
     phys: u64,
-    _len: u64,
     permissions: IommuMapPermissions,
+    format: X86IommuPageTableFormat,
 ) -> Result<(), IommuError> {
-    let is_amd = matches!(super::backend(), Some(super::IommuBackend::Amd(_)));
+    const SIZE_1GIB: u64 = 1024 * 1024 * 1024;
 
-    let interior_flags = |level: u32| -> u64 {
-        if is_amd {
-            permissions.amd_flags() | (((level - 1) as u64) << 9)
-        } else {
-            PTE_P | PTE_RW
-        }
-    };
-
-    let mut leaf = if is_amd {
-        permissions.amd_flags() | (0 << 9)
-    } else {
-        permissions.intel_flags() | (1 << 7)
-    };
+    if (iova & (SIZE_1GIB - 1)) != 0 || (phys & (SIZE_1GIB - 1)) != 0 {
+        return Err(IommuError::InvalidRange);
+    }
 
     let mut table_phys = root_phys;
-    let lvl = 4;
-    let idx = iova_index(iova, lvl);
+
+    let idx = iova_index(iova, 4);
     let entry = read_entry(table_phys, idx);
 
-    if entry & PTE_P == 0 {
+    if entry & format.present_mask() == 0 {
         let new_table = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
-        let new_entry = (new_table & PTE_ADDR_MASK) | interior_flags(lvl);
+        let new_entry = (new_table & PTE_ADDR_MASK) | format.interior_flags(permissions, 4);
+
         write_entry(table_phys, idx, new_entry);
         table_phys = new_table;
     } else {
@@ -304,8 +274,10 @@ pub fn ensure_iommu_1gib_mapped(
 
     let idx = iova_index(iova, 3);
     let entry = read_entry(table_phys, idx);
-    if entry & PTE_P == 0 {
-        write_entry(table_phys, idx, (phys & PTE_ADDR_MASK) | leaf);
+
+    if entry & format.present_mask() == 0 {
+        let leaf = (phys & PTE_ADDR_MASK) | format.leaf_flags(permissions, 3);
+        write_entry(table_phys, idx, leaf);
     }
 
     Ok(())
@@ -396,4 +368,47 @@ pub fn identity_map_range(
 /// Allocate and zero a fresh root table frame. Returns the physical address.
 pub fn alloc_root_table() -> Result<u64, IommuError> {
     alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X86IommuPageTableFormat {
+    Intel,
+    Amd,
+}
+
+impl X86IommuPageTableFormat {
+    #[inline]
+    fn interior_flags(self, permissions: IommuMapPermissions, level: u32) -> u64 {
+        match self {
+            Self::Intel => PTE_P | PTE_RW,
+            Self::Amd => permissions.amd_flags() | (((level - 1) as u64) << 9),
+        }
+    }
+
+    #[inline]
+    fn leaf_flags(self, permissions: IommuMapPermissions, level: u32) -> u64 {
+        match self {
+            Self::Intel => {
+                let mut flags = permissions.intel_flags();
+                if level > 1 {
+                    flags |= 1 << 7;
+                }
+                flags
+            }
+            Self::Amd => {
+                let mut flags = permissions.amd_flags();
+                if level > 1 {
+                    flags |= 0 << 9;
+                }
+                flags
+            }
+        }
+    }
+
+    #[inline]
+    fn present_mask(self) -> u64 {
+        match self {
+            Self::Intel => PTE_P | PTE_RW,
+            Self::Amd => PTE_P,
+        }
+    }
 }

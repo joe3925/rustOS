@@ -13,7 +13,6 @@ use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{heap_capacity_bytes, init_heap};
-use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::{
     boot_usable_bytes, resize_bitmap_for_ram, BootInfoFrameAllocator,
 };
@@ -132,7 +131,6 @@ pub unsafe fn init() {
         Screen::clear_framebuffer();
         crate::platform::init_boot_processor();
         init_dma_manager();
-        init_iommu();
         crate::platform::calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
         crate::platform::start_secondary_cpus();
