@@ -2,16 +2,16 @@ use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::scheduling::state::State;
 use core::hint::black_box;
 
-use crate::memory::paging::stack::StackSize;
-use crate::memory::paging::{stack::KERNEL_STACK_MAX_BYTES, tables::kernel_cr3};
+use crate::arch::memory::paging::tables::kernel_cr3;
+use crate::memory::paging::{base_page_size, kernel_stack_max_bytes};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::static_handlers::get_current_cpu_id;
 use crate::util::PANIC_ACTIVE;
 use alloc::fmt;
+use kernel_types::arch::PageFlags;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
-use x86_64::structures::paging::PageTableFlags;
 #[kernel_macros::exception_handler]
 pub(crate) fn divide_by_zero_fault(stack_frame: &mut State) {
     panic!(
@@ -116,7 +116,6 @@ pub(crate) fn general_protection_fault(stack_frame: &mut State, error_code: u64)
 #[kernel_macros::exception_handler]
 pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode) {
     let _fpu_guard = KernelFpuGuard::new();
-    const PAGE_SIZE: u64 = 4096;
     let fault = Cr2::read_raw();
 
     let is_protection = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
@@ -144,16 +143,16 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
                 let gp = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
                 if gp != 0 {
                     let stack_start = task.stack_start.load(core::sync::atomic::Ordering::Relaxed);
-                    let max_depth = stack_start.saturating_sub(KERNEL_STACK_MAX_BYTES);
+                    let max_depth = stack_start.saturating_sub(kernel_stack_max_bytes());
 
-                    // Allow growth for faults anywhere within the 2MiB reserved window below stack_start.
+                    // Allow growth for faults anywhere within the reserved stack window below stack_start.
                     if fault >= max_depth && fault < stack_start {
-                        let flags = PageTableFlags::PRESENT
-                            | PageTableFlags::WRITABLE
-                            | PageTableFlags::NO_EXECUTE;
+                        let page_size = base_page_size();
+                        let flags =
+                            PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
                         while fault
                             < task.guard_page.load(core::sync::atomic::Ordering::Acquire)
-                                + PAGE_SIZE
+                                + page_size
                         {
                             match task.grow_stack(flags) {
                                 Ok(true) => {}
@@ -169,13 +168,13 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
                         }
                         if fault
                             >= task.guard_page.load(core::sync::atomic::Ordering::Acquire)
-                                + PAGE_SIZE
+                                + page_size
                         {
                             return;
                         }
                     }
 
-                    let reserved_start = gp - StackSize::Huge2M.as_bytes();
+                    let reserved_start = gp - kernel_stack_max_bytes();
 
                     if fault >= reserved_start && fault < gp {
                         unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };

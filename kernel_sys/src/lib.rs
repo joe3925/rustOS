@@ -91,6 +91,7 @@ unsafe extern "C" {
     pub fn kernel_pci_write_config_u32(address: PciConfigAddress, value: u32) -> bool;
 
     // DMA / IOMMU
+    pub fn kernel_dma_base_page_size() -> u64;
     pub fn kernel_dma_register_pci_pdo(
         pdo: &Arc<DeviceObject>,
         identity: DmaPciDeviceIdentity,

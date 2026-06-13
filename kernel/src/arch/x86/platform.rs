@@ -1,11 +1,16 @@
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use super::memory::iommu::X86DeviceMmu;
 use crate::machine::MachineInfo;
 use crate::memory::device_mmu::{
     DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
 };
-use crate::memory::iommu::X86DeviceMmu;
+use crate::memory::paging::types::UserVmLayout;
+use crate::memory::paging::{
+    KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
+    UnmapFrameDisposition,
+};
 use kernel_types::irq::{
     MsiMessage, MsiRequest, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
 };
@@ -17,8 +22,7 @@ use kernel_types::{
 };
 use spin::Mutex;
 use x86_64::instructions::port::Port;
-use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::PhysFrame;
+use x86_64::structures::paging::{PageSize, Size1GiB, Size2MiB, Size4KiB};
 
 use crate::arch::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_logical_ids, apic_program_period_ns, calibrate_tsc,
@@ -28,12 +32,12 @@ use crate::arch::drivers::interrupt_index::{
     APIC, APIC_START_PERIOD, PICS, TSC_HZ,
 };
 use crate::arch::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TIMER_TIME_SCHED};
-use crate::arch::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
+use crate::cpu::get_cpu_info;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::platform::{
-    AddressSpacePlatform, CpuPlatform, DeviceMmuPlatform, InterruptPlatform, PagingPlatform,
-    PciConfigPlatform, Platform, TimerPlatform,
+    AddressSpacePlatform, CpuPlatform, DeviceMmuPlatform, InterruptPlatform,
+    PageTableFrameAllocator, PagingPlatform, PciConfigPlatform, Platform, TimerPlatform,
 };
 use crate::println;
 use crate::structs::stopwatch::Stopwatch;
@@ -280,108 +284,146 @@ impl TimerPlatform for X86Platform {
 }
 
 impl AddressSpacePlatform for X86Platform {
-    type Root = PhysFrame;
+    type Root = crate::arch::memory::paging::address_space::Root;
 
     fn init_kernel_root() {
-        init_kernel_cr3();
+        crate::arch::memory::paging::address_space::init_kernel_root();
     }
 
     fn kernel_root() -> Self::Root {
-        kernel_cr3()
+        crate::arch::memory::paging::address_space::kernel_root()
     }
 
     fn current_root() -> Self::Root {
-        Cr3::read().0
+        crate::arch::memory::paging::address_space::current_root()
     }
 
     unsafe fn switch_root(root: Self::Root) {
-        unsafe {
-            Cr3::write(root, Cr3::read().1);
-        }
+        unsafe { crate::arch::memory::paging::address_space::switch_root(root) }
     }
 
-    fn root_to_phys(root: Self::Root) -> u64 {
-        root.start_address().as_u64()
+    fn root_to_phys(root: Self::Root) -> AbiPhysAddr {
+        crate::arch::memory::paging::address_space::root_to_phys(root)
+    }
+
+    fn create_user_root<A: PageTableFrameAllocator>(
+        allocator: &mut A,
+    ) -> Result<Self::Root, PageMapError> {
+        crate::arch::memory::paging::address_space::create_user_root(allocator)
+    }
+
+    unsafe fn destroy_user_root<A: PageTableFrameAllocator>(
+        root: Self::Root,
+        allocator: &mut A,
+    ) -> Result<(), PageMapError> {
+        unsafe { crate::arch::memory::paging::address_space::destroy_user_root(root, allocator) }
     }
 }
 
 impl PagingPlatform for X86Platform {
-    fn allocate_auto_kernel_range_mapped(
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<AbiVirtAddr, PageMapError> {
-        crate::arch::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped(
-            size,
-            flags.into(),
-        )
-        .map(Into::into)
+    fn paging_capabilities() -> PagingCapabilities {
+        let supports_1g = get_cpu_info()
+            .get_extended_processor_and_feature_identifiers()
+            .is_some_and(|features| features.has_1gib_pages());
+
+        PagingCapabilities {
+            base_page_size: Size4KiB::SIZE,
+            leaf_mapping_sizes: if supports_1g {
+                &X86_MAPPING_SIZES_WITH_1G
+            } else {
+                &X86_MAPPING_SIZES_WITHOUT_1G
+            },
+            supports_global_mappings: true,
+            supports_execute_disable: true,
+            supports_cache_attributes: true,
+        }
+    }
+    fn user_virtual_layout() -> crate::memory::paging::types::UserVmLayout {
+        const USER_VA_START: u64 = 0x0000_0000_0000_0000;
+        const USER_VA_END_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
+
+        UserVmLayout {
+            start: USER_VA_START + Size4KiB::SIZE,
+            end: USER_VA_END_EXCLUSIVE,
+            base_page_size: Size4KiB::SIZE,
+            stack_alignment: 16,
+        }
+    }
+    fn kernel_virtual_layout() -> KernelVirtualLayout {
+        crate::arch::memory::paging::layout::kernel_virtual_layout()
     }
 
-    fn allocate_auto_kernel_range_mapped_contiguous(
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<AbiVirtAddr, PageMapError> {
-        crate::arch::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous(
-            size,
-            flags.into(),
-        )
-        .map(Into::into)
-    }
-
-    fn allocate_kernel_range_mapped(
-        base: u64,
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<AbiVirtAddr, PageMapError> {
-        crate::arch::memory::paging::virt_tracker::allocate_kernel_range_mapped(
-            base,
-            size,
-            flags.into(),
-        )
-        .map(Into::into)
-    }
-
-    fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64) {
-        crate::arch::memory::paging::virt_tracker::deallocate_kernel_range(addr.into(), size);
-    }
-
-    fn unmap_range(virtual_addr: AbiVirtAddr, size: u64) {
-        crate::arch::memory::paging::virt_tracker::unmap_range(virtual_addr.into(), size);
-    }
-
-    fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
-        let _ = unsafe {
-            crate::arch::memory::paging::paging::identity_map_page(
-                frame_addr.into(),
-                0x1000,
-                flags.into(),
-            )
-        };
-    }
-
-    fn map_physical_pages(
+    unsafe fn map_leaf<A: PageTableFrameAllocator>(
+        allocator: &mut A,
+        virt: AbiVirtAddr,
         phys: AbiPhysAddr,
-        size: u64,
-        cache: PhysicalMappingCache,
-    ) -> Result<AbiVirtAddr, PageMapError> {
-        crate::arch::memory::paging::mmio::map_physical_pages(phys.into(), size, cache)
-            .map(Into::into)
+        size: MappingSize,
+        flags: PageFlags,
+        cache: Option<PhysicalMappingCache>,
+        flush: LocalTlbFlush,
+    ) -> Result<(), PageMapError> {
+        unsafe {
+            crate::arch::memory::paging::mapper::map_leaf(
+                allocator, virt, phys, size, flags, cache, flush,
+            )
+        }
     }
 
-    fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
-        crate::arch::memory::paging::mmio::unmap_physical_pages(base.into(), size)
+    unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
+        allocator: &mut A,
+        virt: AbiVirtAddr,
+        size: MappingSize,
+        disposition: UnmapFrameDisposition,
+        flush: LocalTlbFlush,
+    ) -> Result<Option<AbiPhysAddr>, PageMapError> {
+        unsafe {
+            crate::arch::memory::paging::mapper::unmap_leaf(
+                allocator,
+                virt,
+                size,
+                disposition,
+                flush,
+            )
+        }
     }
 
-    fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-        crate::arch::memory::paging::tables::virt_to_phys(addr.into())
-            .map(|(size, phys)| (size, phys.into()))
+    fn resolve_mapping(virt: AbiVirtAddr) -> Option<ResolvedMapping> {
+        crate::arch::memory::paging::mapper::resolve_mapping(virt)
     }
 
-    fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-        crate::arch::memory::paging::tables::resolve_virtual_range_frame(addr.into())
-            .map(|(size, phys)| (size, phys.into()))
+    fn local_flush_tlb_all() {
+        crate::arch::memory::paging::tlb::local_flush_tlb_all();
+    }
+
+    fn local_flush_tlb_range(start: AbiVirtAddr, size: u64, stride: u64) {
+        crate::arch::memory::paging::tlb::local_flush_tlb_range(start, size, stride);
+    }
+
+    fn broadcast_tlb_shootdown() -> bool {
+        crate::arch::memory::paging::tlb::broadcast_tlb_shootdown()
     }
 }
+
+const X86_MAPPING_SIZES_WITH_1G: [MappingSize; 3] = [
+    MappingSize {
+        bytes: Size1GiB::SIZE,
+    },
+    MappingSize {
+        bytes: Size2MiB::SIZE,
+    },
+    MappingSize {
+        bytes: Size4KiB::SIZE,
+    },
+];
+
+const X86_MAPPING_SIZES_WITHOUT_1G: [MappingSize; 2] = [
+    MappingSize {
+        bytes: Size2MiB::SIZE,
+    },
+    MappingSize {
+        bytes: Size4KiB::SIZE,
+    },
+];
 
 impl PciConfigPlatform for X86Platform {
     fn read_pci_config_u32(address: PciConfigAddress) -> Option<u32> {

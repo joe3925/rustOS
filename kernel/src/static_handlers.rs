@@ -75,7 +75,7 @@ use spin::{Mutex, Once};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64 {
-    let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge2M, name, 0);
+    let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge, name, 0);
     SCHEDULER.add_task(task)
 }
 
@@ -192,6 +192,13 @@ pub unsafe extern "C" fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandl
     unsafe {
         irq_borrowed_signal_all(handle, meta);
     }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_dma_base_page_size() -> u64 {
+    dma::get_info()
+        .capabilities
+        .base_page_size()
+        .expect("expected a valid base page size")
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_register_pci_pdo(
@@ -839,7 +846,7 @@ pub extern "C" fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageFlags,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    crate::platform::allocate_auto_kernel_range_mapped(size, flags)
+    crate::memory::paging::allocate_auto_kernel_range_mapped(size, flags)
 }
 
 #[no_mangle]
@@ -847,7 +854,7 @@ pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
     size: u64,
     flags: PageFlags,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    crate::platform::allocate_auto_kernel_range_mapped_contiguous(size, flags)
+    crate::memory::paging::allocate_auto_kernel_range_mapped_contiguous(size, flags)
 }
 
 #[no_mangle]
@@ -856,22 +863,26 @@ pub extern "C" fn allocate_kernel_range_mapped(
     size: u64,
     flags: PageFlags,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    crate::platform::allocate_kernel_range_mapped(base, size, flags)
+    crate::memory::paging::allocate_kernel_range_mapped(base, size, flags)
 }
 
 #[no_mangle]
 pub extern "C" fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64) {
-    crate::platform::deallocate_kernel_range(addr, size)
+    crate::memory::paging::deallocate_kernel_range(addr, size)
 }
 
 #[no_mangle]
 pub extern "C" fn unmap_range(virtual_addr: AbiVirtAddr, size: u64) {
-    crate::platform::unmap_range(virtual_addr, size)
+    crate::memory::paging::unmap_range(virtual_addr, size)
 }
 
 #[no_mangle]
 pub extern "C" fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
-    crate::platform::identity_map_page(frame_addr, flags);
+    let _ = crate::memory::paging::identity_map_page(
+        frame_addr,
+        crate::memory::paging::base_page_size() as usize,
+        flags,
+    );
 }
 
 #[no_mangle]
@@ -880,22 +891,22 @@ pub extern "C" fn map_physical_pages(
     size: u64,
     cache: kernel_types::memory::PhysicalMappingCache,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    crate::platform::map_physical_pages(phys, size, cache)
+    crate::memory::paging::map_physical_pages(phys, size, cache)
 }
 
 #[no_mangle]
 pub extern "C" fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
-    crate::platform::unmap_physical_pages(base, size)
+    crate::memory::paging::unmap_physical_pages(base, size)
 }
 
 #[no_mangle]
 pub extern "C" fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-    crate::platform::virt_to_phys(addr)
+    crate::memory::paging::virt_to_phys(addr)
 }
 
 #[no_mangle]
 pub extern "C" fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-    crate::platform::resolve_virtual_range_frame(addr)
+    crate::memory::paging::resolve_virtual_range_frame(addr)
 }
 
 // ============================================================================

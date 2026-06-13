@@ -1,9 +1,9 @@
-use crate::arch::paging::PageTableFlags;
 use crate::arch::scheduling::task_return_trampoline;
 use crate::arch::VirtAddr;
 use crate::gdt::PER_CPU_GDT;
-use crate::memory::paging::paging::map_kernel_range;
-use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
+use crate::memory::paging::{
+    allocate_kernel_stack, base_page_size, deallocate_kernel_stack, map_range, StackSize,
+};
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
 use crate::scheduling::scheduler::default_task_sched_binding;
@@ -15,12 +15,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use kernel_types::arch::PageFlags;
 use kernel_types::status::PageMapError;
 use spin::Mutex;
 use spin::RwLock;
 pub type TaskEntry = crate::arch::scheduling::TaskEntry;
 
-const PAGE_SIZE: u64 = 4096;
 const C_SHADOW_SPACE_BYTES: u64 = 32;
 const RETURN_ADDRESS_BYTES: u64 = 8;
 const C_ENTRY_FRAME_BYTES: u64 = RETURN_ADDRESS_BYTES + C_SHADOW_SPACE_BYTES;
@@ -254,7 +254,7 @@ impl TaskRef {
     /// Called from the page-fault handler without holding `inner` — safe
     /// because a task can only fault on the CPU it is currently running on,
     /// so there is no concurrent writer for `guard_page`.
-    pub fn grow_stack(&self, flags: PageTableFlags) -> Result<bool, PageMapError> {
+    pub fn grow_stack(&self, flags: PageFlags) -> Result<bool, PageMapError> {
         if !self.is_kernel_mode.load(Ordering::Relaxed) {
             return Ok(false);
         }
@@ -264,20 +264,21 @@ impl TaskRef {
             return Ok(false);
         }
 
-        let next_guard = match gp.checked_sub(PAGE_SIZE) {
+        let page_size = base_page_size();
+        let next_guard = match gp.checked_sub(page_size) {
             Some(v) => v,
             None => return Ok(false),
         };
 
         unsafe {
-            map_kernel_range(VirtAddr::new(gp), PAGE_SIZE, flags, false)?;
+            map_range(VirtAddr::new(gp).into(), page_size, flags, false)?;
         }
 
         let stack_top = self.stack_start.load(Ordering::Acquire);
         if stack_top != 0 && gp < stack_top {
             self.stack_size.store(stack_top - gp, Ordering::Release);
         } else {
-            self.stack_size.fetch_add(PAGE_SIZE, Ordering::AcqRel);
+            self.stack_size.fetch_add(page_size, Ordering::AcqRel);
         }
 
         self.guard_page.store(next_guard, Ordering::Release);
@@ -297,7 +298,7 @@ impl TaskRef {
 
         self.guard_page.store(0, Ordering::Release);
         self.stack_size.store(0, Ordering::Release);
-        deallocate_kernel_stack(VirtAddr::new(stack_top));
+        deallocate_kernel_stack(VirtAddr::new(stack_top).into());
     }
 }
 
@@ -548,7 +549,7 @@ fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
         Some(v) => v,
         None => return 0,
     };
-    match bottom.checked_sub(PAGE_SIZE) {
+    match bottom.checked_sub(base_page_size()) {
         Some(v) => v,
         None => 0,
     }

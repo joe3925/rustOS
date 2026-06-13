@@ -1,19 +1,15 @@
 use self::ApicErrors::{AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
+use crate::KERNEL_INITIALIZED;
 use crate::arch::drivers::timer_driver::set_num_cores;
 use crate::cpu::{self, get_cpu_info};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::machine::MachineInterruptInfo;
-use crate::memory::paging::mmio::map_physical_pages;
-use crate::memory::paging::paging::identity_map_page;
-use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
-use crate::memory::paging::tables::virt_to_phys;
-use crate::memory::paging::virt_tracker::unmap_range;
+use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{boot_info, CORE_LOCK, CPU_ID, INIT_LOCK};
-use crate::KERNEL_INITIALIZED;
+use crate::util::{CORE_LOCK, CPU_ID, INIT_LOCK, boot_info};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -21,13 +17,15 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use core::{mem, ptr};
 use kernel_types::irq::IrqSafeMutex;
+use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::status::PageMapError;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::sgdt;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{PageTableFlags, PhysFrame};
 use x86_64::structures::DescriptorTablePointer;
+use x86_64::structures::paging::{PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
 
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
@@ -70,6 +68,30 @@ const LONGMODE_GDTR_LIMIT_OFF: usize = 0x2E;
 const LONGMODE_GDTR_BASE_OFF: usize = 0x30;
 const TRAMPOLINE_DATA_END: usize = LONGMODE_GDTR_BASE_OFF + mem::size_of::<u64>();
 core::arch::global_asm!(include_str!("../ap_startup.s"));
+
+fn map_physical_pages(
+    phys: PhysAddr,
+    size: u64,
+    cache: PhysicalMappingCache,
+) -> Result<VirtAddr, PageMapError> {
+    crate::memory::paging::map_physical_pages(phys.into(), size, cache).map(Into::into)
+}
+
+fn identity_map_page(
+    phys: PhysAddr,
+    range: usize,
+    flags: PageTableFlags,
+) -> Result<(), PageMapError> {
+    crate::memory::paging::identity_map_page(phys.into(), range, flags.into())
+}
+
+fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    crate::memory::paging::virt_to_phys(addr.into()).map(|(size, phys)| (size, phys.into()))
+}
+
+fn unmap_range(addr: VirtAddr, size: u64) {
+    crate::memory::paging::unmap_range(addr.into(), size);
+}
 
 extern "C" {
     static trampoline: u8;

@@ -16,9 +16,8 @@
 //! path. The cost is bounded: the full tree for a 48-bit IOVA space is
 //! <= 2 MiB of intermediate frames even if every L1 leaf is populated.
 
-use crate::memory::iommu::domain::IommuError;
-use crate::memory::paging::tables::virt_to_phys;
-use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous;
+use super::domain::IommuError;
+use crate::memory::paging::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
 use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -49,7 +48,7 @@ pub fn init_table_arena() -> Result<(), IommuError> {
     }
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let virt = allocate_auto_kernel_range_mapped_contiguous(IOMMU_TABLE_ARENA_SIZE, flags)
+    let virt = allocate_auto_kernel_range_mapped_contiguous(IOMMU_TABLE_ARENA_SIZE, flags.into())
         .map_err(|_| IommuError::NoBackingFrame)?;
     let (_, phys) = virt_to_phys(virt).ok_or(IommuError::NoBackingFrame)?;
 

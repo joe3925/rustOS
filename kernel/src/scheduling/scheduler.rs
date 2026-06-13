@@ -1,5 +1,5 @@
-use crate::arch::scheduling::idle_task;
 use crate::arch::MAX_CPUS;
+use crate::arch::scheduling::idle_task;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
@@ -607,7 +607,9 @@ impl Scheduler {
         let pid = task_handle.inner.read().parent_pid;
 
         if let Some(program) = PROGRAM_MANAGER.get(pid) {
-            unsafe { platform::switch_address_space_root(program.read().address_space_root) };
+            unsafe {
+                crate::memory::paging::switch_address_space_root(program.read().address_space_root)
+            };
         } else {
             let id = task_handle.task_id();
             let _ = self.delete_task(id);

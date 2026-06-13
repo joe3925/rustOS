@@ -12,8 +12,8 @@ use spin::Mutex;
 
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
-use crate::memory::paging::constants::KERNEL_SPACE_BASE;
-use crate::object_manager::{Object, ObjectPayload, OBJECT_MANAGER};
+use crate::memory::paging::{base_page_size, kernel_space_base};
+use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload};
 use crate::platform;
 use crate::util::generate_guid;
 
@@ -474,7 +474,7 @@ impl IoRequestTable {
                 IoRequestState::Running => return Ok(CompleteTransition::Normal),
                 IoRequestState::CancelRequested => return Ok(CompleteTransition::Cancelled),
                 IoRequestState::CompleteQueued | IoRequestState::Reaped | IoRequestState::Free => {
-                    return Err(RequestTableError::AlreadyComplete)
+                    return Err(RequestTableError::AlreadyComplete);
                 }
             }
         }
@@ -490,7 +490,7 @@ impl IoRequestTable {
                 IoRequestState::Submitted | IoRequestState::Running => CompleteTransition::Normal,
                 IoRequestState::CancelRequested => CompleteTransition::Cancelled,
                 IoRequestState::CompleteQueued | IoRequestState::Reaped | IoRequestState::Free => {
-                    return Err(RequestTableError::AlreadyComplete)
+                    return Err(RequestTableError::AlreadyComplete);
                 }
             };
 
@@ -536,7 +536,7 @@ impl IoRequestTable {
                 }
                 IoRequestState::CancelRequested => return Ok(()),
                 IoRequestState::CompleteQueued | IoRequestState::Reaped | IoRequestState::Free => {
-                    return Err(RequestTableError::AlreadyComplete)
+                    return Err(RequestTableError::AlreadyComplete);
                 }
             }
         }
@@ -597,7 +597,7 @@ fn file_status(status: FileStatus) -> u64 {
 
 #[inline(always)]
 fn is_user_addr(addr: u64) -> bool {
-    (0x1000..KERNEL_SPACE_BASE).contains(&addr)
+    (base_page_size()..kernel_space_base().as_u64()).contains(&addr)
 }
 
 #[inline(always)]
@@ -614,15 +614,15 @@ fn user_ptr_range_ok(addr: u64, bytes: usize) -> bool {
 
 fn with_process_address_space<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
     let process_address_space_root = owner.read().address_space_root;
-    let old_address_space_root = platform::current_address_space_root();
+    let old_address_space_root = crate::memory::paging::current_address_space_root();
 
     platform::with_interrupts_disabled(|| {
         unsafe {
-            platform::switch_address_space_root(process_address_space_root);
+            crate::memory::paging::switch_address_space_root(process_address_space_root);
         }
         let result = f();
         unsafe {
-            platform::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::switch_address_space_root(old_address_space_root);
         }
         result
     })

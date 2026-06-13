@@ -3,9 +3,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::device::{DeviceInit, DeviceObject};
 use crate::dma::{
-    Bidirectional, DmaMapped, FromDevice, IOBUFFER_FRAME_SIZE_4KIB, IOBUFFER_PAGE_SIZE, IoBuffer,
-    IoBufferDmaSegment, IoBufferError, IoBufferPageFrame, PhysFramed, ToDevice,
+    Bidirectional, DmaMapped, FromDevice, IoBuffer, IoBufferDmaSegment, IoBufferError,
+    IoBufferPageFrame, PhysFramed, ToDevice,
 };
+
+const TEST_FRAME_SIZE: u64 = 512 * 8;
+const TEST_GRANULE: usize = TEST_FRAME_SIZE as usize;
 
 static UNMAP_COOKIE_SUM: AtomicUsize = AtomicUsize::new(0);
 
@@ -17,17 +20,13 @@ fn device() -> Arc<DeviceObject> {
     DeviceObject::new(DeviceInit::new())
 }
 
+fn frame(phys_addr: u64) -> IoBufferPageFrame {
+    IoBufferPageFrame::new(phys_addr, TEST_FRAME_SIZE, crate::arch::VirtAddr::new(0))
+}
+
 #[test]
 fn physical_iobuffer_validates_frame_layout_and_iterates_regions() {
-    let frames = [
-        IoBufferPageFrame::new(
-            0x2000,
-            IOBUFFER_FRAME_SIZE_4KIB,
-            crate::arch::VirtAddr::new(0),
-        ),
-        IoBufferPageFrame::new(0x3000, IOBUFFER_FRAME_SIZE_4KIB),
-        IoBufferPageFrame::new(0x9000, IOBUFFER_FRAME_SIZE_4KIB),
-    ];
+    let frames = [frame(0x2000), frame(0x3000), frame(0x9000)];
 
     let buffer = IoBuffer::<PhysFramed, ToDevice>::from_frames(128, 6000, &frames).unwrap();
     assert_eq!(buffer.len(), 6000);
@@ -53,27 +52,19 @@ fn physical_iobuffer_rejects_invalid_frame_descriptions() {
     );
 
     assert_eq!(
-        IoBuffer::<PhysFramed, ToDevice>::from_frames(
-            0,
-            IOBUFFER_PAGE_SIZE,
-            &[IoBufferPageFrame::new(0x2100, IOBUFFER_FRAME_SIZE_4KIB)]
-        )
-        .unwrap_err(),
+        IoBuffer::<PhysFramed, ToDevice>::from_frames(0, TEST_GRANULE, &[frame(0x2100)])
+            .unwrap_err(),
         IoBufferError::InvalidFrameAlignment {
             phys_addr: 0x2100,
-            byte_len: IOBUFFER_FRAME_SIZE_4KIB
+            byte_len: TEST_FRAME_SIZE
         }
     );
 
     assert_eq!(
-        IoBuffer::<PhysFramed, ToDevice>::from_frames(
-            4096,
-            1,
-            &[IoBufferPageFrame::new(0x2000, IOBUFFER_FRAME_SIZE_4KIB)]
-        )
-        .unwrap_err(),
+        IoBuffer::<PhysFramed, ToDevice>::from_frames(TEST_GRANULE, 1, &[frame(0x2000)])
+            .unwrap_err(),
         IoBufferError::InvalidFrameLayout {
-            frame_offset: 4096,
+            frame_offset: TEST_GRANULE,
             byte_len: 1
         }
     );
@@ -81,9 +72,9 @@ fn physical_iobuffer_rejects_invalid_frame_descriptions() {
 
 #[test]
 fn dma_mapping_compresses_contiguous_segments_and_unmaps_once() {
-    let frames = [IoBufferPageFrame::new(0x4000, IOBUFFER_FRAME_SIZE_4KIB)];
+    let frames = [frame(0x4000)];
     let buffer =
-        IoBuffer::<PhysFramed, Bidirectional>::from_frames(0, IOBUFFER_PAGE_SIZE, &frames).unwrap();
+        IoBuffer::<PhysFramed, Bidirectional>::from_frames(0, TEST_GRANULE, &frames).unwrap();
     let segments = [
         IoBufferDmaSegment {
             dma_addr: 0x8000,
@@ -134,9 +125,8 @@ fn dma_mapping_compresses_contiguous_segments_and_unmaps_once() {
 
 #[test]
 fn dma_mapping_rejects_too_many_noncompressible_segments_without_unmapping() {
-    let frames = [IoBufferPageFrame::new(0x4000, IOBUFFER_FRAME_SIZE_4KIB)];
-    let buffer =
-        IoBuffer::<PhysFramed, FromDevice>::from_frames(0, IOBUFFER_PAGE_SIZE, &frames).unwrap();
+    let frames = [frame(0x4000)];
+    let buffer = IoBuffer::<PhysFramed, FromDevice>::from_frames(0, TEST_GRANULE, &frames).unwrap();
     let segments = [
         IoBufferDmaSegment {
             dma_addr: 0x1000,

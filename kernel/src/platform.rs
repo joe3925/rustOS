@@ -4,14 +4,19 @@ use crate::machine::MachineInfo;
 use crate::memory::device_mmu::{
     DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
 };
+use crate::memory::paging::types::UserVmLayout;
 use kernel_types::arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
 use kernel_types::irq::{MsiMessage, MsiRequest};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::status::PageMapError;
 
+use crate::memory::paging::{
+    KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
+    UnmapFrameDisposition,
+};
+
 pub type ActivePlatform = crate::arch::PlatformImpl;
-pub type AddressSpaceRoot = <ActivePlatform as AddressSpacePlatform>::Root;
 
 pub trait Platform {
     const NAME: &'static str;
@@ -55,47 +60,59 @@ pub trait TimerPlatform: Platform {
 }
 
 pub trait AddressSpacePlatform: Platform {
-    type Root: Copy;
+    type Root: Copy + Eq;
 
     fn init_kernel_root();
     fn kernel_root() -> Self::Root;
     fn current_root() -> Self::Root;
+
     unsafe fn switch_root(root: Self::Root);
-    fn root_to_phys(root: Self::Root) -> u64;
+
+    fn root_to_phys(root: Self::Root) -> AbiPhysAddr;
+
+    fn create_user_root<A: PageTableFrameAllocator>(
+        allocator: &mut A,
+    ) -> Result<Self::Root, PageMapError>;
+
+    unsafe fn destroy_user_root<A: PageTableFrameAllocator>(
+        root: Self::Root,
+        allocator: &mut A,
+    ) -> Result<(), PageMapError>;
 }
 
-pub trait PagingPlatform: Platform {
-    fn allocate_auto_kernel_range_mapped(
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<AbiVirtAddr, PageMapError>;
+pub trait PageTableFrameAllocator {
+    fn allocate_page_table_frame(&mut self) -> Option<AbiPhysAddr>;
+    fn free_page_table_frame(&mut self, phys: AbiPhysAddr);
+}
 
-    fn allocate_auto_kernel_range_mapped_contiguous(
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<AbiVirtAddr, PageMapError>;
-
-    fn allocate_kernel_range_mapped(
-        base: u64,
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<AbiVirtAddr, PageMapError>;
-
-    fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64);
-    fn unmap_range(virtual_addr: AbiVirtAddr, size: u64);
-    fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags);
-
-    fn map_physical_pages(
+pub trait PagingPlatform: AddressSpacePlatform {
+    fn paging_capabilities() -> PagingCapabilities;
+    fn kernel_virtual_layout() -> KernelVirtualLayout;
+    fn user_virtual_layout() -> UserVmLayout;
+    unsafe fn map_leaf<A: PageTableFrameAllocator>(
+        allocator: &mut A,
+        virt: AbiVirtAddr,
         phys: AbiPhysAddr,
-        size: u64,
-        cache: PhysicalMappingCache,
-    ) -> Result<AbiVirtAddr, PageMapError>;
+        size: MappingSize,
+        flags: PageFlags,
+        cache: Option<PhysicalMappingCache>,
+        flush: LocalTlbFlush,
+    ) -> Result<(), PageMapError>;
 
-    fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError>;
+    unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
+        allocator: &mut A,
+        virt: AbiVirtAddr,
+        size: MappingSize,
+        disposition: UnmapFrameDisposition,
+        flush: LocalTlbFlush,
+    ) -> Result<Option<AbiPhysAddr>, PageMapError>;
 
-    fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)>;
+    fn resolve_mapping(virt: AbiVirtAddr) -> Option<ResolvedMapping>;
 
-    fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)>;
+    fn local_flush_tlb_all();
+    fn local_flush_tlb_range(start: AbiVirtAddr, size: u64, stride: u64);
+
+    fn broadcast_tlb_shootdown() -> bool;
 }
 
 pub trait PciConfigPlatform: Platform {
@@ -108,7 +125,9 @@ pub trait DeviceMmuPlatform: Platform {
         machine: &MachineInfo,
     ) -> DeviceMmuDiscoveryResult<Option<DeviceMmuSystem>>;
 }
-
+pub fn user_vm_layout() -> UserVmLayout {
+    <ActivePlatform as PagingPlatform>::user_virtual_layout()
+}
 pub fn current_cpu_id() -> usize {
     <ActivePlatform as CpuPlatform>::current_cpu_id()
 }
@@ -215,82 +234,6 @@ pub fn scheduler_time_ns(cpu_id: usize) -> u64 {
 
 pub fn context_switch_count(cpu_id: usize) -> u64 {
     <ActivePlatform as TimerPlatform>::context_switch_count(cpu_id)
-}
-
-pub fn init_kernel_address_space_root() {
-    <ActivePlatform as AddressSpacePlatform>::init_kernel_root();
-}
-
-pub fn kernel_address_space_root() -> <ActivePlatform as AddressSpacePlatform>::Root {
-    <ActivePlatform as AddressSpacePlatform>::kernel_root()
-}
-
-pub fn current_address_space_root() -> <ActivePlatform as AddressSpacePlatform>::Root {
-    <ActivePlatform as AddressSpacePlatform>::current_root()
-}
-
-pub unsafe fn switch_address_space_root(root: <ActivePlatform as AddressSpacePlatform>::Root) {
-    unsafe {
-        <ActivePlatform as AddressSpacePlatform>::switch_root(root);
-    }
-}
-
-pub fn address_space_root_phys(root: <ActivePlatform as AddressSpacePlatform>::Root) -> u64 {
-    <ActivePlatform as AddressSpacePlatform>::root_to_phys(root)
-}
-
-pub fn allocate_auto_kernel_range_mapped(
-    size: u64,
-    flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
-    <ActivePlatform as PagingPlatform>::allocate_auto_kernel_range_mapped(size, flags)
-}
-
-pub fn allocate_auto_kernel_range_mapped_contiguous(
-    size: u64,
-    flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
-    <ActivePlatform as PagingPlatform>::allocate_auto_kernel_range_mapped_contiguous(size, flags)
-}
-
-pub fn allocate_kernel_range_mapped(
-    base: u64,
-    size: u64,
-    flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
-    <ActivePlatform as PagingPlatform>::allocate_kernel_range_mapped(base, size, flags)
-}
-
-pub fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64) {
-    <ActivePlatform as PagingPlatform>::deallocate_kernel_range(addr, size);
-}
-
-pub fn unmap_range(virtual_addr: AbiVirtAddr, size: u64) {
-    <ActivePlatform as PagingPlatform>::unmap_range(virtual_addr, size);
-}
-
-pub fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
-    <ActivePlatform as PagingPlatform>::identity_map_page(frame_addr, flags);
-}
-
-pub fn map_physical_pages(
-    phys: AbiPhysAddr,
-    size: u64,
-    cache: PhysicalMappingCache,
-) -> Result<AbiVirtAddr, PageMapError> {
-    <ActivePlatform as PagingPlatform>::map_physical_pages(phys, size, cache)
-}
-
-pub fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
-    <ActivePlatform as PagingPlatform>::unmap_physical_pages(base, size)
-}
-
-pub fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-    <ActivePlatform as PagingPlatform>::virt_to_phys(addr)
-}
-
-pub fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-    <ActivePlatform as PagingPlatform>::resolve_virtual_range_frame(addr)
 }
 
 pub fn read_pci_config_u32(address: PciConfigAddress) -> Option<u32> {

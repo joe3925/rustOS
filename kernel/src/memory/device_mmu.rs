@@ -26,8 +26,14 @@ pub enum DeviceMmuMapPermissions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceMmuCapabilities {
-    pub dma_page_size: u64,
-    pub dma_address_bits: u8,
+    pub supported_page_sizes: &'static [u64],
+    pub supported_superpage_sizes: &'static [u64],
+    pub input_address_bits: u8,
+    pub output_address_bits: u8,
+    pub page_table_alignment: u64,
+    pub invalidation_granularity: u64,
+    pub segment_boundary: u64,
+    pub device_page_sizes_match_cpu_page_sizes: bool,
     pub supports_range_invalidation: bool,
     pub supports_domain_invalidation: bool,
     pub reserved: u32,
@@ -36,12 +42,72 @@ pub struct DeviceMmuCapabilities {
 impl DeviceMmuCapabilities {
     pub const fn empty() -> Self {
         Self {
-            dma_page_size: 4096,
-            dma_address_bits: 0,
+            supported_page_sizes: &[],
+            supported_superpage_sizes: &[],
+            input_address_bits: 0,
+            output_address_bits: 0,
+            page_table_alignment: 0,
+            invalidation_granularity: 0,
+            segment_boundary: 0,
+            device_page_sizes_match_cpu_page_sizes: false,
             supports_range_invalidation: false,
             supports_domain_invalidation: false,
             reserved: 0,
         }
+    }
+
+    pub fn base_page_size(self) -> Option<u64> {
+        self.supported_page_sizes
+            .iter()
+            .copied()
+            .filter(|size| *size != 0)
+            .min()
+    }
+
+    pub fn supports_page_size(self, page_size: u64) -> bool {
+        self.supported_page_sizes.contains(&page_size)
+            || self.supported_superpage_sizes.contains(&page_size)
+    }
+
+    pub fn validate(self) -> DeviceMmuResult<()> {
+        let Some(base_page_size) = self.base_page_size() else {
+            return Err(DeviceMmuError::InvalidDomain);
+        };
+
+        if !base_page_size.is_power_of_two() {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        for size in self
+            .supported_page_sizes
+            .iter()
+            .chain(self.supported_superpage_sizes.iter())
+            .copied()
+        {
+            if size == 0 || !size.is_power_of_two() || size % base_page_size != 0 {
+                return Err(DeviceMmuError::InvalidDomain);
+            }
+        }
+
+        if self.input_address_bits == 0
+            || self.input_address_bits > u64::BITS as u8
+            || self.output_address_bits == 0
+            || self.output_address_bits > u64::BITS as u8
+        {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        let page_table_alignment = self.page_table_alignment.max(base_page_size);
+        if !page_table_alignment.is_power_of_two() {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        let invalidation_granularity = self.invalidation_granularity.max(base_page_size);
+        if !invalidation_granularity.is_power_of_two() {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        Ok(())
     }
 }
 
@@ -64,25 +130,36 @@ pub struct DeviceMmuDomainInfo {
     pub translation_unit_index: u32,
     pub iova_start: u64,
     pub iova_end: u64,
-    pub dma_page_size: u64,
+    pub capabilities: DeviceMmuCapabilities,
 }
 
 #[derive(Debug)]
 pub struct DeviceMmuDomain {
     domain_id: u64,
     translation_unit_index: u32,
-    dma_page_size: u64,
+    capabilities: DeviceMmuCapabilities,
     iova_tracker: RangeTracker,
 }
 
 impl DeviceMmuDomain {
-    pub fn new(info: DeviceMmuDomainInfo) -> Self {
-        Self {
+    pub fn new(info: DeviceMmuDomainInfo) -> DeviceMmuResult<Self> {
+        info.capabilities.validate()?;
+
+        let granularity = info
+            .capabilities
+            .base_page_size()
+            .ok_or(DeviceMmuError::InvalidDomain)?;
+
+        Ok(Self {
             domain_id: info.domain_id,
             translation_unit_index: info.translation_unit_index,
-            dma_page_size: info.dma_page_size,
-            iova_tracker: RangeTracker::new(info.iova_start, info.iova_end),
-        }
+            capabilities: info.capabilities,
+            iova_tracker: RangeTracker::new_with_granularity(
+                info.iova_start,
+                info.iova_end,
+                granularity,
+            ),
+        })
     }
 
     #[inline]
@@ -96,8 +173,13 @@ impl DeviceMmuDomain {
     }
 
     #[inline]
-    pub fn dma_page_size(&self) -> u64 {
-        self.dma_page_size
+    pub fn capabilities(&self) -> DeviceMmuCapabilities {
+        self.capabilities
+    }
+
+    #[inline]
+    pub fn device_page_size(&self) -> u64 {
+        self.capabilities.base_page_size().unwrap_or(0)
     }
 
     #[inline]
@@ -204,7 +286,8 @@ impl DeviceMmuSystem {
         identity: DeviceMmuDeviceIdentity,
     ) -> DeviceMmuResult<Arc<DeviceMmuDomain>> {
         let info = self.backend.create_domain(identity)?;
-        Ok(Arc::new(DeviceMmuDomain::new(info)))
+        info.capabilities.validate()?;
+        Ok(Arc::new(DeviceMmuDomain::new(info)?))
     }
 
     pub fn destroy_domain(&self, domain: &DeviceMmuDomain) {
@@ -235,7 +318,7 @@ impl DeviceMmuSystem {
             return Ok(());
         }
 
-        let page_size = domain.dma_page_size();
+        let page_size = domain.device_page_size();
 
         if page_size == 0 {
             return Err(DeviceMmuError::InvalidDomain);
@@ -258,7 +341,7 @@ impl DeviceMmuSystem {
             return Ok(());
         }
 
-        let page_size = domain.dma_page_size();
+        let page_size = domain.device_page_size();
 
         if page_size == 0 {
             return Err(DeviceMmuError::InvalidDomain);
@@ -278,7 +361,7 @@ impl DeviceMmuSystem {
     ) -> DeviceMmuResult<()> {
         self.unmap_range(domain, rec.iova_base, rec.page_count)?;
 
-        let len = rec.page_count as u64 * domain.dma_page_size();
+        let len = rec.page_count as u64 * domain.device_page_size();
 
         if !rec.is_identity {
             domain.free_iova(rec.iova_base, len);
@@ -297,7 +380,7 @@ impl DeviceMmuSystem {
             return self.invalidate_domain(domain);
         }
 
-        let page_size = domain.dma_page_size();
+        let page_size = domain.device_page_size();
 
         if page_size == 0 {
             return Err(DeviceMmuError::InvalidDomain);

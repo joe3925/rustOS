@@ -1,8 +1,8 @@
 use crate::executable::program::{
-    Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
+    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
 };
-use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
+use crate::memory::paging::{base_page_size, kernel_space_base};
 use crate::platform;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
 
-use crate::object_manager::{Object, ObjectPayload, TaskQueueRef, OBJECT_MANAGER};
+use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload, TaskQueueRef};
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let path = alloc::format!("\\Process\\{}", pid);
@@ -120,7 +120,7 @@ fn resolve_with_working_dir(caller: &ProgramHandle, raw: &str) -> Path {
 }
 #[inline(always)]
 fn is_user_addr(addr: u64) -> bool {
-    (0x1000..KERNEL_SPACE_BASE).contains(&addr)
+    (base_page_size()..kernel_space_base().as_u64()).contains(&addr)
 }
 #[inline(always)]
 pub fn user_ptr_ok<T>(ptr: *const T, bytes: usize) -> bool {
@@ -580,7 +580,9 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     let managed = { caller.read().managed_threads.lock().len() };
     let stack = if let Some(range) = caller.write().tracker.alloc_auto(stack_size) {
         unsafe {
-            let _ = caller.write().virtual_map(range, stack_size as usize);
+            let _ = caller
+                .write()
+                .virtual_map(range.into(), stack_size as usize);
         };
         range + stack_size
     } else {
@@ -596,7 +598,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         0,
         stack_size,
         format!("{} Worker {}", caller.read().title, managed),
-        stack,
+        stack.into(),
         caller_pid,
     );
     SCHEDULER.add_task(task.clone());
@@ -1148,7 +1150,7 @@ pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
         let Some(dst) = pg.tracker.alloc_auto(total as u64) else {
             return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, total as u32);
         };
-        if unsafe { pg.virtual_map(dst, total) }.is_err() {
+        if unsafe { pg.virtual_map(dst.into(), total) }.is_err() {
             return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
         }
         dst

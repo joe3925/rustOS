@@ -1,8 +1,10 @@
 use crate::memory::heap::{
-    mimalloc_arena_size, mimalloc_heap_end, MIMALLOC_ARENA_START, MIMALLOC_HEAP_START,
-    MIMALLOC_OS_HEAP_SIZE,
+    MIMALLOC_ARENA_START, MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE, mimalloc_arena_size,
+    mimalloc_heap_end,
 };
-use crate::memory::paging::paging::unmap_range_unchecked;
+use crate::memory::paging::{
+    align_up_to_base_page, base_page_size, map_fresh_kernel_range_no_flush, unmap_range_unchecked,
+};
 use crate::platform;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
@@ -14,10 +16,9 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 
 use crate::arch::interrupts::without_interrupts;
-use crate::arch::paging::PageTableFlags;
-use crate::arch::{align_up, interrupts, VirtAddr};
+use crate::arch::{VirtAddr, align_up, interrupts};
+use kernel_types::arch::PageFlags;
 
-const PAGE_SIZE: usize = 4096;
 const MIMALLOC_STATS_ENABLED: bool = false;
 const MIMALLOC_OS_ALLOC_ZEROES: bool = false;
 const MIMALLOC_COMMIT_GRANULARITY: usize = 2 * 1024 * 1024;
@@ -391,11 +392,11 @@ impl RangeAllocator {
     unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         self.ensure_init();
 
-        let size = align_up(size as u64, PAGE_SIZE as u64) as usize;
+        let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
         if size == 0 {
             return null_mut();
         }
-        let align = align.max(PAGE_SIZE);
+        let align = align.max(base_page_size() as usize);
 
         let Some((region, alloc_start)) = self.find_region(size, align) else {
             return null_mut();
@@ -431,13 +432,13 @@ impl RangeAllocator {
             return;
         }
 
-        let size = align_up(size as u64, PAGE_SIZE as u64) as usize;
+        let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
         self.add_free_region(addr, size);
         self.free_bytes = self.free_bytes.saturating_add(size).min(self.size);
     }
 
     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
-        if size < core::mem::size_of::<ListNode>() || size < PAGE_SIZE {
+        if size < core::mem::size_of::<ListNode>() || size < base_page_size() as usize {
             return;
         }
 
@@ -615,7 +616,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
         return false;
     }
 
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
 
     let mut tracker = MIMALLOC_COMMIT_TRACKER.lock();
     let commit_start =
@@ -650,12 +651,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
         let start_addr = VirtAddr::new(run_addr as u64);
 
         let res = without_interrupts(|| {
-            crate::memory::paging::paging::map_fresh_kernel_range_no_flush(
-                start_addr,
-                run_size as u64,
-                flags,
-                true,
-            )
+            map_fresh_kernel_range_no_flush(start_addr.into(), run_size as u64, flags, true)
         });
 
         if let Err(e) = res {
@@ -752,7 +748,7 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
 
         without_interrupts(|| unsafe {
-            unmap_range_unchecked(VirtAddr::new(run_addr as u64), run_size as u64);
+            unmap_range_unchecked(VirtAddr::new(run_addr as u64).into(), run_size as u64);
         });
 
         tracker.clear_range(run_start, chunk);

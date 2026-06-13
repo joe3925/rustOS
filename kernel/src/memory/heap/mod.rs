@@ -14,24 +14,19 @@ pub fn mimalloc_thread_done() {
     ALLOCATOR.mimalloc_thread_done();
 }
 
-use crate::arch::{
-    paging::{PageSize, PageTableFlags, Size1GiB, Size2MiB},
-    VirtAddr,
-};
+use crate::arch::VirtAddr;
 use crate::memory::heap::allocator::KernelAllocator;
 #[cfg(feature = "allocator-mimalloc")]
 use crate::memory::paging::frame_alloc::boot_usable_bytes;
-use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
-use crate::memory::paging::paging::{align_up_4k, map_range_with_huge_pages};
-use crate::memory::paging::tables::init_mapper;
-use crate::util::boot_info;
+use crate::memory::paging::{align_up_to_base_page, map_range};
 #[cfg(feature = "allocator-mimalloc")]
 use core::sync::atomic::{AtomicUsize, Ordering};
+use kernel_types::arch::PageFlags;
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
 #[cfg(feature = "allocator-buddy")]
-pub const HEAP_SIZE: u64 = Size1GiB::SIZE * 4;
-pub const BOOTSTRAP_HEAP_SIZE: u64 = Size2MiB::SIZE * 32;
+pub const HEAP_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+pub const BOOTSTRAP_HEAP_SIZE: u64 = 64 * 1024 * 1024;
 
 #[cfg(feature = "allocator-mimalloc")]
 pub const MIMALLOC_HEAP_START: usize = HEAP_START + BOOTSTRAP_HEAP_SIZE as usize;
@@ -42,7 +37,7 @@ pub const MIMALLOC_META_HEAP_SIZE: u64 = 64 * 1024 * 1024;
 #[cfg(feature = "allocator-mimalloc")]
 pub const MIMALLOC_ARENA_START: usize = align_up_usize(
     MIMALLOC_HEAP_START + MIMALLOC_META_HEAP_SIZE as usize,
-    Size1GiB::SIZE as usize,
+    1024 * 1024 * 1024,
 );
 #[cfg(feature = "allocator-mimalloc")]
 pub const MIMALLOC_OS_HEAP_SIZE: u64 = (MIMALLOC_ARENA_START - MIMALLOC_HEAP_START) as u64;
@@ -84,13 +79,17 @@ pub fn heap_capacity_bytes() -> u64 {
 }
 
 pub(crate) fn init_heap() {
-    let heap_start = VirtAddr::new(align_up_4k(HEAP_START as u64));
+    let heap_start = VirtAddr::new(
+        align_up_to_base_page(HEAP_START as u64).expect("invalid platform base page size"),
+    );
 
     let heap_size = {
         cfg_if::cfg_if! {
             if #[cfg(feature = "allocator-mimalloc")] {
-                let reserved_heap_size = align_up_4k(boot_usable_bytes());
-                let upfront_heap_size = align_up_4k(MIMALLOC_UPFRONT_HEAP_SIZE);
+                let reserved_heap_size = align_up_to_base_page(boot_usable_bytes())
+                    .expect("invalid platform base page size");
+                let upfront_heap_size = align_up_to_base_page(MIMALLOC_UPFRONT_HEAP_SIZE)
+                    .expect("invalid platform base page size");
                 assert!(
                     reserved_heap_size >= upfront_heap_size,
                     "mimalloc heap reservation {} bytes is smaller than upfront heap commit {} bytes",
@@ -105,7 +104,7 @@ pub(crate) fn init_heap() {
                 );
                 upfront_heap_size
             } else if #[cfg(feature = "allocator-buddy")] {
-                align_up_4k(HEAP_SIZE)
+                align_up_to_base_page(HEAP_SIZE).expect("invalid platform base page size")
             } else {
                 0
             }
@@ -114,25 +113,10 @@ pub(crate) fn init_heap() {
 
     let heap_end = heap_start + heap_size;
 
-    let boot_info = boot_info();
-    let recursive_index = boot_info
-        .recursive_index
-        .into_option()
-        .expect("missing recursive page-table mapping");
-    let mut mapper = init_mapper(recursive_index);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
 
     unsafe {
-        map_range_with_huge_pages(
-            &mut mapper,
-            heap_start,
-            heap_size,
-            &mut frame_allocator,
-            flags,
-            false,
-        )
-        .expect("Heap creation failed, can't recover")
+        map_range(heap_start.into(), heap_size, flags, false)
+            .expect("Heap creation failed, can't recover")
     };
 }

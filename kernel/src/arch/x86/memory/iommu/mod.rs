@@ -7,8 +7,8 @@ use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
 use core::mem::size_of;
 use kernel_types::dma::{
-    DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity, DMA_IOMMU_VENDOR_AMD_IVRS,
-    DMA_IOMMU_VENDOR_INTEL_DMAR,
+    DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR, DeviceMmuPlatformDeviceIdentity,
+    DmaPciDeviceIdentity,
 };
 use raw_cpuid::CpuId;
 use spin::Mutex;
@@ -21,9 +21,8 @@ use crate::memory::device_mmu::{
     DeviceMmuDeviceIdentity, DeviceMmuDomain, DeviceMmuDomainInfo, DeviceMmuError,
     DeviceMmuMapPermissions, DeviceMmuResult,
 };
-use crate::memory::paging::tables::virt_to_phys;
-use crate::memory::paging::virt_tracker::{
-    allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous,
+use crate::memory::paging::{
+    allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous, virt_to_phys,
 };
 use crate::println;
 
@@ -40,12 +39,31 @@ pub use domain::X86_IOVA_START;
 
 const PAGE_SIZE: usize = 4096;
 const MAP_BATCH_PAGES: usize = 64;
+const X86_IOMMU_PAGE_SIZES: &[u64] = &[PAGE_SIZE as u64];
+const X86_IOMMU_SUPERPAGE_SIZES: &[u64] = &[2 * 1024 * 1024, 1024 * 1024 * 1024];
+
+fn x86_iommu_capabilities() -> DeviceMmuCapabilities {
+    DeviceMmuCapabilities {
+        supported_page_sizes: X86_IOMMU_PAGE_SIZES,
+        supported_superpage_sizes: X86_IOMMU_SUPERPAGE_SIZES,
+        input_address_bits: 48,
+        output_address_bits: 48,
+        page_table_alignment: PAGE_SIZE as u64,
+        invalidation_granularity: PAGE_SIZE as u64,
+        segment_boundary: 0,
+        device_page_sizes_match_cpu_page_sizes: true,
+        supports_range_invalidation: false,
+        supports_domain_invalidation: true,
+        reserved: 0,
+    }
+}
 
 pub(crate) fn alloc_zeroed_pages(num_pages: usize) -> Result<VirtAddr, IommuError> {
     let size = (num_pages * PAGE_SIZE) as u64;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let va =
-        allocate_auto_kernel_range_mapped(size, flags).map_err(|_| IommuError::NoBackingFrame)?;
+    let va: VirtAddr = allocate_auto_kernel_range_mapped(size, flags.into())
+        .map_err(|_| IommuError::NoBackingFrame)?
+        .into();
 
     unsafe {
         core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, size as usize);
@@ -59,15 +77,16 @@ pub(crate) fn alloc_zeroed_pages_contiguous(
 ) -> Result<(PhysAddr, VirtAddr), IommuError> {
     let size = (num_pages * PAGE_SIZE) as u64;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let va = allocate_auto_kernel_range_mapped_contiguous(size, flags)
-        .map_err(|_| IommuError::NoBackingFrame)?;
+    let va: VirtAddr = allocate_auto_kernel_range_mapped_contiguous(size, flags.into())
+        .map_err(|_| IommuError::NoBackingFrame)?
+        .into();
 
     unsafe {
         core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, size as usize);
     }
 
-    let (_, phys) = virt_to_phys(va).ok_or(IommuError::NoBackingFrame)?;
-    Ok((phys, va))
+    let (_, phys) = virt_to_phys(va.into()).ok_or(IommuError::NoBackingFrame)?;
+    Ok((phys.into(), va))
 }
 
 pub enum X86DeviceMmu {
@@ -270,24 +289,12 @@ impl DeviceMmuBackend for X86DeviceMmu {
             Self::Intel { .. } => DeviceMmuBackendInfo {
                 public_vendor_code: DMA_IOMMU_VENDOR_INTEL_DMAR,
                 name: "x86 Intel VT-d",
-                capabilities: DeviceMmuCapabilities {
-                    dma_page_size: PAGE_SIZE as u64,
-                    dma_address_bits: 48,
-                    supports_range_invalidation: false,
-                    supports_domain_invalidation: true,
-                    reserved: 0,
-                },
+                capabilities: x86_iommu_capabilities(),
             },
             Self::Amd { .. } => DeviceMmuBackendInfo {
                 public_vendor_code: DMA_IOMMU_VENDOR_AMD_IVRS,
                 name: "x86 AMD-Vi",
-                capabilities: DeviceMmuCapabilities {
-                    dma_page_size: PAGE_SIZE as u64,
-                    dma_address_bits: 48,
-                    supports_range_invalidation: false,
-                    supports_domain_invalidation: true,
-                    reserved: 0,
-                },
+                capabilities: x86_iommu_capabilities(),
             },
         }
     }
@@ -417,7 +424,7 @@ fn domain_info_from_raw(handle: u64, raw: &IommuDomain) -> DeviceMmuDomainInfo {
         translation_unit_index: raw.remapper_index,
         iova_start: raw.iova_start,
         iova_end: raw.iova_end,
-        dma_page_size: PAGE_SIZE as u64,
+        capabilities: x86_iommu_capabilities(),
     }
 }
 

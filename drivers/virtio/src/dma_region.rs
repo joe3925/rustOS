@@ -1,17 +1,15 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use kernel_api::device::DeviceObject;
-use kernel_api::dma;
+use kernel_api::dma::{self, dma_base_page_size};
 use kernel_api::kernel_types::dma::{
-    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IOBUFFER_MAX_PAGE_CAPACITY,
-    IOBUFFER_PAGE_SIZE, IoBuffer, PhysFramed,
+    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IOBUFFER_MAX_PAGE_CAPACITY, IoBuffer,
+    PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
     deallocate_kernel_range, unmap_range,
 };
-
-const MAX_DMA_MAP_BYTES: usize = IOBUFFER_MAX_PAGE_CAPACITY * IOBUFFER_PAGE_SIZE;
 
 struct DmaChunk {
     byte_offset: usize,
@@ -36,7 +34,7 @@ impl ContiguousDmaRegion {
         mapped_bytes: usize,
         chunk_multiple: usize,
     ) -> Option<Self> {
-        let alloc_bytes = mapped_bytes.div_ceil(IOBUFFER_PAGE_SIZE) * IOBUFFER_PAGE_SIZE;
+        let alloc_bytes = mapped_bytes.div_ceil(dma_base_page_size()) * dma_base_page_size();
         Self::new_with_alloc(device, mapped_bytes, alloc_bytes, chunk_multiple)
     }
 
@@ -51,11 +49,12 @@ impl ContiguousDmaRegion {
         }
 
         let chunk_multiple = chunk_multiple.max(1);
-        if chunk_multiple > MAX_DMA_MAP_BYTES {
+        if chunk_multiple > IOBUFFER_MAX_PAGE_CAPACITY * dma_base_page_size() {
             return None;
         }
 
-        let max_chunk_bytes = (MAX_DMA_MAP_BYTES / chunk_multiple) * chunk_multiple;
+        let max_chunk_bytes =
+            (IOBUFFER_MAX_PAGE_CAPACITY * dma_base_page_size() / chunk_multiple) * chunk_multiple;
         if max_chunk_bytes == 0 {
             return None;
         }

@@ -7,10 +7,10 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::tss::TaskStateSegment;
 
 use crate::cpu::get_cpu_info;
-use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
+use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::structs::per_cpu_vec::PerCpuVec;
 
-use x86_64::instructions::segmentation::{Segment, CS, SS};
+use x86_64::instructions::segmentation::{CS, SS, Segment};
 use x86_64::instructions::tables::load_tss;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const TIMER_IST_INDEX: u16 = 1;
@@ -47,7 +47,7 @@ impl GDTTracker {
         // This needs to be done because interrupt stacks aren't allowed to grow and the bench submit puts a bunch on the stack to prevent alloc in interrupts.
         // TODO: consider allowing interrupt stacks to grow or reducing bench submits footprint.
         let timer_stack_size = if BENCH_ENABLED {
-            StackSize::Huge2M
+            StackSize::Huge
         } else {
             StackSize::Medium
         };
@@ -69,12 +69,13 @@ impl GDTTracker {
         let page_stack =
             allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack");
 
-        tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack;
-        tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = double_fault_stack;
-        tss_static.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = page_stack;
-        tss_static.interrupt_stack_table[YIELD_IST_INDEX as usize] = yield_stack;
-        tss_static.interrupt_stack_table[SCHED_IPI_IST_INDEX as usize] = sched_ipi_stack;
-        tss_static.privilege_stack_table[0] = privilege_stack;
+        tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack.into();
+        tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            double_fault_stack.into();
+        tss_static.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = page_stack.into();
+        tss_static.interrupt_stack_table[YIELD_IST_INDEX as usize] = yield_stack.into();
+        tss_static.interrupt_stack_table[SCHED_IPI_IST_INDEX as usize] = sched_ipi_stack.into();
+        tss_static.privilege_stack_table[0] = privilege_stack.into();
 
         let gdt: &'static mut GlobalDescriptorTable =
             Box::leak(Box::new(GlobalDescriptorTable::new()));

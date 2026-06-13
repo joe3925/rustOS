@@ -10,10 +10,10 @@ use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
+use super::domain::{IommuDomain, IommuError};
+use super::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
 use super::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo, X86PlatformDeviceRoute};
-use crate::memory::iommu::domain::{IommuDomain, IommuError};
-use crate::memory::iommu::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
-use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
+use crate::memory::paging::{map_physical_pages, unmap_physical_pages};
 use crate::println;
 
 const VER_REG: usize = 0x00;
@@ -75,7 +75,7 @@ impl IntelVtdBackend {
         let mut units = Vec::with_capacity(info.remapper_units.len());
         for unit in &info.remapper_units {
             let reg_va = map_physical_pages(
-                PhysAddr::new(unit.register_base),
+                PhysAddr::new(unit.register_base).into(),
                 0x1000,
                 kernel_types::memory::PhysicalMappingCache::Uncached,
             )
@@ -534,14 +534,14 @@ fn find_parent_bridge(ecam_base: u64, start_bus: u8, target_bus: u8) -> Option<P
     for bus in start_bus..target_bus {
         let bus_pa = PhysAddr::new(ecam_base + ((bus as u64) << 20));
         let Ok(bus_va) = map_physical_pages(
-            bus_pa,
+            bus_pa.into(),
             1 << 20,
             kernel_types::memory::PhysicalMappingCache::Uncached,
         ) else {
             continue;
         };
 
-        let candidate = scan_bus_for_parent_bridge(bus_va, target_bus);
+        let candidate = scan_bus_for_parent_bridge(bus_va.into(), target_bus);
         let _ = unmap_physical_pages(bus_va, 1 << 20);
 
         if let Some(parent) = candidate {

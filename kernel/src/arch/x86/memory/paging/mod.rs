@@ -1,7 +1,6 @@
-pub mod constants;
-pub mod frame_alloc;
-pub mod mmio;
-pub mod paging;
-pub mod stack;
+pub mod address_space;
+pub mod flags;
+pub mod layout;
+pub mod mapper;
 pub mod tables;
-pub mod virt_tracker;
+pub mod tlb;

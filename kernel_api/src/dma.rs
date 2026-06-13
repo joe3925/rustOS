@@ -9,7 +9,9 @@ use kernel_types::dma::{
     IoBufferState, MappableIoBufferState, PhysFramed, ToDevice,
 };
 use kernel_types::status::DriverStatus;
-
+pub fn dma_base_page_size() -> usize {
+    unsafe { kernel_sys::kernel_dma_base_page_size() as usize }
+}
 pub fn register_pci_pdo(
     pdo: &Arc<DeviceObject>,
     identity: dma::DmaPciDeviceIdentity,

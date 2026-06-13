@@ -4,21 +4,21 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
 use crate::memory::{
     heap::heap_capacity_bytes,
-    paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
+    paging::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::unwind::{
-    capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
+    CapturedCallchain, MAX_CALLCHAIN_DEPTH, capture_callchain_from_state_limited,
 };
 use crate::scheduling::runtime::runtime::spawn;
 use crate::scheduling::runtime::runtime::{
-    block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
+    JoinAll, block_on, spawn_blocking, spawn_blocking_many, spawn_detached,
 };
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
-use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
+use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_archive_for_path};
 use crate::structs::stopwatch::Stopwatch;
-use crate::util::{boot_info, TOTAL_TIME};
+use crate::util::{TOTAL_TIME, boot_info};
 use crate::{platform, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -33,19 +33,19 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
+use kernel_types::ProstMessage;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
+    BENCH_FLAG_IRQ, BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
     BenchDroppedSampleCounterProto, BenchLevelResult, BenchOverflowPolicy, BenchSampleChunkProto,
-    BenchSampleProto, BenchSweepParams, BenchSweepResult, BenchWindowConfig, BENCH_FLAG_IRQ,
-    BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
+    BenchSampleProto, BenchSweepParams, BenchSweepResult, BenchWindowConfig,
 };
-use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
+use kernel_types::benchmark::{BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1, BenchSweepBothResult};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::{DeviceControl, RequestHandle, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
-use kernel_types::ProstMessage;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use spin::{Mutex, Once};
 
 use crate::arch::interrupts;
@@ -606,7 +606,7 @@ fn bench_capture_metrics(core_id: usize, ts: u64) {
 
     let heap_used = interrupts::without_interrupts(used_memory) as u64;
 
-    let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst) as u64;
+    let mut used_bytes = physical_used_bytes();
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
     let total_bytes = total_usable_bytes();
 
@@ -913,7 +913,7 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
 
     let heap_used = interrupts::without_interrupts(used_memory) as u64;
 
-    let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst) as u64;
+    let mut used_bytes = physical_used_bytes();
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
     let total_bytes = total_usable_bytes();
 
@@ -2176,22 +2176,24 @@ impl BenchWindow {
                 let interval = secs;
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
-                spawn_blocking(move || loop {
-                    platform::wait_duration(interval);
+                spawn_blocking(move || {
+                    loop {
+                        platform::wait_duration(interval);
 
-                    if !BENCH_ENABLED {
-                        return;
-                    }
-
-                    {
-                        let inner = this_arc.inner.lock();
-                        if !inner.running {
-                            break;
+                        if !BENCH_ENABLED {
+                            return;
                         }
-                    }
 
-                    let moved = Arc::clone(&this_arc);
-                    block_on(moved.persist());
+                        {
+                            let inner = this_arc.inner.lock();
+                            if !inner.running {
+                                break;
+                            }
+                        }
+
+                        let moved = Arc::clone(&this_arc);
+                        block_on(moved.persist());
+                    }
                 });
             }
         }
@@ -2773,11 +2775,7 @@ fn safe_ratio(num: u64, den: u64) -> f64 {
 
 #[inline(always)]
 fn safe_ratio_f64(num: f64, den: f64) -> f64 {
-    if den == 0.0 {
-        0.0
-    } else {
-        num / den
-    }
+    if den == 0.0 { 0.0 } else { num / den }
 }
 
 #[inline(always)]
@@ -2858,27 +2856,17 @@ pub async fn bench_async_vs_sync_call_latency_async() {
 
     println!(
         "[bench] async-sm:         total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
-        async_ms,
-        async_us_per_chain,
-        async_ns_per_inner,
-        async_ops_sec
+        async_ms, async_us_per_chain, async_ns_per_inner, async_ops_sec
     );
 
     println!(
         "[bench] async-spawn-wake: total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
-        spawn_ms,
-        spawn_us_per_chain,
-        spawn_ns_per_inner,
-        spawn_ops_sec
+        spawn_ms, spawn_us_per_chain, spawn_ns_per_inner, spawn_ops_sec
     );
 
     println!(
         "[bench] asyncq:           tasks={} total={:.3} ms  us/task={:.3}  ns/inner_call={:.3}  tasks/sec={:.3}",
-        ASYNC_TASKS,
-        q_ms,
-        asyncq_us_per_task,
-        asyncq_ns_per_inner,
-        asyncq_ops_sec
+        ASYNC_TASKS, q_ms, asyncq_us_per_task, asyncq_ns_per_inner, asyncq_ops_sec
     );
 
     println!("[bench] --- async overheads ---");
@@ -3798,12 +3786,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         let ops_10 = seek_ops_sec / 10;
         println!(
             "[disk-bench] fs_seek baseline: iters={} elapsed={} ms ops/sec={} (est per-stack: 1drv={} 5drv={} 10drv={})",
-            seek_iters,
-            seek_ms,
-            seek_ops_sec,
-            ops_1,
-            ops_5,
-            ops_10
+            seek_iters, seek_ms, seek_ops_sec, ops_1, ops_5, ops_10
         );
     }
 
@@ -4181,7 +4164,13 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                             req.set_traversal_policy(TraversalPolicy::ForwardLower);
                             println!(
                                 "[virtio-bench] Starting trial {} for run_id {} with params: flags=0x{:X} total_bytes={} request_size={} start_sector={} max_inflight={}",
-                                trial, run_id, flags, total_bytes, request_size, start_sector, max_inflight
+                                trial,
+                                run_id,
+                                flags,
+                                total_bytes,
+                                request_size,
+                                start_sector,
+                                max_inflight
                             );
                             let st = PNP_MANAGER.send_request(target.clone(), &mut req).await;
                             println!(
@@ -4498,9 +4487,15 @@ fn print_bench_result_table(res: &BenchRunResult) {
         },
         if both.msix_enabled != 0 { "Yes" } else { "No" }
     );
-    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
-    println!("| Mode | Inflight |   Requests |  Total(ms) |  Avg(ms) |  P50(ms) |  P99(ms) |    MiB/s |  Min(ms) |  Max(ms) |  Wait%  |");
-    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
+    println!(
+        "+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+"
+    );
+    println!(
+        "| Mode | Inflight |   Requests |  Total(ms) |  Avg(ms) |  P50(ms) |  P99(ms) |    MiB/s |  Min(ms) |  Max(ms) |  Wait%  |"
+    );
+    println!(
+        "+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+"
+    );
 
     let irq_used = both.irq.used as usize;
     let mut i = 0usize;
@@ -4538,7 +4533,9 @@ fn print_bench_result_table(res: &BenchRunResult) {
         i += 1;
     }
 
-    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
+    println!(
+        "+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+"
+    );
 }
 
 /// Runs the benchmark matrix and prints results as a clean user-readable table.

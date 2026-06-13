@@ -10,9 +10,10 @@ use kernel_api::benchmark::{
     BENCH_PARAMS_VERSION_1, BenchLevelResult, BenchSweepParams, BenchSweepResult,
 };
 use kernel_api::device::DeviceObject;
+use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    Described, DmaMapped, FromDevice, IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer,
-    IoBufferDmaSegments, PhysFramed,
+    Described, DmaMapped, FromDevice, IOBUFFER_MAX_PAGE_CAPACITY, IoBuffer, IoBufferDmaSegments,
+    PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -81,7 +82,7 @@ impl BenchConfig {
 
 fn bench_max_request_size(inner: &DevExtInner) -> u32 {
     let q0 = inner.get_queue(0);
-    let dma_max = (IOBUFFER_MAX_PAGE_CAPACITY * IOBUFFER_PAGE_SIZE) as u32;
+    let dma_max = (IOBUFFER_MAX_PAGE_CAPACITY * dma_base_page_size()) as u32;
     (q0.max_request_bytes.min(dma_max).max(512)) & !511
 }
 
@@ -99,7 +100,7 @@ struct BenchDmaBuffer {
 impl BenchDmaBuffer {
     fn new_read(parent: &Arc<DeviceObject>, byte_len: u32) -> Result<Self, DriverStatus> {
         let byte_len = byte_len as usize;
-        let alloc_bytes = byte_len.div_ceil(IOBUFFER_PAGE_SIZE) * IOBUFFER_PAGE_SIZE;
+        let alloc_bytes = byte_len.div_ceil(dma_base_page_size()) * dma_base_page_size();
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         let base_va = allocate_auto_kernel_range_mapped_contiguous(alloc_bytes as u64, flags)
             .map_err(|_| DriverStatus::InsufficientResources)?;

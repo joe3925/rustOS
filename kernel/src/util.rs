@@ -6,19 +6,18 @@ use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::executable::program::{Program, PROGRAM_MANAGER};
+use crate::executable::program::{PROGRAM_MANAGER, Program};
 use crate::exports::EXPORTS;
-use crate::file_system::file_provider::{install_file_provider, ProviderKind};
+use crate::file_system::file_provider::{ProviderKind, install_file_provider};
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{heap_capacity_bytes, init_heap};
-use crate::memory::paging::frame_alloc::{
-    boot_usable_bytes, resize_bitmap_for_ram, BootInfoFrameAllocator,
-};
-use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
+use crate::memory::paging::{
+    KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked,
+};
 use crate::platform::{current_cpu_id, cycle_counter};
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
@@ -26,7 +25,7 @@ use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
-use crate::{println, BOOT_INFO, BOOT_INFO_INITIALIZED};
+use crate::{BOOT_INFO, BOOT_INFO_INITIALIZED, println};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -113,9 +112,9 @@ static mut TLS_TEST_ZERO_U64: u64 = 0;
 #[thread_local]
 static mut TLS_TEST_ZERO_BYTES: [u8; 16] = [0; 16];
 pub unsafe fn init() {
-    crate::platform::init_kernel_address_space_root();
+    crate::memory::paging::init_kernel_address_space_root();
     let memory_map = &boot_info().memory_regions;
-    BootInfoFrameAllocator::init_start(memory_map);
+    KernelFrameAllocator::init_from_boot_memory_map();
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
@@ -173,7 +172,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         "kernel".to_string(),
         Path::from_string(""),
         VirtAddr::new(0xFFFF_8500_0000_0000),
-        crate::platform::kernel_address_space_root(),
+        crate::memory::paging::kernel_address_space_root(),
         KERNEL_RANGE_TRACKER.clone(),
     );
 
@@ -228,7 +227,9 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
 
     crate::platform::disable_interrupts();
     unsafe {
-        crate::platform::switch_address_space_root(crate::platform::kernel_address_space_root());
+        crate::memory::paging::switch_address_space_root(
+            crate::memory::paging::kernel_address_space_root(),
+        );
     }
     crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
 
@@ -369,7 +370,7 @@ fn reclaim_kernel_stub() {
     }
 
     unsafe {
-        unmap_reserved_range_unchecked(VirtAddr::new(boot.stub_base), boot.stub_size);
+        unmap_reserved_range_unchecked(VirtAddr::new(boot.stub_base).into(), boot.stub_size);
     }
 }
 

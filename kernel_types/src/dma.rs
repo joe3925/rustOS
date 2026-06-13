@@ -54,10 +54,6 @@ pub const DMA_IOMMU_VENDOR_AMD_IVRS: u8 = 2;
 pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE: u32 = 1 << 0;
 pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED: u32 = 1 << 1;
 
-pub const IOBUFFER_PAGE_SIZE: usize = 4096;
-pub const IOBUFFER_FRAME_SIZE_4KIB: u64 = 4 * 1024;
-pub const IOBUFFER_FRAME_SIZE_2MIB: u64 = 2 * 1024 * 1024;
-pub const IOBUFFER_FRAME_SIZE_1GIB: u64 = 1024 * 1024 * 1024;
 pub const IOBUFFER_INLINE_PAGE_CAPACITY: usize = 8;
 pub const IOBUFFER_MAX_PAGE_CAPACITY: usize = 512;
 pub const IOBUFFER_INLINE_FRAME_CAPACITY: usize = IOBUFFER_INLINE_PAGE_CAPACITY;
@@ -123,7 +119,7 @@ pub enum DmaMappingStrategy {
     /// Entire logical buffer mapped as a single contiguous IOVA region -> 1 segment.
     SingleContiguous,
     /// Buffer divided into N equal contiguous IOVA chunks. Requires
-    /// `buffer.len() % chunk_size == 0` and `chunk_size % PAGE_SIZE == 0`.
+    /// `buffer.len() % chunk_size == 0` and alignment to the device translation granularity.
     ContiguousChunks { chunk_size: usize },
     /// Every page's IOVA == its physical address. Adjacent physical pages are
     /// merged into a single segment.
@@ -304,6 +300,7 @@ enum DmaSegmentLayout {
         iova_base: u64,
         page_offset: usize,
         byte_len: usize,
+        page_size: usize,
     },
     FixedChunks {
         dma_addr: u64,
@@ -429,10 +426,7 @@ struct VirtualFrameTranslation {
 
 #[inline]
 fn is_valid_frame_size(byte_len: u64) -> bool {
-    matches!(
-        byte_len,
-        IOBUFFER_FRAME_SIZE_4KIB | IOBUFFER_FRAME_SIZE_2MIB | IOBUFFER_FRAME_SIZE_1GIB
-    )
+    byte_len != 0 && byte_len.is_power_of_two()
 }
 
 fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> {
@@ -459,7 +453,14 @@ fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> 
 
 #[cfg(any(test, feature = "hosted-tests"))]
 fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    Some((IOBUFFER_FRAME_SIZE_4KIB, PhysAddr::new(addr.as_u64())))
+    Some((hosted_test_frame_size(), PhysAddr::new(addr.as_u64())))
+}
+
+#[cfg(any(test, feature = "hosted-tests"))]
+fn hosted_test_frame_size() -> u64 {
+    (IOBUFFER_MAX_PAGE_CAPACITY / IOBUFFER_INLINE_PAGE_CAPACITY) as u64
+        * core::mem::size_of::<u64>() as u64
+        * IOBUFFER_INLINE_PAGE_CAPACITY as u64
 }
 
 #[cfg(not(any(test, feature = "hosted-tests")))]
@@ -840,8 +841,9 @@ impl<'a> IoBufferDmaSegments<'a> {
             DmaSegmentLayout::PageChunks {
                 page_offset,
                 byte_len,
+                page_size,
                 ..
-            } => page_chunk_segment_count(page_offset, byte_len),
+            } => page_chunk_segment_count(page_offset, byte_len, page_size),
             DmaSegmentLayout::FixedChunks { count, .. } => count,
             DmaSegmentLayout::Identity {
                 frame_offset,
@@ -924,6 +926,7 @@ impl<'a> Iterator for IoBufferDmaSegmentIter<'a> {
                 iova_base,
                 page_offset,
                 byte_len,
+                page_size,
             } => {
                 if !self.initialized {
                     self.remaining = byte_len;
@@ -934,8 +937,8 @@ impl<'a> Iterator for IoBufferDmaSegmentIter<'a> {
                 }
 
                 let start_in_page = if self.index == 0 { page_offset } else { 0 };
-                let bytes = self.remaining.min(IOBUFFER_PAGE_SIZE - start_in_page);
-                let dma_addr = iova_base + (self.index * IOBUFFER_PAGE_SIZE + start_in_page) as u64;
+                let bytes = self.remaining.min(page_size - start_in_page);
+                let dma_addr = iova_base + (self.index * page_size + start_in_page) as u64;
                 self.remaining -= bytes;
                 self.index += 1;
                 Some(IoBufferDmaSegment {
@@ -980,13 +983,11 @@ impl<'a> Iterator for IoBufferDmaSegmentIter<'a> {
     }
 }
 
-fn page_chunk_segment_count(page_offset: usize, byte_len: usize) -> usize {
+fn page_chunk_segment_count(page_offset: usize, byte_len: usize, page_size: usize) -> usize {
     if byte_len == 0 {
         0
     } else {
-        page_offset
-            .saturating_add(byte_len)
-            .div_ceil(IOBUFFER_PAGE_SIZE)
+        page_offset.saturating_add(byte_len).div_ceil(page_size)
     }
 }
 
@@ -1383,8 +1384,13 @@ impl<'a> IoBufferRepr<'a> {
         let virt_addr = self
             .virtual_address()
             .expect("IoBuffer is not backed by exactly one virtual extent");
-        let page_offset = virt_addr & (IOBUFFER_PAGE_SIZE - 1);
-        virt_addr - page_offset
+        let frame_offset = self
+            .extents()
+            .first()
+            .map_or(0, |extent| extent.frame_offset);
+        virt_addr
+            .checked_sub(frame_offset)
+            .expect("IoBuffer extent frame offset exceeds virtual address")
     }
 
     pub fn page_offset(&self) -> usize {

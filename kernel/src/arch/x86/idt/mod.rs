@@ -1,21 +1,21 @@
 use core::arch::naked_asm;
 
 use spin::Once;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 use crate::arch::drivers::interrupt_index::InterruptIndex;
 use crate::arch::drivers::timer_driver::timer_interrupt_entry;
+use crate::arch::memory::paging::tlb::tlb_flush_entry;
 use crate::arch::scheduling::{ipi_entry, yield_interrupt_entry};
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{
     DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, SCHED_IPI_IST_INDEX, TIMER_IST_INDEX,
     YIELD_IST_INDEX,
 };
-use crate::memory::paging::paging::tlb_flush_entry;
 use crate::scheduling::scheduler::KernelFpuGuard;
 
-use crate::idt::{irq_dispatch, InterruptGuard};
+use crate::idt::{InterruptGuard, irq_dispatch};
 
 pub type InterruptFrame = InterruptStackFrame;
 
@@ -26,8 +26,9 @@ pub(crate) mod irq_platform {
     use core::sync::atomic::AtomicBool;
 
     use crate::arch::drivers::interrupt_index::{
-        current_cpu_id as arch_current_cpu_id, current_is_in_interrupt_atomic as arch_in_interrupt,
-        get_current_logical_id, send_eoi as arch_send_eoi, InterruptIndex, APIC,
+        APIC, InterruptIndex, current_cpu_id as arch_current_cpu_id,
+        current_is_in_interrupt_atomic as arch_in_interrupt, get_current_logical_id,
+        send_eoi as arch_send_eoi,
     };
 
     pub(crate) const DYNAMIC_VECTOR_START: u8 = 0x60;
@@ -57,11 +58,7 @@ pub(crate) mod irq_platform {
         let base = InterruptIndex::Timer.as_u8();
         let gsi = vector.wrapping_sub(base);
 
-        if gsi < MAX_GSI {
-            Some(gsi)
-        } else {
-            None
-        }
+        if gsi < MAX_GSI { Some(gsi) } else { None }
     }
 
     pub(crate) fn current_cpu_id() -> u32 {

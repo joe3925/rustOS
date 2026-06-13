@@ -1,4 +1,4 @@
-use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
+use crate::memory::paging::{map_physical_pages, unmap_physical_pages};
 use crate::util::boot_info;
 use acpi;
 use acpi::{AcpiHandler, AcpiTables, PhysicalMapping, PlatformInfo};
@@ -65,7 +65,7 @@ impl AcpiHandler for ACPIImpl {
         size: usize,
     ) -> PhysicalMapping<Self, T> {
         let virt_addr = map_physical_pages(
-            PhysAddr::new(physical_address as u64),
+            PhysAddr::new(physical_address as u64).into(),
             size as u64,
             kernel_types::memory::PhysicalMappingCache::Uncached,
         )
@@ -81,7 +81,7 @@ impl AcpiHandler for ACPIImpl {
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
         let _ = unmap_physical_pages(
-            VirtAddr::new(region.virtual_start().as_ptr() as u64),
+            VirtAddr::new(region.virtual_start().as_ptr() as u64).into(),
             region.region_length() as u64,
         );
     }

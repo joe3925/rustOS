@@ -9,11 +9,11 @@ use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
 use spin::Mutex;
 use x86_64::PhysAddr;
 
+use super::alloc_zeroed_pages_contiguous;
+use super::domain::{IommuDomain, IommuError};
+use super::page_table::{self, AMD_IR, AMD_IW, PTE_ADDR_MASK, PTE_P};
 use super::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo, X86PlatformDeviceRoute};
-use crate::memory::iommu::alloc_zeroed_pages_contiguous;
-use crate::memory::iommu::domain::{IommuDomain, IommuError};
-use crate::memory::iommu::page_table::{self, AMD_IR, AMD_IW, PTE_ADDR_MASK, PTE_P};
-use crate::memory::paging::mmio::map_physical_pages;
+use crate::memory::paging::map_physical_pages;
 use crate::println;
 
 const DEV_TAB_BAR: usize = 0x0000;
@@ -84,7 +84,7 @@ impl AmdViBackend {
 
         for unit in &info.remapper_units {
             let reg_va = map_physical_pages(
-                PhysAddr::new(unit.register_base),
+                PhysAddr::new(unit.register_base).into(),
                 0x3000,
                 kernel_types::memory::PhysicalMappingCache::Uncached,
             )

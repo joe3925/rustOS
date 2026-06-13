@@ -12,8 +12,9 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use kernel_api::async_ffi::FfiFuture;
+use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer, ToDevice,
+    Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IoBuffer, ToDevice,
 };
 use kernel_api::println;
 use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
@@ -252,9 +253,9 @@ struct FlushScratch<const BLOCK_SIZE: usize> {
 impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
     fn new(run_hint: usize, cache_capacity_blocks: usize) -> Self {
         let run_hint = run_hint.max(1);
-        let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
+        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
         let scratch_key_capacity = cache_capacity_blocks.max(run_hint);
-        let run_capacity = if BLOCK_SIZE.is_multiple_of(IOBUFFER_PAGE_SIZE) {
+        let run_capacity = if BLOCK_SIZE.is_multiple_of(dma_base_page_size()) {
             (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1))
                 .max(1)
                 .min(cache_capacity_blocks.saturating_sub(1).max(1))
@@ -921,8 +922,7 @@ where
     ) -> Result<(), CacheError<B::Error>> {
         {
             let data_guard = page.data.read();
-            let io_buf =
-                IoBuffer::<Described, ToDevice>::from_slice(&data_guard.bytes[..]);
+            let io_buf = IoBuffer::<Described, ToDevice>::from_slice(&data_guard.bytes[..]);
             let mut req = RequestHandle::new(Write {
                 offset: lba * BLOCK_SIZE as u64,
                 len: BLOCK_SIZE,
@@ -1012,12 +1012,8 @@ where
             return Ok(0);
         }
 
-        let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
-        if run
-            .len()
-            .saturating_mul(frames_per_block)
-            > IOBUFFER_MAX_FRAME_CAPACITY
-        {
+        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
+        if run.len().saturating_mul(frames_per_block) > IOBUFFER_MAX_FRAME_CAPACITY {
             cold_path();
             Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
             return Err(CacheError::InvalidIoBuffer);
@@ -1099,8 +1095,8 @@ where
             return Ok(0);
         }
 
-        let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
-        let raw_max_blocks_per_buffer = if BLOCK_SIZE.is_multiple_of(IOBUFFER_PAGE_SIZE) {
+        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
+        let raw_max_blocks_per_buffer = if BLOCK_SIZE.is_multiple_of(dma_base_page_size()) {
             (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1)).max(1)
         } else {
             1
@@ -1227,8 +1223,8 @@ where
     }
 
     fn max_blocks_per_flush_run(&self, max_blocks_per_run: usize) -> usize {
-        let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
-        let raw_max_blocks_per_buffer = if BLOCK_SIZE.is_multiple_of(IOBUFFER_PAGE_SIZE) {
+        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
+        let raw_max_blocks_per_buffer = if BLOCK_SIZE.is_multiple_of(dma_base_page_size()) {
             (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1)).max(1)
         } else {
             1
@@ -1969,5 +1965,3 @@ where
         total
     }
 }
-
-
