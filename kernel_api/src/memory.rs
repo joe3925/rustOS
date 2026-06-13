@@ -76,14 +76,5 @@ pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
 
 #[inline(always)]
 pub fn virt_to_phys(to_phys: VirtAddr) -> Option<(u64, PhysAddr)> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        return unsafe { kernel_sys::virt_to_phys(to_phys) };
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = to_phys;
-        None
-    }
+    unsafe { kernel_sys::virt_to_phys(to_phys) }
 }

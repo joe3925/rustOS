@@ -1,8 +1,6 @@
+use self::ApicErrors::{AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
+use crate::arch::drivers::timer_driver::set_num_cores;
 use crate::cpu::{self, get_cpu_info};
-use crate::drivers::interrupt_index::ApicErrors::{
-    AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
-};
-use crate::drivers::timer_driver::set_num_cores;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::machine::MachineInterruptInfo;
@@ -590,8 +588,8 @@ pub fn apic_logical_ids() -> Vec<u8> {
     ids.push(get_current_logical_id());
 
     if let Some(info) = crate::machine::machine_info().interrupt_info() {
-        for ap in info.application_processors.iter() {
-            let id = ap.local_apic_id as u8;
+        for processor in info.processors.iter() {
+            let id = processor.platform_cpu_id as u8;
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -810,9 +808,12 @@ impl ApicImpl {
             .interrupt_info()
             .ok_or(NoACPI)?
             .clone();
-        let lapic =
-            Lapic::new(PhysAddr::new(model.local_apic_address)).map_err(|_| BadInterruptModel)?;
-        let ioapic_info = model.io_apics.first().ok_or(BadInterruptModel)?;
+        let lapic = Lapic::new(PhysAddr::new(model.local_interrupt_controller_address))
+            .map_err(|_| BadInterruptModel)?;
+        let ioapic_info = model
+            .interrupt_controllers
+            .first()
+            .ok_or(BadInterruptModel)?;
         let ioapic =
             Ioapic::new(PhysAddr::new(ioapic_info.address)).map_err(|_| BadInterruptModel)?;
 
@@ -838,7 +839,7 @@ impl ApicImpl {
         let apic = ApicImpl::new()?;
 
         unsafe {
-            if apic.apic_info.also_has_legacy_pics {
+            if apic.apic_info.has_compatibility_interrupt_controllers {
                 PICS.lock().disable();
             }
 
@@ -863,7 +864,7 @@ impl ApicImpl {
     }
 
     pub fn start_aps(&self) {
-        let apics = &self.apic_info.application_processors;
+        let apics = &self.apic_info.processors;
 
         let ap_count = apics.len();
         set_num_cores(ap_count + 1);
@@ -988,7 +989,7 @@ impl ApicImpl {
             }
 
             unsafe {
-                let dst = IpiDest::ApicId(apic.local_apic_id as u8);
+                let dst = IpiDest::ApicId(apic.platform_cpu_id as u8);
                 let expected = AP_BOOTED.load(Ordering::SeqCst) + 1;
 
                 self.lapic.send_ipi(dst, IpiKind::InitAssert);
@@ -1017,8 +1018,8 @@ impl ApicImpl {
 
                 assert!(
                     wait_for_ap_booted(expected, Duration::from_millis(100)),
-                    "AP with local APIC id {} did not reach ap_startup",
-                    apic.local_apic_id
+                    "AP with platform CPU id {} did not reach ap_startup",
+                    apic.platform_cpu_id
                 );
             }
         }

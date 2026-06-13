@@ -1,7 +1,7 @@
 use crate::drivers::ACPI::{ACPIImpl, AcpiFirmware};
 use crate::memory::dma::PlatformIommuInfo;
 use crate::util::boot_info;
-use acpi::{AcpiTables, InterruptModel};
+use acpi::AcpiTables;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_types::fdt::FdtHeader;
@@ -21,9 +21,9 @@ pub struct MachineInfo {
 impl MachineInfo {
     fn discover() -> Self {
         let firmware = FirmwareResources::discover();
-        let interrupt_info = firmware
-            .acpi_tables()
-            .and_then(|tables| MachineInterruptInfo::from_acpi(tables.as_ref()));
+        let interrupt_info = firmware.acpi_tables().and_then(|tables| {
+            crate::arch::machine::discover_interrupt_info_from_acpi(tables.as_ref())
+        });
 
         Self {
             firmware,
@@ -78,53 +78,14 @@ impl FirmwareResources {
 
 #[derive(Debug, Clone)]
 pub struct MachineInterruptInfo {
-    pub local_apic_address: u64,
-    pub io_apics: Vec<MachineIoApicInfo>,
-    pub application_processors: Vec<MachineProcessorInfo>,
-    pub also_has_legacy_pics: bool,
-}
-
-impl MachineInterruptInfo {
-    fn from_acpi(tables: &AcpiTables<ACPIImpl>) -> Option<Self> {
-        let platform_info = tables.platform_info().ok()?;
-        let apic = match platform_info.interrupt_model {
-            InterruptModel::Apic(apic) => apic,
-            _ => return None,
-        };
-
-        let application_processors = platform_info
-            .processor_info
-            .map(|info| {
-                info.application_processors
-                    .iter()
-                    .map(|processor| MachineProcessorInfo {
-                        local_apic_id: processor.local_apic_id as u32,
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(Vec::new);
-
-        let io_apics = apic
-            .io_apics
-            .iter()
-            .map(|io_apic| MachineIoApicInfo {
-                id: io_apic.id,
-                address: io_apic.address as u64,
-                global_system_interrupt_base: io_apic.global_system_interrupt_base,
-            })
-            .collect();
-
-        Some(Self {
-            local_apic_address: apic.local_apic_address,
-            io_apics,
-            application_processors,
-            also_has_legacy_pics: apic.also_has_legacy_pics,
-        })
-    }
+    pub local_interrupt_controller_address: u64,
+    pub interrupt_controllers: Vec<MachineInterruptControllerInfo>,
+    pub processors: Vec<MachineProcessorInfo>,
+    pub has_compatibility_interrupt_controllers: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct MachineIoApicInfo {
+pub struct MachineInterruptControllerInfo {
     pub id: u8,
     pub address: u64,
     pub global_system_interrupt_base: u32,
@@ -132,5 +93,5 @@ pub struct MachineIoApicInfo {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MachineProcessorInfo {
-    pub local_apic_id: u32,
+    pub platform_cpu_id: u32,
 }

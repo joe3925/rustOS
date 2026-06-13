@@ -98,7 +98,7 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
             return Err(());
         }
 
-        // Inform firmware we are using APIC mode so _PRT returns GSIs
+        // Inform firmware we want global system interrupt routing from _PRT.
         if let Ok(pic_path) = AmlName::from_str("\\_PIC") {
             let args = ::aml::value::Args([
                 Some(::aml::value::AmlValue::Integer(1)),

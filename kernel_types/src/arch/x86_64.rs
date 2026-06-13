@@ -1,19 +1,10 @@
-use x86_64::registers::control::Cr3;
-
-use crate::arch::{AddressSpacePlatform, PhysAddr, Platform, PortIoPlatform};
+use crate::arch::{Platform, PortIoPlatform};
 use crate::port::PortAccess;
 
 pub struct X86Platform;
 
 impl Platform for X86Platform {
     const NAME: &'static str = "x86_64";
-}
-
-impl AddressSpacePlatform for X86Platform {
-    #[inline]
-    fn current_page_table_root() -> Option<PhysAddr> {
-        Some(PhysAddr::new(Cr3::read().0.start_address().as_u64()))
-    }
 }
 
 impl PortIoPlatform for X86Platform {

@@ -1,9 +1,9 @@
 use core::arch::asm;
 use core::fmt;
-use x86_64::VirtAddr;
 use x86_64::registers::rflags::RFlags;
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::structures::idt::InterruptStackFrame;
+use x86_64::VirtAddr;
 /// Scheduling state for a task - stored atomically outside the Task RwLock
 /// to allow lock-free checks in the scheduler hot path.
 #[repr(u8)]

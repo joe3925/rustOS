@@ -1,12 +1,12 @@
+use crate::arch::drivers::interrupt_index::IpiDest;
+use crate::arch::drivers::interrupt_index::IpiKind;
+use crate::arch::drivers::interrupt_index::LocalApic;
+use crate::arch::drivers::timer_driver::NUM_CORES;
 use crate::arch::MAX_CPUS;
-use crate::drivers::interrupt_index::IpiDest;
-use crate::drivers::interrupt_index::IpiKind;
-use crate::drivers::interrupt_index::LocalApic;
-use crate::drivers::timer_driver::NUM_CORES;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard, TLB_FLUSH_VECTOR};
 use crate::{
+    arch::drivers::interrupt_index::{current_cpu_id, send_eoi, APIC},
     cpu::get_cpu_info,
-    drivers::interrupt_index::{current_cpu_id, send_eoi, APIC},
     memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper},
     util::boot_info,
     KERNEL_INITIALIZED,

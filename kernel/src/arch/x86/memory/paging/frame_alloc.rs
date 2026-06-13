@@ -14,8 +14,8 @@ use kernel_abi::{MemoryRegion, MemoryRegionKind};
 use kernel_types::irq::IrqSafeRwLock;
 use spin::RwLock;
 use x86_64::{
-    PhysAddr,
     structures::paging::{FrameAllocator, PageSize, PhysFrame, Size1GiB, Size2MiB, Size4KiB},
+    PhysAddr,
 };
 
 const FRAME_SIZE: usize = 0x1000;

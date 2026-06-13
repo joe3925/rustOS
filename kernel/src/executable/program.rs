@@ -199,7 +199,7 @@ pub struct Program {
     pub main_thread: Option<TaskHandle>,
     pub managed_threads: Mutex<Vec<TaskHandle>>,
     pub modules: RwLock<Vec<ModuleHandle>>,
-    pub cr3: AddressSpaceRoot,
+    pub address_space_root: AddressSpaceRoot,
     pub tracker: Arc<RangeTracker>,
 
     pub handle_table: RwLock<HandleTable>,
@@ -216,7 +216,7 @@ impl Program {
         title: String,
         image_path: Path,
         image_base: VirtAddr,
-        cr3: AddressSpaceRoot,
+        address_space_root: AddressSpaceRoot,
         tracker: Arc<RangeTracker>,
     ) -> Self {
         let working_dir = image_path.parent().unwrap_or(image_path.clone());
@@ -229,7 +229,7 @@ impl Program {
             main_thread: None,
             managed_threads: Mutex::new(Vec::new()),
             modules: RwLock::new(Vec::new()),
-            cr3,
+            address_space_root,
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
             working_dir,
@@ -249,10 +249,10 @@ impl Program {
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
 
-        let old_cr3 = platform::current_address_space_root();
+        let old_address_space_root = platform::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            platform::switch_address_space_root(self.cr3);
+            platform::switch_address_space_root(self.address_space_root);
         });
 
         let res = (|| {
@@ -278,7 +278,7 @@ impl Program {
         })();
 
         unsafe {
-            platform::switch_address_space_root(old_cr3);
+            platform::switch_address_space_root(old_address_space_root);
         }
 
         res
@@ -287,8 +287,8 @@ impl Program {
         let start = virt_addr;
         let end = virt_addr + size as u64;
 
-        let old_cr3 = platform::current_address_space_root();
-        platform::switch_address_space_root(self.cr3);
+        let old_address_space_root = platform::current_address_space_root();
+        platform::switch_address_space_root(self.address_space_root);
 
         let result = (|| {
             let boot_info = boot_info();
@@ -313,7 +313,7 @@ impl Program {
             Ok(())
         })();
 
-        platform::switch_address_space_root(old_cr3);
+        platform::switch_address_space_root(old_address_space_root);
         result
     }
     pub fn virtual_map_auto_alloc(&self, size: usize) -> Result<VirtAddr, PageMapError> {
@@ -324,10 +324,10 @@ impl Program {
             .ok_or(PageMapError::NoMemory())?;
         let end = start + size as u64;
 
-        let old_cr3 = platform::current_address_space_root();
+        let old_address_space_root = platform::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            platform::switch_address_space_root(self.cr3);
+            platform::switch_address_space_root(self.address_space_root);
         });
 
         let boot_info = boot_info();
@@ -349,7 +349,7 @@ impl Program {
             )?;
         }
         unsafe {
-            platform::switch_address_space_root(old_cr3);
+            platform::switch_address_space_root(old_address_space_root);
         }
 
         Ok(start)

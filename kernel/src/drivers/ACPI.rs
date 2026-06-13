@@ -1,8 +1,7 @@
 use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
 use crate::util::boot_info;
 use acpi;
-use acpi::platform::interrupt::Apic;
-use acpi::{AcpiHandler, AcpiTables, InterruptModel, PhysicalMapping, PlatformInfo};
+use acpi::{AcpiHandler, AcpiTables, PhysicalMapping, PlatformInfo};
 use alloc::alloc::Global;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
@@ -16,7 +15,7 @@ pub struct Xsdp {
     pub checksum: u8,
     pub oem_id: [u8; 6],
     pub revision: u8,
-    pub rsdt_address: u32, // Deprecated since version 2.0
+    pub rsdt_address: u32, // todo: prob remove this
 
     pub length: u32,
     pub xsdt_address: u64,
@@ -38,13 +37,6 @@ impl AcpiFirmware {
         Some(AcpiFirmware { tables: arc_tab })
     }
 
-    pub fn get_interrupt_model(&self) -> Option<Apic<'_, Global>> {
-        let platform_info = self.tables.platform_info().ok()?;
-        match &platform_info.interrupt_model {
-            InterruptModel::Apic(apic) => Some(apic.clone()),
-            _ => None,
-        }
-    }
     pub fn get_plat_info(&self) -> Option<PlatformInfo<'_, Global>> {
         self.tables.platform_info().ok()
     }

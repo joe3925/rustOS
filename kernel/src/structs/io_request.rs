@@ -613,16 +613,16 @@ fn user_ptr_range_ok(addr: u64, bytes: usize) -> bool {
 }
 
 fn with_process_address_space<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
-    let process_cr3 = owner.read().cr3;
-    let old = platform::current_address_space_root();
+    let process_address_space_root = owner.read().address_space_root;
+    let old_address_space_root = platform::current_address_space_root();
 
     platform::with_interrupts_disabled(|| {
         unsafe {
-            platform::switch_address_space_root(process_cr3);
+            platform::switch_address_space_root(process_address_space_root);
         }
         let result = f();
         unsafe {
-            platform::switch_address_space_root(old);
+            platform::switch_address_space_root(old_address_space_root);
         }
         result
     })

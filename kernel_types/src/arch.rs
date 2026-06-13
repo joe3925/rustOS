@@ -14,10 +14,6 @@ pub trait Platform {
     const NAME: &'static str;
 }
 
-pub trait AddressSpacePlatform: Platform {
-    fn current_page_table_root() -> Option<PhysAddr>;
-}
-
 pub trait PortIoPlatform: Platform {
     unsafe fn read_port_u8(port: u16) -> u8;
     unsafe fn read_port_u16(port: u16) -> u16;
@@ -157,11 +153,6 @@ impl Not for PageFlags {
     fn not(self) -> Self::Output {
         Self(!self.0)
     }
-}
-
-#[inline]
-pub fn current_page_table_root() -> Option<PhysAddr> {
-    <ActivePlatform as AddressSpacePlatform>::current_page_table_root()
 }
 
 #[cfg(target_arch = "x86_64")]

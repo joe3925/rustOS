@@ -12,6 +12,149 @@ pub type IrqContextQuery = extern "C" fn() -> bool;
 pub type IrqInterruptsEnabled = extern "C" fn() -> bool;
 pub type IrqInterruptsSet = extern "C" fn();
 
+pub const MSI_REQUESTER_NONE: u32 = 0;
+pub const MSI_REQUESTER_PCI: u32 = 1;
+
+pub const MSI_TARGET_ANY: u32 = 0;
+pub const MSI_TARGET_PLATFORM_CPU: u32 = 1;
+
+pub const MSI_KIND_MSI: u32 = 0;
+pub const MSI_KIND_MSIX: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsiRequester {
+    pub kind: u32,
+    pub segment: u16,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub reserved0: u8,
+    pub requester_id: u16,
+}
+
+impl MsiRequester {
+    pub const fn none() -> Self {
+        Self {
+            kind: MSI_REQUESTER_NONE,
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+            reserved0: 0,
+            requester_id: 0,
+        }
+    }
+
+    pub const fn pci(segment: u16, bus: u8, device: u8, function: u8) -> Self {
+        Self {
+            kind: MSI_REQUESTER_PCI,
+            segment,
+            bus,
+            device,
+            function,
+            reserved0: 0,
+            requester_id: ((bus as u16) << 8) | ((device as u16) << 3) | function as u16,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsiTarget {
+    pub mode: u32,
+    pub platform_cpu_id: u32,
+}
+
+impl MsiTarget {
+    pub const fn any() -> Self {
+        Self {
+            mode: MSI_TARGET_ANY,
+            platform_cpu_id: 0,
+        }
+    }
+
+    pub const fn platform_cpu(platform_cpu_id: u32) -> Self {
+        Self {
+            mode: MSI_TARGET_PLATFORM_CPU,
+            platform_cpu_id,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsiMessage {
+    pub address: u64,
+    pub data: u32,
+    pub reserved0: u32,
+}
+
+impl MsiMessage {
+    pub const fn new(address: u64, data: u32) -> Self {
+        Self {
+            address,
+            data,
+            reserved0: 0,
+        }
+    }
+
+    pub const fn address_lo(self) -> u32 {
+        self.address as u32
+    }
+
+    pub const fn address_hi(self) -> u32 {
+        (self.address >> 32) as u32
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, kernel_macros::RequestPayload)]
+pub struct MsiRequest {
+    pub requester: MsiRequester,
+    pub target: MsiTarget,
+    pub vector: u8,
+    pub reserved0: u8,
+    pub table_index: u16,
+    pub kind: u32,
+    pub flags: u32,
+}
+
+impl MsiRequest {
+    pub const fn new(
+        requester: MsiRequester,
+        target: MsiTarget,
+        vector: u8,
+        kind: u32,
+        table_index: u16,
+    ) -> Self {
+        Self {
+            requester,
+            target,
+            vector,
+            reserved0: 0,
+            table_index,
+            kind,
+            flags: 0,
+        }
+    }
+
+    pub const fn pci_msix(vector: u8, target: MsiTarget, table_index: u16) -> Self {
+        Self::new(
+            MsiRequester::none(),
+            target,
+            vector,
+            MSI_KIND_MSIX,
+            table_index,
+        )
+    }
+
+    pub const fn with_requester(mut self, requester: MsiRequester) -> Self {
+        self.requester = requester;
+        self
+    }
+}
+
 static IRQ_CONTEXT_QUERY: AtomicUsize = AtomicUsize::new(0);
 static IRQ_INTERRUPTS_ENABLED: AtomicUsize = AtomicUsize::new(0);
 static IRQ_INTERRUPTS_DISABLE: AtomicUsize = AtomicUsize::new(0);

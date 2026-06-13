@@ -7,8 +7,8 @@ use kernel_api::kernel_types::dma::{
     IOBUFFER_PAGE_SIZE, IoBuffer, PhysFramed,
 };
 use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
-    unmap_range, VirtAddr,
+    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
+    deallocate_kernel_range, unmap_range,
 };
 
 const MAX_DMA_MAP_BYTES: usize = IOBUFFER_MAX_PAGE_CAPACITY * IOBUFFER_PAGE_SIZE;
@@ -91,11 +91,8 @@ impl ContiguousDmaRegion {
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, byte_len) };
             let buffer =
                 IoBuffer::<Described, Bidirectional>::from_slice_mut(buf).into_phys_framed();
-            let mapped = match dma::map_buffer(
-                device,
-                buffer,
-                DmaMappingStrategy::SingleContiguous,
-            ) {
+            let mapped = match dma::map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
+            {
                 Ok(mapped) => mapped,
                 Err(_) => {
                     region.destroy();
@@ -177,4 +174,3 @@ impl Drop for ContiguousDmaRegion {
         self.destroy();
     }
 }
-

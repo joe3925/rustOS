@@ -1,11 +1,11 @@
 extern crate rand_xoshiro;
 
+use crate::arch::VirtAddr;
 use crate::benchmarking::BenchWindow;
 use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::drivers::timer_driver::NUM_CORES;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
 use crate::file_system::file_provider::{install_file_provider, ProviderKind};
@@ -20,14 +20,14 @@ use crate::memory::paging::frame_alloc::{
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
-use crate::platform::{current_cpu_id, CpuPlatform, TimerPlatform};
+use crate::platform::{current_cpu_id, cycle_counter};
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
-use crate::{cpu, println, BOOT_INFO, BOOT_INFO_INITIALIZED};
+use crate::{println, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -46,10 +46,6 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
-#[cfg(target_arch = "x86_64")]
-use x86_64::structures::idt::InterruptDescriptorTable;
-#[cfg(target_arch = "x86_64")]
-use x86_64::VirtAddr;
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
@@ -137,20 +133,18 @@ pub unsafe fn init() {
         crate::platform::init_boot_processor();
         init_dma_manager();
         init_iommu();
-        crate::platform::ActivePlatform::calibrate_boot_timer();
+        crate::platform::calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
-        crate::platform::ActivePlatform::start_secondary_cpus();
+        crate::platform::start_secondary_cpus();
     }
 
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {
         core::hint::spin_loop();
     }
 
-    crate::platform::ActivePlatform::init_current_cpu_local_state(
-        CPU_ID.fetch_add(1, Ordering::Acquire) as u32,
-    );
+    crate::platform::init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
 
-    crate::platform::ActivePlatform::init_periodic_timer();
+    crate::platform::init_periodic_timer();
     SCHEDULER.init_core(current_cpu_id());
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
@@ -174,7 +168,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         boot_usable_bytes()
     ));
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
+    GlobalAsyncExecutor::global().init(max(4, crate::platform::processor_count()), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let mut program = Program::new(
@@ -324,34 +318,12 @@ pub extern "C" fn trigger_stack_overflow() {
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn trigger_triple_fault() -> ! {
-    #[cfg(target_arch = "x86_64")]
-    {
-        static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
-
-        crate::platform::disable_interrupts();
-        unsafe {
-            EMPTY_IDT.load();
-            asm!("ud2", options(noreturn));
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        crate::platform::disable_interrupts();
-        loop {
-            core::hint::spin_loop()
-        }
-    }
+    crate::platform::disable_interrupts();
+    crate::arch::instructions::triple_fault()
 }
 
 pub fn trigger_breakpoint() {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        asm!("int 3");
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // No-op or trigger other architecture breakpoint
-    }
+    crate::arch::instructions::breakpoint();
 }
 
 pub fn test_full_heap() {
@@ -376,7 +348,7 @@ pub fn test_full_heap() {
 }
 
 pub extern "C" fn random_number() -> u64 {
-    let mut rng = Random::new(cpu::get_cycles());
+    let mut rng = Random::new(cycle_counter());
     rng.next_u64()
 }
 

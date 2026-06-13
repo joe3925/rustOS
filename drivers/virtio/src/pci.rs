@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
-use kernel_api::memory::{map_mmio_region, PhysAddr, VirtAddr};
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region};
 use kernel_api::pnp::ResourceKind;
 
 /// Volatile reads/writes that remain defined on unaligned PCI/virtio registers.
@@ -87,7 +87,7 @@ pub fn find_config_space(resources: &[PciResource]) -> Option<(u64, u64)> {
     None
 }
 
-/// Find a GSI from the resource blob (preferred over legacy IRQ lines).
+/// Find a GSI from the resource blob (preferred over interrupt line resources).
 pub fn find_gsi(resources: &[PciResource]) -> Option<u16> {
     for r in resources {
         if r.kind == ResourceKind::Gsi as u32 {
@@ -97,8 +97,8 @@ pub fn find_gsi(resources: &[PciResource]) -> Option<u16> {
     None
 }
 
-/// Find the legacy IRQ line from the resource blob.
-pub fn find_legacy_irq_line(resources: &[PciResource]) -> Option<u8> {
+/// Find the IRQ line from the resource blob.
+pub fn find_interrupt_line(resources: &[PciResource]) -> Option<u8> {
     for r in resources {
         if r.kind == ResourceKind::Interrupt as u32 {
             return Some(r.start as u8);

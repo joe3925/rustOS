@@ -44,7 +44,7 @@ impl BlockOnThreadState {
 #[repr(C)]
 pub struct Stopwatch {
     start_cycles: u64,
-    tsc_hz: u64,
+    cycle_counter_frequency_hz: u64,
 }
 
 impl Stopwatch {
@@ -54,7 +54,7 @@ impl Stopwatch {
     }
 
     #[inline(always)]
-    pub fn tsc_hz(&self) -> u64 {
-        self.tsc_hz
+    pub fn cycle_counter_frequency_hz(&self) -> u64 {
+        self.cycle_counter_frequency_hz
     }
 }

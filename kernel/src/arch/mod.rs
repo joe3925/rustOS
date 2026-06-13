@@ -11,10 +11,13 @@ pub use x86::{cpu, drivers, exception_handlers, gdt, idt, memory, syscalls};
 pub(crate) use x86::scheduling;
 
 #[cfg(target_arch = "x86_64")]
+pub(crate) use x86::machine;
+
+#[cfg(target_arch = "x86_64")]
 pub use x86::{PhysAddr, VirtAddr};
 
 #[cfg(target_arch = "x86_64")]
-pub use x86::{PageFlags, align_up, control, idt_types, instructions, interrupts, paging};
+pub use x86::{align_up, control, idt_types, instructions, interrupts, paging, PageFlags};
 
 #[cfg(target_arch = "x86_64")]
 pub use x86::MAX_CPUS;

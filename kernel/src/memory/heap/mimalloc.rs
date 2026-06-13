@@ -1,9 +1,9 @@
-use crate::cpu;
 use crate::memory::heap::{
     mimalloc_arena_size, mimalloc_heap_end, MIMALLOC_ARENA_START, MIMALLOC_HEAP_START,
     MIMALLOC_OS_HEAP_SIZE,
 };
 use crate::memory::paging::paging::unmap_range_unchecked;
+use crate::platform;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
 use alloc::vec::Vec;
@@ -291,7 +291,7 @@ pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) ->
 #[inline(always)]
 fn mimalloc_stats_start() -> u64 {
     if MIMALLOC_STATS_ENABLED {
-        cpu::get_cycles()
+        platform::cycle_counter()
     } else {
         0
     }
@@ -303,7 +303,7 @@ fn mimalloc_record_alloc(size: usize, start: u64) {
         return;
     }
 
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_ALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
     MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
@@ -315,7 +315,7 @@ fn mimalloc_record_dealloc(size: usize, start: u64) {
         return;
     }
 
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_DEALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
     MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
@@ -327,7 +327,7 @@ fn mimalloc_record_realloc(old_size: usize, new_size: usize, start: u64) {
         return;
     }
 
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_REALLOC_OLD_BYTES.fetch_add(old_size, Ordering::Relaxed);
     MIMALLOC_REALLOC_NEW_BYTES.fetch_add(new_size, Ordering::Relaxed);
@@ -765,7 +765,10 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
 #[inline(always)]
 fn mimalloc_record_commit_cycles(start: u64) {
     if MIMALLOC_STATS_ENABLED {
-        MIMALLOC_COMMIT_CYCLES.fetch_add(cpu::get_cycles().wrapping_sub(start), Ordering::Relaxed);
+        MIMALLOC_COMMIT_CYCLES.fetch_add(
+            platform::cycle_counter().wrapping_sub(start),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -811,8 +814,8 @@ pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
 
 #[no_mangle]
 pub extern "C" fn rustos_mi_clock_now() -> u64 {
-    let cycles = crate::cpu::get_cycles();
-    let hz = crate::drivers::interrupt_index::TSC_HZ.load(Ordering::Relaxed);
+    let cycles = platform::cycle_counter();
+    let hz = platform::cycle_counter_frequency_hz();
     if hz == 0 {
         cycles
     } else {
@@ -826,7 +829,7 @@ pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> b
         return false;
     }
 
-    let mut state = crate::cpu::get_cycles()
+    let mut state = platform::cycle_counter()
         ^ (buf as u64).rotate_left(17)
         ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let bytes = core::slice::from_raw_parts_mut(buf.cast::<u8>(), len);

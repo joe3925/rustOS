@@ -1,14 +1,14 @@
 use kernel_sys::{
     irq_handle_get_user_ctx, irq_handle_is_closed, irq_handle_set_user_ctx, irq_handle_unregister,
-    irq_handle_wait_ffi, kernel_apic_cpu_ids, kernel_irq_alloc_vector,
-    kernel_irq_borrowed_ensure_signal, kernel_irq_borrowed_signal, kernel_irq_borrowed_signal_all,
-    kernel_irq_borrowed_signal_n, kernel_irq_free_vector, kernel_irq_register,
+    irq_handle_wait_ffi, kernel_irq_alloc_vector, kernel_irq_borrowed_ensure_signal,
+    kernel_irq_borrowed_signal, kernel_irq_borrowed_signal_all, kernel_irq_borrowed_signal_n,
+    kernel_irq_compose_msi_message, kernel_irq_free_vector, kernel_irq_register,
     kernel_irq_register_gsi, kernel_platform_cpu_ids,
 };
 use kernel_types::irq::IRQ_RESCUE_WAKEUP;
 pub use kernel_types::irq::{
-    IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta,
-    IrqWaitResult,
+    IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult, MsiMessage, MsiRequest,
+    MsiRequester, MsiTarget, IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK,
 };
 
 use kernel_types::async_ffi::FfiFuture;
@@ -90,27 +90,45 @@ impl IrqBorrowedHandleExt for IrqBorrowedHandle {
 pub fn irq_register_isr(vector: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
     let h = unsafe { kernel_irq_register(vector, isr, ctx) };
 
-    if h.is_closed() { None } else { Some(h) }
+    if h.is_closed() {
+        None
+    } else {
+        Some(h)
+    }
 }
 
 pub fn irq_register_isr_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
     let h = unsafe { kernel_irq_register_gsi(gsi, isr, ctx) };
 
-    if h.is_closed() { None } else { Some(h) }
+    if h.is_closed() {
+        None
+    } else {
+        Some(h)
+    }
 }
 
 pub fn irq_alloc_vector() -> Option<u8> {
     let v = unsafe { kernel_irq_alloc_vector() };
 
-    if v < 0 { None } else { Some(v as u8) }
+    if v < 0 {
+        None
+    } else {
+        Some(v as u8)
+    }
 }
 
 pub fn irq_free_vector(vector: u8) -> bool {
     unsafe { kernel_irq_free_vector(vector) }
 }
 
-pub fn apic_cpu_ids() -> alloc::vec::Vec<u8> {
-    unsafe { kernel_apic_cpu_ids() }
+pub fn irq_compose_msi_message(request: &MsiRequest) -> Option<MsiMessage> {
+    let mut message = MsiMessage::default();
+
+    if unsafe { kernel_irq_compose_msi_message(request, &mut message) } {
+        Some(message)
+    } else {
+        None
+    }
 }
 
 pub fn platform_cpu_ids() -> alloc::vec::Vec<u8> {

@@ -1,13 +1,5 @@
 use crate::arch::scheduling::idle_task;
 use crate::arch::MAX_CPUS;
-use crate::cpu;
-use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
-use crate::drivers::interrupt_index::LocalApic;
-use crate::drivers::interrupt_index::{
-    current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, APIC,
-};
-use crate::drivers::timer_driver::NUM_CORES;
-use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
@@ -48,7 +40,7 @@ pub struct KernelFpuGuard {
 impl KernelFpuGuard {
     #[inline(always)]
     pub fn new() -> Self {
-        let cpu_id = current_cpu_id();
+        let cpu_id = platform::current_cpu_id();
         let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
             {
                 let mut guard = task.inner.try_write().expect(
@@ -70,7 +62,7 @@ impl Drop for KernelFpuGuard {
     fn drop(&mut self) {
         self.saved_task.take();
 
-        let cpu_id = current_cpu_id();
+        let cpu_id = platform::current_cpu_id();
         if let Some(current) = SCHEDULER.get_current_task(cpu_id) {
             let mut guard = current
                 .inner
@@ -85,7 +77,7 @@ pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
     idle_task: TaskHandle,
     current: CurrentTask,
-    lapic_id: u8,
+    platform_cpu_id: usize,
 }
 
 struct SchedulerState {
@@ -110,9 +102,8 @@ impl Scheduler {
             all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
             cores: IrqSafeRwLock::new(Vec::new()),
             domains: DomainMaster::new(
-                alloc::vec![build_fifo_domain(NUM_CORES.load(Ordering::Relaxed))]
-                    .into_boxed_slice(),
-                NUM_CORES.load(Ordering::Relaxed),
+                alloc::vec![build_fifo_domain(platform::processor_count())].into_boxed_slice(),
+                platform::processor_count(),
             ),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
@@ -126,7 +117,7 @@ impl Scheduler {
     }
 
     #[inline(always)]
-    fn build_core(&self, cpu_id: usize, lapic_id: u8) -> Arc<CoreScheduler> {
+    fn build_core(&self, cpu_id: usize, platform_cpu_id: usize) -> Arc<CoreScheduler> {
         let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
 
         idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
@@ -139,7 +130,7 @@ impl Scheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
             idle_task: idle.clone(),
             current: CurrentTask::new(&idle),
-            lapic_id,
+            platform_cpu_id,
         })
     }
 
@@ -163,13 +154,13 @@ impl Scheduler {
             MAX_CPUS
         );
 
-        let lapic_id = get_current_logical_id();
-        cores.push(self.build_core(cpu_id, lapic_id));
+        let platform_cpu_id = platform::current_logical_id();
+        cores.push(self.build_core(cpu_id, platform_cpu_id));
         self.num_cores.store(cores.len(), Ordering::Release);
     }
 
     fn register_task(&self, task: TaskHandle) -> u64 {
-        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+        if platform::current_is_in_interrupt() {
             panic!("attempted to register task from interrupt context");
         }
 
@@ -192,7 +183,7 @@ impl Scheduler {
     }
 
     fn register_task_no_reap(&self, task: TaskHandle) -> u64 {
-        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+        if platform::current_is_in_interrupt() {
             panic!("attempted to register task from interrupt context");
         }
 
@@ -207,7 +198,7 @@ impl Scheduler {
 
     #[inline(always)]
     pub fn reap_retired_tasks(&self) {
-        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+        if platform::current_is_in_interrupt() {
             return;
         }
 
@@ -236,42 +227,12 @@ impl Scheduler {
     }
 
     pub(crate) fn kick_remote_core(&self, cpu: usize) {
-        if cpu == current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+        if cpu == platform::current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return;
         }
 
         if let Some(core) = self.core(cpu) {
-            let in_interrupt = current_is_in_interrupt_atomic().load(Ordering::Acquire);
-
-            if in_interrupt {
-                let Some(apic) = APIC.try_lock() else {
-                    return;
-                };
-
-                if let Some(a) = apic.as_ref() {
-                    unsafe {
-                        a.lapic.send_ipi(
-                            IpiDest::ApicId(core.lapic_id),
-                            IpiKind::Fixed {
-                                vector: SCHED_IPI_VECTOR,
-                            },
-                        )
-                    }
-                }
-
-                return;
-            }
-
-            unsafe {
-                if let Some(a) = APIC.lock().as_ref() {
-                    a.lapic.send_ipi(
-                        IpiDest::ApicId(core.lapic_id),
-                        IpiKind::Fixed {
-                            vector: SCHED_IPI_VECTOR,
-                        },
-                    )
-                }
-            }
+            let _ = platform::send_ipi(core.platform_cpu_id, SCHED_IPI_VECTOR);
         }
     }
 
@@ -310,7 +271,11 @@ impl Scheduler {
         }
 
         if task.sched_state() == SchedState::Blocked {
-            self.commit_pending_migration(&task, current_cpu_id(), cpu::get_cycles());
+            self.commit_pending_migration(
+                &task,
+                platform::current_cpu_id(),
+                platform::cycle_counter(),
+            );
         }
 
         Ok(())
@@ -324,7 +289,7 @@ impl Scheduler {
             return;
         }
 
-        let in_interrupt = current_is_in_interrupt_atomic().load(Ordering::Acquire);
+        let in_interrupt = platform::current_is_in_interrupt();
         let mut spins: u32 = 0;
 
         loop {
@@ -339,7 +304,11 @@ impl Scheduler {
 
                     let hint_cpu = task.target_cpu();
                     if task.has_pending_sched_binding() && !in_interrupt {
-                        self.commit_pending_migration(task, current_cpu_id(), cpu::get_cycles());
+                        self.commit_pending_migration(
+                            task,
+                            platform::current_cpu_id(),
+                            platform::cycle_counter(),
+                        );
                     }
 
                     let domain = self.domains.get(task.domain_id());
@@ -372,7 +341,7 @@ impl Scheduler {
             panic!("Attempt to park with interrupts disabled, this will always cause a deadlock");
         }
 
-        let cpu_id = current_cpu_id();
+        let cpu_id = platform::current_cpu_id();
         let Some(core) = self.core(cpu_id) else {
             return;
         };
@@ -416,7 +385,7 @@ impl Scheduler {
             return None;
         };
 
-        let now_cycles = cpu::get_cycles();
+        let now_cycles = platform::cycle_counter();
 
         let mut prev_task = None;
 
@@ -638,7 +607,7 @@ impl Scheduler {
         let pid = task_handle.inner.read().parent_pid;
 
         if let Some(program) = PROGRAM_MANAGER.get(pid) {
-            unsafe { platform::switch_address_space_root(program.read().cr3) };
+            unsafe { platform::switch_address_space_root(program.read().address_space_root) };
         } else {
             let id = task_handle.task_id();
             let _ = self.delete_task(id);
@@ -657,7 +626,7 @@ impl Scheduler {
     }
 
     pub fn maybe_balance(&self) {
-        let current_tick = TIMER.load(Ordering::Relaxed);
+        let current_tick = platform::timer_tick_count();
         self.domains.maybe_balance(current_tick);
     }
 
@@ -712,16 +681,16 @@ impl Scheduler {
         };
 
         if !is_idle {
-            send_eoi(SCHED_IPI_VECTOR);
+            platform::end_interrupt(SCHED_IPI_VECTOR);
             return;
         }
 
-        let now_cycles = cpu::get_cycles();
+        let now_cycles = platform::cycle_counter();
 
         let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(t) => t,
             None => {
-                send_eoi(SCHED_IPI_VECTOR);
+                platform::end_interrupt(SCHED_IPI_VECTOR);
                 return;
             }
         };
@@ -729,7 +698,7 @@ impl Scheduler {
         self.restore_page_table(&next);
         self.restore_thread_local_storage(&next);
 
-        send_eoi(SCHED_IPI_VECTOR);
+        platform::end_interrupt(SCHED_IPI_VECTOR);
 
         let ctx_guard = next.inner.read();
         unsafe { ctx_guard.context.restore(state) };
@@ -742,15 +711,15 @@ pub extern "C" fn ipi_handler_c(state: *mut State) {
         return;
     }
 
-    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
-        send_eoi(SCHED_IPI_VECTOR);
+    if platform::current_is_in_interrupt() {
+        platform::end_interrupt(SCHED_IPI_VECTOR);
         return;
     }
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
-    let cpu_id = current_cpu_id();
+    let cpu_id = platform::current_cpu_id();
 
     SCHEDULER.on_ipi(state, cpu_id);
 }
@@ -761,28 +730,30 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
         return;
     }
 
-    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+    if platform::current_is_in_interrupt() {
         return;
     }
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
-    let cpu_id = current_cpu_id();
+    let cpu_id = platform::current_cpu_id();
 
     SCHEDULER.on_timer_tick(state, cpu_id);
 }
 
 #[no_mangle]
 pub extern "C" fn ipi_eoi_only() {
-    crate::drivers::interrupt_index::send_eoi(SCHED_IPI_VECTOR);
+    platform::end_interrupt(SCHED_IPI_VECTOR);
 }
 
 pub extern "C" fn kernel_task_end() -> ! {
     crate::memory::heap::mimalloc_thread_done();
 
     platform::with_interrupts_disabled(|| {
-        let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
+        let task = SCHEDULER
+            .get_current_task(platform::current_cpu_id())
+            .unwrap();
         task.terminate();
     });
 

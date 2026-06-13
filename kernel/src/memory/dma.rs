@@ -23,15 +23,6 @@
 // - Decide whether to use `IommuDomain.mappings` for validation/accounting, or remove it
 //   if state is fully managed by `pending_unmaps`.
 //
-// Test coverage:
-// - Add unit/integration tests for all mapping strategies with:
-//   - aligned/unaligned buffers
-//   - multi-page and max-inline-page cases
-//   - fragmentation-heavy identity scenarios
-//   - map failure rollback correctness
-//   - unregister while mappings are live
-// - Add backend-specific tests for Intel VT-d and AMD-Vi invalidation behavior.
-//
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::drivers::ACPI::ACPIImpl;
 use acpi::sdt::{SdtHeader, Signature};

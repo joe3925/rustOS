@@ -191,19 +191,19 @@ impl PELoader {
             return Err(LoadError::Not64Bit);
         }
 
-        let new_cr3 = program.cr3;
-        let old_cr3 = platform::current_address_space_root();
+        let new_address_space_root = program.address_space_root;
+        let old_address_space_root = platform::current_address_space_root();
 
         let (handle, _exports, _image_size) = {
-            unsafe { platform::switch_address_space_root(new_cr3) };
+            unsafe { platform::switch_address_space_root(new_address_space_root) };
             let r = self.map_into_program(program);
-            unsafe { platform::switch_address_space_root(old_cr3) };
+            unsafe { platform::switch_address_space_root(old_address_space_root) };
             r?
         };
 
-        unsafe { platform::switch_address_space_root(new_cr3) };
+        unsafe { platform::switch_address_space_root(new_address_space_root) };
         let r = self.patch_imports_sync(program);
-        unsafe { platform::switch_address_space_root(old_cr3) };
+        unsafe { platform::switch_address_space_root(old_address_space_root) };
         r?;
 
         Ok(handle)
@@ -250,7 +250,7 @@ impl PELoader {
         let image_size = opt_hdr.windows_fields.size_of_image as u64;
 
         let new_frame = PhysFrame::containing_address(table_phys);
-        let old_cr3 = platform::current_address_space_root();
+        let old_address_space_root = platform::current_address_space_root();
 
         unsafe { platform::switch_address_space_root(new_frame) };
 
@@ -309,7 +309,7 @@ impl PELoader {
         let _ = self.resolve_imports(&mut program).await;
         let _ = self.patch_imports(&mut program);
 
-        unsafe { platform::switch_address_space_root(old_cr3) };
+        unsafe { platform::switch_address_space_root(old_address_space_root) };
 
         let pid = PROGRAM_MANAGER.add_program(program);
         {

@@ -18,8 +18,12 @@ use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
     DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
 };
-use kernel_types::irq::{DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
+use kernel_types::irq::{
+    DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult, MsiMessage,
+    MsiRequest,
+};
 use kernel_types::object_manager::OmError;
+use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
 
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
@@ -46,9 +50,10 @@ unsafe extern "C" {
     pub fn get_device_tree_blob() -> Option<*const FdtHeader>;
     pub unsafe fn get_current_cpu_id() -> usize;
     pub unsafe fn get_current_platform_cpu_id() -> usize;
-    pub unsafe fn get_current_lapic_id() -> usize;
     pub fn stopwatch_new() -> Stopwatch;
     pub fn elapsed(s: &Stopwatch) -> Duration;
+    pub fn kernel_cycle_counter() -> u64;
+    pub fn kernel_cycle_counter_frequency_hz() -> u64;
     // Tasking
     pub fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
@@ -78,6 +83,11 @@ unsafe extern "C" {
     pub fn irq_handle_wait_ffi(h: &IrqHandle, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
     pub fn kernel_irq_alloc_vector() -> i32;
     pub fn kernel_irq_free_vector(vector: u8) -> bool;
+    pub fn kernel_irq_compose_msi_message(request: &MsiRequest, out: &mut MsiMessage) -> bool;
+
+    // PCI platform config access
+    pub fn kernel_pci_read_config_u32(address: PciConfigAddress, out: &mut u32) -> bool;
+    pub fn kernel_pci_write_config_u32(address: PciConfigAddress, value: u32) -> bool;
 
     // DMA / IOMMU
     pub fn kernel_dma_register_pci_pdo(
@@ -226,7 +236,6 @@ unsafe extern "C" {
 
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
     pub fn kernel_platform_cpu_ids() -> Vec<u8>;
-    pub fn kernel_apic_cpu_ids() -> Vec<u8>;
 
     // Bench (drivers)
     pub fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle;

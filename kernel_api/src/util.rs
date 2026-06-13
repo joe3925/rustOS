@@ -21,8 +21,8 @@ pub fn get_current_cpu_id() -> usize {
     unsafe { kernel_sys::get_current_cpu_id() }
 }
 #[inline]
-pub fn get_current_lapic_id() -> usize {
-    unsafe { kernel_sys::get_current_lapic_id() }
+pub fn get_current_platform_cpu_id() -> usize {
+    unsafe { kernel_sys::get_current_platform_cpu_id() }
 }
 #[inline]
 pub fn panic_common(mod_name: &'static str, info: &core::panic::PanicInfo) -> ! {

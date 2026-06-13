@@ -14,7 +14,6 @@ use crate::{
     },
     console::CONSOLE,
     drivers::{
-        interrupt_index::{self, current_cpu_id, get_current_logical_id},
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
         ACPI::ACPIImpl,
     },
@@ -27,10 +26,7 @@ use crate::{
         irq_borrowed_signal_n, irq_free_vector, irq_register, irq_register_gsi, irq_signal,
         irq_signal_all, irq_signal_exactly, irq_signal_n,
     },
-    memory::{
-        dma,
-        paging::{mmio, stack::StackSize},
-    },
+    memory::{dma, paging::stack::StackSize},
     registry::reg,
     scheduling::{
         self,
@@ -66,7 +62,8 @@ use kernel_types::{
     fdt::FdtHeader,
     fs::{OpenFlags, Path},
     io::IoTarget,
-    irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta},
+    irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, MsiMessage, MsiRequest},
+    pci::PciConfigAddress,
     pnp::{DeviceIds, DeviceRelationType},
     request::{DeviceControl, RequestHandle, RequestKind},
     runtime::BlockOnThreadState,
@@ -87,10 +84,6 @@ pub unsafe extern "C" fn park_self_and_yield() {
 }
 pub extern "C" fn get_current_platform_cpu_id() -> usize {
     crate::platform::current_logical_id()
-}
-
-pub extern "C" fn get_current_lapic_id() -> usize {
-    get_current_platform_cpu_id()
 }
 
 pub extern "C" fn wake_task(id: u64) {
@@ -134,6 +127,37 @@ pub extern "C" fn kernel_irq_alloc_vector() -> i32 {
 pub extern "C" fn kernel_irq_free_vector(vector: u8) -> bool {
     irq_free_vector(vector)
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_irq_compose_msi_message(
+    request: &MsiRequest,
+    out: &mut MsiMessage,
+) -> bool {
+    match crate::platform::compose_msi_message(request) {
+        Some(message) => {
+            *out = message;
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_pci_read_config_u32(address: PciConfigAddress, out: &mut u32) -> bool {
+    match crate::platform::read_pci_config_u32(address) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_pci_write_config_u32(address: PciConfigAddress, value: u32) -> bool {
+    crate::platform::write_pci_config_u32(address, value)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
     unsafe {
@@ -222,11 +246,6 @@ pub extern "C" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
 pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
     crate::platform::cpu_topology_ids()
 }
-
-#[no_mangle]
-pub extern "C" fn kernel_apic_cpu_ids() -> Vec<u8> {
-    kernel_platform_cpu_ids()
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
     CONSOLE.lock().print(str.as_bytes());
@@ -246,6 +265,14 @@ pub extern "C" fn stopwatch_new() -> Stopwatch {
 #[unsafe(no_mangle)]
 pub extern "C" fn elapsed(s: &Stopwatch) -> Duration {
     s.elapsed()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_cycle_counter() -> u64 {
+    crate::platform::cycle_counter()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_cycle_counter_frequency_hz() -> u64 {
+    crate::platform::cycle_counter_frequency_hz()
 }
 #[no_mangle]
 pub extern "C" fn file_open(
@@ -805,8 +832,7 @@ pub extern "C" fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageFlags,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped(size, flags.into())
-        .map(Into::into)
+    crate::platform::allocate_auto_kernel_range_mapped(size, flags)
 }
 
 #[no_mangle]
@@ -814,11 +840,7 @@ pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
     size: u64,
     flags: PageFlags,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous(
-        size,
-        flags.into(),
-    )
-    .map(Into::into)
+    crate::platform::allocate_auto_kernel_range_mapped_contiguous(size, flags)
 }
 
 #[no_mangle]
@@ -827,25 +849,22 @@ pub extern "C" fn allocate_kernel_range_mapped(
     size: u64,
     flags: PageFlags,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    crate::memory::paging::virt_tracker::allocate_kernel_range_mapped(base, size, flags.into())
-        .map(Into::into)
+    crate::platform::allocate_kernel_range_mapped(base, size, flags)
 }
 
 #[no_mangle]
 pub extern "C" fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64) {
-    crate::memory::paging::virt_tracker::deallocate_kernel_range(addr.into(), size)
+    crate::platform::deallocate_kernel_range(addr, size)
 }
 
 #[no_mangle]
 pub extern "C" fn unmap_range(virtual_addr: AbiVirtAddr, size: u64) {
-    crate::memory::paging::virt_tracker::unmap_range(virtual_addr.into(), size)
+    crate::platform::unmap_range(virtual_addr, size)
 }
 
 #[no_mangle]
 pub extern "C" fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
-    let _ = unsafe {
-        crate::memory::paging::paging::identity_map_page(frame_addr.into(), 0x1000, flags.into())
-    };
+    crate::platform::identity_map_page(frame_addr, flags);
 }
 
 #[no_mangle]
@@ -854,23 +873,22 @@ pub extern "C" fn map_physical_pages(
     size: u64,
     cache: kernel_types::memory::PhysicalMappingCache,
 ) -> Result<AbiVirtAddr, PageMapError> {
-    mmio::map_physical_pages(phys.into(), size, cache).map(Into::into)
+    crate::platform::map_physical_pages(phys, size, cache)
 }
 
 #[no_mangle]
 pub extern "C" fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
-    mmio::unmap_physical_pages(base.into(), size)
+    crate::platform::unmap_physical_pages(base, size)
 }
 
 #[no_mangle]
 pub extern "C" fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-    crate::memory::paging::tables::virt_to_phys(addr.into()).map(|(size, phys)| (size, phys.into()))
+    crate::platform::virt_to_phys(addr)
 }
 
 #[no_mangle]
 pub extern "C" fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
-    crate::memory::paging::tables::resolve_virtual_range_frame(addr.into())
-        .map(|(size, phys)| (size, phys.into()))
+    crate::platform::resolve_virtual_range_frame(addr)
 }
 
 // ============================================================================

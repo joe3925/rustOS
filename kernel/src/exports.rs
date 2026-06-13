@@ -17,6 +17,8 @@ export! {
     wait_duration,
     elapsed,
     stopwatch_new,
+    kernel_cycle_counter,
+    kernel_cycle_counter_frequency_hz,
     create_kernel_task,
     kill_kernel_task_by_id,
     park_self_and_yield,
@@ -42,7 +44,6 @@ export! {
     resolve_virtual_range_frame,
     get_current_cpu_id,
     get_current_platform_cpu_id,
-    get_current_lapic_id,
 
     kernel_alloc,
     kernel_free,
@@ -123,7 +124,9 @@ export! {
     bench_kernel_window_create,
 
     kernel_platform_cpu_ids,
-    kernel_apic_cpu_ids,
+    kernel_irq_compose_msi_message,
+    kernel_pci_read_config_u32,
+    kernel_pci_write_config_u32,
 
     routing_resolve_path_to_device,
     routing_get_stack_top_from_weak,

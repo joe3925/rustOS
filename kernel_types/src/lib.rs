@@ -28,6 +28,7 @@ pub mod io;
 pub mod irq;
 pub mod memory;
 pub mod object_manager;
+pub mod pci;
 pub mod pnp;
 pub mod port;
 pub mod request;

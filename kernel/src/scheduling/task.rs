@@ -1,11 +1,10 @@
 use crate::arch::paging::PageTableFlags;
 use crate::arch::scheduling::task_return_trampoline;
 use crate::arch::VirtAddr;
-use crate::cpu::get_cpu_info;
-use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
+use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
 use crate::scheduling::scheduler::default_task_sched_binding;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
@@ -357,10 +356,8 @@ impl Task {
         sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
-        let cpu_id = get_cpu_info()
-            .get_feature_info()
-            .expect("NO CPUID")
-            .initial_local_apic_id();
+        let cpu_id = platform::current_cpu_id();
+        let platform_cpu_id = platform::current_logical_id();
 
         let stack_top = stack_pointer.as_u64();
         let guard_page = initial_guard_page(stack_top, stack_size);
@@ -375,7 +372,7 @@ impl Task {
             *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
         }
 
-        let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
+        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
         state.cs = selectors.user_code_selector.0 as u64 | 3;
         state.ss = selectors.user_data_selector.0 as u64 | 3;
 
@@ -399,7 +396,7 @@ impl Task {
         Arc::new(TaskRef {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
-            target_cpu: AtomicUsize::new(cpu_id as usize),
+            target_cpu: AtomicUsize::new(cpu_id),
             permit: AtomicU8::new(0),
             block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
@@ -443,10 +440,8 @@ impl Task {
         sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
-        let cpu_id = get_cpu_info()
-            .get_feature_info()
-            .expect("NO CPUID")
-            .initial_local_apic_id();
+        let cpu_id = platform::current_cpu_id();
+        let platform_cpu_id = platform::current_logical_id();
 
         let stack_top = allocate_kernel_stack(stack_size).expect("Failed to allocate stack");
         let stack_top_u64 = stack_top.as_u64();
@@ -462,7 +457,7 @@ impl Task {
             *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
         }
 
-        let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
+        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
         state.cs = selectors.kernel_code_selector.0 as u64;
         state.ss = selectors.kernel_data_selector.0 as u64;
 
@@ -489,7 +484,7 @@ impl Task {
         Arc::new(TaskRef {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
-            target_cpu: AtomicUsize::new(cpu_id as usize),
+            target_cpu: AtomicUsize::new(cpu_id),
             permit: AtomicU8::new(0),
             block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
@@ -915,7 +910,7 @@ impl TaskTable {
     }
 
     pub(crate) fn reap_retired(&self) {
-        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+        if platform::current_is_in_interrupt() {
             return;
         }
 

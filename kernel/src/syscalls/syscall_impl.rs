@@ -1,9 +1,9 @@
-use crate::drivers::interrupt_index::current_cpu_id;
 use crate::executable::program::{
     Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
+use crate::platform;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
@@ -226,7 +226,7 @@ pub fn make_err(class: ErrClass, code: u16, arg: u32) -> u64 {
 
 fn current_process() -> Result<(u64, ProgramHandle), u64> {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -525,7 +525,7 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
 
 pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -562,7 +562,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
 pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     let stack_size = StackSize::Medium.as_bytes();
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -817,7 +817,9 @@ pub(crate) fn sys_io_cancel(completion_queue_handle: UserHandle, request_id: Req
 }
 
 pub(crate) fn sys_get_thread() -> UserHandle {
-    let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
+    let task = SCHEDULER
+        .get_current_task(platform::current_cpu_id())
+        .unwrap();
     let caller_pid = task.inner.read().parent_pid;
     let obj = ensure_thread_object(caller_pid, &task);
     obj.id
@@ -830,7 +832,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
     let msg = unsafe { &mut *message_ptr };
 
     let sender_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -873,7 +875,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
     let rule_u = unsafe { &*rule_ptr };
 
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -988,7 +990,7 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     let rule_u = unsafe { &*rule_ptr };
 
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1021,7 +1023,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
     }
 
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1062,7 +1064,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
 
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1077,7 +1079,7 @@ pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
 
 pub(crate) fn sys_create_mq() -> UserHandle {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1101,7 +1103,7 @@ pub(crate) fn sys_create_mq() -> UserHandle {
 
 pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()

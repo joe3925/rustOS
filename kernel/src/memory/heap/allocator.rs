@@ -1,7 +1,7 @@
-use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::memory::heap::buddylocked::BuddyLocked;
 use crate::memory::paging::frame_alloc::total_usable_bytes;
 use crate::memory::paging::stack::StackSize;
+use crate::platform;
 use crate::println;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
@@ -55,7 +55,7 @@ cfg_if::cfg_if! {
 
             pub fn mimalloc_thread_done(&self) {
                 if self.mimalloc_enabled() {
-                    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+                    if platform::current_is_in_interrupt() {
                         panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
                     }
                     unsafe { mi::mimalloc_thread_done_impl(); }
@@ -70,7 +70,7 @@ cfg_if::cfg_if! {
         unsafe impl GlobalAlloc for KernelAllocator {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
                 if self.mimalloc_enabled() {
-                    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+                    if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
                     mi::mimalloc_alloc(layout)
@@ -81,7 +81,7 @@ cfg_if::cfg_if! {
 
             unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
                 if self.mimalloc_enabled() {
-                    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+                    if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
                     mi::mimalloc_alloc_zeroed(layout)
@@ -101,7 +101,7 @@ cfg_if::cfg_if! {
                 }
 
                 if mi::ptr_is_mimalloc(ptr) {
-                    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+                    if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
                     mi::mimalloc_dealloc(ptr, layout)
@@ -116,7 +116,7 @@ cfg_if::cfg_if! {
                 }
 
                 if mi::ptr_is_mimalloc(ptr) {
-                    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+                    if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
                     mi::mimalloc_realloc(ptr, layout, new_size)

@@ -8,10 +8,6 @@ pub use kernel_types::{async_ffi, device, request, status};
 pub use kernel_routing;
 pub use kernel_types;
 
-pub mod arch;
-#[cfg(target_arch = "x86_64")]
-pub use x86_64;
-
 pub use acpi;
 pub use kernel_macros::request_handler;
 pub mod benchmark;
@@ -19,6 +15,7 @@ pub mod dma;
 pub mod fs;
 pub mod irq;
 pub mod memory;
+pub mod pci;
 pub mod pnp;
 pub mod reg;
 pub mod runtime;

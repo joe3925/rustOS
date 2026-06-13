@@ -1,7 +1,7 @@
 use kernel_sys::{
-    BenchSpanGuard, bench_kernel_span_begin, bench_kernel_submit_rip_sample,
-    bench_kernel_window_create, bench_kernel_window_destroy, bench_kernel_window_persist,
-    bench_kernel_window_start, bench_kernel_window_stop,
+    bench_kernel_span_begin, bench_kernel_submit_rip_sample, bench_kernel_window_create,
+    bench_kernel_window_destroy, bench_kernel_window_persist, bench_kernel_window_start,
+    bench_kernel_window_stop, BenchSpanGuard,
 };
 use kernel_types::{
     async_ffi::FfiFuture,

@@ -218,17 +218,22 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
     let prt_arc: Arc<[PrtEntry]> = Arc::from(prt_vec.clone());
 
     if segments.is_none() {
-        println!("[PCI] No ECAM segments; falling back to legacy CFG#1 scan.");
+        if !dev_ext::platform_config_access_available() {
+            println!("[PCI] no ECAM segments and no platform PCI config access");
+            return DriverStatus::NotImplemented;
+        }
+
+        println!("[PCI] No ECAM segments; scanning through platform PCI config access.");
         for bus in 0u8..=255 {
             for dev in 0u8..32 {
-                let ht = match dev_ext::header_type_legacy(bus, dev) {
+                let ht = match dev_ext::header_type_config(bus, dev) {
                     Some(v) => v,
                     None => continue,
                 };
                 let multi = (ht & 0x80) != 0;
                 let func_span = if multi { 0u8..8 } else { 0u8..1 };
                 for func in func_span {
-                    if let Some(mut p) = dev_ext::probe_function_legacy(bus, dev, func) {
+                    if let Some(mut p) = dev_ext::probe_function_config(bus, dev, func) {
                         resolve_gsi(&mut p, prt_vec.as_slice());
                         make_pdo_for_function(&devnode, &p);
                     }

@@ -13,8 +13,7 @@ mod pci;
 mod temp_benchmark;
 mod virtqueue;
 
-use alloc::vec;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use blk::{
     BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_FLUSH,
     VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
@@ -45,6 +44,7 @@ use kernel_api::kernel_types::io::{
     DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo,
 };
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
+use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
@@ -54,8 +54,7 @@ use kernel_api::pnp::{
     pnp_forward_request_to_next_lower,
 };
 use kernel_api::request::{DeviceControl, Flush, Pnp, Read, RequestHandle, RequestKind, Write};
-use kernel_api::runtime::KernelStopwatch;
-use kernel_api::runtime::spawn_detached;
+use kernel_api::runtime::{KernelStopwatch, cycle_counter, spawn_detached};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::panic_common;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
@@ -116,8 +115,8 @@ impl DeviceControlHandler for VirtioPdoIo {
 }
 
 #[inline]
-fn duration_to_tsc_cycles(duration: Duration, tsc_hz: u64) -> u64 {
-    if unlikely(tsc_hz == 0) {
+fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64 {
+    if unlikely(frequency_hz == 0) {
         cold_path();
         return 0;
     }
@@ -129,7 +128,7 @@ fn duration_to_tsc_cycles(duration: Duration, tsc_hz: u64) -> u64 {
     }
 
     let cycles = nanos
-        .saturating_mul(tsc_hz as u128)
+        .saturating_mul(frequency_hz as u128)
         .saturating_add(999_999_999)
         / 1_000_000_000;
     cycles.min(u64::MAX as u128) as u64
@@ -141,7 +140,7 @@ where
 {
     let mut completion = core::pin::pin!(completion);
     let timer = KernelStopwatch::start();
-    let spin_cycles = duration_to_tsc_cycles(spin_for, timer.tsc_hz());
+    let spin_cycles = duration_to_cycle_counter_ticks(spin_for, timer.cycle_counter_frequency_hz());
     let start_cycles = timer.start_cycles();
 
     loop {
@@ -156,14 +155,14 @@ where
             return result;
         }
 
-        if spin_cycles == 0 || rdtsc().wrapping_sub(start_cycles) >= spin_cycles {
+        if spin_cycles == 0 || cycle_counter().wrapping_sub(start_cycles) >= spin_cycles {
             break;
         }
     }
     let res = completion.await;
     res
 }
-// legacy helpers
+// Request helpers
 #[inline(always)]
 fn complete_req<K: RequestKind>(
     _req: &mut RequestHandle<'_, K>,
@@ -401,16 +400,16 @@ extern "C" fn virtio_msix_isr(
 async fn setup_msix_via_pci(
     dev: &Arc<DeviceObject>,
     vector: u8,
-    cpu: u8,
+    platform_cpu_id: u8,
     table_index: u16,
 ) -> Result<(), DriverStatus> {
-    let mut buf = vec![0u8; 6];
-    buf[0..2].copy_from_slice(&1u16.to_le_bytes());
-    buf[2..4].copy_from_slice(&table_index.to_le_bytes());
-    buf[4] = vector;
-    buf[5] = cpu;
+    let setup = MsiRequest::pci_msix(
+        vector,
+        MsiTarget::platform_cpu(platform_cpu_id as u32),
+        table_index,
+    );
 
-    let mut req = RequestHandle::new(DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, buf));
+    let mut req = RequestHandle::new(DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup));
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut req).await;
 
     if status == DriverStatus::Success {
@@ -522,7 +521,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
         }
     };
 
-    let cpu_ids = kernel_api::irq::apic_cpu_ids();
+    let cpu_ids = kernel_api::irq::platform_cpu_ids();
     let cpu_count = cpu_ids.len().max(1);
     let target_queue_count = (init_result.num_queues as usize).min(cpu_count).max(1);
 
@@ -639,14 +638,14 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
 
     virtqueues.truncate(final_queue_count);
 
-    let legacy_irq_handle: Option<IrqHandle> = if !use_msix {
+    let line_irq_handle: Option<IrqHandle> = if !use_msix {
         if let Some(gsi) = pci::find_gsi(&resources) {
             if gsi < 64 {
                 irq_register_isr_gsi(gsi as u8, virtio_isr, caps.isr_cfg.as_u64() as usize)
             } else {
                 None
             }
-        } else if let Some(line) = pci::find_legacy_irq_line(&resources) {
+        } else if let Some(line) = pci::find_interrupt_line(&resources) {
             if line < 16 {
                 let vector = PIC_BASE_VECTOR + line;
                 irq_register_isr(vector, virtio_isr, caps.isr_cfg.as_u64() as usize)
@@ -716,7 +715,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
                 None => (None, None, None),
             }
         } else if i == 0 && !use_msix {
-            (legacy_irq_handle.clone(), None, None)
+            (line_irq_handle.clone(), None, None)
         } else {
             (None, None, None)
         };
@@ -1060,28 +1059,6 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
 }
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
-#[inline]
-fn rdtsc() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let lo: u32;
-        let hi: u32;
-        unsafe {
-            core::arch::asm!(
-                "rdtsc",
-                out("eax") lo,
-                out("edx") hi,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        ((hi as u64) << 32) | (lo as u64)
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // TODO: implement standard cross-platform timestamp retrieval
-        0
-    }
-}
 
 #[request_handler]
 pub async fn virtio_pdo_start<'req, 'data, 'b>(

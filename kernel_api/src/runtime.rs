@@ -9,8 +9,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
-use kernel_sys::elapsed;
-use kernel_sys::stopwatch_new;
+use kernel_sys::{elapsed, kernel_cycle_counter, kernel_cycle_counter_frequency_hz, stopwatch_new};
 use spin::Mutex;
 
 use kernel_sys::{
@@ -205,6 +204,17 @@ where
 pub fn try_steal_blocking_one() -> bool {
     unsafe { sys_try_steal_blocking_one() }
 }
+
+#[inline(always)]
+pub fn cycle_counter() -> u64 {
+    unsafe { kernel_cycle_counter() }
+}
+
+#[inline(always)]
+pub fn cycle_counter_frequency_hz() -> u64 {
+    unsafe { kernel_cycle_counter_frequency_hz() }
+}
+
 pub struct KernelStopwatch {
     inner: Stopwatch,
 }
@@ -228,7 +238,7 @@ impl KernelStopwatch {
     }
 
     #[inline(always)]
-    pub fn tsc_hz(&self) -> u64 {
-        self.inner.tsc_hz()
+    pub fn cycle_counter_frequency_hz(&self) -> u64 {
+        self.inner.cycle_counter_frequency_hz()
     }
 }

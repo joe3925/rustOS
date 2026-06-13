@@ -1,11 +1,11 @@
-use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
+use crate::arch::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
 use kernel_routing::println;
 
+use crate::arch::drivers::interrupt_index::APIC_TICKS_PER_NS;
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
-use crate::drivers::interrupt_index::APIC_TICKS_PER_NS;
 
-use crate::drivers::interrupt_index::{current_cpu_id, send_eoi_timer};
+use crate::arch::drivers::interrupt_index::{current_cpu_id, send_eoi_timer};
 use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
 use crate::scheduling::state::State;
 use crate::structs::per_cpu_vec::PerCpuVec;

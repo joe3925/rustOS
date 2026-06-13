@@ -4,8 +4,8 @@ use core::sync::atomic::Ordering;
 
 use kernel_sync::{ParkReason, Platform, ThreadEntry};
 
-use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::stack::StackSize;
+use crate::platform;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::BlockReason;
 use crate::scheduling::task::{Task, TaskHandle, WAIT_QUEUE_NONE};
@@ -18,7 +18,7 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn current_task() -> Option<Self::Task> {
-        let cpu_id = current_cpu_id();
+        let cpu_id = platform::current_cpu_id();
         SCHEDULER.get_current_task(cpu_id)
     }
 

@@ -2,6 +2,7 @@ pub mod cpu;
 pub mod exception_handlers;
 pub mod gdt;
 pub mod idt;
+pub(crate) mod machine;
 pub mod memory;
 pub mod platform;
 pub(crate) mod scheduling;
@@ -38,6 +39,7 @@ pub mod interrupts {
 
 pub mod instructions {
     use core::arch::asm;
+    use x86_64::structures::idt::InterruptDescriptorTable;
 
     pub unsafe fn trigger_guard_page_overflow(target: u64) -> ! {
         unsafe {
@@ -59,6 +61,15 @@ pub mod instructions {
     pub fn breakpoint() {
         unsafe {
             asm!("int 3");
+        }
+    }
+
+    pub fn triple_fault() -> ! {
+        static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
+
+        unsafe {
+            EMPTY_IDT.load();
+            asm!("ud2", options(noreturn));
         }
     }
 }

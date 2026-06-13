@@ -30,9 +30,9 @@ use crate::scheduling::runtime::runtime::JoinAll;
 
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
-    drivers::interrupt_index::wait_duration,
     file_system::file_provider::{self, install_file_provider, ProviderKind},
     memory::paging::frame_alloc::USED_MEMORY,
+    platform::wait_duration,
     println,
     registry::rebind_and_persist_after_provider_switch,
     scheduling::runtime::runtime::spawn_detached,

@@ -1,4 +1,4 @@
-use crate::drivers::interrupt_index::get_current_logical_id;
+use crate::arch::drivers::interrupt_index::get_current_logical_id;
 
 use crate::executable::program::{Message, UserHandle};
 use crate::gdt::PER_CPU_GDT;
@@ -6,9 +6,9 @@ use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
-use x86_64::VirtAddr;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
+use x86_64::VirtAddr;
 
 pub fn syscall_init() {
     let gdt = PER_CPU_GDT.lock();
