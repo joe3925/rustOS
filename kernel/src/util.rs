@@ -6,9 +6,9 @@ use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::executable::program::{PROGRAM_MANAGER, Program};
+use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file_provider::{ProviderKind, install_file_provider};
+use crate::file_system::file_provider::{install_file_provider, ProviderKind};
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
@@ -16,7 +16,7 @@ use crate::memory::heap::{heap_capacity_bytes, init_heap};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::memory::paging::{
-    KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked,
+    boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked, KernelFrameAllocator,
 };
 use crate::platform::{current_cpu_id, cycle_counter};
 use crate::scheduling::global_async::GlobalAsyncExecutor;
@@ -25,7 +25,7 @@ use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
-use crate::{BOOT_INFO, BOOT_INFO_INITIALIZED, println};
+use crate::{println, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -146,7 +146,7 @@ pub unsafe fn init() {
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
         0,
-        StackSize::Tiny,
+        StackSize::Huge,
         "kernel".into(),
         0,
     ));
@@ -546,7 +546,7 @@ pub fn test_kernel_tls_runtime() {
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_tls_self_test_worker,
         0,
-        StackSize::Tiny,
+        StackSize::Huge,
         "kernel-tls-self-test".into(),
         0,
     ));

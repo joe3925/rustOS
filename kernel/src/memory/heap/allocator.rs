@@ -271,7 +271,7 @@ pub fn test_full_heap_parallel() {
             let task = Task::new_kernel_mode(
                 parallel_worker,
                 ctx_arg.as_usize(),
-                StackSize::Large,
+                StackSize::Huge,
                 name,
                 0,
             );

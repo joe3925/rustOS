@@ -1,5 +1,5 @@
-use crate::arch::MAX_CPUS;
 use crate::arch::scheduling::idle_task;
+use crate::arch::MAX_CPUS;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
@@ -118,7 +118,7 @@ impl Scheduler {
 
     #[inline(always)]
     fn build_core(&self, cpu_id: usize, platform_cpu_id: usize) -> Arc<CoreScheduler> {
-        let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
+        let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Huge, "".into(), 0);
 
         idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
         idle.inner.write().context.r11 = 0x890189d70ecaca7f;
