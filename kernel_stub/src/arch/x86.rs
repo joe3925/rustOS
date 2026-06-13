@@ -4,12 +4,10 @@ use goblin::pe::header::COFF_MACHINE_X86_64;
 
 pub use x86_64::instructions::port::Port;
 pub use x86_64::structures::paging::{
-    mapper::TranslateError, FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
-    PageTableFlags, PhysFrame, Size4KiB,
+    mapper::RecursivePageTable, mapper::TranslateError, FrameAllocator, Mapper, Page, PageTable,
+    PageTableFlags, PageTableIndex, PhysFrame, Size4KiB,
 };
 pub use x86_64::{PhysAddr, VirtAddr};
-
-use x86_64::registers::control::Cr3;
 
 pub fn validate_kernel_machine(machine: u16) -> Result<(), &'static str> {
     if machine == COFF_MACHINE_X86_64 {
@@ -40,14 +38,22 @@ pub fn halt() -> ! {
     }
 }
 
-pub unsafe fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
-    let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
-    unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
+pub unsafe fn init_mapper(recursive_index: u16) -> RecursivePageTable<'static> {
+    let recursive_index = PageTableIndex::new(recursive_index);
+    let level_4_table = unsafe { active_level_4_table(recursive_index) };
+    unsafe { RecursivePageTable::new_unchecked(level_4_table, recursive_index) }
 }
 
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
-    let (level_4_table_frame, _) = Cr3::read();
-    let phys = level_4_table_frame.start_address();
-    let virt = physical_memory_offset + phys.as_u64();
+unsafe fn active_level_4_table(recursive_index: PageTableIndex) -> &'static mut PageTable {
+    let virt = recursive_level_4_table_addr(recursive_index);
     unsafe { &mut *virt.as_mut_ptr() }
+}
+
+fn recursive_level_4_table_addr(recursive_index: PageTableIndex) -> VirtAddr {
+    let idx = u64::from(recursive_index);
+    let mut addr = (idx << 39) | (idx << 30) | (idx << 21) | (idx << 12);
+    if addr & (1 << 47) != 0 {
+        addr |= 0xFFFF_0000_0000_0000;
+    }
+    VirtAddr::new(addr)
 }

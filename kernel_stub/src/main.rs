@@ -8,8 +8,9 @@ mod arch;
 
 use alloc::alloc::{GlobalAlloc, Layout};
 use arch::{
-    enter_kernel_pe, init_mapper, validate_kernel_machine, FrameAllocator, Mapper, OffsetPageTable,
-    Page, PageTableFlags, PhysAddr, PhysFrame, Port, Size4KiB, TranslateError, VirtAddr,
+    enter_kernel_pe, init_mapper, validate_kernel_machine, FrameAllocator, Mapper, Page,
+    PageTableFlags, PhysAddr, PhysFrame, Port, RecursivePageTable, Size4KiB, TranslateError,
+    VirtAddr,
 };
 use bootloader_api::config::Mapping;
 use bootloader_api::info::{
@@ -28,8 +29,8 @@ use kernel_abi::{
     KernelSymbolString, KernelSymbols, KernelTextSection, MemoryRegion, MemoryRegionKind,
     MemoryRegions, Optional, PeTlsDirectory, PixelFormat, KERNEL_PE_BASE, MAX_BOOT_MEMORY_REGIONS,
     MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS, MAX_KERNEL_SECTIONS,
-    MAX_KERNEL_SYMBOL_STRING_BYTES, PHYSICAL_MEMORY_OFFSET, RUSTOS_BOOT_INFO_MAGIC,
-    RUSTOS_BOOT_INFO_VERSION, STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
+    MAX_KERNEL_SYMBOL_STRING_BYTES, RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION,
+    STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
 };
 
 const KERNEL_PE: &[u8] = include_bytes!(env!("KERNEL_PE_PATH"));
@@ -40,7 +41,8 @@ const MAX_ALLOCATED_RANGES: usize = 128;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::FixedAddress(PHYSICAL_MEMORY_OFFSET));
+    config.mappings.physical_memory = None;
+    config.mappings.page_table_recursive = Some(Mapping::Dynamic);
     config.kernel_stack_size = 1 * 1024 * 1024;
     config.mappings.kernel_stack = Mapping::Dynamic;
     config.mappings.framebuffer = Mapping::Dynamic;
@@ -146,13 +148,13 @@ fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
     init_serial();
     serial_println("kernel_stub: loading embedded PE kernel");
 
-    let phys_offset = boot_info
-        .physical_memory_offset
+    let recursive_index = boot_info
+        .recursive_index
         .into_option()
-        .unwrap_or_else(|| fatal("kernel_stub: bootloader did not map physical memory"));
+        .unwrap_or_else(|| fatal("kernel_stub: bootloader did not map page tables recursively"));
 
     let mut frame_allocator = BootFrameAllocator::new(&boot_info.memory_regions);
-    let mut mapper = unsafe { init_mapper(VirtAddr::new(phys_offset)) };
+    let mut mapper = unsafe { init_mapper(recursive_index) };
 
     let loaded = load_kernel_pe(&mut mapper, &mut frame_allocator).unwrap_or_else(|err| fatal(err));
     let handoff = build_handoff(boot_info, loaded).unwrap_or_else(|err| fatal(err));
@@ -163,7 +165,7 @@ fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
 }
 
 fn load_kernel_pe(
-    mapper: &mut OffsetPageTable<'static>,
+    mapper: &mut RecursivePageTable<'static>,
     frame_allocator: &mut BootFrameAllocator,
 ) -> Result<LoadedKernel, &'static str> {
     let pe = PE::parse(KERNEL_PE).map_err(|_| "kernel_stub: embedded kernel is not a PE image")?;
@@ -263,7 +265,7 @@ fn directory_present(dir: Option<&DataDirectory>) -> bool {
 }
 
 fn map_image_range(
-    mapper: &mut OffsetPageTable<'static>,
+    mapper: &mut RecursivePageTable<'static>,
     frame_allocator: &mut BootFrameAllocator,
     base: u64,
     size: u64,
@@ -331,7 +333,7 @@ fn copy_section(base: u64, image_size: u64, section: &SectionTable) -> Result<()
 }
 
 fn apply_section_permissions(
-    mapper: &mut OffsetPageTable<'static>,
+    mapper: &mut RecursivePageTable<'static>,
     base: u64,
     image_size: u64,
     sections: &[SectionTable],
@@ -369,7 +371,7 @@ fn apply_section_permissions(
 }
 
 fn set_page_flags(
-    mapper: &mut OffsetPageTable<'static>,
+    mapper: &mut RecursivePageTable<'static>,
     base: u64,
     size: u64,
     flags: PageTableFlags,
@@ -430,7 +432,6 @@ fn build_handoff(
                 len: memory_region_count,
             },
             framebuffer,
-            physical_memory_offset: Optional::Some(PHYSICAL_MEMORY_OFFSET),
             recursive_index: translate_optional(boot_info.recursive_index),
             rsdp_addr: translate_optional(boot_info.rsdp_addr),
             fdt_header: Optional::None,

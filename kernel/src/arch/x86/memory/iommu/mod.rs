@@ -6,7 +6,7 @@ use spin::{Mutex, Once};
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::{PhysAddr, VirtAddr};
 
-use crate::memory::dma::{PlatformIommuInfo, platform_iommu_info};
+use crate::memory::dma::{platform_iommu_info, PlatformIommuInfo};
 use crate::memory::paging::tables::virt_to_phys;
 use crate::memory::paging::virt_tracker::{
     allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous,
@@ -52,7 +52,7 @@ pub(crate) fn alloc_zeroed_pages_contiguous(
     unsafe {
         core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, size as usize);
     }
-    let phys = virt_to_phys(va).ok_or(IommuError::NoBackingFrame)?;
+    let (_, phys) = virt_to_phys(va).ok_or(IommuError::NoBackingFrame)?;
     Ok((phys, va))
 }
 
@@ -75,21 +75,28 @@ fn backend() -> Option<&'static IommuBackend> {
 }
 
 pub fn init_iommu() {
-    let _ = IOMMU_BACKEND.call_once(|| match platform_iommu_info() {
-        PlatformIommuInfo::Intel(info) => match IntelVtdBackend::init(info) {
-            Ok(backend) => Some(IommuBackend::Intel(backend)),
-            Err(err) => {
-                println!("iommu: Intel VT-d init failed: {:?}", err);
-                None
-            }
-        },
-        PlatformIommuInfo::Amd(info) => match AmdViBackend::init(info) {
-            Ok(backend) => Some(IommuBackend::Amd(backend)),
-            Err(err) => {
-                println!("iommu: AMD-Vi init failed: {:?}", err);
-                None
-            }
-        },
+    let _ = IOMMU_BACKEND.call_once(|| {
+        if let Err(err) = page_table::init_table_arena() {
+            println!("iommu: table arena init failed: {:?}", err);
+            return None;
+        }
+
+        match platform_iommu_info() {
+            PlatformIommuInfo::Intel(info) => match IntelVtdBackend::init(info) {
+                Ok(backend) => Some(IommuBackend::Intel(backend)),
+                Err(err) => {
+                    println!("iommu: Intel VT-d init failed: {:?}", err);
+                    None
+                }
+            },
+            PlatformIommuInfo::Amd(info) => match AmdViBackend::init(info) {
+                Ok(backend) => Some(IommuBackend::Amd(backend)),
+                Err(err) => {
+                    println!("iommu: AMD-Vi init failed: {:?}", err);
+                    None
+                }
+            },
+        }
     });
 }
 

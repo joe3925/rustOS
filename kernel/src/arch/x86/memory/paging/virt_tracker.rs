@@ -3,8 +3,8 @@ use crate::{
         constants::{MANAGED_KERNEL_RANGE_END, MANAGED_KERNEL_RANGE_START},
         frame_alloc::BootInfoFrameAllocator,
         paging::{
-            TlbFlush, align_up_4k, map_contiguous_physical_range, map_range_with_huge_pages,
-            unmap_range_impl,
+            align_up_4k, map_contiguous_physical_range, map_range_with_huge_pages,
+            unmap_range_impl, TlbFlush,
         },
         tables::init_mapper,
     },
@@ -16,8 +16,8 @@ use core::sync::atomic::AtomicUsize;
 use kernel_types::status::PageMapError;
 use lazy_static::lazy_static;
 use x86_64::{
-    PhysAddr, VirtAddr,
     structures::paging::{PageTableFlags, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
 };
 
 pub(crate) const MAX_PENDING_FREES: usize = 64;
@@ -58,8 +58,11 @@ pub extern "C" fn allocate_auto_kernel_range_mapped(
     debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
 
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .ok_or(PageMapError::NoMemoryMap())?;
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     if let Err(err) = unsafe {
@@ -104,8 +107,11 @@ pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
         .ok_or(PageMapError::NoMemory())?;
 
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .ok_or(PageMapError::NoMemoryMap())?;
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     let phys_base =
@@ -143,8 +149,11 @@ pub extern "C" fn allocate_kernel_range_mapped(
     debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
 
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .ok_or(PageMapError::NoMemoryMap())?;
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     if let Err(err) = unsafe {
@@ -194,8 +203,11 @@ pub fn allocate_auto_kernel_range_mapped_aligned(
     debug_assert_eq!(addr.as_u64() & (alignment - 1), 0, "Alignment violated");
 
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .ok_or(PageMapError::NoMemoryMap())?;
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     if let Err(err) = unsafe {

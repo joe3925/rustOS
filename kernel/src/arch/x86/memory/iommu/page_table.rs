@@ -17,8 +17,10 @@
 //! <= 2 MiB of intermediate frames even if every L1 leaf is populated.
 
 use crate::memory::iommu::domain::IommuError;
-use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
-use crate::util::boot_info;
+use crate::memory::paging::tables::virt_to_phys;
+use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous;
+use spin::Mutex;
+use x86_64::structures::paging::PageTableFlags;
 
 pub const PTE_P: u64 = 1 << 0;
 pub const PTE_RW: u64 = 1 << 1;
@@ -26,17 +28,90 @@ pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 pub const AMD_IR: u64 = 1 << 61;
 pub const AMD_IW: u64 = 1 << 62;
 
-#[inline]
-fn phys_offset() -> u64 {
-    boot_info()
-        .physical_memory_offset
-        .into_option()
-        .expect("IOMMU page-table walker: physical memory offset missing")
+const IOMMU_TABLE_ARENA_SIZE: u64 = 8 * 1024 * 1024;
+const IOMMU_TABLE_PAGE_SIZE: u64 = 0x1000;
+
+static IOMMU_TABLE_ARENA: Mutex<IommuTableArena> = Mutex::new(IommuTableArena::empty());
+
+struct IommuTableArena {
+    phys_base: u64,
+    virt_base: u64,
+    size: u64,
+    next: u64,
+}
+
+impl IommuTableArena {
+    const fn empty() -> Self {
+        Self {
+            phys_base: 0,
+            virt_base: 0,
+            size: 0,
+            next: 0,
+        }
+    }
+
+    fn contains_phys(&self, phys: u64) -> bool {
+        self.size != 0 && phys >= self.phys_base && phys < self.phys_base + self.size
+    }
+
+    fn virt_for_phys<T>(&self, phys: u64) -> Option<*mut T> {
+        if !self.contains_phys(phys) {
+            return None;
+        }
+        Some((self.virt_base + (phys - self.phys_base)) as *mut T)
+    }
+
+    fn alloc_page(&mut self) -> Option<(u64, *mut u64)> {
+        let next = self.next.checked_add(IOMMU_TABLE_PAGE_SIZE)?;
+        if next > self.size {
+            return None;
+        }
+
+        let phys = self.phys_base + self.next;
+        let ptr = (self.virt_base + self.next) as *mut u64;
+        self.next = next;
+        Some((phys, ptr))
+    }
+}
+
+pub fn init_table_arena() -> Result<(), IommuError> {
+    let mut arena = IOMMU_TABLE_ARENA.lock();
+    if arena.size != 0 {
+        return Ok(());
+    }
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let virt = allocate_auto_kernel_range_mapped_contiguous(IOMMU_TABLE_ARENA_SIZE, flags)
+        .map_err(|_| IommuError::NoBackingFrame)?;
+    let (_, phys) = virt_to_phys(virt).ok_or(IommuError::NoBackingFrame)?;
+
+    *arena = IommuTableArena {
+        phys_base: phys.as_u64(),
+        virt_base: virt.as_u64(),
+        size: IOMMU_TABLE_ARENA_SIZE,
+        next: 0,
+    };
+    Ok(())
 }
 
 #[inline]
-fn phys_table_ptr(phys: u64) -> *mut u64 {
-    (phys_offset() + phys) as *mut u64
+pub(crate) unsafe fn phys_to_mut<T>(phys: u64) -> *mut T {
+    IOMMU_TABLE_ARENA
+        .lock()
+        .virt_for_phys::<T>(phys)
+        .expect("IOMMU table physical address is outside the table arena")
+}
+
+#[inline]
+fn read_entry(phys: u64, index: usize) -> u64 {
+    unsafe { phys_to_mut::<u64>(phys).add(index).read_volatile() }
+}
+
+#[inline]
+fn write_entry(phys: u64, index: usize, value: u64) {
+    unsafe {
+        phys_to_mut::<u64>(phys).add(index).write_volatile(value);
+    }
 }
 
 #[inline]
@@ -47,15 +122,13 @@ fn iova_index(iova: u64, level: u32) -> usize {
 
 /// Allocate one 4 KiB frame for a page-table level and zero it.
 pub fn alloc_pt_frame_phys() -> Option<u64> {
-    let phys = BootInfoFrameAllocator::allocate_contiguous_frames(1)?;
-    let p = phys.as_u64();
+    let (phys, ptr) = IOMMU_TABLE_ARENA.lock().alloc_page()?;
     unsafe {
-        let ptr = (phys_offset() + p) as *mut u64;
         for i in 0..512 {
             ptr.add(i).write_volatile(0);
         }
     }
-    Some(p)
+    Some(phys)
 }
 
 /// Map a single 4 KiB page. `leaf_flags` adds vendor-specific bits (e.g.
@@ -78,21 +151,19 @@ pub fn map_4k<F: Fn(u32) -> u64>(
 
     for lvl in (2..=4).rev() {
         let idx = iova_index(iova, lvl);
-        let entry_ptr = unsafe { phys_table_ptr(table_phys).add(idx) };
-        let entry = unsafe { entry_ptr.read_volatile() };
+        let entry = read_entry(table_phys, idx);
         if entry & present_mask != 0 {
             table_phys = entry & PTE_ADDR_MASK;
         } else {
             let np = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
-            unsafe { entry_ptr.write_volatile(np | interior_flags(lvl)) };
+            write_entry(table_phys, idx, np | interior_flags(lvl));
             table_phys = np;
         }
     }
 
     let idx = iova_index(iova, 1);
-    let entry_ptr = unsafe { phys_table_ptr(table_phys).add(idx) };
     let leaf = (phys & PTE_ADDR_MASK) | leaf_flags;
-    unsafe { entry_ptr.write_volatile(leaf) };
+    write_entry(table_phys, idx, leaf);
     Ok(())
 }
 
@@ -104,7 +175,7 @@ pub fn unmap_4k(root_phys: u64, iova: u64, present_mask: u64) -> Option<u64> {
     let mut table_phys = root_phys;
     for lvl in (2..=4).rev() {
         let idx = iova_index(iova, lvl);
-        let entry = unsafe { phys_table_ptr(table_phys).add(idx).read_volatile() };
+        let entry = read_entry(table_phys, idx);
         if entry & present_mask == 0 {
             return None;
         }
@@ -112,12 +183,11 @@ pub fn unmap_4k(root_phys: u64, iova: u64, present_mask: u64) -> Option<u64> {
     }
 
     let idx = iova_index(iova, 1);
-    let entry_ptr = unsafe { phys_table_ptr(table_phys).add(idx) };
-    let entry = unsafe { entry_ptr.read_volatile() };
+    let entry = read_entry(table_phys, idx);
     if entry & present_mask == 0 {
         return None;
     }
-    unsafe { entry_ptr.write_volatile(0) };
+    write_entry(table_phys, idx, 0);
     Some(entry & PTE_ADDR_MASK)
 }
 

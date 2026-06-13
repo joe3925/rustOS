@@ -257,10 +257,8 @@ impl Program {
 
         let res = (|| {
             let boot_info = boot_info();
-            let phys_mem_offset =
-                VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-
-            let mut mapper = init_mapper(phys_mem_offset);
+            let recursive_index = boot_info.recursive_index.into_option().unwrap();
+            let mut mapper = init_mapper(recursive_index);
             let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
             let flags = PageTableFlags::PRESENT
@@ -294,13 +292,11 @@ impl Program {
 
         let result = (|| {
             let boot_info = boot_info();
-            let phys_mem_offset = VirtAddr::new(
-                boot_info
-                    .physical_memory_offset
-                    .into_option()
-                    .expect("phys mem off missing"),
-            );
-            let mut mapper = init_mapper(phys_mem_offset);
+            let recursive_index = boot_info
+                .recursive_index
+                .into_option()
+                .expect("recursive page-table mapping missing");
+            let mut mapper = init_mapper(recursive_index);
             let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
             let flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
@@ -335,10 +331,8 @@ impl Program {
         });
 
         let boot_info = boot_info();
-        let phys_mem_offset =
-            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-
-        let mut mapper = init_mapper(phys_mem_offset);
+        let recursive_index = boot_info.recursive_index.into_option().unwrap();
+        let mut mapper = init_mapper(recursive_index);
         let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
         let flags =

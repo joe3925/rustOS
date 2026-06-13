@@ -41,7 +41,6 @@ use alloc::sync::Arc;
 pub use kernel_macros::RequestPayload;
 pub use request::{RequestPayload, RequestPayloadInto};
 
-use crate::arch::VirtAddr;
 use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
@@ -51,7 +50,6 @@ use crate::request::{
     Read, Request, RequestHandle, RequestKind, Write,
 };
 use crate::status::DriverStatus;
-pub const PHYSICAL_MEMORY_OFFSET: VirtAddr = VirtAddr::new(0xFFFF_8000_0000_0000);
 pub type EvtDriverDeviceAdd =
     extern "C" fn(driver: &Arc<device::DriverObject>, init: &mut device::DeviceInit) -> DriverStep;
 pub type EvtDriverUnload =

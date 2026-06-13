@@ -192,22 +192,18 @@ impl IntelVtdBackend {
             let new_ctx = page_table::alloc_root_table()?;
             unit.context_table_phys[bus as usize] = new_ctx;
 
-            let root_entry_ptr =
-                unsafe { phys_to_mut::<u64>(unit.root_table_phys).add((bus as usize) * 2) };
-            unsafe {
-                root_entry_ptr.write_volatile((new_ctx & PTE_ADDR_MASK) | 1);
-                root_entry_ptr.add(1).write_volatile(0);
-            }
+            write_table_pair(
+                unit.root_table_phys,
+                (bus as usize) * 2,
+                (new_ctx & PTE_ADDR_MASK) | 1,
+                0,
+            )?;
             new_ctx
         };
 
-        let ctx_entry_ptr = unsafe { phys_to_mut::<u64>(ctx_phys).add((devfn as usize) * 2) };
         let qw0 = (domain.root_phys & PTE_ADDR_MASK) | 1;
         let qw1 = AGAW_48 | ((domain.domain_id as u64) << 8);
-        unsafe {
-            ctx_entry_ptr.write_volatile(qw0);
-            ctx_entry_ptr.add(1).write_volatile(qw1);
-        }
+        write_table_pair(ctx_phys, (devfn as usize) * 2, qw0, qw1)?;
 
         let ccmd = CCMD_ICC | CCMD_CIRG_DOMAIN | ((domain.domain_id as u64) << 16);
         unsafe {
@@ -521,11 +517,16 @@ unsafe fn wait_bit_clear64(base: *mut u8, off: usize, bit: u64) {
     }
 }
 
-#[inline]
-unsafe fn phys_to_mut<T>(phys: u64) -> *mut T {
-    let off = crate::util::boot_info()
-        .physical_memory_offset
-        .into_option()
-        .expect("phys memory offset missing");
-    (off + phys) as *mut T
+fn write_table_pair(
+    table_phys: u64,
+    index: usize,
+    first: u64,
+    second: u64,
+) -> Result<(), IommuError> {
+    unsafe {
+        let ptr = page_table::phys_to_mut::<u64>(table_phys).add(index);
+        ptr.write_volatile(first);
+        ptr.add(1).write_volatile(second);
+    }
+    Ok(())
 }

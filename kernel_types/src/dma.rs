@@ -7,7 +7,7 @@ use core::mem::ManuallyDrop;
 use core::ptr;
 use kernel_macros::RequestPayload;
 
-use crate::arch::{self, VirtAddr};
+use crate::arch::{PhysAddr, VirtAddr};
 use crate::device::DeviceObject;
 
 #[repr(transparent)]
@@ -387,6 +387,41 @@ impl Drop for BorrowedDmaMapping<'_> {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtToPhysResult {
+    pub found: u8,
+    pub reserved: [u8; 7],
+    pub phys_addr: PhysAddr,
+    pub frame_size: u64,
+}
+
+impl VirtToPhysResult {
+    pub fn none() -> Self {
+        Self {
+            found: 0,
+            reserved: [0; 7],
+            phys_addr: PhysAddr::new(0),
+            frame_size: 0,
+        }
+    }
+
+    pub fn some(phys_addr: PhysAddr, frame_size: u64) -> Self {
+        Self {
+            found: 1,
+            reserved: [0; 7],
+            phys_addr,
+            frame_size,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedVirtualAddress {
+    phys_addr: PhysAddr,
+    frame_size: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VirtualFrameTranslation {
     phys_addr: u64,
@@ -403,18 +438,40 @@ fn is_valid_frame_size(byte_len: u64) -> bool {
 }
 
 fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> {
-    let translated = arch::translate_current_virtual_address(
-        crate::PHYSICAL_MEMORY_OFFSET,
-        VirtAddr::new(virt_addr as u64),
-    )?;
+    let (frame_size, phys_addr) = resolve_virtual_address(VirtAddr::new(virt_addr as u64))?;
+
+    if !is_valid_frame_size(frame_size) {
+        return None;
+    }
+
+    let offset = virt_addr as u64 & (frame_size - 1);
+    let phys_addr = phys_addr.as_u64();
+    let phys_base = phys_addr.checked_sub(offset)?;
+
+    if phys_base & (frame_size - 1) != 0 {
+        return None;
+    }
 
     Some(VirtualFrameTranslation {
-        phys_addr: translated.phys_addr.as_u64() - translated.offset,
-        byte_len: translated.byte_len,
-        offset: translated.offset,
+        phys_addr: phys_base,
+        byte_len: frame_size,
+        offset,
     })
 }
 
+#[cfg(any(test, feature = "hosted-tests"))]
+fn resolve_virtual_address(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    Some((IOBUFFER_FRAME_SIZE_4KIB, PhysAddr::new(addr.as_u64())))
+}
+
+#[cfg(not(any(test, feature = "hosted-tests")))]
+fn resolve_virtual_address(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    unsafe extern "C" {
+        fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+    }
+
+    unsafe { virt_to_phys(addr) }
+}
 fn describe_virtual_buffer_to_frames(
     virt_addr: usize,
     byte_len: usize,

@@ -861,6 +861,11 @@ pub extern "C" fn unmap_mmio_region(base: AbiVirtAddr, size: u64) -> Result<(), 
     mmio::unmap_mmio_region(base.into(), size)
 }
 
+#[no_mangle]
+pub extern "C" fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
+    crate::memory::paging::tables::virt_to_phys(addr.into()).map(|(size, phys)| (size, phys.into()))
+}
+
 // ============================================================================
 // Routing functions - linker seams for kernel_routing crate (kernel_link feature)
 // and FFI exports for drivers

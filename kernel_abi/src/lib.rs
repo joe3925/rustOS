@@ -3,9 +3,8 @@
 use core::{ops, slice};
 
 pub const RUSTOS_BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_5045;
-pub const RUSTOS_BOOT_INFO_VERSION: u32 = 3;
+pub const RUSTOS_BOOT_INFO_VERSION: u32 = 6;
 
-pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 pub const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
 pub const STUB_IMAGE_BASE: u64 = 0xFFFF_8800_0000_0000;
 
@@ -30,7 +29,6 @@ pub struct BootInfo {
     pub flags: u32,
     pub memory_regions: MemoryRegions,
     pub framebuffer: Optional<FrameBuffer>,
-    pub physical_memory_offset: Optional<u64>,
     pub recursive_index: Optional<u16>,
     pub rsdp_addr: Optional<u64>,
     pub fdt_header: Optional<*const FdtHeader>,
@@ -63,7 +61,6 @@ impl BootInfo {
                 len: 0,
             },
             framebuffer: Optional::None,
-            physical_memory_offset: Optional::None,
             recursive_index: Optional::None,
             rsdp_addr: Optional::None,
             fdt_header: Optional::None,

@@ -2,12 +2,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_types::status::PageMapError;
 use x86_64::{
-    PhysAddr, VirtAddr,
     registers::control::Cr3,
     structures::paging::{
-        FrameAllocator, OffsetPageTable, PageTable, PageTableFlags, PageTableIndex, PhysFrame,
-        Size4KiB,
+        PageTable, PageTableFlags, PageTableIndex, PhysFrame, RecursivePageTable, Size4KiB,
+        Translate,
     },
+    PhysAddr, VirtAddr,
 };
 
 use crate::{memory::paging::virt_tracker::allocate_auto_kernel_range_mapped, util::boot_info};
@@ -23,29 +23,51 @@ pub fn kernel_cr3() -> PhysFrame<Size4KiB> {
     PhysFrame::containing_address(x86_64::PhysAddr::new(KERNEL_CR3_U64.load(Ordering::SeqCst)))
 }
 
+use x86_64::structures::paging::mapper::MappedFrame;
+use x86_64::structures::paging::mapper::MapperAllSizes;
+use x86_64::structures::paging::mapper::TranslateResult;
+
 #[inline(always)]
-pub(crate) extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr> {
-    let mem_offset = boot_info().physical_memory_offset.into_option().unwrap();
-    kernel_types::arch::translate_current_virtual_address(
-        kernel_types::arch::VirtAddr::new(mem_offset),
-        kernel_types::arch::VirtAddr::new(addr.as_u64()),
-    )
-    .map(|translation| PhysAddr::new(translation.phys_addr.as_u64()))
+pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    let recursive_index = boot_info().recursive_index.into_option()?;
+    let mapper = init_mapper(recursive_index);
+    let res = mapper.translate(addr);
+    match res {
+        TranslateResult::Mapped { frame, offset, .. } => {
+            let size = match frame {
+                MappedFrame::Size4KiB(_) => 4096,
+                MappedFrame::Size2MiB(_) => 2 * 1024 * 1024,
+                MappedFrame::Size1GiB(_) => 1024 * 1024 * 1024,
+            };
+            Some((size, frame.start_address() + offset))
+        }
+        _ => None,
+    }
 }
-fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
-    let (table_frame, _) = Cr3::read();
-    let virt_addr = mem_offset + table_frame.start_address().as_u64();
-    let page_table_ptr: *mut PageTable = virt_addr.as_mut_ptr();
-    unsafe { &mut *page_table_ptr }
+
+fn get_level4_page_table(recursive_index: PageTableIndex) -> &'static mut PageTable {
+    let virt_addr = recursive_level_4_table_addr(recursive_index);
+    unsafe { &mut *virt_addr.as_mut_ptr() }
 }
-pub fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
-    let level_4_table = get_level4_page_table(physical_memory_offset);
-    unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
+
+pub fn init_mapper(recursive_index: u16) -> RecursivePageTable<'static> {
+    let recursive_index = PageTableIndex::new(recursive_index);
+    let level_4_table = get_level4_page_table(recursive_index);
+    unsafe { RecursivePageTable::new_unchecked(level_4_table, recursive_index) }
+}
+
+fn recursive_level_4_table_addr(recursive_index: PageTableIndex) -> VirtAddr {
+    let idx = u64::from(recursive_index);
+    let mut addr = (idx << 39) | (idx << 30) | (idx << 21) | (idx << 12);
+    if addr & (1 << 47) != 0 {
+        addr |= 0xFFFF_0000_0000_0000;
+    }
+    VirtAddr::new(addr)
 }
 
 pub fn new_user_mode_page_table() -> Result<(PhysAddr, VirtAddr), PageMapError> {
-    let mem_offset = boot_info()
-        .physical_memory_offset
+    let recursive_index = boot_info()
+        .recursive_index
         .into_option()
         .ok_or(PageMapError::NoMemoryMap())?;
 
@@ -54,8 +76,8 @@ pub fn new_user_mode_page_table() -> Result<(PhysAddr, VirtAddr), PageMapError> 
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
     )?;
 
-    let table_phys_addr = virt_to_phys(table_virt).ok_or(PageMapError::TranslationFailed())?;
-    let kernel_pml4 = get_level4_page_table(VirtAddr::new(mem_offset));
+    let (_, table_phys_addr) = virt_to_phys(table_virt).ok_or(PageMapError::TranslationFailed())?;
+    let kernel_pml4 = get_level4_page_table(PageTableIndex::new(recursive_index));
 
     let new_table: &mut PageTable = unsafe { &mut *(table_virt.as_mut_ptr()) };
     new_table.zero();
@@ -65,31 +87,4 @@ pub fn new_user_mode_page_table() -> Result<(PhysAddr, VirtAddr), PageMapError> 
     }
 
     Ok((table_phys_addr, table_virt))
-}
-
-fn get_or_create_table(
-    parent: &mut PageTable,
-    index: PageTableIndex,
-    mem_offset: VirtAddr,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> &'static mut PageTable {
-    let entry = &mut parent[index];
-
-    if entry.flags().contains(PageTableFlags::PRESENT) {
-        let phys = entry.frame().unwrap().start_address();
-        let virt = mem_offset + phys.as_u64();
-        unsafe { &mut *(virt.as_mut_ptr()) }
-    } else {
-        let frame = frame_allocator
-            .allocate_frame()
-            .expect("Frame allocation failed");
-        let virt = mem_offset + frame.start_address().as_u64();
-        let table = unsafe {
-            let ptr: *mut PageTable = virt.as_mut_ptr();
-            ptr.write(PageTable::new());
-            &mut *ptr
-        };
-        entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
-        table
-    }
 }

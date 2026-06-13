@@ -2,15 +2,15 @@ use spin::Mutex;
 
 use kernel_types::status::PageMapError;
 use x86_64::{
-    PhysAddr, VirtAddr,
     structures::paging::{Mapper as _, Page, PageTableFlags, Size1GiB, Size2MiB, Size4KiB},
+    PhysAddr, VirtAddr,
 };
 
 use crate::{
     cpu::get_cpu_info,
     memory::paging::{
         frame_alloc::BootInfoFrameAllocator,
-        paging::{TlbFlush, align_up_4k, map_contiguous_physical_range},
+        paging::{align_up_4k, map_contiguous_physical_range, TlbFlush},
         tables::init_mapper,
         virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range},
     },
@@ -85,8 +85,11 @@ pub extern "C" fn map_mmio_region_aligned(
         .ok_or(PageMapError::NoMemory())?;
 
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .ok_or(PageMapError::NoMemoryMap())?;
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
@@ -120,14 +123,11 @@ pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> 
     let total = align_up_4k(size + off);
 
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(
-        boot_info
-            .physical_memory_offset
-            .into_option()
-            .expect("missing phys-mem offset"),
-    );
-
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .ok_or(PageMapError::NoMemoryMap())?;
+    let mut mapper = init_mapper(recursive_index);
 
     let mut cur = start;
     let mut remaining = total;

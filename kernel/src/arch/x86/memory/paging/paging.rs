@@ -5,23 +5,24 @@ use crate::drivers::interrupt_index::LocalApic;
 use crate::drivers::timer_driver::NUM_CORES;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard, TLB_FLUSH_VECTOR};
 use crate::{
-    KERNEL_INITIALIZED,
     cpu::get_cpu_info,
-    drivers::interrupt_index::{APIC, current_cpu_id, send_eoi},
+    drivers::interrupt_index::{current_cpu_id, send_eoi, APIC},
     memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper},
     util::boot_info,
+    KERNEL_INITIALIZED,
 };
 use core::arch::naked_asm;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
 use x86_64::{
-    PhysAddr, VirtAddr, instructions,
+    instructions,
     structures::paging::{
+        mapper::{MapToError, MapperFlush},
         FrameAllocator, Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size1GiB, Size2MiB,
         Size4KiB,
-        mapper::{MapToError, MapperFlush},
     },
+    PhysAddr, VirtAddr,
 };
 
 const TLB_SHOOTDOWN_MODE_FULL: usize = 0;
@@ -260,14 +261,11 @@ enum UnmapFrameMode {
 
 unsafe fn unmap_range_with_frame_mode(virtual_addr: VirtAddr, size: u64, mode: UnmapFrameMode) {
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(
-        boot_info
-            .physical_memory_offset
-            .into_option()
-            .expect("missing phys‑mem offset"),
-    );
-
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .expect("missing recursive page-table mapping");
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     unsafe {
@@ -372,13 +370,11 @@ pub unsafe extern "C" fn identity_map_page(
     flags: PageTableFlags,
 ) -> Result<(), MapToError<Size4KiB>> {
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(
-        boot_info
-            .physical_memory_offset
-            .into_option()
-            .ok_or(MapToError::FrameAllocationFailed)?,
-    );
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info
+        .recursive_index
+        .into_option()
+        .ok_or(MapToError::FrameAllocationFailed)?;
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
     let page_size = 0x1000;
 
@@ -592,8 +588,8 @@ pub(crate) unsafe fn map_existing_kernel_range(
     flush: TlbFlush,
 ) -> Result<(), PageMapError> {
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info.recursive_index.into_option().unwrap();
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     unsafe {
@@ -632,8 +628,8 @@ pub(crate) unsafe fn ensure_kernel_2mib_units_mapped(
     }
 
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info.recursive_index.into_option().unwrap();
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     let mut unit = start_unit;
@@ -935,8 +931,8 @@ unsafe fn map_kernel_range_with_flush(
     flush: TlbFlush,
 ) -> Result<(), PageMapError> {
     let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let recursive_index = boot_info.recursive_index.into_option().unwrap();
+    let mut mapper = init_mapper(recursive_index);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     unsafe {

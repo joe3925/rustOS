@@ -124,7 +124,6 @@ unsafe fn copy_boot_info(src: &BootInfo) {
         flags: src.flags,
         memory_regions,
         framebuffer: copy_framebuffer(&src.framebuffer),
-        physical_memory_offset: src.physical_memory_offset,
         recursive_index: src.recursive_index,
         rsdp_addr: src.rsdp_addr,
         fdt_header: src.fdt_header,

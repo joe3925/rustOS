@@ -16,12 +16,6 @@ pub trait Platform {
 
 pub trait AddressSpacePlatform: Platform {
     fn current_page_table_root() -> Option<PhysAddr>;
-
-    fn translate_virtual_address(
-        physical_memory_offset: VirtAddr,
-        page_table_root: PhysAddr,
-        virt_addr: VirtAddr,
-    ) -> Option<PageTranslation>;
 }
 
 pub trait PortIoPlatform: Platform {
@@ -165,42 +159,9 @@ impl Not for PageFlags {
     }
 }
 
-pub const SIZE_4KIB: u64 = 4 * 1024;
-pub const SIZE_2MIB: u64 = 2 * 1024 * 1024;
-pub const SIZE_1GIB: u64 = 1024 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PageTranslation {
-    pub phys_addr: PhysAddr,
-    pub byte_len: u64,
-    pub offset: u64,
-}
-
 #[inline]
 pub fn current_page_table_root() -> Option<PhysAddr> {
     <ActivePlatform as AddressSpacePlatform>::current_page_table_root()
-}
-
-#[inline]
-pub fn translate_virtual_address(
-    physical_memory_offset: VirtAddr,
-    page_table_root: PhysAddr,
-    virt_addr: VirtAddr,
-) -> Option<PageTranslation> {
-    <ActivePlatform as AddressSpacePlatform>::translate_virtual_address(
-        physical_memory_offset,
-        page_table_root,
-        virt_addr,
-    )
-}
-
-#[inline]
-pub fn translate_current_virtual_address(
-    physical_memory_offset: VirtAddr,
-    virt_addr: VirtAddr,
-) -> Option<PageTranslation> {
-    let page_table_root = current_page_table_root()?;
-    translate_virtual_address(physical_memory_offset, page_table_root, virt_addr)
 }
 
 #[cfg(target_arch = "x86_64")]

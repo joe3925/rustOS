@@ -23,13 +23,13 @@ use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
-use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, IoBufferPageFrame, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::port::Port;
 use kernel_api::kernel_types::request::RequestData;
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -75,15 +75,14 @@ fn continue_req<K: RequestKind>(_req: &mut RequestHandle<'_, K>) -> DriverStep {
     DriverStep::Continue
 }
 
-fn phys_byte_ptr(phys_addr: u64) -> *mut u8 {
-    (PHYSICAL_MEMORY_OFFSET.as_u64() + phys_addr) as *mut u8
-}
-
 struct PhysCursor<'a> {
     frames: &'a [IoBufferPageFrame],
     frame_idx: usize,
     frame_offset: usize,
     remaining: usize,
+    mapped_frame_idx: Option<usize>,
+    mapped_base: VirtAddr,
+    mapped_size: u64,
 }
 
 impl<'a> PhysCursor<'a> {
@@ -118,6 +117,9 @@ impl<'a> PhysCursor<'a> {
             frame_idx: 0,
             frame_offset,
             remaining: len,
+            mapped_frame_idx: None,
+            mapped_base: VirtAddr::new(0),
+            mapped_size: 0,
         })
     }
 
@@ -127,6 +129,27 @@ impl<'a> PhysCursor<'a> {
             return None;
         }
         Some(frame.phys_addr + self.frame_offset as u64)
+    }
+
+    fn mapped_byte_ptr(&mut self) -> Option<*mut u8> {
+        if self.mapped_frame_idx != Some(self.frame_idx) {
+            self.unmap_current_frame();
+            let frame = self.frames.get(self.frame_idx)?;
+            let mapped = map_mmio_region(PhysAddr::new(frame.phys_addr), frame.byte_len).ok()?;
+            self.mapped_frame_idx = Some(self.frame_idx);
+            self.mapped_base = mapped;
+            self.mapped_size = frame.byte_len;
+        }
+
+        Some((self.mapped_base.as_u64() + self.frame_offset as u64) as *mut u8)
+    }
+
+    fn unmap_current_frame(&mut self) {
+        if self.mapped_frame_idx.take().is_some() {
+            let _ = unmap_mmio_region(self.mapped_base, self.mapped_size);
+            self.mapped_base = VirtAddr::new(0);
+            self.mapped_size = 0;
+        }
     }
 
     fn advance(&mut self) -> bool {
@@ -139,6 +162,7 @@ impl<'a> PhysCursor<'a> {
         self.remaining -= 1;
         self.frame_offset += 1;
         if self.frame_offset >= frame.byte_len as usize {
+            self.unmap_current_frame();
             self.frame_idx += 1;
             self.frame_offset = 0;
         }
@@ -149,7 +173,7 @@ impl<'a> PhysCursor<'a> {
         if self.remaining == 0 {
             return None;
         }
-        let ptr = phys_byte_ptr(self.phys_addr()?) as *const u8;
+        let ptr = self.mapped_byte_ptr()? as *const u8;
         let value = unsafe { core::ptr::read(ptr) };
         self.advance().then_some(value)
     }
@@ -158,10 +182,10 @@ impl<'a> PhysCursor<'a> {
         if self.remaining == 0 {
             return false;
         }
-        let Some(phys_addr) = self.phys_addr() else {
+        let Some(ptr) = self.mapped_byte_ptr() else {
             return false;
         };
-        unsafe { core::ptr::write(phys_byte_ptr(phys_addr), value) };
+        unsafe { core::ptr::write(ptr, value) };
         self.advance()
     }
 
@@ -173,6 +197,12 @@ impl<'a> PhysCursor<'a> {
 
     fn write_u16_le(&mut self, value: u16) -> bool {
         self.write_u8((value & 0xFF) as u8) && self.write_u8((value >> 8) as u8)
+    }
+}
+
+impl Drop for PhysCursor<'_> {
+    fn drop(&mut self) {
+        self.unmap_current_frame();
     }
 }
 

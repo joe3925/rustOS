@@ -124,11 +124,12 @@ unsafe extern "C" {
     pub fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags);
     pub fn map_mmio_region(mmio_base: PhysAddr, mmio_size: u64) -> Result<VirtAddr, PageMapError>;
     pub fn unmap_mmio_region(mmio_base: VirtAddr, mmio_size: u64) -> Result<(), PageMapError>;
+    pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
 
     // Registry (async FFI)
     pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
     pub fn reg_set_value(key_path: &str, name: &str, data: Data)
-        -> FfiFuture<Result<(), RegError>>;
+    -> FfiFuture<Result<(), RegError>>;
     pub fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>>;
     pub fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>>;
     pub fn reg_delete_value(key_path: &str, name: &str) -> FfiFuture<Result<bool, RegError>>;
@@ -189,7 +190,7 @@ unsafe extern "C" {
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
     pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit)
-        -> Arc<DeviceObject>;
+    -> Arc<DeviceObject>;
 
     pub fn pnp_create_control_device_and_link(
         name: String,
