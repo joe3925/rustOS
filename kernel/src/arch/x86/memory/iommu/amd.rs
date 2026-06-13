@@ -5,11 +5,11 @@
 
 use alloc::vec::Vec;
 
-use kernel_types::dma::DmaPciDeviceIdentity;
+use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
 use spin::Mutex;
 use x86_64::PhysAddr;
 
-use super::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo};
+use super::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo, X86PlatformDeviceRoute};
 use crate::memory::iommu::alloc_zeroed_pages_contiguous;
 use crate::memory::iommu::domain::{IommuDomain, IommuError};
 use crate::memory::iommu::page_table::{self, AMD_IR, AMD_IW, PTE_ADDR_MASK, PTE_P};
@@ -70,6 +70,7 @@ struct AmdUnit {
     iova_end: u64,
     segment: u16,
     device_entries: Vec<AmdIvhdDeviceEntry>,
+    platform_routes: Vec<X86PlatformDeviceRoute>,
     next_domain_id: u32,
 }
 
@@ -134,6 +135,7 @@ impl AmdViBackend {
                 iova_end,
                 segment: unit.segment,
                 device_entries: unit.device_entries.clone(),
+                platform_routes: unit.platform_routes.clone(),
                 next_domain_id: 1,
             });
         }
@@ -152,11 +154,7 @@ impl AmdViBackend {
             let mut inner = self.inner.lock();
             let unit_index = inner.select_unit_index(identity.segment, identity.requester_id)?;
             let unit = &mut inner.units[unit_index];
-            if unit.next_domain_id >= (u16::MAX as u32) {
-                return Err(IommuError::HardwareError);
-            }
-            let domain_id = unit.next_domain_id as u16;
-            unit.next_domain_id += 1;
+            let domain_id = allocate_domain_id(unit)?;
             (unit_index, domain_id, unit.iova_end)
         };
 
@@ -166,6 +164,35 @@ impl AmdViBackend {
             domain_id,
             identity.segment,
             identity.requester_id,
+            unit_index as u32,
+            iova_end,
+        ))
+    }
+
+    pub fn create_platform_domain(
+        &self,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> Result<IommuDomain, IommuError> {
+        let (unit_index, segment, source_id, domain_id, iova_end) = {
+            let mut inner = self.inner.lock();
+            let (unit_index, source_id) = inner.select_platform_route(identity)?;
+            let unit = &mut inner.units[unit_index];
+            let domain_id = allocate_domain_id(unit)?;
+            (
+                unit_index,
+                unit.segment,
+                source_id,
+                domain_id,
+                unit.iova_end,
+            )
+        };
+
+        let root_phys = page_table::alloc_root_table()?;
+        Ok(IommuDomain::new(
+            root_phys,
+            domain_id,
+            segment,
+            source_id,
             unit_index as u32,
             iova_end,
         ))
@@ -181,14 +208,29 @@ impl AmdViBackend {
             return Err(IommuError::HardwareError);
         }
 
-        let dte_requester_id =
-            resolve_requester_id_alias(unit, domain.requester_id).ok_or(IommuError::Unsupported)?;
-        write_dte(unit.dev_table_va, dte_requester_id, domain);
-        let commands = [
-            invalidate_dte_cmd(dte_requester_id),
-            invalidate_pages_cmd(domain.domain_id),
-        ];
-        submit_serialized(unit, &commands)
+        attach_source_id(unit, domain, domain.requester_id)
+    }
+
+    pub fn attach_platform(
+        &self,
+        domain: &IommuDomain,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> Result<(), IommuError> {
+        let mut inner = self.inner.lock();
+        let unit = inner
+            .units
+            .get_mut(domain.remapper_index as usize)
+            .ok_or(IommuError::HardwareError)?;
+        if unit.segment != domain.segment || !unit_has_platform_route(unit, identity) {
+            return Err(IommuError::Unsupported);
+        }
+
+        let end = platform_translation_id_end(identity)?;
+        for source_id in identity.iommu_id_base..end {
+            attach_source_id(unit, domain, source_id as u16)?;
+        }
+
+        Ok(())
     }
 
     #[inline]
@@ -277,6 +319,29 @@ impl AmdInner {
 
         Err(IommuError::Unsupported)
     }
+
+    fn select_platform_route(
+        &self,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> Result<(usize, u16), IommuError> {
+        validate_platform_identity(identity)?;
+
+        let mut found = None;
+        for (idx, unit) in self.units.iter().enumerate() {
+            for route in &unit.platform_routes {
+                if !platform_route_matches(route, identity) {
+                    continue;
+                }
+
+                let source_id = route.translation_id_base as u16;
+                if found.replace((idx, source_id)).is_some() {
+                    return Err(IommuError::Unsupported);
+                }
+            }
+        }
+
+        found.ok_or(IommuError::Unsupported)
+    }
 }
 
 fn calc_iova_end(va_bits: u8) -> u64 {
@@ -286,6 +351,75 @@ fn calc_iova_end(va_bits: u8) -> u64 {
         _ => 48,
     };
     1u64 << width
+}
+
+fn allocate_domain_id(unit: &mut AmdUnit) -> Result<u16, IommuError> {
+    if unit.next_domain_id >= (u16::MAX as u32) {
+        return Err(IommuError::HardwareError);
+    }
+
+    let domain_id = unit.next_domain_id as u16;
+    unit.next_domain_id += 1;
+    Ok(domain_id)
+}
+
+fn attach_source_id(
+    unit: &mut AmdUnit,
+    domain: &IommuDomain,
+    source_id: u16,
+) -> Result<(), IommuError> {
+    let dte_requester_id =
+        resolve_requester_id_alias(unit, source_id).ok_or(IommuError::Unsupported)?;
+    write_dte(unit.dev_table_va, dte_requester_id, domain);
+    let commands = [
+        invalidate_dte_cmd(dte_requester_id),
+        invalidate_pages_cmd(domain.domain_id),
+    ];
+    submit_serialized(unit, &commands)
+}
+
+fn validate_platform_identity(identity: DeviceMmuPlatformDeviceIdentity) -> Result<(), IommuError> {
+    if identity.iommu_id_count == 0 {
+        return Err(IommuError::Unsupported);
+    }
+
+    let Some(last) = identity
+        .iommu_id_base
+        .checked_add(identity.iommu_id_count - 1)
+    else {
+        return Err(IommuError::Unsupported);
+    };
+
+    if last > u16::MAX as u32 {
+        return Err(IommuError::Unsupported);
+    }
+
+    Ok(())
+}
+
+fn platform_translation_id_end(
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> Result<u32, IommuError> {
+    validate_platform_identity(identity)?;
+    identity
+        .iommu_id_base
+        .checked_add(identity.iommu_id_count)
+        .ok_or(IommuError::Unsupported)
+}
+
+fn unit_has_platform_route(unit: &AmdUnit, identity: DeviceMmuPlatformDeviceIdentity) -> bool {
+    unit.platform_routes
+        .iter()
+        .any(|route| platform_route_matches(route, identity))
+}
+
+fn platform_route_matches(
+    route: &X86PlatformDeviceRoute,
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> bool {
+    route.firmware_node == identity.firmware_node
+        && route.translation_id_base == identity.iommu_id_base
+        && route.translation_id_count == identity.iommu_id_count
 }
 
 fn require_host_dma_translation(register_base: u64, ext_features: u64) {

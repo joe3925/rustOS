@@ -9,6 +9,7 @@
 #![feature(const_trait_impl)]
 #![feature(specialization)]
 #![feature(try_trait_v2_residual)]
+#![feature(lazy_type_alias)]
 extern crate alloc;
 extern crate self as kernel_types;
 

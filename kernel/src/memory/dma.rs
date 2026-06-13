@@ -932,7 +932,7 @@ impl DmaManager {
         pdo: &Arc<DeviceObject>,
         identity: DeviceMmuPlatformDeviceIdentity,
     ) -> DriverStatus {
-        if identity.translation_id_count == 0 {
+        if identity.iommu_id_count == 0 {
             return DriverStatus::InvalidParameter;
         }
 

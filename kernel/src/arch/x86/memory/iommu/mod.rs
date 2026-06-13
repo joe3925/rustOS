@@ -7,7 +7,8 @@ use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
 use core::mem::size_of;
 use kernel_types::dma::{
-    DmaPciDeviceIdentity, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
+    DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity, DMA_IOMMU_VENDOR_AMD_IVRS,
+    DMA_IOMMU_VENDOR_INTEL_DMAR,
 };
 use raw_cpuid::CpuId;
 use spin::Mutex;
@@ -173,27 +174,39 @@ impl X86DeviceMmu {
                 let raw = backend.create_domain(identity).map_err(map_iommu_error)?;
                 let mut domains = domains.lock();
                 let (handle, raw) = domains.insert(raw);
-
-                Ok(DeviceMmuDomainInfo {
-                    domain_id: handle,
-                    translation_unit_index: raw.remapper_index,
-                    iova_start: raw.iova_start,
-                    iova_end: raw.iova_end,
-                    dma_page_size: PAGE_SIZE as u64,
-                })
+                Ok(domain_info_from_raw(handle, &raw))
             }
             Self::Amd { backend, domains } => {
                 let raw = backend.create_domain(identity).map_err(map_iommu_error)?;
                 let mut domains = domains.lock();
                 let (handle, raw) = domains.insert(raw);
+                Ok(domain_info_from_raw(handle, &raw))
+            }
+        }
+    }
 
-                Ok(DeviceMmuDomainInfo {
-                    domain_id: handle,
-                    translation_unit_index: raw.remapper_index,
-                    iova_start: raw.iova_start,
-                    iova_end: raw.iova_end,
-                    dma_page_size: PAGE_SIZE as u64,
-                })
+    fn create_platform_domain(
+        &self,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> DeviceMmuResult<DeviceMmuDomainInfo> {
+        validate_platform_translation_ids(identity)?;
+
+        match self {
+            Self::Intel { backend, domains } => {
+                let raw = backend
+                    .create_platform_domain(identity)
+                    .map_err(map_iommu_error)?;
+                let mut domains = domains.lock();
+                let (handle, raw) = domains.insert(raw);
+                Ok(domain_info_from_raw(handle, &raw))
+            }
+            Self::Amd { backend, domains } => {
+                let raw = backend
+                    .create_platform_domain(identity)
+                    .map_err(map_iommu_error)?;
+                let mut domains = domains.lock();
+                let (handle, raw) = domains.insert(raw);
+                Ok(domain_info_from_raw(handle, &raw))
             }
         }
     }
@@ -285,7 +298,7 @@ impl DeviceMmuBackend for X86DeviceMmu {
     ) -> DeviceMmuResult<DeviceMmuDomainInfo> {
         match identity {
             DeviceMmuDeviceIdentity::Pci(identity) => self.create_pci_domain(identity),
-            DeviceMmuDeviceIdentity::Platform(_) => Err(DeviceMmuError::Unsupported),
+            DeviceMmuDeviceIdentity::Platform(identity) => self.create_platform_domain(identity),
         }
     }
 
@@ -298,24 +311,42 @@ impl DeviceMmuBackend for X86DeviceMmu {
         domain: &DeviceMmuDomain,
         identity: DeviceMmuDeviceIdentity,
     ) -> DeviceMmuResult<DeviceMmuAttachment> {
-        let pci = match identity {
-            DeviceMmuDeviceIdentity::Pci(identity) => identity,
-            DeviceMmuDeviceIdentity::Platform(_) => return Err(DeviceMmuError::Unsupported),
-        };
-
         let raw = self.raw_domain(domain)?;
 
-        match self {
-            Self::Intel { backend, .. } => backend.attach(&raw).map_err(map_iommu_error)?,
-            Self::Amd { backend, .. } => backend.attach(&raw).map_err(map_iommu_error)?,
-        }
+        match identity {
+            DeviceMmuDeviceIdentity::Pci(pci) => {
+                match self {
+                    Self::Intel { backend, .. } => backend.attach(&raw).map_err(map_iommu_error)?,
+                    Self::Amd { backend, .. } => backend.attach(&raw).map_err(map_iommu_error)?,
+                }
 
-        Ok(DeviceMmuAttachment {
-            attachment_id: pci.requester_id as u64,
-            domain_id: domain.domain_id(),
-            translation_unit_index: raw.remapper_index,
-            reserved: 0,
-        })
+                Ok(DeviceMmuAttachment {
+                    attachment_id: pci.requester_id as u64,
+                    domain_id: domain.domain_id(),
+                    translation_unit_index: raw.remapper_index,
+                    reserved: 0,
+                })
+            }
+            DeviceMmuDeviceIdentity::Platform(platform) => {
+                validate_platform_translation_ids(platform)?;
+
+                match self {
+                    Self::Intel { backend, .. } => backend
+                        .attach_platform(&raw, platform)
+                        .map_err(map_iommu_error)?,
+                    Self::Amd { backend, .. } => backend
+                        .attach_platform(&raw, platform)
+                        .map_err(map_iommu_error)?,
+                }
+
+                Ok(DeviceMmuAttachment {
+                    attachment_id: platform_attachment_id(platform),
+                    domain_id: domain.domain_id(),
+                    translation_unit_index: raw.remapper_index,
+                    reserved: 0,
+                })
+            }
+        }
     }
 
     fn detach_device(&self, _domain: &DeviceMmuDomain, _attachment: DeviceMmuAttachment) {}
@@ -380,6 +411,41 @@ fn map_iommu_error(err: IommuError) -> DeviceMmuError {
     err
 }
 
+fn domain_info_from_raw(handle: u64, raw: &IommuDomain) -> DeviceMmuDomainInfo {
+    DeviceMmuDomainInfo {
+        domain_id: handle,
+        translation_unit_index: raw.remapper_index,
+        iova_start: raw.iova_start,
+        iova_end: raw.iova_end,
+        dma_page_size: PAGE_SIZE as u64,
+    }
+}
+
+fn validate_platform_translation_ids(
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> DeviceMmuResult<()> {
+    if identity.iommu_id_count == 0 {
+        return Err(DeviceMmuError::InvalidDevice);
+    }
+
+    let Some(last) = identity
+        .iommu_id_base
+        .checked_add(identity.iommu_id_count - 1)
+    else {
+        return Err(DeviceMmuError::InvalidDevice);
+    };
+
+    if last > u16::MAX as u32 {
+        return Err(DeviceMmuError::InvalidDevice);
+    }
+
+    Ok(())
+}
+
+fn platform_attachment_id(identity: DeviceMmuPlatformDeviceIdentity) -> u64 {
+    ((identity.iommu_id_base as u64) << 32) | identity.iommu_id_count as u64
+}
+
 #[derive(Debug)]
 pub enum X86PlatformIommuInfo {
     Intel(IntelPlatformIommuInfo),
@@ -402,6 +468,7 @@ pub struct IntelRemapperUnit {
     pub include_all: bool,
     pub proximity_domain: Option<u32>,
     pub device_scopes: Vec<IntelDeviceScope>,
+    pub platform_routes: Vec<X86PlatformDeviceRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +492,49 @@ pub struct IntelDeviceScope {
 pub struct IntelPciPath {
     pub device: u8,
     pub function: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86PlatformDeviceRoute {
+    pub firmware_node: u64,
+    pub translation_id_base: u32,
+    pub translation_id_count: u32,
+    pub flags: u32,
+}
+
+pub const X86_PLATFORM_ROUTE_FLAG_INTEL_DMAR_SCOPE: u32 = 1 << 0;
+pub const X86_PLATFORM_ROUTE_FLAG_AMD_IVRS_SPECIAL: u32 = 1 << 1;
+pub const X86_PLATFORM_ROUTE_FLAG_AMD_IVRS_ACPI_HID: u32 = 1 << 2;
+
+pub fn x86_intel_dmar_firmware_node(
+    scope_type: u8,
+    enumeration_id: u8,
+    start_bus: u8,
+    requester_id: u16,
+) -> u64 {
+    (1u64 << 56)
+        | ((scope_type as u64) << 48)
+        | ((enumeration_id as u64) << 40)
+        | ((start_bus as u64) << 32)
+        | requester_id as u64
+}
+
+pub fn x86_amd_special_firmware_node(variety: u8, handle: u8) -> u64 {
+    (2u64 << 56) | ((variety as u64) << 48) | ((handle as u64) << 40)
+}
+
+pub fn x86_amd_acpi_hid_firmware_node(
+    hardware_id: u64,
+    compatible_id: u64,
+    uid_type: u8,
+    uid_length: u8,
+) -> u64 {
+    let mut hash = fnv1a64_init();
+    hash = fnv1a64_u8(hash, 3);
+    hash = fnv1a64_u64(hash, hardware_id);
+    hash = fnv1a64_u64(hash, compatible_id);
+    hash = fnv1a64_u8(hash, uid_type);
+    fnv1a64_u8(hash, uid_length)
 }
 
 #[derive(Debug)]
@@ -452,6 +562,7 @@ pub struct AmdRemapperUnit {
     pub feature_reporting: u32,
     pub efr_image: Option<u64>,
     pub device_entries: Vec<AmdIvhdDeviceEntry>,
+    pub platform_routes: Vec<X86PlatformDeviceRoute>,
 }
 
 #[derive(Debug)]
@@ -593,6 +704,7 @@ fn parse_intel_dmar(tables: &AcpiTables<ACPIImpl>) -> IntelPlatformIommuInfo {
 
                 let unit = read_packed::<DmarHardwareUnit>(payload, offset);
                 let scopes = parse_intel_device_scopes(&subtable[size_of::<DmarHardwareUnit>()..]);
+                let platform_routes = build_intel_platform_routes(&scopes);
 
                 remapper_units.push(IntelRemapperUnit {
                     segment: unit.segment,
@@ -601,6 +713,7 @@ fn parse_intel_dmar(tables: &AcpiTables<ACPIImpl>) -> IntelPlatformIommuInfo {
                     include_all: (unit.flags & DMAR_INCLUDE_ALL) != 0,
                     proximity_domain: None,
                     device_scopes: scopes,
+                    platform_routes,
                 });
             }
             DMAR_TYPE_RESERVED_MEMORY => {
@@ -728,6 +841,8 @@ fn parse_amd_ivrs(tables: &AcpiTables<ACPIImpl>) -> AmdPlatformIommuInfo {
                         .expect("IVRS device entries are truncated"),
                 );
 
+                let platform_routes = build_amd_platform_routes(&device_entries);
+
                 remapper_units.push(AmdRemapperUnit {
                     block_type: header.block_type,
                     flags: header.flags,
@@ -739,6 +854,7 @@ fn parse_amd_ivrs(tables: &AcpiTables<ACPIImpl>) -> AmdPlatformIommuInfo {
                     feature_reporting,
                     efr_image,
                     device_entries,
+                    platform_routes,
                 });
             }
             IVRS_TYPE_MEMORY_ALL | IVRS_TYPE_MEMORY_SPECIFIED | IVRS_TYPE_MEMORY_RANGE => {
@@ -838,6 +954,103 @@ fn select_amd_ivhd_type(payload: &[u8]) -> u8 {
     }
 
     target_ivhd_type.unwrap_or(IVRS_TYPE_HARDWARE_10)
+}
+
+fn build_intel_platform_routes(scopes: &[IntelDeviceScope]) -> Vec<X86PlatformDeviceRoute> {
+    let mut routes = Vec::new();
+
+    for scope in scopes {
+        if !intel_scope_is_platform(scope.scope_type) {
+            continue;
+        }
+
+        let Some(requester_id) = intel_scope_requester_id(scope) else {
+            continue;
+        };
+
+        routes.push(X86PlatformDeviceRoute {
+            firmware_node: x86_intel_dmar_firmware_node(
+                scope.scope_type,
+                scope.enumeration_id,
+                scope.start_bus,
+                requester_id,
+            ),
+            translation_id_base: requester_id as u32,
+            translation_id_count: 1,
+            flags: X86_PLATFORM_ROUTE_FLAG_INTEL_DMAR_SCOPE,
+        });
+    }
+
+    routes
+}
+
+fn intel_scope_is_platform(scope_type: u8) -> bool {
+    !matches!(
+        scope_type,
+        DMAR_SCOPE_PCI_ENDPOINT | DMAR_SCOPE_PCI_SUB_HIERARCHY
+    )
+}
+
+fn intel_scope_requester_id(scope: &IntelDeviceScope) -> Option<u16> {
+    let last = scope.path.last()?;
+    Some(((scope.start_bus as u16) << 8) | ((last.device as u16) << 3) | last.function as u16)
+}
+
+fn build_amd_platform_routes(entries: &[AmdIvhdDeviceEntry]) -> Vec<X86PlatformDeviceRoute> {
+    let mut routes = Vec::new();
+
+    for entry in entries {
+        match entry {
+            AmdIvhdDeviceEntry::Special {
+                requester_id,
+                handle,
+                variety,
+                ..
+            } => routes.push(X86PlatformDeviceRoute {
+                firmware_node: x86_amd_special_firmware_node(*variety, *handle),
+                translation_id_base: *requester_id as u32,
+                translation_id_count: 1,
+                flags: X86_PLATFORM_ROUTE_FLAG_AMD_IVRS_SPECIAL,
+            }),
+            AmdIvhdDeviceEntry::AcpiHid {
+                requester_id,
+                hardware_id,
+                compatible_id,
+                uid_type,
+                uid_length,
+                ..
+            } => routes.push(X86PlatformDeviceRoute {
+                firmware_node: x86_amd_acpi_hid_firmware_node(
+                    *hardware_id,
+                    *compatible_id,
+                    *uid_type,
+                    *uid_length,
+                ),
+                translation_id_base: *requester_id as u32,
+                translation_id_count: 1,
+                flags: X86_PLATFORM_ROUTE_FLAG_AMD_IVRS_ACPI_HID,
+            }),
+            _ => {}
+        }
+    }
+
+    routes
+}
+
+fn fnv1a64_init() -> u64 {
+    0xcbf29ce484222325
+}
+
+fn fnv1a64_u8(hash: u64, value: u8) -> u64 {
+    (hash ^ value as u64).wrapping_mul(0x100000001b3)
+}
+
+fn fnv1a64_u64(mut hash: u64, value: u64) -> u64 {
+    for byte in value.to_le_bytes() {
+        hash = fnv1a64_u8(hash, byte);
+    }
+
+    hash
 }
 
 fn parse_intel_device_scopes(bytes: &[u8]) -> Vec<IntelDeviceScope> {
@@ -1130,6 +1343,8 @@ const DMAR_TYPE_RESERVED_MEMORY: u16 = 1;
 const DMAR_TYPE_HARDWARE_AFFINITY: u16 = 3;
 const DMAR_INCLUDE_ALL: u8 = 1;
 const DMAR_ALLOW_ALL: u16 = 1;
+const DMAR_SCOPE_PCI_ENDPOINT: u8 = 0x01;
+const DMAR_SCOPE_PCI_SUB_HIERARCHY: u8 = 0x02;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]

@@ -1514,7 +1514,7 @@ impl<K: RequestKind> Drop for Request<K> {
         self.complete_for_drop();
     }
 }
-type CompletionEntry<K> = (CompletionRoutine<K>, usize);
+type CompletionEntry<K: RequestKind> = (CompletionRoutine<K>, usize);
 
 extern "C" fn chained_completion<K: RequestKind>(
     req: &mut Request<K>,

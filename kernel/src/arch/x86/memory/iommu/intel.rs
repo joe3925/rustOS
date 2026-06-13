@@ -6,11 +6,11 @@
 
 use alloc::vec::Vec;
 
-use kernel_types::dma::DmaPciDeviceIdentity;
+use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
-use super::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo};
+use super::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo, X86PlatformDeviceRoute};
 use crate::memory::iommu::domain::{IommuDomain, IommuError};
 use crate::memory::iommu::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
 use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
@@ -62,6 +62,7 @@ struct VtdUnit {
     segment: u16,
     include_all: bool,
     device_scopes: Vec<IntelDeviceScope>,
+    platform_routes: Vec<X86PlatformDeviceRoute>,
     domain_id_count: u32,
     next_domain_id: u32,
 }
@@ -138,6 +139,7 @@ impl IntelVtdBackend {
                 segment: unit.segment,
                 include_all: unit.include_all,
                 device_scopes: unit.device_scopes.clone(),
+                platform_routes: unit.platform_routes.clone(),
                 domain_id_count,
                 next_domain_id: 1,
             });
@@ -157,12 +159,7 @@ impl IntelVtdBackend {
             let mut inner = self.inner.lock();
             let unit_index = inner.select_unit_index(identity)?;
             let unit = &mut inner.units[unit_index];
-            if unit.next_domain_id >= unit.domain_id_count {
-                return Err(IommuError::HardwareError);
-            }
-
-            let domain_id = unit.next_domain_id as u16;
-            unit.next_domain_id += 1;
+            let domain_id = allocate_domain_id(unit)?;
             (unit_index, domain_id, unit.iova_end)
         };
 
@@ -177,10 +174,36 @@ impl IntelVtdBackend {
         ))
     }
 
-    pub fn attach(&self, domain: &IommuDomain) -> Result<(), IommuError> {
-        let bus = (domain.requester_id >> 8) as u8;
-        let devfn = (domain.requester_id & 0xff) as u8;
+    pub fn create_platform_domain(
+        &self,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> Result<IommuDomain, IommuError> {
+        let (unit_index, segment, source_id, domain_id, iova_end) = {
+            let mut inner = self.inner.lock();
+            let (unit_index, source_id) = inner.select_platform_route(identity)?;
+            let unit = &mut inner.units[unit_index];
+            let domain_id = allocate_domain_id(unit)?;
+            (
+                unit_index,
+                unit.segment,
+                source_id,
+                domain_id,
+                unit.iova_end,
+            )
+        };
 
+        let root_phys = page_table::alloc_root_table()?;
+        Ok(IommuDomain::new(
+            root_phys,
+            domain_id,
+            segment,
+            source_id,
+            unit_index as u32,
+            iova_end,
+        ))
+    }
+
+    pub fn attach(&self, domain: &IommuDomain) -> Result<(), IommuError> {
         let mut inner = self.inner.lock();
         let unit = inner
             .units
@@ -190,31 +213,32 @@ impl IntelVtdBackend {
             return Err(IommuError::HardwareError);
         }
 
-        let ctx_phys = if unit.context_table_phys[bus as usize] != 0 {
-            unit.context_table_phys[bus as usize]
-        } else {
-            let new_ctx = page_table::alloc_root_table()?;
-            unit.context_table_phys[bus as usize] = new_ctx;
+        attach_source_id(unit, domain, domain.requester_id)?;
+        invalidate_context_domain(unit, domain.domain_id);
+        invalidate_domain_iotlb(unit, domain.domain_id);
+        Ok(())
+    }
 
-            write_table_pair(
-                unit.root_table_phys,
-                (bus as usize) * 2,
-                (new_ctx & PTE_ADDR_MASK) | 1,
-                0,
-            )?;
-            new_ctx
-        };
-
-        let qw0 = (domain.root_phys & PTE_ADDR_MASK) | 1;
-        let qw1 = AGAW_48 | ((domain.domain_id as u64) << 8);
-        write_table_pair(ctx_phys, (devfn as usize) * 2, qw0, qw1)?;
-
-        let ccmd = CCMD_ICC | CCMD_CIRG_DOMAIN | ((domain.domain_id as u64) << 16);
-        unsafe {
-            write_reg64(unit.reg_base_va, CCMD_REG, ccmd);
-            wait_bit_clear64(unit.reg_base_va, CCMD_REG, CCMD_ICC);
+    pub fn attach_platform(
+        &self,
+        domain: &IommuDomain,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> Result<(), IommuError> {
+        let mut inner = self.inner.lock();
+        let unit = inner
+            .units
+            .get_mut(domain.remapper_index as usize)
+            .ok_or(IommuError::HardwareError)?;
+        if unit.segment != domain.segment || !unit_has_platform_route(unit, identity) {
+            return Err(IommuError::Unsupported);
         }
 
+        let end = platform_translation_id_end(identity)?;
+        for source_id in identity.iommu_id_base..end {
+            attach_source_id(unit, domain, source_id as u16)?;
+        }
+
+        invalidate_context_domain(unit, domain.domain_id);
         invalidate_domain_iotlb(unit, domain.domain_id);
         Ok(())
     }
@@ -304,6 +328,122 @@ impl VtdInner {
 
         Err(IommuError::Unsupported)
     }
+
+    fn select_platform_route(
+        &self,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> Result<(usize, u16), IommuError> {
+        validate_platform_identity(identity)?;
+
+        let mut found = None;
+        for (idx, unit) in self.units.iter().enumerate() {
+            for route in &unit.platform_routes {
+                if !platform_route_matches(route, identity) {
+                    continue;
+                }
+
+                let source_id = route.translation_id_base as u16;
+                if found.replace((idx, source_id)).is_some() {
+                    return Err(IommuError::Unsupported);
+                }
+            }
+        }
+
+        found.ok_or(IommuError::Unsupported)
+    }
+}
+
+fn allocate_domain_id(unit: &mut VtdUnit) -> Result<u16, IommuError> {
+    if unit.next_domain_id >= unit.domain_id_count {
+        return Err(IommuError::HardwareError);
+    }
+
+    let domain_id = unit.next_domain_id as u16;
+    unit.next_domain_id += 1;
+    Ok(domain_id)
+}
+
+fn attach_source_id(
+    unit: &mut VtdUnit,
+    domain: &IommuDomain,
+    source_id: u16,
+) -> Result<(), IommuError> {
+    let bus = (source_id >> 8) as u8;
+    let devfn = (source_id & 0xff) as u8;
+    let ctx_phys = ensure_context_table(unit, bus)?;
+    let qw0 = (domain.root_phys & PTE_ADDR_MASK) | 1;
+    let qw1 = AGAW_48 | ((domain.domain_id as u64) << 8);
+    write_table_pair(ctx_phys, (devfn as usize) * 2, qw0, qw1)
+}
+
+fn ensure_context_table(unit: &mut VtdUnit, bus: u8) -> Result<u64, IommuError> {
+    if unit.context_table_phys[bus as usize] != 0 {
+        return Ok(unit.context_table_phys[bus as usize]);
+    }
+
+    let new_ctx = page_table::alloc_root_table()?;
+    unit.context_table_phys[bus as usize] = new_ctx;
+
+    write_table_pair(
+        unit.root_table_phys,
+        (bus as usize) * 2,
+        (new_ctx & PTE_ADDR_MASK) | 1,
+        0,
+    )?;
+
+    Ok(new_ctx)
+}
+
+fn invalidate_context_domain(unit: &VtdUnit, domain_id: u16) {
+    let ccmd = CCMD_ICC | CCMD_CIRG_DOMAIN | ((domain_id as u64) << 16);
+    unsafe {
+        write_reg64(unit.reg_base_va, CCMD_REG, ccmd);
+        wait_bit_clear64(unit.reg_base_va, CCMD_REG, CCMD_ICC);
+    }
+}
+
+fn validate_platform_identity(identity: DeviceMmuPlatformDeviceIdentity) -> Result<(), IommuError> {
+    if identity.iommu_id_count == 0 {
+        return Err(IommuError::Unsupported);
+    }
+
+    let Some(last) = identity
+        .iommu_id_base
+        .checked_add(identity.iommu_id_count - 1)
+    else {
+        return Err(IommuError::Unsupported);
+    };
+
+    if last > u16::MAX as u32 {
+        return Err(IommuError::Unsupported);
+    }
+
+    Ok(())
+}
+
+fn platform_translation_id_end(
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> Result<u32, IommuError> {
+    validate_platform_identity(identity)?;
+    identity
+        .iommu_id_base
+        .checked_add(identity.iommu_id_count)
+        .ok_or(IommuError::Unsupported)
+}
+
+fn unit_has_platform_route(unit: &VtdUnit, identity: DeviceMmuPlatformDeviceIdentity) -> bool {
+    unit.platform_routes
+        .iter()
+        .any(|route| platform_route_matches(route, identity))
+}
+
+fn platform_route_matches(
+    route: &X86PlatformDeviceRoute,
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> bool {
+    route.firmware_node == identity.firmware_node
+        && route.translation_id_base == identity.iommu_id_base
+        && route.translation_id_count == identity.iommu_id_count
 }
 
 #[inline]
