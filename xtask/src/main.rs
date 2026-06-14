@@ -661,7 +661,7 @@ fn qemu_args(
     options: &QemuOptions,
 ) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| "8G".to_string());
-    let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
+    let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "10".to_string());
     let accel = qemu_accel(qemu, options);
     let iommu_device = qemu_iommu_device(&accel);
     let gdb = format!("tcp::{}", options.gdb_port);

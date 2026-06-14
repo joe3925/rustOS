@@ -1,4 +1,3 @@
-// lib.rs (or main driver file)
 #![no_std]
 #![no_main]
 #![feature(const_option_ops)]
