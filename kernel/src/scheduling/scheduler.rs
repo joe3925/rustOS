@@ -5,7 +5,9 @@ use crate::idt::SCHED_IPI_VECTOR;
 use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
-use crate::scheduling::domain::{DomainMaster, EnqueueReason, SwitchOutOutcome, TaskSchedBinding};
+use crate::scheduling::domain::{
+    DomainMaster, EnqueueReason, RoundRobinDomainAlgorithm, SwitchOutOutcome, TaskSchedBinding,
+};
 use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding};
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{BlockReason, SchedState, State};
@@ -87,7 +89,7 @@ struct SchedulerState {
 pub struct Scheduler {
     all_tasks: TaskTable,
     cores: IrqSafeRwLock<Vec<Arc<CoreScheduler>>>,
-    domains: DomainMaster,
+    domains: DomainMaster<RoundRobinDomainAlgorithm>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
 }
@@ -118,7 +120,7 @@ impl Scheduler {
 
     #[inline(always)]
     fn build_core(&self, cpu_id: usize, platform_cpu_id: usize) -> Arc<CoreScheduler> {
-        let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Huge, "".into(), 0);
+        let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
 
         idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
         idle.inner.write().context.r11 = 0x890189d70ecaca7f;

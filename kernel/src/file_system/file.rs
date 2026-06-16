@@ -5,8 +5,8 @@ use crate::benchmarking::bench_runtime_executor_async;
 use crate::benchmarking::used_memory;
 use crate::benchmarking::yield_once;
 
-use crate::benchmarking::BenchWindow;
 use crate::benchmarking::bench_c_drive_io;
+use crate::benchmarking::BenchWindow;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::static_handlers::print;
 use crate::util::trigger_triple_fault;
@@ -25,12 +25,12 @@ use kernel_types::{
 use rand_core::block;
 
 use crate::file_system::file_provider::provider;
-use crate::scheduling::runtime::runtime::JoinAll;
 use crate::scheduling::runtime::runtime::spawn;
+use crate::scheduling::runtime::runtime::JoinAll;
 
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
-    file_system::file_provider::{self, ProviderKind, install_file_provider},
+    file_system::file_provider::{self, install_file_provider, ProviderKind},
     memory::paging::used_bytes,
     platform::wait_duration,
     println,
@@ -412,10 +412,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     //
     spawn_detached(async move {
         loop {
-            bench_async_vs_sync_call_latency_async().await;
-            bench_runtime_executor_async().await;
+            // bench_async_vs_sync_call_latency_async().await;
+            // bench_runtime_executor_async().await;
             bench_c_drive_io_async(true).await;
-            test_full_heap_parallel();
+            //test_full_heap_parallel();
         }
         // loop {
         //     bench_c_drive_io_async().await;

@@ -146,7 +146,7 @@ pub unsafe fn init() {
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
         0,
-        StackSize::Huge,
+        StackSize::Tiny,
         "kernel".into(),
         0,
     ));

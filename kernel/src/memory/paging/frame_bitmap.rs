@@ -7,9 +7,10 @@ use super::layout::{align_up, base_page_size, low_physical_reserve_bytes};
 const EARLY_BOOT_BITMAP_STORAGE_BYTES: usize = 128 * 1024;
 const EARLY_BOOT_FRAME_BITMAP_WORDS: usize =
     EARLY_BOOT_BITMAP_STORAGE_BYTES / core::mem::size_of::<u64>();
+const WORD_BITS: usize = u64::BITS as usize;
 
 const fn early_boot_frame_capacity() -> usize {
-    EARLY_BOOT_FRAME_BITMAP_WORDS * u64::BITS as usize
+    EARLY_BOOT_FRAME_BITMAP_WORDS * WORD_BITS
 }
 
 pub struct FrameBitmap {
@@ -125,8 +126,7 @@ pub fn bitmap_layout_for_physical_coverage(
 }
 
 fn bitmap_words_for_frames(frames: usize) -> Option<usize> {
-    let word_bits = u64::BITS as usize;
-    frames.checked_add(word_bits - 1).map(|v| v / word_bits)
+    frames.checked_add(WORD_BITS - 1).map(|v| v / WORD_BITS)
 }
 
 pub fn heap_bitmap(words: usize, fill: u64) -> Result<Vec<u64>, BitmapResizeError> {
@@ -195,14 +195,18 @@ pub fn range_fits_bitmap(bitmap: &FrameBitmap, start: usize, len: usize) -> bool
 }
 
 pub fn preserve_set_bits_limited(dst: &mut [u64], src: &[u64], frames: usize) {
-    let full_words = frames / u64::BITS as usize;
+    if frames == 0 {
+        return;
+    }
+
+    let full_words = frames / WORD_BITS;
     let common_full_words = core::cmp::min(full_words, core::cmp::min(dst.len(), src.len()));
 
     for idx in 0..common_full_words {
         dst[idx] |= src[idx];
     }
 
-    let rem = frames & (u64::BITS as usize - 1);
+    let rem = frames & (WORD_BITS - 1);
     if rem == 0 {
         return;
     }
@@ -214,19 +218,60 @@ pub fn preserve_set_bits_limited(dst: &mut [u64], src: &[u64], frames: usize) {
     dst[full_words] |= src[full_words] & low_bits_mask(rem);
 }
 
+pub fn preserve_reclaimed_free_bits_limited(
+    dst_memory: &mut [u64],
+    old_memory: &[u64],
+    old_reclaimed: &[u64],
+    frames: usize,
+) {
+    if frames == 0 {
+        return;
+    }
+
+    let full_words = frames / WORD_BITS;
+    let common_full_words = core::cmp::min(
+        full_words,
+        core::cmp::min(
+            dst_memory.len(),
+            core::cmp::min(old_memory.len(), old_reclaimed.len()),
+        ),
+    );
+
+    for idx in 0..common_full_words {
+        let reclaimed_free = old_reclaimed[idx] & !old_memory[idx];
+        dst_memory[idx] &= !reclaimed_free;
+    }
+
+    let rem = frames & (WORD_BITS - 1);
+    if rem == 0 {
+        return;
+    }
+
+    if full_words >= dst_memory.len()
+        || full_words >= old_memory.len()
+        || full_words >= old_reclaimed.len()
+    {
+        return;
+    }
+
+    let mask = low_bits_mask(rem);
+    let reclaimed_free = old_reclaimed[full_words] & !old_memory[full_words] & mask;
+    dst_memory[full_words] &= !reclaimed_free;
+}
+
 pub fn count_set_bits_up_to(bitmap: &[u64], frames: usize) -> usize {
     if frames == 0 || bitmap.is_empty() {
         return 0;
     }
 
-    let full_words = core::cmp::min(frames / u64::BITS as usize, bitmap.len());
+    let full_words = core::cmp::min(frames / WORD_BITS, bitmap.len());
     let mut count = 0usize;
 
     for word in &bitmap[..full_words] {
         count += word.count_ones() as usize;
     }
 
-    let rem = frames & (u64::BITS as usize - 1);
+    let rem = frames & (WORD_BITS - 1);
     if rem != 0 && full_words < bitmap.len() {
         count += (bitmap[full_words] & low_bits_mask(rem)).count_ones() as usize;
     }
@@ -235,8 +280,8 @@ pub fn count_set_bits_up_to(bitmap: &[u64], frames: usize) -> usize {
 }
 
 pub fn set_bit(bitmap: &mut [u64], idx: usize) {
-    let w = idx / u64::BITS as usize;
-    let b = idx & (u64::BITS as usize - 1);
+    let w = idx / WORD_BITS;
+    let b = idx & (WORD_BITS - 1);
     if w >= bitmap.len() {
         return;
     }
@@ -244,85 +289,83 @@ pub fn set_bit(bitmap: &mut [u64], idx: usize) {
 }
 
 pub fn bit_is_set(bitmap: &[u64], idx: usize) -> bool {
-    let w = idx / u64::BITS as usize;
-    let b = idx & (u64::BITS as usize - 1);
+    let w = idx / WORD_BITS;
+    let b = idx & (WORD_BITS - 1);
     w < bitmap.len() && (bitmap[w] & (1u64 << b)) != 0
 }
 
 pub fn set_range(bitmap: &mut [u64], start: usize, len: usize) {
-    if len == 0 {
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    if len == 0 || bitmap.is_empty() {
         return;
     }
 
-    let words = bitmap.len();
-    if words == 0 {
+    let total_bits = bitmap.len().saturating_mul(WORD_BITS);
+    if start >= total_bits {
         return;
     }
 
-    let word_bits = u64::BITS as usize;
-    if start / word_bits >= words {
+    let end = core::cmp::min(end, total_bits);
+    if start >= end {
         return;
     }
 
-    let end_incl = start + len - 1;
-    let max_bit = words * word_bits - 1;
-    let end_incl = core::cmp::min(end_incl, max_bit);
-
-    let first_word = start / word_bits;
-    let last_word = end_incl / word_bits;
+    let first_word = start / WORD_BITS;
+    let last_word = (end - 1) / WORD_BITS;
+    let first_bit = start & (WORD_BITS - 1);
+    let last_bit = (end - 1) & (WORD_BITS - 1);
 
     if first_word == last_word {
-        let mask = ((!0u64) << (start & (word_bits - 1)))
-            & ((!0u64) >> ((word_bits - 1) - (end_incl & (word_bits - 1))));
-        bitmap[first_word] |= mask;
+        bitmap[first_word] |= bit_range_mask(first_bit, last_bit);
         return;
     }
 
-    bitmap[first_word] |= !0u64 << (start & (word_bits - 1));
+    bitmap[first_word] |= !0u64 << first_bit;
 
-    for word in bitmap.iter_mut().take(last_word).skip(first_word + 1) {
-        *word = !0u64;
+    if first_word + 1 < last_word {
+        bitmap[first_word + 1..last_word].fill(u64::MAX);
     }
 
-    bitmap[last_word] |= !0u64 >> ((word_bits - 1) - (end_incl & (word_bits - 1)));
+    bitmap[last_word] |= low_bits_mask(last_bit + 1);
 }
 
 pub fn clear_range(bitmap: &mut [u64], start: usize, len: usize) {
-    if len == 0 {
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    if len == 0 || bitmap.is_empty() {
         return;
     }
 
-    let words = bitmap.len();
-    if words == 0 {
+    let total_bits = bitmap.len().saturating_mul(WORD_BITS);
+    if start >= total_bits {
         return;
     }
 
-    let word_bits = u64::BITS as usize;
-    if start / word_bits >= words {
+    let end = core::cmp::min(end, total_bits);
+    if start >= end {
         return;
     }
 
-    let end_incl = start + len - 1;
-    let max_bit = words * word_bits - 1;
-    let end_incl = core::cmp::min(end_incl, max_bit);
-
-    let first_word = start / word_bits;
-    let last_word = end_incl / word_bits;
+    let first_word = start / WORD_BITS;
+    let last_word = (end - 1) / WORD_BITS;
+    let first_bit = start & (WORD_BITS - 1);
+    let last_bit = (end - 1) & (WORD_BITS - 1);
 
     if first_word == last_word {
-        let mask = ((!0u64) << (start & (word_bits - 1)))
-            & ((!0u64) >> ((word_bits - 1) - (end_incl & (word_bits - 1))));
-        bitmap[first_word] &= !mask;
+        bitmap[first_word] &= !bit_range_mask(first_bit, last_bit);
         return;
     }
 
-    bitmap[first_word] &= !(!0u64 << (start & (word_bits - 1)));
+    bitmap[first_word] &= low_bits_mask(first_bit);
 
-    for word in bitmap.iter_mut().take(last_word).skip(first_word + 1) {
-        *word = 0;
+    if first_word + 1 < last_word {
+        bitmap[first_word + 1..last_word].fill(0);
     }
 
-    bitmap[last_word] &= !(!0u64 >> ((word_bits - 1) - (end_incl & (word_bits - 1))));
+    bitmap[last_word] &= !low_bits_mask(last_bit + 1);
 }
 
 pub fn set_range_count_new(
@@ -331,76 +374,107 @@ pub fn set_range_count_new(
     start: usize,
     len: usize,
 ) -> usize {
-    if len == 0 || start >= frame_capacity {
+    let Some(end) = start.checked_add(len) else {
+        return 0;
+    };
+    if len == 0 || start >= frame_capacity || bitmap.is_empty() {
         return 0;
     }
 
-    let end = start.saturating_add(len).min(frame_capacity);
-    let mut new_bits = 0usize;
-    let word_bits = u64::BITS as usize;
-
-    for idx in start..end {
-        let w = idx / word_bits;
-        let b = idx & (word_bits - 1);
-        if w >= bitmap.len() {
-            break;
-        }
-
-        let mask = 1u64 << b;
-        if bitmap[w] & mask == 0 {
-            bitmap[w] |= mask;
-            new_bits += 1;
-        }
+    let end = core::cmp::min(end, frame_capacity);
+    let total_bits = bitmap.len().saturating_mul(WORD_BITS);
+    let end = core::cmp::min(end, total_bits);
+    if start >= end {
+        return 0;
     }
 
+    let first_word = start / WORD_BITS;
+    let last_word = (end - 1) / WORD_BITS;
+    let first_bit = start & (WORD_BITS - 1);
+    let last_bit = (end - 1) & (WORD_BITS - 1);
+    let mut new_bits = 0usize;
+
+    if first_word == last_word {
+        return set_word_bits_count_new(
+            &mut bitmap[first_word],
+            bit_range_mask(first_bit, last_bit),
+        );
+    }
+
+    new_bits += set_word_bits_count_new(&mut bitmap[first_word], !0u64 << first_bit);
+
+    for word in &mut bitmap[first_word + 1..last_word] {
+        let old = *word;
+        new_bits += (!old).count_ones() as usize;
+        *word = u64::MAX;
+    }
+
+    new_bits += set_word_bits_count_new(&mut bitmap[last_word], low_bits_mask(last_bit + 1));
     new_bits
 }
 
 pub fn range_all_set(bitmap: &[u64], frame_capacity: usize, start: usize, len: usize) -> bool {
-    if len == 0 {
-        return true;
-    }
-
     let Some(end) = start.checked_add(len) else {
         return false;
     };
-    if end > frame_capacity {
+    if len == 0 {
+        return true;
+    }
+    if end > frame_capacity || bitmap.is_empty() {
         return false;
     }
 
-    let word_bits = u64::BITS as usize;
-    for idx in start..end {
-        let w = idx / word_bits;
-        let b = idx & (word_bits - 1);
-        if w >= bitmap.len() || bitmap[w] & (1u64 << b) == 0 {
+    let total_bits = bitmap.len().saturating_mul(WORD_BITS);
+    if end > total_bits {
+        return false;
+    }
+
+    let first_word = start / WORD_BITS;
+    let last_word = (end - 1) / WORD_BITS;
+    let first_bit = start & (WORD_BITS - 1);
+    let last_bit = (end - 1) & (WORD_BITS - 1);
+
+    if first_word == last_word {
+        let mask = bit_range_mask(first_bit, last_bit);
+        return bitmap[first_word] & mask == mask;
+    }
+
+    let first_mask = !0u64 << first_bit;
+    if bitmap[first_word] & first_mask != first_mask {
+        return false;
+    }
+
+    for word in &bitmap[first_word + 1..last_word] {
+        if *word != u64::MAX {
             return false;
         }
     }
 
-    true
+    let last_mask = low_bits_mask(last_bit + 1);
+    bitmap[last_word] & last_mask == last_mask
 }
 
 pub fn first_set_bit_in_range(bitmap: &[u64], start: usize, end: usize) -> Option<usize> {
-    if start >= end {
+    if start >= end || bitmap.is_empty() {
         return None;
     }
-    let word_bits = u64::BITS as usize;
-    let total_bits = bitmap.len() * word_bits;
+
+    let total_bits = bitmap.len().saturating_mul(WORD_BITS);
     let end = end.min(total_bits);
     if start >= end {
         return None;
     }
 
-    let first_word = start / word_bits;
-    let last_word = (end - 1) / word_bits;
-    let start_bit = start & (word_bits - 1);
+    let first_word = start / WORD_BITS;
+    let last_word = (end - 1) / WORD_BITS;
+    let start_bit = start & (WORD_BITS - 1);
 
     if first_word == last_word {
-        let last_bit = (end - 1) & (word_bits - 1);
-        let mask = (!0u64 << start_bit) & (!0u64 >> ((word_bits - 1) - last_bit));
+        let last_bit = (end - 1) & (WORD_BITS - 1);
+        let mask = bit_range_mask(start_bit, last_bit);
         let word = bitmap[first_word] & mask;
         return if word != 0 {
-            Some(first_word * word_bits + word.trailing_zeros() as usize)
+            Some(first_word * WORD_BITS + word.trailing_zeros() as usize)
         } else {
             None
         };
@@ -408,24 +482,19 @@ pub fn first_set_bit_in_range(bitmap: &[u64], start: usize, end: usize) -> Optio
 
     let word = bitmap[first_word] & (!0u64 << start_bit);
     if word != 0 {
-        return Some(first_word * word_bits + word.trailing_zeros() as usize);
+        return Some(first_word * WORD_BITS + word.trailing_zeros() as usize);
     }
 
-    for (w, word) in bitmap
-        .iter()
-        .enumerate()
-        .take(last_word)
-        .skip(first_word + 1)
-    {
+    for (w, word) in bitmap[first_word + 1..last_word].iter().enumerate() {
         if *word != 0 {
-            return Some(w * word_bits + word.trailing_zeros() as usize);
+            return Some((first_word + 1 + w) * WORD_BITS + word.trailing_zeros() as usize);
         }
     }
 
-    let last_bit = (end - 1) & (word_bits - 1);
-    let word = bitmap[last_word] & (!0u64 >> ((word_bits - 1) - last_bit));
+    let last_bit = (end - 1) & (WORD_BITS - 1);
+    let word = bitmap[last_word] & low_bits_mask(last_bit + 1);
     if word != 0 {
-        Some(last_word * word_bits + word.trailing_zeros() as usize)
+        Some(last_word * WORD_BITS + word.trailing_zeros() as usize)
     } else {
         None
     }
@@ -436,13 +505,12 @@ pub fn mark_unused_tail_bits_allocated(bitmap: &mut [u64], frames: usize) {
         return;
     }
 
-    let word_bits = u64::BITS as usize;
-    let rem = frames & (word_bits - 1);
+    let rem = frames & (WORD_BITS - 1);
     if rem == 0 {
         return;
     }
 
-    let last_word = frames / word_bits;
+    let last_word = frames / WORD_BITS;
     if last_word < bitmap.len() {
         bitmap[last_word] |= !low_bits_mask(rem);
     }
@@ -453,13 +521,12 @@ pub fn clear_unused_tail_bits(bitmap: &mut [u64], frames: usize) {
         return;
     }
 
-    let word_bits = u64::BITS as usize;
-    let rem = frames & (word_bits - 1);
+    let rem = frames & (WORD_BITS - 1);
     if rem == 0 {
         return;
     }
 
-    let last_word = frames / word_bits;
+    let last_word = frames / WORD_BITS;
     if last_word < bitmap.len() {
         bitmap[last_word] &= low_bits_mask(rem);
     }
@@ -476,10 +543,23 @@ pub fn low_reserved_frames() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+fn set_word_bits_count_new(word: &mut u64, mask: u64) -> usize {
+    let old = *word;
+    let new = old | mask;
+    *word = new;
+    (new ^ old).count_ones() as usize
+}
+
+fn bit_range_mask(first_bit: usize, last_bit: usize) -> u64 {
+    let lower = !0u64 << first_bit;
+    let upper = low_bits_mask(last_bit + 1);
+    lower & upper
+}
+
 fn low_bits_mask(bits: usize) -> u64 {
     if bits == 0 {
         0
-    } else if bits >= u64::BITS as usize {
+    } else if bits >= WORD_BITS {
         u64::MAX
     } else {
         (1u64 << bits) - 1

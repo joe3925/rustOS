@@ -75,7 +75,7 @@ use spin::{Mutex, Once};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64 {
-    let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge, name, 0);
+    let task = Task::new_kernel_mode(entry, ctx, StackSize::Tiny, name, 0);
     SCHEDULER.add_task(task)
 }
 
