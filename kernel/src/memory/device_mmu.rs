@@ -366,8 +366,7 @@ impl DeviceMmuSystem {
         if !rec.is_identity {
             domain.free_iova(rec.iova_base, len);
         }
-
-        self.invalidate_range(domain, rec.iova_base, len)
+        Ok(())
     }
 
     pub fn invalidate_range(

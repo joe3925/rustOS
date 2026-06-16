@@ -1,15 +1,15 @@
 use self::ApicErrors::{AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
-use crate::KERNEL_INITIALIZED;
 use crate::arch::drivers::timer_driver::set_num_cores;
 use crate::cpu::{self, get_cpu_info};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::machine::MachineInterruptInfo;
-use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
+use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{CORE_LOCK, CPU_ID, INIT_LOCK, boot_info};
+use crate::util::{boot_info, CORE_LOCK, CPU_ID, INIT_LOCK};
+use crate::KERNEL_INITIALIZED;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -24,13 +24,13 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::sgdt;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::DescriptorTablePointer;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame};
+use x86_64::structures::DescriptorTablePointer;
 use x86_64::{PhysAddr, VirtAddr};
 
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
 pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 0x8;
-pub(crate) const APIC_START_PERIOD: u64 = 250000;
+pub(crate) const APIC_START_PERIOD: u64 = 500000;
 
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });

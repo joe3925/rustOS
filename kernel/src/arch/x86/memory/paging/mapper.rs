@@ -104,23 +104,6 @@ pub fn resolve_mapping(virt: AbiVirtAddr) -> Option<ResolvedMapping> {
     })
 }
 
-pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    let recursive_index = boot_info().recursive_index.into_option()?;
-    let mapper = init_mapper(recursive_index);
-    let res = mapper.translate(addr);
-    match res {
-        x86_64::structures::paging::mapper::TranslateResult::Mapped { frame, offset, .. } => {
-            let size = match frame {
-                MappedFrame::Size4KiB(_) => Size4KiB::SIZE,
-                MappedFrame::Size2MiB(_) => Size2MiB::SIZE,
-                MappedFrame::Size1GiB(_) => Size1GiB::SIZE,
-            };
-            Some((size, frame.start_address() + offset))
-        }
-        _ => None,
-    }
-}
-
 pub fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     let recursive_index = boot_info().recursive_index.into_option()?;
     let rec = u64::from(recursive_index);

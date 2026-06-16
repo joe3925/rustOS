@@ -165,7 +165,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         boot_usable_bytes()
     ));
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(max(4, crate::platform::processor_count()), 1_000_000);
+    GlobalAsyncExecutor::global().init(crate::platform::processor_count(), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let mut program = Program::new(

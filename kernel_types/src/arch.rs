@@ -12,6 +12,7 @@ compile_error!("kernel_types does not have an implementation for this target arc
 
 pub trait Platform {
     const NAME: &'static str;
+    fn cycle_counter() -> u64;
 }
 
 pub trait PortIoPlatform: Platform {

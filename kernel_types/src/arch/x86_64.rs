@@ -5,6 +5,19 @@ pub struct X86Platform;
 
 impl Platform for X86Platform {
     const NAME: &'static str = "x86_64";
+    fn cycle_counter() -> u64 {
+        let lo: u32;
+        let hi: u32;
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        ((hi as u64) << 32) | (lo as u64)
+    }
 }
 
 impl PortIoPlatform for X86Platform {
