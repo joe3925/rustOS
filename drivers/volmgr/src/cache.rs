@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use kernel_api::util::random_number;
 use schnellru::{LruMap, Unlimited};
 
-use crate::cache_core::VolumeCache;
+use crate::cache_core::core::VolumeCache;
 use crate::cache_traits::{CacheConfig, CacheError, VolumeCacheBackend};
 
 pub trait CacheIndex<V>: Send {

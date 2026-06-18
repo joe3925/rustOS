@@ -46,7 +46,7 @@ use kernel_api::status::DriverStatus;
 
 use spin::Once;
 
-use crate::cache_core::VolumeCache;
+use crate::cache_core::core::VolumeCache;
 use crate::cache_traits::{CacheConfig, CacheError, VolumeCacheBackend, VolumeCacheOps};
 
 mod cache;

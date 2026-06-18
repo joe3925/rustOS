@@ -1,17 +1,15 @@
-use super::cache::{CacheIndex, CacheIndexFactory, DefaultIndexFactory};
-use super::cache_traits::{
+use crate::alloc::vec::Vec;
+use crate::cache::{CacheIndex, CacheIndexFactory, DefaultIndexFactory};
+use crate::cache_traits::{
     CacheConfig, CacheError, CacheStats, VolumeCacheBackend, VolumeCacheOps,
 };
-use crate::alloc::vec::Vec;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cmp::min;
 use core::hint::{cold_path, likely, unlikely};
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use futures::future::{FutureExt as FuturesFutureExt, Shared};
-use kernel_api::async_ffi::FfiFuture;
+use futures::future::FutureExt as FuturesFutureExt;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
     Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IoBuffer, ToDevice,
@@ -20,7 +18,12 @@ use kernel_api::println;
 use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
-use spin::{Mutex, RwLock};
+use spin::Mutex;
+
+use super::flush::{
+    FlushFilter, FlushJobHandle, FlushRunScratchLease, FlushScratch, PreparedFlushPage,
+};
+use super::page::{Page, PagePool, PageUseGuard};
 
 struct StatsInner {
     read_hits: AtomicU64,
@@ -80,95 +83,6 @@ impl StatsInner {
 }
 
 #[repr(C, align(4096))]
-struct PageBuf<const BLOCK_SIZE: usize> {
-    bytes: [u8; BLOCK_SIZE],
-}
-
-impl<const BLOCK_SIZE: usize> PageBuf<BLOCK_SIZE> {
-    fn zeroed() -> Box<Self> {
-        Box::new(Self {
-            bytes: [0u8; BLOCK_SIZE],
-        })
-    }
-}
-
-struct Page<const BLOCK_SIZE: usize> {
-    data: RwLock<Box<PageBuf<BLOCK_SIZE>>>,
-    dirty: AtomicBool,
-    writeback: AtomicBool,
-    generation: AtomicU64,
-    wb_generation: AtomicU64,
-    active_ops: AtomicUsize,
-    /// File-level owner tag. 0 = unowned; owner-targeted flushes only match
-    /// explicit non-zero owners.
-    owner: AtomicU64,
-}
-
-impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
-    fn new_zeroed() -> Option<Self> {
-        Some(Self {
-            data: RwLock::new(PageBuf::zeroed()),
-            dirty: AtomicBool::new(false),
-            writeback: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
-            wb_generation: AtomicU64::new(0),
-            active_ops: AtomicUsize::new(0),
-            owner: AtomicU64::new(0),
-        })
-    }
-
-    fn mark_dirty(&self) -> bool {
-        self.owner.store(0, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        !self.dirty.swap(true, Ordering::AcqRel)
-    }
-
-    fn mark_dirty_with_owner(&self, owner: u64) -> bool {
-        self.owner.store(owner, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        !self.dirty.swap(true, Ordering::AcqRel)
-    }
-
-    fn enter_use(&self) {
-        self.active_ops.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn leave_use(&self) {
-        self.active_ops.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    fn reset_for_reuse(&self) {
-        self.dirty.store(false, Ordering::Release);
-        self.writeback.store(false, Ordering::Release);
-        self.generation.store(0, Ordering::Release);
-        self.wb_generation.store(0, Ordering::Release);
-        self.active_ops.store(0, Ordering::Release);
-        self.owner.store(0, Ordering::Release);
-    }
-
-    fn is_evictable(&self) -> bool {
-        !self.dirty.load(Ordering::Acquire)
-            && !self.writeback.load(Ordering::Acquire)
-            && self.active_ops.load(Ordering::Acquire) == 0
-    }
-}
-
-struct PageUseGuard<'a, const BLOCK_SIZE: usize> {
-    page: &'a Page<BLOCK_SIZE>,
-}
-
-impl<'a, const BLOCK_SIZE: usize> PageUseGuard<'a, BLOCK_SIZE> {
-    fn new(page: &'a Page<BLOCK_SIZE>) -> Self {
-        page.enter_use();
-        Self { page }
-    }
-}
-
-impl<'a, const BLOCK_SIZE: usize> Drop for PageUseGuard<'a, BLOCK_SIZE> {
-    fn drop(&mut self) {
-        self.page.leave_use();
-    }
-}
 
 struct Shard<I> {
     index: I,
@@ -184,151 +98,12 @@ impl<I> Shard<I> {
     }
 }
 
-struct PagePool<const BLOCK_SIZE: usize> {
-    free: Mutex<Vec<Arc<Page<BLOCK_SIZE>>>>,
-}
-
-impl<const BLOCK_SIZE: usize> PagePool<BLOCK_SIZE> {
-    fn new(capacity: usize) -> Option<Self> {
-        let mut free = Vec::with_capacity(capacity);
-        let mut i = 0usize;
-        while i < capacity {
-            free.push(Arc::new(Page::new_zeroed()?));
-            i += 1;
-        }
-
-        Some(Self {
-            free: Mutex::new(free),
-        })
-    }
-
-    fn pop(&self) -> Option<Arc<Page<BLOCK_SIZE>>> {
-        self.free.lock().pop()
-    }
-
-    fn push(&self, mut page: Arc<Page<BLOCK_SIZE>>) {
-        if let Some(inner) = Arc::get_mut(&mut page) {
-            inner.reset_for_reuse();
-            self.free.lock().push(page);
-        } else {
-            cold_path();
-        }
-    }
-}
-
 enum WriteAcquire<const BLOCK_SIZE: usize> {
     Cached(Arc<Page<BLOCK_SIZE>>),
     Direct(Arc<Page<BLOCK_SIZE>>),
 }
 
-/// Filter predicate for flush operations.
-enum FlushFilter<'a> {
-    /// Flush all dirty pages.
-    All,
-    /// Flush dirty pages within a block range.
-    BlockRange(&'a Range<u64>),
-    /// Flush dirty pages belonging to the given owner.
-    Owner(u64),
-}
-
-impl FlushFilter<'_> {
-    #[inline]
-    fn matches<const BLOCK_SIZE: usize>(&self, lba: u64, page: &Page<BLOCK_SIZE>) -> bool {
-        match self {
-            FlushFilter::All => true,
-            FlushFilter::BlockRange(r) => lba >= r.start && lba < r.end,
-            FlushFilter::Owner(owner) => {
-                let page_owner = page.owner.load(Ordering::Acquire);
-                page_owner == *owner
-            }
-        }
-    }
-}
-
-struct FlushScratch<const BLOCK_SIZE: usize> {
-    keys: Vec<u64>,
-    run: Vec<PreparedFlushPage<BLOCK_SIZE>>,
-}
-
-impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
-    fn new(run_hint: usize, cache_capacity_blocks: usize) -> Self {
-        let run_hint = run_hint.max(1);
-        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
-        let scratch_key_capacity = cache_capacity_blocks.max(run_hint);
-        let run_capacity = if BLOCK_SIZE.is_multiple_of(dma_base_page_size()) {
-            (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1))
-                .max(1)
-                .min(cache_capacity_blocks.saturating_sub(1).max(1))
-        } else {
-            1
-        };
-
-        Self {
-            keys: Vec::with_capacity(scratch_key_capacity),
-            run: Vec::with_capacity(run_capacity),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.keys.clear();
-        self.run.clear();
-    }
-}
-
-struct FlushRunScratchLease<'a, const BLOCK_SIZE: usize> {
-    scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
-    run: Option<Vec<PreparedFlushPage<BLOCK_SIZE>>>,
-}
-
-impl<'a, const BLOCK_SIZE: usize> FlushRunScratchLease<'a, BLOCK_SIZE> {
-    fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>) -> Self {
-        let run = {
-            let mut scratch = scratch.lock();
-            core::mem::take(&mut scratch.run)
-        };
-
-        Self {
-            scratch,
-            run: Some(run),
-        }
-    }
-
-    fn run_mut(&mut self) -> &mut Vec<PreparedFlushPage<BLOCK_SIZE>> {
-        self.run
-            .as_mut()
-            .expect("flush run scratch lease used after drop")
-    }
-}
-
-impl<const BLOCK_SIZE: usize> Drop for FlushRunScratchLease<'_, BLOCK_SIZE> {
-    fn drop(&mut self) {
-        let Some(mut run) = self.run.take() else {
-            return;
-        };
-
-        run.clear();
-
-        let mut scratch = self.scratch.lock();
-        if scratch.run.capacity() < run.capacity() {
-            scratch.run = run;
-        }
-    }
-}
-struct PreparedFlushPage<const BLOCK_SIZE: usize> {
-    lba: u64,
-    page: Arc<Page<BLOCK_SIZE>>,
-    wb_generation: u64,
-}
-
-pub(crate) struct FlushJobHandle<E> {
-    id: u64,
-    future: Shared<FfiFuture<()>>,
-    result: Arc<Mutex<Option<Result<(), CacheError<E>>>>>,
-}
-
-// pooled page vectors removed; streaming batching used instead.
-
-pub struct VolumeCache<B, const BLOCK_SIZE: usize, F = DefaultIndexFactory>
+pub(crate) struct VolumeCache<B, const BLOCK_SIZE: usize, F = DefaultIndexFactory>
 where
     B: VolumeCacheBackend,
     F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
