@@ -9,9 +9,8 @@ use crate::memory::{
 use crate::profiling::unwind::{
     capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
 };
-use crate::scheduling::runtime::runtime::spawn;
-use crate::scheduling::runtime::runtime::{
-    block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
+use kernel_executor::runtime::runtime::{
+    block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
@@ -1711,7 +1710,7 @@ async fn build_exports_for_window(
         let st = state;
         let last_seq = *last_export_seq.get(core).unwrap_or(&0);
 
-        gather_joins.push(crate::scheduling::runtime::runtime::spawn_blocking(
+        gather_joins.push(kernel_executor::runtime::runtime::spawn_blocking(
             move || -> Vec<BenchEvent> {
                 let events = st.drain_core_events(core);
 

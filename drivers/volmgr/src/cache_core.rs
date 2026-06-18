@@ -1,6 +1,6 @@
-use super::cache::{
-    CacheConfig, CacheError, CacheIndex, CacheIndexFactory, CacheStats, DefaultIndexFactory,
-    VolumeCacheBackend, VolumeCacheOps,
+use super::cache::{CacheIndex, CacheIndexFactory, DefaultIndexFactory};
+use super::cache_traits::{
+    CacheConfig, CacheError, CacheStats, VolumeCacheBackend, VolumeCacheOps,
 };
 use crate::alloc::vec::Vec;
 use alloc::boxed::Box;

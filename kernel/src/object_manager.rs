@@ -20,7 +20,7 @@ use lazy_static::lazy_static;
 use spin::RwLock;
 
 use crate::executable::program::{MessageQueue, ProgramHandle};
-use crate::scheduling::scheduler::TaskHandle;
+use crate::scheduling::task::TaskHandle;
 use crate::structs::completion_queue::CompletionQueue;
 use crate::structs::io_request::FileObject;
 

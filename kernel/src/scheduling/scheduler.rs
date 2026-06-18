@@ -14,7 +14,7 @@ use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::CurrentTask;
 use crate::scheduling::task::Task;
 use crate::scheduling::task::TaskError;
-pub use crate::scheduling::task::TaskHandle;
+use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
 use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;

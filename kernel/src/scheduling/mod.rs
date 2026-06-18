@@ -1,6 +1,5 @@
 pub(crate) mod domain;
 pub(crate) mod fifo_scheduler;
-pub mod global_async;
 #[allow(dead_code)]
 pub mod runtime;
 pub(crate) mod scheduler;

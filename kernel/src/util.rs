@@ -19,9 +19,10 @@ use crate::memory::paging::{
     boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked, KernelFrameAllocator,
 };
 use crate::platform::{current_cpu_id, cycle_counter};
-use crate::scheduling::global_async::GlobalAsyncExecutor;
+use kernel_executor::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
+use crate::scheduling::runtime::runtime::init_executor_platform;
+use kernel_executor::runtime::runtime::spawn_detached;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;

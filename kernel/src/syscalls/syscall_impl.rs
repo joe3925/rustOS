@@ -11,7 +11,7 @@ use crate::structs::io_request::{
     FileObject, IoOpcode, KernelIoOp, RequestId, UserIoCompletion, UserIoOp,
 };
 use crate::{format, print};
-use crate::{scheduling::scheduler::TaskHandle, util::generate_guid};
+use crate::{scheduling::task::TaskHandle, util::generate_guid};
 use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;

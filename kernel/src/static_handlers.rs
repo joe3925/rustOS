@@ -5,6 +5,11 @@ use core::{
 };
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::object_manager::OmError;
+use kernel_executor::global_async::GlobalAsyncExecutor;
+use kernel_executor::runtime::runtime::{
+    block_on as kernel_block_on, spawn as kernel_spawn,
+    spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
+};
 
 use crate::arch::{interrupts, syscalls};
 use crate::memory::heap::allocator::KernelAllocator;
@@ -31,11 +36,6 @@ use crate::{
     registry::reg,
     scheduling::{
         self,
-        global_async::GlobalAsyncExecutor,
-        runtime::runtime::{
-            block_on as kernel_block_on, spawn as kernel_spawn,
-            spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
-        },
         scheduler::SCHEDULER,
         task::Task,
     },
@@ -704,7 +704,7 @@ pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: 
 
 #[no_mangle]
 pub extern "C" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
-    scheduling::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
+    kernel_executor::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
 }
 
 #[no_mangle]

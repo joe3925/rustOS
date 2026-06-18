@@ -25,8 +25,7 @@ use kernel_types::{
 use rand_core::block;
 
 use crate::file_system::file_provider::provider;
-use crate::scheduling::runtime::runtime::spawn;
-use crate::scheduling::runtime::runtime::JoinAll;
+use kernel_executor::runtime::runtime::{spawn, JoinAll};
 
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
@@ -35,9 +34,9 @@ use crate::{
     platform::wait_duration,
     println,
     registry::rebind_and_persist_after_provider_switch,
-    scheduling::runtime::runtime::spawn_detached,
     util::TOTAL_TIME,
 };
+use kernel_executor::runtime::runtime::spawn_detached;
 
 #[derive(Debug)]
 pub struct File {

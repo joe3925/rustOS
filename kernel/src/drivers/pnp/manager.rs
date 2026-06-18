@@ -9,7 +9,7 @@ use kernel_types::status::DriverError;
 
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
-use crate::scheduling::runtime::runtime::spawn_detached;
+use kernel_executor::runtime::runtime::spawn_detached;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};

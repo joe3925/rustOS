@@ -3,7 +3,7 @@ use crate::export;
 use crate::function;
 use crate::get_rva;
 use crate::idt::*;
-use crate::scheduling::runtime::runtime::try_steal_blocking_one;
+use kernel_executor::runtime::runtime::try_steal_blocking_one;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;

@@ -5,12 +5,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use kernel_executor::global_async::{ExecutorDomainId, KERNEL_NORMAL_EXECUTOR_DOMAIN};
+use kernel_executor::runtime::runtime::spawn_detached_in_executor_domain;
+use kernel_sync::bounded_mpmc::BoundedSendError;
+use kernel_sync::mpmc::TryRecvError;
 
-use crate::scheduling::runtime::runtime::spawn_detached_in_executor_domain;
-use crate::structs::bounded_mpmc::{
-    bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender,
+use crate::sync_platform::{
+    bounded_mpmc_channel, BoundedMpmcReceiver as BoundedReceiver,
+    BoundedMpmcSender as BoundedSender,
 };
-use crate::structs::mpmc::TryRecvError;
 
 use super::io_request::{
     CompleteTransition, IoOpcode, IoRequestFuture, IoRequestOutput, IoRequestTable, KernelIoOp,
