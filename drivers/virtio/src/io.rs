@@ -12,7 +12,7 @@ use kernel_api::request::{DeviceControl, Flush, Read, RequestHandle, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 
-use crate::blk::{VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+use crate::blk::{SubmitRequestError, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 use crate::dev_ext::{ChildExt, DevExt, DevExtInner, QueueState};
 use crate::temp_benchmark::{
     IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
@@ -25,6 +25,12 @@ use crate::{
 };
 
 pub(crate) struct VirtioPdoIo;
+
+fn too_many_dma_segments_status(operation: &str) -> DriverStatus {
+    virtio_device_error(alloc::format!(
+        "virtio-blk: {operation} request has too many DMA segments"
+    ))
+}
 
 impl DeviceRead for VirtioPdoIo {
     #[request_handler]
@@ -106,7 +112,7 @@ async fn submit_virtio_no_data_request(
                 core::iter::empty::<IoBufferDmaSegment>(),
                 false,
             ) {
-                Some(h) => {
+                Ok(h) => {
                     qs.completion_slots
                         .attach(h, completion.as_ref().expect("completion missing"));
                     let queue_full = vq.num_free == 0;
@@ -119,10 +125,14 @@ async fn submit_virtio_no_data_request(
                     );
                     true
                 }
-                None => {
+                Err(SubmitRequestError::QueueFull) => {
                     cold_path();
                     vq.notify(inner.notify_base, inner.notify_off_multiplier);
                     false
+                }
+                Err(SubmitRequestError::TooManyDataSegments) => {
+                    cold_path();
+                    return too_many_dma_segments_status(operation);
                 }
             }
         };
@@ -262,7 +272,7 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                     .arena
                     .submit_request(&mut vq, VIRTIO_BLK_T_IN, sector, segments, false)
                 {
-                    Some(h) => {
+                    Ok(h) => {
                         qs.completion_slots
                             .attach(h, completion.as_ref().expect("completion missing"));
                         let queue_full = vq.num_free == 0;
@@ -275,10 +285,14 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                         );
                         true
                     }
-                    None => {
+                    Err(SubmitRequestError::QueueFull) => {
                         cold_path();
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
                         false
+                    }
+                    Err(SubmitRequestError::TooManyDataSegments) => {
+                        cold_path();
+                        break 'transfer too_many_dma_segments_status("read");
                     }
                 }
             };
@@ -389,7 +403,7 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                     .arena
                     .submit_request(&mut vq, VIRTIO_BLK_T_OUT, sector, segments, true)
                 {
-                    Some(h) => {
+                    Ok(h) => {
                         qs.completion_slots
                             .attach(h, completion.as_ref().expect("completion missing"));
                         let queue_full = vq.num_free == 0;
@@ -402,10 +416,14 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                         );
                         true
                     }
-                    None => {
+                    Err(SubmitRequestError::QueueFull) => {
                         cold_path();
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
                         false
+                    }
+                    Err(SubmitRequestError::TooManyDataSegments) => {
+                        cold_path();
+                        break 'transfer too_many_dma_segments_status("write");
                     }
                 }
             };

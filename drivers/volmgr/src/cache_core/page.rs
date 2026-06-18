@@ -5,6 +5,7 @@ use core::hint::cold_path;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, RwLock};
 
+#[repr(C, align(4096))]
 pub(super) struct PageBuf<const BLOCK_SIZE: usize> {
     pub(super) bytes: [u8; BLOCK_SIZE],
 }

@@ -11,7 +11,9 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::FutureExt as FuturesFutureExt;
 use kernel_api::dma::dma_base_page_size;
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
+use kernel_api::kernel_types::dma::{
+    Described, FromDevice, IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBuffer, ToDevice,
+};
 use kernel_api::println;
 use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
 use kernel_api::runtime::spawn;
@@ -79,8 +81,6 @@ impl StatsInner {
         }
     }
 }
-
-#[repr(C, align(4096))]
 
 struct Shard<I> {
     index: I,
@@ -1033,6 +1033,16 @@ where
         max_blocks_per_run
             .max(1)
             .min(self.cfg.capacity_blocks.saturating_sub(1).max(1))
+            .min(Self::max_blocks_per_dma_request())
+    }
+
+    fn max_blocks_per_dma_request() -> usize {
+        let dma_page_size = dma_base_page_size().max(1);
+        let segments_per_block = BLOCK_SIZE.div_ceil(dma_page_size).max(1);
+        IOBUFFER_INLINE_SEGMENT_CAPACITY
+            .checked_div(segments_per_block)
+            .unwrap_or(0)
+            .max(1)
     }
 
     async fn flush_owner_streaming_batched(

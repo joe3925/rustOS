@@ -1,4 +1,4 @@
-use crate::blk::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
+use crate::blk::{SubmitRequestError, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::completion::CompletionToken;
 use crate::dev_ext::{DevExtInner, QueueState};
 use crate::{SubmitTasksGuard, drain_queue_completions, virtio_data_mapping_strategy};
@@ -204,7 +204,7 @@ fn submit_bench_read<'a>(
             dma_buffer.dma_segments(),
             false,
         ) {
-            Some(head) => {
+            Ok(head) => {
                 bench_queue
                     .completion_slots
                     .attach(head, completion.as_ref().expect("completion missing"));
@@ -219,9 +219,14 @@ fn submit_bench_read<'a>(
                 start_cycles = cycle_counter();
                 true
             }
-            None => {
+            Err(SubmitRequestError::QueueFull) => {
                 vq.notify(inner.notify_base, inner.notify_off_multiplier);
                 false
+            }
+            Err(SubmitRequestError::TooManyDataSegments) => {
+                return Err(benchmark_device_error(
+                    "virtio-blk: benchmark read has too many DMA segments",
+                ));
             }
         }
     };
