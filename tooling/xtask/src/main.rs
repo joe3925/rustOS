@@ -354,7 +354,9 @@ fn generate_kernel_def(root: &Path, def_path: &Path) -> Result<(), String> {
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("xtask should live under workspace root")
+        .expect("xtask should live under a tooling/ directory")
+        .parent()
+        .expect("tooling/ should live under workspace root")
         .to_path_buf()
 }
 

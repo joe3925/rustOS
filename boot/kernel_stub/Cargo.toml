@@ -14,7 +14,7 @@ goblin = { version = "0.10.0", features = [
     "pe64",
     "pe32",
 ], default-features = false }
-kernel_abi = { path = "../kernel_abi" }
+kernel_abi = { path = "../../libs/kernel_abi" }
 x86_64 = { version = "=0.15.2", default-features = false, features = [
     "instructions",
 ] }

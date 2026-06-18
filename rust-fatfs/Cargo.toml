@@ -41,7 +41,7 @@ default = ["alloc", "lfn", "unicode", "log_level_trace"]
 bitflags = { version = "2", default-features = false }
 log = { version = "0.4", default-features = false }
 chrono = { version = "0.4", default-features = false, optional = true }
-kernel_types = { version = "0.1.0", path = "../kernel_types" }
+kernel_types = { version = "0.1.0", path = "../libs/kernel_types" }
 
 [dev-dependencies]
 env_logger = "0.9"
