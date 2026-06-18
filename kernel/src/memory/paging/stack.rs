@@ -1,4 +1,4 @@
-use kernel_types::arch::{PageFlags, VirtAddr as AbiVirtAddr};
+use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
 
 use super::layout::{align_up, base_page_size, supported_mapping_sizes};
@@ -55,7 +55,7 @@ pub fn kernel_stack_reservation_bytes() -> u64 {
     kernel_stack_max_bytes() + base_page_size()
 }
 
-pub fn allocate_kernel_stack(size: StackSize) -> Result<AbiVirtAddr, PageMapError> {
+pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> {
     let max_stack = kernel_stack_max_bytes();
     let reserve_total = kernel_stack_reservation_bytes();
 
@@ -73,8 +73,8 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<AbiVirtAddr, PageMapErro
     let region_base =
         allocate_auto_kernel_range_aligned(reserve_total, required_alignment_for_bytes(max_stack))
             .ok_or(PageMapError::NoMemory())?;
-    let stack_top = AbiVirtAddr::new(region_base.as_u64() + reserve_total);
-    let map_start = AbiVirtAddr::new(stack_top.as_u64() - map_bytes);
+    let stack_top = VirtAddr::new(region_base.as_u64() + reserve_total);
+    let map_start = VirtAddr::new(stack_top.as_u64() - map_bytes);
 
     if let Err(err) = unsafe { map_range(map_start, map_bytes, flags, false) } {
         unmap_range(region_base, reserve_total);
@@ -84,8 +84,8 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<AbiVirtAddr, PageMapErro
     Ok(stack_top)
 }
 
-pub fn deallocate_kernel_stack(stack_top: AbiVirtAddr) {
+pub fn deallocate_kernel_stack(stack_top: VirtAddr) {
     let reserve_total = kernel_stack_reservation_bytes();
-    let region_base = AbiVirtAddr::new(stack_top.as_u64() - reserve_total);
+    let region_base = VirtAddr::new(stack_top.as_u64() - reserve_total);
     unmap_range(region_base, reserve_total);
 }

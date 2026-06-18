@@ -7,7 +7,7 @@ use core::mem::ManuallyDrop;
 use core::ptr;
 use kernel_macros::RequestPayload;
 
-use crate::arch::{PhysAddr, VirtAddr};
+use crate::arch::{PagingPlatform, PhysAddr, Platform, VirtAddr};
 use crate::device::DeviceObject;
 
 #[repr(transparent)]
@@ -465,11 +465,8 @@ fn hosted_test_frame_size() -> u64 {
 
 #[cfg(not(any(test, feature = "hosted-tests")))]
 fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    unsafe extern "C" {
-        fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
-    }
-
-    unsafe { resolve_virtual_range_frame(addr) }
+    let block = <Platform as PagingPlatform>::translate_addr(addr)?;
+    Some((block.block_size, block.phys_addr))
 }
 fn describe_virtual_buffer_to_frames(
     virt_addr: usize,

@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicUsize;
 
-use kernel_types::arch::VirtAddr as AbiVirtAddr;
+use kernel_types::arch::VirtAddr;
 use lazy_static::lazy_static;
 
 use crate::structs::range_tracker::{RangeAllocationError, RangeTracker};
@@ -24,14 +24,14 @@ lazy_static! {
         ));
 }
 
-pub fn allocate_auto_kernel_range(size: u64) -> Option<AbiVirtAddr> {
+pub fn allocate_auto_kernel_range(size: u64) -> Option<VirtAddr> {
     let aligned_size = align_up_to_base_page(size)?;
     let addr = KERNEL_RANGE_TRACKER.alloc_auto(aligned_size)?;
     debug_assert_eq!(addr.as_u64() % base_page_size(), 0);
     Some(addr.into())
 }
 
-pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<AbiVirtAddr> {
+pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<VirtAddr> {
     let aligned_size = align_up_to_base_page(size)?;
     let base_page = base_page_size();
 
@@ -54,7 +54,7 @@ pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<A
     Some(addr.into())
 }
 
-pub fn allocate_kernel_range(base: u64, size: u64) -> Result<AbiVirtAddr, RangeAllocationError> {
+pub fn allocate_kernel_range(base: u64, size: u64) -> Result<VirtAddr, RangeAllocationError> {
     if base % base_page_size() != 0 {
         return Err(RangeAllocationError::Unaligned);
     }
@@ -64,7 +64,7 @@ pub fn allocate_kernel_range(base: u64, size: u64) -> Result<AbiVirtAddr, RangeA
     Ok(addr.into())
 }
 
-pub fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64) {
+pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     debug_assert_eq!(addr.as_u64() % base_page_size(), 0);
     if let Some(aligned_size) = align_up_to_base_page(size) {
         KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), aligned_size);

@@ -2,9 +2,9 @@ use core::mem::size_of;
 
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
-use x86_64::PhysAddr;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableIndex, PhysFrame, Size4KiB};
+use x86_64::PhysAddr;
 
 use crate::platform::PageTableFrameAllocator;
 use crate::util::boot_info;

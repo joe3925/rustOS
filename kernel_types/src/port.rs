@@ -51,7 +51,7 @@ impl PortValue for u32 {
     }
 }
 
-pub type NativePortAccess = crate::arch::ActivePlatform;
+pub type NativePortAccess = crate::arch::Platform;
 
 #[repr(transparent)]
 pub struct Port<T, A = NativePortAccess> {

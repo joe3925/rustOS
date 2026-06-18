@@ -16,7 +16,7 @@ use kernel_types::irq::{
 };
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::{
-    arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr},
+    arch::{PageFlags, PhysAddr, VirtAddr},
     memory::PhysicalMappingCache,
     status::PageMapError,
 };
@@ -302,7 +302,7 @@ impl AddressSpacePlatform for X86Platform {
         unsafe { crate::arch::memory::paging::address_space::switch_root(root) }
     }
 
-    fn root_to_phys(root: Self::Root) -> AbiPhysAddr {
+    fn root_to_phys(root: Self::Root) -> PhysAddr {
         crate::arch::memory::paging::address_space::root_to_phys(root)
     }
 
@@ -355,8 +355,8 @@ impl PagingPlatform for X86Platform {
 
     unsafe fn map_leaf<A: PageTableFrameAllocator>(
         allocator: &mut A,
-        virt: AbiVirtAddr,
-        phys: AbiPhysAddr,
+        virt: VirtAddr,
+        phys: PhysAddr,
         size: MappingSize,
         flags: PageFlags,
         cache: Option<PhysicalMappingCache>,
@@ -371,11 +371,11 @@ impl PagingPlatform for X86Platform {
 
     unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
         allocator: &mut A,
-        virt: AbiVirtAddr,
+        virt: VirtAddr,
         size: MappingSize,
         disposition: UnmapFrameDisposition,
         flush: LocalTlbFlush,
-    ) -> Result<Option<AbiPhysAddr>, PageMapError> {
+    ) -> Result<Option<PhysAddr>, PageMapError> {
         unsafe {
             crate::arch::memory::paging::mapper::unmap_leaf(
                 allocator,
@@ -387,7 +387,7 @@ impl PagingPlatform for X86Platform {
         }
     }
 
-    fn resolve_mapping(virt: AbiVirtAddr) -> Option<ResolvedMapping> {
+    fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping> {
         crate::arch::memory::paging::mapper::resolve_mapping(virt)
     }
 
@@ -395,7 +395,7 @@ impl PagingPlatform for X86Platform {
         crate::arch::memory::paging::tlb::local_flush_tlb_all();
     }
 
-    fn local_flush_tlb_range(start: AbiVirtAddr, size: u64, stride: u64) {
+    fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64) {
         crate::arch::memory::paging::tlb::local_flush_tlb_range(start, size, stride);
     }
 

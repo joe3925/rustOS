@@ -1,4 +1,4 @@
-use kernel_types::arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::{PageMapError, PageMapFailure};
 
@@ -19,7 +19,7 @@ use super::virt_tracker::{
 pub fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     let aligned_size = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
     let addr = allocate_auto_kernel_range(aligned_size).ok_or(PageMapError::NoMemory())?;
 
@@ -34,7 +34,7 @@ pub fn allocate_auto_kernel_range_mapped(
 pub fn allocate_auto_kernel_range_mapped_contiguous(
     size: u64,
     flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     let aligned_size = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
     if aligned_size == 0 {
         return Err(PageMapError::NoMemory());
@@ -78,7 +78,7 @@ pub fn allocate_kernel_range_mapped(
     base: u64,
     size: u64,
     flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     let aligned_size = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
     let addr = allocate_kernel_range(base, aligned_size).map_err(|_| PageMapError::NoMemory())?;
 
@@ -91,7 +91,7 @@ pub fn allocate_kernel_range_mapped(
 }
 
 pub unsafe fn map_range(
-    addr: AbiVirtAddr,
+    addr: VirtAddr,
     size: u64,
     flags: PageFlags,
     ignore_already_mapped: bool,
@@ -108,7 +108,7 @@ pub unsafe fn map_range(
 }
 
 pub unsafe fn map_fresh_kernel_range_no_flush(
-    addr: AbiVirtAddr,
+    addr: VirtAddr,
     size: u64,
     flags: PageFlags,
     ignore_already_mapped: bool,
@@ -125,7 +125,7 @@ pub unsafe fn map_fresh_kernel_range_no_flush(
 }
 
 unsafe fn map_range_with_flush(
-    addr: AbiVirtAddr,
+    addr: VirtAddr,
     size: u64,
     flags: PageFlags,
     ignore_already_mapped: bool,
@@ -151,7 +151,7 @@ unsafe fn map_range_with_flush(
             match unsafe {
                 <ActivePlatform as PagingPlatform>::map_leaf(
                     &mut allocator,
-                    AbiVirtAddr::new(virt),
+                    VirtAddr::new(virt),
                     phys,
                     *mapping_size,
                     flags,
@@ -211,8 +211,8 @@ unsafe fn map_range_with_flush(
 }
 
 pub unsafe fn map_contiguous_physical_range(
-    virt_base: AbiVirtAddr,
-    phys_base: AbiPhysAddr,
+    virt_base: VirtAddr,
+    phys_base: PhysAddr,
     size: u64,
     flags: PageFlags,
     cache: Option<PhysicalMappingCache>,
@@ -235,8 +235,8 @@ pub unsafe fn map_contiguous_physical_range(
             match unsafe {
                 <ActivePlatform as PagingPlatform>::map_leaf(
                     &mut allocator,
-                    AbiVirtAddr::new(cur_virt),
-                    AbiPhysAddr::new(cur_phys),
+                    VirtAddr::new(cur_virt),
+                    PhysAddr::new(cur_phys),
                     *mapping_size,
                     flags,
                     cache,
@@ -283,8 +283,8 @@ pub unsafe fn map_contiguous_physical_range(
 }
 
 pub unsafe fn map_allocated_range(
-    virt_base: AbiVirtAddr,
-    phys_base: AbiPhysAddr,
+    virt_base: VirtAddr,
+    phys_base: PhysAddr,
     size: u64,
     flags: PageFlags,
 ) -> Result<(), PageMapError> {
@@ -300,33 +300,33 @@ pub unsafe fn map_allocated_range(
     }
 }
 
-pub fn unmap_range(addr: AbiVirtAddr, size: u64) {
+pub fn unmap_range(addr: VirtAddr, size: u64) {
     deallocate_kernel_range(addr, size);
     unsafe {
         unmap_range_with_disposition(addr, size, UnmapFrameDisposition::FreeMappedFrame);
     }
 }
 
-pub unsafe fn unmap_range_unchecked(addr: AbiVirtAddr, size: u64) {
+pub unsafe fn unmap_range_unchecked(addr: VirtAddr, size: u64) {
     unsafe {
         unmap_range_with_disposition(addr, size, UnmapFrameDisposition::FreeMappedFrame);
     }
 }
 
-pub unsafe fn unmap_range_keep_frames_unchecked(addr: AbiVirtAddr, size: u64) {
+pub unsafe fn unmap_range_keep_frames_unchecked(addr: VirtAddr, size: u64) {
     unsafe {
         unmap_range_with_disposition(addr, size, UnmapFrameDisposition::KeepFrame);
     }
 }
 
-pub unsafe fn unmap_reserved_range_unchecked(addr: AbiVirtAddr, size: u64) {
+pub unsafe fn unmap_reserved_range_unchecked(addr: VirtAddr, size: u64) {
     unsafe {
         unmap_range_with_disposition(addr, size, UnmapFrameDisposition::ReleaseReservedFrame);
     }
 }
 
 pub(crate) unsafe fn unmap_range_with_disposition(
-    addr: AbiVirtAddr,
+    addr: VirtAddr,
     size: u64,
     disposition: UnmapFrameDisposition,
 ) {
@@ -348,7 +348,7 @@ pub(crate) unsafe fn unmap_range_with_disposition(
             if unsafe {
                 <ActivePlatform as PagingPlatform>::unmap_leaf(
                     &mut allocator,
-                    AbiVirtAddr::new(virt),
+                    VirtAddr::new(virt),
                     *mapping_size,
                     disposition,
                     LocalTlbFlush::Flush,
@@ -372,13 +372,13 @@ pub(crate) unsafe fn unmap_range_with_disposition(
 }
 
 pub fn identity_map_page(
-    phys: AbiPhysAddr,
+    phys: PhysAddr,
     range: usize,
     flags: PageFlags,
 ) -> Result<(), PageMapError> {
     unsafe {
         map_contiguous_physical_range(
-            AbiVirtAddr::new(phys.as_u64()),
+            VirtAddr::new(phys.as_u64()),
             phys,
             range as u64,
             flags,
@@ -388,16 +388,16 @@ pub fn identity_map_page(
     }
 }
 
-pub fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
+pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     let resolved = <ActivePlatform as PagingPlatform>::resolve_mapping(addr)?;
     Some((resolved.mapping_size, resolved.phys_addr))
 }
 
-pub fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
+pub fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     virt_to_phys(addr)
 }
 
-pub(crate) fn flush_after_unmap(addr: AbiVirtAddr, size: u64) {
+pub(crate) fn flush_after_unmap(addr: VirtAddr, size: u64) {
     trigger_tlb_shootdown_range(addr, size);
 }
 
@@ -425,7 +425,7 @@ fn frame_count_for_bytes(bytes: u64) -> Option<usize> {
 
 unsafe fn rollback_mapped_range(
     allocator: &mut KernelPageTableFrameAllocator,
-    addr: AbiVirtAddr,
+    addr: VirtAddr,
     size: u64,
     disposition: UnmapFrameDisposition,
 ) {
@@ -445,7 +445,7 @@ unsafe fn rollback_mapped_range(
             if unsafe {
                 <ActivePlatform as PagingPlatform>::unmap_leaf(
                     allocator,
-                    AbiVirtAddr::new(virt),
+                    VirtAddr::new(virt),
                     *mapping_size,
                     disposition,
                     LocalTlbFlush::Defer,
@@ -468,7 +468,7 @@ unsafe fn rollback_mapped_range(
         let _ = unsafe {
             <ActivePlatform as PagingPlatform>::unmap_leaf(
                 allocator,
-                AbiVirtAddr::new(virt),
+                VirtAddr::new(virt),
                 MappingSize { bytes: page },
                 disposition,
                 LocalTlbFlush::Defer,

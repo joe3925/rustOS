@@ -1,5 +1,5 @@
 use crate::platform::{ActivePlatform, PagingPlatform};
-use kernel_types::arch::VirtAddr as AbiVirtAddr;
+use kernel_types::arch::VirtAddr;
 
 use super::types::{KernelVirtualLayout, MappingSize, PagingCapabilities};
 
@@ -11,19 +11,19 @@ pub fn kernel_virtual_layout() -> KernelVirtualLayout {
     <ActivePlatform as PagingPlatform>::kernel_virtual_layout()
 }
 
-pub fn kernel_space_base() -> AbiVirtAddr {
+pub fn kernel_space_base() -> VirtAddr {
     kernel_virtual_layout().kernel_space_base
 }
 
-pub fn managed_kernel_range_start() -> AbiVirtAddr {
+pub fn managed_kernel_range_start() -> VirtAddr {
     kernel_virtual_layout().managed_kernel_range_start
 }
 
-pub fn managed_kernel_range_end() -> AbiVirtAddr {
+pub fn managed_kernel_range_end() -> VirtAddr {
     kernel_virtual_layout().managed_kernel_range_end
 }
 
-pub fn mmio_base() -> AbiVirtAddr {
+pub fn mmio_base() -> VirtAddr {
     kernel_virtual_layout().mmio_base
 }
 

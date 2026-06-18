@@ -42,6 +42,7 @@ export! {
     unmap_physical_pages,
     virt_to_phys,
     resolve_virtual_range_frame,
+    kernel_paging_info,
     get_current_cpu_id,
     get_current_platform_cpu_id,
 

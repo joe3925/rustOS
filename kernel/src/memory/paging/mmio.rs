@@ -1,6 +1,6 @@
 use spin::Mutex;
 
-use kernel_types::arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 
@@ -12,10 +12,10 @@ use super::virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_
 static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn map_physical_pages(
-    phys: AbiPhysAddr,
+    phys: PhysAddr,
     size: u64,
     cache: PhysicalMappingCache,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     let base_page = base_page_size();
     let phys_addr = phys.as_u64();
     let off = phys_addr % base_page;
@@ -27,11 +27,11 @@ pub fn map_physical_pages(
 }
 
 pub fn map_physical_pages_aligned(
-    phys: AbiPhysAddr,
+    phys: PhysAddr,
     size: u64,
     va_alignment: u64,
     cache: PhysicalMappingCache,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
     if size == 0 {
@@ -56,7 +56,7 @@ pub fn map_physical_pages_aligned(
     if let Err(err) = unsafe {
         map_contiguous_physical_range(
             virtual_addr,
-            AbiPhysAddr::new(aligned_phys),
+            PhysAddr::new(aligned_phys),
             total_size,
             flags,
             Some(cache),
@@ -67,10 +67,10 @@ pub fn map_physical_pages_aligned(
         return Err(err);
     }
 
-    Ok(AbiVirtAddr::new(virtual_addr.as_u64() + off))
+    Ok(VirtAddr::new(virtual_addr.as_u64() + off))
 }
 
-pub fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
+pub fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
     if size == 0 {
@@ -79,7 +79,7 @@ pub fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapE
 
     let base_page = base_page_size();
     let off = base.as_u64() % base_page;
-    let start = AbiVirtAddr::new(base.as_u64() - off);
+    let start = VirtAddr::new(base.as_u64() - off);
     let total = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
 
     unsafe {

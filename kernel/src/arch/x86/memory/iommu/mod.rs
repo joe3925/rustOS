@@ -7,8 +7,8 @@ use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
 use core::mem::size_of;
 use kernel_types::dma::{
-    DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR, DeviceMmuPlatformDeviceIdentity,
-    DmaPciDeviceIdentity,
+    DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity, DMA_IOMMU_VENDOR_AMD_IVRS,
+    DMA_IOMMU_VENDOR_INTEL_DMAR,
 };
 use raw_cpuid::CpuId;
 use spin::Mutex;

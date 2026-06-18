@@ -49,7 +49,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use kernel_types::arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
+use kernel_types::arch::{PageFlags, PagingInfo, PhysAddr, VirtAddr};
 use kernel_types::{
     async_ffi::{FfiFuture, FutureExt},
     benchmark::{
@@ -845,7 +845,7 @@ pub extern "C" fn get_current_cpu_id() -> usize {
 pub extern "C" fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     crate::memory::paging::allocate_auto_kernel_range_mapped(size, flags)
 }
 
@@ -853,7 +853,7 @@ pub extern "C" fn allocate_auto_kernel_range_mapped(
 pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
     size: u64,
     flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     crate::memory::paging::allocate_auto_kernel_range_mapped_contiguous(size, flags)
 }
 
@@ -862,22 +862,22 @@ pub extern "C" fn allocate_kernel_range_mapped(
     base: u64,
     size: u64,
     flags: PageFlags,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     crate::memory::paging::allocate_kernel_range_mapped(base, size, flags)
 }
 
 #[no_mangle]
-pub extern "C" fn deallocate_kernel_range(addr: AbiVirtAddr, size: u64) {
+pub extern "C" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     crate::memory::paging::deallocate_kernel_range(addr, size)
 }
 
 #[no_mangle]
-pub extern "C" fn unmap_range(virtual_addr: AbiVirtAddr, size: u64) {
+pub extern "C" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
     crate::memory::paging::unmap_range(virtual_addr, size)
 }
 
 #[no_mangle]
-pub extern "C" fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
+pub extern "C" fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags) {
     let _ = crate::memory::paging::identity_map_page(
         frame_addr,
         crate::memory::paging::base_page_size() as usize,
@@ -887,26 +887,34 @@ pub extern "C" fn identity_map_page(frame_addr: AbiPhysAddr, flags: PageFlags) {
 
 #[no_mangle]
 pub extern "C" fn map_physical_pages(
-    phys: AbiPhysAddr,
+    phys: PhysAddr,
     size: u64,
     cache: kernel_types::memory::PhysicalMappingCache,
-) -> Result<AbiVirtAddr, PageMapError> {
+) -> Result<VirtAddr, PageMapError> {
     crate::memory::paging::map_physical_pages(phys, size, cache)
 }
 
 #[no_mangle]
-pub extern "C" fn unmap_physical_pages(base: AbiVirtAddr, size: u64) -> Result<(), PageMapError> {
+pub extern "C" fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     crate::memory::paging::unmap_physical_pages(base, size)
 }
 
 #[no_mangle]
-pub extern "C" fn virt_to_phys(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
+pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     crate::memory::paging::virt_to_phys(addr)
 }
 
 #[no_mangle]
-pub extern "C" fn resolve_virtual_range_frame(addr: AbiVirtAddr) -> Option<(u64, AbiPhysAddr)> {
+pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     crate::memory::paging::resolve_virtual_range_frame(addr)
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_paging_info() -> Option<PagingInfo> {
+    crate::util::boot_info()
+        .recursive_index
+        .into_option()
+        .map(|recursive_index| PagingInfo { recursive_index })
 }
 
 // ============================================================================

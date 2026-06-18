@@ -1,6 +1,6 @@
 use crate::memory::heap::{
-    MIMALLOC_ARENA_START, MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE, mimalloc_arena_size,
-    mimalloc_heap_end,
+    mimalloc_arena_size, mimalloc_heap_end, MIMALLOC_ARENA_START, MIMALLOC_HEAP_START,
+    MIMALLOC_OS_HEAP_SIZE,
 };
 use crate::memory::paging::{
     align_up_to_base_page, base_page_size, map_fresh_kernel_range_no_flush, unmap_range_unchecked,
@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 
 use crate::arch::interrupts::without_interrupts;
-use crate::arch::{VirtAddr, align_up, interrupts};
+use crate::arch::{align_up, interrupts, VirtAddr};
 use kernel_types::arch::PageFlags;
 
 const MIMALLOC_STATS_ENABLED: bool = false;

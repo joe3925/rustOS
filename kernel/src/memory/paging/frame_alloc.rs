@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_abi::{MemoryRegion, MemoryRegionKind};
-use kernel_types::arch::PhysAddr as AbiPhysAddr;
+use kernel_types::arch::PhysAddr;
 use kernel_types::irq::IrqSafeRwLock;
 
 use crate::platform::PageTableFrameAllocator;
@@ -39,7 +39,7 @@ impl KernelFrameAllocator {
         init_from_memory_regions(memory_regions);
     }
 
-    pub fn allocate_base_frame() -> Option<AbiPhysAddr> {
+    pub fn allocate_base_frame() -> Option<PhysAddr> {
         let frame_size = cached_frame_size();
         let low_frames = cached_low_reserved_frames();
         let mut bm = MEMORY_BITMAP.write();
@@ -69,14 +69,14 @@ impl KernelFrameAllocator {
                 NEXT_WORD_BASE.store(word_idx, Ordering::Relaxed);
                 USED_MEMORY_BYTES.fetch_add(frame_size as usize, Ordering::Relaxed);
 
-                return Some(AbiPhysAddr::new((frame_idx as u64) * frame_size));
+                return Some(PhysAddr::new((frame_idx as u64) * frame_size));
             }
         }
 
         None
     }
 
-    pub fn allocate_mapping_frame(size: MappingSize) -> Option<AbiPhysAddr> {
+    pub fn allocate_mapping_frame(size: MappingSize) -> Option<PhysAddr> {
         let frame_count = base_frame_count_for_mapping(size)?;
         Self::allocate_contiguous_frames_aligned(frame_count, frame_count)
     }
@@ -84,7 +84,7 @@ impl KernelFrameAllocator {
     pub fn allocate_contiguous_frames_aligned(
         frame_count: usize,
         align_frames: usize,
-    ) -> Option<AbiPhysAddr> {
+    ) -> Option<PhysAddr> {
         if frame_count == 0 || align_frames == 0 {
             return None;
         }
@@ -137,7 +137,7 @@ impl KernelFrameAllocator {
                             frame_count.saturating_mul(frame_size as usize),
                             Ordering::Relaxed,
                         );
-                        return Some(AbiPhysAddr::new((start_idx as u64) * frame_size));
+                        return Some(PhysAddr::new((start_idx as u64) * frame_size));
                     }
                     Some(conflict_idx) => {
                         let next_scan_idx = conflict_idx.saturating_add(1);
@@ -158,7 +158,7 @@ impl KernelFrameAllocator {
         None
     }
 
-    pub fn free_mapping_frame(base: AbiPhysAddr, size: MappingSize) {
+    pub fn free_mapping_frame(base: PhysAddr, size: MappingSize) {
         let Some(len) = base_frame_count_for_mapping(size) else {
             return;
         };
@@ -182,7 +182,7 @@ impl KernelFrameAllocator {
         );
     }
 
-    pub fn release_reserved_mapping_frame(base: AbiPhysAddr, size: MappingSize) {
+    pub fn release_reserved_mapping_frame(base: PhysAddr, size: MappingSize) {
         let Some(len) = base_frame_count_for_mapping(size) else {
             return;
         };
@@ -227,11 +227,11 @@ impl KernelFrameAllocator {
 pub struct KernelPageTableFrameAllocator;
 
 impl PageTableFrameAllocator for KernelPageTableFrameAllocator {
-    fn allocate_page_table_frame(&mut self) -> Option<AbiPhysAddr> {
+    fn allocate_page_table_frame(&mut self) -> Option<PhysAddr> {
         KernelFrameAllocator::allocate_base_frame()
     }
 
-    fn free_page_table_frame(&mut self, phys: AbiPhysAddr) {
+    fn free_page_table_frame(&mut self, phys: PhysAddr) {
         KernelFrameAllocator::free_mapping_frame(
             phys,
             MappingSize {

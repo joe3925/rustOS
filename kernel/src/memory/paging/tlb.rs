@@ -1,11 +1,11 @@
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use kernel_types::arch::VirtAddr as AbiVirtAddr;
+use kernel_types::arch::VirtAddr;
 
-use crate::KERNEL_INITIALIZED;
 use crate::arch::MAX_CPUS;
 use crate::platform::{ActivePlatform, PagingPlatform};
+use crate::KERNEL_INITIALIZED;
 
 use super::layout::base_page_size;
 use super::types::TlbShootdownRange;
@@ -25,7 +25,7 @@ pub fn trigger_tlb_shootdown() {
     trigger_tlb_shootdown_request(None);
 }
 
-pub fn trigger_tlb_shootdown_range(start: AbiVirtAddr, size: u64) {
+pub fn trigger_tlb_shootdown_range(start: VirtAddr, size: u64) {
     let range = TlbShootdownRange::new(start, size);
     trigger_tlb_shootdown_ranges(core::slice::from_ref(&range));
 }

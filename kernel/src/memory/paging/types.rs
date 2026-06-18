@@ -1,4 +1,4 @@
-use kernel_types::arch::{PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
+use kernel_types::arch::{PhysAddr, VirtAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MappingSize {
@@ -16,10 +16,10 @@ pub struct PagingCapabilities {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KernelVirtualLayout {
-    pub kernel_space_base: AbiVirtAddr,
-    pub managed_kernel_range_start: AbiVirtAddr,
-    pub managed_kernel_range_end: AbiVirtAddr,
-    pub mmio_base: AbiVirtAddr,
+    pub kernel_space_base: VirtAddr,
+    pub managed_kernel_range_start: VirtAddr,
+    pub managed_kernel_range_end: VirtAddr,
+    pub mmio_base: VirtAddr,
     pub low_physical_reserve_bytes: u64,
 }
 #[derive(Debug, Clone, Copy)]
@@ -32,7 +32,7 @@ pub struct UserVmLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedMapping {
     pub mapping_size: u64,
-    pub phys_addr: AbiPhysAddr,
+    pub phys_addr: PhysAddr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,13 +50,13 @@ pub enum UnmapFrameDisposition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlbShootdownRange {
-    pub start: AbiVirtAddr,
+    pub start: VirtAddr,
     pub size: u64,
     pub stride: u64,
 }
 
 impl TlbShootdownRange {
-    pub fn new(start: AbiVirtAddr, size: u64) -> Self {
+    pub fn new(start: VirtAddr, size: u64) -> Self {
         Self {
             start,
             size,
@@ -64,7 +64,7 @@ impl TlbShootdownRange {
         }
     }
 
-    pub const fn with_stride(start: AbiVirtAddr, size: u64, stride: u64) -> Self {
+    pub const fn with_stride(start: VirtAddr, size: u64, stride: u64) -> Self {
         Self {
             start,
             size,

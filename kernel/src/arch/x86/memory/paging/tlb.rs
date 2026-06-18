@@ -1,17 +1,17 @@
 use core::arch::naked_asm;
 
-use kernel_types::arch::VirtAddr as AbiVirtAddr;
-use x86_64::VirtAddr;
+use kernel_types::arch::VirtAddr;
 use x86_64::instructions;
+use x86_64::VirtAddr as X86VirtAddr;
 
-use crate::arch::drivers::interrupt_index::{APIC, IpiDest, IpiKind, LocalApic, send_eoi};
+use crate::arch::drivers::interrupt_index::{send_eoi, IpiDest, IpiKind, LocalApic, APIC};
 use crate::idt::{InterruptGuard, TLB_FLUSH_VECTOR};
 
 pub fn local_flush_tlb_all() {
     instructions::tlb::flush_all();
 }
 
-pub fn local_flush_tlb_range(start: AbiVirtAddr, size: u64, stride: u64) {
+pub fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64) {
     let stride = if stride == 0 { return } else { stride };
     let mut addr = start.as_u64() & !(stride - 1);
     let Some(end) = start
@@ -25,7 +25,7 @@ pub fn local_flush_tlb_range(start: AbiVirtAddr, size: u64, stride: u64) {
     };
 
     while addr < end {
-        let Ok(virt) = VirtAddr::try_new(addr) else {
+        let Ok(virt) = X86VirtAddr::try_new(addr) else {
             instructions::tlb::flush_all();
             return;
         };

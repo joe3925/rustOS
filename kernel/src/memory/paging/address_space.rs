@@ -1,4 +1,4 @@
-use kernel_types::arch::PhysAddr as AbiPhysAddr;
+use kernel_types::arch::PhysAddr;
 use kernel_types::status::PageMapError;
 
 use crate::platform::{ActivePlatform, AddressSpacePlatform};
@@ -25,7 +25,7 @@ pub unsafe fn switch_address_space_root(root: AddressSpaceRoot) {
     }
 }
 
-pub fn address_space_root_phys(root: AddressSpaceRoot) -> AbiPhysAddr {
+pub fn address_space_root_phys(root: AddressSpaceRoot) -> PhysAddr {
     <ActivePlatform as AddressSpacePlatform>::root_to_phys(root)
 }
 

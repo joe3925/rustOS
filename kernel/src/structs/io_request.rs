@@ -13,7 +13,7 @@ use spin::Mutex;
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
 use crate::memory::paging::{base_page_size, kernel_space_base};
-use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload};
+use crate::object_manager::{Object, ObjectPayload, OBJECT_MANAGER};
 use crate::platform;
 use crate::util::generate_guid;
 

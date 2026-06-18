@@ -5,24 +5,25 @@ use core::ops::{Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, Not, S
 pub mod x86;
 
 #[cfg(target_arch = "x86_64")]
-pub type ActivePlatform = x86::X86Platform;
+pub use x86::{PagingInfo, Platform};
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("kernel_types does not have an implementation for this target architecture");
 
-pub trait Platform {
+pub trait PlatformInfo {
     const NAME: &'static str;
     fn cycle_counter() -> u64;
 }
 
-pub trait PortIoPlatform: Platform {
-    unsafe fn read_port_u8(port: u16) -> u8;
-    unsafe fn read_port_u16(port: u16) -> u16;
-    unsafe fn read_port_u32(port: u16) -> u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranslatedBlock {
+    pub phys_addr: PhysAddr,
+    pub block_size: u64,
+}
 
-    unsafe fn write_port_u8(port: u16, value: u8);
-    unsafe fn write_port_u16(port: u16, value: u16);
-    unsafe fn write_port_u32(port: u16, value: u32);
+pub trait PagingPlatform: PlatformInfo {
+    fn paging_info() -> Option<PagingInfo>;
+    fn translate_addr(addr: VirtAddr) -> Option<TranslatedBlock>;
 }
 
 #[repr(transparent)]

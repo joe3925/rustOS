@@ -1,10 +1,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     PageTable, PageTableIndex, PhysFrame, RecursivePageTable, Size4KiB,
 };
+use x86_64::VirtAddr;
 
 pub static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
 

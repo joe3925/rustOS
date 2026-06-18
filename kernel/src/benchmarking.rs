@@ -7,18 +7,18 @@ use crate::memory::{
     paging::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::unwind::{
-    CapturedCallchain, MAX_CALLCHAIN_DEPTH, capture_callchain_from_state_limited,
+    capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
 };
 use crate::scheduling::runtime::runtime::spawn;
 use crate::scheduling::runtime::runtime::{
-    JoinAll, block_on, spawn_blocking, spawn_blocking_many, spawn_detached,
+    block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
-use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_archive_for_path};
+use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
 use crate::structs::stopwatch::Stopwatch;
-use crate::util::{TOTAL_TIME, boot_info};
+use crate::util::{boot_info, TOTAL_TIME};
 use crate::{platform, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -33,19 +33,19 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use kernel_types::ProstMessage;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
-    BENCH_FLAG_IRQ, BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
     BenchDroppedSampleCounterProto, BenchLevelResult, BenchOverflowPolicy, BenchSampleChunkProto,
-    BenchSampleProto, BenchSweepParams, BenchSweepResult, BenchWindowConfig,
+    BenchSampleProto, BenchSweepParams, BenchSweepResult, BenchWindowConfig, BENCH_FLAG_IRQ,
+    BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
 };
-use kernel_types::benchmark::{BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1, BenchSweepBothResult};
+use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::{DeviceControl, RequestHandle, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
-use serde_json::{Value, json};
+use kernel_types::ProstMessage;
+use serde_json::{json, Value};
 use spin::{Mutex, Once};
 
 use crate::arch::interrupts;
@@ -2176,24 +2176,22 @@ impl BenchWindow {
                 let interval = secs;
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
-                spawn_blocking(move || {
-                    loop {
-                        platform::wait_duration(interval);
+                spawn_blocking(move || loop {
+                    platform::wait_duration(interval);
 
-                        if !BENCH_ENABLED {
-                            return;
-                        }
-
-                        {
-                            let inner = this_arc.inner.lock();
-                            if !inner.running {
-                                break;
-                            }
-                        }
-
-                        let moved = Arc::clone(&this_arc);
-                        block_on(moved.persist());
+                    if !BENCH_ENABLED {
+                        return;
                     }
+
+                    {
+                        let inner = this_arc.inner.lock();
+                        if !inner.running {
+                            break;
+                        }
+                    }
+
+                    let moved = Arc::clone(&this_arc);
+                    block_on(moved.persist());
                 });
             }
         }
@@ -2775,7 +2773,11 @@ fn safe_ratio(num: u64, den: u64) -> f64 {
 
 #[inline(always)]
 fn safe_ratio_f64(num: f64, den: f64) -> f64 {
-    if den == 0.0 { 0.0 } else { num / den }
+    if den == 0.0 {
+        0.0
+    } else {
+        num / den
+    }
 }
 
 #[inline(always)]

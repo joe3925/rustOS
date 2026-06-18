@@ -7,10 +7,10 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::tss::TaskStateSegment;
 
 use crate::cpu::get_cpu_info;
-use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
+use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::structs::per_cpu_vec::PerCpuVec;
 
-use x86_64::instructions::segmentation::{CS, SS, Segment};
+use x86_64::instructions::segmentation::{Segment, CS, SS};
 use x86_64::instructions::tables::load_tss;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const TIMER_IST_INDEX: u16 = 1;

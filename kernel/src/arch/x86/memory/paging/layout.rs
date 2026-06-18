@@ -1,4 +1,4 @@
-use kernel_types::arch::VirtAddr as AbiVirtAddr;
+use kernel_types::arch::VirtAddr;
 
 use crate::memory::paging::KernelVirtualLayout;
 
@@ -10,10 +10,10 @@ pub const LOW_PHYSICAL_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
 
 pub fn kernel_virtual_layout() -> KernelVirtualLayout {
     KernelVirtualLayout {
-        kernel_space_base: AbiVirtAddr::new(KERNEL_SPACE_BASE),
-        managed_kernel_range_start: AbiVirtAddr::new(MANAGED_KERNEL_RANGE_START),
-        managed_kernel_range_end: AbiVirtAddr::new(MANAGED_KERNEL_RANGE_END),
-        mmio_base: AbiVirtAddr::new(MMIO_BASE),
+        kernel_space_base: VirtAddr::new(KERNEL_SPACE_BASE),
+        managed_kernel_range_start: VirtAddr::new(MANAGED_KERNEL_RANGE_START),
+        managed_kernel_range_end: VirtAddr::new(MANAGED_KERNEL_RANGE_END),
+        mmio_base: VirtAddr::new(MMIO_BASE),
         low_physical_reserve_bytes: LOW_PHYSICAL_RESERVE_BYTES,
     }
 }

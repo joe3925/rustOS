@@ -5,7 +5,7 @@ use crate::memory::device_mmu::{
     DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
 };
 use crate::memory::paging::types::UserVmLayout;
-use kernel_types::arch::{PageFlags, PhysAddr as AbiPhysAddr, VirtAddr as AbiVirtAddr};
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{MsiMessage, MsiRequest};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::pci::PciConfigAddress;
@@ -68,7 +68,7 @@ pub trait AddressSpacePlatform: Platform {
 
     unsafe fn switch_root(root: Self::Root);
 
-    fn root_to_phys(root: Self::Root) -> AbiPhysAddr;
+    fn root_to_phys(root: Self::Root) -> PhysAddr;
 
     fn create_user_root<A: PageTableFrameAllocator>(
         allocator: &mut A,
@@ -81,8 +81,8 @@ pub trait AddressSpacePlatform: Platform {
 }
 
 pub trait PageTableFrameAllocator {
-    fn allocate_page_table_frame(&mut self) -> Option<AbiPhysAddr>;
-    fn free_page_table_frame(&mut self, phys: AbiPhysAddr);
+    fn allocate_page_table_frame(&mut self) -> Option<PhysAddr>;
+    fn free_page_table_frame(&mut self, phys: PhysAddr);
 }
 
 pub trait PagingPlatform: AddressSpacePlatform {
@@ -91,8 +91,8 @@ pub trait PagingPlatform: AddressSpacePlatform {
     fn user_virtual_layout() -> UserVmLayout;
     unsafe fn map_leaf<A: PageTableFrameAllocator>(
         allocator: &mut A,
-        virt: AbiVirtAddr,
-        phys: AbiPhysAddr,
+        virt: VirtAddr,
+        phys: PhysAddr,
         size: MappingSize,
         flags: PageFlags,
         cache: Option<PhysicalMappingCache>,
@@ -101,16 +101,16 @@ pub trait PagingPlatform: AddressSpacePlatform {
 
     unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
         allocator: &mut A,
-        virt: AbiVirtAddr,
+        virt: VirtAddr,
         size: MappingSize,
         disposition: UnmapFrameDisposition,
         flush: LocalTlbFlush,
-    ) -> Result<Option<AbiPhysAddr>, PageMapError>;
+    ) -> Result<Option<PhysAddr>, PageMapError>;
 
-    fn resolve_mapping(virt: AbiVirtAddr) -> Option<ResolvedMapping>;
+    fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping>;
 
     fn local_flush_tlb_all();
-    fn local_flush_tlb_range(start: AbiVirtAddr, size: u64, stride: u64);
+    fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64);
 
     fn broadcast_tlb_shootdown() -> bool;
 }
