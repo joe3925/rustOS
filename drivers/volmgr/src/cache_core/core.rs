@@ -5,10 +5,13 @@ use crate::cache_traits::{
 };
 use alloc::sync::Arc;
 use core::cmp::min;
+use core::future::Future;
 use core::hint::{cold_path, likely, unlikely};
 use core::marker::PhantomData;
 use core::ops::Range;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 use futures::future::FutureExt as FuturesFutureExt;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
@@ -23,6 +26,7 @@ use spin::Mutex;
 use super::flush::{
     FlushFilter, FlushJobHandle, FlushRunScratchLease, FlushScratch, PreparedFlushPage,
 };
+use super::notify::WritebackNotifier;
 use super::page::{Page, PagePool, PageUseGuard};
 
 struct StatsInner {
@@ -101,6 +105,57 @@ enum WriteAcquire<const BLOCK_SIZE: usize> {
     Direct(Arc<Page<BLOCK_SIZE>>),
 }
 
+enum WritebackWaitResult {
+    Clean,
+    NeedsFlush,
+}
+
+enum FilteredWritebackState {
+    Clean,
+    NeedsFlush,
+    ActiveWriteback,
+}
+
+struct WritebackProgressWait<'cache, 'filter, 'range, B, const BLOCK_SIZE: usize, F>
+where
+    B: VolumeCacheBackend,
+    F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
+{
+    cache: &'cache VolumeCache<B, BLOCK_SIZE, F>,
+    filter: &'filter FlushFilter<'range>,
+}
+
+impl<'cache, 'filter, 'range, B, const BLOCK_SIZE: usize, F> Future
+    for WritebackProgressWait<'cache, 'filter, 'range, B, BLOCK_SIZE, F>
+where
+    B: VolumeCacheBackend,
+    F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
+{
+    type Output = WritebackWaitResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let observed_epoch = this.cache.writeback_notifier.epoch();
+
+        match this.cache.filtered_writeback_state(this.filter) {
+            FilteredWritebackState::Clean => Poll::Ready(WritebackWaitResult::Clean),
+            FilteredWritebackState::NeedsFlush => Poll::Ready(WritebackWaitResult::NeedsFlush),
+            FilteredWritebackState::ActiveWriteback => {
+                if this
+                    .cache
+                    .writeback_notifier
+                    .register_if_unchanged(observed_epoch, cx.waker())
+                {
+                    Poll::Pending
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct VolumeCache<B, const BLOCK_SIZE: usize, F = DefaultIndexFactory>
 where
     B: VolumeCacheBackend,
@@ -112,6 +167,7 @@ where
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     dirty_pages: Arc<AtomicUsize>,
+    writeback_notifier: WritebackNotifier,
     background_writeback_active: AtomicBool,
     closed: AtomicBool,
     flush_job: Mutex<Option<Arc<FlushJobHandle<B::Error>>>>,
@@ -191,6 +247,7 @@ where
             cfg,
             stats: Arc::new(StatsInner::new()),
             dirty_pages: Arc::new(AtomicUsize::new(0)),
+            writeback_notifier: WritebackNotifier::new(),
             background_writeback_active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             flush_job: Mutex::new(None),
@@ -379,7 +436,14 @@ where
         };
 
         let run = [prepared];
-        Self::flush_prepared_run(&self.backend, &self.stats, &self.dirty_pages, &run).await?;
+        Self::flush_prepared_run(
+            &self.backend,
+            &self.stats,
+            &self.dirty_pages,
+            &self.writeback_notifier,
+            &run,
+        )
+        .await?;
 
         Ok(true)
     }
@@ -755,9 +819,12 @@ where
     fn finish_prepared_flush_pages(
         stats: &StatsInner,
         dirty_pages: &AtomicUsize,
+        writeback_notifier: &WritebackNotifier,
         pages: &[PreparedFlushPage<BLOCK_SIZE>],
         success: bool,
     ) {
+        let mut completed_writebacks = 0usize;
+
         for prepared in pages {
             if likely(success) {
                 let cur_gen = prepared.page.generation.load(Ordering::Acquire);
@@ -772,6 +839,11 @@ where
                 dirty_pages.fetch_add(1, Ordering::AcqRel);
             }
             prepared.page.writeback.store(false, Ordering::Release);
+            completed_writebacks += 1;
+        }
+
+        if completed_writebacks != 0 {
+            writeback_notifier.notify_all();
         }
     }
 
@@ -779,6 +851,7 @@ where
         backend: &Arc<B>,
         stats: &Arc<StatsInner>,
         dirty_pages: &Arc<AtomicUsize>,
+        writeback_notifier: &WritebackNotifier,
         run: &[PreparedFlushPage<BLOCK_SIZE>],
     ) -> Result<usize, CacheError<B::Error>> {
         // TODO: allow this to be configured
@@ -793,7 +866,7 @@ where
 
         if run_len.checked_mul(BLOCK_SIZE).is_none() {
             cold_path();
-            Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+            Self::finish_prepared_flush_pages(stats, dirty_pages, writeback_notifier, run, false);
             return Err(CacheError::OffsetOverflow);
         }
 
@@ -816,7 +889,13 @@ where
                 Ok(io_buf) => io_buf,
                 Err(_) => {
                     cold_path();
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        run,
+                        false,
+                    );
                     return Err(CacheError::InvalidIoBuffer);
                 }
             };
@@ -831,12 +910,24 @@ where
                     stats
                         .backend_writes
                         .fetch_add(run_len as u64, Ordering::Relaxed);
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, true);
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        run,
+                        true,
+                    );
                     Ok(run_len)
                 }
                 Err(err) => {
                     cold_path();
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        run,
+                        false,
+                    );
                     Err(err)
                 }
             }
@@ -857,7 +948,13 @@ where
                 Ok(io_buf) => io_buf,
                 Err(_) => {
                     cold_path();
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        run,
+                        false,
+                    );
                     return Err(CacheError::InvalidIoBuffer);
                 }
             };
@@ -872,12 +969,24 @@ where
                     stats
                         .backend_writes
                         .fetch_add(run_len as u64, Ordering::Relaxed);
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, true);
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        run,
+                        true,
+                    );
                     Ok(run_len)
                 }
                 Err(err) => {
                     cold_path();
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        run,
+                        false,
+                    );
                     Err(err)
                 }
             }
@@ -936,6 +1045,7 @@ where
                     &self.backend,
                     &self.stats,
                     &self.dirty_pages,
+                    &self.writeback_notifier,
                     run.as_slice(),
                 )
                 .await
@@ -964,6 +1074,7 @@ where
                         &self.backend,
                         &self.stats,
                         &self.dirty_pages,
+                        &self.writeback_notifier,
                         run.as_slice(),
                     )
                     .await
@@ -991,6 +1102,7 @@ where
                     &self.backend,
                     &self.stats,
                     &self.dirty_pages,
+                    &self.writeback_notifier,
                     run.as_slice(),
                 )
                 .await
@@ -1012,6 +1124,7 @@ where
                 &self.backend,
                 &self.stats,
                 &self.dirty_pages,
+                &self.writeback_notifier,
                 run.as_slice(),
             )
             .await
@@ -1165,22 +1278,53 @@ where
         Ok((matched, writebacks))
     }
 
-    async fn has_dirty_pages_filtered(&self, filter: &FlushFilter<'_>) -> bool {
+    fn filtered_writeback_state(&self, filter: &FlushFilter<'_>) -> FilteredWritebackState {
+        let mut has_dirty = false;
         let mut shard_idx = 0usize;
+
         while shard_idx < self.shards.len() {
             let shard = self.shards[shard_idx].lock();
-            let mut found = false;
             shard.index.for_each(|lba, page| {
-                if !found && page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
-                    found = true;
+                if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
+                    has_dirty = true;
                 }
             });
-            if found {
-                return true;
+
+            if has_dirty {
+                let mut has_active_writeback = false;
+                shard.index.for_each(|lba, page| {
+                    if !has_active_writeback
+                        && page.dirty.load(Ordering::Acquire)
+                        && page.writeback.load(Ordering::Acquire)
+                        && filter.matches(lba, page)
+                    {
+                        has_active_writeback = true;
+                    }
+                });
+
+                if has_active_writeback {
+                    return FilteredWritebackState::ActiveWriteback;
+                }
             }
+
             shard_idx += 1;
         }
-        false
+
+        if has_dirty {
+            FilteredWritebackState::NeedsFlush
+        } else {
+            FilteredWritebackState::Clean
+        }
+    }
+
+    fn wait_for_writeback_progress<'cache, 'filter, 'range>(
+        &'cache self,
+        filter: &'filter FlushFilter<'range>,
+    ) -> WritebackProgressWait<'cache, 'filter, 'range, B, BLOCK_SIZE, F> {
+        WritebackProgressWait {
+            cache: self,
+            filter,
+        }
     }
 
     async fn flush_until_clean(&self) -> Result<(), CacheError<B::Error>> {
@@ -1277,16 +1421,39 @@ where
     ) -> Result<(), CacheError<B::Error>> {
         loop {
             let dirty_before = self.dirty_pages.load(Ordering::Acquire);
-            self.flush_internal_filtered(filter, force_device_flush)
+            let (_, writebacks) = self
+                .flush_internal_filtered(filter, force_device_flush)
                 .await?;
-            if !self.has_dirty_pages_filtered(filter).await {
+            if matches!(
+                self.filtered_writeback_state(filter),
+                FilteredWritebackState::Clean
+            ) {
                 break;
+            }
+
+            if writebacks == 0 {
+                if matches!(
+                    self.wait_for_writeback_progress(filter).await,
+                    WritebackWaitResult::Clean
+                ) {
+                    break;
+                }
+                continue;
             }
 
             let dirty_after = self.dirty_pages.load(Ordering::Acquire);
             if dirty_after >= dirty_before {
-                self.flush_internal_filtered(filter, force_device_flush)
+                let (_, retry_writebacks) = self
+                    .flush_internal_filtered(filter, force_device_flush)
                     .await?;
+                if retry_writebacks == 0 {
+                    if matches!(
+                        self.wait_for_writeback_progress(filter).await,
+                        WritebackWaitResult::Clean
+                    ) {
+                        break;
+                    }
+                }
             }
         }
 
