@@ -5,18 +5,9 @@
 extern crate alloc;
 
 mod arch;
+mod platform;
 
 use alloc::alloc::{GlobalAlloc, Layout};
-use arch::{
-    enter_kernel_pe, init_mapper, validate_kernel_machine, FrameAllocator, Mapper, Page,
-    PageTableFlags, PhysAddr, PhysFrame, Port, RecursivePageTable, Size4KiB, TranslateError,
-    VirtAddr,
-};
-use bootloader_api::config::Mapping;
-use bootloader_api::info::{
-    MemoryRegion as BootMemoryRegion, MemoryRegionKind as BootMemoryRegionKind,
-};
-use bootloader_api::{entry_point, BootInfo as BootloaderBootInfo, BootloaderConfig};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{addr_of_mut, copy_nonoverlapping};
@@ -25,33 +16,20 @@ use goblin::pe::optional_header::MAGIC_64;
 use goblin::pe::section_table::{SectionTable, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 use goblin::pe::PE;
 use kernel_abi::{
-    BootInfo, FrameBuffer, FrameBufferInfo, KernelSection, KernelSections, KernelSymbol,
-    KernelSymbolString, KernelSymbols, KernelTextSection, MemoryRegion, MemoryRegionKind,
-    MemoryRegions, Optional, PeTlsDirectory, PixelFormat, KERNEL_PE_BASE, MAX_BOOT_MEMORY_REGIONS,
-    MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS, MAX_KERNEL_SECTIONS,
-    MAX_KERNEL_SYMBOL_STRING_BYTES, RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION,
-    STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
+    BootInfo, KernelSection, KernelSections, KernelSymbol, KernelSymbolString, KernelSymbols,
+    KernelTextSection, MemoryRegion, MemoryRegionKind, MemoryRegions, Optional,
+    MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
+    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, RUSTOS_BOOT_INFO_MAGIC,
+    RUSTOS_BOOT_INFO_VERSION,
+};
+use platform::{
+    ActivePlatform, BootloaderMemoryRegion, BootloaderPlatform, KernelImagePermissions,
+    KernelImagePlatform, LoadedKernel, PhysRange, Platform,
 };
 
 const KERNEL_PE: &[u8] = include_bytes!(env!("KERNEL_PE_PATH"));
-const PAGE_SIZE: u64 = 0x1000;
-const LOW_RESERVED_END: u64 = 0x20_0000;
 const STUB_HEAP_SIZE: usize = 2 * 1024 * 1024;
 const MAX_ALLOCATED_RANGES: usize = 128;
-
-pub static BOOTLOADER_CONFIG: BootloaderConfig = {
-    let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = None;
-    config.mappings.page_table_recursive = Some(Mapping::Dynamic);
-    config.kernel_stack_size = 1 * 1024 * 1024;
-    config.mappings.kernel_stack = Mapping::Dynamic;
-    config.mappings.framebuffer = Mapping::Dynamic;
-    config.mappings.dynamic_range_start = Some(STUB_DYNAMIC_RANGE_START);
-    config.mappings.dynamic_range_end = Some(STUB_DYNAMIC_RANGE_END);
-    config
-};
-
-entry_point!(stub_start, config = &BOOTLOADER_CONFIG);
 
 #[repr(align(16))]
 struct Heap([u8; STUB_HEAP_SIZE]);
@@ -99,13 +77,13 @@ unsafe impl GlobalAlloc for BumpAllocator {
 
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
-    fatal("kernel_stub: allocation failed")
+    fatal::<ActivePlatform>("kernel_stub: allocation failed")
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println_fmt(format_args!("kernel_stub panic: {info}"));
-    halt_loop()
+    ActivePlatform::halt()
 }
 
 static mut ABI_MEMORY_REGIONS: [MemoryRegion; MAX_BOOT_MEMORY_REGIONS] =
@@ -124,63 +102,45 @@ static mut ALLOCATED_RANGES: [PhysRange; MAX_ALLOCATED_RANGES] =
     [PhysRange::empty(); MAX_ALLOCATED_RANGES];
 static mut ALLOCATED_RANGE_COUNT: usize = 0;
 
-#[derive(Clone, Copy)]
-struct PhysRange {
-    start: u64,
-    end: u64,
-}
-
-impl PhysRange {
-    const fn empty() -> Self {
-        Self { start: 0, end: 0 }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LoadedKernel {
-    image_base: u64,
-    image_size: u64,
-    entry: u64,
-    section_count: usize,
-}
-
-fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
-    init_serial();
+pub fn start<P>(boot_info: &'static mut P::BootloaderInfo) -> !
+where
+    P: BootloaderPlatform,
+{
+    P::init_debug();
     serial_println("kernel_stub: loading embedded PE kernel");
 
-    let recursive_index = boot_info
-        .recursive_index
-        .into_option()
-        .unwrap_or_else(|| fatal("kernel_stub: bootloader did not map page tables recursively"));
+    let mut frame_allocator = P::init_frame_allocator(boot_info);
+    let mut mapper = P::init_mapper(boot_info).unwrap_or_else(|err| fatal::<P>(err));
 
-    let mut frame_allocator = BootFrameAllocator::new(&boot_info.memory_regions);
-    let mut mapper = unsafe { init_mapper(recursive_index) };
-
-    let loaded = load_kernel_pe(&mut mapper, &mut frame_allocator).unwrap_or_else(|err| fatal(err));
-    let handoff = build_handoff(boot_info, loaded).unwrap_or_else(|err| fatal(err));
+    let loaded = load_kernel_pe::<P>(&mut mapper, &mut frame_allocator)
+        .unwrap_or_else(|err| fatal::<P>(err));
+    let handoff = build_handoff::<P>(boot_info, loaded).unwrap_or_else(|err| fatal::<P>(err));
 
     serial_println("kernel_stub: jumping to PE kernel");
 
-    unsafe { enter_kernel_pe(loaded.entry, handoff as *const BootInfo) }
+    unsafe { P::enter_kernel(loaded.entry, handoff as *const BootInfo) }
 }
 
-fn load_kernel_pe(
-    mapper: &mut RecursivePageTable<'static>,
-    frame_allocator: &mut BootFrameAllocator,
-) -> Result<LoadedKernel, &'static str> {
+fn load_kernel_pe<P>(
+    mapper: &mut P::ImageMapper,
+    frame_allocator: &mut P::FrameAllocator,
+) -> Result<LoadedKernel, &'static str>
+where
+    P: KernelImagePlatform,
+{
     let pe = PE::parse(KERNEL_PE).map_err(|_| "kernel_stub: embedded kernel is not a PE image")?;
-    validate_kernel_pe(&pe)?;
+    validate_kernel_pe::<P>(&pe)?;
 
     let opt = pe
         .header
         .optional_header
         .as_ref()
         .ok_or("kernel_stub: PE optional header missing")?;
-    let image_size = align_up_4k(opt.windows_fields.size_of_image as u64);
+    let image_size = align_up(opt.windows_fields.size_of_image as u64, P::base_page_size());
     let headers_size = opt.windows_fields.size_of_headers as usize;
     let image_base = opt.windows_fields.image_base;
 
-    map_image_range(mapper, frame_allocator, image_base, image_size)?;
+    P::map_kernel_image_range(mapper, frame_allocator, image_base, image_size)?;
 
     unsafe {
         core::ptr::write_bytes(image_base as *mut u8, 0, image_size as usize);
@@ -192,8 +152,8 @@ fn load_kernel_pe(
         copy_section(image_base, image_size, section)?;
     }
 
-    prepare_kernel_pe_tls(image_base, image_size, &pe)?;
-    apply_section_permissions(mapper, image_base, image_size, &pe.sections)?;
+    prepare_kernel_pe_tls::<P>(image_base, image_size, &pe)?;
+    apply_section_permissions::<P>(mapper, image_base, image_size, &pe.sections)?;
 
     let entry = image_base
         .checked_add(pe.entry as u64)
@@ -207,7 +167,10 @@ fn load_kernel_pe(
     })
 }
 
-fn validate_kernel_pe(pe: &PE<'_>) -> Result<(), &'static str> {
+fn validate_kernel_pe<P>(pe: &PE<'_>) -> Result<(), &'static str>
+where
+    P: KernelImagePlatform,
+{
     let opt = pe
         .header
         .optional_header
@@ -217,8 +180,10 @@ fn validate_kernel_pe(pe: &PE<'_>) -> Result<(), &'static str> {
     if !pe.is_64 || opt.standard_fields.magic != MAGIC_64 {
         return Err("kernel_stub: kernel PE must be PE32+");
     }
-    validate_kernel_machine(pe.header.coff_header.machine)?;
-    if pe.image_base != KERNEL_PE_BASE || opt.windows_fields.image_base != KERNEL_PE_BASE {
+    P::validate_kernel_machine(pe.header.coff_header.machine)?;
+    if pe.image_base != P::kernel_image_base()
+        || opt.windows_fields.image_base != P::kernel_image_base()
+    {
         return Err("kernel_stub: kernel PE preferred base does not match the kernel layout");
     }
     if pe.entry == 0 {
@@ -239,64 +204,27 @@ fn validate_kernel_pe(pe: &PE<'_>) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn prepare_kernel_pe_tls(
+fn prepare_kernel_pe_tls<P>(
     image_base: u64,
     image_size: u64,
     pe: &PE<'_>,
-) -> Result<(), &'static str> {
+) -> Result<(), &'static str>
+where
+    P: KernelImagePlatform,
+{
     let Some(tls) = pe.tls_data.as_ref() else {
         return Ok(());
     };
 
-    let directory = pe_tls_directory_from_goblin(tls.image_tls_directory);
-    validate_pe_tls_directory(image_base, image_size, &directory)?;
-
-    if directory.address_of_index != 0 {
-        unsafe {
-            (directory.address_of_index as *mut u32).write(0);
-        }
-    }
+    let directory = P::tls_directory_from_pe(tls.image_tls_directory);
+    P::validate_tls_directory(image_base, image_size, &directory)?;
+    P::prepare_tls_directory(&directory)?;
 
     Ok(())
 }
 
 fn directory_present(dir: Option<&DataDirectory>) -> bool {
     dir.is_some_and(|dir| dir.virtual_address != 0 && dir.size != 0)
-}
-
-fn map_image_range(
-    mapper: &mut RecursivePageTable<'static>,
-    frame_allocator: &mut BootFrameAllocator,
-    base: u64,
-    size: u64,
-) -> Result<(), &'static str> {
-    if size == 0 || base & (PAGE_SIZE - 1) != 0 {
-        return Err("kernel_stub: invalid PE image range");
-    }
-
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    let start = Page::<Size4KiB>::containing_address(VirtAddr::new(base));
-    let end = Page::<Size4KiB>::containing_address(VirtAddr::new(base + size - 1));
-
-    for page in Page::range_inclusive(start, end) {
-        match mapper.translate_page(page) {
-            Ok(_) => return Err("kernel_stub: kernel PE preferred base is already mapped"),
-            Err(TranslateError::PageNotMapped) => {}
-            Err(_) => return Err("kernel_stub: kernel PE preferred base overlaps a huge mapping"),
-        }
-
-        let frame = frame_allocator
-            .allocate_frame()
-            .ok_or("kernel_stub: out of physical memory while mapping PE kernel")?;
-        unsafe {
-            mapper
-                .map_to(page, frame, flags, frame_allocator)
-                .map_err(|_| "kernel_stub: failed to map PE kernel page")?
-                .flush();
-        }
-    }
-
-    Ok(())
 }
 
 fn copy_section(base: u64, image_size: u64, section: &SectionTable) -> Result<(), &'static str> {
@@ -332,17 +260,23 @@ fn copy_section(base: u64, image_size: u64, section: &SectionTable) -> Result<()
     Ok(())
 }
 
-fn apply_section_permissions(
-    mapper: &mut RecursivePageTable<'static>,
+fn apply_section_permissions<P>(
+    mapper: &mut P::ImageMapper,
     base: u64,
     image_size: u64,
     sections: &[SectionTable],
-) -> Result<(), &'static str> {
-    set_page_flags(
+) -> Result<(), &'static str>
+where
+    P: KernelImagePlatform,
+{
+    P::set_kernel_image_permissions(
         mapper,
         base,
         image_size,
-        PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE,
+        KernelImagePermissions {
+            writable: false,
+            executable: false,
+        },
     )?;
 
     for section in sections {
@@ -351,92 +285,48 @@ fn apply_section_permissions(
             continue;
         }
 
-        let mut flags = PageTableFlags::PRESENT;
-        if section.characteristics & IMAGE_SCN_MEM_WRITE != 0 {
-            flags |= PageTableFlags::WRITABLE;
-        }
-        if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
-            flags |= PageTableFlags::NO_EXECUTE;
-        }
-
-        set_page_flags(
+        P::set_kernel_image_permissions(
             mapper,
             base + section.virtual_address as u64,
             section_size,
-            flags,
+            KernelImagePermissions {
+                writable: section.characteristics & IMAGE_SCN_MEM_WRITE != 0,
+                executable: section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0,
+            },
         )?;
     }
 
     Ok(())
 }
 
-fn set_page_flags(
-    mapper: &mut RecursivePageTable<'static>,
-    base: u64,
-    size: u64,
-    flags: PageTableFlags,
-) -> Result<(), &'static str> {
-    let start = Page::<Size4KiB>::containing_address(VirtAddr::new(base));
-    let end = Page::<Size4KiB>::containing_address(VirtAddr::new(base + size - 1));
-
-    for page in Page::range_inclusive(start, end) {
-        unsafe {
-            mapper
-                .update_flags(page, flags)
-                .map_err(|_| "kernel_stub: failed to update PE page permissions")?
-                .flush();
-        }
-    }
-
-    Ok(())
-}
-
-fn build_handoff(
-    boot_info: &'static mut BootloaderBootInfo,
+fn build_handoff<P>(
+    boot_info: &'static mut P::BootloaderInfo,
     loaded: LoadedKernel,
-) -> Result<&'static mut BootInfo, &'static str> {
-    let memory_region_count = translate_memory_regions(&boot_info.memory_regions)?;
+) -> Result<&'static mut BootInfo, &'static str>
+where
+    P: BootloaderPlatform,
+{
+    let memory_region_count = translate_memory_regions::<P>(boot_info)?;
     let section_count = translate_kernel_sections(loaded.image_base, loaded.section_count)?;
     let kernel_text = translate_kernel_text_section(loaded.image_base)?;
-    let pe_tls_directory = translate_kernel_tls_directory(loaded.image_base, loaded.image_size)?;
+    let tls_directory = translate_kernel_tls_directory::<P>(loaded.image_base, loaded.image_size)?;
     let (kernel_import_count, kernel_export_count) = translate_kernel_symbols()?;
-
-    let framebuffer = match boot_info.framebuffer.as_mut() {
-        Some(fb) => {
-            let info = fb.info();
-            let buffer = fb.buffer_mut();
-            Optional::Some(unsafe {
-                FrameBuffer::new(
-                    buffer.as_mut_ptr() as u64,
-                    FrameBufferInfo {
-                        byte_len: info.byte_len,
-                        width: info.width,
-                        height: info.height,
-                        pixel_format: translate_pixel_format(info.pixel_format),
-                        bytes_per_pixel: info.bytes_per_pixel,
-                        stride: info.stride,
-                    },
-                )
-            })
-        }
-        None => Optional::None,
-    };
+    let (ramdisk_addr, ramdisk_len) = P::ramdisk(boot_info);
 
     unsafe {
-        ABI_BOOT_INFO = BootInfo {
+        let common_boot_info = BootInfo {
             magic: RUSTOS_BOOT_INFO_MAGIC,
             version: RUSTOS_BOOT_INFO_VERSION,
             flags: 0,
+            rsdp_addr: Optional::None,
+            arch_info: kernel_abi::arch::ArchInfo::empty(),
             memory_regions: MemoryRegions {
                 ptr: addr_of_mut!(ABI_MEMORY_REGIONS).cast::<MemoryRegion>(),
                 len: memory_region_count,
             },
-            framebuffer,
-            recursive_index: translate_optional(boot_info.recursive_index),
-            rsdp_addr: translate_optional(boot_info.rsdp_addr),
-            fdt_header: Optional::None,
+            framebuffer: P::framebuffer(boot_info),
+            fdt_header: P::fdt_header(boot_info),
             tls_template: Optional::None,
-            pe_tls_directory,
             kernel_imports: KernelSymbols {
                 ptr: addr_of_mut!(ABI_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
                 len: kernel_import_count,
@@ -445,8 +335,8 @@ fn build_handoff(
                 ptr: addr_of_mut!(ABI_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
                 len: kernel_export_count,
             },
-            ramdisk_addr: translate_optional(boot_info.ramdisk_addr),
-            ramdisk_len: boot_info.ramdisk_len,
+            ramdisk_addr,
+            ramdisk_len,
             kernel_addr: 0,
             kernel_len: loaded.image_size,
             kernel_image_offset: 0,
@@ -458,57 +348,67 @@ fn build_handoff(
                 ptr: addr_of_mut!(ABI_KERNEL_SECTIONS).cast::<KernelSection>(),
                 len: section_count,
             },
-            stub_base: STUB_IMAGE_BASE,
-            stub_size: align_up_4k(boot_info.kernel_len.max(PAGE_SIZE)),
+            stub_base: P::stub_image_base(),
+            stub_size: P::stub_image_size(boot_info),
         };
+
+        let (boot_info, _) = P::finalize_boot_info(boot_info, common_boot_info, tls_directory)?;
+        ABI_BOOT_INFO = boot_info;
 
         Ok(&mut *addr_of_mut!(ABI_BOOT_INFO))
     }
 }
 
-fn translate_memory_regions(boot_regions: &[BootMemoryRegion]) -> Result<usize, &'static str> {
+fn translate_memory_regions<P>(boot_info: &P::BootloaderInfo) -> Result<usize, &'static str>
+where
+    P: BootloaderPlatform,
+{
     let mut out_len = 0usize;
 
-    for region in boot_regions {
+    P::for_each_memory_region(boot_info, |region| {
         if region.end <= region.start {
-            continue;
+            return Ok(());
         }
 
         let mut cursor = region.start;
-        let kind = translate_memory_kind(region.kind);
-        let ranges = unsafe {
-            core::slice::from_raw_parts(
-                addr_of_mut!(ALLOCATED_RANGES).cast::<PhysRange>(),
-                ALLOCATED_RANGE_COUNT,
-            )
-        };
+        let kind = region.kind;
 
-        if cursor < LOW_RESERVED_END && region.end > 0 {
-            let end = region.end.min(LOW_RESERVED_END);
-            push_translated_region(&mut out_len, cursor, end, MemoryRegionKind::Bootloader)?;
-            cursor = end;
-        }
+        P::for_each_reserved_memory_range(|reserved| {
+            cursor = translate_reserved_range(&mut out_len, region, cursor, kind, reserved)?;
+            Ok(())
+        })?;
 
-        for reserved in ranges {
-            let start = reserved.start.max(region.start).max(cursor);
-            let end = reserved.end.min(region.end);
-            if end <= start {
-                continue;
-            }
-
-            if cursor < start {
-                push_translated_region(&mut out_len, cursor, start, kind)?;
-            }
-            push_translated_region(&mut out_len, start, end, MemoryRegionKind::Bootloader)?;
-            cursor = end;
+        for reserved in allocated_ranges() {
+            cursor = translate_reserved_range(&mut out_len, region, cursor, kind, *reserved)?;
         }
 
         if cursor < region.end {
             push_translated_region(&mut out_len, cursor, region.end, kind)?;
         }
+
+        Ok(())
+    })?;
+    Ok(out_len)
+}
+
+fn translate_reserved_range(
+    out_len: &mut usize,
+    region: BootloaderMemoryRegion,
+    cursor: u64,
+    kind: MemoryRegionKind,
+    reserved: PhysRange,
+) -> Result<u64, &'static str> {
+    let start = reserved.start.max(region.start).max(cursor);
+    let end = reserved.end.min(region.end);
+    if end <= start {
+        return Ok(cursor);
     }
 
-    Ok(out_len)
+    if cursor < start {
+        push_translated_region(out_len, cursor, start, kind)?;
+    }
+    push_translated_region(out_len, start, end, MemoryRegionKind::Bootloader)?;
+    Ok(end)
 }
 
 fn push_translated_region(
@@ -584,69 +484,21 @@ fn translate_kernel_text_section(
     Ok(Optional::None)
 }
 
-fn translate_kernel_tls_directory(
+fn translate_kernel_tls_directory<P>(
     image_base: u64,
     image_size: u64,
-) -> Result<Optional<PeTlsDirectory>, &'static str> {
+) -> Result<Optional<P::TlsDirectory>, &'static str>
+where
+    P: KernelImagePlatform,
+{
     let pe = PE::parse(KERNEL_PE).map_err(|_| "kernel_stub: failed to reparse PE TLS")?;
     let Some(tls) = pe.tls_data.as_ref() else {
         return Ok(Optional::None);
     };
 
-    let directory = pe_tls_directory_from_goblin(tls.image_tls_directory);
-    validate_pe_tls_directory(image_base, image_size, &directory)?;
+    let directory = P::tls_directory_from_pe(tls.image_tls_directory);
+    P::validate_tls_directory(image_base, image_size, &directory)?;
     Ok(Optional::Some(directory))
-}
-
-fn pe_tls_directory_from_goblin(directory: goblin::pe::tls::ImageTlsDirectory) -> PeTlsDirectory {
-    PeTlsDirectory {
-        start_address_of_raw_data: directory.start_address_of_raw_data,
-        end_address_of_raw_data: directory.end_address_of_raw_data,
-        address_of_index: directory.address_of_index,
-        address_of_callbacks: directory.address_of_callbacks,
-        size_of_zero_fill: directory.size_of_zero_fill,
-        characteristics: directory.characteristics,
-    }
-}
-
-fn validate_pe_tls_directory(
-    image_base: u64,
-    image_size: u64,
-    directory: &PeTlsDirectory,
-) -> Result<(), &'static str> {
-    let image_end = image_base
-        .checked_add(image_size)
-        .ok_or("kernel_stub: PE image range overflow")?;
-
-    if directory.start_address_of_raw_data != 0 || directory.end_address_of_raw_data != 0 {
-        if directory.start_address_of_raw_data > directory.end_address_of_raw_data {
-            return Err("kernel_stub: PE TLS raw data range is backwards");
-        }
-        if directory.start_address_of_raw_data < image_base
-            || directory.end_address_of_raw_data > image_end
-        {
-            return Err("kernel_stub: PE TLS raw data is outside the kernel image");
-        }
-    }
-
-    if directory.address_of_index != 0 {
-        let index_end = directory
-            .address_of_index
-            .checked_add(core::mem::size_of::<u32>() as u64)
-            .ok_or("kernel_stub: PE TLS index address overflow")?;
-        if directory.address_of_index < image_base || index_end > image_end {
-            return Err("kernel_stub: PE TLS index is outside the kernel image");
-        }
-    }
-
-    if directory.address_of_callbacks != 0
-        && (directory.address_of_callbacks < image_base
-            || directory.address_of_callbacks >= image_end)
-    {
-        return Err("kernel_stub: PE TLS callbacks pointer is outside the kernel image");
-    }
-
-    Ok(())
 }
 
 fn translate_kernel_symbols() -> Result<(usize, usize), &'static str> {
@@ -716,87 +568,11 @@ fn store_kernel_symbol_string(value: &str) -> Result<KernelSymbolString, &'stati
     }
 }
 
-fn translate_memory_kind(kind: BootMemoryRegionKind) -> MemoryRegionKind {
-    match kind {
-        BootMemoryRegionKind::Usable => MemoryRegionKind::Usable,
-        BootMemoryRegionKind::Bootloader => MemoryRegionKind::Bootloader,
-        BootMemoryRegionKind::UnknownUefi(value) => MemoryRegionKind::UnknownUefi(value),
-        BootMemoryRegionKind::UnknownBios(value) => MemoryRegionKind::UnknownBios(value),
-        _ => MemoryRegionKind::Bootloader,
-    }
-}
-
-fn translate_pixel_format(pixel_format: bootloader_api::info::PixelFormat) -> PixelFormat {
-    match pixel_format {
-        bootloader_api::info::PixelFormat::Rgb => PixelFormat::Rgb,
-        bootloader_api::info::PixelFormat::Bgr => PixelFormat::Bgr,
-        bootloader_api::info::PixelFormat::U8 => PixelFormat::U8,
-        bootloader_api::info::PixelFormat::Unknown {
-            red_position,
-            green_position,
-            blue_position,
-        } => PixelFormat::Unknown {
-            red_position,
-            green_position,
-            blue_position,
-        },
-        _ => PixelFormat::Rgb,
-    }
-}
-
-fn translate_optional<T>(value: bootloader_api::info::Optional<T>) -> Optional<T> {
-    match value.into_option() {
-        Some(value) => Optional::Some(value),
-        None => Optional::None,
-    }
-}
-
-struct BootFrameAllocator {
-    regions: *const BootMemoryRegion,
-    len: usize,
-    next_frame: u64,
-}
-
-impl BootFrameAllocator {
-    fn new(regions: &[BootMemoryRegion]) -> Self {
-        Self {
-            regions: regions.as_ptr(),
-            len: regions.len(),
-            next_frame: LOW_RESERVED_END / PAGE_SIZE,
-        }
-    }
-
-    fn regions(&self) -> &[BootMemoryRegion] {
-        unsafe { core::slice::from_raw_parts(self.regions, self.len) }
-    }
-}
-
-unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
-    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        let mut best: Option<u64> = None;
-
-        for region in self.regions() {
-            if region.kind != BootMemoryRegionKind::Usable || region.end <= region.start {
-                continue;
-            }
-
-            let start = align_up_4k(region.start).max(self.next_frame * PAGE_SIZE);
-            let end = region.end & !(PAGE_SIZE - 1);
-            if start < end {
-                best = Some(best.map_or(start, |current| current.min(start)));
-            }
-        }
-
-        let phys = best?;
-        self.next_frame = phys / PAGE_SIZE + 1;
-        record_allocated_frame(phys).ok()?;
-        Some(PhysFrame::containing_address(PhysAddr::new(phys)))
-    }
-}
-
-fn record_allocated_frame(phys: u64) -> Result<(), &'static str> {
+pub(crate) fn record_allocated_frame(phys: u64) -> Result<(), &'static str> {
     unsafe {
-        let end = phys + PAGE_SIZE;
+        let end = phys
+            .checked_add(ActivePlatform::base_page_size())
+            .ok_or("kernel_stub: physical allocation range overflow")?;
         if ALLOCATED_RANGE_COUNT > 0 {
             let last = &mut ALLOCATED_RANGES[ALLOCATED_RANGE_COUNT - 1];
             if last.end == phys {
@@ -814,26 +590,18 @@ fn record_allocated_frame(phys: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn align_up_4k(value: u64) -> u64 {
-    (value + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+fn allocated_ranges() -> &'static [PhysRange] {
+    unsafe {
+        core::slice::from_raw_parts(
+            addr_of_mut!(ALLOCATED_RANGES).cast::<PhysRange>(),
+            ALLOCATED_RANGE_COUNT,
+        )
+    }
 }
 
-fn init_serial() {
-    unsafe {
-        let mut data = Port::<u8>::new(0x3F8);
-        let mut interrupt_enable = Port::<u8>::new(0x3F9);
-        let mut fifo_control = Port::<u8>::new(0x3FA);
-        let mut line_control = Port::<u8>::new(0x3FB);
-        let mut modem_control = Port::<u8>::new(0x3FC);
-
-        interrupt_enable.write(0x00);
-        line_control.write(0x80);
-        data.write(0x03);
-        interrupt_enable.write(0x00);
-        line_control.write(0x03);
-        fifo_control.write(0xC7);
-        modem_control.write(0x0B);
-    }
+pub(crate) fn align_up(value: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
 }
 
 struct Serial;
@@ -841,20 +609,9 @@ struct Serial;
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
-            serial_write_byte(byte);
+            ActivePlatform::write_debug_byte(byte);
         }
         Ok(())
-    }
-}
-
-fn serial_write_byte(byte: u8) {
-    unsafe {
-        let mut line_status = Port::<u8>::new(0x3FD);
-        while line_status.read() & 0x20 == 0 {
-            core::hint::spin_loop();
-        }
-        let mut data = Port::<u8>::new(0x3F8);
-        data.write(byte);
     }
 }
 
@@ -870,11 +627,7 @@ fn serial_println_fmt(args: fmt::Arguments) {
     let _ = serial.write_str("\r\n");
 }
 
-fn fatal(message: &'static str) -> ! {
+fn fatal<P: Platform>(message: &'static str) -> ! {
     serial_println(message);
-    halt_loop()
-}
-
-fn halt_loop() -> ! {
-    arch::halt()
+    P::halt()
 }

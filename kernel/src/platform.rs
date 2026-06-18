@@ -20,6 +20,7 @@ pub type ActivePlatform = crate::arch::PlatformImpl;
 
 pub trait Platform {
     const NAME: &'static str;
+    const KERNEL_IMAGE_BASE: u64;
 
     fn init_boot_processor();
 }

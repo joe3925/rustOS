@@ -28,6 +28,7 @@ pub unsafe fn map_leaf<A: PageTableFrameAllocator>(
     flush: LocalTlbFlush,
 ) -> Result<(), PageMapError> {
     let recursive_index = boot_info()
+        .arch_info
         .recursive_index
         .into_option()
         .ok_or(PageMapError::NoMemoryMap())?;
@@ -83,6 +84,7 @@ pub unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
     flush: LocalTlbFlush,
 ) -> Result<Option<PhysAddr>, PageMapError> {
     let recursive_index = boot_info()
+        .arch_info
         .recursive_index
         .into_option()
         .ok_or(PageMapError::NoMemoryMap())?;

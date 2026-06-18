@@ -169,10 +169,11 @@ pub extern "C" fn kernel_main(ctx: usize) {
     GlobalAsyncExecutor::global().init(crate::platform::processor_count(), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
+    let kernel_image_base = boot_info().kernel_image_base;
     let mut program = Program::new(
         "kernel".to_string(),
         Path::from_string(""),
-        VirtAddr::new(0xFFFF_8500_0000_0000),
+        VirtAddr::new(kernel_image_base),
         crate::memory::paging::kernel_address_space_root(),
         KERNEL_RANGE_TRACKER.clone(),
     );
@@ -183,7 +184,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         title: "kernel.exe".into(),
         image_path: Path::from_string(""),
         parent_pid: 0,
-        image_base: VirtAddr::new(0xFFFF_8500_0000_0000).into(),
+        image_base: VirtAddr::new(kernel_image_base).into(),
         symbols: EXPORTS.to_vec(),
         pe_info: None,
     }))]);

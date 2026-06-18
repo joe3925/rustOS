@@ -2,18 +2,10 @@
 
 use core::{ops, slice};
 
+pub mod arch;
+
 pub const RUSTOS_BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_5045;
-pub const RUSTOS_BOOT_INFO_VERSION: u32 = 6;
-
-pub const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
-pub const STUB_IMAGE_BASE: u64 = 0xFFFF_8800_0000_0000;
-
-// Keep the bootloader's dynamic mappings out of the fixed stub image P4 slot.
-// The bootloader reserves dynamic virtual space in whole P4 entries, so this
-// band deliberately spans several entries for the stack, boot info, framebuffer,
-// and any other early mappings it creates before the stub runs.
-pub const STUB_DYNAMIC_RANGE_START: u64 = 0xFFFF_8900_0000_0000;
-pub const STUB_DYNAMIC_RANGE_END: u64 = 0xFFFF_9000_0000_0000;
+pub const RUSTOS_BOOT_INFO_VERSION: u32 = 7;
 
 pub const MAX_BOOT_MEMORY_REGIONS: usize = 256;
 pub const MAX_KERNEL_SECTIONS: usize = 96;
@@ -27,13 +19,12 @@ pub struct BootInfo {
     pub magic: u64,
     pub version: u32,
     pub flags: u32,
+    pub rsdp_addr: Optional<u64>,
+    pub arch_info: arch::ArchInfo,
     pub memory_regions: MemoryRegions,
     pub framebuffer: Optional<FrameBuffer>,
-    pub recursive_index: Optional<u16>,
-    pub rsdp_addr: Optional<u64>,
     pub fdt_header: Optional<*const FdtHeader>,
     pub tls_template: Optional<TlsTemplate>,
-    pub pe_tls_directory: Optional<PeTlsDirectory>,
     pub kernel_imports: KernelSymbols,
     pub kernel_exports: KernelSymbols,
     pub ramdisk_addr: Optional<u64>,
@@ -56,16 +47,15 @@ impl BootInfo {
             magic: RUSTOS_BOOT_INFO_MAGIC,
             version: RUSTOS_BOOT_INFO_VERSION,
             flags: 0,
+            rsdp_addr: Optional::None,
+            arch_info: arch::ArchInfo::empty(),
             memory_regions: MemoryRegions {
                 ptr: core::ptr::null_mut(),
                 len: 0,
             },
             framebuffer: Optional::None,
-            recursive_index: Optional::None,
-            rsdp_addr: Optional::None,
             fdt_header: Optional::None,
             tls_template: Optional::None,
-            pe_tls_directory: Optional::None,
             kernel_imports: KernelSymbols {
                 ptr: core::ptr::null(),
                 len: 0,
@@ -152,8 +142,8 @@ impl MemoryRegion {
 pub enum MemoryRegionKind {
     Usable,
     Bootloader,
-    UnknownUefi(u32),
-    UnknownBios(u32),
+    Reserved,
+    Unknown(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -256,17 +246,6 @@ pub struct TlsTemplate {
     pub start_addr: u64,
     pub file_size: u64,
     pub mem_size: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct PeTlsDirectory {
-    pub start_address_of_raw_data: u64,
-    pub end_address_of_raw_data: u64,
-    pub address_of_index: u64,
-    pub address_of_callbacks: u64,
-    pub size_of_zero_fill: u32,
-    pub characteristics: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

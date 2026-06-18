@@ -3478,7 +3478,7 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 200 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
     16 * 1024,
@@ -3555,7 +3555,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             &[
                 OpenFlags::Create,
                 OpenFlags::ReadWrite,
-                //OpenFlags::WriteThrough,
+                OpenFlags::WriteThrough,
             ]
         } else {
             &[OpenFlags::Create, OpenFlags::ReadWrite]

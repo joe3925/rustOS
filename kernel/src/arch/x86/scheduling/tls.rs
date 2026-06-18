@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use core::arch::asm;
 use core::fmt;
 use core::ptr;
-use kernel_abi::PeTlsDirectory;
+use kernel_abi::arch::PeTlsDirectory;
 use kernel_types::runtime::BlockOnThreadState;
 use spin::Mutex;
 use spin::Once;
@@ -123,7 +123,7 @@ fn kernel_tls_layout() -> Option<&'static KernelTlsLayout> {
 }
 
 fn detect_kernel_tls_layout() -> Option<KernelTlsLayout> {
-    let directory = boot_info().pe_tls_directory.as_ref().copied()?;
+    let directory = boot_info().arch_info.pe_tls_directory.as_ref().copied()?;
     let template_align = pe_tls_alignment(&directory);
     let raw_data_size = pe_tls_raw_data_size(&directory);
     let zero_fill_size = usize::try_from(directory.size_of_zero_fill)

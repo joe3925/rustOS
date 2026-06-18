@@ -3,11 +3,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
+#[derive(Clone, Copy)]
+struct KernelPeTarget {
+    machine: u16,
+    machine_name: &'static str,
+    optional_magic: u16,
+    image_base: u64,
+}
+
+fn kernel_pe_target() -> KernelPeTarget {
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    match target_arch.as_str() {
+        "x86_64" => KernelPeTarget {
+            machine: 0x8664,
+            machine_name: "x86_64",
+            optional_magic: 0x20B,
+            image_base: 0xFFFF_8500_0000_0000,
+        },
+        _ => panic!("kernel_stub build does not have an implementation for target architecture `{target_arch}`"),
+    }
+}
 
 fn main() {
     let kernel_pe = kernel_pe_path();
-    validate_kernel_pe(&kernel_pe);
+    validate_kernel_pe(&kernel_pe, kernel_pe_target());
     publish_stable_kernel_artifacts(&kernel_pe);
 
     println!("cargo:rerun-if-changed={}", kernel_pe.display());
@@ -78,7 +97,7 @@ fn copy_artifact(source: &Path, destination: &Path, what: &str) {
     });
 }
 
-fn validate_kernel_pe(path: &PathBuf) {
+fn validate_kernel_pe(path: &PathBuf, target: KernelPeTarget) {
     let bytes = fs::read(path).unwrap_or_else(|err| {
         panic!(
             "failed to read kernel PE artifact {}: {err}",
@@ -103,15 +122,19 @@ fn validate_kernel_pe(path: &PathBuf) {
     let magic = read_u16(&bytes, optional);
     let image_base = read_u64(&bytes, optional + 24);
 
-    if machine != 0x8664 {
-        panic!("kernel PE machine is not x86_64: 0x{machine:x}");
+    if machine != target.machine {
+        panic!(
+            "kernel PE machine is not {}: 0x{machine:x}",
+            target.machine_name
+        );
     }
-    if magic != 0x20B {
+    if magic != target.optional_magic {
         panic!("kernel PE is not PE32+: 0x{magic:x}");
     }
-    if image_base != KERNEL_PE_BASE {
+    if image_base != target.image_base {
         panic!(
-            "kernel PE image base is 0x{image_base:x}, expected 0x{KERNEL_PE_BASE:x}; build it through the kernel_stub artifact dependency"
+            "kernel PE image base is 0x{image_base:x}, expected 0x{:x}; build it through the kernel_stub artifact dependency",
+            target.image_base
         );
     }
 }

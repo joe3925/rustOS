@@ -49,6 +49,7 @@ pub fn create_user_root<A: PageTableFrameAllocator>(
     )?;
 
     let recursive_index = boot_info()
+        .arch_info
         .recursive_index
         .into_option()
         .ok_or(PageMapError::NoMemoryMap())?;

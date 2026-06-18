@@ -3,13 +3,13 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
-use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
-use kernel_types::object_manager::OmError;
 use kernel_executor::global_async::GlobalAsyncExecutor;
 use kernel_executor::runtime::runtime::{
-    block_on as kernel_block_on, spawn as kernel_spawn,
-    spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
+    block_on as kernel_block_on, spawn as kernel_spawn, spawn_blocking as kernel_spawn_blocking,
+    spawn_detached as kernel_spawn_detached,
 };
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::object_manager::OmError;
 
 use crate::arch::{interrupts, syscalls};
 use crate::memory::heap::allocator::KernelAllocator;
@@ -34,11 +34,7 @@ use crate::{
     },
     memory::{dma, paging::stack::StackSize},
     registry::reg,
-    scheduling::{
-        self,
-        scheduler::SCHEDULER,
-        task::Task,
-    },
+    scheduling::{self, scheduler::SCHEDULER, task::Task},
     structs::stopwatch::Stopwatch,
     util::boot_info,
 };
@@ -912,6 +908,7 @@ pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, Ph
 #[no_mangle]
 pub extern "C" fn kernel_paging_info() -> Option<PagingInfo> {
     crate::util::boot_info()
+        .arch_info
         .recursive_index
         .into_option()
         .map(|recursive_index| PagingInfo { recursive_index })
