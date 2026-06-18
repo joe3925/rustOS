@@ -781,55 +781,105 @@ where
         dirty_pages: &Arc<AtomicUsize>,
         run: &[PreparedFlushPage<BLOCK_SIZE>],
     ) -> Result<usize, CacheError<B::Error>> {
-        if run.is_empty() {
+        // TODO: allow this to be configured
+        const INLINE_RUNS: usize = 8;
+        const INLINE_SEGMENTS: usize = INLINE_RUNS;
+
+        let run_len = run.len();
+
+        if run_len == 0 {
             return Ok(0);
         }
 
-        let mut write_len = 0usize;
-        let mut read_guards = Vec::with_capacity(run.len());
+        if run_len.checked_mul(BLOCK_SIZE).is_none() {
+            cold_path();
+            Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+            return Err(CacheError::OffsetOverflow);
+        }
 
-        for prepared in run {
-            let guard = prepared.page.data.read();
-            let Some(next_write_len) = write_len.checked_add(BLOCK_SIZE) else {
-                cold_path();
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-                return Err(CacheError::OffsetOverflow);
+        if run_len <= INLINE_RUNS && run_len <= INLINE_SEGMENTS {
+            let mut read_guards = [const { None }; INLINE_RUNS];
+            let mut segments: [&[u8]; INLINE_SEGMENTS] = [&[]; INLINE_SEGMENTS];
+
+            for idx in 0..run_len {
+                read_guards[idx] = Some(run[idx].page.data.read());
+            }
+
+            for idx in 0..run_len {
+                let guard = unsafe { read_guards.get_unchecked(idx).as_ref().unwrap_unchecked() };
+
+                segments[idx] = &guard.bytes[..];
+            }
+
+            let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..run_len])
+            {
+                Ok(io_buf) => io_buf,
+                Err(_) => {
+                    cold_path();
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    return Err(CacheError::InvalidIoBuffer);
+                }
             };
-            write_len = next_write_len;
-            read_guards.push(guard);
-        }
 
-        let mut segments = Vec::with_capacity(read_guards.len());
-        for guard in &read_guards {
-            segments.push(&guard.bytes[..]);
-        }
+            let write_res = backend
+                .write_phys_framed(run[0].lba, run_len, io_buf)
+                .await
+                .map_err(CacheError::Backend);
 
-        let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..]) {
-            Ok(io_buf) => io_buf,
-            Err(_) => {
-                cold_path();
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-                return Err(CacheError::InvalidIoBuffer);
+            match write_res {
+                Ok(()) => {
+                    stats
+                        .backend_writes
+                        .fetch_add(run_len as u64, Ordering::Relaxed);
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, true);
+                    Ok(run_len)
+                }
+                Err(err) => {
+                    cold_path();
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    Err(err)
+                }
             }
-        };
+        } else {
+            let mut read_guards = Vec::with_capacity(run_len);
 
-        let write_res = backend
-            .write_phys_framed(run[0].lba, run.len(), io_buf)
-            .await
-            .map_err(CacheError::Backend);
-
-        match write_res {
-            Ok(()) => {
-                stats
-                    .backend_writes
-                    .fetch_add(run.len() as u64, Ordering::Relaxed);
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, true);
-                Ok(run.len())
+            for prepared in run {
+                read_guards.push(prepared.page.data.read());
             }
-            Err(err) => {
-                cold_path();
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-                Err(err)
+
+            let mut segments = Vec::with_capacity(run_len);
+
+            for guard in &read_guards {
+                segments.push(&guard.bytes[..]);
+            }
+
+            let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..]) {
+                Ok(io_buf) => io_buf,
+                Err(_) => {
+                    cold_path();
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    return Err(CacheError::InvalidIoBuffer);
+                }
+            };
+
+            let write_res = backend
+                .write_phys_framed(run[0].lba, run_len, io_buf)
+                .await
+                .map_err(CacheError::Backend);
+
+            match write_res {
+                Ok(()) => {
+                    stats
+                        .backend_writes
+                        .fetch_add(run_len as u64, Ordering::Relaxed);
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, true);
+                    Ok(run_len)
+                }
+                Err(err) => {
+                    cold_path();
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    Err(err)
+                }
             }
         }
     }
