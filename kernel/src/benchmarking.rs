@@ -3555,7 +3555,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             &[
                 OpenFlags::Create,
                 OpenFlags::ReadWrite,
-                //OpenFlags::WriteThrough,
+                OpenFlags::WriteThrough,
             ]
         } else {
             &[OpenFlags::Create, OpenFlags::ReadWrite]

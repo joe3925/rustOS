@@ -5,7 +5,6 @@ use core::sync::atomic::Ordering;
 use futures::future::Shared;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::dma::dma_base_page_size;
-use kernel_api::kernel_types::dma::IOBUFFER_MAX_FRAME_CAPACITY;
 use spin::Mutex;
 
 use super::page::Page;
@@ -46,15 +45,8 @@ pub(super) struct FlushScratch<const BLOCK_SIZE: usize> {
 impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
     pub(super) fn new(run_hint: usize, cache_capacity_blocks: usize) -> Self {
         let run_hint = run_hint.max(1);
-        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
         let scratch_key_capacity = cache_capacity_blocks.max(run_hint);
-        let run_capacity = if BLOCK_SIZE.is_multiple_of(dma_base_page_size()) {
-            (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1))
-                .max(1)
-                .min(cache_capacity_blocks.saturating_sub(1).max(1))
-        } else {
-            1
-        };
+        let run_capacity = run_hint.min(cache_capacity_blocks.saturating_sub(1).max(1));
 
         Self {
             keys: Vec::with_capacity(scratch_key_capacity),

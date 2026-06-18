@@ -3,8 +3,7 @@ use alloc::{sync::Arc, vec::Vec};
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::{self, dma_base_page_size};
 use kernel_api::kernel_types::dma::{
-    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IOBUFFER_MAX_PAGE_CAPACITY, IoBuffer,
-    PhysFramed,
+    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IoBuffer, PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -49,12 +48,13 @@ impl ContiguousDmaRegion {
         }
 
         let chunk_multiple = chunk_multiple.max(1);
-        if chunk_multiple > IOBUFFER_MAX_PAGE_CAPACITY * dma_base_page_size() {
+        let max_segment_bytes = u32::MAX as usize;
+
+        if chunk_multiple > max_segment_bytes {
             return None;
         }
 
-        let max_chunk_bytes =
-            (IOBUFFER_MAX_PAGE_CAPACITY * dma_base_page_size() / chunk_multiple) * chunk_multiple;
+        let max_chunk_bytes = (max_segment_bytes / chunk_multiple) * chunk_multiple;
         if max_chunk_bytes == 0 {
             return None;
         }
@@ -62,6 +62,7 @@ impl ContiguousDmaRegion {
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         let base_va =
             allocate_auto_kernel_range_mapped_contiguous(alloc_bytes as u64, flags).ok()?;
+
         unsafe {
             core::ptr::write_bytes(base_va.as_u64() as *mut u8, 0, alloc_bytes);
         }
@@ -74,9 +75,11 @@ impl ContiguousDmaRegion {
         };
 
         let mut byte_offset = 0usize;
+
         while byte_offset < mapped_bytes {
             let remaining = mapped_bytes - byte_offset;
             let mut byte_len = remaining.min(max_chunk_bytes);
+
             if remaining > max_chunk_bytes && chunk_multiple > 1 {
                 byte_len -= byte_len % chunk_multiple;
                 if byte_len == 0 {
@@ -85,11 +88,12 @@ impl ContiguousDmaRegion {
                 }
             }
 
-            // Each chunk maps a disjoint sub-slice of the same contiguous allocation.
             let buf_ptr = (base_va.as_u64() as *mut u8).wrapping_add(byte_offset);
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, byte_len) };
+
             let buffer =
                 IoBuffer::<Described, Bidirectional>::from_slice_mut(buf).into_phys_framed();
+
             let mapped = match dma::map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
             {
                 Ok(mapped) => mapped,
@@ -105,6 +109,7 @@ impl ContiguousDmaRegion {
                 region.destroy();
                 return None;
             };
+
             if segments.len() != 1 || segment.byte_len as usize != byte_len {
                 let _ = dma::unmap_buffer(mapped);
                 region.destroy();
@@ -117,6 +122,7 @@ impl ContiguousDmaRegion {
                 dma_addr: segment.dma_addr,
                 buffer: Some(mapped),
             });
+
             byte_offset += byte_len;
         }
 

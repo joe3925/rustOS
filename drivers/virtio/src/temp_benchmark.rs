@@ -12,8 +12,7 @@ use kernel_api::benchmark::{
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    Described, DmaMapped, FromDevice, IOBUFFER_MAX_PAGE_CAPACITY, IoBuffer, IoBufferDmaSegments,
-    PhysFramed,
+    Described, DmaMapped, FromDevice, IoBuffer, IoBufferDmaSegments, PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -82,8 +81,7 @@ impl BenchConfig {
 
 fn bench_max_request_size(inner: &DevExtInner) -> u32 {
     let q0 = inner.get_queue(0);
-    let dma_max = (IOBUFFER_MAX_PAGE_CAPACITY * dma_base_page_size()) as u32;
-    (q0.max_request_bytes.min(dma_max).max(512)) & !511
+    q0.max_request_bytes.max(512) & !511
 }
 
 fn bench_max_inflight_queue0(inner: &DevExtInner) -> usize {

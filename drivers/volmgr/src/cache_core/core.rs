@@ -11,9 +11,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::FutureExt as FuturesFutureExt;
 use kernel_api::dma::dma_base_page_size;
-use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IoBuffer, ToDevice,
-};
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::println;
 use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
 use kernel_api::runtime::spawn;
@@ -787,13 +785,6 @@ where
             return Ok(0);
         }
 
-        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
-        if run.len().saturating_mul(frames_per_block) > IOBUFFER_MAX_FRAME_CAPACITY {
-            cold_path();
-            Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-            return Err(CacheError::InvalidIoBuffer);
-        }
-
         let mut write_len = 0usize;
         let mut read_guards = Vec::with_capacity(run.len());
 
@@ -850,7 +841,7 @@ where
     ) -> Option<Arc<Page<BLOCK_SIZE>>> {
         let shard_idx = self.shard_index(lba);
         let shard = self.shards[shard_idx].lock();
-        let page = shard.index.peek(&lba)?;
+        let page: &Arc<Page<BLOCK_SIZE>> = shard.index.peek(&lba)?;
         if likely(page.dirty.load(Ordering::Acquire) && filter.matches(lba, page)) {
             Some(Arc::clone(page))
         } else {
@@ -870,18 +861,7 @@ where
             return Ok(0);
         }
 
-        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
-        let raw_max_blocks_per_buffer = if BLOCK_SIZE.is_multiple_of(dma_base_page_size()) {
-            (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1)).max(1)
-        } else {
-            1
-        };
-
-        let cache_safe_limit = self.cfg.capacity_blocks.saturating_sub(1).max(1);
-        let max_blocks_per_buffer = raw_max_blocks_per_buffer
-            .min(max_blocks_per_run.max(1))
-            .min(cache_safe_limit);
-
+        let max_blocks_per_buffer = self.max_blocks_per_flush_run(max_blocks_per_run);
         let run_capacity = max_blocks_per_buffer.min(keys.len());
 
         let mut run_scratch = FlushRunScratchLease::new(&self.flush_scratch);
@@ -928,6 +908,7 @@ where
 
             let Some(page) = self.page_for_flush_key(*lba, filter) else {
                 cold_path();
+
                 if !run.is_empty() {
                     match Self::flush_prepared_run(
                         &self.backend,
@@ -955,6 +936,7 @@ where
                 run.push(prepared);
             } else if !run.is_empty() {
                 cold_path();
+
                 match Self::flush_prepared_run(
                     &self.backend,
                     &self.stats,
@@ -975,7 +957,7 @@ where
             }
         }
 
-        if result.is_ok() {
+        if result.is_ok() && !run.is_empty() {
             match Self::flush_prepared_run(
                 &self.backend,
                 &self.stats,
@@ -998,15 +980,8 @@ where
     }
 
     fn max_blocks_per_flush_run(&self, max_blocks_per_run: usize) -> usize {
-        let frames_per_block = BLOCK_SIZE.div_ceil(dma_base_page_size());
-        let raw_max_blocks_per_buffer = if BLOCK_SIZE.is_multiple_of(dma_base_page_size()) {
-            (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1)).max(1)
-        } else {
-            1
-        };
-
-        raw_max_blocks_per_buffer
-            .min(max_blocks_per_run.max(1))
+        max_blocks_per_run
+            .max(1)
             .min(self.cfg.capacity_blocks.saturating_sub(1).max(1))
     }
 
@@ -1024,6 +999,7 @@ where
         let chunk_limit = self
             .max_blocks_per_flush_run(max_blocks_per_run)
             .max(self.cfg.flush_parallelism.max(1));
+
         let mut matched = 0usize;
         let mut writebacks = 0usize;
         let mut shard_idx = 0usize;
@@ -1035,8 +1011,8 @@ where
                 let (walked, mut keys) = {
                     let mut scratch = self.flush_scratch.lock();
                     let mut keys = core::mem::take(&mut scratch.keys);
-                    keys.clear();
 
+                    keys.clear();
                     if keys.capacity() < chunk_limit {
                         keys.reserve(chunk_limit - keys.capacity());
                     }
