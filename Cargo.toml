@@ -3,7 +3,7 @@ cargo-features = ["profile-rustflags"]
 
 [workspace]
 members = ["boot/os", "boot/kernel_stub", "tooling/xtask"]
-exclude = ["kernel", "drivers", "libs", "rust-fatfs", "third_party"]
+exclude = ["kernel", "drivers", "libs", "third_party"]
 resolver = "2"
 
 [profile.dev]

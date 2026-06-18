@@ -9,9 +9,6 @@ use crate::memory::{
 use crate::profiling::unwind::{
     capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
 };
-use kernel_executor::runtime::runtime::{
-    block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
-};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
@@ -32,6 +29,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
+use kernel_executor::runtime::runtime::{
+    block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
+};
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
     BenchDroppedSampleCounterProto, BenchLevelResult, BenchOverflowPolicy, BenchSampleChunkProto,
@@ -3555,7 +3555,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             &[
                 OpenFlags::Create,
                 OpenFlags::ReadWrite,
-                OpenFlags::WriteThrough,
+                //OpenFlags::WriteThrough,
             ]
         } else {
             &[OpenFlags::Create, OpenFlags::ReadWrite]
