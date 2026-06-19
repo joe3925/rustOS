@@ -9,8 +9,8 @@ use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::io::{DeviceOps, IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
 use kernel_types::request::{
-    DeviceControl, Dummy, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Pnp, Read,
-    RequestHandle, RequestKind, TraversalPolicy, Write,
+    DeviceControl, Dummy, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Pnp, Read, RequestHandle,
+    RequestKind, TraversalPolicy, Write,
 };
 use kernel_types::status::DriverStatus;
 
@@ -348,10 +348,7 @@ impl<'data> RoutedRequest for Pnp<'data> {
         dev: &Arc<DeviceObject>,
         _policy: TraversalPolicy,
     ) -> Result<Arc<DeviceObject>, DriverStatus> {
-        dev.lower_device
-            .get()
-            .cloned()
-            .ok_or(DriverStatus::Success)
+        dev.lower_device.get().cloned().ok_or(DriverStatus::Success)
     }
 }
 
@@ -497,11 +494,7 @@ async fn pnp_minor_dispatch<'data>(
 ) -> Option<DriverStep> {
     let minor = handle.read().body.request.minor_function;
 
-    if let Some(cb) = device
-        .pnp_vtable
-        .as_ref()
-        .and_then(|vt| vt.get(minor))
-    {
+    if let Some(cb) = device.pnp_vtable.as_ref().and_then(|vt| vt.get(minor)) {
         let mut step = cb(device, handle).await;
         if matches!(
             step,

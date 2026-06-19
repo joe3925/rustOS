@@ -4,8 +4,8 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::bounded_mpmc::{BoundedReceiver, BoundedSendError, BoundedSender, bounded_mpmc_channel};
-use crate::mpmc::{Receiver, RecvError, Sender, TryRecvError, mpmc_channel};
+use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender};
+use crate::mpmc::{mpmc_channel, Receiver, RecvError, Sender, TryRecvError};
 use crate::platform::Platform;
 
 pub type JobFn = extern "C" fn(usize);

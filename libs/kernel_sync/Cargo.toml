@@ -1,3 +1,5 @@
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "kernel_sync"
 version = "0.1.0"
@@ -15,3 +17,6 @@ crossbeam-queue = { version = "0.3.12", default-features = false, features = [
     "alloc",
 ] }
 kernel_types = { path = "../kernel_types" }
+
+[dev-dependencies]
+kernel_types = { path = "../kernel_types", features = ["hosted-tests"] }

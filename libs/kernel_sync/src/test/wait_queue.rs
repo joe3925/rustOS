@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::platform::{ParkReason, Platform};
+use crate::platform::Platform;
 use crate::test::{recv_timeout, P};
 use crate::WaitQueue;
 
@@ -37,7 +37,7 @@ fn wake_one_unparks_waiting_thread() {
     let handle = std::thread::spawn(move || {
         assert!(worker_queue.enqueue_current());
         ready_tx.send(()).unwrap();
-        <P as Platform>::park_current(ParkReason::None);
+        <P as Platform>::park_current();
         assert!(!worker_queue.is_current_enqueued());
         done_tx.send(()).unwrap();
     });
@@ -66,7 +66,7 @@ fn dequeue_all_returns_every_waiter() {
         handles.push(std::thread::spawn(move || {
             assert!(worker_queue.enqueue_current());
             ready_tx.send(()).unwrap();
-            <P as Platform>::park_current(ParkReason::None);
+            <P as Platform>::park_current();
             done_tx.send(()).unwrap();
         }));
     }

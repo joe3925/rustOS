@@ -3,8 +3,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::device::{DeviceInit, DeviceObject};
 use crate::dma::{
-    Bidirectional, DmaMapped, FromDevice, IoBuffer, IoBufferDmaSegment, IoBufferError,
-    IoBufferPageFrame, PhysFramed, ToDevice,
+    Bidirectional, DmaMapped, FromDevice, IoBuffer, IoBufferDmaMappingLayout, IoBufferDmaSegment,
+    IoBufferError, IoBufferPageFrame, PhysFramed, ToDevice,
 };
 
 const TEST_FRAME_SIZE: u64 = 512 * 8;
@@ -38,7 +38,7 @@ fn physical_iobuffer_validates_frame_layout_and_iterates_regions() {
     assert!(!regions[0].has_virtual_backing());
     assert_eq!(regions[0].frame_offset(), 128);
     assert_eq!(regions[0].len(), 6000);
-    assert_eq!(regions[0].physical_frames().len(), 2);
+    assert_eq!(regions[0].physical_frames().len(), 3);
 }
 
 #[test]
@@ -71,41 +71,18 @@ fn physical_iobuffer_rejects_invalid_frame_descriptions() {
 }
 
 #[test]
-fn dma_mapping_compresses_contiguous_segments_and_unmaps_once() {
+fn dma_mapping_contiguous_layout_unmaps_once() {
     let frames = [frame(0x4000)];
     let buffer =
         IoBuffer::<PhysFramed, Bidirectional>::from_frames(0, TEST_GRANULE, &frames).unwrap();
-    let segments = [
-        IoBufferDmaSegment {
-            dma_addr: 0x8000,
-            byte_len: 1024,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0x8400,
-            byte_len: 1024,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0x8800,
-            byte_len: 1024,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0x8C00,
-            byte_len: 1024,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0x9000,
-            byte_len: 1024,
-            reserved: 0,
-        },
-    ];
+    let layout = IoBufferDmaMappingLayout::Contiguous {
+        dma_addr: 0x8000,
+        byte_len: buffer.len(),
+    };
 
     let before = UNMAP_COOKIE_SUM.load(Ordering::Acquire);
     let mapped: IoBuffer<'_, DmaMapped<PhysFramed>, Bidirectional> = buffer
-        .apply_dma_mapping(&segments, device(), record_unmap, 7)
+        .apply_dma_mapping(layout, device(), record_unmap, 7)
         .unwrap();
 
     assert_eq!(mapped.dma_segments().len(), 1);
@@ -113,7 +90,7 @@ fn dma_mapping_compresses_contiguous_segments_and_unmaps_once() {
         mapped.dma_segments().first(),
         Some(IoBufferDmaSegment {
             dma_addr: 0x8000,
-            byte_len: 5120,
+            byte_len: TEST_GRANULE as u32,
             reserved: 0
         })
     );
@@ -124,47 +101,31 @@ fn dma_mapping_compresses_contiguous_segments_and_unmaps_once() {
 }
 
 #[test]
-fn dma_mapping_rejects_too_many_noncompressible_segments_without_unmapping() {
+fn dma_mapping_rejects_invalid_layout_without_unmapping() {
     let frames = [frame(0x4000)];
     let buffer = IoBuffer::<PhysFramed, FromDevice>::from_frames(0, TEST_GRANULE, &frames).unwrap();
-    let segments = [
-        IoBufferDmaSegment {
-            dma_addr: 0x1000,
-            byte_len: 1,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0x3000,
-            byte_len: 2,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0x6000,
-            byte_len: 3,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0xA000,
-            byte_len: 4,
-            reserved: 0,
-        },
-        IoBufferDmaSegment {
-            dma_addr: 0xF000,
-            byte_len: 5,
-            reserved: 0,
-        },
-    ];
+    let before = UNMAP_COOKIE_SUM.load(Ordering::Acquire);
 
     let err = buffer
-        .apply_dma_mapping(&segments, device(), record_unmap, 11)
+        .apply_dma_mapping(
+            IoBufferDmaMappingLayout::FixedChunks {
+                dma_addr: 0x1000,
+                chunk_len: 0,
+                count: 5,
+            },
+            device(),
+            record_unmap,
+            11,
+        )
         .unwrap_err()
         .1;
 
     assert_eq!(
         err,
-        IoBufferError::SegmentCapacityExceeded {
-            required: 5,
-            capacity: 4
+        IoBufferError::InvalidFrameLayout {
+            frame_offset: 0,
+            byte_len: 0
         }
     );
+    assert_eq!(UNMAP_COOKIE_SUM.load(Ordering::Acquire), before);
 }

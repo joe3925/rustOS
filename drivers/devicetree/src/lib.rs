@@ -19,8 +19,7 @@ use kernel_api::{
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, QueryIdType,
         ResourceDescriptor, driver_set_evt_device_add, encode_resource_descriptors,
-        get_device_tree_blob,
-        pnp_create_child_devnode_and_pdo_with_init,
+        get_device_tree_blob, pnp_create_child_devnode_and_pdo_with_init,
     },
     request::{Pnp, RequestData, RequestHandle},
     request_handler,

@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::platform::{ParkReason, Platform, ThreadEntry};
+use crate::platform::{Platform, ThreadEntry};
 
 const WAIT_QUEUE_NONE: u64 = 0;
 
@@ -83,7 +83,7 @@ impl Platform for StdPlatform {
     }
 
     #[inline]
-    fn park_current(_: ParkReason) {
+    fn park_current() {
         ::std::thread::park();
     }
 

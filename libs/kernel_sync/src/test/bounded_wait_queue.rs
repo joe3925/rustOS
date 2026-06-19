@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use crate::bounded_wait_queue::BoundedWaitQueueEnqueue;
 use crate::bounded_wait_queue::BoundedWaitQueueError;
 
-use crate::platform::{ParkReason, Platform};
+use crate::platform::Platform;
 use crate::test::{recv_timeout, P};
 use crate::BoundedWaitQueue;
 
@@ -36,7 +35,7 @@ fn capacity_is_enforced_across_tasks() {
     let first = std::thread::spawn(move || {
         assert_eq!(first_queue.enqueue_current().is_ok(), true);
         ready_tx.send(()).unwrap();
-        <P as Platform>::park_current(ParkReason::None);
+        <P as Platform>::park_current();
     });
 
     recv_timeout(&ready_rx);
@@ -69,7 +68,7 @@ fn wake_one_then_wake_all_unparks_waiters() {
         handles.push(std::thread::spawn(move || {
             assert_eq!(worker_queue.enqueue_current().is_ok(), true);
             ready_tx.send(()).unwrap();
-            <P as Platform>::park_current(ParkReason::None);
+            <P as Platform>::park_current();
             done_tx.send(()).unwrap();
         }));
     }

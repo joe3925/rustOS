@@ -68,7 +68,8 @@ fn stable_target_path(file_name: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir
         .parent()
-        .expect("kernel_stub should live under workspace root");
+        .and_then(Path::parent)
+        .expect("kernel_stub should live under boot/ in the workspace root");
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
 
     workspace_root.join("target").join(profile).join(file_name)

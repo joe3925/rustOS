@@ -5,9 +5,9 @@
         "linkedProjects": [
           "drivers/Cargo.toml",
           "kernel/Cargo.toml",
-          "kernel_types/Cargo.toml",
+          "libs/kernel_types/Cargo.toml",
           "third_party/rust-fatfs/Cargo.toml",
-          "kernel_macros/Cargo.toml",
+          "libs/kernel_macros/Cargo.toml",
           "Cargo.toml",
         ],
 

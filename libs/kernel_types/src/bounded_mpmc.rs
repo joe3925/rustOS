@@ -90,6 +90,20 @@ impl<T> BoundedMpmcQueue<T> {
 
     pub fn try_push_wait_free(&self, value: T) -> Result<(), BoundedMpmcPushError<T>> {
         let cap = self.slots.len();
+        let len = self.len.load(Ordering::Acquire);
+
+        if len >= cap {
+            return Err(BoundedMpmcPushError::Full(value));
+        }
+
+        if self
+            .len
+            .compare_exchange(len, len + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(BoundedMpmcPushError::Contended(value));
+        }
+
         let pos = self.push_pos.load(Ordering::Relaxed);
         let slot = &self.slots[pos % cap];
 
@@ -107,6 +121,7 @@ impl<T> BoundedMpmcQueue<T> {
                 )
                 .is_err()
             {
+                self.len.fetch_sub(1, Ordering::Release);
                 return Err(BoundedMpmcPushError::Contended(value));
             }
 
@@ -114,12 +129,13 @@ impl<T> BoundedMpmcQueue<T> {
                 slot.write_value(value);
             }
 
-            self.len.fetch_add(1, Ordering::Release);
             slot.sequence.store(pos.wrapping_add(1), Ordering::Release);
             Ok(())
         } else if diff < 0 {
+            self.len.fetch_sub(1, Ordering::Release);
             Err(BoundedMpmcPushError::Full(value))
         } else {
+            self.len.fetch_sub(1, Ordering::Release);
             Err(BoundedMpmcPushError::Contended(value))
         }
     }

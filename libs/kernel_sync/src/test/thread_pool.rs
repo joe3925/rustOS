@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::test::{P, wait_until};
+use crate::test::{wait_until, P};
 use crate::{BoundedThreadPool, Job, SubmitError, ThreadPool};
 
 extern "C" fn increment(context: usize) {

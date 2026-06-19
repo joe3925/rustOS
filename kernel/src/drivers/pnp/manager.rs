@@ -1,7 +1,7 @@
 use super::driver_index::{self as idx, HwIndex};
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::object_manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
+use crate::object_manager::{ObjRef, Object, ObjectPayload, OBJECT_MANAGER};
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;
 use kernel_types::status::DriverError;
@@ -11,9 +11,8 @@ use crate::registry::reg::{get_key, get_value, list_keys};
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use kernel_executor::runtime::runtime::spawn_detached;
-use kernel_types::ClassAddCallback;
 use kernel_types::device::{
     DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
     DriverRuntime, DriverState, StackLayer,
@@ -25,6 +24,7 @@ use kernel_types::pnp::{
 };
 use kernel_types::request::{DeviceControl, Pnp, Request, RequestData, RequestHandle, RequestKind};
 use kernel_types::status::{Data, DriverStatus, RegError};
+use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
 
 #[repr(C)]

@@ -25,3 +25,18 @@ fn retrying_push_pop_match_queue_style_api() {
     assert_eq!(queue.try_pop(), Some(2));
     assert_eq!(queue.try_pop(), None);
 }
+
+#[test]
+fn capacity_one_does_not_overwrite_live_slot() {
+    let queue = BoundedMpmcQueue::<usize>::new(1);
+
+    assert_eq!(queue.try_push(1), Ok(()));
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.try_push(2), Err(BoundedMpmcPushError::Full(2)));
+    assert_eq!(queue.try_pop(), Some(1));
+    assert_eq!(queue.try_pop(), None);
+
+    assert_eq!(queue.try_push(3), Ok(()));
+    assert_eq!(queue.try_push(4), Err(BoundedMpmcPushError::Full(4)));
+    assert_eq!(queue.try_pop(), Some(3));
+}

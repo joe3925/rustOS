@@ -3,13 +3,13 @@ use crate::export;
 use crate::function;
 use crate::get_rva;
 use crate::idt::*;
-use kernel_executor::runtime::runtime::try_steal_blocking_one;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;
 use crate::vec;
 use alloc::string::String;
 use alloc::vec::Vec;
+use kernel_executor::runtime::runtime::try_steal_blocking_one;
 
 export! {
     function,
