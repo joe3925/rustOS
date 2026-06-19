@@ -62,7 +62,11 @@ use kernel_abi::{
 use kernel_abi::{RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION};
 use lazy_static::lazy_static;
 
-static mut BOOT_INFO: BootInfo = BootInfo::empty();
+use crate::platform::{ActivePlatform, Platform};
+
+pub type ActiveBootInfo = BootInfo<<ActivePlatform as Platform>::BootArchInfo>;
+
+static mut BOOT_INFO: ActiveBootInfo = ActiveBootInfo::empty();
 
 static BOOT_INFO_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut BOOT_MEMORY_REGIONS: [MemoryRegion; MAX_BOOT_MEMORY_REGIONS] =
@@ -84,7 +88,7 @@ fn panic(info: &PanicInfo) -> ! {
     panic_common(MOD_NAME, info)
 }
 #[no_mangle]
-pub extern "C" fn kernel_pe_entry(boot_info: *const BootInfo) -> ! {
+pub extern "C" fn kernel_pe_entry(boot_info: *const ActiveBootInfo) -> ! {
     if boot_info.is_null() {
         panic!("kernel_pe_entry received a null boot info pointer");
     }
@@ -101,7 +105,7 @@ pub extern "C" fn kernel_pe_entry(boot_info: *const BootInfo) -> ! {
 
     loop {}
 }
-unsafe fn copy_boot_info(src: &BootInfo) {
+unsafe fn copy_boot_info(src: &ActiveBootInfo) {
     BOOT_KERNEL_SYMBOL_STRING_LEN = 0;
 
     let memory_regions = copy_memory_regions(&src.memory_regions);
@@ -117,7 +121,7 @@ unsafe fn copy_boot_info(src: &BootInfo) {
     );
     let kernel_sections = copy_kernel_sections(&src.kernel_sections);
 
-    BOOT_INFO = BootInfo {
+    BOOT_INFO = ActiveBootInfo {
         magic: src.magic,
         version: src.version,
         flags: src.flags,

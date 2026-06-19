@@ -1,4 +1,4 @@
-use crate::Optional;
+use crate::{BootArchInfo, Optional};
 
 pub const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
 pub const STUB_IMAGE_BASE: u64 = 0xFFFF_8800_0000_0000;
@@ -12,18 +12,22 @@ pub const STUB_DYNAMIC_RANGE_END: u64 = 0xFFFF_9000_0000_0000;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct ArchInfo {
+pub struct X86BootArchInfo {
     pub recursive_index: Optional<u16>,
     pub pe_tls_directory: Optional<PeTlsDirectory>,
 }
 
-impl ArchInfo {
+impl X86BootArchInfo {
     pub const fn empty() -> Self {
         Self {
             recursive_index: Optional::None,
             pe_tls_directory: Optional::None,
         }
     }
+}
+
+impl BootArchInfo for X86BootArchInfo {
+    const EMPTY: Self = Self::empty();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

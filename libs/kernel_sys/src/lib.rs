@@ -27,7 +27,7 @@ use kernel_types::object_manager::OmError;
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
 
-use kernel_types::arch::{PageFlags, PagingInfo, PhysAddr, VirtAddr};
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fdt::FdtHeader;
 use kernel_types::fs::{File, OpenFlags, Path};
@@ -146,8 +146,6 @@ unsafe extern "C" {
     pub fn unmap_physical_pages(virt: VirtAddr, size: u64) -> Result<(), PageMapError>;
     pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     pub fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
-    pub fn kernel_paging_info() -> Option<PagingInfo>;
-
     // Registry (async FFI)
     pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
     pub fn reg_set_value(key_path: &str, name: &str, data: Data)

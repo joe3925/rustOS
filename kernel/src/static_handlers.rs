@@ -44,7 +44,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use kernel_types::arch::{PageFlags, PagingInfo, PhysAddr, VirtAddr};
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::{
     async_ffi::{FfiFuture, FutureExt},
     benchmark::{
@@ -902,15 +902,6 @@ pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 #[no_mangle]
 pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     crate::memory::paging::resolve_virtual_range_frame(addr)
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_paging_info() -> Option<PagingInfo> {
-    crate::util::boot_info()
-        .arch_info
-        .recursive_index
-        .into_option()
-        .map(|recursive_index| PagingInfo { recursive_index })
 }
 
 // ============================================================================

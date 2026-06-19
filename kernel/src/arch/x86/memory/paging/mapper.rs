@@ -1,11 +1,9 @@
-use kernel_types::arch::{
-    PageFlags, PagingPlatform as KernelTypesPagingPlatform, PhysAddr,
-    Platform as KernelTypesPlatform, VirtAddr,
-};
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size1GiB, Size2MiB, Size4KiB,
+    FrameAllocator, Mapper, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size1GiB,
+    Size2MiB, Size4KiB,
 };
 use x86_64::{PhysAddr as X86PhysAddr, VirtAddr as X86VirtAddr};
 
@@ -16,7 +14,7 @@ use crate::platform::PageTableFrameAllocator;
 use crate::util::boot_info;
 
 use super::flags::page_flags_to_x86;
-use super::tables::init_mapper;
+use super::tables::{init_mapper, recursive_table_addr};
 
 pub unsafe fn map_leaf<A: PageTableFrameAllocator>(
     allocator: &mut A,
@@ -100,17 +98,71 @@ pub unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
 }
 
 pub fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping> {
-    let translated = <KernelTypesPlatform as KernelTypesPagingPlatform>::translate_addr(virt)?;
+    let recursive_index = boot_info().arch_info.recursive_index.into_option()?;
+    let (mapping_size, phys_addr) = translate_addr(recursive_index, virt)?;
     Some(ResolvedMapping {
-        mapping_size: translated.block_size,
-        phys_addr: translated.phys_addr,
+        mapping_size,
+        phys_addr,
     })
 }
 
 pub fn resolve_virtual_range_frame(addr: X86VirtAddr) -> Option<(u64, X86PhysAddr)> {
-    let translated =
-        <KernelTypesPlatform as KernelTypesPagingPlatform>::translate_addr(addr.into())?;
-    Some((translated.block_size, translated.phys_addr.into()))
+    let recursive_index = boot_info().arch_info.recursive_index.into_option()?;
+    let (mapping_size, phys_addr) = translate_addr(recursive_index, addr.into())?;
+    Some((mapping_size, phys_addr.into()))
+}
+
+fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    let rec = u64::from(recursive_index);
+    let v_u64 = addr.as_u64();
+
+    let p4_idx = (v_u64 >> 39) & 0x1FF;
+    let p3_idx = (v_u64 >> 30) & 0x1FF;
+    let p2_idx = (v_u64 >> 21) & 0x1FF;
+    let p1_idx = (v_u64 >> 12) & 0x1FF;
+
+    let p4_table = unsafe { &*(recursive_table_addr(rec, rec, rec, rec) as *const PageTable) };
+    let p4_entry = &p4_table[p4_idx as usize];
+    if !p4_entry.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+
+    let p3_table = unsafe { &*(recursive_table_addr(rec, rec, rec, p4_idx) as *const PageTable) };
+    let p3_entry = &p3_table[p3_idx as usize];
+    if !p3_entry.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    if p3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Some((
+            Size1GiB::SIZE,
+            PhysAddr::new(p3_entry.addr().as_u64() + (v_u64 & (Size1GiB::SIZE - 1))),
+        ));
+    }
+
+    let p2_table =
+        unsafe { &*(recursive_table_addr(rec, rec, p4_idx, p3_idx) as *const PageTable) };
+    let p2_entry = &p2_table[p2_idx as usize];
+    if !p2_entry.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+    if p2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Some((
+            Size2MiB::SIZE,
+            PhysAddr::new(p2_entry.addr().as_u64() + (v_u64 & (Size2MiB::SIZE - 1))),
+        ));
+    }
+
+    let p1_table =
+        unsafe { &*(recursive_table_addr(rec, p4_idx, p3_idx, p2_idx) as *const PageTable) };
+    let p1_entry = &p1_table[p1_idx as usize];
+    if !p1_entry.flags().contains(PageTableFlags::PRESENT) {
+        return None;
+    }
+
+    Some((
+        Size4KiB::SIZE,
+        PhysAddr::new(p1_entry.addr().as_u64() + (v_u64 & (Size4KiB::SIZE - 1))),
+    ))
 }
 
 unsafe fn map_existing_frame<S, A>(

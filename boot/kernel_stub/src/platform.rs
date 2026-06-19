@@ -1,5 +1,8 @@
 use goblin::pe::tls::ImageTlsDirectory;
-use kernel_abi::{arch, BootInfo, FdtHeader, FrameBuffer, MemoryRegionKind, Optional};
+use kernel_abi::{
+    BootArchInfo as KernelBootArchInfo, BootInfo, FdtHeader, FrameBuffer, MemoryRegionKind,
+    Optional,
+};
 
 pub type ActivePlatform = crate::arch::PlatformImpl;
 
@@ -37,6 +40,8 @@ pub struct KernelImagePermissions {
 }
 
 pub trait Platform {
+    type BootArchInfo: KernelBootArchInfo;
+
     const NAME: &'static str;
 
     fn init_debug();
@@ -76,7 +81,7 @@ pub trait KernelImagePlatform: Platform {
     ) -> Result<(), &'static str>;
     fn prepare_tls_directory(directory: &Self::TlsDirectory) -> Result<(), &'static str>;
 
-    unsafe fn enter_kernel(entry: u64, boot_info: *const BootInfo) -> !;
+    unsafe fn enter_kernel(entry: u64, boot_info: *const BootInfo<Self::BootArchInfo>) -> !;
 }
 
 pub trait BootloaderPlatform: KernelImagePlatform {
@@ -107,7 +112,7 @@ pub trait BootloaderPlatform: KernelImagePlatform {
 
     fn finalize_boot_info(
         bootloader_info: &mut Self::BootloaderInfo,
-        boot_info: BootInfo,
+        boot_info: BootInfo<Self::BootArchInfo>,
         tls_directory: Optional<Self::TlsDirectory>,
-    ) -> Result<(BootInfo, arch::ArchInfo), &'static str>;
+    ) -> Result<BootInfo<Self::BootArchInfo>, &'static str>;
 }

@@ -23,7 +23,7 @@ use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
-use crate::{println, BOOT_INFO, BOOT_INFO_INITIALIZED};
+use crate::{println, ActiveBootInfo, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -33,7 +33,6 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use kernel_abi::BootInfo;
 use kernel_executor::global_async::GlobalAsyncExecutor;
 use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_types::arch::VirtAddr;
@@ -335,7 +334,7 @@ pub extern "C" fn random_number() -> u64 {
     rng.next_u64()
 }
 
-pub fn boot_info() -> &'static mut BootInfo {
+pub fn boot_info() -> &'static mut ActiveBootInfo {
     if !BOOT_INFO_INITIALIZED.load(Ordering::Acquire) {
         panic!("BOOT_INFO not initialized");
     }

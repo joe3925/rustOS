@@ -7,8 +7,8 @@ use bootloader_api::info::{
 use bootloader_api::{entry_point, BootInfo as BootloaderBootInfo, BootloaderConfig};
 use goblin::pe::header::COFF_MACHINE_X86_64;
 use kernel_abi::arch::{
-    ArchInfo, PeTlsDirectory, KERNEL_PE_BASE, STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START,
-    STUB_IMAGE_BASE,
+    PeTlsDirectory, X86BootArchInfo, KERNEL_PE_BASE, STUB_DYNAMIC_RANGE_END,
+    STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
 };
 use kernel_abi::{
     BootInfo, FdtHeader, FrameBuffer, FrameBufferInfo, MemoryRegionKind, Optional, PixelFormat,
@@ -47,10 +47,12 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(stub_start, config = &BOOTLOADER_CONFIG);
 
 fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
-    crate::start::<X86Platform>(boot_info)
+    crate::start(boot_info)
 }
 
 impl Platform for X86Platform {
+    type BootArchInfo = X86BootArchInfo;
+
     const NAME: &'static str = "x86_64";
 
     fn init_debug() {
@@ -236,7 +238,7 @@ impl KernelImagePlatform for X86Platform {
         Ok(())
     }
 
-    unsafe fn enter_kernel(entry: u64, boot_info: *const BootInfo) -> ! {
+    unsafe fn enter_kernel(entry: u64, boot_info: *const BootInfo<Self::BootArchInfo>) -> ! {
         unsafe {
             asm!(
                 "cld",
@@ -339,16 +341,16 @@ impl BootloaderPlatform for X86Platform {
 
     fn finalize_boot_info(
         bootloader_info: &mut Self::BootloaderInfo,
-        mut boot_info: BootInfo,
+        mut boot_info: BootInfo<Self::BootArchInfo>,
         tls_directory: Optional<Self::TlsDirectory>,
-    ) -> Result<(BootInfo, ArchInfo), &'static str> {
-        let arch_info = ArchInfo {
+    ) -> Result<BootInfo<Self::BootArchInfo>, &'static str> {
+        let arch_info = X86BootArchInfo {
             recursive_index: translate_optional(bootloader_info.recursive_index),
             pe_tls_directory: tls_directory,
         };
         boot_info.rsdp_addr = translate_optional(bootloader_info.rsdp_addr);
         boot_info.arch_info = arch_info;
-        Ok((boot_info, arch_info))
+        Ok(boot_info)
     }
 }
 
@@ -438,6 +440,19 @@ unsafe fn init_recursive_mapper(recursive_index: u16) -> RecursivePageTable<'sta
 }
 
 unsafe fn active_level_4_table(recursive_index: PageTableIndex) -> &'static mut PageTable {
-    let virt = kernel_types::arch::recursive_level_4_table_addr(u64::from(recursive_index) as u16);
+    let virt = recursive_level_4_table_addr(u64::from(recursive_index) as u16);
     unsafe { &mut *virt.as_mut_ptr() }
+}
+
+const fn recursive_table_addr(p4: u64, p3: u64, p2: u64, p1: u64) -> u64 {
+    let mut addr = (p4 << 39) | (p3 << 30) | (p2 << 21) | (p1 << 12);
+    if addr & (1 << 47) != 0 {
+        addr |= 0xFFFF_0000_0000_0000;
+    }
+    addr
+}
+
+const fn recursive_level_4_table_addr(recursive_index: u16) -> VirtAddr {
+    let idx = recursive_index as u64;
+    VirtAddr::new(recursive_table_addr(idx, idx, idx, idx))
 }

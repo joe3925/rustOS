@@ -27,6 +27,8 @@ use platform::{
     KernelImagePlatform, LoadedKernel, PhysRange, Platform,
 };
 
+type ActiveBootInfo = BootInfo<<ActivePlatform as Platform>::BootArchInfo>;
+
 const KERNEL_PE: &[u8] = include_bytes!(env!("KERNEL_PE_PATH"));
 const STUB_HEAP_SIZE: usize = 2 * 1024 * 1024;
 const MAX_ALLOCATED_RANGES: usize = 128;
@@ -97,28 +99,27 @@ static mut ABI_KERNEL_EXPORT_SYMBOLS: [KernelSymbol; MAX_KERNEL_EXPORT_SYMBOLS] 
 static mut ABI_KERNEL_SYMBOL_STRING_BYTES: [u8; MAX_KERNEL_SYMBOL_STRING_BYTES] =
     [0; MAX_KERNEL_SYMBOL_STRING_BYTES];
 static mut ABI_KERNEL_SYMBOL_STRING_LEN: usize = 0;
-static mut ABI_BOOT_INFO: BootInfo = BootInfo::empty();
+static mut ABI_BOOT_INFO: ActiveBootInfo = ActiveBootInfo::empty();
 static mut ALLOCATED_RANGES: [PhysRange; MAX_ALLOCATED_RANGES] =
     [PhysRange::empty(); MAX_ALLOCATED_RANGES];
 static mut ALLOCATED_RANGE_COUNT: usize = 0;
 
-pub fn start<P>(boot_info: &'static mut P::BootloaderInfo) -> !
-where
-    P: BootloaderPlatform,
-{
-    P::init_debug();
+pub fn start(boot_info: &'static mut <ActivePlatform as BootloaderPlatform>::BootloaderInfo) -> ! {
+    ActivePlatform::init_debug();
     serial_println("kernel_stub: loading embedded PE kernel");
 
-    let mut frame_allocator = P::init_frame_allocator(boot_info);
-    let mut mapper = P::init_mapper(boot_info).unwrap_or_else(|err| fatal::<P>(err));
+    let mut frame_allocator = ActivePlatform::init_frame_allocator(boot_info);
+    let mut mapper =
+        ActivePlatform::init_mapper(boot_info).unwrap_or_else(|err| fatal::<ActivePlatform>(err));
 
-    let loaded = load_kernel_pe::<P>(&mut mapper, &mut frame_allocator)
-        .unwrap_or_else(|err| fatal::<P>(err));
-    let handoff = build_handoff::<P>(boot_info, loaded).unwrap_or_else(|err| fatal::<P>(err));
+    let loaded = load_kernel_pe::<ActivePlatform>(&mut mapper, &mut frame_allocator)
+        .unwrap_or_else(|err| fatal::<ActivePlatform>(err));
+    let handoff =
+        build_handoff(boot_info, loaded).unwrap_or_else(|err| fatal::<ActivePlatform>(err));
 
     serial_println("kernel_stub: jumping to PE kernel");
 
-    unsafe { P::enter_kernel(loaded.entry, handoff as *const BootInfo) }
+    unsafe { ActivePlatform::enter_kernel(loaded.entry, handoff as *const ActiveBootInfo) }
 }
 
 fn load_kernel_pe<P>(
@@ -299,33 +300,32 @@ where
     Ok(())
 }
 
-fn build_handoff<P>(
-    boot_info: &'static mut P::BootloaderInfo,
+fn build_handoff(
+    boot_info: &'static mut <ActivePlatform as BootloaderPlatform>::BootloaderInfo,
     loaded: LoadedKernel,
-) -> Result<&'static mut BootInfo, &'static str>
-where
-    P: BootloaderPlatform,
-{
-    let memory_region_count = translate_memory_regions::<P>(boot_info)?;
+) -> Result<&'static mut ActiveBootInfo, &'static str> {
+    let memory_region_count = translate_memory_regions::<ActivePlatform>(boot_info)?;
     let section_count = translate_kernel_sections(loaded.image_base, loaded.section_count)?;
     let kernel_text = translate_kernel_text_section(loaded.image_base)?;
-    let tls_directory = translate_kernel_tls_directory::<P>(loaded.image_base, loaded.image_size)?;
+    let tls_directory =
+        translate_kernel_tls_directory::<ActivePlatform>(loaded.image_base, loaded.image_size)?;
     let (kernel_import_count, kernel_export_count) = translate_kernel_symbols()?;
-    let (ramdisk_addr, ramdisk_len) = P::ramdisk(boot_info);
+    let (ramdisk_addr, ramdisk_len) = ActivePlatform::ramdisk(boot_info);
 
     unsafe {
-        let common_boot_info = BootInfo {
+        let common_boot_info = ActiveBootInfo {
             magic: RUSTOS_BOOT_INFO_MAGIC,
             version: RUSTOS_BOOT_INFO_VERSION,
             flags: 0,
             rsdp_addr: Optional::None,
-            arch_info: kernel_abi::arch::ArchInfo::empty(),
+            arch_info:
+                <<ActivePlatform as Platform>::BootArchInfo as kernel_abi::BootArchInfo>::EMPTY,
             memory_regions: MemoryRegions {
                 ptr: addr_of_mut!(ABI_MEMORY_REGIONS).cast::<MemoryRegion>(),
                 len: memory_region_count,
             },
-            framebuffer: P::framebuffer(boot_info),
-            fdt_header: P::fdt_header(boot_info),
+            framebuffer: ActivePlatform::framebuffer(boot_info),
+            fdt_header: ActivePlatform::fdt_header(boot_info),
             tls_template: Optional::None,
             kernel_imports: KernelSymbols {
                 ptr: addr_of_mut!(ABI_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
@@ -348,11 +348,12 @@ where
                 ptr: addr_of_mut!(ABI_KERNEL_SECTIONS).cast::<KernelSection>(),
                 len: section_count,
             },
-            stub_base: P::stub_image_base(),
-            stub_size: P::stub_image_size(boot_info),
+            stub_base: ActivePlatform::stub_image_base(),
+            stub_size: ActivePlatform::stub_image_size(boot_info),
         };
 
-        let (boot_info, _) = P::finalize_boot_info(boot_info, common_boot_info, tls_directory)?;
+        let boot_info =
+            ActivePlatform::finalize_boot_info(boot_info, common_boot_info, tls_directory)?;
         ABI_BOOT_INFO = boot_info;
 
         Ok(&mut *addr_of_mut!(ABI_BOOT_INFO))

@@ -10,6 +10,7 @@ use crate::memory::device_mmu::{
 };
 use crate::memory::paging::types::UserVmLayout;
 use acpi::AcpiTables;
+use kernel_abi::BootArchInfo as KernelBootArchInfo;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{MsiMessage, MsiRequest};
 use kernel_types::memory::PhysicalMappingCache;
@@ -25,6 +26,8 @@ use crate::memory::paging::{
 pub type ActivePlatform = crate::arch::PlatformImpl;
 
 pub trait Platform {
+    type BootArchInfo: KernelBootArchInfo;
+
     const NAME: &'static str;
     const KERNEL_IMAGE_BASE: u64;
 

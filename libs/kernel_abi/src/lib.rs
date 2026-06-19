@@ -1,6 +1,6 @@
 #![no_std]
 
-use core::{ops, slice};
+use core::{fmt::Debug, ops, slice};
 
 pub mod arch;
 
@@ -13,14 +13,28 @@ pub const MAX_KERNEL_IMPORT_SYMBOLS: usize = 512;
 pub const MAX_KERNEL_EXPORT_SYMBOLS: usize = 1024;
 pub const MAX_KERNEL_SYMBOL_STRING_BYTES: usize = 128 * 1024;
 
+pub trait BootArchInfo: Copy + Debug {
+    const EMPTY: Self;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EmptyArchInfo {
+    pub reserved: u64,
+}
+
+impl BootArchInfo for EmptyArchInfo {
+    const EMPTY: Self = Self { reserved: 0 };
+}
+
 #[derive(Debug)]
 #[repr(C)]
-pub struct BootInfo {
+pub struct BootInfo<A: BootArchInfo = EmptyArchInfo> {
     pub magic: u64,
     pub version: u32,
     pub flags: u32,
     pub rsdp_addr: Optional<u64>,
-    pub arch_info: arch::ArchInfo,
+    pub arch_info: A,
     pub memory_regions: MemoryRegions,
     pub framebuffer: Optional<FrameBuffer>,
     pub fdt_header: Optional<*const FdtHeader>,
@@ -41,14 +55,14 @@ pub struct BootInfo {
     pub stub_size: u64,
 }
 
-impl BootInfo {
+impl<A: BootArchInfo> BootInfo<A> {
     pub const fn empty() -> Self {
         Self {
             magic: RUSTOS_BOOT_INFO_MAGIC,
             version: RUSTOS_BOOT_INFO_VERSION,
             flags: 0,
             rsdp_addr: Optional::None,
-            arch_info: arch::ArchInfo::empty(),
+            arch_info: A::EMPTY,
             memory_regions: MemoryRegions {
                 ptr: core::ptr::null_mut(),
                 len: 0,

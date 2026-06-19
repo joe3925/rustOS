@@ -5,10 +5,10 @@ use core::ops::{Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, Not, S
 pub mod x86;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86::{PagingInfo, Platform, recursive_level_4_table_addr, recursive_table_addr};
+pub use x86::Platform;
 
 #[cfg(not(target_arch = "x86_64"))]
-compile_error!("kernel_types does not have an implementation for this target architecture");
+pub struct Platform;
 
 pub trait PlatformInfo {
     const NAME: &'static str;
@@ -22,7 +22,6 @@ pub struct TranslatedBlock {
 }
 
 pub trait PagingPlatform: PlatformInfo {
-    fn paging_info() -> Option<PagingInfo>;
     fn translate_addr(addr: VirtAddr) -> Option<TranslatedBlock>;
 }
 
@@ -155,4 +154,38 @@ impl Not for PageFlags {
     fn not(self) -> Self::Output {
         Self(!self.0)
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+impl PlatformInfo for Platform {
+    const NAME: &'static str = "generic";
+
+    fn cycle_counter() -> u64 {
+        0
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+impl PagingPlatform for Platform {
+    fn translate_addr(addr: VirtAddr) -> Option<TranslatedBlock> {
+        resolve_virtual_range_frame(addr).map(|(block_size, phys_addr)| TranslatedBlock {
+            phys_addr,
+            block_size,
+        })
+    }
+}
+
+#[cfg(all(not(target_arch = "x86_64"), any(test, feature = "hosted-tests")))]
+fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    Some((4096, PhysAddr::new(addr.as_u64())))
+}
+
+#[cfg(all(not(target_arch = "x86_64"), not(any(test, feature = "hosted-tests"))))]
+fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    unsafe extern "C" {
+        #[link_name = "resolve_virtual_range_frame"]
+        fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+    }
+
+    unsafe { sys_resolve_virtual_range_frame(addr) }
 }
