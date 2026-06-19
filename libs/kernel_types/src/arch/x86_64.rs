@@ -110,7 +110,7 @@ fn paging_info() -> Option<PagingInfo> {
     unsafe { kernel_paging_info() }
 }
 
-fn recursive_table_addr(p4: u64, p3: u64, p2: u64, p1: u64) -> u64 {
+pub const fn recursive_table_addr(p4: u64, p3: u64, p2: u64, p1: u64) -> u64 {
     let mut addr = (p4 << 39) | (p3 << 30) | (p2 << 21) | (p1 << 12);
     if addr & (1 << 47) != 0 {
         addr |= 0xFFFF_0000_0000_0000;
@@ -118,83 +118,46 @@ fn recursive_table_addr(p4: u64, p3: u64, p2: u64, p1: u64) -> u64 {
     addr
 }
 
-pub trait PortIoPlatform: PlatformInfo {
-    unsafe fn read_port_u8(port: u16) -> u8;
-    unsafe fn read_port_u16(port: u16) -> u16;
-    unsafe fn read_port_u32(port: u16) -> u32;
-
-    unsafe fn write_port_u8(port: u16, value: u8);
-    unsafe fn write_port_u16(port: u16, value: u16);
-    unsafe fn write_port_u32(port: u16, value: u32);
-}
-
-impl PortIoPlatform for Platform {
-    #[inline]
-    unsafe fn read_port_u8(port: u16) -> u8 {
-        let mut port = x86_64::instructions::port::Port::<u8>::new(port);
-        unsafe { port.read() }
-    }
-
-    #[inline]
-    unsafe fn read_port_u16(port: u16) -> u16 {
-        let mut port = x86_64::instructions::port::Port::<u16>::new(port);
-        unsafe { port.read() }
-    }
-
-    #[inline]
-    unsafe fn read_port_u32(port: u16) -> u32 {
-        let mut port = x86_64::instructions::port::Port::<u32>::new(port);
-        unsafe { port.read() }
-    }
-
-    #[inline]
-    unsafe fn write_port_u8(port: u16, value: u8) {
-        let mut port = x86_64::instructions::port::Port::<u8>::new(port);
-        unsafe { port.write(value) }
-    }
-
-    #[inline]
-    unsafe fn write_port_u16(port: u16, value: u16) {
-        let mut port = x86_64::instructions::port::Port::<u16>::new(port);
-        unsafe { port.write(value) }
-    }
-
-    #[inline]
-    unsafe fn write_port_u32(port: u16, value: u32) {
-        let mut port = x86_64::instructions::port::Port::<u32>::new(port);
-        unsafe { port.write(value) }
-    }
+pub const fn recursive_level_4_table_addr(recursive_index: u16) -> VirtAddr {
+    let idx = recursive_index as u64;
+    VirtAddr::new(recursive_table_addr(idx, idx, idx, idx))
 }
 
 impl PortAccess for Platform {
     #[inline]
     unsafe fn read_u8(port: u16) -> u8 {
-        unsafe { <Self as PortIoPlatform>::read_port_u8(port) }
+        let mut port = x86_64::instructions::port::Port::<u8>::new(port);
+        unsafe { port.read() }
     }
 
     #[inline]
     unsafe fn read_u16(port: u16) -> u16 {
-        unsafe { <Self as PortIoPlatform>::read_port_u16(port) }
+        let mut port = x86_64::instructions::port::Port::<u16>::new(port);
+        unsafe { port.read() }
     }
 
     #[inline]
     unsafe fn read_u32(port: u16) -> u32 {
-        unsafe { <Self as PortIoPlatform>::read_port_u32(port) }
+        let mut port = x86_64::instructions::port::Port::<u32>::new(port);
+        unsafe { port.read() }
     }
 
     #[inline]
     unsafe fn write_u8(port: u16, value: u8) {
-        unsafe { <Self as PortIoPlatform>::write_port_u8(port, value) }
+        let mut port = x86_64::instructions::port::Port::<u8>::new(port);
+        unsafe { port.write(value) }
     }
 
     #[inline]
     unsafe fn write_u16(port: u16, value: u16) {
-        unsafe { <Self as PortIoPlatform>::write_port_u16(port, value) }
+        let mut port = x86_64::instructions::port::Port::<u16>::new(port);
+        unsafe { port.write(value) }
     }
 
     #[inline]
     unsafe fn write_u32(port: u16, value: u32) {
-        unsafe { <Self as PortIoPlatform>::write_port_u32(port, value) }
+        let mut port = x86_64::instructions::port::Port::<u32>::new(port);
+        unsafe { port.write(value) }
     }
 }
 

@@ -5,7 +5,7 @@ use core::ops::{Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, Not, S
 pub mod x86;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86::{PagingInfo, Platform};
+pub use x86::{recursive_level_4_table_addr, recursive_table_addr, PagingInfo, Platform};
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("kernel_types does not have an implementation for this target architecture");

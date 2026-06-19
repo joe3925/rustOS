@@ -38,7 +38,6 @@ pub mod page_table;
 pub use domain::X86_IOVA_START;
 
 const PAGE_SIZE: usize = 4096;
-const MAP_BATCH_PAGES: usize = 64;
 const X86_IOMMU_PAGE_SIZES: &[u64] = &[PAGE_SIZE as u64];
 const X86_IOMMU_SUPERPAGE_SIZES: &[u64] = &[2 * 1024 * 1024, 1024 * 1024 * 1024];
 
@@ -244,7 +243,14 @@ impl X86DeviceMmu {
         }
     }
 
-    fn map_pfns(&self, raw: &IommuDomain, iova: u64, phys: u64, len: u64) -> DeviceMmuResult<()> {
+    fn map_pfns(
+        &self,
+        raw: &IommuDomain,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        permissions: DeviceMmuMapPermissions,
+    ) -> DeviceMmuResult<()> {
         if (iova & ((PAGE_SIZE as u64) - 1)) != 0
             || (phys & ((PAGE_SIZE as u64) - 1)) != 0
             || (len & ((PAGE_SIZE as u64) - 1)) != 0
@@ -252,34 +258,13 @@ impl X86DeviceMmu {
             return Err(DeviceMmuError::InvalidRange);
         }
 
-        let mut cur_iova = iova;
-        let mut cur_phys = phys;
-        let mut remaining_pages = len / PAGE_SIZE as u64;
+        let format = match self {
+            Self::Intel { .. } => page_table::X86IommuPageTableFormat::Intel,
+            Self::Amd { .. } => page_table::X86IommuPageTableFormat::Amd,
+        };
 
-        while remaining_pages != 0 {
-            let batch = core::cmp::min(remaining_pages as usize, MAP_BATCH_PAGES);
-            let mut pfns = [0u64; MAP_BATCH_PAGES];
-
-            for idx in 0..batch {
-                pfns[idx] = (cur_phys + (idx as u64 * PAGE_SIZE as u64)) >> 12;
-            }
-
-            match self {
-                Self::Intel { backend, .. } => backend
-                    .map_pages(raw, cur_iova, &pfns[..batch])
-                    .map_err(map_iommu_error)?,
-                Self::Amd { backend, .. } => backend
-                    .map_pages(raw, cur_iova, &pfns[..batch])
-                    .map_err(map_iommu_error)?,
-            }
-
-            let advance = batch as u64 * PAGE_SIZE as u64;
-            cur_iova += advance;
-            cur_phys += advance;
-            remaining_pages -= batch as u64;
-        }
-
-        Ok(())
+        page_table::map_range(raw.root_phys, iova, phys, len, permissions, format)
+            .map_err(map_iommu_error)
     }
 }
 
@@ -364,10 +349,10 @@ impl DeviceMmuBackend for X86DeviceMmu {
         iova: u64,
         phys: u64,
         len: u64,
-        _permissions: DeviceMmuMapPermissions,
+        permissions: DeviceMmuMapPermissions,
     ) -> DeviceMmuResult<()> {
         let raw = self.raw_domain(domain)?;
-        self.map_pfns(&raw, iova, phys, len)
+        self.map_pfns(&raw, iova, phys, len, permissions)
     }
 
     fn unmap_range(

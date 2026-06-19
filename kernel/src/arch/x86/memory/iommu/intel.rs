@@ -244,28 +244,6 @@ impl IntelVtdBackend {
     }
 
     #[inline]
-    pub fn map_pages(
-        &self,
-        domain: &IommuDomain,
-        iova: u64,
-        phys_pfns: &[u64],
-    ) -> Result<(), IommuError> {
-        let mut cur_iova = iova;
-        for &pfn in phys_pfns {
-            page_table::map_4k(
-                domain.root_phys,
-                cur_iova,
-                pfn << 12,
-                |_| PTE_P | PTE_RW,
-                PTE_P | PTE_RW,
-                PTE_P | PTE_RW,
-            )?;
-            cur_iova += 0x1000;
-        }
-        Ok(())
-    }
-
-    #[inline]
     pub fn unmap_pages(&self, domain: &IommuDomain, iova: u64, page_count: u32) {
         let mut cur = iova;
         for _ in 0..page_count {

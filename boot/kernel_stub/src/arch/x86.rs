@@ -438,15 +438,7 @@ unsafe fn init_recursive_mapper(recursive_index: u16) -> RecursivePageTable<'sta
 }
 
 unsafe fn active_level_4_table(recursive_index: PageTableIndex) -> &'static mut PageTable {
-    let virt = recursive_level_4_table_addr(recursive_index);
+    let virt =
+        kernel_types::arch::recursive_level_4_table_addr(u64::from(recursive_index) as u16);
     unsafe { &mut *virt.as_mut_ptr() }
-}
-
-fn recursive_level_4_table_addr(recursive_index: PageTableIndex) -> VirtAddr {
-    let idx = u64::from(recursive_index);
-    let mut addr = (idx << 39) | (idx << 30) | (idx << 21) | (idx << 12);
-    if addr & (1 << 47) != 0 {
-        addr |= 0xFFFF_0000_0000_0000;
-    }
-    VirtAddr::new(addr)
 }

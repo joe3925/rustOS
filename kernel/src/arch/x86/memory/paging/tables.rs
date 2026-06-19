@@ -4,7 +4,6 @@ use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     PageTable, PageTableIndex, PhysFrame, RecursivePageTable, Size4KiB,
 };
-use x86_64::VirtAddr;
 
 pub static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
 
@@ -24,15 +23,7 @@ pub fn init_mapper(recursive_index: u16) -> RecursivePageTable<'static> {
 }
 
 pub fn get_level4_page_table(recursive_index: PageTableIndex) -> &'static mut PageTable {
-    let virt_addr = recursive_level_4_table_addr(recursive_index);
+    let virt_addr =
+        kernel_types::arch::recursive_level_4_table_addr(u64::from(recursive_index) as u16);
     unsafe { &mut *virt_addr.as_mut_ptr() }
-}
-
-pub fn recursive_level_4_table_addr(recursive_index: PageTableIndex) -> VirtAddr {
-    let idx = u64::from(recursive_index);
-    let mut addr = (idx << 39) | (idx << 30) | (idx << 21) | (idx << 12);
-    if addr & (1 << 47) != 0 {
-        addr |= 0xFFFF_0000_0000_0000;
-    }
-    VirtAddr::new(addr)
 }

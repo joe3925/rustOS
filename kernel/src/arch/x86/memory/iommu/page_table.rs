@@ -17,8 +17,8 @@
 //! <= 2 MiB of intermediate frames even if every L1 leaf is populated.
 
 use super::domain::IommuError;
+use crate::memory::device_mmu::DeviceMmuMapPermissions;
 use crate::memory::paging::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
-use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
 
 pub const PTE_P: u64 = 1 << 0;
@@ -109,47 +109,12 @@ pub fn alloc_pt_frame_phys() -> Option<u64> {
     Some(phys)
 }
 
-/// Map a single 4 KiB page. `leaf_flags` adds vendor-specific bits (e.g.
-/// AMD `IR`/`IW`) on top of the shared `P | R/W` flags. Interior frames
-/// allocated on the way down are intentionally not reported — see the
-/// module docstring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IommuMapPermissions {
-    Read,
-    Write,
-    ReadWrite,
-}
-
-impl IommuMapPermissions {
-    pub(crate) fn amd_flags(self) -> u64 {
-        let mut f = PTE_P;
-        if matches!(self, Self::Read | Self::ReadWrite) {
-            f |= AMD_IR;
-        }
-        if matches!(self, Self::Write | Self::ReadWrite) {
-            f |= AMD_IW;
-        }
-        f
-    }
-
-    pub(crate) fn intel_flags(self) -> u64 {
-        let mut f = PTE_P;
-        if matches!(self, Self::Read | Self::ReadWrite) {
-            f |= 1;
-        } // R
-        if matches!(self, Self::Write | Self::ReadWrite) {
-            f |= 2;
-        } // W
-        f
-    }
-}
-
 pub fn map_range(
     root_phys: u64,
     iova: u64,
     phys: u64,
     len: u64,
-    permissions: IommuMapPermissions,
+    permissions: DeviceMmuMapPermissions,
     format: X86IommuPageTableFormat,
 ) -> Result<(), IommuError> {
     if len == 0 {
@@ -206,7 +171,7 @@ pub fn ensure_iommu_2mib_mapped(
     root_phys: u64,
     iova: u64,
     phys: u64,
-    permissions: IommuMapPermissions,
+    permissions: DeviceMmuMapPermissions,
     format: X86IommuPageTableFormat,
 ) -> Result<(), IommuError> {
     const SIZE_2MIB: u64 = 2 * 1024 * 1024;
@@ -247,7 +212,7 @@ pub fn ensure_iommu_1gib_mapped(
     root_phys: u64,
     iova: u64,
     phys: u64,
-    permissions: IommuMapPermissions,
+    permissions: DeviceMmuMapPermissions,
     format: X86IommuPageTableFormat,
 ) -> Result<(), IommuError> {
     const SIZE_1GIB: u64 = 1024 * 1024 * 1024;
@@ -376,25 +341,25 @@ pub enum X86IommuPageTableFormat {
 
 impl X86IommuPageTableFormat {
     #[inline]
-    fn interior_flags(self, permissions: IommuMapPermissions, level: u32) -> u64 {
+    fn interior_flags(self, permissions: DeviceMmuMapPermissions, level: u32) -> u64 {
         match self {
             Self::Intel => PTE_P | PTE_RW,
-            Self::Amd => permissions.amd_flags() | (((level - 1) as u64) << 9),
+            Self::Amd => amd_permission_flags(permissions) | (((level - 1) as u64) << 9),
         }
     }
 
     #[inline]
-    fn leaf_flags(self, permissions: IommuMapPermissions, level: u32) -> u64 {
+    fn leaf_flags(self, permissions: DeviceMmuMapPermissions, level: u32) -> u64 {
         match self {
             Self::Intel => {
-                let mut flags = permissions.intel_flags();
+                let mut flags = intel_permission_flags(permissions);
                 if level > 1 {
                     flags |= 1 << 7;
                 }
                 flags
             }
             Self::Amd => {
-                let mut flags = permissions.amd_flags();
+                let mut flags = amd_permission_flags(permissions);
                 if level > 1 {
                     flags |= 0 << 9;
                 }
@@ -410,4 +375,32 @@ impl X86IommuPageTableFormat {
             Self::Amd => PTE_P,
         }
     }
+}
+
+fn amd_permission_flags(permissions: DeviceMmuMapPermissions) -> u64 {
+    let mut flags = PTE_P;
+    if matches!(
+        permissions,
+        DeviceMmuMapPermissions::Read | DeviceMmuMapPermissions::ReadWrite
+    ) {
+        flags |= AMD_IR;
+    }
+    if matches!(
+        permissions,
+        DeviceMmuMapPermissions::Write | DeviceMmuMapPermissions::ReadWrite
+    ) {
+        flags |= AMD_IW;
+    }
+    flags
+}
+
+fn intel_permission_flags(permissions: DeviceMmuMapPermissions) -> u64 {
+    let mut flags = PTE_P;
+    if matches!(
+        permissions,
+        DeviceMmuMapPermissions::Write | DeviceMmuMapPermissions::ReadWrite
+    ) {
+        flags |= PTE_RW;
+    }
+    flags
 }
