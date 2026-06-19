@@ -1,0 +1,189 @@
+use super::super::drivers::interrupt_index::get_current_logical_id;
+use super::super::gdt::PER_CPU_GDT;
+
+use crate::executable::program::{Message, UserHandle};
+use crate::scheduling::scheduler::KernelFpuGuard;
+use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
+use crate::syscalls::syscall_impl::*;
+use core::arch::naked_asm;
+use x86_64::registers::control::{Efer, EferFlags};
+use x86_64::registers::model_specific::{LStar, Star};
+use x86_64::VirtAddr;
+
+pub fn syscall_init() {
+    let gdt = PER_CPU_GDT.lock();
+    unsafe { Efer::update(|e| e.set(EferFlags::SYSTEM_CALL_EXTENSIONS, true)) };
+    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    let id = get_current_logical_id() as usize;
+    let selectors = gdt.selectors_per_cpu.get_by_id(id);
+    let kernel_cs = selectors.kernel_code_selector;
+    let kernel_ss = selectors.kernel_data_selector;
+    let user_cs = selectors.user_code_selector;
+    let user_ss = selectors.user_data_selector;
+
+    Star::write(user_cs, user_ss, kernel_cs, kernel_ss).expect("Bad STAR segment selectors");
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SyscallFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub rax: u64,
+}
+#[unsafe(naked)]
+pub unsafe extern "C" fn syscall_entry() -> ! {
+    naked_asm!(
+        "push rax",
+        "push rbp",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+
+        "mov  rbx, rsp",
+        "and  rsp, -16",
+        "sub  rsp, 32",
+        "mov  rcx, rbx",
+        "cld",
+        "call {handler}",
+        "mov  rsp, rbx",
+
+        "pop  r15",
+        "pop  r14",
+        "pop  r13",
+        "pop  r12",
+        "pop  r11",
+        "pop  r10",
+        "pop  r9",
+        "pop  r8",
+        "pop  rdi",
+        "pop  rsi",
+        "pop  rdx",
+        "pop  rcx",
+        "pop  rbx",
+        "pop  rbp",
+        "pop  rax",
+
+        "sysretq",
+
+        handler = sym syscall_handler,
+    );
+}
+type Handler = unsafe fn(u64, u64, u64, u64, *const u64) -> u64;
+
+macro_rules! make_wrapper {
+    ($wrap:ident, $real:path $(, $t:ty )* $(,)?) => {
+        #[inline(always)]
+        unsafe fn $wrap(rcx: u64, rdx: u64, r8: u64, r9: u64,
+                        rest: *const u64) -> u64 {
+            let regs = [rcx, rdx, r8, r9];
+            let mut idx = 0usize;
+            #[inline(always)]
+            unsafe fn next(regs: &[u64;4], rest: *const u64, idx: &mut usize) -> u64 {
+                let v = if *idx < 4 { regs[*idx] } else { *rest.add(*idx - 4) };
+                *idx += 1;
+                v
+            }
+            $real(
+                $( next(&regs, rest, &mut idx) as $t ),*
+            ) as u64
+        }
+    };
+}
+
+make_wrapper!(wrap_print, sys_print, *const u8);
+make_wrapper!(wrap_destroy, sys_destroy_task, u64);
+make_wrapper!(wrap_create, sys_create_task, usize);
+make_wrapper!(
+    wrap_completion_queue_create,
+    sys_completion_queue_create,
+    usize,
+    usize,
+    u64
+);
+make_wrapper!(wrap_io_enqueue, sys_io_enqueue, UserHandle, *const UserIoOp);
+make_wrapper!(
+    wrap_io_enqueue_many,
+    sys_io_enqueue_many,
+    UserHandle,
+    *const UserIoOp,
+    usize,
+    *mut RequestId
+);
+make_wrapper!(
+    wrap_completion_poll,
+    sys_completion_poll,
+    UserHandle,
+    *mut UserIoCompletion,
+    usize
+);
+make_wrapper!(
+    wrap_completion_wait,
+    sys_completion_wait,
+    UserHandle,
+    *mut UserIoCompletion,
+    usize,
+    u64
+);
+make_wrapper!(wrap_io_cancel, sys_io_cancel, UserHandle, RequestId);
+make_wrapper!(wrap_get_thread, sys_get_thread,);
+make_wrapper!(wrap_mq_request, sys_mq_request, UserHandle, *mut Message);
+make_wrapper!(wrap_mq_route_add, sys_rule_add, *const UserRoutingRule);
+make_wrapper!(wrap_mq_route_clear, sys_rule_clear, *const UserRoutingRule);
+make_wrapper!(wrap_mq_peek, sys_mq_peek, UserHandle, *mut Message);
+make_wrapper!(wrap_get_default_mq_handle, sys_get_default_mq_handle,);
+make_wrapper!(wrap_create_mq, sys_create_mq,);
+
+const SYSCALL_TABLE: &[Handler] = &[
+    wrap_print,                   // 0
+    wrap_destroy,                 // 1
+    wrap_create,                  // 2
+    wrap_completion_queue_create, // 3
+    wrap_io_enqueue,              // 4
+    wrap_io_enqueue_many,         // 5
+    wrap_completion_poll,         // 6
+    wrap_completion_wait,         // 7
+    wrap_io_cancel,               // 8
+    wrap_get_thread,              // 9
+    wrap_mq_request,              // 10
+    wrap_mq_route_add,            // 11
+    wrap_mq_route_clear,          // 12
+    wrap_mq_peek,                 // 13
+    wrap_get_default_mq_handle,   // 14
+    wrap_create_mq,               // 15
+];
+
+#[no_mangle]
+pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
+    let _fpu_guard = KernelFpuGuard::new();
+    let num = frame.rax as usize;
+    // stack args start immediately after the pushed register block
+    let rest_ptr = unsafe { (frame as *const SyscallFrame).add(1) } as *const u64;
+
+    frame.rax = if let Some(h) = SYSCALL_TABLE.get(num) {
+        unsafe { h(frame.r10, frame.rdx, frame.r8, frame.r9, rest_ptr) }
+    } else {
+        0
+    };
+}

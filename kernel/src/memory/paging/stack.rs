@@ -1,80 +1,82 @@
+use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
-use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
-use crate::memory::paging::{
-    paging::{align_up_4k, map_kernel_range},
-    virt_tracker::{allocate_auto_kernel_range_aligned, unmap_range},
-};
+use super::layout::{align_up, base_page_size, supported_mapping_sizes};
+use super::map::{map_range, unmap_range};
+use super::virt_tracker::allocate_auto_kernel_range_aligned;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StackSize {
-    Tiny = 4 * 1024,
-    Small = 8 * 1024,
-    Medium = 16 * 1024,
-    Large = 64 * 1024,
+    Tiny,
+    Small,
+    Medium,
+    Large,
     #[default]
-    Huge16M = 16 * 1024 * 1024,
-    Huge2M = 2 * 1024 * 1024,
-    Huge1G = 1024 * 1024 * 1024,
+    Huge,
 }
 
 impl StackSize {
     #[inline]
-    pub const fn as_bytes(self) -> u64 {
-        self as u64
-    }
-
-    #[inline]
-    pub const fn total_size_with_guard(self) -> u64 {
-        self.as_bytes() + 0x1000
-    }
-
-    #[inline]
-    pub const fn required_alignment(self) -> u64 {
+    pub fn as_bytes(self) -> u64 {
         match self {
-            StackSize::Tiny | StackSize::Small | StackSize::Medium | StackSize::Large => 0x1000,
-            StackSize::Huge2M | StackSize::Huge16M => 2 * 1024 * 1024,
-            StackSize::Huge1G => 1024 * 1024 * 1024,
+            Self::Tiny => 4 * 1024,
+            Self::Small => 8 * 1024,
+            Self::Medium => 16 * 1024,
+            Self::Large => 64 * 1024,
+            Self::Huge => 16 * 1024 * 1024,
         }
+    }
+
+    #[inline]
+    pub fn total_size_with_guard(self) -> u64 {
+        self.as_bytes() + base_page_size()
+    }
+
+    #[inline]
+    pub fn required_alignment(self) -> u64 {
+        required_alignment_for_bytes(self.as_bytes())
     }
 }
 
-const GUARD_4K: u64 = 0x1000;
-pub const KERNEL_STACK_MAX: StackSize = StackSize::Huge2M;
-pub const KERNEL_STACK_MAX_BYTES: u64 = KERNEL_STACK_MAX.as_bytes();
-pub const KERNEL_STACK_RESERVATION_BYTES: u64 = KERNEL_STACK_MAX_BYTES + GUARD_4K;
+fn required_alignment_for_bytes(bytes: u64) -> u64 {
+    for size in supported_mapping_sizes() {
+        if bytes >= size.bytes {
+            return size.bytes;
+        }
+    }
+    base_page_size()
+}
+
+pub fn kernel_stack_max_bytes() -> u64 {
+    StackSize::Huge.as_bytes()
+}
+
+pub fn kernel_stack_reservation_bytes() -> u64 {
+    kernel_stack_max_bytes() + base_page_size()
+}
 
 pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> {
-    let max_stack = KERNEL_STACK_MAX_BYTES;
-    let reserve_total = KERNEL_STACK_RESERVATION_BYTES;
+    let max_stack = kernel_stack_max_bytes();
+    let reserve_total = kernel_stack_reservation_bytes();
 
     let map_bytes = {
-        let b = align_up_4k(size.as_bytes());
-        if b > max_stack {
+        let bytes = align_up(size.as_bytes(), base_page_size()).ok_or(PageMapError::NoMemory())?;
+        if bytes > max_stack {
             max_stack
         } else {
-            b
+            bytes
         }
     };
 
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
 
-    // Reserve the full stack window (+4KiB hard guard) but do NOT map it yet.
     let region_base =
-        allocate_auto_kernel_range_aligned(reserve_total, KERNEL_STACK_MAX.required_alignment())
+        allocate_auto_kernel_range_aligned(reserve_total, required_alignment_for_bytes(max_stack))
             .ok_or(PageMapError::NoMemory())?;
-    let stack_top = region_base + reserve_total;
+    let stack_top = VirtAddr::new(region_base.as_u64() + reserve_total);
+    let map_start = VirtAddr::new(stack_top.as_u64() - map_bytes);
 
-    // Map only the requested initial stack bytes at the *top* of the reserved window.
-    // Layout (low -> high):
-    //   [region_base .. region_base+4K)                 unmapped hard guard
-    //   [region_base+4K .. stack_top-map_bytes)         unmapped reserve (for growth)
-    //   [stack_top-map_bytes .. stack_top)             mapped initial stack
-    let map_start = stack_top - map_bytes;
-
-    if let Err(err) = unsafe { map_kernel_range(map_start, map_bytes, flags, false) } {
+    if let Err(err) = unsafe { map_range(map_start, map_bytes, flags, false) } {
         unmap_range(region_base, reserve_total);
         return Err(err);
     }
@@ -83,6 +85,7 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
 }
 
 pub fn deallocate_kernel_stack(stack_top: VirtAddr) {
-    let region_base = stack_top - KERNEL_STACK_RESERVATION_BYTES;
-    unmap_range(region_base, KERNEL_STACK_RESERVATION_BYTES);
+    let reserve_total = kernel_stack_reservation_bytes();
+    let region_base = VirtAddr::new(stack_top.as_u64() - reserve_total);
+    unmap_range(region_base, reserve_total);
 }

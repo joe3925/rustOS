@@ -1,17 +1,13 @@
-use crate::memory::paging::mmio::{map_mmio_region, unmap_mmio_region};
+use crate::memory::paging::{map_physical_pages, unmap_physical_pages};
 use crate::util::boot_info;
 use acpi;
-use acpi::platform::interrupt::Apic;
-use acpi::{AcpiHandler, AcpiTables, InterruptModel, PhysicalMapping, PlatformInfo};
+use acpi::{AcpiHandler, AcpiTables, PhysicalMapping, PlatformInfo};
 use alloc::alloc::Global;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
-use lazy_static::lazy_static;
-use x86_64::{PhysAddr, VirtAddr};
 
-lazy_static! {
-    pub static ref ACPI_TABLES: ACPI = ACPI::new();
-}
+use kernel_types::arch::{PhysAddr, VirtAddr};
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct Xsdp {
@@ -19,46 +15,37 @@ pub struct Xsdp {
     pub checksum: u8,
     pub oem_id: [u8; 6],
     pub revision: u8,
-    pub rsdt_address: u32, // Deprecated since version 2.0
+    pub rsdt_address: u32, // todo: prob remove this
 
     pub length: u32,
     pub xsdt_address: u64,
     pub extended_checksum: u8,
     pub reserved: [u8; 3],
 }
-unsafe impl Send for ACPI {}
-unsafe impl Sync for ACPI {}
-pub struct ACPI {
+unsafe impl Send for AcpiFirmware {}
+unsafe impl Sync for AcpiFirmware {}
+pub struct AcpiFirmware {
     tables: Arc<AcpiTables<ACPIImpl>>,
 }
-impl ACPI {
-    pub fn new() -> Self {
+impl AcpiFirmware {
+    pub fn from_boot_info() -> Option<Self> {
         let handler = ACPIImpl::new();
-        if boot_info().rsdp_addr.into_option().is_none() {
-            panic!("RSDP was not supplied by bootloader");
-        }
-        let tables = unsafe {
-            AcpiTables::from_rsdp(
-                handler,
-                boot_info().rsdp_addr.into_option().unwrap() as usize,
-            )
-            .expect("failed to parse ACPI")
-        };
+        let rsdp = boot_info().rsdp_addr.into_option()?;
+        let tables =
+            unsafe { AcpiTables::from_rsdp(handler, rsdp as usize).expect("failed to parse ACPI") };
         let arc_tab = Arc::new(tables);
-        ACPI { tables: arc_tab }
+        Some(AcpiFirmware { tables: arc_tab })
     }
-    pub fn get_interrupt_model(&self) -> Option<Apic<'_, Global>> {
-        let platform_info = self.tables.platform_info().ok()?;
-        match &platform_info.interrupt_model {
-            InterruptModel::Apic(apic) => Some(apic.clone()),
-            _ => None,
-        }
-    }
+
     pub fn get_plat_info(&self) -> Option<PlatformInfo<'_, Global>> {
         self.tables.platform_info().ok()
     }
     pub fn get_tables(&self) -> Arc<AcpiTables<ACPIImpl>> {
         self.tables.clone()
+    }
+
+    pub fn into_tables(self) -> Arc<AcpiTables<ACPIImpl>> {
+        self.tables
     }
 }
 unsafe impl Send for ACPIImpl {}
@@ -77,8 +64,12 @@ impl AcpiHandler for ACPIImpl {
         physical_address: usize,
         size: usize,
     ) -> PhysicalMapping<Self, T> {
-        let virt_addr = map_mmio_region(PhysAddr::new(physical_address as u64), size as u64)
-            .expect("failed to map io space for ACPI");
+        let virt_addr = map_physical_pages(
+            PhysAddr::new(physical_address as u64).into(),
+            size as u64,
+            kernel_types::memory::PhysicalMappingCache::Uncached,
+        )
+        .expect("Failed to map physical region for ACPI");
         PhysicalMapping::new(
             physical_address,
             NonNull::new(virt_addr.as_mut_ptr()).unwrap(),
@@ -89,8 +80,8 @@ impl AcpiHandler for ACPIImpl {
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        let _ = unmap_mmio_region(
-            VirtAddr::new(region.virtual_start().as_ptr() as u64),
+        let _ = unmap_physical_pages(
+            VirtAddr::new(region.virtual_start().as_ptr() as u64).into(),
             region.region_length() as u64,
         );
     }

@@ -1,4 +1,3 @@
-
 use alloc::sync::Arc;
 use aml::AmlContext;
 use spin::{Once, RwLock};

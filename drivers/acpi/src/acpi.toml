@@ -1,4 +1,4 @@
 image = "acpi.dll"
-start = "boot"
-role = "base"
-hwids = []
+start = "demand"
+role = "function"
+hwids = ["ACPI\\ROOT"]

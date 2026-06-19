@@ -1,19 +1,13 @@
 use crate::alloc::format;
-use crate::drivers::interrupt_index::{self, TSC_HZ};
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
 use crate::memory::{
     heap::heap_capacity_bytes,
-    paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
+    paging::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::unwind::{
     capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
-};
-use crate::scheduling::runtime::runtime::spawn;
-use crate::scheduling::runtime::runtime::{
-    block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
@@ -21,7 +15,7 @@ use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
-use crate::{cpu, println, vec};
+use crate::{platform, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -35,6 +29,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
+use kernel_executor::runtime::runtime::{
+    block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
+};
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
     BenchDroppedSampleCounterProto, BenchLevelResult, BenchOverflowPolicy, BenchSampleChunkProto,
@@ -49,7 +46,7 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::ProstMessage;
 use serde_json::{json, Value};
 use spin::{Mutex, Once};
-use x86_64::instructions::interrupts;
+
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
 pub const BENCH_ENABLED: bool = false;
 
@@ -373,7 +370,7 @@ struct BenchState {
 
 impl BenchState {
     fn new() -> Self {
-        let cores = unsafe { TIMER_TIME_SCHED.iter() }.count().max(1);
+        let cores = platform::processor_count().max(1);
         let mut rings = Vec::with_capacity(cores);
         let mut drained_events = Vec::with_capacity(cores);
         let mut sample_drops = Vec::with_capacity(cores);
@@ -605,23 +602,16 @@ fn bench_capture_metrics(core_id: usize, ts: u64) {
         return;
     }
 
-    let heap_used = interrupts::without_interrupts(used_memory) as u64;
+    let heap_used = platform::with_interrupts_disabled(used_memory) as u64;
 
-    let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst) as u64;
+    let mut used_bytes = physical_used_bytes();
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
     let total_bytes = total_usable_bytes();
 
     let heap_total_bytes = heap_capacity_bytes();
 
-    let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
-        .nth(core_id)
-        .map(|a| a.load(Ordering::SeqCst) as u64)
-        .unwrap_or(0);
-
-    let core_switches = unsafe { PER_CORE_SWITCHES.iter() }
-        .nth(core_id)
-        .map(|a| a.load(Ordering::SeqCst) as u64)
-        .unwrap_or(0);
+    let core_sched_ns = platform::scheduler_time_ns(core_id);
+    let core_switches = platform::context_switch_count(core_id);
 
     let event = BenchEvent {
         seq: 0,
@@ -919,23 +909,16 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
         return;
     }
 
-    let heap_used = interrupts::without_interrupts(used_memory) as u64;
+    let heap_used = platform::with_interrupts_disabled(used_memory) as u64;
 
-    let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst) as u64;
+    let mut used_bytes = physical_used_bytes();
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
     let total_bytes = total_usable_bytes();
 
     let heap_total_bytes = heap_capacity_bytes();
 
-    let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
-        .nth(core_id)
-        .map(|a| a.load(Ordering::SeqCst) as u64)
-        .unwrap_or(0);
-
-    let core_switches = unsafe { PER_CORE_SWITCHES.iter() }
-        .nth(core_id)
-        .map(|a| a.load(Ordering::SeqCst) as u64)
-        .unwrap_or(0);
+    let core_sched_ns = platform::scheduler_time_ns(core_id);
+    let core_switches = platform::context_switch_count(core_id);
 
     let event = BenchEvent {
         seq: 0,
@@ -963,7 +946,7 @@ pub fn bench_submit_rip_sample_current_core(rip: u64) {
         return;
     }
 
-    let core_id = interrupt_index::current_cpu_id();
+    let core_id = platform::current_cpu_id();
     let ts = bench_now_ns();
     let callchain = callchain_from_external_stack(rip, &[]);
 
@@ -979,7 +962,7 @@ pub fn bench_submit_interrupt_sample_current_core(state: &State) {
         return;
     }
 
-    let core_id = interrupt_index::current_cpu_id();
+    let core_id = platform::current_cpu_id();
     let task = SCHEDULER.get_current_task(core_id);
     if task.is_none() {
         if let Some(state) = bench_state_get() {
@@ -1021,7 +1004,7 @@ fn bench_log_span_begin(span_id: u32, tag: &'static str, object_id: u64) {
         return;
     }
 
-    let core_id = interrupt_index::current_cpu_id();
+    let core_id = platform::current_cpu_id();
     let ts = bench_now_ns();
 
     let event = BenchEvent {
@@ -1045,7 +1028,7 @@ pub fn bench_log_span_end(span_id: u32, tag: &'static str, object_id: u64) {
         return;
     }
 
-    let core_id = interrupt_index::current_cpu_id();
+    let core_id = platform::current_cpu_id();
     let ts = bench_now_ns();
 
     let event = BenchEvent {
@@ -1726,7 +1709,7 @@ async fn build_exports_for_window(
         let st = state;
         let last_seq = *last_export_seq.get(core).unwrap_or(&0);
 
-        gather_joins.push(crate::scheduling::runtime::runtime::spawn_blocking(
+        gather_joins.push(kernel_executor::runtime::runtime::spawn_blocking(
             move || -> Vec<BenchEvent> {
                 let events = st.drain_core_events(core);
 
@@ -2178,7 +2161,7 @@ impl BenchWindow {
         if let Some(timeout_ms) = timeout_ms_opt {
             let this = self.clone();
             spawn_blocking(move || {
-                interrupt_index::wait_duration(timeout_ms);
+                platform::wait_duration(timeout_ms);
                 this.stop();
                 println!("starting timeout persist");
                 block_on(this.persist());
@@ -2192,7 +2175,7 @@ impl BenchWindow {
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
                 spawn_blocking(move || loop {
-                    interrupt_index::wait_duration(interval);
+                    platform::wait_duration(interval);
 
                     if !BENCH_ENABLED {
                         return;
@@ -2873,27 +2856,17 @@ pub async fn bench_async_vs_sync_call_latency_async() {
 
     println!(
         "[bench] async-sm:         total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
-        async_ms,
-        async_us_per_chain,
-        async_ns_per_inner,
-        async_ops_sec
+        async_ms, async_us_per_chain, async_ns_per_inner, async_ops_sec
     );
 
     println!(
         "[bench] async-spawn-wake: total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
-        spawn_ms,
-        spawn_us_per_chain,
-        spawn_ns_per_inner,
-        spawn_ops_sec
+        spawn_ms, spawn_us_per_chain, spawn_ns_per_inner, spawn_ops_sec
     );
 
     println!(
         "[bench] asyncq:           tasks={} total={:.3} ms  us/task={:.3}  ns/inner_call={:.3}  tasks/sec={:.3}",
-        ASYNC_TASKS,
-        q_ms,
-        asyncq_us_per_task,
-        asyncq_ns_per_inner,
-        asyncq_ops_sec
+        ASYNC_TASKS, q_ms, asyncq_us_per_task, asyncq_ns_per_inner, asyncq_ops_sec
     );
 
     println!("[bench] --- async overheads ---");
@@ -2938,7 +2911,7 @@ pub async fn bench_runtime_executor_async() {
 async fn bench_spawn_detached() {
     let done = CountDown::new(SPAWN_DETACHED_ITERS);
 
-    let t0 = rdtsc_ordered();
+    let t0 = ordered_cycle_counter();
 
     let mut i = 0usize;
     while i < SPAWN_DETACHED_ITERS {
@@ -2946,9 +2919,9 @@ async fn bench_spawn_detached() {
         i += 1;
     }
 
-    let t1 = rdtsc_ordered();
+    let t1 = ordered_cycle_counter();
     done.wait().await;
-    let t2 = rdtsc_ordered();
+    let t2 = ordered_cycle_counter();
 
     println!("--- detached spawn ---");
     print_cycles_per("enqueue", t1.wrapping_sub(t0), SPAWN_DETACHED_ITERS);
@@ -2964,7 +2937,7 @@ async fn detached_spawn_task(done: Arc<CountDown>, value: u64) {
 async fn bench_spawn_join() {
     let mut handles = Vec::with_capacity(SPAWN_JOIN_ITERS);
 
-    let t0 = rdtsc_ordered();
+    let t0 = ordered_cycle_counter();
 
     let mut i = 0usize;
     while i < SPAWN_JOIN_ITERS {
@@ -2972,9 +2945,9 @@ async fn bench_spawn_join() {
         i += 1;
     }
 
-    let t1 = rdtsc_ordered();
+    let t1 = ordered_cycle_counter();
     let results = JoinAll::new(handles).await;
-    let t2 = rdtsc_ordered();
+    let t2 = ordered_cycle_counter();
 
     let mut checksum = 0u64;
     for v in results {
@@ -2998,7 +2971,7 @@ async fn bench_driver_traffic() {
     let shared = DriverBenchShared::new(DRIVER_REQUESTS);
     let mut requests = Vec::with_capacity(DRIVER_REQUESTS);
 
-    let t0 = rdtsc_ordered();
+    let t0 = ordered_cycle_counter();
 
     let mut i = 0usize;
     while i < DRIVER_REQUESTS {
@@ -3008,11 +2981,11 @@ async fn bench_driver_traffic() {
         i += 1;
     }
 
-    let t_spawned = rdtsc_ordered();
+    let t_spawned = ordered_cycle_counter();
 
     ParkedWait::new(shared.clone()).await;
 
-    let t_parked = rdtsc_ordered();
+    let t_parked = ordered_cycle_counter();
 
     let mut wake_call_cycles = 0u64;
     let mut idx = 0usize;
@@ -3020,24 +2993,24 @@ async fn bench_driver_traffic() {
     while idx < requests.len() {
         let end = min(idx + DRIVER_WAKE_BATCH, requests.len());
 
-        let b0 = rdtsc_ordered();
+        let b0 = ordered_cycle_counter();
 
         while idx < end {
             requests[idx].signal();
             idx += 1;
         }
 
-        let b1 = rdtsc_ordered();
+        let b1 = ordered_cycle_counter();
         wake_call_cycles = wake_call_cycles.wrapping_add(b1.wrapping_sub(b0));
 
         yield_once().await;
     }
 
-    let t_wakes_done = rdtsc_ordered();
+    let t_wakes_done = ordered_cycle_counter();
 
     shared.done.wait().await;
 
-    let t_done = rdtsc_ordered();
+    let t_done = ordered_cycle_counter();
 
     let latency_sum = shared.wake_latency_sum.load(Ordering::Relaxed);
     let latency_max = shared.wake_latency_max.load(Ordering::Relaxed);
@@ -3078,8 +3051,8 @@ async fn driver_request_task(req: Arc<DriverRequest>) {
 
     DriverStage::new(1).await;
 
-    let now = rdtsc_ordered();
-    let wake = req.wake_tsc.load(Ordering::Acquire);
+    let now = ordered_cycle_counter();
+    let wake = req.wake_cycle_counter.load(Ordering::Acquire);
     let latency = now.wrapping_sub(wake);
 
     req.shared
@@ -3122,7 +3095,7 @@ struct DriverRequest {
     index: usize,
     ready: AtomicBool,
     parked_once: AtomicBool,
-    wake_tsc: AtomicU64,
+    wake_cycle_counter: AtomicU64,
     waker: Mutex<Option<Waker>>,
     shared: Arc<DriverBenchShared>,
 }
@@ -3133,16 +3106,16 @@ impl DriverRequest {
             index,
             ready: AtomicBool::new(false),
             parked_once: AtomicBool::new(false),
-            wake_tsc: AtomicU64::new(0),
+            wake_cycle_counter: AtomicU64::new(0),
             waker: Mutex::new(None),
             shared,
         }
     }
 
     fn signal(&self) {
-        let t = rdtsc_ordered();
+        let t = ordered_cycle_counter();
 
-        self.wake_tsc.store(t, Ordering::Release);
+        self.wake_cycle_counter.store(t, Ordering::Release);
         self.ready.store(true, Ordering::Release);
 
         let waker = {
@@ -3365,21 +3338,8 @@ fn print_cycles_per(name: &str, total: u64, count: usize) {
 }
 
 #[inline(always)]
-fn rdtsc_ordered() -> u64 {
-    let low: u32;
-    let high: u32;
-
-    unsafe {
-        core::arch::asm!(
-            "lfence",
-            "rdtsc",
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    ((high as u64) << 32) | low as u64
+fn ordered_cycle_counter() -> u64 {
+    platform::ordered_cycle_counter()
 }
 // =====================
 // Config
@@ -3407,11 +3367,11 @@ pub const BENCH_MAX_LAT_SAMPLES: usize = 0;
 // =====================
 
 #[inline(always)]
-fn cycles_to_ns(delta_cycles: u64, tsc_hz: u64) -> u64 {
-    if tsc_hz == 0 {
+fn cycles_to_ns(delta_cycles: u64, cycle_counter_frequency_hz: u64) -> u64 {
+    if cycle_counter_frequency_hz == 0 {
         return 0;
     }
-    ((delta_cycles as u128 * 1_000_000_000u128) / (tsc_hz as u128)) as u64
+    ((delta_cycles as u128 * 1_000_000_000u128) / (cycle_counter_frequency_hz as u128)) as u64
 }
 
 #[inline(always)]
@@ -3826,12 +3786,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         let ops_10 = seek_ops_sec / 10;
         println!(
             "[disk-bench] fs_seek baseline: iters={} elapsed={} ms ops/sec={} (est per-stack: 1drv={} 5drv={} 10drv={})",
-            seek_iters,
-            seek_ms,
-            seek_ops_sec,
-            ops_1,
-            ops_5,
-            ops_10
+            seek_iters, seek_ms, seek_ops_sec, ops_1, ops_5, ops_10
         );
     }
 
@@ -3844,15 +3799,15 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
 // VirtIO Disk Benchmark Sweep
 // =============================================================================
 
-/// Convert TSC cycles to milliseconds.
+/// Convert platform cycle-counter ticks to milliseconds.
 pub const IOCTL_BLOCK_BENCH_SWEEP_BOTH: u32 = 0xB000_8004;
 
 #[inline]
-fn cycles_to_ms(cycles: u64, tsc_hz: u64) -> f64 {
-    if tsc_hz == 0 {
+fn cycles_to_ms(cycles: u64, cycle_counter_frequency_hz: u64) -> f64 {
+    if cycle_counter_frequency_hz == 0 {
         return 0.0;
     }
-    (cycles as f64 / tsc_hz as f64) * 1000.0
+    (cycles as f64 / cycle_counter_frequency_hz as f64) * 1000.0
 }
 
 fn csv_escape(s: &str, out: &mut String) {
@@ -3892,7 +3847,7 @@ fn csv_push_header(out: &mut String) {
         "run_id,trial,mode,\
 req_version,req_flags,req_total_bytes,req_request_size_bytes,req_start_sector,req_max_inflight,\
 used_version,used_flags,used_total_bytes,used_request_size_bytes,used_start_sector,used_max_inflight,\
-tsc_hz,queue_count,queue0_size,indirect,msix,\
+cycle_counter_frequency_hz,queue_count,queue0_size,indirect,msix,\
 level_inflight,request_count,total_cycles,total_ms,avg_cycles,avg_ms,p50_cycles,p50_ms,p99_cycles,p99_ms,p999_cycles,p999_ms,\
 min_cycles,min_ms,max_cycles,max_ms,\
 wait_pct,active_pct,throughput_mib_s,iops\n",
@@ -3906,20 +3861,20 @@ fn csv_push_level(
     mode: &str,
     requested: &BenchSweepParams,
     used_params: &BenchSweepParams,
-    tsc_hz: u64,
+    cycle_counter_frequency_hz: u64,
     queue_count: u16,
     queue0_size: u16,
     indirect_enabled: bool,
     msix_enabled: bool,
     lvl: BenchLevelResult,
 ) {
-    let total_ms = cycles_to_ms(lvl.total_time_cycles, tsc_hz);
-    let avg_ms = cycles_to_ms(lvl.avg_cycles, tsc_hz);
-    let p50_ms = cycles_to_ms(lvl.p50_cycles, tsc_hz);
-    let p99_ms = cycles_to_ms(lvl.p99_cycles, tsc_hz);
-    let p999_ms = cycles_to_ms(lvl.p999_cycles, tsc_hz);
-    let min_ms = cycles_to_ms(lvl.min_cycles, tsc_hz);
-    let max_ms = cycles_to_ms(lvl.max_cycles, tsc_hz);
+    let total_ms = cycles_to_ms(lvl.total_time_cycles, cycle_counter_frequency_hz);
+    let avg_ms = cycles_to_ms(lvl.avg_cycles, cycle_counter_frequency_hz);
+    let p50_ms = cycles_to_ms(lvl.p50_cycles, cycle_counter_frequency_hz);
+    let p99_ms = cycles_to_ms(lvl.p99_cycles, cycle_counter_frequency_hz);
+    let p999_ms = cycles_to_ms(lvl.p999_cycles, cycle_counter_frequency_hz);
+    let min_ms = cycles_to_ms(lvl.min_cycles, cycle_counter_frequency_hz);
+    let max_ms = cycles_to_ms(lvl.max_cycles, cycle_counter_frequency_hz);
 
     // lvl.idle_pct is actually "wait pct": percent of benchmark wall time spent inside irq_wait().await.
     let wait_pct = clamp_pct(lvl.idle_pct);
@@ -3971,7 +3926,7 @@ fn csv_push_level(
     out.push_str(&used_params.max_inflight.to_string());
     out.push(',');
 
-    out.push_str(&tsc_hz.to_string());
+    out.push_str(&cycle_counter_frequency_hz.to_string());
     out.push(',');
     out.push_str(&queue_count.to_string());
     out.push(',');
@@ -4041,7 +3996,7 @@ fn bench_sweep_append_csv_rows(
     requested: &BenchSweepParams,
     both: &BenchSweepBothResult,
     sweep: &BenchSweepResult,
-    tsc_hz: u64,
+    cycle_counter_frequency_hz: u64,
 ) {
     let indirect = both.indirect_enabled != 0;
     let msix = both.msix_enabled != 0;
@@ -4057,7 +4012,7 @@ fn bench_sweep_append_csv_rows(
             mode,
             requested,
             &both.params_used,
-            tsc_hz,
+            cycle_counter_frequency_hz,
             both.queue_count,
             both.queue0_size,
             indirect,
@@ -4136,7 +4091,7 @@ pub struct BenchRunResult {
     pub trial: u32,
     pub requested: BenchSweepParams,
     pub both: BenchSweepBothResult,
-    pub tsc_hz: u64,
+    pub cycle_counter_frequency_hz: u64,
 }
 
 /// Runs the benchmark matrix and returns all results.
@@ -4151,9 +4106,9 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
         }
     };
 
-    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
-    if tsc_hz == 0 {
-        println!("[virtio-bench] TSC not calibrated");
+    let cycle_counter_frequency_hz = platform::cycle_counter_frequency_hz();
+    if cycle_counter_frequency_hz == 0 {
+        println!("[virtio-bench] platform cycle counter not calibrated");
         return None;
     }
 
@@ -4209,7 +4164,13 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                             req.set_traversal_policy(TraversalPolicy::ForwardLower);
                             println!(
                                 "[virtio-bench] Starting trial {} for run_id {} with params: flags=0x{:X} total_bytes={} request_size={} start_sector={} max_inflight={}",
-                                trial, run_id, flags, total_bytes, request_size, start_sector, max_inflight
+                                trial,
+                                run_id,
+                                flags,
+                                total_bytes,
+                                request_size,
+                                start_sector,
+                                max_inflight
                             );
                             let st = PNP_MANAGER.send_request(target.clone(), &mut req).await;
                             println!(
@@ -4247,7 +4208,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                 trial,
                                 requested,
                                 both,
-                                tsc_hz,
+                                cycle_counter_frequency_hz,
                             });
 
                             run_id = run_id.wrapping_add(1);
@@ -4355,7 +4316,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatri
             &res.requested,
             &res.both,
             &res.both.irq,
-            res.tsc_hz,
+            res.cycle_counter_frequency_hz,
         );
 
         let mut poll_chunk = String::new();
@@ -4367,7 +4328,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatri
             &res.requested,
             &res.both,
             &res.both.poll,
-            res.tsc_hz,
+            res.cycle_counter_frequency_hz,
         );
 
         let mut request_chunk = String::new();
@@ -4379,7 +4340,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatri
             &res.requested,
             &res.both,
             &res.both.request,
-            res.tsc_hz,
+            res.cycle_counter_frequency_hz,
         );
 
         if write_csv_chunk_to_file(&mut irq_f, &irq_chunk)
@@ -4452,17 +4413,22 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn print_level_table_row(mode: &str, lvl: &BenchLevelResult, request_size: u32, tsc_hz: u64) {
-    let tsc_hz_f = tsc_hz as f64;
-    let avg_ms = (lvl.avg_cycles as f64 / tsc_hz_f) * 1000.0;
-    let p50_ms = (lvl.p50_cycles as f64 / tsc_hz_f) * 1000.0;
-    let p99_ms = (lvl.p99_cycles as f64 / tsc_hz_f) * 1000.0;
-    let min_ms = (lvl.min_cycles as f64 / tsc_hz_f) * 1000.0;
-    let max_ms = (lvl.max_cycles as f64 / tsc_hz_f) * 1000.0;
-    let total_ms = (lvl.total_time_cycles as f64 / tsc_hz_f) * 1000.0;
+fn print_level_table_row(
+    mode: &str,
+    lvl: &BenchLevelResult,
+    request_size: u32,
+    cycle_counter_frequency_hz: u64,
+) {
+    let cycle_counter_frequency_hz_f = cycle_counter_frequency_hz as f64;
+    let avg_ms = (lvl.avg_cycles as f64 / cycle_counter_frequency_hz_f) * 1000.0;
+    let p50_ms = (lvl.p50_cycles as f64 / cycle_counter_frequency_hz_f) * 1000.0;
+    let p99_ms = (lvl.p99_cycles as f64 / cycle_counter_frequency_hz_f) * 1000.0;
+    let min_ms = (lvl.min_cycles as f64 / cycle_counter_frequency_hz_f) * 1000.0;
+    let max_ms = (lvl.max_cycles as f64 / cycle_counter_frequency_hz_f) * 1000.0;
+    let total_ms = (lvl.total_time_cycles as f64 / cycle_counter_frequency_hz_f) * 1000.0;
     let throughput_mib_s = if lvl.total_time_cycles != 0 {
         let bytes = lvl.request_count as f64 * request_size as f64;
-        let secs = lvl.total_time_cycles as f64 / tsc_hz_f;
+        let secs = lvl.total_time_cycles as f64 / cycle_counter_frequency_hz_f;
         (bytes / (1024.0 * 1024.0)) / secs
     } else {
         0.0
@@ -4521,9 +4487,15 @@ fn print_bench_result_table(res: &BenchRunResult) {
         },
         if both.msix_enabled != 0 { "Yes" } else { "No" }
     );
-    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
-    println!("| Mode | Inflight |   Requests |  Total(ms) |  Avg(ms) |  P50(ms) |  P99(ms) |    MiB/s |  Min(ms) |  Max(ms) |  Wait%  |");
-    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
+    println!(
+        "+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+"
+    );
+    println!(
+        "| Mode | Inflight |   Requests |  Total(ms) |  Avg(ms) |  P50(ms) |  P99(ms) |    MiB/s |  Min(ms) |  Max(ms) |  Wait%  |"
+    );
+    println!(
+        "+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+"
+    );
 
     let irq_used = both.irq.used as usize;
     let mut i = 0usize;
@@ -4532,7 +4504,7 @@ fn print_bench_result_table(res: &BenchRunResult) {
             "IRQ",
             &both.irq.levels[i],
             both.params_used.request_size,
-            res.tsc_hz,
+            res.cycle_counter_frequency_hz,
         );
         i += 1;
     }
@@ -4544,7 +4516,7 @@ fn print_bench_result_table(res: &BenchRunResult) {
             "POLL",
             &both.poll.levels[i],
             both.params_used.request_size,
-            res.tsc_hz,
+            res.cycle_counter_frequency_hz,
         );
         i += 1;
     }
@@ -4556,12 +4528,14 @@ fn print_bench_result_table(res: &BenchRunResult) {
             "REQ",
             &both.request.levels[i],
             both.params_used.request_size,
-            res.tsc_hz,
+            res.cycle_counter_frequency_hz,
         );
         i += 1;
     }
 
-    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
+    println!(
+        "+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+"
+    );
 }
 
 /// Runs the benchmark matrix and prints results as a clean user-readable table.

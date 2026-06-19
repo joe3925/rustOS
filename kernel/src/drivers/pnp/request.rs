@@ -4,8 +4,8 @@
 //! This module only contains DPC queue functionality that requires kernel internals.
 
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::scheduling::runtime::runtime::spawn_detached;
 use alloc::collections::vec_deque::VecDeque;
+use kernel_executor::runtime::runtime::spawn_detached;
 use spin::Mutex;
 
 use super::manager::PnpManager;

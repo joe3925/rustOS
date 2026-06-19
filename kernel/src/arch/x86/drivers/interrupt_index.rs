@@ -1,0 +1,1226 @@
+use self::ApicErrors::{AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
+use super::super::cpu::{self, get_cpu_info};
+use super::super::gdt::PER_CPU_GDT;
+use super::super::idt::load_idt;
+use super::super::syscalls::syscall::syscall_init;
+use super::timer_driver::set_num_cores;
+use crate::machine::MachineInterruptInfo;
+use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
+use crate::scheduling::scheduler::SCHEDULER;
+use crate::structs::per_cpu_vec::PerCpuVec;
+use crate::util::{boot_info, CORE_LOCK, CPU_ID, INIT_LOCK};
+use crate::KERNEL_INITIALIZED;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
+use core::{mem, ptr};
+use kernel_types::irq::IrqSafeMutex;
+use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::status::PageMapError;
+use pic8259::ChainedPics;
+use spin::Mutex;
+use x86_64::instructions::port::Port;
+use x86_64::instructions::tables::sgdt;
+use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::{PageTableFlags, PhysFrame};
+use x86_64::structures::DescriptorTablePointer;
+use x86_64::{PhysAddr, VirtAddr};
+
+pub(crate) const PIC_1_OFFSET: u8 = 0x20;
+pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 0x8;
+pub(crate) const APIC_START_PERIOD: u64 = 500000;
+
+pub static PICS: Mutex<ChainedPics> =
+    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+pub static APIC: IrqSafeMutex<Option<ApicImpl>> = IrqSafeMutex::new(None);
+pub static USE_APIC: AtomicBool = AtomicBool::new(false);
+/// Counts APs that have made it into Rust code (past the SIPI trampoline).
+static AP_BOOTED: AtomicUsize = AtomicUsize::new(0);
+
+pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+pub static LAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
+
+pub static APIC_TICKS_PER_NS: PerCpuVec<AtomicU64> = PerCpuVec::new();
+
+pub const TIMER_FREQ: u64 = 300;
+
+const PIT_FREQUENCY_HZ: u32 = 1_193_182;
+const PIT_CONTROL_PORT: u16 = 0x43;
+const PIT_CHANNEL2_PORT: u16 = 0x42;
+const PIT_MODE_PORT: u16 = 0x61;
+
+const TRAMPOLINE_BASE: u64 = 0x0000_8000;
+const TRAMPOLINE_STEP: u64 = 0x1000;
+const TRAMPOLINE_EXPECTED_LEN: usize = 0xE4;
+const FOUR_GIB: u64 = 0x1_0000_0000;
+const PAGE_SIZE: u64 = 0x1000;
+const AP_STACK_SIZE: usize = (2 * 1024 * 1024) - 0x1000;
+
+const PAGEMAP_OFF: usize = 0x08;
+const GDTR_LIMIT_OFF: usize = 0x10;
+const GDTR_BASE_OFF: usize = 0x12;
+const TEMP_STACK_OFF: usize = 0x1A;
+const START_STACK_OFF: usize = 0x1E;
+const START_ADDR_OFF: usize = 0x26;
+const LONGMODE_GDTR_LIMIT_OFF: usize = 0x2E;
+const LONGMODE_GDTR_BASE_OFF: usize = 0x30;
+const TRAMPOLINE_DATA_END: usize = LONGMODE_GDTR_BASE_OFF + mem::size_of::<u64>();
+core::arch::global_asm!(include_str!("../ap_startup.s"));
+
+fn map_physical_pages(
+    phys: PhysAddr,
+    size: u64,
+    cache: PhysicalMappingCache,
+) -> Result<VirtAddr, PageMapError> {
+    crate::memory::paging::map_physical_pages(phys.into(), size, cache).map(Into::into)
+}
+
+fn identity_map_page(
+    phys: PhysAddr,
+    range: usize,
+    flags: PageTableFlags,
+) -> Result<(), PageMapError> {
+    crate::memory::paging::identity_map_page(phys.into(), range, flags.into())
+}
+
+fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    crate::memory::paging::virt_to_phys(addr.into()).map(|(size, phys)| (size, phys.into()))
+}
+
+fn unmap_range(addr: VirtAddr, size: u64) {
+    crate::memory::paging::unmap_range(addr.into(), size);
+}
+
+extern "C" {
+    static trampoline: u8;
+    static trampoline_end: u8;
+}
+
+pub fn trampoline_blob() -> &'static [u8] {
+    let start = core::ptr::addr_of!(trampoline) as *const u8;
+    let end = core::ptr::addr_of!(trampoline_end) as *const u8;
+
+    let len = unsafe { end.offset_from(start) as usize };
+    unsafe { core::slice::from_raw_parts(start, len) }
+}
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct PassedInfo {
+    pub pagemap: u64,
+    pub gdtr_limit: u16,
+    pub gdtr_base: u64,
+    pub temp_stack: u32,
+    pub start_stack: u64,
+    pub start_address: u64,
+    pub longmode_gdtr_limit: u16,
+    pub longmode_gdtr_base: u64,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct TrampolinePatch {
+    pagemap: u64,
+    gdtr_limit: u16,
+    gdtr_base: u64,
+    temp_stack: u32,
+    start_stack: u64,
+    start_address: u64,
+    longmode_gdtr_limit: u16,
+    longmode_gdtr_base: u64,
+}
+
+fn verify_trampoline_static_layout(code: &[u8]) {
+    assert_eq!(
+        code.len(),
+        TRAMPOLINE_EXPECTED_LEN,
+        "AP trampoline blob size changed"
+    );
+    assert_eq!(PAGEMAP_OFF, 0x08);
+    assert_eq!(GDTR_LIMIT_OFF, 0x10);
+    assert_eq!(GDTR_BASE_OFF, 0x12);
+    assert_eq!(TEMP_STACK_OFF, 0x1A);
+    assert_eq!(START_STACK_OFF, 0x1E);
+    assert_eq!(START_ADDR_OFF, 0x26);
+    assert_eq!(LONGMODE_GDTR_LIMIT_OFF, 0x2E);
+    assert_eq!(LONGMODE_GDTR_BASE_OFF, 0x30);
+    assert_eq!(
+        TRAMPOLINE_DATA_END - PAGEMAP_OFF,
+        mem::size_of::<PassedInfo>()
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, pagemap),
+        PAGEMAP_OFF
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, gdtr_limit),
+        GDTR_LIMIT_OFF
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, gdtr_base),
+        GDTR_BASE_OFF
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, temp_stack),
+        TEMP_STACK_OFF
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, start_stack),
+        START_STACK_OFF
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, start_address),
+        START_ADDR_OFF
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, longmode_gdtr_limit),
+        LONGMODE_GDTR_LIMIT_OFF
+    );
+    assert_eq!(
+        PAGEMAP_OFF + core::mem::offset_of!(PassedInfo, longmode_gdtr_base),
+        LONGMODE_GDTR_BASE_OFF
+    );
+}
+
+fn verify_trampoline_installed(code: &[u8]) {
+    verify_trampoline_bytes(code, 0, code.len());
+}
+
+fn verify_kernel_image_mapped() {
+    let boot = boot_info();
+    let base = boot.kernel_image_base;
+    let size = boot.kernel_image_size;
+    let entry = boot.kernel_entry;
+    assert!(base != 0, "kernel PE image base is not recorded");
+    assert!(size != 0, "kernel PE image size is not recorded");
+    let end = base
+        .checked_add(size)
+        .expect("kernel PE image range overflow");
+
+    assert!(
+        entry >= base && entry < end,
+        "kernel PE entry address {:#x} is outside mapped image {:#x}..{:#x}",
+        entry,
+        base,
+        end
+    );
+    assert!(
+        virt_to_phys(VirtAddr::new(entry)).is_some(),
+        "kernel PE entry address is not mapped in the AP page table"
+    );
+
+    let mut addr = base & !(PAGE_SIZE - 1);
+    while addr < end {
+        assert!(
+            virt_to_phys(VirtAddr::new(addr)).is_some(),
+            "kernel PE image page {:#x} is not mapped in the AP page table",
+            addr
+        );
+        addr = addr
+            .checked_add(PAGE_SIZE)
+            .expect("kernel image walk overflow");
+    }
+}
+
+fn verify_patched_trampoline(code: &[u8], patch: TrampolinePatch) {
+    verify_trampoline_bytes(code, 0, PAGEMAP_OFF);
+    verify_trampoline_bytes(code, TRAMPOLINE_DATA_END, code.len());
+
+    assert_eq!(read_trampoline_u64(PAGEMAP_OFF), patch.pagemap);
+    assert_eq!(read_trampoline_u16(GDTR_LIMIT_OFF), patch.gdtr_limit);
+    assert_eq!(read_trampoline_u64(GDTR_BASE_OFF), patch.gdtr_base);
+    assert_eq!(read_trampoline_u32(TEMP_STACK_OFF), patch.temp_stack);
+    assert_eq!(read_trampoline_u64(START_STACK_OFF), patch.start_stack);
+    assert_eq!(read_trampoline_u64(START_ADDR_OFF), patch.start_address);
+    assert_eq!(
+        read_trampoline_u16(LONGMODE_GDTR_LIMIT_OFF),
+        patch.longmode_gdtr_limit
+    );
+    assert_eq!(
+        read_trampoline_u64(LONGMODE_GDTR_BASE_OFF),
+        patch.longmode_gdtr_base
+    );
+}
+
+fn verify_trampoline_bytes(code: &[u8], start: usize, end: usize) {
+    let mut idx = start;
+    while idx < end {
+        let actual = unsafe { ptr::read_volatile((TRAMPOLINE_BASE as *const u8).add(idx)) };
+        assert_eq!(
+            actual,
+            code[idx],
+            "AP trampoline byte mismatch at physical {:#x}",
+            TRAMPOLINE_BASE + idx as u64
+        );
+        idx += 1;
+    }
+}
+
+fn read_trampoline_u16(offset: usize) -> u16 {
+    unsafe { ptr::read_unaligned((TRAMPOLINE_BASE as *const u8).add(offset) as *const u16) }
+}
+
+fn read_trampoline_u32(offset: usize) -> u32 {
+    unsafe { ptr::read_unaligned((TRAMPOLINE_BASE as *const u8).add(offset) as *const u32) }
+}
+
+fn read_trampoline_u64(offset: usize) -> u64 {
+    unsafe { ptr::read_unaligned((TRAMPOLINE_BASE as *const u8).add(offset) as *const u64) }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+
+pub enum InterruptIndex {
+    Timer = PIC_1_OFFSET,
+    KeyboardIndex = PIC_1_OFFSET + 0x1,
+    PrimaryDrive = PIC_1_OFFSET + 0xE,
+    SecondaryDrive = PIC_1_OFFSET + 0xF,
+    SysCall = PIC_1_OFFSET + 0x60,
+}
+pub fn get_current_logical_id() -> u8 {
+    let info = get_cpu_info();
+    info.get_feature_info()
+        .expect("cpu id not available?")
+        .initial_local_apic_id()
+}
+
+static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
+
+pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
+    let idx = lapic_id as usize;
+
+    let mut v = PERCPU_SLOTS.lock();
+
+    if v.len() <= idx {
+        v.resize_with(idx + 1, || None);
+    }
+
+    if let Some(p) = v[idx] {
+        return p;
+    }
+
+    let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
+        is_in_interrupt: AtomicBool::new(false),
+        reserved_interrupt_pad: [0; 0x7],
+        cpu_id: lapic_id as u64,
+        reserved0: [0; 0x48],
+        tls_array_pointer: 0,
+    }));
+
+    v[idx] = Some(p);
+    p
+}
+
+#[repr(C, align(64))]
+pub struct PerCpu {
+    pub is_in_interrupt: AtomicBool, // 0x00
+    reserved_interrupt_pad: [u8; 0x7],
+    pub cpu_id: u64, // 0x08
+    reserved0: [u8; 0x48],
+    pub tls_array_pointer: u64, // 0x58
+}
+
+pub const PERCPU_IS_IN_INTERRUPT_OFF: usize = 0x00;
+pub const PERCPU_CPU_ID_OFF: usize = 0x08;
+pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = 0x58;
+
+const _: () = {
+    assert!(core::mem::align_of::<PerCpu>() == 0x40);
+    assert!(core::mem::size_of::<PerCpu>() == 0x80);
+    assert!(core::mem::offset_of!(PerCpu, is_in_interrupt) == PERCPU_IS_IN_INTERRUPT_OFF);
+    assert!(core::mem::offset_of!(PerCpu, cpu_id) == PERCPU_CPU_ID_OFF);
+    assert!(core::mem::offset_of!(PerCpu, tls_array_pointer) == PERCPU_TLS_ARRAY_POINTER_OFF);
+};
+
+const IA32_GS_BASE: u32 = 0xC000_0101;
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+#[inline(always)]
+fn wrmsr(msr: u32, val: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") val as u32,
+            in("edx") (val >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline(always)]
+fn rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    ((hi as u64) << 32) | lo as u64
+}
+
+#[inline(always)]
+pub fn set_gs_bases(percpu: *const PerCpu) {
+    let p = percpu as u64;
+
+    wrmsr(IA32_GS_BASE, p);
+    wrmsr(IA32_KERNEL_GS_BASE, p);
+}
+
+#[inline(always)]
+pub fn current_percpu() -> &'static PerCpu {
+    let ptr = rdmsr(IA32_GS_BASE) as *const PerCpu;
+
+    debug_assert!(!ptr.is_null());
+
+    unsafe { &*ptr }
+}
+
+#[inline(always)]
+pub fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
+    &current_percpu().is_in_interrupt
+}
+
+extern "C" fn current_is_in_interrupt() -> bool {
+    current_is_in_interrupt_atomic().load(Ordering::Acquire)
+}
+
+extern "C" fn irq_interrupts_enabled() -> bool {
+    x86_64::instructions::interrupts::are_enabled()
+}
+
+extern "C" fn irq_interrupts_disable() {
+    x86_64::instructions::interrupts::disable();
+}
+
+extern "C" fn irq_interrupts_enable() {
+    x86_64::instructions::interrupts::enable();
+}
+
+extern "C" fn irq_interrupts_enable_and_hlt() {
+    x86_64::instructions::interrupts::enable_and_hlt();
+}
+
+#[inline(always)]
+pub fn is_in_interrupt_atomic_for(lapic_id: u32) -> &'static AtomicBool {
+    &alloc_or_get_percpu_for(lapic_id).is_in_interrupt
+}
+
+#[inline(always)]
+pub fn set_current_cpu_id(id: u32) {
+    let id = id as u64;
+
+    unsafe {
+        asm!(
+            "mov qword ptr gs:[{off}], {id:r}",
+            off = const PERCPU_CPU_ID_OFF,
+            id = in(reg) id,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline(always)]
+pub fn current_cpu_id() -> usize {
+    let id: u64;
+
+    unsafe {
+        asm!(
+            "mov {out:r}, qword ptr gs:[{off}]",
+            out = out(reg) id,
+            off = const PERCPU_CPU_ID_OFF,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    id as usize
+}
+impl InterruptIndex {
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+pub fn calibrate_tsc(tsc_start: u64, tsc_end: u64, delay_ms: u64) {
+    let tsc_freq = (tsc_end - tsc_start) * 1000 / delay_ms;
+    TSC_HZ.store(tsc_freq, Ordering::SeqCst);
+}
+pub fn wait_duration(d: Duration) {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    let nanos = d.as_nanos();
+    let hz = tsc_hz as u128;
+
+    let target_delta = nanos.saturating_mul(hz).saturating_add(999_999_999) / 1_000_000_000;
+
+    cpu::wait_cycle(target_delta);
+}
+
+pub fn wait_duration_idle(d: Duration) {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    let nanos = d.as_nanos();
+    let hz = tsc_hz as u128;
+
+    let target_delta = nanos.saturating_mul(hz).saturating_add(999_999_999) / 1_000_000_000;
+
+    cpu::wait_cycle_idle(target_delta);
+}
+pub fn wait_using_pit_50ms() {
+    let counts_for_50ms: u16 = (PIT_FREQUENCY_HZ / 20) as u16;
+
+    unsafe {
+        let mut control = Port::new(PIT_CONTROL_PORT);
+        let mut ch2 = Port::new(PIT_CHANNEL2_PORT);
+        let mut mode = Port::new(PIT_MODE_PORT);
+
+        control.write(0b1011_0000u8);
+
+        ch2.write((counts_for_50ms & 0xFF) as u8);
+        ch2.write((counts_for_50ms >> 8) as u8);
+
+        let mut val: u8 = mode.read();
+        val = (val & !0b11) | 0b01;
+        mode.write(val);
+
+        loop {
+            let status: u8 = mode.read();
+            if (status & 0b0010_0000) != 0 {
+                break;
+            }
+        }
+    }
+}
+
+fn duration_to_tsc_cycles(d: Duration) -> u128 {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    d.as_nanos()
+        .saturating_mul(tsc_hz as u128)
+        .saturating_add(999_999_999)
+        / 1_000_000_000
+}
+
+fn wait_for_ap_booted(expected: usize, timeout: Duration) -> bool {
+    if AP_BOOTED.load(Ordering::Acquire) >= expected {
+        return true;
+    }
+
+    let target_delta = duration_to_tsc_cycles(timeout);
+    let start = cpu::get_cycles() as u128;
+
+    loop {
+        if AP_BOOTED.load(Ordering::Acquire) >= expected {
+            return true;
+        }
+
+        let elapsed = (cpu::get_cycles() as u128).saturating_sub(start);
+        if elapsed >= target_delta {
+            return false;
+        }
+
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn lapic() -> *mut u32 {
+    LAPIC_BASE_VA.load(Ordering::SeqCst) as *mut u32
+}
+#[inline]
+fn rd(off: APICOffset) -> u32 {
+    unsafe { lapic().add(off as usize / 4).read_volatile() }
+}
+#[inline]
+fn wr(off: APICOffset, v: u32) {
+    unsafe { lapic().add(off as usize / 4).write_volatile(v) }
+}
+
+pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
+    assert!(window_ms > 0);
+    let saved_lvt = rd(APICOffset::LvtT);
+    let saved_ticr = rd(APICOffset::Ticr);
+
+    wr(APICOffset::LvtT, saved_lvt | (1 << 16));
+    wr(APICOffset::Ticr, u32::MAX);
+
+    wait_duration(Duration::from_millis(window_ms));
+
+    let cur = rd(APICOffset::Tccr) as u64;
+    let dec = (u32::MAX as u64).saturating_sub(cur);
+
+    let elapsed_ns = (window_ms as u128) * 1_000_000u128;
+    let q32 = if dec == 0 {
+        0
+    } else {
+        (((dec as u128) << 32) / elapsed_ns) as u64
+    };
+
+    APIC_TICKS_PER_NS.get().store(q32, Ordering::Relaxed);
+
+    wr(APICOffset::Ticr, saved_ticr);
+    wr(APICOffset::LvtT, saved_lvt);
+
+    q32
+}
+
+#[inline]
+pub fn apic_ticr_for_ns(ns: u64) -> u32 {
+    let fp = APIC_TICKS_PER_NS.get().load(Ordering::Relaxed);
+
+    if fp == 0 || ns == 0 {
+        return 0;
+    }
+    let prod = ((ns as u128) * (fp as u128) + ((1u128 << 32) - 1)) >> 32; // ceil
+    core::cmp::min(prod as u64, u32::MAX as u64) as u32
+}
+
+pub fn apic_program_period_ns(ns: u64) {
+    let lvt = rd(APICOffset::LvtT);
+    wr(APICOffset::Ticr, apic_ticr_for_ns(ns));
+    wr(APICOffset::LvtT, lvt & !(1 << 16));
+}
+pub fn apic_program_period_ms(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    let ns = ms.saturating_mul(1_000_000);
+    apic_program_period_ns(ns);
+}
+
+/// Return the list of known APIC logical IDs.
+pub fn apic_logical_ids() -> Vec<u8> {
+    let mut ids = Vec::new();
+    ids.push(get_current_logical_id());
+
+    if let Some(info) = crate::machine::machine_info().interrupt_info() {
+        for processor in info.processors.iter() {
+            let id = processor.platform_cpu_id as u8;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+
+    ids
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ApicErrors {
+    NotAvailable,
+    NoCPUID,
+    BadInterruptModel,
+    NoACPI,
+    AlreadyInit,
+}
+impl ApicErrors {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            NotAvailable => "Apic is not supported by this CPU",
+            NoCPUID => "CPU ID is not supported by this CPU",
+            BadInterruptModel => "CPU has incorrect Interrupt model",
+            NoACPI => "ACPI is not supported by this CPU",
+            AlreadyInit => "The APIC has already been init",
+        }
+    }
+}
+
+pub trait LocalApic {
+    unsafe fn init(&self, logical_id: u8);
+    fn init_timer(&self);
+    fn end_interrupt(&self);
+    unsafe fn send_ipi(&self, dest: IpiDest, kind: IpiKind);
+    unsafe fn write(&self, offset: usize, value: u32);
+}
+
+pub trait IoApic {
+    fn init_keyboard(&self);
+}
+pub struct Lapic {
+    base_addr: VirtAddr,
+}
+
+impl Lapic {
+    pub fn new(phys: PhysAddr) -> Result<Self, ()> {
+        let virt = map_physical_pages(
+            phys,
+            0x1000,
+            kernel_types::memory::PhysicalMappingCache::Uncached,
+        )
+        .map_err(|_| ())?;
+        Ok(Self { base_addr: virt })
+    }
+
+    fn ptr(&self) -> *mut u32 {
+        self.base_addr.as_mut_ptr()
+    }
+
+    unsafe fn wait_for_delivery(&self) {
+        let icr1 = self.ptr().add(APICOffset::Icr1 as usize / 4);
+        while (icr1.read_volatile() & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl LocalApic for Lapic {
+    unsafe fn init(&self, logical_id: u8) {
+        let base = self.ptr();
+
+        let svr = base.add(APICOffset::Svr as usize / 4);
+        svr.write_volatile(svr.read_volatile() | 0x100);
+
+        base.add(APICOffset::Dfr as usize / 4)
+            .write_volatile(0xFFFF_FFFF);
+        base.add(APICOffset::Ldr as usize / 4)
+            .write_volatile((logical_id as u32) << 24);
+
+        base.add(APICOffset::Tpr as usize / 4).write_volatile(0);
+    }
+
+    fn init_timer(&self) {
+        unsafe {
+            let base = self.ptr();
+            base.add(APICOffset::Svr as usize / 4)
+                .write_volatile(base.add(APICOffset::Svr as usize / 4).read_volatile() | 0x100);
+            base.add(APICOffset::LvtT as usize / 4)
+                .write_volatile(0x20 | (1 << 17));
+            base.add(APICOffset::Tdcr as usize / 4).write_volatile(0x3);
+            base.add(APICOffset::Ticr as usize / 4)
+                .write_volatile(TIMER_FREQ as u32);
+        }
+    }
+
+    fn end_interrupt(&self) {
+        unsafe {
+            self.ptr()
+                .add(APICOffset::Eoi as usize / 4)
+                .write_volatile(0);
+        }
+    }
+    unsafe fn send_ipi(&self, dest: IpiDest, kind: IpiKind) {
+        let base = self.ptr();
+        let icr1 = base.add(APICOffset::Icr1 as usize / 4);
+        let icr2 = base.add(APICOffset::Icr2 as usize / 4);
+
+        while (icr1.read_volatile() & (1 << 12)) != 0 {}
+
+        let mut hi = 0u32;
+        let shorthand = match dest {
+            IpiDest::ApicId(id) => {
+                hi = (id as u32) << 24;
+                0u32
+            }
+            IpiDest::SelfOnly => 0b01 << 18,
+            IpiDest::AllIncludingSelf => 0b10 << 18,
+            IpiDest::AllExcludingSelf => 0b11 << 18,
+        };
+
+        let mut lo = 0u32;
+        match kind {
+            IpiKind::Fixed { vector } => {
+                lo = (vector as u32);
+            }
+            IpiKind::Nmi => {
+                lo = 0b100 << 8;
+            }
+            IpiKind::InitAssert => {
+                lo = (0b101 << 8) | (1 << 14) | (1 << 15);
+            }
+            IpiKind::InitDeassert => {
+                lo = (0b101 << 8) | (1 << 15);
+            }
+            IpiKind::Startup { vector_phys_addr } => {
+                let v = ((vector_phys_addr.as_u64() >> 12) & 0xFF) as u32;
+                lo = (0b110 << 8) | v;
+            }
+        }
+
+        icr2.write_volatile(hi);
+        icr1.write_volatile(shorthand | lo);
+    }
+    unsafe fn write(&self, offset: usize, value: u32) {
+        self.ptr().add(offset / 4).write_volatile(value);
+    }
+}
+pub struct Ioapic {
+    base_addr: VirtAddr,
+}
+
+impl Ioapic {
+    pub fn new(phys: PhysAddr) -> Result<Self, ()> {
+        let virt = map_physical_pages(
+            phys,
+            0x2048,
+            kernel_types::memory::PhysicalMappingCache::Uncached,
+        )
+        .map_err(|_| ())?;
+        Ok(Self { base_addr: virt })
+    }
+
+    fn ptr(&self) -> *mut u32 {
+        self.base_addr.as_mut_ptr()
+    }
+    pub fn unmask_irq_any_cpu(&self, irq: u8, vector: u8, cpu_logical_mask: u8) {
+        let reg_low = 0x10 + (irq as u32) * 2;
+        let reg_high = reg_low + 1;
+
+        const IOAPIC_DELIVERY_LOWEST: u32 = 1 << 8;
+        const IOAPIC_DEST_LOGICAL: u32 = 1 << 11;
+        const IOAPIC_MASKED: u32 = 1 << 16;
+
+        let low = (vector as u32) | IOAPIC_DELIVERY_LOWEST | IOAPIC_DEST_LOGICAL;
+        let high = (cpu_logical_mask as u32) << 24;
+
+        unsafe {
+            let ioregsel = self.ptr();
+            let iowin = (self.base_addr.as_u64() + 0x10) as *mut u32;
+
+            ioregsel.write_volatile(reg_high);
+            iowin.write_volatile(high);
+
+            ioregsel.write_volatile(reg_low);
+            iowin.write_volatile(low & !IOAPIC_MASKED);
+        }
+    }
+}
+
+impl IoApic for Ioapic {
+    fn init_keyboard(&self) {
+        unsafe {
+            self.ptr().add(0).write_volatile(0x12);
+            self.ptr()
+                .add(4)
+                .write_volatile(InterruptIndex::KeyboardIndex as u8 as u32);
+        }
+    }
+}
+pub struct ApicImpl {
+    pub apic_info: MachineInterruptInfo,
+    pub lapic: Lapic,
+    pub ioapic: Ioapic,
+}
+
+impl ApicImpl {
+    pub fn new() -> Result<Self, ApicErrors> {
+        let info = get_cpu_info();
+        let features = info.get_feature_info().ok_or(NoCPUID)?;
+
+        if !features.has_apic() {
+            return Err(NotAvailable);
+        }
+
+        let model = crate::machine::machine_info()
+            .interrupt_info()
+            .ok_or(NoACPI)?
+            .clone();
+        let lapic = Lapic::new(PhysAddr::new(model.local_interrupt_controller_address))
+            .map_err(|_| BadInterruptModel)?;
+        let ioapic_info = model
+            .interrupt_controllers
+            .first()
+            .ok_or(BadInterruptModel)?;
+        let ioapic =
+            Ioapic::new(PhysAddr::new(ioapic_info.address)).map_err(|_| BadInterruptModel)?;
+
+        Ok(Self {
+            apic_info: model,
+            lapic,
+            ioapic,
+        })
+    }
+    pub fn init_apic_full() -> Result<(), ApicErrors> {
+        use core::sync::atomic::Ordering;
+        use x86_64::instructions::interrupts;
+
+        interrupts::disable();
+
+        if APIC.lock().is_some() {
+            interrupts::enable();
+            return Err(ApicErrors::AlreadyInit);
+        }
+
+        let first_time = !USE_APIC.load(Ordering::SeqCst);
+
+        let apic = ApicImpl::new()?;
+
+        unsafe {
+            if apic.apic_info.has_compatibility_interrupt_controllers {
+                PICS.lock().disable();
+            }
+
+            let logical_id = get_current_logical_id();
+            apic.lapic.init(logical_id);
+            apic.lapic.init_timer();
+
+            if first_time {
+                apic.ioapic.init_keyboard();
+            }
+            LAPIC_BASE_VA.store(apic.lapic.base_addr.as_u64(), Ordering::Release);
+            APIC.lock().replace(apic);
+            USE_APIC.store(true, Ordering::SeqCst);
+        }
+
+        interrupts::enable();
+        Ok(())
+    }
+
+    pub fn end_interrupt(&self) {
+        self.lapic.end_interrupt();
+    }
+
+    pub fn start_aps(&self) {
+        let apics = &self.apic_info.processors;
+
+        let ap_count = apics.len();
+        set_num_cores(ap_count + 1);
+
+        if ap_count == 0 {
+            return;
+        }
+
+        // Reset boot tracker in case this is invoked again.
+        AP_BOOTED.store(0, Ordering::SeqCst);
+
+        let code = trampoline_blob();
+        verify_trampoline_static_layout(code);
+        assert!(code.len() <= TRAMPOLINE_STEP as usize);
+
+        const GDT_PHYS: u64 = 0x6000;
+        static GDT: [u64; 3] = [0, 0x00AF_9A00_0000_FFFF, 0x00AF_9200_0000_FFFF];
+
+        let map_start = GDT_PHYS;
+        // Single trampoline at 0x8000 reused per AP.
+        let map_end = TRAMPOLINE_BASE + TRAMPOLINE_STEP;
+        let mut map_len = (map_end - map_start) as usize;
+        map_len = (map_len + 0x0FFF) & !0x0FFF;
+
+        unsafe {
+            identity_map_page(
+                PhysAddr::new(map_start),
+                map_len as usize,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+            )
+            .expect("map low RAM");
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                GDT.as_ptr() as *const u8,
+                GDT_PHYS as *mut u8,
+                mem::size_of_val(&GDT),
+            );
+        }
+
+        let gdtr = DescriptorTablePointer {
+            base: VirtAddr::new(GDT_PHYS),
+            limit: (mem::size_of::<[u64; 3]>() - 1) as u16,
+        };
+        let longmode_gdt = sgdt();
+        assert!(
+            virt_to_phys(longmode_gdt.base).is_some(),
+            "AP long-mode GDTR base is not mapped in the AP page table"
+        );
+        verify_kernel_image_mapped();
+
+        // Install trampoline code once at the fixed address.
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), TRAMPOLINE_BASE as *mut u8, code.len());
+        }
+        verify_trampoline_installed(code);
+
+        for apic in apics.iter() {
+            let tramp_u64 = TRAMPOLINE_BASE;
+            let tramp_phys = PhysAddr::new(tramp_u64);
+
+            unsafe {
+                let info = tramp_u64 as *mut u8;
+
+                let (frame, _flags): (PhysFrame, u16) = Cr3::read_raw();
+                let pagemap = frame.start_address().as_u64();
+                assert!(
+                    pagemap < FOUR_GIB,
+                    "AP trampoline CR3 address {:#x} does not fit in mov cr3, eax",
+                    pagemap
+                );
+
+                let temp_sp = (tramp_u64 + TRAMPOLINE_STEP - 0x10) as u32;
+                assert!(
+                    temp_sp <= u16::MAX as u32,
+                    "AP real-mode temporary stack does not fit in 16-bit SP"
+                );
+
+                let stack_top = allocate_kernel_stack(StackSize::Medium)
+                    .expect("AP stack")
+                    .as_u64();
+                assert!(stack_top != 0, "AP stack top is null");
+                assert!(
+                    virt_to_phys(VirtAddr::new(stack_top - 1)).is_some(),
+                    "AP stack is not mapped in the AP page table"
+                );
+
+                let start_address = ap_startup as *const () as u64;
+                assert!(
+                    virt_to_phys(VirtAddr::new(start_address)).is_some(),
+                    "AP entry address is not mapped in the AP page table"
+                );
+
+                let patch = TrampolinePatch {
+                    pagemap,
+                    gdtr_limit: gdtr.limit,
+                    gdtr_base: gdtr.base.as_u64(),
+                    temp_stack: temp_sp,
+                    start_stack: stack_top,
+                    start_address,
+                    longmode_gdtr_limit: longmode_gdt.limit,
+                    longmode_gdtr_base: longmode_gdt.base.as_u64(),
+                };
+
+                ptr::write_unaligned(info.add(PAGEMAP_OFF) as *mut u64, patch.pagemap);
+                ptr::write_unaligned(info.add(GDTR_LIMIT_OFF) as *mut u16, patch.gdtr_limit);
+                ptr::write_unaligned(info.add(GDTR_BASE_OFF) as *mut u64, patch.gdtr_base);
+                ptr::write_unaligned(info.add(TEMP_STACK_OFF) as *mut u32, patch.temp_stack);
+                ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, patch.start_stack);
+                ptr::write_unaligned(info.add(START_ADDR_OFF) as *mut u64, patch.start_address);
+                ptr::write_unaligned(
+                    info.add(LONGMODE_GDTR_LIMIT_OFF) as *mut u16,
+                    patch.longmode_gdtr_limit,
+                );
+                ptr::write_unaligned(
+                    info.add(LONGMODE_GDTR_BASE_OFF) as *mut u64,
+                    patch.longmode_gdtr_base,
+                );
+
+                verify_patched_trampoline(code, patch);
+            }
+
+            unsafe {
+                let dst = IpiDest::ApicId(apic.platform_cpu_id as u8);
+                let expected = AP_BOOTED.load(Ordering::SeqCst) + 1;
+
+                self.lapic.send_ipi(dst, IpiKind::InitAssert);
+                self.lapic.wait_for_delivery();
+
+                self.lapic.send_ipi(dst, IpiKind::InitDeassert);
+                self.lapic.wait_for_delivery();
+
+                self.lapic.send_ipi(
+                    dst,
+                    IpiKind::Startup {
+                        vector_phys_addr: tramp_phys,
+                    },
+                );
+                self.lapic.wait_for_delivery();
+
+                if !wait_for_ap_booted(expected, Duration::from_millis(1)) {
+                    self.lapic.send_ipi(
+                        dst,
+                        IpiKind::Startup {
+                            vector_phys_addr: tramp_phys,
+                        },
+                    );
+                    self.lapic.wait_for_delivery();
+                }
+
+                assert!(
+                    wait_for_ap_booted(expected, Duration::from_millis(100)),
+                    "AP with platform CPU id {} did not reach ap_startup",
+                    apic.platform_cpu_id
+                );
+            }
+        }
+
+        unmap_range(VirtAddr::new(map_start), map_len as u64);
+    }
+}
+
+#[inline(always)]
+pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
+    let p: &'static PerCpu = alloc_or_get_percpu_for(lapic_id);
+    let ptr = p as *const PerCpu;
+    unsafe {
+        (*(ptr as *mut PerCpu)).cpu_id = lapic_id as u64;
+        (*(ptr as *mut PerCpu)).tls_array_pointer = 0;
+    }
+    set_gs_bases(ptr);
+    kernel_types::irq::set_irq_context_query(current_is_in_interrupt);
+    kernel_types::irq::set_irq_interrupt_control(
+        irq_interrupts_enabled,
+        irq_interrupts_disable,
+        irq_interrupts_enable,
+        irq_interrupts_enable_and_hlt,
+    );
+    p
+}
+
+extern "C" fn ap_startup() -> ! {
+    cpu::enable_sse();
+    CORE_LOCK.fetch_add(1, Ordering::SeqCst);
+    // Signal that this AP is past the trampoline and safe to reuse it.
+    // CORE_LOCK is already raised so the BSP cannot miss this AP before it
+    // finishes serialized core initialization.
+    AP_BOOTED.fetch_add(1, Ordering::SeqCst);
+    {
+        let _g = INIT_LOCK.lock();
+
+        unsafe { PER_CPU_GDT.lock().init_gdt() };
+        load_idt();
+
+        let lapic_id = get_current_logical_id() as u32;
+        init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+
+        unsafe {
+            let mut guard = APIC.lock();
+            if let Some(apic) = guard.as_mut() {
+                apic.lapic.init(lapic_id as u8);
+                apic.lapic.init_timer();
+            }
+        }
+
+        syscall_init();
+        apic_calibrate_ticks_per_ns_via_wait(10);
+        apic_program_period_ns(APIC_START_PERIOD);
+        SCHEDULER.init_core(current_cpu_id());
+        CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    while !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
+        core::hint::spin_loop()
+    }
+    x86_64::instructions::interrupts::enable();
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy)]
+#[repr(isize)]
+#[allow(dead_code)]
+pub enum APICOffset {
+    R0x00 = 0x0,      // RESERVED = 0x00
+    R0x10 = 0x10,     // RESERVED = 0x10
+    Ir = 0x20,        // ID Register
+    Vr = 0x30,        // Version Register
+    R0x40 = 0x40,     // RESERVED = 0x40
+    R0x50 = 0x50,     // RESERVED = 0x50
+    R0x60 = 0x60,     // RESERVED = 0x60
+    R0x70 = 0x70,     // RESERVED = 0x70
+    Tpr = 0x80,       // Text Priority Register
+    Apr = 0x90,       // Arbitration Priority Register
+    Ppr = 0xA0,       // Processor Priority Register
+    Eoi = 0xB0,       // End of Interrupt
+    Rrd = 0xC0,       // Remote Read Register
+    Ldr = 0xD0,       // Logical Destination Register
+    Dfr = 0xE0,       // DFR
+    Svr = 0xF0,       // Spurious (Interrupt) Vector Register
+    Isr1 = 0x100,     // In-Service Register 1
+    Isr2 = 0x110,     // In-Service Register 2
+    Isr3 = 0x120,     // In-Service Register 3
+    Isr4 = 0x130,     // In-Service Register 4
+    Isr5 = 0x140,     // In-Service Register 5
+    Isr6 = 0x150,     // In-Service Register 6
+    Isr7 = 0x160,     // In-Service Register 7
+    Isr8 = 0x170,     // In-Service Register 8
+    Tmr1 = 0x180,     // Trigger Mode Register 1
+    Tmr2 = 0x190,     // Trigger Mode Register 2
+    Tmr3 = 0x1A0,     // Trigger Mode Register 3
+    Tmr4 = 0x1B0,     // Trigger Mode Register 4
+    Tmr5 = 0x1C0,     // Trigger Mode Register 5
+    Tmr6 = 0x1D0,     // Trigger Mode Register 6
+    Tmr7 = 0x1E0,     // Trigger Mode Register 7
+    Tmr8 = 0x1F0,     // Trigger Mode Register 8
+    Irr1 = 0x200,     // Interrupt Request Register 1
+    Irr2 = 0x210,     // Interrupt Request Register 2
+    Irr3 = 0x220,     // Interrupt Request Register 3
+    Irr4 = 0x230,     // Interrupt Request Register 4
+    Irr5 = 0x240,     // Interrupt Request Register 5
+    Irr6 = 0x250,     // Interrupt Request Register 6
+    Irr7 = 0x260,     // Interrupt Request Register 7
+    Irr8 = 0x270,     // Interrupt Request Register 8
+    Esr = 0x280,      // Error Status Register
+    R0x290 = 0x290,   // RESERVED = 0x290
+    R0x2A0 = 0x2A0,   // RESERVED = 0x2A0
+    R0x2B0 = 0x2B0,   // RESERVED = 0x2B0
+    R0x2C0 = 0x2C0,   // RESERVED = 0x2C0
+    R0x2D0 = 0x2D0,   // RESERVED = 0x2D0
+    R0x2E0 = 0x2E0,   // RESERVED = 0x2E0
+    LvtCmci = 0x2F0,  // LVT Corrected Machine Check Interrupt (CMCI) Register
+    Icr1 = 0x300,     // Interrupt Command Register 1
+    Icr2 = 0x310,     // Interrupt Command Register 2
+    LvtT = 0x320,     // LVT Timer Register
+    LvtTsr = 0x330,   // LVT Thermal Sensor Register
+    LvtPmcr = 0x340,  // LVT Performance Monitoring Counters Register
+    LvtLint0 = 0x350, // LVT LINT0 Register
+    LvtLint1 = 0x360, // LVT LINT1 Register
+    LvtE = 0x370,     // LVT Error Register
+    Ticr = 0x380,     // Initial Count Register (for Timer)
+    Tccr = 0x390,     // Current Count Register (for Timer)
+    R0x3A0 = 0x3A0,   // RESERVED = 0x3A0
+    R0x3B0 = 0x3B0,   // RESERVED = 0x3B0
+    R0x3C0 = 0x3C0,   // RESERVED = 0x3C0
+    R0x3D0 = 0x3D0,   // RESERVED = 0x3D0
+    Tdcr = 0x3E0,     // Divide Configuration Register (for Timer)
+    R0x3F0 = 0x3F0,   // RESERVED = 0x3F0
+}
+#[derive(Clone, Copy)]
+pub enum IpiDest {
+    ApicId(u8),
+    SelfOnly,
+    AllIncludingSelf,
+    AllExcludingSelf,
+}
+
+#[derive(Clone, Copy)]
+pub enum IpiKind {
+    Fixed { vector: u8 },
+    Nmi,
+    InitAssert,
+    InitDeassert,
+    Startup { vector_phys_addr: PhysAddr },
+}
+
+#[inline(always)]
+pub fn send_eoi(vector: u8) {
+    if USE_APIC.load(Ordering::Relaxed) {
+        let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
+        if base != 0 {
+            unsafe {
+                ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
+            }
+            return;
+        }
+    }
+    unsafe {
+        if vector >= PIC_1_OFFSET + 8 {
+            Port::new(0xA0u16).write(0x20u8);
+        }
+        Port::new(0x20u16).write(0x20u8);
+    }
+}
+/// A faster send eoi for the timer interrupt
+#[inline(always)]
+pub extern "C" fn send_eoi_timer() {
+    let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
+        }
+    }
+}

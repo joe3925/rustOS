@@ -3,20 +3,13 @@ use crate::export;
 use crate::function;
 use crate::get_rva;
 use crate::idt::*;
-use crate::memory::paging::mmio::map_mmio_region;
-use crate::memory::paging::paging::identity_map_page;
-use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
-use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous;
-use crate::memory::paging::virt_tracker::allocate_kernel_range_mapped;
-use crate::memory::paging::virt_tracker::deallocate_kernel_range;
-use crate::memory::paging::virt_tracker::unmap_range;
-use crate::scheduling::runtime::runtime::try_steal_blocking_one;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;
 use crate::vec;
 use alloc::string::String;
 use alloc::vec::Vec;
+use kernel_executor::runtime::runtime::try_steal_blocking_one;
 
 export! {
     function,
@@ -24,6 +17,8 @@ export! {
     wait_duration,
     elapsed,
     stopwatch_new,
+    kernel_cycle_counter,
+    kernel_cycle_counter_frequency_hz,
     create_kernel_task,
     kill_kernel_task_by_id,
     park_self_and_yield,
@@ -35,6 +30,7 @@ export! {
     try_steal_blocking_one,
     get_rsdp,
     get_acpi_tables,
+    get_device_tree_blob,
     task_yield,
     allocate_auto_kernel_range_mapped,
     allocate_auto_kernel_range_mapped_contiguous,
@@ -42,14 +38,20 @@ export! {
     deallocate_kernel_range,
     unmap_range,
     identity_map_page,
-    map_mmio_region,
-    unmap_mmio_region,
+    map_physical_pages,
+    unmap_physical_pages,
+    virt_to_phys,
+    resolve_virtual_range_frame,
+    kernel_paging_info,
     get_current_cpu_id,
-    get_current_lapic_id,
+    get_current_platform_cpu_id,
 
     kernel_alloc,
     kernel_free,
+
+    kernel_dma_base_page_size,
     kernel_dma_register_pci_pdo,
+    kernel_dma_register_platform_pdo,
     kernel_dma_open_device_handle,
     kernel_dma_query_device_state,
     kernel_dma_map_buffer,
@@ -125,7 +127,10 @@ export! {
     bench_kernel_window_destroy,
     bench_kernel_window_create,
 
-    kernel_apic_cpu_ids,
+    kernel_platform_cpu_ids,
+    kernel_irq_compose_msi_message,
+    kernel_pci_read_config_u32,
+    kernel_pci_write_config_u32,
 
     routing_resolve_path_to_device,
     routing_get_stack_top_from_weak,

@@ -1,30 +1,44 @@
 {
-    "lsp": {
-        "rust-analyzer": {
-            "initialization_options": {
-                "cargo": {
-                    "metadataExtraArgs": ["-Zjson-target-spec"],
-                    "extraArgs": ["-Zjson-target-spec"],
-                },
-                "diagnostics": {
-                    "disabled": ["mismatched-types"],
-                },
-                "procMacro": {
-                    "enable": true,
-                },
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "linkedProjects": [
+          "drivers/Cargo.toml",
+          "kernel/Cargo.toml",
+          "libs/kernel_types/Cargo.toml",
+          "third_party/rust-fatfs/Cargo.toml",
+          "libs/kernel_macros/Cargo.toml",
+          "Cargo.toml",
+        ],
 
-                "check": {
-                    "allTargets": false,
-                    "extraArgs": ["-Zjson-target-spec"],
-                },
-                "checkOnSave": true,
-                "linkedProjects": [
-                    "drivers/Cargo.toml",
-                    "kernel/Cargo.toml",
-                    "rust-fatfs/Cargo.toml",
-                    "Cargo.toml",
-                ],
-            },
+        "cargo": {
+          "target": "x86_64-pc-windows-msvc",
+          "allTargets": false,
+          "metadataExtraArgs": ["-Zjson-target-spec"],
+          "extraArgs": ["-Zjson-target-spec"],
+          "buildScripts": {
+            "enable": true,
+          },
         },
+
+        "procMacro": {
+          "enable": true,
+        },
+
+        "checkOnSave": true,
+
+        "check": {
+          "allTargets": false,
+          "targets": ["x86_64-pc-windows-msvc"],
+          "extraArgs": ["-Zjson-target-spec"],
+        },
+
+        "diagnostics": {
+          "experimental": {
+            "enable": false,
+          },
+        },
+      },
     },
+  },
 }

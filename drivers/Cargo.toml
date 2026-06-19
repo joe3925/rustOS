@@ -3,6 +3,7 @@ cargo-features = ["profile-rustflags"]
 members = [
     "acpi",
     "base_driver",
+    "devicetree",
     "disk",
     "fat32",
     "i8042",
@@ -10,16 +11,21 @@ members = [
     "mountmgr",
     "partmgr",
     "pci",
+    "root",
     "virtio",
     "volmgr",
 ]
 resolver = "2"
 [workspace.dependencies]
-kernel_api = { path = "../kernel_api", default-features = false, features = [
+kernel_api = { path = "../libs/kernel_api", default-features = false, features = [
     "async-ffi-slab",
     "async-ffi-slab-slots-256",
     "async-ffi-slab-slot-bytes-8k",
 ] }
+
+[patch.crates-io]
+device_tree = { path = "../third_party/device_tree" }
+
 [profile.dev]
 opt-level = 3
 panic = "abort"

@@ -1,9 +1,9 @@
-use crate::drivers::interrupt_index::current_cpu_id;
 use crate::executable::program::{
-    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
+    Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
-use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
+use crate::memory::paging::{base_page_size, kernel_space_base};
+use crate::platform;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
@@ -11,7 +11,7 @@ use crate::structs::io_request::{
     FileObject, IoOpcode, KernelIoOp, RequestId, UserIoCompletion, UserIoOp,
 };
 use crate::{format, print};
-use crate::{scheduling::scheduler::TaskHandle, util::generate_guid};
+use crate::{scheduling::task::TaskHandle, util::generate_guid};
 use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
 
-use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload, TaskQueueRef};
+use crate::object_manager::{Object, ObjectPayload, TaskQueueRef, OBJECT_MANAGER};
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let path = alloc::format!("\\Process\\{}", pid);
@@ -120,7 +120,7 @@ fn resolve_with_working_dir(caller: &ProgramHandle, raw: &str) -> Path {
 }
 #[inline(always)]
 fn is_user_addr(addr: u64) -> bool {
-    (0x1000..KERNEL_SPACE_BASE).contains(&addr)
+    (base_page_size()..kernel_space_base().as_u64()).contains(&addr)
 }
 #[inline(always)]
 pub fn user_ptr_ok<T>(ptr: *const T, bytes: usize) -> bool {
@@ -226,7 +226,7 @@ pub fn make_err(class: ErrClass, code: u16, arg: u32) -> u64 {
 
 fn current_process() -> Result<(u64, ProgramHandle), u64> {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -525,7 +525,7 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
 
 pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -562,7 +562,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
 pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     let stack_size = StackSize::Medium.as_bytes();
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -580,7 +580,9 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     let managed = { caller.read().managed_threads.lock().len() };
     let stack = if let Some(range) = caller.write().tracker.alloc_auto(stack_size) {
         unsafe {
-            let _ = caller.write().virtual_map(range, stack_size as usize);
+            let _ = caller
+                .write()
+                .virtual_map(range.into(), stack_size as usize);
         };
         range + stack_size
     } else {
@@ -596,7 +598,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         0,
         stack_size,
         format!("{} Worker {}", caller.read().title, managed),
-        stack,
+        stack.into(),
         caller_pid,
     );
     SCHEDULER.add_task(task.clone());
@@ -817,7 +819,9 @@ pub(crate) fn sys_io_cancel(completion_queue_handle: UserHandle, request_id: Req
 }
 
 pub(crate) fn sys_get_thread() -> UserHandle {
-    let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
+    let task = SCHEDULER
+        .get_current_task(platform::current_cpu_id())
+        .unwrap();
     let caller_pid = task.inner.read().parent_pid;
     let obj = ensure_thread_object(caller_pid, &task);
     obj.id
@@ -830,7 +834,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
     let msg = unsafe { &mut *message_ptr };
 
     let sender_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -873,7 +877,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
     let rule_u = unsafe { &*rule_ptr };
 
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -988,7 +992,7 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     let rule_u = unsafe { &*rule_ptr };
 
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1021,7 +1025,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
     }
 
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1062,7 +1066,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
 
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1077,7 +1081,7 @@ pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
 
 pub(crate) fn sys_create_mq() -> UserHandle {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1101,7 +1105,7 @@ pub(crate) fn sys_create_mq() -> UserHandle {
 
 pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
     let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
+        .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
         .read()
@@ -1146,7 +1150,7 @@ pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
         let Some(dst) = pg.tracker.alloc_auto(total as u64) else {
             return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, total as u32);
         };
-        if unsafe { pg.virtual_map(dst, total) }.is_err() {
+        if unsafe { pg.virtual_map(dst.into(), total) }.is_err() {
             return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
         }
         dst

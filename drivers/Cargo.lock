@@ -157,6 +157,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "device_tree"
+version = "1.1.0"
+
+[[package]]
+name = "devicetree"
+version = "0.1.0"
+dependencies = [
+ "device_tree",
+ "kernel_api",
+ "spin",
+]
+
+[[package]]
 name = "disk"
 version = "0.1.0"
 dependencies = [
@@ -361,7 +374,6 @@ dependencies = [
  "acpi 5.2.0",
  "kernel_types",
  "spin",
- "x86_64",
 ]
 
 [[package]]
@@ -482,6 +494,13 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
+name = "root"
+version = "0.1.0"
+dependencies = [
+ "kernel_api",
+]
 
 [[package]]
 name = "rustversion"

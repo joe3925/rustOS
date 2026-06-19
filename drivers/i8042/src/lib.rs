@@ -1,3 +1,4 @@
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 #![no_main]
 #![feature(const_option_ops)]

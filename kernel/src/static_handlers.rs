@@ -1,23 +1,26 @@
 use core::{
     alloc::{GlobalAlloc, Layout},
-    arch::asm,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
+use kernel_executor::global_async::GlobalAsyncExecutor;
+use kernel_executor::runtime::runtime::{
+    block_on as kernel_block_on, spawn as kernel_spawn, spawn_blocking as kernel_spawn_blocking,
+    spawn_detached as kernel_spawn_detached,
+};
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::object_manager::OmError;
-use x86_64::instructions::interrupts;
 
 use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
     benchmarking::{
-        BenchSpanGuard, BenchWindow, bench_log_span_end, bench_span_guard, bench_submit_rip_sample,
+        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
     },
     console::CONSOLE,
     drivers::{
-        ACPI::{ACPI_TABLES, ACPIImpl},
-        interrupt_index::{self, current_cpu_id, get_current_logical_id},
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
+        ACPI::ACPIImpl,
     },
     file_system::{
         file::{self, File},
@@ -28,21 +31,9 @@ use crate::{
         irq_borrowed_signal_n, irq_free_vector, irq_register, irq_register_gsi, irq_signal,
         irq_signal_all, irq_signal_exactly, irq_signal_n,
     },
-    memory::{
-        dma,
-        paging::{mmio, stack::StackSize},
-    },
+    memory::{dma, paging::stack::StackSize},
     registry::reg,
-    scheduling::{
-        self,
-        global_async::GlobalAsyncExecutor,
-        runtime::runtime::{
-            block_on as kernel_block_on, spawn as kernel_spawn,
-            spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
-        },
-        scheduler::SCHEDULER,
-        task::Task,
-    },
+    scheduling::{self, scheduler::SCHEDULER, task::Task},
     structs::stopwatch::Stopwatch,
     util::boot_info,
 };
@@ -53,8 +44,8 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use kernel_types::arch::{PageFlags, PagingInfo, PhysAddr, VirtAddr};
 use kernel_types::{
-    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
     async_ffi::{FfiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
@@ -64,20 +55,22 @@ use kernel_types::{
         DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
         DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
     },
+    fdt::FdtHeader,
     fs::{OpenFlags, Path},
     io::IoTarget,
-    irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta},
+    irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, MsiMessage, MsiRequest},
+    pci::PciConfigAddress,
     pnp::{DeviceIds, DeviceRelationType},
     request::{DeviceControl, RequestHandle, RequestKind},
     runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
+    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
-use x86_64::VirtAddr;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64 {
-    let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge2M, name, 0);
+    let task = Task::new_kernel_mode(entry, ctx, StackSize::Tiny, name, 0);
     SCHEDULER.add_task(task)
 }
 
@@ -85,8 +78,8 @@ pub unsafe extern "C" fn park_self_and_yield() {
     // TODO:
     todo!()
 }
-pub extern "C" fn get_current_lapic_id() -> usize {
-    get_current_logical_id() as usize
+pub extern "C" fn get_current_platform_cpu_id() -> usize {
+    crate::platform::current_logical_id()
 }
 
 pub extern "C" fn wake_task(id: u64) {
@@ -130,6 +123,37 @@ pub extern "C" fn kernel_irq_alloc_vector() -> i32 {
 pub extern "C" fn kernel_irq_free_vector(vector: u8) -> bool {
     irq_free_vector(vector)
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_irq_compose_msi_message(
+    request: &MsiRequest,
+    out: &mut MsiMessage,
+) -> bool {
+    match crate::platform::compose_msi_message(request) {
+        Some(message) => {
+            *out = message;
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_pci_read_config_u32(address: PciConfigAddress, out: &mut u32) -> bool {
+    match crate::platform::read_pci_config_u32(address) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_pci_write_config_u32(address: PciConfigAddress, value: u32) -> bool {
+    crate::platform::write_pci_config_u32(address, value)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
     unsafe {
@@ -165,13 +189,26 @@ pub unsafe extern "C" fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandl
     }
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn kernel_dma_base_page_size() -> u64 {
+    dma::get_info()
+        .capabilities
+        .base_page_size()
+        .expect("expected a valid base page size")
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_register_pci_pdo(
     pdo: &Arc<DeviceObject>,
     identity: DmaPciDeviceIdentity,
 ) -> DriverStatus {
     dma::register_pci_pdo(pdo, identity)
 }
-
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_dma_register_platform_pdo(
+    pdo: &Arc<DeviceObject>,
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> DriverStatus {
+    dma::register_platform_pdo(pdo, identity)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_open_device_handle(
     device: &Arc<DeviceObject>,
@@ -215,8 +252,8 @@ pub extern "C" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_apic_cpu_ids() -> Vec<u8> {
-    interrupt_index::apic_logical_ids()
+pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
+    crate::platform::cpu_topology_ids()
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
@@ -228,7 +265,7 @@ pub fn routing_print_impl(s: &str) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn wait_duration(time: Duration) {
-    interrupt_index::wait_duration(time);
+    crate::platform::wait_duration(time);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn stopwatch_new() -> Stopwatch {
@@ -237,6 +274,14 @@ pub extern "C" fn stopwatch_new() -> Stopwatch {
 #[unsafe(no_mangle)]
 pub extern "C" fn elapsed(s: &Stopwatch) -> Duration {
     s.elapsed()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_cycle_counter() -> u64 {
+    crate::platform::cycle_counter()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_cycle_counter_frequency_hz() -> u64 {
+    crate::platform::cycle_counter_frequency_hz()
 }
 #[no_mangle]
 pub extern "C" fn file_open(
@@ -330,7 +375,14 @@ pub extern "C" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<Strin
 }
 
 pub extern "C" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
-    ACPI_TABLES.get_tables()
+    crate::machine::machine_info()
+        .firmware()
+        .acpi_tables()
+        .expect("ACPI tables were not supplied by bootloader")
+}
+
+pub extern "C" fn get_device_tree_blob() -> Option<*const FdtHeader> {
+    crate::machine::machine_info().firmware().fdt_header()
 }
 
 pub extern "C" fn pnp_create_pdo(
@@ -457,7 +509,7 @@ pub extern "C" fn driver_set_evt_driver_unload(
 }
 
 pub extern "C" fn get_rsdp() -> u64 {
-    boot_info().rsdp_addr.into_option().unwrap()
+    boot_info().rsdp_addr.into_option().unwrap_or(0)
 }
 
 pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(
@@ -595,8 +647,8 @@ static BLOCKING_INIT: Once = Once::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn task_yield() {
-    interrupts::without_interrupts(|| {
-        unsafe { asm!("int 0x80") };
+    crate::platform::with_interrupts_disabled(|| {
+        crate::platform::request_task_yield();
     });
 }
 
@@ -647,7 +699,7 @@ pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: 
 
 #[no_mangle]
 pub extern "C" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
-    scheduling::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
+    kernel_executor::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
 }
 
 #[no_mangle]
@@ -782,11 +834,83 @@ pub extern "C" fn bench_kernel_span_end(
 
 #[no_mangle]
 pub extern "C" fn get_current_cpu_id() -> usize {
-    current_cpu_id()
+    crate::platform::current_cpu_id()
 }
 #[no_mangle]
-pub extern "C" fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
-    mmio::unmap_mmio_region(base, size)
+pub extern "C" fn allocate_auto_kernel_range_mapped(
+    size: u64,
+    flags: PageFlags,
+) -> Result<VirtAddr, PageMapError> {
+    crate::memory::paging::allocate_auto_kernel_range_mapped(size, flags)
+}
+
+#[no_mangle]
+pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
+    size: u64,
+    flags: PageFlags,
+) -> Result<VirtAddr, PageMapError> {
+    crate::memory::paging::allocate_auto_kernel_range_mapped_contiguous(size, flags)
+}
+
+#[no_mangle]
+pub extern "C" fn allocate_kernel_range_mapped(
+    base: u64,
+    size: u64,
+    flags: PageFlags,
+) -> Result<VirtAddr, PageMapError> {
+    crate::memory::paging::allocate_kernel_range_mapped(base, size, flags)
+}
+
+#[no_mangle]
+pub extern "C" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
+    crate::memory::paging::deallocate_kernel_range(addr, size)
+}
+
+#[no_mangle]
+pub extern "C" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
+    crate::memory::paging::unmap_range(virtual_addr, size)
+}
+
+#[no_mangle]
+pub extern "C" fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags) {
+    let _ = crate::memory::paging::identity_map_page(
+        frame_addr,
+        crate::memory::paging::base_page_size() as usize,
+        flags,
+    );
+}
+
+#[no_mangle]
+pub extern "C" fn map_physical_pages(
+    phys: PhysAddr,
+    size: u64,
+    cache: kernel_types::memory::PhysicalMappingCache,
+) -> Result<VirtAddr, PageMapError> {
+    crate::memory::paging::map_physical_pages(phys, size, cache)
+}
+
+#[no_mangle]
+pub extern "C" fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+    crate::memory::paging::unmap_physical_pages(base, size)
+}
+
+#[no_mangle]
+pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    crate::memory::paging::virt_to_phys(addr)
+}
+
+#[no_mangle]
+pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    crate::memory::paging::resolve_virtual_range_frame(addr)
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_paging_info() -> Option<PagingInfo> {
+    crate::util::boot_info()
+        .arch_info
+        .recursive_index
+        .into_option()
+        .map(|recursive_index| PagingInfo { recursive_index })
 }
 
 // ============================================================================

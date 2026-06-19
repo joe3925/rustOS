@@ -1,5 +1,6 @@
-// TODO: legacy driver so not the biggest prio but there is a memory corruption race condition somewhere that needs to be fixed.
+// TODO: there is a memory corruption race condition somewhere that needs to be fixed.
 // the race can be triggered by sending a request then awaiting it and so on for a while. It will occur at some point shows as a GPF.
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 #![no_main]
 #![feature(const_option_ops)]
@@ -23,12 +24,13 @@ use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
-use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, IoBufferPageFrame, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
-use kernel_api::kernel_types::irq::IrqMeta;
+use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::port::Port;
 use kernel_api::kernel_types::request::RequestData;
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -38,7 +40,6 @@ use kernel_api::request::{DeviceControl, Pnp, Read, RequestHandle, RequestKind, 
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
-use kernel_api::x86_64::instructions::port::Port;
 
 use dev_ext::{ControllerState, DevExt, Ports};
 
@@ -73,10 +74,6 @@ fn complete_req<K: RequestKind>(
 
 fn continue_req<K: RequestKind>(_req: &mut RequestHandle<'_, K>) -> DriverStep {
     DriverStep::Continue
-}
-
-fn phys_byte_ptr(phys_addr: u64) -> *mut u8 {
-    (PHYSICAL_MEMORY_OFFSET.as_u64() + phys_addr) as *mut u8
 }
 
 struct PhysCursor<'a> {
@@ -129,6 +126,11 @@ impl<'a> PhysCursor<'a> {
         Some(frame.phys_addr + self.frame_offset as u64)
     }
 
+    fn byte_ptr(&self) -> Option<*mut u8> {
+        let frame = self.frames.get(self.frame_idx)?;
+        Some((frame.cpu_address().as_u64() + self.frame_offset as u64) as *mut u8)
+    }
+
     fn advance(&mut self) -> bool {
         if self.remaining == 0 {
             return false;
@@ -149,7 +151,7 @@ impl<'a> PhysCursor<'a> {
         if self.remaining == 0 {
             return None;
         }
-        let ptr = phys_byte_ptr(self.phys_addr()?) as *const u8;
+        let ptr = self.byte_ptr()? as *const u8;
         let value = unsafe { core::ptr::read(ptr) };
         self.advance().then_some(value)
     }
@@ -158,10 +160,10 @@ impl<'a> PhysCursor<'a> {
         if self.remaining == 0 {
             return false;
         }
-        let Some(phys_addr) = self.phys_addr() else {
+        let Some(ptr) = self.byte_ptr() else {
             return false;
         };
-        unsafe { core::ptr::write(phys_byte_ptr(phys_addr), value) };
+        unsafe { core::ptr::write(ptr, value) };
         self.advance()
     }
 
@@ -195,7 +197,7 @@ fn write_buffer_cursor<'a>(
 extern "C" fn ide_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {

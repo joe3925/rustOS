@@ -1,0 +1,23 @@
+[package]
+name = "kernel_stub"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "kernel_stub"
+path = "src/main.rs"
+
+[dependencies]
+goblin = { version = "0.10.0", features = [
+    "pe64",
+    "pe32",
+], default-features = false }
+kernel_abi = { path = "../../libs/kernel_abi" }
+kernel_types = { path = "../../libs/kernel_types", default-features = false }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+bootloader_api = "0.11.10"
+x86_64 = { version = "=0.15.2", default-features = false, features = [
+    "instructions",
+] }

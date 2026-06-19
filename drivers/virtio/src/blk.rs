@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::dma::{IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBufferDmaSegment};
-use kernel_api::x86_64::VirtAddr;
+use kernel_api::memory::VirtAddr;
 
 use crate::dma_region::ContiguousDmaRegion;
 use crate::pci;
@@ -220,6 +220,12 @@ pub const MAX_DATA_DESCRIPTORS: usize = IOBUFFER_INLINE_SEGMENT_CAPACITY;
 /// 1 for header + data descriptors + 1 for status.
 pub const MAX_INDIRECT_DESCRIPTORS: usize = MAX_DATA_DESCRIPTORS + 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitRequestError {
+    QueueFull,
+    TooManyDataSegments,
+}
+
 #[repr(C)]
 pub struct BlkSlot {
     pub header: VirtioBlkReqHeader, // 16 bytes
@@ -268,7 +274,7 @@ impl BlkIoSlots {
         sector: u64,
         data_segments: impl IntoIterator<Item = IoBufferDmaSegment>,
         is_write: bool,
-    ) -> Option<u16> {
+    ) -> Result<u16, SubmitRequestError> {
         let mut segments = [IoBufferDmaSegment {
             dma_addr: 0,
             byte_len: 0,
@@ -282,7 +288,7 @@ impl BlkIoSlots {
             }
             if unlikely(segment_count == MAX_DATA_DESCRIPTORS) {
                 cold_path();
-                return None;
+                return Err(SubmitRequestError::TooManyDataSegments);
             }
             segments[segment_count] = seg;
             segment_count += 1;
@@ -290,7 +296,7 @@ impl BlkIoSlots {
 
         let Some(head) = vq.alloc_desc() else {
             cold_path();
-            return None;
+            return Err(SubmitRequestError::QueueFull);
         };
         let slot_ptr = self.get_slot_ptr(head);
 
@@ -340,7 +346,7 @@ impl BlkIoSlots {
             vq.push_allocated_indirect(head, indirect_phys, total_table_len);
         }
 
-        Some(head)
+        Ok(head)
     }
 
     pub fn destroy(&mut self) {

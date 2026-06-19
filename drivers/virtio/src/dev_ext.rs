@@ -6,8 +6,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::io::DiskInfo;
-use kernel_api::util::get_current_lapic_id;
-use kernel_api::x86_64::VirtAddr;
+use kernel_api::memory::VirtAddr;
+use kernel_api::util::get_current_platform_cpu_id;
 use spin::{Mutex, Once, RwLock, RwLockReadGuard};
 
 use crate::blk::BlkIoSlots;
@@ -33,7 +33,7 @@ pub struct QueueState {
     pub max_request_bytes: u32,
     /// Maximum number of data descriptors we will use for a single request.
     pub max_data_segments: u16,
-    /// IRQ handle for this queue (MSI-X or shared legacy).
+    /// IRQ handle for this queue (MSI-X or shared line IRQ).
     pub irq_handle: UnsafeCell<Option<IrqHandle>>,
     /// MSI-X vector number if MSI-X is being used for this queue.
     pub msix_vector: Option<u8>,
@@ -96,7 +96,7 @@ impl DevExtInner {
     #[inline]
     pub fn select_queue(&self) -> usize {
         match self.queue_strategy {
-            QueueSelectionStrategy::CpuAffinity => get_current_lapic_id() % self.queue_count,
+            QueueSelectionStrategy::CpuAffinity => get_current_platform_cpu_id() % self.queue_count,
             QueueSelectionStrategy::RoundRobin => {
                 self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.queue_count
             }

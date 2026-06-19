@@ -24,20 +24,20 @@
 
 extern crate alloc;
 
-pub mod gdt;
-mod idt;
+mod arch;
 
 mod benchmarking;
 mod console;
-mod cpu;
 mod crt;
 mod drivers;
-mod exception_handlers;
 mod executable;
 mod exports;
 mod file_system;
+mod idt;
+mod machine;
 mod memory;
 mod object_manager;
+mod platform;
 mod profiling;
 mod registry;
 mod scheduling;
@@ -46,7 +46,8 @@ mod structs;
 mod sync_platform;
 mod syscalls;
 mod util;
-use crate::util::{KERNEL_INITIALIZED, panic_common};
+
+use crate::util::{panic_common, KERNEL_INITIALIZED};
 
 use alloc::{format, vec};
 use core::panic::PanicInfo;
@@ -54,9 +55,9 @@ use core::ptr::{addr_of_mut, copy_nonoverlapping};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_abi::{
     BootInfo, FrameBuffer, KernelSection, KernelSections, KernelSymbol, KernelSymbolString,
-    KernelSymbols, MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
-    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, MemoryRegion, MemoryRegionKind,
-    MemoryRegions, Optional,
+    KernelSymbols, MemoryRegion, MemoryRegions, Optional, MAX_BOOT_MEMORY_REGIONS,
+    MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS, MAX_KERNEL_SECTIONS,
+    MAX_KERNEL_SYMBOL_STRING_BYTES,
 };
 use kernel_abi::{RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION};
 use lazy_static::lazy_static;
@@ -120,13 +121,12 @@ unsafe fn copy_boot_info(src: &BootInfo) {
         magic: src.magic,
         version: src.version,
         flags: src.flags,
+        rsdp_addr: src.rsdp_addr,
+        arch_info: src.arch_info,
         memory_regions,
         framebuffer: copy_framebuffer(&src.framebuffer),
-        physical_memory_offset: src.physical_memory_offset,
-        recursive_index: src.recursive_index,
-        rsdp_addr: src.rsdp_addr,
+        fdt_header: src.fdt_header,
         tls_template: src.tls_template,
-        pe_tls_directory: src.pe_tls_directory,
         kernel_imports,
         kernel_exports,
         ramdisk_addr: src.ramdisk_addr,
@@ -246,62 +246,6 @@ fn copy_framebuffer(src: &Optional<FrameBuffer>) -> Optional<FrameBuffer> {
     }
 }
 
-fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
-    const LOW_START: u64 = 0;
-    const LOW_END: u64 = 0x20_0000;
-
-    let mut free_idx = regions.iter().position(|r| r.start == 0 && r.end == 0);
-
-    let mut need_insert: Option<MemoryRegion> = None;
-    let mut tagged_any = false;
-
-    for i in 0..regions.len() {
-        let r = &mut regions[i];
-
-        if r.kind != MemoryRegionKind::Usable {
-            continue;
-        }
-        if r.end <= LOW_START || r.start >= LOW_END {
-            continue;
-        }
-
-        tagged_any = true;
-
-        if r.start >= LOW_START && r.end <= LOW_END {
-            r.kind = MemoryRegionKind::Bootloader;
-            continue;
-        }
-
-        if r.start < LOW_END && r.end > LOW_END {
-            need_insert = Some(MemoryRegion {
-                start: r.start,
-                end: LOW_END,
-                kind: MemoryRegionKind::Bootloader,
-            });
-
-            r.start = LOW_END;
-
-            free_idx = free_idx.filter(|_| false);
-        }
-    }
-
-    if let Some(low_part) = need_insert {
-        if let Some(idx) = free_idx {
-            regions[idx] = low_part;
-        }
-    }
-
-    if !tagged_any {
-        if let Some(idx) = free_idx {
-            regions[idx] = MemoryRegion {
-                start: LOW_START,
-                end: LOW_END,
-                kind: MemoryRegionKind::Bootloader,
-            };
-        }
-    }
-}
-
 pub extern "C" fn function(x: i64) -> i64 {
     (x - 10) / 10
 }
@@ -313,7 +257,8 @@ pub fn test_runner(tests: &[&dyn Fn()]) {
     }
 }
 const fn get_rva(addr: usize) -> usize {
-    let base = 0xFFFF_8500_0000_0000usize;
+    let base =
+        <crate::platform::ActivePlatform as crate::platform::Platform>::KERNEL_IMAGE_BASE as usize;
     addr - base
 }
 #[macro_export]

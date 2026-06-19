@@ -9,16 +9,13 @@ mod blk;
 mod completion;
 mod dev_ext;
 mod dma_region;
+mod io;
 mod pci;
 mod temp_benchmark;
 mod virtqueue;
 
-use alloc::vec;
-use alloc::{sync::Arc, vec::Vec};
-use blk::{
-    BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_FLUSH,
-    VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
-};
+use alloc::{sync::Arc, vec, vec::Vec};
+use blk::{BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP};
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
@@ -27,10 +24,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
-use kernel_api::benchmark::{
-    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
-    BenchSweepResult,
-};
+use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
@@ -38,87 +32,35 @@ use kernel_api::irq::{
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
 use kernel_api::kernel_types::dma::{
-    BorrowedDmaMapping, Described, DmaMappingStrategy, FromDevice, IoBuffer, IoBufferDirection,
-    IoBufferDmaSegment, IoBufferState, ToDevice,
+    BorrowedDmaMapping, Described, DmaMappingStrategy, IoBuffer, IoBufferDirection, IoBufferState,
 };
-use kernel_api::kernel_types::io::{
-    DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo,
-};
-use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
+use kernel_api::kernel_types::io::DiskInfo;
+use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
+use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
-use kernel_api::memory::unmap_mmio_region;
+use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{DeviceControl, Flush, Pnp, Read, RequestHandle, RequestKind, Write};
-use kernel_api::runtime::KernelStopwatch;
-use kernel_api::runtime::spawn_detached;
+use kernel_api::request::{DeviceControl, Pnp, RequestHandle, RequestKind};
+use kernel_api::runtime::{KernelStopwatch, cycle_counter, spawn_detached};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::panic_common;
-use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::{Mutex, RwLock};
-use temp_benchmark::{
-    IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
-    bench_sweep, bench_sweep_params, bench_sweep_params_request, sanitize_bench_params,
-};
 use virtqueue::Virtqueue;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
-const COMPLETION_POLL_TIME: Duration = Duration::from_nanos(1494117);
-
-struct VirtioPdoIo;
-
-impl DeviceRead for VirtioPdoIo {
-    #[request_handler]
-    async fn handler<'req, 'data, 'b>(
-        pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'data>>,
-        buf_len: usize,
-    ) -> DriverStep {
-        virtio_pdo_read_impl(pdo, req, buf_len).await
-    }
-}
-
-impl DeviceWrite for VirtioPdoIo {
-    #[request_handler]
-    async fn handler<'req, 'data, 'b>(
-        pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'data>>,
-        buf_len: usize,
-    ) -> DriverStep {
-        virtio_pdo_write_impl(pdo, req, buf_len).await
-    }
-}
-
-impl DeviceFlush for VirtioPdoIo {
-    #[request_handler]
-    async fn handler<'req, 'b>(
-        pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Flush>,
-    ) -> DriverStep {
-        virtio_pdo_flush_impl(pdo, req).await
-    }
-}
-
-impl DeviceControlHandler for VirtioPdoIo {
-    #[request_handler]
-    async fn handler<'req, 'data, 'b>(
-        pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
-    ) -> DriverStep {
-        virtio_pdo_ioctl_impl(pdo, req).await
-    }
-}
+pub(crate) const COMPLETION_POLL_TIME: Duration = Duration::from_nanos(1494117);
 
 #[inline]
-fn duration_to_tsc_cycles(duration: Duration, tsc_hz: u64) -> u64 {
-    if unlikely(tsc_hz == 0) {
+fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64 {
+    if unlikely(frequency_hz == 0) {
         cold_path();
         return 0;
     }
@@ -130,19 +72,23 @@ fn duration_to_tsc_cycles(duration: Duration, tsc_hz: u64) -> u64 {
     }
 
     let cycles = nanos
-        .saturating_mul(tsc_hz as u128)
+        .saturating_mul(frequency_hz as u128)
         .saturating_add(999_999_999)
         / 1_000_000_000;
     cycles.min(u64::MAX as u128) as u64
 }
 
-async fn wait_completion_hybrid<F>(qs: &QueueState, completion: F, spin_for: Duration) -> F::Output
+pub(crate) async fn wait_completion_hybrid<F>(
+    qs: &QueueState,
+    completion: F,
+    spin_for: Duration,
+) -> F::Output
 where
     F: Future,
 {
     let mut completion = core::pin::pin!(completion);
     let timer = KernelStopwatch::start();
-    let spin_cycles = duration_to_tsc_cycles(spin_for, timer.tsc_hz());
+    let spin_cycles = duration_to_cycle_counter_ticks(spin_for, timer.cycle_counter_frequency_hz());
     let start_cycles = timer.start_cycles();
 
     loop {
@@ -157,16 +103,16 @@ where
             return result;
         }
 
-        if spin_cycles == 0 || rdtsc().wrapping_sub(start_cycles) >= spin_cycles {
+        if spin_cycles == 0 || cycle_counter().wrapping_sub(start_cycles) >= spin_cycles {
             break;
         }
     }
     let res = completion.await;
     res
 }
-// legacy helpers
+// Request helpers
 #[inline(always)]
-fn complete_req<K: RequestKind>(
+pub(crate) fn complete_req<K: RequestKind>(
     _req: &mut RequestHandle<'_, K>,
     status: DriverStatus,
 ) -> DriverStep {
@@ -177,13 +123,13 @@ fn continue_req<K: RequestKind>(_req: &mut RequestHandle<'_, K>) -> DriverStep {
     DriverStep::Continue
 }
 
-fn virtio_device_error(message: impl Into<alloc::string::String>) -> DriverStatus {
+pub(crate) fn virtio_device_error(message: impl Into<alloc::string::String>) -> DriverStatus {
     DriverStatus::DeviceError {
         message: message.into(),
     }
 }
 
-fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
+pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
     match status {
         VIRTIO_BLK_S_OK => DriverStatus::Success,
         VIRTIO_BLK_S_IOERR => virtio_device_error(alloc::format!(
@@ -212,7 +158,7 @@ where
     }
 }
 
-fn map_request_buffer<'map, 'buffer, Direction>(
+pub(crate) fn map_request_buffer<'map, 'buffer, Direction>(
     device: &Arc<DeviceObject>,
     buffer: &'map IoBuffer<'buffer, Described, Direction>,
 ) -> Result<BorrowedDmaMapping<'map>, DriverStatus>
@@ -226,109 +172,6 @@ where
         virtio_data_mapping_strategy(phys_framed),
     )
     .map_err(|_| DriverStatus::InsufficientResources)
-}
-
-async fn submit_virtio_no_data_request(
-    inner: &DevExtInner,
-    qs: &QueueState,
-    req_type: u32,
-    operation: &str,
-) -> DriverStatus {
-    let completion = loop {
-        let completion = match qs.completion_slots.alloc() {
-            Some(completion) => completion,
-            None => {
-                cold_path();
-                let drained = drain_queue_completions(qs);
-                if unlikely(drained == 0) {
-                    let mut done = false;
-                    core::future::poll_fn(|cx| {
-                        if done {
-                            core::task::Poll::Ready(())
-                        } else {
-                            done = true;
-                            cx.waker().wake_by_ref();
-                            core::task::Poll::Pending
-                        }
-                    })
-                    .await;
-                }
-                continue;
-            }
-        };
-        let mut completion = Some(completion);
-        let submitted = {
-            let mut vq = qs.queue.write();
-            match qs.arena.submit_request(
-                &mut vq,
-                req_type,
-                0,
-                core::iter::empty::<IoBufferDmaSegment>(),
-                false,
-            ) {
-                Some(h) => {
-                    qs.completion_slots
-                        .attach(h, completion.as_ref().expect("completion missing"));
-                    let queue_full = vq.num_free == 0;
-                    let _submit_guard = SubmitTasksGuard::new(
-                        &qs.submitting_tasks,
-                        &vq,
-                        inner.notify_base,
-                        inner.notify_off_multiplier,
-                        queue_full,
-                    );
-                    true
-                }
-                None => {
-                    cold_path();
-                    vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                    false
-                }
-            }
-        };
-
-        if submitted {
-            break completion.take().expect("completion missing");
-        }
-
-        let mut done = false;
-        core::future::poll_fn(|cx| {
-            if done {
-                core::task::Poll::Ready(())
-            } else {
-                done = true;
-                cx.waker().wake_by_ref();
-                core::task::Poll::Pending
-            }
-        })
-        .await;
-    };
-
-    match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
-        Ok(device_status) => blk_status_to_driver_status(operation, device_status),
-        Err(_) => virtio_device_error(alloc::format!(
-            "virtio-blk: {operation} failed: completion canceled before device status"
-        )),
-    }
-}
-
-async fn flush_virtio_cache(pdo: &Arc<DeviceObject>) -> DriverStatus {
-    let (_parent, inner) = match get_parent_inner(pdo) {
-        Ok(v) => v,
-        Err(s) => {
-            cold_path();
-            return s;
-        }
-    };
-
-    if unlikely(!inner.flush_supported) {
-        cold_path();
-        return DriverStatus::NotImplemented;
-    }
-
-    let queue_idx = inner.select_queue();
-    let qs = inner.get_queue(queue_idx);
-    submit_virtio_no_data_request(&inner, qs, VIRTIO_BLK_T_FLUSH, "flush").await
 }
 
 #[cfg(not(test))]
@@ -365,7 +208,7 @@ pub extern "C" fn virtio_device_add(
 extern "C" fn virtio_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
@@ -387,7 +230,7 @@ extern "C" fn virtio_isr(
 extern "C" fn virtio_msix_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
     _ctx: usize,
 ) -> bool {
@@ -402,16 +245,16 @@ extern "C" fn virtio_msix_isr(
 async fn setup_msix_via_pci(
     dev: &Arc<DeviceObject>,
     vector: u8,
-    cpu: u8,
+    platform_cpu_id: u8,
     table_index: u16,
 ) -> Result<(), DriverStatus> {
-    let mut buf = vec![0u8; 6];
-    buf[0..2].copy_from_slice(&1u16.to_le_bytes());
-    buf[2..4].copy_from_slice(&table_index.to_le_bytes());
-    buf[4] = vector;
-    buf[5] = cpu;
+    let setup = MsiRequest::pci_msix(
+        vector,
+        MsiTarget::platform_cpu(platform_cpu_id as u32),
+        table_index,
+    );
 
-    let mut req = RequestHandle::new(DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, buf));
+    let mut req = RequestHandle::new(DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup));
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut req).await;
 
     if status == DriverStatus::Success {
@@ -473,10 +316,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
         }
     };
 
-    let cfg_base = match kernel_api::memory::map_mmio_region(
-        kernel_api::x86_64::PhysAddr::new(cfg_phys),
-        cfg_len,
-    ) {
+    let cfg_base = match kernel_api::memory::map_mmio_region(PhysAddr::new(cfg_phys), cfg_len) {
         Ok(va) => va,
         Err(_) => {
             println!("virtio-blk: failed to map PCI config space");
@@ -526,7 +366,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
         }
     };
 
-    let cpu_ids = kernel_api::irq::apic_cpu_ids();
+    let cpu_ids = kernel_api::irq::platform_cpu_ids();
     let cpu_count = cpu_ids.len().max(1);
     let target_queue_count = (init_result.num_queues as usize).min(cpu_count).max(1);
 
@@ -643,14 +483,14 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
 
     virtqueues.truncate(final_queue_count);
 
-    let legacy_irq_handle: Option<IrqHandle> = if !use_msix {
+    let line_irq_handle: Option<IrqHandle> = if !use_msix {
         if let Some(gsi) = pci::find_gsi(&resources) {
             if gsi < 64 {
                 irq_register_isr_gsi(gsi as u8, virtio_isr, caps.isr_cfg.as_u64() as usize)
             } else {
                 None
             }
-        } else if let Some(line) = pci::find_legacy_irq_line(&resources) {
+        } else if let Some(line) = pci::find_interrupt_line(&resources) {
             if line < 16 {
                 let vector = PIC_BASE_VECTOR + line;
                 irq_register_isr(vector, virtio_isr, caps.isr_cfg.as_u64() as usize)
@@ -720,7 +560,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
                 None => (None, None, None),
             }
         } else if i == 0 && !use_msix {
-            (legacy_irq_handle.clone(), None, None)
+            (line_irq_handle.clone(), None, None)
         } else {
             (None, None, None)
         };
@@ -1063,21 +903,7 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
     }
 }
 
-const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
-#[inline]
-fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
+pub(crate) const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 
 #[request_handler]
 pub async fn virtio_pdo_start<'req, 'data, 'b>(
@@ -1140,395 +966,4 @@ pub async fn virtio_pdo_query_resources<'req, 'data, 'b>(
     };
 
     complete_req(req, status)
-}
-
-fn get_parent_inner(
-    pdo: &Arc<DeviceObject>,
-) -> Result<(Arc<DeviceObject>, Arc<DevExtInner>), DriverStatus> {
-    let cdx = pdo
-        .try_devext::<ChildExt>()
-        .map_err(|_| DriverStatus::NoSuchDevice)?;
-    let parent = cdx
-        .parent_device
-        .upgrade()
-        .ok_or(DriverStatus::NoSuchDevice)?;
-    let dx = parent
-        .try_devext::<DevExt>()
-        .map_err(|_| DriverStatus::NoSuchDevice)?;
-    let inner = dx.inner.get().ok_or(DriverStatus::DeviceNotReady)?.clone();
-    Ok((parent, inner))
-}
-#[inline(always)]
-async fn virtio_pdo_read_impl<'req, 'data, 'b>(
-    pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Read<'data>>,
-    _buf_len: usize,
-) -> DriverStep {
-    let (parent, inner) = match get_parent_inner(pdo) {
-        Ok(v) => v,
-        Err(s) => {
-            cold_path();
-            return complete_req(req, s);
-        }
-    };
-    let (offset, len) = {
-        let r = req.read();
-        (r.body.offset, r.body.len)
-    };
-
-    if unlikely(len == 0) {
-        cold_path();
-        return complete_req(req, DriverStatus::Success);
-    }
-    if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
-        cold_path();
-        return complete_req(req, DriverStatus::InvalidParameter);
-    }
-
-    let sector = offset >> 9;
-    let queue_idx = inner.select_queue();
-    let qs = inner.get_queue(queue_idx);
-
-    let status = 'transfer: {
-        let buffer = &req.read().body.buffer;
-        if unlikely(buffer.len() < len) {
-            cold_path();
-            break 'transfer DriverStatus::InvalidParameter;
-        }
-        let mapped_buffer = match map_request_buffer::<FromDevice>(&parent, buffer) {
-            Ok(b) => b,
-            Err(status) => {
-                cold_path();
-                break 'transfer status;
-            }
-        };
-
-        let completion = loop {
-            let completion = match qs.completion_slots.alloc() {
-                Some(completion) => completion,
-                None => {
-                    cold_path();
-                    let drained = drain_queue_completions(qs);
-                    if unlikely(drained == 0) {
-                        let mut done = false;
-                        core::future::poll_fn(|cx| {
-                            if done {
-                                core::task::Poll::Ready(())
-                            } else {
-                                done = true;
-                                cx.waker().wake_by_ref();
-                                core::task::Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
-                    continue;
-                }
-            };
-            let mut completion = Some(completion);
-            let submitted = {
-                let mut vq = qs.queue.write();
-                let segments = mapped_buffer.dma_segments();
-                match qs
-                    .arena
-                    .submit_request(&mut vq, VIRTIO_BLK_T_IN, sector, segments, false)
-                {
-                    Some(h) => {
-                        qs.completion_slots
-                            .attach(h, completion.as_ref().expect("completion missing"));
-                        let queue_full = vq.num_free == 0;
-                        let _submit_guard = SubmitTasksGuard::new(
-                            &qs.submitting_tasks,
-                            &vq,
-                            inner.notify_base,
-                            inner.notify_off_multiplier,
-                            queue_full,
-                        );
-                        true
-                    }
-                    None => {
-                        cold_path();
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        false
-                    }
-                }
-            };
-
-            if submitted {
-                break completion.take().expect("completion missing");
-            }
-
-            let mut done = false;
-            core::future::poll_fn(|cx| {
-                if done {
-                    core::task::Poll::Ready(())
-                } else {
-                    done = true;
-                    cx.waker().wake_by_ref();
-                    core::task::Poll::Pending
-                }
-            })
-            .await;
-        };
-
-        match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
-            Ok(device_status) => blk_status_to_driver_status("read", device_status),
-            Err(_) => {
-                cold_path();
-                virtio_device_error(
-                    "virtio-blk: read failed: completion canceled before device status",
-                )
-            }
-        }
-    };
-
-    complete_req(req, status)
-}
-#[inline(always)]
-async fn virtio_pdo_write_impl<'req, 'data, 'b>(
-    pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Write<'data>>,
-    _buf_len: usize,
-) -> DriverStep {
-    let (parent, inner) = match get_parent_inner(pdo) {
-        Ok(v) => v,
-        Err(s) => {
-            cold_path();
-            return complete_req(req, s);
-        }
-    };
-
-    let (offset, len) = {
-        let r = req.read();
-        (r.body.offset, r.body.len)
-    };
-
-    if unlikely(len == 0) {
-        cold_path();
-        return complete_req(req, DriverStatus::Success);
-    }
-    if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
-        cold_path();
-        return complete_req(req, DriverStatus::InvalidParameter);
-    }
-
-    let sector = offset >> 9;
-    let queue_idx = inner.select_queue();
-    let qs = inner.get_queue(queue_idx);
-
-    let status = 'transfer: {
-        let buffer = &req.read().body.buffer;
-        if unlikely(buffer.len() < len) {
-            cold_path();
-            break 'transfer DriverStatus::InvalidParameter;
-        }
-        let mapped_buffer = match map_request_buffer::<ToDevice>(&parent, buffer) {
-            Ok(b) => b,
-            Err(status) => {
-                cold_path();
-                break 'transfer status;
-            }
-        };
-
-        let completion = loop {
-            let completion = match qs.completion_slots.alloc() {
-                Some(completion) => completion,
-                None => {
-                    cold_path();
-                    let drained = drain_queue_completions(qs);
-                    if unlikely(drained == 0) {
-                        let mut done = false;
-                        core::future::poll_fn(|cx| {
-                            if done {
-                                core::task::Poll::Ready(())
-                            } else {
-                                done = true;
-                                cx.waker().wake_by_ref();
-                                core::task::Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
-                    continue;
-                }
-            };
-            let mut completion = Some(completion);
-            let submitted = {
-                let mut vq = qs.queue.write();
-                let segments = mapped_buffer.dma_segments();
-                match qs
-                    .arena
-                    .submit_request(&mut vq, VIRTIO_BLK_T_OUT, sector, segments, true)
-                {
-                    Some(h) => {
-                        qs.completion_slots
-                            .attach(h, completion.as_ref().expect("completion missing"));
-                        let queue_full = vq.num_free == 0;
-                        let _submit_guard = SubmitTasksGuard::new(
-                            &qs.submitting_tasks,
-                            &vq,
-                            inner.notify_base,
-                            inner.notify_off_multiplier,
-                            queue_full,
-                        );
-                        true
-                    }
-                    None => {
-                        cold_path();
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        false
-                    }
-                }
-            };
-
-            if submitted {
-                break completion.take().expect("completion missing");
-            }
-
-            let mut done = false;
-            core::future::poll_fn(|cx| {
-                if done {
-                    core::task::Poll::Ready(())
-                } else {
-                    done = true;
-                    cx.waker().wake_by_ref();
-                    core::task::Poll::Pending
-                }
-            })
-            .await;
-        };
-
-        match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
-            Ok(device_status) => blk_status_to_driver_status("write", device_status),
-            Err(_) => {
-                cold_path();
-                virtio_device_error(
-                    "virtio-blk: write failed: completion canceled before device status",
-                )
-            }
-        }
-    };
-
-    complete_req(req, status)
-}
-#[inline(always)]
-async fn virtio_pdo_flush_impl<'req, 'b>(
-    pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Flush>,
-) -> DriverStep {
-    complete_req(req, DriverStatus::Success)
-}
-#[inline(always)]
-async fn virtio_pdo_ioctl_impl<'req, 'data, 'b>(
-    pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
-) -> DriverStep {
-    let code = req.read().body.code;
-
-    match code {
-        IOCTL_BLOCK_FLUSH => {
-            let status = flush_virtio_cache(pdo).await;
-            complete_req(req, status)
-        }
-
-        IOCTL_BLOCK_BENCH_SWEEP => {
-            let (parent, inner) = match get_parent_inner(pdo) {
-                Ok(v) => v,
-                Err(s) => return complete_req(req, s),
-            };
-
-            match bench_sweep(&parent, &inner, true).await {
-                Ok(r) => {
-                    {
-                        req.write().set_data_t(r);
-                    }
-                    complete_req(req, DriverStatus::Success)
-                }
-                Err(e) => complete_req(req, e),
-            }
-        }
-
-        IOCTL_BLOCK_BENCH_SWEEP_POLLING => {
-            let (parent, inner) = match get_parent_inner(pdo) {
-                Ok(v) => v,
-                Err(s) => return complete_req(req, s),
-            };
-
-            match bench_sweep(&parent, &inner, false).await {
-                Ok(r) => {
-                    {
-                        req.write().set_data_t(r);
-                    }
-                    complete_req(req, DriverStatus::Success)
-                }
-                Err(e) => complete_req(req, e),
-            }
-        }
-
-        IOCTL_BLOCK_BENCH_SWEEP_BOTH => {
-            let (parent, inner) = match get_parent_inner(pdo) {
-                Ok(v) => v,
-                Err(s) => return complete_req(req, s),
-            };
-
-            let params_in = {
-                req.data()
-                    .read_only()
-                    .view::<BenchSweepParams>()
-                    .copied()
-                    .unwrap_or_default()
-            };
-            let params_used = sanitize_bench_params(&inner, params_in);
-            let request = if (params_used.flags & BENCH_FLAG_REQUEST) != 0 {
-                match bench_sweep_params_request(pdo, &inner, &params_used).await {
-                    Ok(r) => r,
-                    Err(e) => return complete_req(req, e),
-                }
-            } else {
-                BenchSweepResult::default()
-            };
-
-            let irq = if (params_used.flags & BENCH_FLAG_IRQ) != 0 {
-                match bench_sweep_params(&parent, &inner, &params_used, true).await {
-                    Ok(r) => r,
-                    Err(e) => return complete_req(req, e),
-                }
-            } else {
-                BenchSweepResult::default()
-            };
-
-            let poll = if (params_used.flags & BENCH_FLAG_POLL) != 0 {
-                match bench_sweep_params(&parent, &inner, &params_used, false).await {
-                    Ok(r) => r,
-                    Err(e) => return complete_req(req, e),
-                }
-            } else {
-                BenchSweepResult::default()
-            };
-
-            let qs0 = inner.get_queue(0);
-            let qsz = qs0.vq_ref().size;
-
-            let msix_enabled = inner.queues.iter().any(|q| q.msix_vector.is_some());
-
-            let out = BenchSweepBothResult {
-                params_used,
-                irq,
-                poll,
-                request,
-                queue_count: inner.queue_count as u16,
-                queue0_size: qsz,
-                indirect_enabled: if inner.indirect_desc_enabled { 1 } else { 0 },
-                msix_enabled: if msix_enabled { 1 } else { 0 },
-                _pad0: 0,
-            };
-
-            {
-                req.write().set_data_t(out);
-            }
-            complete_req(req, DriverStatus::Success)
-        }
-
-        _ => complete_req(req, DriverStatus::NotImplemented),
-    }
 }

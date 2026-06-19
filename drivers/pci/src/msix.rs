@@ -1,53 +1,17 @@
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
 use kernel_api::device::DeviceObject;
-use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
+use kernel_api::irq::irq_compose_msi_message;
+use kernel_api::kernel_types::irq::{
+    MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiRequest, MsiRequester,
+};
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
 use kernel_api::request::{DeviceControl, RequestHandle};
 use kernel_api::status::DriverStatus;
-use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 use crate::dev_ext::{BarKind, PciPdoExt};
-
-/// Single MSI-X entry setup request from child driver.
-#[derive(Clone, Copy, Debug)]
-pub struct MsixEntrySetup {
-    pub table_index: u16,
-    pub vector: u8,
-    pub cpu: u8,
-}
-
-/// Parse MSI-X setup request from blob.
-/// Format: num_entries(u16) + [table_index(u16) + vector(u8) + cpu(u8)] * N
-fn parse_msix_setup_request(data: &[u8]) -> Option<Vec<MsixEntrySetup>> {
-    if data.len() < 2 {
-        return None;
-    }
-
-    let num_entries = u16::from_le_bytes([data[0], data[1]]) as usize;
-    let expected_len = 2 + num_entries * 4;
-
-    if data.len() < expected_len {
-        return None;
-    }
-
-    let mut entries = Vec::with_capacity(num_entries);
-    for i in 0..num_entries {
-        let base = 2 + i * 4;
-        let table_index = u16::from_le_bytes([data[base], data[base + 1]]);
-        let vector = data[base + 2];
-        let cpu = data[base + 3];
-        entries.push(MsixEntrySetup {
-            table_index,
-            vector,
-            cpu,
-        });
-    }
-
-    Some(entries)
-}
 
 /// Read 16-bit value from config space.
 #[inline]
@@ -78,18 +42,22 @@ pub async fn pci_setup_msix<'req, 'data>(
         None => return DriverStep::complete(DriverStatus::NotImplemented),
     };
 
-    let entries = match {
+    let msi_request = match {
         let data = req.data().read_only();
-        parse_msix_setup_request(data.view::<Vec<u8>>().map(|v| v.as_slice()).unwrap_or(&[]))
+        data.view::<MsiRequest>().copied()
     } {
-        Some(e) => e,
+        Some(request) => request,
         None => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
-    for entry in &entries {
-        if entry.table_index >= msix.table_size {
-            return DriverStep::complete(DriverStatus::InvalidParameter);
-        }
+    if msi_request.kind != MSI_KIND_MSIX
+        || msi_request.table_index >= msix.table_size
+        || !matches!(
+            msi_request.target.mode,
+            MSI_TARGET_ANY | MSI_TARGET_PLATFORM_CPU
+        )
+    {
+        return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
     let table_bar = &ext.bars[msix.table_bar as usize];
@@ -105,39 +73,36 @@ pub async fn pci_setup_msix<'req, 'data>(
         Err(_) => return DriverStep::complete(DriverStatus::InsufficientResources),
     };
 
-    for entry in &entries {
-        let entry_offset = entry.table_index as u64 * 16;
-        let entry_va = table_va.as_u64() + entry_offset;
-
-        // Message Address (x86 APIC): 0xFEE00000 | (cpu << 12)
-        // Bits [19:12] = Destination ID (CPU)
-        // Bits [11:4] = Reserved
-        // Bit [3] = Redirection Hint (0)
-        // Bit [2] = Destination Mode (0 = Physical)
-        let msg_addr_lo: u32 = 0xFEE0_0000 | ((entry.cpu as u32) << 12);
-        let msg_addr_hi: u32 = 0;
-
-        // Message Data: vector number in bits [7:0]
-        let msg_data: u32 = entry.vector as u32;
-
-        // Vector Control: bit 0 = mask (0 = unmasked/enabled)
-        let vector_ctrl_masked: u32 = 1;
-        let vector_ctrl_unmasked: u32 = 0;
-
-        unsafe {
-            // Program entry while masked to avoid spurious interrupts on picky devices.
-            write_volatile((entry_va + 12) as *mut u32, vector_ctrl_masked);
-            write_volatile((entry_va + 0) as *mut u32, msg_addr_lo);
-            write_volatile((entry_va + 4) as *mut u32, msg_addr_hi);
-            write_volatile((entry_va + 8) as *mut u32, msg_data);
-            write_volatile((entry_va + 12) as *mut u32, vector_ctrl_unmasked);
+    let msi_request =
+        msi_request.with_requester(MsiRequester::pci(ext.seg, ext.bus, ext.dev, ext.func));
+    let message = match irq_compose_msi_message(&msi_request) {
+        Some(message) => message,
+        None => {
+            let _ = unmap_mmio_region(table_va, table_region_size);
+            return DriverStep::complete(DriverStatus::NotImplemented);
         }
+    };
 
-        // Read back and verify
-        let _rb_addr = unsafe { read_volatile((entry_va + 0) as *const u32) };
-        let _rb_data = unsafe { read_volatile((entry_va + 8) as *const u32) };
-        let _rb_ctrl = unsafe { read_volatile((entry_va + 12) as *const u32) };
+    let entry_offset = msi_request.table_index as u64 * 16;
+    let entry_va = table_va.as_u64() + entry_offset;
+
+    // Vector Control: bit 0 = mask (0 = masked)
+    let vector_ctrl_masked: u32 = 1;
+    let vector_ctrl_unmasked: u32 = 0;
+
+    unsafe {
+        // Program entry while masked to avoid spurious interrupts on picky devices.
+        write_volatile((entry_va + 12) as *mut u32, vector_ctrl_masked);
+        write_volatile((entry_va + 0) as *mut u32, message.address_lo());
+        write_volatile((entry_va + 4) as *mut u32, message.address_hi());
+        write_volatile((entry_va + 8) as *mut u32, message.data);
+        write_volatile((entry_va + 12) as *mut u32, vector_ctrl_unmasked);
     }
+
+    // Read back and verify
+    let _rb_addr = unsafe { read_volatile((entry_va + 0) as *const u32) };
+    let _rb_data = unsafe { read_volatile((entry_va + 8) as *const u32) };
+    let _rb_ctrl = unsafe { read_volatile((entry_va + 12) as *const u32) };
 
     let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
         Ok(va) => va,

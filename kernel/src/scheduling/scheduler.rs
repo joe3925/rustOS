@@ -1,34 +1,25 @@
-use crate::cpu;
-use crate::drivers::interrupt_index::LocalApic;
-use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
-use crate::drivers::interrupt_index::{
-    APIC, IpiDest, IpiKind, current_cpu_id, get_current_logical_id, send_eoi,
-};
-use crate::drivers::timer_driver::NUM_CORES;
-use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::idt::SCHED_IPI_VECTOR;
-use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
+use crate::idt::InterruptGuard;
 use crate::memory::paging::stack::StackSize;
-use crate::scheduling::domain::{DomainMaster, EnqueueReason, SwitchOutOutcome, TaskSchedBinding};
+use crate::platform;
+use crate::scheduling::domain::{
+    DomainMaster, EnqueueReason, RoundRobinDomainAlgorithm, SwitchOutOutcome, TaskSchedBinding,
+};
 use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding};
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::state::{BlockReason, SchedState, State};
+use crate::scheduling::state::{SchedState, State};
 use crate::scheduling::task::CurrentTask;
+use crate::scheduling::task::Task;
 use crate::scheduling::task::TaskError;
-pub use crate::scheduling::task::TaskHandle;
+use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
-use crate::scheduling::task::{IDLE_MAGIC_LOWER, IDLE_UUID_UPPER, Task, idle_task};
 use crate::scheduling::tls;
-use crate::util::{KERNEL_INITIALIZED, MAX_CPUS};
+use crate::util::KERNEL_INITIALIZED;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
-use x86_64::instructions::interrupts;
-use x86_64::registers::control::Cr3;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
 
 pub fn default_task_sched_binding() -> TaskSchedBinding {
@@ -48,7 +39,7 @@ pub struct KernelFpuGuard {
 impl KernelFpuGuard {
     #[inline(always)]
     pub fn new() -> Self {
-        let cpu_id = current_cpu_id();
+        let cpu_id = platform::current_cpu_id();
         let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
             {
                 let mut guard = task.inner.try_write().expect(
@@ -70,7 +61,7 @@ impl Drop for KernelFpuGuard {
     fn drop(&mut self) {
         self.saved_task.take();
 
-        let cpu_id = current_cpu_id();
+        let cpu_id = platform::current_cpu_id();
         if let Some(current) = SCHEDULER.get_current_task(cpu_id) {
             let mut guard = current
                 .inner
@@ -85,7 +76,7 @@ pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
     idle_task: TaskHandle,
     current: CurrentTask,
-    lapic_id: u8,
+    platform_cpu_id: usize,
 }
 
 struct SchedulerState {
@@ -95,7 +86,7 @@ struct SchedulerState {
 pub struct Scheduler {
     all_tasks: TaskTable,
     cores: IrqSafeRwLock<Vec<Arc<CoreScheduler>>>,
-    domains: DomainMaster,
+    domains: DomainMaster<RoundRobinDomainAlgorithm>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
 }
@@ -110,9 +101,8 @@ impl Scheduler {
             all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
             cores: IrqSafeRwLock::new(Vec::new()),
             domains: DomainMaster::new(
-                alloc::vec![build_fifo_domain(NUM_CORES.load(Ordering::Relaxed))]
-                    .into_boxed_slice(),
-                NUM_CORES.load(Ordering::Relaxed),
+                alloc::vec![build_fifo_domain(platform::processor_count())].into_boxed_slice(),
+                platform::processor_count(),
             ),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
@@ -126,11 +116,16 @@ impl Scheduler {
     }
 
     #[inline(always)]
-    fn build_core(&self, cpu_id: usize, lapic_id: u8) -> Arc<CoreScheduler> {
-        let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
+    fn build_core(&self, cpu_id: usize, platform_cpu_id: usize) -> Arc<CoreScheduler> {
+        let idle = Task::new_kernel_mode(
+            platform::idle_task_entry(),
+            0,
+            StackSize::Tiny,
+            "".into(),
+            0,
+        );
 
-        idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
-        idle.inner.write().context.r11 = 0x890189d70ecaca7f;
+        platform::mark_idle_task_context(&mut idle.inner.write().context);
 
         let _idle_id = self.register_task_no_reap(idle.clone());
         idle.set_target_cpu(cpu_id);
@@ -139,7 +134,7 @@ impl Scheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
             idle_task: idle.clone(),
             current: CurrentTask::new(&idle),
-            lapic_id,
+            platform_cpu_id,
         })
     }
 
@@ -157,19 +152,19 @@ impl Scheduler {
             cores.len()
         );
         assert!(
-            cpu_id < MAX_CPUS,
+            cpu_id < platform::MAX_CPUS,
             "cpu id {} exceeds scheduler domain cpu capacity {}",
             cpu_id,
-            MAX_CPUS
+            platform::MAX_CPUS
         );
 
-        let lapic_id = get_current_logical_id();
-        cores.push(self.build_core(cpu_id, lapic_id));
+        let platform_cpu_id = platform::current_logical_id();
+        cores.push(self.build_core(cpu_id, platform_cpu_id));
         self.num_cores.store(cores.len(), Ordering::Release);
     }
 
     fn register_task(&self, task: TaskHandle) -> u64 {
-        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+        if platform::current_is_in_interrupt() {
             panic!("attempted to register task from interrupt context");
         }
 
@@ -192,7 +187,7 @@ impl Scheduler {
     }
 
     fn register_task_no_reap(&self, task: TaskHandle) -> u64 {
-        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+        if platform::current_is_in_interrupt() {
             panic!("attempted to register task from interrupt context");
         }
 
@@ -207,7 +202,7 @@ impl Scheduler {
 
     #[inline(always)]
     pub fn reap_retired_tasks(&self) {
-        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+        if platform::current_is_in_interrupt() {
             return;
         }
 
@@ -236,42 +231,12 @@ impl Scheduler {
     }
 
     pub(crate) fn kick_remote_core(&self, cpu: usize) {
-        if cpu == current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+        if cpu == platform::current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return;
         }
 
         if let Some(core) = self.core(cpu) {
-            let in_interrupt = current_is_in_interrupt_atomic().load(Ordering::Acquire);
-
-            if in_interrupt {
-                let Some(apic) = APIC.try_lock() else {
-                    return;
-                };
-
-                if let Some(a) = apic.as_ref() {
-                    unsafe {
-                        a.lapic.send_ipi(
-                            IpiDest::ApicId(core.lapic_id),
-                            IpiKind::Fixed {
-                                vector: SCHED_IPI_VECTOR,
-                            },
-                        )
-                    }
-                }
-
-                return;
-            }
-
-            unsafe {
-                if let Some(a) = APIC.lock().as_ref() {
-                    a.lapic.send_ipi(
-                        IpiDest::ApicId(core.lapic_id),
-                        IpiKind::Fixed {
-                            vector: SCHED_IPI_VECTOR,
-                        },
-                    )
-                }
-            }
+            let _ = platform::send_ipi(core.platform_cpu_id, platform::scheduler_ipi_vector());
         }
     }
 
@@ -310,7 +275,11 @@ impl Scheduler {
         }
 
         if task.sched_state() == SchedState::Blocked {
-            self.commit_pending_migration(&task, current_cpu_id(), cpu::get_cycles());
+            self.commit_pending_migration(
+                &task,
+                platform::current_cpu_id(),
+                platform::cycle_counter(),
+            );
         }
 
         Ok(())
@@ -324,7 +293,7 @@ impl Scheduler {
             return;
         }
 
-        let in_interrupt = current_is_in_interrupt_atomic().load(Ordering::Acquire);
+        let in_interrupt = platform::current_is_in_interrupt();
         let mut spins: u32 = 0;
 
         loop {
@@ -339,7 +308,11 @@ impl Scheduler {
 
                     let hint_cpu = task.target_cpu();
                     if task.has_pending_sched_binding() && !in_interrupt {
-                        self.commit_pending_migration(task, current_cpu_id(), cpu::get_cycles());
+                        self.commit_pending_migration(
+                            task,
+                            platform::current_cpu_id(),
+                            platform::cycle_counter(),
+                        );
                     }
 
                     let domain = self.domains.get(task.domain_id());
@@ -367,12 +340,12 @@ impl Scheduler {
         }
     }
 
-    pub fn park_current(&self, _reason: BlockReason) {
-        if !x86_64::instructions::interrupts::are_enabled() {
+    pub fn park_current(&self) {
+        if !platform::interrupts_enabled() {
             panic!("Attempt to park with interrupts disabled, this will always cause a deadlock");
         }
 
-        let cpu_id = current_cpu_id();
+        let cpu_id = platform::current_cpu_id();
         let Some(core) = self.core(cpu_id) else {
             return;
         };
@@ -416,7 +389,7 @@ impl Scheduler {
             return None;
         };
 
-        let now_cycles = cpu::get_cycles();
+        let now_cycles = platform::cycle_counter();
 
         let mut prev_task = None;
 
@@ -447,7 +420,7 @@ impl Scheduler {
         self.restore_thread_local_storage(&next);
 
         let ctx_guard = next.inner.read();
-        unsafe { ctx_guard.context.restore(state) };
+        unsafe { platform::restore_task_context(&ctx_guard.context, state) };
 
         prev_task
     }
@@ -638,7 +611,9 @@ impl Scheduler {
         let pid = task_handle.inner.read().parent_pid;
 
         if let Some(program) = PROGRAM_MANAGER.get(pid) {
-            unsafe { Cr3::write(program.read().cr3, Cr3::read().1) };
+            unsafe {
+                crate::memory::paging::switch_address_space_root(program.read().address_space_root)
+            };
         } else {
             let id = task_handle.task_id();
             let _ = self.delete_task(id);
@@ -657,7 +632,7 @@ impl Scheduler {
     }
 
     pub fn maybe_balance(&self) {
-        let current_tick = TIMER.load(Ordering::Relaxed);
+        let current_tick = platform::timer_tick_count();
         self.domains.maybe_balance(current_tick);
     }
 
@@ -712,16 +687,16 @@ impl Scheduler {
         };
 
         if !is_idle {
-            send_eoi(SCHED_IPI_VECTOR);
+            platform::end_interrupt(platform::scheduler_ipi_vector());
             return;
         }
 
-        let now_cycles = cpu::get_cycles();
+        let now_cycles = platform::cycle_counter();
 
         let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(t) => t,
             None => {
-                send_eoi(SCHED_IPI_VECTOR);
+                platform::end_interrupt(platform::scheduler_ipi_vector());
                 return;
             }
         };
@@ -729,10 +704,10 @@ impl Scheduler {
         self.restore_page_table(&next);
         self.restore_thread_local_storage(&next);
 
-        send_eoi(SCHED_IPI_VECTOR);
+        platform::end_interrupt(platform::scheduler_ipi_vector());
 
         let ctx_guard = next.inner.read();
-        unsafe { ctx_guard.context.restore(state) };
+        unsafe { platform::restore_task_context(&ctx_guard.context, state) };
     }
 }
 
@@ -742,15 +717,15 @@ pub extern "C" fn ipi_handler_c(state: *mut State) {
         return;
     }
 
-    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
-        send_eoi(SCHED_IPI_VECTOR);
+    if platform::current_is_in_interrupt() {
+        platform::end_interrupt(platform::scheduler_ipi_vector());
         return;
     }
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
-    let cpu_id = current_cpu_id();
+    let cpu_id = platform::current_cpu_id();
 
     SCHEDULER.on_ipi(state, cpu_id);
 }
@@ -761,125 +736,30 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
         return;
     }
 
-    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+    if platform::current_is_in_interrupt() {
         return;
     }
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
-    let cpu_id = current_cpu_id();
+    let cpu_id = platform::current_cpu_id();
 
     SCHEDULER.on_timer_tick(state, cpu_id);
 }
 
 #[no_mangle]
 pub extern "C" fn ipi_eoi_only() {
-    crate::drivers::interrupt_index::send_eoi(SCHED_IPI_VECTOR);
-}
-
-#[unsafe(naked)]
-#[no_mangle]
-pub extern "C" fn ipi_entry() {
-    naked_asm!(
-        "/* {upper} {lower} {eoi_only} */",
-        "cli",
-        "push rax",
-        "mov  rax, {upper}",
-        "cmp  r10, rax",
-        "jne  9f",
-        "mov  rax, {lower}",
-        "cmp  r11, rax",
-        "jne  9f",
-        "pop  rax",
-
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-
-        "mov  rcx, rsp",
-        "mov  rbx, rsp",
-        "cld",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {handler}",
-        "mov  rsp, rbx",
-
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
-        "iretq",
-
-        "9:",
-        "pop  rax",
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-        "cld",
-        "mov  rbx, rsp",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {eoi_only}",
-        "mov  rsp, rbx",
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
-        "iretq",
-
-        upper = const IDLE_UUID_UPPER,
-        lower = const IDLE_MAGIC_LOWER,
-        handler = sym ipi_handler_c,
-        eoi_only = sym ipi_eoi_only,
-    );
-}
-
-#[unsafe(naked)]
-pub extern "C" fn yield_interrupt_entry() {
-    naked_asm!(
-        "cli",
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-
-        "mov  rcx, rsp",
-        "mov  rbx, rsp",
-        "cld",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {handler}",
-        "mov  rsp, rbx",
-
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
-        "iretq",
-
-        handler = sym yield_handler_c,
-    );
-}
-
-#[unsafe(naked)]
-pub extern "C" fn task_return_trampoline() -> ! {
-    naked_asm!(
-        "cld",
-        "sub rsp, 8",
-        "mov qword ptr [rsp], 0",
-        "jmp {task_end}",
-        task_end = sym kernel_task_end,
-    );
+    platform::end_interrupt(platform::scheduler_ipi_vector());
 }
 
 pub extern "C" fn kernel_task_end() -> ! {
     crate::memory::heap::mimalloc_thread_done();
 
-    interrupts::without_interrupts(|| {
-        let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
+    platform::with_interrupts_disabled(|| {
+        let task = SCHEDULER
+            .get_current_task(platform::current_cpu_id())
+            .unwrap();
         task.terminate();
     });
 

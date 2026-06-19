@@ -1,0 +1,414 @@
+use crate::structs::range_tracker::RangeTracker;
+use alloc::sync::Arc;
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::DmaPciDeviceIdentity;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMmuError {
+    NoBackingFrame,
+    IovaSpaceExhausted,
+    NotMapped,
+    HardwareError,
+    Unsupported,
+    InvalidDevice,
+    InvalidDomain,
+    InvalidRange,
+}
+
+pub type DeviceMmuResult<T> = Result<T, DeviceMmuError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMmuMapPermissions {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceMmuCapabilities {
+    pub supported_page_sizes: &'static [u64],
+    pub supported_superpage_sizes: &'static [u64],
+    pub input_address_bits: u8,
+    pub output_address_bits: u8,
+    pub page_table_alignment: u64,
+    pub invalidation_granularity: u64,
+    pub segment_boundary: u64,
+    pub device_page_sizes_match_cpu_page_sizes: bool,
+    pub supports_range_invalidation: bool,
+    pub supports_domain_invalidation: bool,
+    pub reserved: u32,
+}
+
+impl DeviceMmuCapabilities {
+    pub const fn empty() -> Self {
+        Self {
+            supported_page_sizes: &[],
+            supported_superpage_sizes: &[],
+            input_address_bits: 0,
+            output_address_bits: 0,
+            page_table_alignment: 0,
+            invalidation_granularity: 0,
+            segment_boundary: 0,
+            device_page_sizes_match_cpu_page_sizes: false,
+            supports_range_invalidation: false,
+            supports_domain_invalidation: false,
+            reserved: 0,
+        }
+    }
+
+    pub fn base_page_size(self) -> Option<u64> {
+        self.supported_page_sizes
+            .iter()
+            .copied()
+            .filter(|size| *size != 0)
+            .min()
+    }
+
+    pub fn supports_page_size(self, page_size: u64) -> bool {
+        self.supported_page_sizes.contains(&page_size)
+            || self.supported_superpage_sizes.contains(&page_size)
+    }
+
+    pub fn validate(self) -> DeviceMmuResult<()> {
+        let Some(base_page_size) = self.base_page_size() else {
+            return Err(DeviceMmuError::InvalidDomain);
+        };
+
+        if !base_page_size.is_power_of_two() {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        for size in self
+            .supported_page_sizes
+            .iter()
+            .chain(self.supported_superpage_sizes.iter())
+            .copied()
+        {
+            if size == 0 || !size.is_power_of_two() || size % base_page_size != 0 {
+                return Err(DeviceMmuError::InvalidDomain);
+            }
+        }
+
+        if self.input_address_bits == 0
+            || self.input_address_bits > u64::BITS as u8
+            || self.output_address_bits == 0
+            || self.output_address_bits > u64::BITS as u8
+        {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        let page_table_alignment = self.page_table_alignment.max(base_page_size);
+        if !page_table_alignment.is_power_of_two() {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        let invalidation_granularity = self.invalidation_granularity.max(base_page_size);
+        if !invalidation_granularity.is_power_of_two() {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceMmuBackendInfo {
+    pub public_vendor_code: u8,
+    pub name: &'static str,
+    pub capabilities: DeviceMmuCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMmuDeviceIdentity {
+    Pci(DmaPciDeviceIdentity),
+    Platform(DeviceMmuPlatformDeviceIdentity),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceMmuDomainInfo {
+    pub domain_id: u64,
+    pub translation_unit_index: u32,
+    pub iova_start: u64,
+    pub iova_end: u64,
+    pub capabilities: DeviceMmuCapabilities,
+}
+
+#[derive(Debug)]
+pub struct DeviceMmuDomain {
+    domain_id: u64,
+    translation_unit_index: u32,
+    capabilities: DeviceMmuCapabilities,
+    iova_tracker: RangeTracker,
+}
+
+impl DeviceMmuDomain {
+    pub fn new(info: DeviceMmuDomainInfo) -> DeviceMmuResult<Self> {
+        info.capabilities.validate()?;
+
+        let granularity = info
+            .capabilities
+            .base_page_size()
+            .ok_or(DeviceMmuError::InvalidDomain)?;
+
+        Ok(Self {
+            domain_id: info.domain_id,
+            translation_unit_index: info.translation_unit_index,
+            capabilities: info.capabilities,
+            iova_tracker: RangeTracker::new_with_granularity(
+                info.iova_start,
+                info.iova_end,
+                granularity,
+            ),
+        })
+    }
+
+    #[inline]
+    pub fn domain_id(&self) -> u64 {
+        self.domain_id
+    }
+
+    #[inline]
+    pub fn translation_unit_index(&self) -> u32 {
+        self.translation_unit_index
+    }
+
+    #[inline]
+    pub fn capabilities(&self) -> DeviceMmuCapabilities {
+        self.capabilities
+    }
+
+    #[inline]
+    pub fn device_page_size(&self) -> u64 {
+        self.capabilities.base_page_size().unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn alloc_iova(&self, size: u64) -> Option<u64> {
+        self.iova_tracker.alloc_auto(size).map(|addr| addr.as_u64())
+    }
+
+    #[inline]
+    pub fn free_iova(&self, base: u64, size: u64) {
+        self.iova_tracker.dealloc(base, size);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceMmuAttachment {
+    pub attachment_id: u64,
+    pub domain_id: u64,
+    pub translation_unit_index: u32,
+    pub reserved: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappingRecord {
+    pub iova_base: u64,
+    pub page_count: u32,
+    pub is_identity: bool,
+}
+
+pub trait DeviceMmuBackend: Send + Sync {
+    fn info(&self) -> DeviceMmuBackendInfo;
+
+    fn create_domain(
+        &self,
+        identity: DeviceMmuDeviceIdentity,
+    ) -> DeviceMmuResult<DeviceMmuDomainInfo>;
+
+    fn destroy_domain(&self, domain: &DeviceMmuDomain);
+
+    fn attach_device(
+        &self,
+        domain: &DeviceMmuDomain,
+        identity: DeviceMmuDeviceIdentity,
+    ) -> DeviceMmuResult<DeviceMmuAttachment>;
+
+    fn detach_device(&self, domain: &DeviceMmuDomain, attachment: DeviceMmuAttachment);
+
+    fn map_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        permissions: DeviceMmuMapPermissions,
+    ) -> DeviceMmuResult<()>;
+
+    fn unmap_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        page_count: u32,
+    ) -> DeviceMmuResult<()>;
+
+    fn invalidate_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        len: u64,
+    ) -> DeviceMmuResult<()>;
+
+    fn invalidate_domain(&self, domain: &DeviceMmuDomain) -> DeviceMmuResult<()>;
+}
+
+#[derive(Clone)]
+pub struct DeviceMmuSystem {
+    backend: Arc<dyn DeviceMmuBackend>,
+}
+
+impl DeviceMmuSystem {
+    pub fn new(backend: Arc<dyn DeviceMmuBackend>) -> Self {
+        Self { backend }
+    }
+
+    pub fn from_backend<B>(backend: B) -> Self
+    where
+        B: DeviceMmuBackend + 'static,
+    {
+        Self {
+            backend: Arc::new(backend),
+        }
+    }
+
+    #[inline]
+    pub fn info(&self) -> DeviceMmuBackendInfo {
+        self.backend.info()
+    }
+
+    #[inline]
+    pub fn public_vendor_code(&self) -> u8 {
+        self.backend.info().public_vendor_code
+    }
+
+    pub fn create_domain(
+        &self,
+        identity: DeviceMmuDeviceIdentity,
+    ) -> DeviceMmuResult<Arc<DeviceMmuDomain>> {
+        let info = self.backend.create_domain(identity)?;
+        info.capabilities.validate()?;
+        Ok(Arc::new(DeviceMmuDomain::new(info)?))
+    }
+
+    pub fn destroy_domain(&self, domain: &DeviceMmuDomain) {
+        self.backend.destroy_domain(domain);
+    }
+
+    pub fn attach_device(
+        &self,
+        domain: &DeviceMmuDomain,
+        identity: DeviceMmuDeviceIdentity,
+    ) -> DeviceMmuResult<DeviceMmuAttachment> {
+        self.backend.attach_device(domain, identity)
+    }
+
+    pub fn detach_device(&self, domain: &DeviceMmuDomain, attachment: DeviceMmuAttachment) {
+        self.backend.detach_device(domain, attachment);
+    }
+
+    pub fn map_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        permissions: DeviceMmuMapPermissions,
+    ) -> DeviceMmuResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let page_size = domain.device_page_size();
+
+        if page_size == 0 {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        if (iova % page_size) != 0 || (phys % page_size) != 0 || (len % page_size) != 0 {
+            return Err(DeviceMmuError::InvalidRange);
+        }
+
+        self.backend.map_range(domain, iova, phys, len, permissions)
+    }
+
+    pub fn unmap_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        page_count: u32,
+    ) -> DeviceMmuResult<()> {
+        if page_count == 0 {
+            return Ok(());
+        }
+
+        let page_size = domain.device_page_size();
+
+        if page_size == 0 {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        if (iova % page_size) != 0 {
+            return Err(DeviceMmuError::InvalidRange);
+        }
+
+        self.backend.unmap_range(domain, iova, page_count)
+    }
+
+    pub fn unmap_record(
+        &self,
+        domain: &DeviceMmuDomain,
+        rec: MappingRecord,
+    ) -> DeviceMmuResult<()> {
+        self.unmap_range(domain, rec.iova_base, rec.page_count)?;
+
+        let len = rec.page_count as u64 * domain.device_page_size();
+
+        if !rec.is_identity {
+            domain.free_iova(rec.iova_base, len);
+        }
+        Ok(())
+    }
+
+    pub fn invalidate_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        len: u64,
+    ) -> DeviceMmuResult<()> {
+        if len == 0 {
+            return self.invalidate_domain(domain);
+        }
+
+        let page_size = domain.device_page_size();
+
+        if page_size == 0 {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        if (iova % page_size) != 0 || (len % page_size) != 0 {
+            return Err(DeviceMmuError::InvalidRange);
+        }
+
+        self.backend.invalidate_range(domain, iova, len)
+    }
+
+    pub fn invalidate_domain(&self, domain: &DeviceMmuDomain) -> DeviceMmuResult<()> {
+        self.backend.invalidate_domain(domain)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceMmuDiscoveryError {
+    FirmwareUnavailable,
+    NotPresent,
+    Unsupported,
+    MalformedFirmware,
+    Backend(DeviceMmuError),
+}
+
+pub type DeviceMmuDiscoveryResult<T> = Result<T, DeviceMmuDiscoveryError>;
+
+impl From<DeviceMmuError> for DeviceMmuDiscoveryError {
+    fn from(value: DeviceMmuError) -> Self {
+        Self::Backend(value)
+    }
+}

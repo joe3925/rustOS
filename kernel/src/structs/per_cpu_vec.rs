@@ -1,11 +1,11 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::drivers::interrupt_index::current_cpu_id;
+use crate::platform;
 
 /// Per-CPU storage backed by a Vec.
 ///
-/// Safe because `.get()` uses `current_cpu_id()` so each CPU only accesses its own slot.
+/// Safe because `.get()` uses the current platform CPU id so each CPU only accesses its own slot.
 /// No locks needed for per-CPU access after initialization.
 pub struct PerCpuVec<T> {
     data: UnsafeCell<Vec<T>>,
@@ -30,21 +30,21 @@ impl<T> PerCpuVec<T> {
         }
     }
 
-    /// Get reference to current CPU's slot (uses current_cpu_id())
+    /// Get reference to current CPU's slot.
     #[inline]
     pub fn get(&self) -> &T {
-        let id = current_cpu_id();
+        let id = platform::current_cpu_id();
         unsafe { &(&*self.data.get())[id] }
     }
 
     /// Get mutable reference to current CPU's slot
     #[inline]
     pub fn get_mut(&self) -> &mut T {
-        let id = current_cpu_id();
+        let id = platform::current_cpu_id();
         unsafe { &mut (&mut *self.data.get())[id] }
     }
 
-    /// Get by explicit ID (for cases like GDT init where LAPIC ID is used)
+    /// Get by explicit platform CPU ID.
     #[inline]
     pub fn get_by_id(&self, id: usize) -> &T {
         unsafe { &(&*self.data.get())[id] }

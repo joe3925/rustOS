@@ -1,11 +1,10 @@
 use alloc::sync::Arc;
 
 use kernel_executor::platform::{self as exec_platform, ExecutorPlatform, Job};
-use kernel_executor::runtime::runtime as exec_runtime;
 use spin::Once;
 
 use crate::static_handlers::{print, task_yield};
-use crate::structs::thread_pool::{BoundedThreadPool, ThreadPool};
+use crate::sync_platform::{BoundedThreadPool, ThreadPool};
 
 struct KernelExecutorPlatform {
     runtime_pool: Once<Arc<BoundedThreadPool>>,
@@ -87,12 +86,3 @@ static PLATFORM: KernelExecutorPlatform = KernelExecutorPlatform::new();
 pub fn init_executor_platform() {
     exec_platform::init(&PLATFORM);
 }
-
-pub use exec_runtime::block_on;
-pub use exec_runtime::spawn;
-pub use exec_runtime::spawn_blocking;
-pub use exec_runtime::spawn_blocking_many;
-pub use exec_runtime::spawn_detached;
-pub use exec_runtime::spawn_detached_in_executor_domain;
-pub use exec_runtime::try_steal_blocking_one;
-pub use exec_runtime::JoinAll;

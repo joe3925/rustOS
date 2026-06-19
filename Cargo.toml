@@ -2,15 +2,8 @@ cargo-features = ["profile-rustflags"]
 
 
 [workspace]
-members = [
-    "os",
-    "kernel_executor",
-    "kernel_abi",
-    "kernel_stub",
-    "kernel_sync",
-    "xtask",
-]
-exclude = ["rustos-api", "kernel"]
+members = ["boot/os", "boot/kernel_stub", "tooling/xtask"]
+exclude = ["kernel", "drivers", "libs", "third_party"]
 resolver = "2"
 
 [profile.dev]

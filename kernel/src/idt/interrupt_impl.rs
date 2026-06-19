@@ -1,4 +1,3 @@
-use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -8,20 +7,18 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
-    AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta,
-    IrqSafeRwLock, IrqWaitResult, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET, WAITER_PREPARING,
-    WAITER_SIGNALED, WAITER_WAITING, WaiterSlot,
+    AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqFrame, IrqHandle, IrqHandleInner, IrqIsrFn,
+    IrqMeta, IrqSafeRwLock, IrqWaitResult, WaiterSlot, WAITER_CLAIMED, WAITER_FREE,
+    WAITER_MAX_TICKET, WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING,
 };
 use spin::{Mutex, Once};
-use x86_64::structures::idt::InterruptStackFrame;
 
-use crate::drivers;
-use crate::drivers::interrupt_index::{APIC, current_cpu_id, get_current_logical_id, send_eoi};
+use crate::platform::{self, ActivePlatform, InterruptPlatform};
+
+pub type InterruptFrame = <ActivePlatform as InterruptPlatform>::InterruptFrame;
 
 const MAX_HANDLERS_PER_VECTOR: usize = 4;
 const MAX_TOTAL_REGISTRATIONS: usize = 64;
-const DYNAMIC_VECTOR_START: u8 = 0x60;
-const DYNAMIC_VECTOR_END: u8 = 0xEF;
 const RESERVED_ID: usize = usize::MAX;
 const NO_VECTOR: usize = usize::MAX;
 
@@ -169,7 +166,11 @@ impl IrqHandleOps for IrqHandleInner {
         let _ = self
             .pending_signals
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                if pending == 0 { Some(1) } else { Some(pending) }
+                if pending == 0 {
+                    Some(1)
+                } else {
+                    Some(pending)
+                }
             });
 
         self.signal_phase.fetch_add(1, Ordering::AcqRel);
@@ -277,7 +278,11 @@ fn next_waiter_ticket(handle: &IrqHandleInner) -> usize {
         .wrapping_add(1)
         & WAITER_MAX_TICKET;
 
-    if ticket == 0 { 1 } else { ticket }
+    if ticket == 0 {
+        1
+    } else {
+        ticket
+    }
 }
 
 fn try_consume_pending(handle: &IrqHandleInner) -> Option<IrqWaitResult> {
@@ -470,7 +475,7 @@ unsafe impl Sync for IrqReg {}
 extern "C" fn dummy_isr(
     _: u8,
     _: u32,
-    _: &mut InterruptStackFrame,
+    _: &mut InterruptFrame,
     _: IrqBorrowedHandle,
     _: usize,
 ) -> bool {
@@ -537,11 +542,11 @@ struct VectorAllocator;
 
 impl VectorAllocator {
     fn is_dynamic(vector: u8) -> bool {
-        vector >= DYNAMIC_VECTOR_START && vector <= DYNAMIC_VECTOR_END && vector != 0x80
+        platform::is_dynamic_vector(vector)
     }
 
     fn alloc() -> Option<u8> {
-        for vec in DYNAMIC_VECTOR_START..=DYNAMIC_VECTOR_END {
+        for vec in platform::dynamic_vector_range() {
             if Self::reserve(vec) {
                 return Some(vec);
             }
@@ -847,12 +852,13 @@ impl IrqManager {
         }
     }
 
-    fn dispatch(&self, vector: u8, frame: &mut InterruptStackFrame) {
-        let cpu = current_cpu_id() as u32;
+    fn dispatch(&self, vector: u8, frame: &mut InterruptFrame) {
+        let cpu = platform::current_cpu_id() as u32;
         let slot = &self.vectors[vector as usize];
         let regs = slot.regs.read();
 
         for r in regs.iter() {
+            let frame = unsafe { &mut *(frame as *mut InterruptFrame as *mut IrqFrame) };
             let claimed = (r.isr)(vector, cpu, frame, r.handle.as_ptr(), r.ctx);
 
             if claimed {
@@ -860,7 +866,7 @@ impl IrqManager {
             }
         }
 
-        send_eoi(vector);
+        platform::end_interrupt(vector);
     }
 }
 
@@ -877,7 +883,7 @@ fn null_handle() -> IrqHandle {
 extern "C" fn dummy_drop(_: usize) {}
 
 pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
-    if vector == 0x80 {
+    if platform::is_reserved_vector(vector) {
         return null_handle();
     }
 
@@ -907,33 +913,19 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     };
 
     if first_for_vector {
-        if let Some(gsi) = vector_to_gsi(vector) {
-            APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
-                gsi,
-                vector,
-                get_current_logical_id(),
-            );
+        if let Some(gsi) = platform::vector_to_gsi(vector) {
+            platform::unmask_gsi_any_cpu(gsi, vector);
         }
     }
 
     handle
 }
 
-fn vector_to_gsi(vector: u8) -> Option<u8> {
-    let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
-    let gsi = vector.wrapping_sub(base);
-
-    if gsi < 64 { Some(gsi) } else { None }
-}
-
 pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
-    let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
-
-    if gsi >= 64 {
+    let Some(vector) = platform::gsi_to_vector(gsi) else {
         return null_handle();
-    }
+    };
 
-    let vector = base + gsi;
     let handle_ptr = create_irq_handle_inner(DropHook::new(dummy_drop, 0));
 
     let first_for_vector = {
@@ -950,17 +942,13 @@ pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     };
 
     if first_for_vector {
-        APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
-            gsi,
-            vector,
-            get_current_logical_id(),
-        );
+        platform::unmask_gsi_any_cpu(gsi, vector);
     }
 
     handle
 }
 
-pub fn irq_dispatch(vector: u8, frame: &mut InterruptStackFrame) {
+pub fn irq_dispatch(vector: u8, frame: &mut InterruptFrame) {
     irq_manager().dispatch(vector, frame);
 }
 
@@ -1028,16 +1016,13 @@ pub fn irq_free_vector(vector: u8) -> bool {
     VectorAllocator::free_explicit(vector)
 }
 
-pub const SCHED_IPI_VECTOR: u8 = 0xF2;
-pub const TLB_FLUSH_VECTOR: u8 = 0xF3;
-
 pub struct InterruptGuard {
     was_in_interrupt: bool,
 }
 
 impl InterruptGuard {
     pub fn new() -> Self {
-        let was_in_interrupt = current_is_in_interrupt_atomic().swap(true, Ordering::AcqRel);
+        let was_in_interrupt = platform::enter_interrupt();
         InterruptGuard { was_in_interrupt }
     }
 
@@ -1049,36 +1034,6 @@ impl InterruptGuard {
 
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
-        if !self.was_in_interrupt {
-            current_is_in_interrupt_atomic().store(false, Ordering::Release);
-        }
-    }
-}
-
-pub struct NestedInterruptEnableGuard {
-    disable_on_drop: bool,
-}
-
-impl NestedInterruptEnableGuard {
-    #[inline(always)]
-    pub fn new() -> Self {
-        let was_enabled = x86_64::instructions::interrupts::are_enabled();
-
-        if !was_enabled {
-            x86_64::instructions::interrupts::enable();
-        }
-
-        Self {
-            disable_on_drop: !was_enabled,
-        }
-    }
-}
-
-impl Drop for NestedInterruptEnableGuard {
-    #[inline(always)]
-    fn drop(&mut self) {
-        if self.disable_on_drop {
-            x86_64::instructions::interrupts::disable();
-        }
+        platform::leave_interrupt(self.was_in_interrupt);
     }
 }

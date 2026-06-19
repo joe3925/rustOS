@@ -1,12 +1,12 @@
-use crate::scheduling::task::TaskHandle;
-use crate::util::MAX_CPUS;
+use crate::{platform::MAX_CPUS, scheduling::task::TaskHandle};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const CPU_SET_WORD_BITS: usize = u64::BITS as usize;
-const CPU_SET_WORDS: usize = (MAX_CPUS + CPU_SET_WORD_BITS - 1) / CPU_SET_WORD_BITS;
+const CPU_SET_WORDS: usize =
+    (crate::platform::MAX_CPUS + CPU_SET_WORD_BITS - 1) / CPU_SET_WORD_BITS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainId(pub u16);
@@ -268,12 +268,67 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
     }
 }
 
-pub struct DomainMaster {
-    domains: Box<[Box<dyn DomainOps>]>,
-    per_cpu_cursor: Box<[AtomicUsize]>,
+pub trait DomainAlgorithm: Send + Sync {
+    fn pick_next(
+        &self,
+        domains: &[Box<dyn DomainOps>],
+        per_cpu_cursor: &[AtomicUsize],
+        cpu_id: usize,
+        now_cycles: u64,
+    ) -> Option<TaskHandle>;
+}
+#[derive(Default)]
+pub struct RoundRobinDomainAlgorithm;
+
+impl DomainAlgorithm for RoundRobinDomainAlgorithm {
+    fn pick_next(
+        &self,
+        domains: &[Box<dyn DomainOps>],
+        per_cpu_cursor: &[AtomicUsize],
+        cpu_id: usize,
+        now_cycles: u64,
+    ) -> Option<TaskHandle> {
+        if domains.is_empty() {
+            return None;
+        }
+
+        let cursor = per_cpu_cursor
+            .get(cpu_id)
+            .unwrap_or_else(|| panic!("domain cursor missing for cpu {}", cpu_id));
+
+        let start = cursor.load(Ordering::Relaxed) % domains.len();
+
+        for offset in 0..domains.len() {
+            let idx = (start + offset) % domains.len();
+            let domain = &domains[idx];
+
+            if !domain.contains_cpu(cpu_id) {
+                continue;
+            }
+
+            if let Some(task) = domain.pick_next(cpu_id, now_cycles) {
+                cursor.store((idx + 1) % domains.len(), Ordering::Relaxed);
+                return Some(task);
+            }
+        }
+
+        None
+    }
 }
 
-impl DomainMaster {
+pub struct DomainMaster<A>
+where
+    A: DomainAlgorithm,
+{
+    domains: Box<[Box<dyn DomainOps>]>,
+    per_cpu_cursor: Box<[AtomicUsize]>,
+    algorithm: A,
+}
+
+impl<A> DomainMaster<A>
+where
+    A: DomainAlgorithm + Default,
+{
     pub fn new(domains: Box<[Box<dyn DomainOps>]>, cpu_count: usize) -> Self {
         let mut per_cpu_cursor = Vec::with_capacity(cpu_count);
         for _ in 0..cpu_count {
@@ -283,6 +338,7 @@ impl DomainMaster {
         Self {
             domains,
             per_cpu_cursor: per_cpu_cursor.into_boxed_slice(),
+            algorithm: A::default(),
         }
     }
 
@@ -295,30 +351,8 @@ impl DomainMaster {
     }
 
     pub fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
-        if self.domains.is_empty() {
-            return None;
-        }
-
-        let cursor = self
-            .per_cpu_cursor
-            .get(cpu_id)
-            .unwrap_or_else(|| panic!("domain cursor missing for cpu {}", cpu_id));
-        let start = cursor.load(Ordering::Relaxed) % self.domains.len();
-
-        for offset in 0..self.domains.len() {
-            let idx = (start + offset) % self.domains.len();
-            let domain = &self.domains[idx];
-            if !domain.contains_cpu(cpu_id) {
-                continue;
-            }
-
-            if let Some(task) = domain.pick_next(cpu_id, now_cycles) {
-                cursor.store((idx + 1) % self.domains.len(), Ordering::Relaxed);
-                return Some(task);
-            }
-        }
-
-        None
+        self.algorithm
+            .pick_next(&self.domains, &self.per_cpu_cursor, cpu_id, now_cycles)
     }
 
     pub fn maybe_balance(&self, current_tick: usize) {

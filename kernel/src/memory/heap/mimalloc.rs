@@ -1,9 +1,11 @@
-use crate::cpu;
 use crate::memory::heap::{
-    MIMALLOC_ARENA_START, MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE, mimalloc_arena_size,
-    mimalloc_heap_end,
+    mimalloc_arena_size, mimalloc_heap_end, MIMALLOC_ARENA_START, MIMALLOC_HEAP_START,
+    MIMALLOC_OS_HEAP_SIZE,
 };
-use crate::memory::paging::paging::unmap_range_unchecked;
+use crate::memory::paging::{
+    align_up_to_base_page, base_page_size, map_fresh_kernel_range_no_flush, unmap_range_unchecked,
+};
+use crate::platform;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
 use alloc::vec::Vec;
@@ -12,12 +14,9 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
-use x86_64::VirtAddr;
-use x86_64::align_up;
-use x86_64::instructions::interrupts::without_interrupts;
-use x86_64::structures::paging::PageTableFlags;
 
-const PAGE_SIZE: usize = 4096;
+use kernel_types::arch::{PageFlags, VirtAddr};
+
 const MIMALLOC_STATS_ENABLED: bool = false;
 const MIMALLOC_OS_ALLOC_ZEROES: bool = false;
 const MIMALLOC_COMMIT_GRANULARITY: usize = 2 * 1024 * 1024;
@@ -291,7 +290,7 @@ pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) ->
 #[inline(always)]
 fn mimalloc_stats_start() -> u64 {
     if MIMALLOC_STATS_ENABLED {
-        cpu::get_cycles()
+        platform::cycle_counter()
     } else {
         0
     }
@@ -303,7 +302,7 @@ fn mimalloc_record_alloc(size: usize, start: u64) {
         return;
     }
 
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_ALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
     MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
@@ -315,7 +314,7 @@ fn mimalloc_record_dealloc(size: usize, start: u64) {
         return;
     }
 
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_DEALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
     MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
@@ -327,7 +326,7 @@ fn mimalloc_record_realloc(old_size: usize, new_size: usize, start: u64) {
         return;
     }
 
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_REALLOC_OLD_BYTES.fetch_add(old_size, Ordering::Relaxed);
     MIMALLOC_REALLOC_NEW_BYTES.fetch_add(new_size, Ordering::Relaxed);
@@ -391,11 +390,11 @@ impl RangeAllocator {
     unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         self.ensure_init();
 
-        let size = align_up(size as u64, PAGE_SIZE as u64) as usize;
+        let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
         if size == 0 {
             return null_mut();
         }
-        let align = align.max(PAGE_SIZE);
+        let align = align.max(base_page_size() as usize);
 
         let Some((region, alloc_start)) = self.find_region(size, align) else {
             return null_mut();
@@ -431,13 +430,13 @@ impl RangeAllocator {
             return;
         }
 
-        let size = align_up(size as u64, PAGE_SIZE as u64) as usize;
+        let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
         self.add_free_region(addr, size);
         self.free_bytes = self.free_bytes.saturating_add(size).min(self.size);
     }
 
     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
-        if size < core::mem::size_of::<ListNode>() || size < PAGE_SIZE {
+        if size < core::mem::size_of::<ListNode>() || size < base_page_size() as usize {
             return;
         }
 
@@ -508,7 +507,7 @@ impl RangeAllocator {
         let region_start = region.start_addr();
         let region_end = region.end_addr();
 
-        let alloc_start = align_up(region_start as u64, align as u64) as usize;
+        let alloc_start = align_up_const(region_start, align);
         let alloc_end = alloc_start.checked_add(size).ok_or(())?;
 
         if alloc_end > region_end {
@@ -615,7 +614,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
         return false;
     }
 
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
 
     let mut tracker = MIMALLOC_COMMIT_TRACKER.lock();
     let commit_start =
@@ -647,15 +646,10 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
 
         let run_addr = tracker.track_start + run_start * MIMALLOC_COMMIT_GRANULARITY;
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
-        let start_addr = x86_64::VirtAddr::new(run_addr as u64);
+        let start_addr = VirtAddr::new(run_addr as u64);
 
-        let res = without_interrupts(|| {
-            crate::memory::paging::paging::map_fresh_kernel_range_no_flush(
-                start_addr,
-                run_size as u64,
-                flags,
-                true,
-            )
+        let res = platform::with_interrupts_disabled(|| {
+            map_fresh_kernel_range_no_flush(start_addr.into(), run_size as u64, flags, true)
         });
 
         if let Err(e) = res {
@@ -751,8 +745,8 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
         let run_addr = tracker.track_start + run_start * MIMALLOC_COMMIT_GRANULARITY;
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
 
-        without_interrupts(|| unsafe {
-            unmap_range_unchecked(VirtAddr::new(run_addr as u64), run_size as u64);
+        platform::with_interrupts_disabled(|| unsafe {
+            unmap_range_unchecked(VirtAddr::new(run_addr as u64).into(), run_size as u64);
         });
 
         tracker.clear_range(run_start, chunk);
@@ -765,13 +759,16 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
 #[inline(always)]
 fn mimalloc_record_commit_cycles(start: u64) {
     if MIMALLOC_STATS_ENABLED {
-        MIMALLOC_COMMIT_CYCLES.fetch_add(cpu::get_cycles().wrapping_sub(start), Ordering::Relaxed);
+        MIMALLOC_COMMIT_CYCLES.fetch_add(
+            platform::cycle_counter().wrapping_sub(start),
+            Ordering::Relaxed,
+        );
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void {
-    let ptr = without_interrupts(|| {
+    let ptr = platform::with_interrupts_disabled(|| {
         MIMALLOC_OS_ALLOCATOR
             .lock()
             .alloc(size, alignment)
@@ -792,7 +789,9 @@ pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
     if !addr.is_null() {
-        without_interrupts(|| MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size));
+        platform::with_interrupts_disabled(|| {
+            MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size)
+        });
     }
 }
 
@@ -811,8 +810,8 @@ pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
 
 #[no_mangle]
 pub extern "C" fn rustos_mi_clock_now() -> u64 {
-    let cycles = crate::cpu::get_cycles();
-    let hz = crate::drivers::interrupt_index::TSC_HZ.load(Ordering::Relaxed);
+    let cycles = platform::cycle_counter();
+    let hz = platform::cycle_counter_frequency_hz();
     if hz == 0 {
         cycles
     } else {
@@ -826,7 +825,7 @@ pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> b
         return false;
     }
 
-    let mut state = crate::cpu::get_cycles()
+    let mut state = platform::cycle_counter()
         ^ (buf as u64).rotate_left(17)
         ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let bytes = core::slice::from_raw_parts_mut(buf.cast::<u8>(), len);
@@ -842,8 +841,8 @@ pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}
 
 #[no_mangle]
 pub extern "C" fn rustos_mi_thread_yield() {
-    if x86_64::instructions::interrupts::are_enabled() {
-        x86_64::instructions::hlt();
+    if platform::interrupts_enabled() {
+        platform::enable_interrupts_and_halt();
     } else {
         core::hint::spin_loop();
     }

@@ -1,0 +1,4 @@
+image = "devicetree.dll"
+start = "demand"
+role = "function"
+hwids = ["FDT\\ROOT", "FDT\\BUS"]

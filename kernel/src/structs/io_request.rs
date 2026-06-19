@@ -9,13 +9,12 @@ use core::task::{Context, Poll, Waker};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::status::FileStatus;
 use spin::Mutex;
-use x86_64::instructions::interrupts;
-use x86_64::registers::control::Cr3;
 
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
-use crate::memory::paging::constants::KERNEL_SPACE_BASE;
+use crate::memory::paging::{base_page_size, kernel_space_base};
 use crate::object_manager::{Object, ObjectPayload, OBJECT_MANAGER};
+use crate::platform;
 use crate::util::generate_guid;
 
 pub type RequestId = u64;
@@ -475,7 +474,7 @@ impl IoRequestTable {
                 IoRequestState::Running => return Ok(CompleteTransition::Normal),
                 IoRequestState::CancelRequested => return Ok(CompleteTransition::Cancelled),
                 IoRequestState::CompleteQueued | IoRequestState::Reaped | IoRequestState::Free => {
-                    return Err(RequestTableError::AlreadyComplete)
+                    return Err(RequestTableError::AlreadyComplete);
                 }
             }
         }
@@ -491,7 +490,7 @@ impl IoRequestTable {
                 IoRequestState::Submitted | IoRequestState::Running => CompleteTransition::Normal,
                 IoRequestState::CancelRequested => CompleteTransition::Cancelled,
                 IoRequestState::CompleteQueued | IoRequestState::Reaped | IoRequestState::Free => {
-                    return Err(RequestTableError::AlreadyComplete)
+                    return Err(RequestTableError::AlreadyComplete);
                 }
             };
 
@@ -537,7 +536,7 @@ impl IoRequestTable {
                 }
                 IoRequestState::CancelRequested => return Ok(()),
                 IoRequestState::CompleteQueued | IoRequestState::Reaped | IoRequestState::Free => {
-                    return Err(RequestTableError::AlreadyComplete)
+                    return Err(RequestTableError::AlreadyComplete);
                 }
             }
         }
@@ -598,7 +597,7 @@ fn file_status(status: FileStatus) -> u64 {
 
 #[inline(always)]
 fn is_user_addr(addr: u64) -> bool {
-    (0x1000..KERNEL_SPACE_BASE).contains(&addr)
+    (base_page_size()..kernel_space_base().as_u64()).contains(&addr)
 }
 
 #[inline(always)]
@@ -613,17 +612,17 @@ fn user_ptr_range_ok(addr: u64, bytes: usize) -> bool {
             .is_some_and(|end| is_user_addr(end - 1))
 }
 
-fn with_process_cr3<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
-    let process_cr3 = owner.read().cr3;
-    let old = Cr3::read();
+fn with_process_address_space<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
+    let process_address_space_root = owner.read().address_space_root;
+    let old_address_space_root = crate::memory::paging::current_address_space_root();
 
-    interrupts::without_interrupts(|| {
+    platform::with_interrupts_disabled(|| {
         unsafe {
-            Cr3::write(process_cr3, old.1);
+            crate::memory::paging::switch_address_space_root(process_address_space_root);
         }
         let result = f();
         unsafe {
-            Cr3::write(old.0, old.1);
+            crate::memory::paging::switch_address_space_root(old_address_space_root);
         }
         result
     })
@@ -634,7 +633,7 @@ fn copy_to_user_bytes(owner: &ProgramHandle, dst: u64, bytes: &[u8]) -> Result<(
         return Err(IO_STATUS_INVALID_PARAMETER);
     }
 
-    with_process_cr3(owner, || unsafe {
+    with_process_address_space(owner, || unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
     });
 
@@ -647,7 +646,7 @@ fn copy_to_user_value<T: Clone>(owner: &ProgramHandle, dst: u64, value: &T) -> R
     }
 
     let cloned = value.clone();
-    with_process_cr3(owner, || unsafe {
+    with_process_address_space(owner, || unsafe {
         core::ptr::write_unaligned(dst as *mut T, cloned);
     });
 

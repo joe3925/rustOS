@@ -1,7 +1,7 @@
-use crate::blk::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
+use crate::blk::{SubmitRequestError, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::completion::CompletionToken;
 use crate::dev_ext::{DevExtInner, QueueState};
-use crate::{SubmitTasksGuard, drain_queue_completions, rdtsc, virtio_data_mapping_strategy};
+use crate::{SubmitTasksGuard, drain_queue_completions, virtio_data_mapping_strategy};
 use alloc::{sync::Arc, vec::Vec};
 use core::hint::spin_loop;
 use core::pin::Pin;
@@ -10,19 +10,18 @@ use kernel_api::benchmark::{
     BENCH_PARAMS_VERSION_1, BenchLevelResult, BenchSweepParams, BenchSweepResult,
 };
 use kernel_api::device::DeviceObject;
+use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    Described, DmaMapped, FromDevice, IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer,
-    IoBufferDmaSegments, PhysFramed,
+    Described, DmaMapped, FromDevice, IoBuffer, IoBufferDmaSegments, PhysFramed,
 };
 use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
-    unmap_range,
+    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
+    deallocate_kernel_range, unmap_range,
 };
 use kernel_api::pnp::pnp_send_request;
 use kernel_api::request::{Read, RequestHandle, TraversalPolicy};
-use kernel_api::runtime::spawn;
+use kernel_api::runtime::{cycle_counter, spawn};
 use kernel_api::status::DriverStatus;
-use kernel_api::x86_64::VirtAddr;
 use spin::Mutex;
 pub const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 pub const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
@@ -82,8 +81,7 @@ impl BenchConfig {
 
 fn bench_max_request_size(inner: &DevExtInner) -> u32 {
     let q0 = inner.get_queue(0);
-    let dma_max = (IOBUFFER_MAX_PAGE_CAPACITY * IOBUFFER_PAGE_SIZE) as u32;
-    (q0.max_request_bytes.min(dma_max).max(512)) & !511
+    q0.max_request_bytes.max(512) & !511
 }
 
 fn bench_max_inflight_queue0(inner: &DevExtInner) -> usize {
@@ -100,7 +98,7 @@ struct BenchDmaBuffer {
 impl BenchDmaBuffer {
     fn new_read(parent: &Arc<DeviceObject>, byte_len: u32) -> Result<Self, DriverStatus> {
         let byte_len = byte_len as usize;
-        let alloc_bytes = byte_len.div_ceil(IOBUFFER_PAGE_SIZE) * IOBUFFER_PAGE_SIZE;
+        let alloc_bytes = byte_len.div_ceil(dma_base_page_size()) * dma_base_page_size();
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         let base_va = allocate_auto_kernel_range_mapped_contiguous(alloc_bytes as u64, flags)
             .map_err(|_| DriverStatus::InsufficientResources)?;
@@ -162,7 +160,7 @@ impl Drop for BenchDmaBuffer {
 }
 
 struct BenchInflight<'a> {
-    start_tsc: u64,
+    start_cycles: u64,
     completion: CompletionToken<'a>,
     _buffer: BenchDmaBuffer,
 }
@@ -195,7 +193,7 @@ fn submit_bench_read<'a>(
         None => return Ok(None),
     };
     let mut completion = Some(completion);
-    let mut start_tsc = 0u64;
+    let mut start_cycles = 0u64;
 
     let submitted = {
         let mut vq = bench_queue.queue.write();
@@ -206,7 +204,7 @@ fn submit_bench_read<'a>(
             dma_buffer.dma_segments(),
             false,
         ) {
-            Some(head) => {
+            Ok(head) => {
                 bench_queue
                     .completion_slots
                     .attach(head, completion.as_ref().expect("completion missing"));
@@ -218,19 +216,24 @@ fn submit_bench_read<'a>(
                     inner.notify_off_multiplier,
                     queue_full,
                 );
-                start_tsc = rdtsc();
+                start_cycles = cycle_counter();
                 true
             }
-            None => {
+            Err(SubmitRequestError::QueueFull) => {
                 vq.notify(inner.notify_base, inner.notify_off_multiplier);
                 false
+            }
+            Err(SubmitRequestError::TooManyDataSegments) => {
+                return Err(benchmark_device_error(
+                    "virtio-blk: benchmark read has too many DMA segments",
+                ));
             }
         }
     };
 
     if submitted {
         Ok(Some(BenchInflight {
-            start_tsc,
+            start_cycles,
             completion: completion.take().expect("completion missing"),
             _buffer: dma_buffer,
         }))
@@ -247,9 +250,9 @@ fn record_completion(
     batch_completed: &mut usize,
     first_error: &mut Option<DriverStatus>,
 ) {
-    let end_tsc = rdtsc();
+    let end_cycles = cycle_counter();
     if status == VIRTIO_BLK_S_OK {
-        lat_samples.push(end_tsc.saturating_sub(inflight.start_tsc));
+        lat_samples.push(end_cycles.saturating_sub(inflight.start_cycles));
     } else if first_error.is_none() {
         *first_error = Some(benchmark_status_error(status));
     }
@@ -376,7 +379,7 @@ async fn bench_reads_direct(
     let mut completed = 0u32;
     let mut irq_wait_wall_cycles = 0u64;
     let mut busy_cycles = 0u64;
-    let run_start_tsc = rdtsc();
+    let run_start_cycles = cycle_counter();
 
     while completed < total_requests {
         let batch_target = (total_requests - completed).min(inflight as u32) as usize;
@@ -428,10 +431,10 @@ async fn bench_reads_direct(
             }
 
             if use_interrupts {
-                let wait_start = rdtsc();
+                let wait_start = cycle_counter();
                 let (inflight_req, status) =
                     await_one_irq_completion(&mut slots, batch_submitted).await?;
-                let wait_end = rdtsc();
+                let wait_end = cycle_counter();
                 irq_wait_wall_cycles =
                     irq_wait_wall_cycles.saturating_add(wait_end.saturating_sub(wait_start));
 
@@ -456,10 +459,10 @@ async fn bench_reads_direct(
         }
     }
 
-    let run_end_tsc = rdtsc();
+    let run_end_cycles = cycle_counter();
 
     result.request_count = lat_samples.len() as u32;
-    result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
+    result.total_time_cycles = run_end_cycles.saturating_sub(run_start_cycles);
 
     if result.total_time_cycles != 0 && use_interrupts {
         let pct = (irq_wait_wall_cycles as f64) * 100.0 / (result.total_time_cycles as f64);
@@ -514,10 +517,10 @@ async fn bench_read_via_request(
         });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let start_tsc = rdtsc();
+        let start_cycles = cycle_counter();
         let status = pnp_send_request(target, &mut req).await;
-        let end_tsc = rdtsc();
-        let cycles = end_tsc.saturating_sub(start_tsc);
+        let end_cycles = cycle_counter();
+        let cycles = end_cycles.saturating_sub(start_cycles);
         drop(req);
 
         *completion.lock() = Some(BenchRequestCompletion { status, cycles });
@@ -540,7 +543,7 @@ async fn bench_reads_request(
     let mut lat_samples: Vec<u64> = Vec::with_capacity(total_requests as usize);
     let mut current_sector = start_sector;
     let mut completed = 0u32;
-    let run_start_tsc = rdtsc();
+    let run_start_cycles = cycle_counter();
 
     while completed < total_requests {
         let batch_target = (total_requests - completed).min(inflight as u32) as usize;
@@ -589,10 +592,10 @@ async fn bench_reads_request(
         }
     }
 
-    let run_end_tsc = rdtsc();
+    let run_end_cycles = cycle_counter();
 
     result.request_count = lat_samples.len() as u32;
-    result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
+    result.total_time_cycles = run_end_cycles.saturating_sub(run_start_cycles);
     result.idle_pct = 0.0;
 
     if !lat_samples.is_empty() {
@@ -791,13 +794,13 @@ const BENCH_SPIN_CHUNK: u32 = 256;
 
 #[inline]
 pub fn bench_spin_chunk_and_count(busy_cycles: &mut u64) {
-    let t0 = rdtsc();
+    let t0 = cycle_counter();
     let mut i = 0u32;
     while i < BENCH_SPIN_CHUNK {
         spin_loop();
         i += 1;
     }
-    let t1 = rdtsc();
+    let t1 = cycle_counter();
     *busy_cycles = busy_cycles.saturating_add(t1.saturating_sub(t0));
 }
 
@@ -808,6 +811,3 @@ fn percentile_index_permille(n: usize, permille: usize) -> usize {
     }
     ((n - 1) * permille) / 1000
 }
-
-
-

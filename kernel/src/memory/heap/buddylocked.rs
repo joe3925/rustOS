@@ -2,9 +2,9 @@ use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
-use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::memory::heap::HEAP_START;
+use crate::platform::with_interrupts_disabled;
 
 #[cfg(feature = "allocator-buddy")]
 use crate::memory::heap::HEAP_SIZE;
@@ -28,7 +28,7 @@ impl BuddyLocked {
     #[inline(always)]
     unsafe fn ensure_init(&self) {
         if !self.init.load(Ordering::Acquire) {
-            without_interrupts(|| {
+            with_interrupts_disabled(|| {
                 if !self.init.load(Ordering::Acquire) {
                     #[cfg(feature = "allocator-mimalloc")]
                     let size = BOOTSTRAP_HEAP_SIZE as usize;
@@ -43,7 +43,7 @@ impl BuddyLocked {
     }
 
     pub fn free_memory(&self) -> usize {
-        without_interrupts(|| {
+        with_interrupts_disabled(|| {
             let inner = self.inner.lock();
             inner.stats_total_bytes() - inner.stats_alloc_actual()
         })
@@ -53,7 +53,7 @@ impl BuddyLocked {
 unsafe impl GlobalAlloc for BuddyLocked {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.ensure_init();
-        without_interrupts(|| self.inner.lock().alloc(layout))
+        with_interrupts_disabled(|| self.inner.lock().alloc(layout))
             .expect("kernel heap overflow")
             .as_ptr()
     }
@@ -68,7 +68,7 @@ unsafe impl GlobalAlloc for BuddyLocked {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         self.ensure_init();
-        without_interrupts(|| {
+        with_interrupts_disabled(|| {
             self.inner.lock().dealloc(
                 NonNull::new(ptr).expect("null ptr passed to kernel heap dealloc"),
                 layout,

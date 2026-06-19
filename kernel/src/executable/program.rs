@@ -1,3 +1,4 @@
+use crate::platform::user_vm_layout;
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
     string::{String, ToString},
@@ -11,28 +12,20 @@ use kernel_types::status::LoadError::NoSuchSymbol;
 use kernel_types::{device::ModuleHandle, fs::Path, memory::PeInfo, status::PageMapError};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
-use x86_64::{
-    instructions::hlt,
-    registers::control::Cr3,
-    structures::paging::{PageTableFlags, PhysFrame},
-    VirtAddr,
-};
 
 use crate::{
     executable::pe_loadable::PELoader,
-    memory::paging::paging::map_range_with_huge_pages,
     object_manager::{Object, ObjectPayload, OBJECT_MANAGER},
+    platform,
     scheduling::task::TaskHandle,
     util::generate_guid,
 };
 use crate::{
-    memory::paging::{
-        frame_alloc::BootInfoFrameAllocator, paging::unmap_range_unchecked, tables::init_mapper,
-    },
+    memory::paging::{map_range, unmap_range_unchecked, AddressSpaceRoot},
     scheduling::scheduler::SCHEDULER,
     structs::range_tracker::RangeTracker,
-    util::boot_info,
 };
+use kernel_types::arch::{PageFlags, VirtAddr};
 
 use kernel_types::status::LoadError;
 
@@ -203,7 +196,7 @@ pub struct Program {
     pub main_thread: Option<TaskHandle>,
     pub managed_threads: Mutex<Vec<TaskHandle>>,
     pub modules: RwLock<Vec<ModuleHandle>>,
-    pub cr3: PhysFrame,
+    pub address_space_root: AddressSpaceRoot,
     pub tracker: Arc<RangeTracker>,
 
     pub handle_table: RwLock<HandleTable>,
@@ -220,7 +213,7 @@ impl Program {
         title: String,
         image_path: Path,
         image_base: VirtAddr,
-        cr3: PhysFrame,
+        address_space_root: AddressSpaceRoot,
         tracker: Arc<RangeTracker>,
     ) -> Self {
         let working_dir = image_path.parent().unwrap_or(image_path.clone());
@@ -233,7 +226,7 @@ impl Program {
             main_thread: None,
             managed_threads: Mutex::new(Vec::new()),
             modules: RwLock::new(Vec::new()),
-            cr3,
+            address_space_root,
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
             working_dir,
@@ -253,38 +246,20 @@ impl Program {
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
 
-        let old_cr3 = Cr3::read();
+        let old_address_space_root = crate::memory::paging::current_address_space_root();
 
-        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-            Cr3::write(self.cr3, old_cr3.1);
+        platform::with_interrupts_disabled(|| unsafe {
+            crate::memory::paging::switch_address_space_root(self.address_space_root);
         });
 
         let res = (|| {
-            let boot_info = boot_info();
-            let phys_mem_offset =
-                VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+            let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
 
-            let mut mapper = init_mapper(phys_mem_offset);
-            let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-
-            let flags = PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE;
-
-            unsafe {
-                map_range_with_huge_pages(
-                    &mut mapper,
-                    start,
-                    end.as_u64() - start.as_u64(),
-                    &mut frame_alloc,
-                    flags,
-                    false,
-                )
-            }
+            unsafe { map_range(start.into(), end.as_u64() - start.as_u64(), flags, false) }
         })();
 
         unsafe {
-            Cr3::write(old_cr3.0, old_cr3.1);
+            crate::memory::paging::switch_address_space_root(old_address_space_root);
         }
 
         res
@@ -292,77 +267,81 @@ impl Program {
     pub unsafe fn virtual_map(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
         let start = virt_addr;
         let end = virt_addr + size as u64;
+        let old_address_space_root = crate::memory::paging::current_address_space_root();
 
-        let old_cr3 = Cr3::read();
-        Cr3::write(self.cr3, old_cr3.1);
+        unsafe {
+            crate::memory::paging::switch_address_space_root(self.address_space_root);
+        }
 
-        let result = (|| {
-            let boot_info = boot_info();
-            let phys_mem_offset = VirtAddr::new(
-                boot_info
-                    .physical_memory_offset
-                    .into_option()
-                    .expect("phys mem off missing"),
-            );
-            let mut mapper = init_mapper(phys_mem_offset);
-            let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-            let flags = PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::USER_ACCESSIBLE;
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
+        let result =
+            unsafe { map_range(start.into(), end.as_u64() - start.as_u64(), flags, false) };
 
-            map_range_with_huge_pages(
-                &mut mapper,
-                start,
-                end.as_u64() - start.as_u64(),
-                &mut frame_alloc,
-                flags,
-                false,
-            )?;
-            Ok(())
-        })();
+        unsafe {
+            crate::memory::paging::switch_address_space_root(old_address_space_root);
+        }
 
-        Cr3::write(old_cr3.0, old_cr3.1);
         result
     }
     pub fn virtual_map_auto_alloc(&self, size: usize) -> Result<VirtAddr, PageMapError> {
         let _guard = self.page_table_lock.lock();
-        let start = self
+        let start: VirtAddr = self
             .tracker
             .alloc_auto(size as u64)
-            .ok_or(PageMapError::NoMemory())?;
+            .ok_or(PageMapError::NoMemory())?
+            .into();
         let end = start + size as u64;
 
-        let old_cr3 = Cr3::read();
+        let old_address_space_root = crate::memory::paging::current_address_space_root();
 
-        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-            Cr3::write(self.cr3, old_cr3.1);
+        platform::with_interrupts_disabled(|| unsafe {
+            crate::memory::paging::switch_address_space_root(self.address_space_root);
         });
 
-        let boot_info = boot_info();
-        let phys_mem_offset =
-            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-
-        let mut mapper = init_mapper(phys_mem_offset);
-        let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-
-        let flags =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
 
         unsafe {
-            map_range_with_huge_pages(
-                &mut mapper,
-                start,
-                end.as_u64() - start.as_u64(),
-                &mut frame_alloc,
-                flags,
-                false,
-            )?;
+            map_range(start.into(), end.as_u64() - start.as_u64(), flags, false)?;
         }
         unsafe {
-            Cr3::write(old_cr3.0, old_cr3.1);
+            crate::memory::paging::switch_address_space_root(old_address_space_root);
         }
 
         Ok(start)
+    }
+    pub fn unmap_user_vm(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
+        let size = crate::memory::paging::align_up_to_base_page(size as u64)
+            .ok_or(PageMapError::NoMemory())?;
+
+        if size == 0 {
+            return Ok(());
+        }
+
+        let start = virt_addr.as_u64();
+        let end = start.checked_add(size).ok_or(PageMapError::NoMemory())?;
+        let layout = user_vm_layout();
+
+        if start < layout.start || end > layout.end {
+            return Err(PageMapError::NoMemory());
+        }
+
+        if start % layout.base_page_size != 0 {
+            return Err(PageMapError::NoMemory());
+        }
+
+        let _guard = self.page_table_lock.lock();
+
+        self.tracker.dealloc(start, size);
+
+        let old_address_space_root = crate::memory::paging::current_address_space_root();
+
+        platform::with_interrupts_disabled(|| unsafe {
+            crate::memory::paging::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::unmap_range_unchecked(virt_addr.into(), size);
+            crate::memory::paging::switch_address_space_root(old_address_space_root);
+        });
+
+        Ok(())
     }
     pub async fn load_module(&mut self, root_path: Path) -> Result<ModuleHandle, LoadError> {
         let mut queue = Vec::new();
@@ -415,7 +394,7 @@ impl Program {
         let managed = self.managed_threads.lock();
 
         loop {
-            hlt();
+            platform::enable_interrupts_and_halt();
 
             let mut running = managed.len() + 1;
 
@@ -437,7 +416,7 @@ impl Program {
         }
 
         for (start, end) in self.tracker.get_allocations() {
-            unsafe { unmap_range_unchecked(VirtAddr::new(start), end - start) };
+            unsafe { unmap_range_unchecked(VirtAddr::new(start).into(), end - start) };
         }
 
         Ok(())
@@ -453,7 +432,7 @@ impl Program {
 
             if have.eq_ignore_ascii_case(want) {
                 if let Some((_, rva)) = m.symbols.iter().find(|(name, _)| name == symbol_name) {
-                    return Ok(m.image_base + *rva as u64);
+                    return Ok((m.image_base + *rva as u64).into());
                 }
             }
         }
@@ -576,7 +555,7 @@ impl ProgramManager {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         prog.pid = pid;
         if let Some(ref mut task) = prog.main_thread {
-            x86_64::instructions::interrupts::without_interrupts(move || {
+            platform::with_interrupts_disabled(move || {
                 task.inner.write().parent_pid = pid;
             });
         }

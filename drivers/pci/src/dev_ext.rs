@@ -1,13 +1,13 @@
-// dev_ext.rs
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::device::DeviceObject;
-use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
+use kernel_api::kernel_types::pci::{EcamSegment, PciConfigAddress};
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
+use kernel_api::pci::{pci_read_config_u32, pci_write_config_u32};
 use kernel_api::request::{Pnp, Request, RequestData, RequestHandle};
 use kernel_api::status::{DriverStatus, PageMapError};
 
@@ -16,23 +16,10 @@ use kernel_api::pnp::{
     pnp_forward_request_to_next_lower,
 };
 
-use kernel_api::{
-    println,
-    x86_64::{PhysAddr, VirtAddr},
-};
-use spin::{Mutex, Once, RwLock};
+use kernel_api::println;
+use spin::{Once, RwLock};
 
-const PCI_CFG1_ADDR: u16 = 0xCF8;
-const PCI_CFG1_DATA: u16 = 0xCFC;
-static CFG1_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Clone, Copy, Debug)]
-pub struct McfgSegment {
-    pub base: u64,
-    pub seg: u16,
-    pub start_bus: u8,
-    pub end_bus: u8,
-}
+pub type McfgSegment = EcamSegment;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PrtEntry {
@@ -130,7 +117,7 @@ pub struct EcamSegmentMap {
 
 #[inline]
 fn ecam_phys_addr(seg: &McfgSegment, bus: u8, dev: u8, func: u8, offset: u16) -> u64 {
-    seg.base + ((bus as u64) << 20) + ((dev as u64) << 15) + ((func as u64) << 12) + (offset as u64)
+    seg.config_space_phys_addr(bus, dev, func, offset)
 }
 
 fn probe_msix_capability(cfg_base: VirtAddr) -> Option<MsixInfo> {
@@ -612,12 +599,7 @@ pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
                 let seg = u16::from_le_bytes([blob[off + 8], blob[off + 9]]);
                 let sb = blob[off + 10];
                 let eb = blob[off + 11];
-                segs.push(McfgSegment {
-                    base,
-                    seg,
-                    start_bus: sb,
-                    end_bus: eb,
-                });
+                segs.push(McfgSegment::new(base, seg, sb, eb));
                 off += 12;
             }
             break;
@@ -686,124 +668,73 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
 }
 
 #[inline]
-fn cfg1_addr(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
-    0x8000_0000
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & !3)
+fn platform_config_address(bus: u8, dev: u8, func: u8, offset: u16) -> PciConfigAddress {
+    PciConfigAddress::new(0, bus, dev, func, offset)
 }
 
 #[inline]
-unsafe fn outl(port: u16, val: u32) {
-    unsafe {
-        asm!(
-            "out dx, eax",
-            in("dx") port,
-            in("eax") val,
-            options(nostack, preserves_flags)
-        );
+fn platform_config_read32(bus: u8, dev: u8, func: u8, offset: u16) -> Option<u32> {
+    pci_read_config_u32(platform_config_address(bus, dev, func, offset))
+}
+
+#[inline]
+fn platform_config_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) -> Option<()> {
+    pci_write_config_u32(platform_config_address(bus, dev, func, offset), val).then_some(())
+}
+
+pub fn platform_config_access_available() -> bool {
+    platform_config_read32(0, 0, 0, 0x00).is_some()
+}
+
+fn probe_msix_capability_config(bus: u8, dev: u8, func: u8) -> Option<MsixInfo> {
+    let status = (platform_config_read32(bus, dev, func, 0x04)? >> 16) as u16;
+    if (status & (1 << 4)) == 0 {
+        return None;
     }
-}
 
-#[inline]
-unsafe fn inl(port: u16) -> u32 {
-    unsafe {
-        let v: u32;
-        asm!(
-            "in eax, dx",
-            in("dx") port,
-            out("eax") v,
-            options(nostack, preserves_flags)
-        );
-        v
-    }
-}
+    let mut cap_ptr = (platform_config_read32(bus, dev, func, 0x34)? & 0xFF) as u16;
 
-#[inline]
-unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
-    unsafe {
-        outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-        inl(PCI_CFG1_DATA)
-    }
-}
+    while cap_ptr != 0 && cap_ptr < 0x100 {
+        let cap_header = platform_config_read32(bus, dev, func, cap_ptr)?;
+        let cap_id = (cap_header & 0xFF) as u8;
+        let next_ptr = ((cap_header >> 8) & 0xFF) as u16;
 
-#[inline]
-unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
-    unsafe {
-        outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-        outl(PCI_CFG1_DATA, val);
-    }
-}
+        if cap_id == 0x11 {
+            let msg_ctrl = (cap_header >> 16) as u16;
+            let table_size = (msg_ctrl & 0x7FF) + 1;
 
-#[inline]
-fn cfg1_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
-    let _g = CFG1_LOCK.lock();
-    unsafe { cfg1_read32_unlocked(bus, dev, func, offset) }
-}
+            let table_reg = platform_config_read32(bus, dev, func, cap_ptr + 4)?;
+            let table_bar = (table_reg & 0x7) as u8;
+            let table_offset = table_reg & !0x7;
 
-#[inline]
-fn cfg1_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) -> u32 {
-    let _g = CFG1_LOCK.lock();
-    unsafe {
-        cfg1_write32_unlocked(bus, dev, func, offset, val);
-        val
-    }
-}
+            let pba_reg = platform_config_read32(bus, dev, func, cap_ptr + 8)?;
+            let pba_bar = (pba_reg & 0x7) as u8;
+            let pba_offset = pba_reg & !0x7;
 
-unsafe fn probe_msix_capability_legacy(bus: u8, dev: u8, func: u8) -> Option<MsixInfo> {
-    unsafe {
-        let status = (cfg1_read32_unlocked(bus, dev, func, 0x04) >> 16) as u16;
-        if (status & (1 << 4)) == 0 {
-            return None;
+            return Some(MsixInfo {
+                cap_offset: cap_ptr,
+                table_bar,
+                table_offset,
+                table_size,
+                pba_bar,
+                pba_offset,
+            });
         }
-
-        let mut cap_ptr = (cfg1_read32_unlocked(bus, dev, func, 0x34) & 0xFF) as u16;
-
-        while cap_ptr != 0 && cap_ptr < 0x100 {
-            let cap_header = cfg1_read32_unlocked(bus, dev, func, cap_ptr);
-            let cap_id = (cap_header & 0xFF) as u8;
-            let next_ptr = ((cap_header >> 8) & 0xFF) as u16;
-
-            if cap_id == 0x11 {
-                let msg_ctrl = (cap_header >> 16) as u16;
-                let table_size = (msg_ctrl & 0x7FF) + 1;
-
-                let table_reg = cfg1_read32_unlocked(bus, dev, func, cap_ptr + 4);
-                let table_bar = (table_reg & 0x7) as u8;
-                let table_offset = table_reg & !0x7;
-
-                let pba_reg = cfg1_read32_unlocked(bus, dev, func, cap_ptr + 8);
-                let pba_bar = (pba_reg & 0x7) as u8;
-                let pba_offset = pba_reg & !0x7;
-
-                return Some(MsixInfo {
-                    cap_offset: cap_ptr,
-                    table_bar,
-                    table_offset,
-                    table_size,
-                    pba_bar,
-                    pba_offset,
-                });
-            }
-            cap_ptr = next_ptr;
-        }
-        None
+        cap_ptr = next_ptr;
     }
+    None
 }
 
-pub fn header_type_legacy(bus: u8, dev: u8) -> Option<u8> {
-    let vid = cfg1_read32(bus, dev, 0, 0x00) & 0xFFFF;
+pub fn header_type_config(bus: u8, dev: u8) -> Option<u8> {
+    let vid = platform_config_read32(bus, dev, 0, 0x00)? & 0xFFFF;
     if vid == 0xFFFF {
         return None;
     }
-    Some(((cfg1_read32(bus, dev, 0, 0x0C) >> 16) & 0xFF) as u8)
+    Some(((platform_config_read32(bus, dev, 0, 0x0C)? >> 16) & 0xFF) as u8)
 }
 
-pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
-    let _g = CFG1_LOCK.lock();
-
-    let did_vid = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x00) };
+pub fn probe_function_config(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
+    let did_vid = platform_config_read32(bus, dev, func, 0x00)?;
     let vendor = did_vid & 0xFFFF;
     if vendor == 0xFFFF {
         return None;
@@ -811,25 +742,25 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
 
     let device_id = ((did_vid >> 16) & 0xFFFF) as u16;
     let vendor_id = (did_vid & 0xFFFF) as u16;
-    let command = (unsafe { cfg1_read32_unlocked(bus, dev, func, 0x04) } & 0xFFFF) as u16;
+    let command = (platform_config_read32(bus, dev, func, 0x04)? & 0xFFFF) as u16;
 
-    let class_rev = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x08) };
+    let class_rev = platform_config_read32(bus, dev, func, 0x08)?;
     let revision = (class_rev & 0xFF) as u8;
     let prog_if = ((class_rev >> 8) & 0xFF) as u8;
     let subclass = ((class_rev >> 16) & 0xFF) as u8;
     let class = ((class_rev >> 24) & 0xFF) as u8;
 
-    let hdr_type = ((unsafe { cfg1_read32_unlocked(bus, dev, func, 0x0C) } >> 16) & 0xFF) as u8;
+    let hdr_type = ((platform_config_read32(bus, dev, func, 0x0C)? >> 16) & 0xFF) as u8;
     let hdr_kind = hdr_type & 0x7F;
 
     let (ss_vid, ss_id) = if hdr_kind == 0x00 {
-        let ss = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x2C) };
+        let ss = platform_config_read32(bus, dev, func, 0x2C)?;
         ((ss & 0xFFFF) as u16, ((ss >> 16) & 0xFFFF) as u16)
     } else {
         (0, 0)
     };
 
-    let intr = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x3C) };
+    let intr = platform_config_read32(bus, dev, func, 0x3C)?;
     let irq_line = (intr & 0xFF) as u8;
     let irq_pin = ((intr >> 8) & 0xFF) as u8;
 
@@ -845,7 +776,7 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
     let mut i = 0;
     while i < max_bars {
         let off = 0x10 + (i as u16) * 4;
-        let orig = unsafe { cfg1_read32_unlocked(bus, dev, func, off) };
+        let orig = platform_config_read32(bus, dev, func, off)?;
         if orig == 0 {
             i += 1;
             continue;
@@ -853,9 +784,9 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
 
         if (orig & 0x1) == 0x1 {
             let base: u64 = (orig & 0xFFFF_FFFC) as u64;
-            unsafe { cfg1_write32_unlocked(bus, dev, func, off, 0xFFFF_FFFF) };
-            let mask = unsafe { cfg1_read32_unlocked(bus, dev, func, off) } & 0xFFFF_FFFC;
-            unsafe { cfg1_write32_unlocked(bus, dev, func, off, orig) };
+            platform_config_write32(bus, dev, func, off, 0xFFFF_FFFF)?;
+            let mask = platform_config_read32(bus, dev, func, off)? & 0xFFFF_FFFC;
+            platform_config_write32(bus, dev, func, off, orig)?;
             let size = ((!mask).wrapping_add(1)) as u64;
             bars[i] = Bar {
                 kind: BarKind::Io,
@@ -870,9 +801,9 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
             match mem_ty {
                 0b00 => {
                     let base = (orig & 0xFFFF_FFF0) as u64;
-                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, 0xFFFF_FFF0) };
-                    let mask = unsafe { cfg1_read32_unlocked(bus, dev, func, off) } & 0xFFFF_FFF0;
-                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, orig) };
+                    platform_config_write32(bus, dev, func, off, 0xFFFF_FFF0)?;
+                    let mask = platform_config_read32(bus, dev, func, off)? & 0xFFFF_FFF0;
+                    platform_config_write32(bus, dev, func, off, orig)?;
                     let size = ((!mask).wrapping_add(1)) as u64;
                     bars[i] = Bar {
                         kind: BarKind::Mem32,
@@ -883,15 +814,14 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
                     i += 1;
                 }
                 0b10 => {
-                    let orig_hi = unsafe { cfg1_read32_unlocked(bus, dev, func, off + 4) };
+                    let orig_hi = platform_config_read32(bus, dev, func, off + 4)?;
                     let base = ((orig_hi as u64) << 32) | ((orig as u64) & 0xFFFF_FFF0);
-                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, 0xFFFF_FFF0) };
-                    unsafe { cfg1_write32_unlocked(bus, dev, func, off + 4, 0xFFFF_FFFF) };
-                    let mask_lo =
-                        unsafe { cfg1_read32_unlocked(bus, dev, func, off) } & 0xFFFF_FFF0;
-                    let mask_hi = unsafe { cfg1_read32_unlocked(bus, dev, func, off + 4) };
-                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, orig) };
-                    unsafe { cfg1_write32_unlocked(bus, dev, func, off + 4, orig_hi) };
+                    platform_config_write32(bus, dev, func, off, 0xFFFF_FFF0)?;
+                    platform_config_write32(bus, dev, func, off + 4, 0xFFFF_FFFF)?;
+                    let mask_lo = platform_config_read32(bus, dev, func, off)? & 0xFFFF_FFF0;
+                    let mask_hi = platform_config_read32(bus, dev, func, off + 4)?;
+                    platform_config_write32(bus, dev, func, off, orig)?;
+                    platform_config_write32(bus, dev, func, off + 4, orig_hi)?;
                     let mask = ((mask_hi as u64) << 32) | (mask_lo as u64);
                     let size = ((!mask).wrapping_add(1)) as u64;
                     bars[i] = Bar {
@@ -909,7 +839,7 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
         }
     }
 
-    let msix = unsafe { probe_msix_capability_legacy(bus, dev, func) };
+    let msix = probe_msix_capability_config(bus, dev, func);
 
     Some(PciPdoExt {
         seg: 0,

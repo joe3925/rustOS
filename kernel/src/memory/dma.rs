@@ -1,90 +1,51 @@
-// TODO(rustos-iommu-dma): Follow-up work remaining after initial bring-up.
-//
-// High-priority correctness:
-// - Track and validate mapping ownership more strictly (cookie/device/domain consistency,
-//   stale-cookie behavior, and domain teardown ordering).
-// - Add explicit detach/cleanup behavior for device unregister and domain lifetime
-//   (including IOMMU-side detach where required by backend).
-//
-// IOMMU semantics / hardware completeness:
-// - Respect ACPI reserved regions (RMRR/IVMD) and enforce mapping restrictions.
-// - Add Intel/AMD fault/event reporting integration into kernel diagnostics.
-// - Evaluate per-range/page-selective invalidation instead of always domain-wide invalidation.
-//
-// DMA policy and feature completeness:
-// - Enforce per-device DMA constraints (DMA mask width, segment boundary constraints,
-//   max segment count/size policies).
-// - Implement bounce-buffer or remap fallback paths when direct mapping cannot satisfy
-//   device constraints.
-//
-// API / observability:
-// - Surface richer error distinctions (translation failure vs IOVA exhaustion vs HW fault).
-// - Add mapping/unmapping counters and per-device/domain telemetry for debugging.
-// - Decide whether to use `IommuDomain.mappings` for validation/accounting, or remove it
-//   if state is fully managed by `pending_unmaps`.
-//
-// Test coverage:
-// - Add unit/integration tests for all mapping strategies with:
-//   - aligned/unaligned buffers
-//   - multi-page and max-inline-page cases
-//   - fragmentation-heavy identity scenarios
-//   - map failure rollback correctness
-//   - unregister while mappings are live
-// - Add backend-specific tests for Intel VT-d and AMD-Vi invalidation behavior.
-//
-use crate::drivers::ACPI::{ACPI_TABLES, ACPIImpl};
 use crate::drivers::pnp::device::DevNodeExt;
-use acpi::sdt::{SdtHeader, Signature};
-use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
+use crate::memory::device_mmu::DeviceMmuAttachment;
+use crate::memory::device_mmu::DeviceMmuBackendInfo;
+use crate::memory::device_mmu::DeviceMmuDeviceIdentity;
+use crate::memory::device_mmu::DeviceMmuDomain;
+use crate::memory::device_mmu::DeviceMmuError;
+use crate::memory::device_mmu::DeviceMmuMapPermissions;
+use crate::memory::device_mmu::DeviceMmuSystem;
+use crate::memory::device_mmu::MappingRecord;
 use alloc::collections::BTreeMap;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
+use alloc::sync::Weak;
 use alloc::vec::Vec;
-use core::mem::size_of;
 use kernel_types::device::DeviceObject;
-use kernel_types::dma::{
-    BorrowedDmaMapping, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
-    DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, DmaDeviceHandle, DmaDeviceState, DmaMapError,
-    DmaMapped, DmaMappingStrategy, DmaPciDeviceIdentity, IOBUFFER_INLINE_SEGMENT_CAPACITY,
-    IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer, IoBufferDmaSegment,
-    IoBufferPageFrame, PhysFramed, ToDevice,
-};
+use kernel_types::dma::BorrowedDmaMapping;
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::DmaDeviceHandle;
+use kernel_types::dma::DmaDeviceState;
+use kernel_types::dma::DmaMapError;
+use kernel_types::dma::DmaMapped;
+use kernel_types::dma::DmaMappingStrategy;
+use kernel_types::dma::DmaPciDeviceIdentity;
+use kernel_types::dma::IoBuffer;
+use kernel_types::dma::IoBufferDmaMappingLayout;
+use kernel_types::dma::IoBufferPageFrame;
+use kernel_types::dma::PhysFramed;
+use kernel_types::dma::ToDevice;
+use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_types::status::DriverStatus;
-use raw_cpuid::CpuId;
-use spin::{Mutex, Once};
-
-use crate::memory::iommu::{self, IommuDomain, MappingRecord};
-
+use spin::Mutex;
+use spin::Once;
 static DMA_MANAGER: Once<DmaManager> = Once::new();
-
-enum PendingDmaSegments {
-    Contiguous {
-        dma_addr: u64,
-        byte_len: usize,
-    },
-    PageChunks {
-        iova_base: u64,
-        page_offset: usize,
-        byte_len: usize,
-    },
-    FixedChunks {
-        dma_addr: u64,
-        chunk_len: usize,
-        count: usize,
-    },
-    Identity {
-        frame_offset: usize,
-        byte_len: usize,
-    },
-}
 
 pub fn init_dma_manager() {
     let _ = DMA_MANAGER.call_once(DmaManager::new);
 }
-
+pub fn get_info() -> DeviceMmuBackendInfo {
+    manager().get_info()
+}
 pub fn register_pci_pdo(pdo: &Arc<DeviceObject>, identity: DmaPciDeviceIdentity) -> DriverStatus {
     manager().register_pci_pdo(pdo, identity)
 }
-
+pub fn register_platform_pdo(
+    pdo: &Arc<DeviceObject>,
+    identity: DeviceMmuPlatformDeviceIdentity,
+) -> DriverStatus {
+    manager().register_platform_pdo(pdo, identity)
+}
 pub fn open_device_handle(device: &Arc<DeviceObject>) -> Result<DmaDeviceHandle, DriverStatus> {
     manager().open_device_handle(device)
 }
@@ -97,18 +58,9 @@ pub fn unregister_device(device: &Arc<DeviceObject>) -> DriverStatus {
     manager().unregister_device(device)
 }
 
-pub fn platform_iommu_info() -> &'static PlatformIommuInfo {
-    manager().platform.as_ref()
-}
-
-// ---------------------------------------------------------------------------
-// IoBuffer mapping
-// ---------------------------------------------------------------------------
-
 struct PreparedDmaMapping {
     records: PendingMappingRecords,
-    segments: [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
-    segments_len: usize,
+    layout: IoBufferDmaMappingLayout,
 }
 
 pub fn map_buffer<'a>(
@@ -120,33 +72,18 @@ pub fn map_buffer<'a>(
     (IoBuffer<'a, PhysFramed, ToDevice>, DmaMapError),
 > {
     let m = manager();
+
     let key = match resolve_hardware_pdo(device) {
         Ok(pdo) => device_key(&pdo),
         Err(_) => return Err((buffer, DmaMapError::NoIommu)),
     };
 
-    let mut state = m.state.lock();
-    let Some(entry) = state.devices.get_mut(&key) else {
-        return Err((buffer, DmaMapError::NoIommu));
-    };
-    let Some(pdo) = entry.pdo.upgrade() else {
-        return Err((buffer, DmaMapError::NoIommu));
+    let active = match m.begin_mapping(key) {
+        Ok(active) => active,
+        Err(err) => return Err((buffer, err)),
     };
 
-    let domain = if let Some(domain) = entry.domain.as_ref() {
-        domain.clone()
-    } else {
-        let identity = match entry.identity {
-            RegisteredDmaIdentity::Pci(id) => id,
-        };
-        let Some(domain) = iommu::get_or_create_domain(key, identity) else {
-            return Err((buffer, DmaMapError::NoIommu));
-        };
-        entry.domain = Some(domain.clone());
-        domain
-    };
-
-    let prepared = match prepare_dma_mapping(&domain, &buffer, strategy) {
+    let prepared = match prepare_dma_mapping(&m.device_mmu, &active.domain, &buffer, strategy) {
         Ok(prepared) => prepared,
         Err(err) => return Err((buffer, err)),
     };
@@ -155,16 +92,19 @@ pub fn map_buffer<'a>(
         return Err((buffer, DmaMapError::RemappingUnavailable));
     }
 
-    let cookie = state.next_cookie;
+    let PreparedDmaMapping { records, layout } = prepared;
+    let cookie = m.alloc_cookie();
+
     let mapped_buffer = match buffer.apply_dma_mapping(
-        &prepared.segments[..prepared.segments_len],
-        pdo,
+        layout,
+        active.pdo.clone(),
         unmap_trampoline,
         cookie as usize,
     ) {
         Ok(mapped_buffer) => mapped_buffer,
         Err((buffer, err)) => {
-            rollback_mappings(&domain, &prepared.records);
+            rollback_mappings(&m.device_mmu, &active.domain, &records);
+
             return Err((
                 buffer,
                 match err {
@@ -180,17 +120,15 @@ pub fn map_buffer<'a>(
         }
     };
 
-    state.next_cookie = state.next_cookie.wrapping_add(1);
-    state.pending_unmaps.insert(
+    m.insert_pending_unmap(
         cookie,
         PendingUnmap {
             device_key: key,
-            domain: domain.clone(),
-            records: prepared.records,
+            domain: active.domain.clone(),
+            records,
         },
     );
 
-    iommu::invalidate(&domain);
     Ok(mapped_buffer)
 }
 
@@ -206,105 +144,98 @@ pub fn map_buffer_ref<'map, 'buffer>(
     strategy: DmaMappingStrategy,
 ) -> Result<BorrowedDmaMapping<'map>, DmaMapError> {
     let m = manager();
+
     let key = match resolve_hardware_pdo(device) {
         Ok(pdo) => device_key(&pdo),
         Err(_) => return Err(DmaMapError::NoIommu),
     };
 
-    let mut state = m.state.lock();
-    let Some(entry) = state.devices.get_mut(&key) else {
-        return Err(DmaMapError::NoIommu);
-    };
-    let Some(pdo) = entry.pdo.upgrade() else {
-        return Err(DmaMapError::NoIommu);
-    };
+    let active = m.begin_mapping(key)?;
 
-    let domain = if let Some(domain) = entry.domain.as_ref() {
-        domain.clone()
-    } else {
-        let identity = match entry.identity {
-            RegisteredDmaIdentity::Pci(id) => id,
-        };
-        let Some(domain) = iommu::get_or_create_domain(key, identity) else {
-            return Err(DmaMapError::NoIommu);
-        };
-        entry.domain = Some(domain.clone());
-        domain
-    };
-
-    let prepared = prepare_dma_mapping(&domain, buffer, strategy)?;
+    let prepared = prepare_dma_mapping(&m.device_mmu, &active.domain, buffer, strategy)?;
 
     if prepared.records.is_empty() {
         return Err(DmaMapError::RemappingUnavailable);
     }
 
-    let cookie = state.next_cookie;
-    let mapping = match BorrowedDmaMapping::new(
-        &prepared.segments[..prepared.segments_len],
-        pdo,
+    let PreparedDmaMapping { records, layout } = prepared;
+    let cookie = m.alloc_cookie();
+
+    let mapping = match BorrowedDmaMapping::new_layout(
+        layout,
+        buffer.extents(),
+        buffer.page_frames(),
+        active.pdo.clone(),
         unmap_trampoline,
         cookie as usize,
     ) {
         Ok(mapping) => mapping,
         Err(kernel_types::dma::IoBufferError::SegmentCapacityExceeded { required, .. }) => {
-            rollback_mappings(&domain, &prepared.records);
+            rollback_mappings(&m.device_mmu, &active.domain, &records);
             return Err(DmaMapError::SegmentCapacityExceeded { required });
         }
         Err(kernel_types::dma::IoBufferError::PageCapacityExceeded { required, .. }) => {
-            rollback_mappings(&domain, &prepared.records);
+            rollback_mappings(&m.device_mmu, &active.domain, &records);
             return Err(DmaMapError::PageCapacityExceeded { required });
         }
         Err(_) => {
-            rollback_mappings(&domain, &prepared.records);
+            rollback_mappings(&m.device_mmu, &active.domain, &records);
             return Err(DmaMapError::InvalidSize);
         }
     };
 
-    state.next_cookie = state.next_cookie.wrapping_add(1);
-    state.pending_unmaps.insert(
+    m.insert_pending_unmap(
         cookie,
         PendingUnmap {
             device_key: key,
-            domain: domain.clone(),
-            records: prepared.records,
+            domain: active.domain.clone(),
+            records,
         },
     );
 
-    iommu::invalidate(&domain);
     Ok(mapping)
 }
 
 fn prepare_dma_mapping(
-    domain: &IommuDomain,
+    device_mmu: &DeviceMmuSystem,
+    domain: &Arc<DeviceMmuDomain>,
     buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
 ) -> Result<PreparedDmaMapping, DmaMapError> {
-    validate_dma_buffer(buffer)?;
+    let device_page_size_u64 = domain.device_page_size();
+    let device_page_size =
+        usize::try_from(device_page_size_u64).map_err(|_| DmaMapError::InvalidSize)?;
+
+    if device_page_size == 0 || !device_page_size_u64.is_power_of_two() {
+        return Err(DmaMapError::InvalidSize);
+    }
+
+    if device_page_size > u32::MAX as usize {
+        return Err(DmaMapError::InvalidSize);
+    }
+
+    validate_dma_buffer(buffer, device_page_size)?;
 
     let buffer_len = buffer.len();
-    let Some(iommu_page_count) = covered_iommu_page_count_for_buffer(buffer) else {
+
+    let Some(iommu_page_count) = covered_iommu_page_count_for_buffer(buffer, device_page_size)
+    else {
         return Err(DmaMapError::InvalidSize);
     };
-    let Ok(iommu_page_count_u32) = u32::try_from(iommu_page_count) else {
-        return Err(DmaMapError::InvalidSize);
-    };
-    let Some(map_size) = (iommu_page_count as u64).checked_mul(IOBUFFER_PAGE_SIZE as u64) else {
+
+    let Some(map_size) = (iommu_page_count as u64).checked_mul(device_page_size_u64) else {
         return Err(DmaMapError::InvalidSize);
     };
 
     let mut records = PendingMappingRecords::new();
-    let mut segments = [IoBufferDmaSegment {
-        dma_addr: 0,
-        byte_len: 0,
-        reserved: 0,
-    }; IOBUFFER_INLINE_SEGMENT_CAPACITY];
 
-    let segments_len = match strategy {
+    let layout = match strategy {
         DmaMappingStrategy::SingleContiguous => {
             if buffer_len > u32::MAX as usize {
                 return Err(DmaMapError::InvalidSize);
             }
-            if !buffer_supports_contiguous_iova(buffer) {
+
+            if !buffer_supports_contiguous_iova(buffer, device_page_size) {
                 return Err(DmaMapError::RemappingUnavailable);
             }
 
@@ -312,186 +243,157 @@ fn prepare_dma_mapping(
                 return Err(DmaMapError::RemappingUnavailable);
             };
 
-            let rec = MappingRecord {
-                iova_base,
-                page_count: iommu_page_count_u32,
-                is_identity: false,
-            };
-            records.push(rec)?;
+            records.push_range(iova_base, iommu_page_count, device_page_size, false)?;
 
-            if let Err(err) = map_buffer_frames_to_iova(domain, iova_base, buffer) {
-                rollback_mappings(domain, &records);
+            if let Err(err) =
+                map_buffer_frames_to_iova(device_mmu, domain, iova_base, buffer, device_page_size)
+            {
+                rollback_mappings(device_mmu, domain, &records);
                 return Err(err);
             }
 
-            let Some(page_offset) = first_dma_page_offset(buffer) else {
-                rollback_mappings(domain, &records);
+            let Some(page_offset) = first_dma_page_offset(buffer, device_page_size) else {
+                rollback_mappings(device_mmu, domain, &records);
                 return Err(DmaMapError::InvalidSize);
             };
 
-            segments[0] = IoBufferDmaSegment {
+            IoBufferDmaMappingLayout::Contiguous {
                 dma_addr: iova_base + page_offset as u64,
-                byte_len: buffer_len as u32,
-                reserved: 0,
-            };
-            1
+                byte_len: buffer_len,
+            }
         }
         DmaMappingStrategy::ScatterGather => {
-            if iommu_page_count > IOBUFFER_INLINE_SEGMENT_CAPACITY {
-                return Err(DmaMapError::SegmentCapacityExceeded {
-                    required: iommu_page_count,
-                });
-            }
-
             let Some(iova_base) = domain.alloc_iova(map_size) else {
                 return Err(DmaMapError::RemappingUnavailable);
             };
 
-            let rec = MappingRecord {
-                iova_base,
-                page_count: iommu_page_count_u32,
-                is_identity: false,
-            };
-            records.push(rec)?;
+            records.push_range(iova_base, iommu_page_count, device_page_size, false)?;
 
-            if let Err(err) = map_buffer_frames_to_iova(domain, iova_base, buffer) {
-                rollback_mappings(domain, &records);
+            if let Err(err) =
+                map_buffer_frames_to_iova(device_mmu, domain, iova_base, buffer, device_page_size)
+            {
+                rollback_mappings(device_mmu, domain, &records);
                 return Err(err);
             }
 
-            match build_scatter_segments_from_iova(buffer, iova_base, &mut segments) {
-                Ok(len) => len,
-                Err(err) => {
-                    rollback_mappings(domain, &records);
-                    return Err(err);
-                }
+            IoBufferDmaMappingLayout::ScatterGather {
+                iova_base,
+                page_size: device_page_size,
             }
         }
         DmaMappingStrategy::ContiguousChunks { chunk_size } => {
             if chunk_size == 0 {
                 return Err(DmaMapError::InvalidSize);
             }
-            if (chunk_size % IOBUFFER_PAGE_SIZE) != 0 {
+
+            if (chunk_size % device_page_size) != 0 {
                 return Err(DmaMapError::ChunkSizeNotPageAligned { chunk_size });
             }
+
             if (buffer_len % chunk_size) != 0 {
                 return Err(DmaMapError::UnalignedChunkSize {
                     buffer_len,
                     chunk_size,
                 });
             }
+
             if chunk_size > u32::MAX as usize {
                 return Err(DmaMapError::InvalidSize);
             }
-            if !buffer_supports_contiguous_iova(buffer) {
+
+            if !buffer_supports_contiguous_iova(buffer, device_page_size) {
                 return Err(DmaMapError::RemappingUnavailable);
             }
 
             let chunk_count = buffer_len / chunk_size;
-            if chunk_count > IOBUFFER_INLINE_SEGMENT_CAPACITY {
-                return Err(DmaMapError::SegmentCapacityExceeded {
-                    required: chunk_count,
-                });
-            }
 
             let Some(iova_base) = domain.alloc_iova(map_size) else {
                 return Err(DmaMapError::RemappingUnavailable);
             };
 
-            let rec = MappingRecord {
-                iova_base,
-                page_count: iommu_page_count_u32,
-                is_identity: false,
-            };
-            records.push(rec)?;
+            records.push_range(iova_base, iommu_page_count, device_page_size, false)?;
 
-            if let Err(err) = map_buffer_frames_to_iova(domain, iova_base, buffer) {
-                rollback_mappings(domain, &records);
+            if let Err(err) =
+                map_buffer_frames_to_iova(device_mmu, domain, iova_base, buffer, device_page_size)
+            {
+                rollback_mappings(device_mmu, domain, &records);
                 return Err(err);
             }
 
-            let Some(page_offset) = first_dma_page_offset(buffer) else {
-                rollback_mappings(domain, &records);
+            let Some(page_offset) = first_dma_page_offset(buffer, device_page_size) else {
+                rollback_mappings(device_mmu, domain, &records);
                 return Err(DmaMapError::InvalidSize);
             };
 
-            let dma_addr = iova_base + page_offset as u64;
-            for idx in 0..chunk_count {
-                segments[idx] = IoBufferDmaSegment {
-                    dma_addr: dma_addr + (idx as u64 * chunk_size as u64),
-                    byte_len: chunk_size as u32,
-                    reserved: 0,
-                };
+            IoBufferDmaMappingLayout::FixedChunks {
+                dma_addr: iova_base + page_offset as u64,
+                chunk_len: chunk_size as u32,
+                count: chunk_count,
             }
-
-            chunk_count
         }
         DmaMappingStrategy::FullIdentity => {
-            if let Err(err) = map_identity_frames(domain, buffer, &mut records) {
-                rollback_mappings(domain, &records);
+            if let Err(err) =
+                map_identity_frames(device_mmu, domain, buffer, device_page_size, &mut records)
+            {
+                rollback_mappings(device_mmu, domain, &records);
                 return Err(err);
             }
 
-            match build_identity_segments(buffer, &mut segments) {
-                Ok(len) => len,
-                Err(err) => {
-                    rollback_mappings(domain, &records);
-                    return Err(err);
-                }
-            }
+            IoBufferDmaMappingLayout::IdentityExtents
         }
     };
 
-    if segments_len == 0 || records.is_empty() {
-        rollback_mappings(domain, &records);
+    if records.is_empty() {
+        rollback_mappings(device_mmu, domain, &records);
         return Err(DmaMapError::RemappingUnavailable);
     }
 
-    Ok(PreparedDmaMapping {
-        records,
-        segments,
-        segments_len,
-    })
+    if let Err(err) = device_mmu.invalidate_domain(domain) {
+        rollback_mappings(device_mmu, domain, &records);
+        return Err(map_device_mmu_error(err));
+    }
+
+    Ok(PreparedDmaMapping { records, layout })
 }
 
 extern "C" fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
     let m = manager();
-    let mut state = m.state.lock();
-    let Some(pending) = state.pending_unmaps.remove(&(cookie as u64)) else {
+
+    let Some(pending) = m.remove_pending_unmap(cookie as u64) else {
         return;
     };
+
     for rec in pending.records.as_slice() {
-        unmap_record(&pending.domain, *rec);
+        let _ = m.device_mmu.unmap_record(&pending.domain, *rec);
     }
 }
 
-fn map_iommu_error(err: iommu::IommuError) -> DmaMapError {
+fn map_device_mmu_error(err: DeviceMmuError) -> DmaMapError {
     match err {
-        iommu::IommuError::NoBackingFrame | iommu::IommuError::IovaSpaceExhausted => {
-            DmaMapError::RemappingUnavailable
-        }
-        iommu::IommuError::NotMapped
-        | iommu::IommuError::HardwareError
-        | iommu::IommuError::Unsupported => DmaMapError::NoIommu,
+        DeviceMmuError::NoBackingFrame => DmaMapError::RemappingUnavailable,
+        DeviceMmuError::IovaSpaceExhausted => DmaMapError::RemappingUnavailable,
+        DeviceMmuError::InvalidRange => DmaMapError::InvalidSize,
+        DeviceMmuError::NotMapped => DmaMapError::NoIommu,
+        DeviceMmuError::HardwareError => DmaMapError::NoIommu,
+        DeviceMmuError::Unsupported => DmaMapError::NoIommu,
+        DeviceMmuError::InvalidDevice => DmaMapError::NoIommu,
+        DeviceMmuError::InvalidDomain => DmaMapError::NoIommu,
     }
 }
 
-fn validate_dma_buffer(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> Result<(), DmaMapError> {
+fn validate_dma_buffer(
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    device_page_size: usize,
+) -> Result<(), DmaMapError> {
     if buffer.len() == 0 || buffer.page_count() == 0 || buffer.extent_count() == 0 {
         return Err(DmaMapError::InvalidSize);
-    }
-
-    if buffer.page_count() > IOBUFFER_MAX_PAGE_CAPACITY {
-        return Err(DmaMapError::PageCapacityExceeded {
-            required: buffer.page_count(),
-        });
     }
 
     if !buffer_frames_cover_extents(buffer) {
         return Err(DmaMapError::InvalidSize);
     }
 
-    if covered_iommu_page_count_for_buffer(buffer).is_none() {
+    if covered_iommu_page_count_for_buffer(buffer, device_page_size).is_none() {
         return Err(DmaMapError::InvalidSize);
     }
 
@@ -515,6 +417,7 @@ where
         let Some(end_frame) = extent.first_frame.checked_add(extent.frame_count) else {
             return Err(DmaMapError::InvalidSize);
         };
+
         let Some(extent_frames) = frames.get(extent.first_frame..end_frame) else {
             return Err(DmaMapError::InvalidSize);
         };
@@ -536,16 +439,23 @@ fn buffer_frames_cover_extents(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> b
     .is_ok()
 }
 
-fn first_dma_page_offset(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> Option<usize> {
+fn first_dma_page_offset(
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    device_page_size: usize,
+) -> Option<usize> {
     for extent in buffer.extents() {
         if extent.byte_len != 0 {
-            return Some(extent.frame_offset & (IOBUFFER_PAGE_SIZE - 1));
+            return Some(extent.frame_offset % device_page_size);
         }
     }
+
     None
 }
 
-fn buffer_supports_contiguous_iova(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> bool {
+fn buffer_supports_contiguous_iova(
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    device_page_size: usize,
+) -> bool {
     let mut logical_len = 0usize;
     let mut first_offset = None;
 
@@ -554,7 +464,8 @@ fn buffer_supports_contiguous_iova(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) 
             continue;
         }
 
-        let start_offset = extent.frame_offset & (IOBUFFER_PAGE_SIZE - 1);
+        let start_offset = extent.frame_offset % device_page_size;
+
         match first_offset {
             Some(_) if start_offset != 0 => return false,
             None => first_offset = Some(start_offset),
@@ -564,13 +475,15 @@ fn buffer_supports_contiguous_iova(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) 
         let Some(next_logical_len) = logical_len.checked_add(extent.byte_len) else {
             return false;
         };
+
         logical_len = next_logical_len;
 
         if logical_len < buffer.len() {
             let Some(total_offset) = first_offset.unwrap_or(0).checked_add(logical_len) else {
                 return false;
             };
-            if (total_offset & (IOBUFFER_PAGE_SIZE - 1)) != 0 {
+
+            if (total_offset % device_page_size) != 0 {
                 return false;
             }
         }
@@ -591,15 +504,18 @@ fn frames_cover_buffer(
     let Some(first) = frames.first() else {
         return false;
     };
+
     if frame_offset >= first.byte_len as usize {
         return false;
     }
 
     let mut available = (first.byte_len as usize).saturating_sub(frame_offset);
+
     for frame in &frames[1..] {
         if available >= buffer_len {
             return true;
         }
+
         available = available.saturating_add(frame.byte_len as usize);
     }
 
@@ -608,14 +524,19 @@ fn frames_cover_buffer(
 
 fn covered_iommu_page_count_for_buffer(
     buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    device_page_size: usize,
 ) -> Option<usize> {
     let mut total = 0usize;
 
     for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
-        let Some(count) = covered_iommu_page_count(frames, frame_offset, byte_len) else {
+        let Some(count) =
+            covered_iommu_page_count(frames, frame_offset, byte_len, device_page_size)
+        else {
             return Err(DmaMapError::InvalidSize);
         };
+
         total = total.checked_add(count).ok_or(DmaMapError::InvalidSize)?;
+
         Ok(())
     })
     .ok()?;
@@ -627,15 +548,25 @@ fn covered_iommu_page_count(
     frames: &[IoBufferPageFrame],
     frame_offset: usize,
     buffer_len: usize,
+    device_page_size: usize,
 ) -> Option<usize> {
     let mut total = 0usize;
-    for_each_covered_page_run(frames, frame_offset, buffer_len, |_, page_count| {
-        total = total
-            .checked_add(page_count)
-            .ok_or(DmaMapError::InvalidSize)?;
-        Ok(())
-    })
+
+    for_each_covered_page_run(
+        frames,
+        frame_offset,
+        buffer_len,
+        device_page_size,
+        |_, page_count| {
+            total = total
+                .checked_add(page_count)
+                .ok_or(DmaMapError::InvalidSize)?;
+
+            Ok(())
+        },
+    )
     .ok()?;
+
     Some(total)
 }
 
@@ -643,6 +574,7 @@ fn for_each_covered_page_run<F>(
     frames: &[IoBufferPageFrame],
     frame_offset: usize,
     buffer_len: usize,
+    device_page_size: usize,
     mut f: F,
 ) -> Result<(), DmaMapError>
 where
@@ -655,15 +587,18 @@ where
         if remaining == 0 {
             return Ok(());
         }
+
         if offset >= frame.byte_len {
             return Err(DmaMapError::InvalidSize);
         }
 
         let start = frame.phys_addr + offset;
         let bytes = remaining.min((frame.byte_len - offset) as usize);
-        let page_base = start & !((IOBUFFER_PAGE_SIZE as u64) - 1);
-        let page_end = align_up_u64(start + bytes as u64, IOBUFFER_PAGE_SIZE as u64)?;
-        let page_count = ((page_end - page_base) / IOBUFFER_PAGE_SIZE as u64) as usize;
+        let device_page_size_u64 = device_page_size as u64;
+        let page_base = align_down_u64(start, device_page_size_u64);
+        let page_end = align_up_u64(start + bytes as u64, device_page_size_u64)?;
+        let page_count = ((page_end - page_base) / device_page_size_u64) as usize;
+
         f(page_base, page_count)?;
 
         remaining -= bytes;
@@ -677,288 +612,142 @@ where
     }
 }
 
-fn for_each_covered_data_run<F>(
-    frames: &[IoBufferPageFrame],
-    frame_offset: usize,
-    buffer_len: usize,
-    mut f: F,
-) -> Result<(), DmaMapError>
-where
-    F: FnMut(u64, usize) -> Result<(), DmaMapError>,
-{
-    let mut remaining = buffer_len;
-    let mut offset = frame_offset as u64;
-
-    for frame in frames {
-        if remaining == 0 {
-            return Ok(());
-        }
-        if offset >= frame.byte_len {
-            return Err(DmaMapError::InvalidSize);
-        }
-
-        let bytes = remaining.min((frame.byte_len - offset) as usize);
-        f(frame.phys_addr + offset, bytes)?;
-
-        remaining -= bytes;
-        offset = 0;
-    }
-
-    if remaining == 0 {
-        Ok(())
-    } else {
-        Err(DmaMapError::InvalidSize)
-    }
-}
-
 fn map_phys_run_to_iova(
-    domain: &IommuDomain,
+    device_mmu: &DeviceMmuSystem,
+    domain: &Arc<DeviceMmuDomain>,
     iova_base: u64,
     phys_base: u64,
     page_count: usize,
+    device_page_size: usize,
 ) -> Result<(), DmaMapError> {
-    let mut pfns = [0u64; IOBUFFER_MAX_PAGE_CAPACITY];
-    let mut mapped = 0usize;
+    let len = (page_count as u64)
+        .checked_mul(device_page_size as u64)
+        .ok_or(DmaMapError::InvalidSize)?;
 
-    while mapped < page_count {
-        let chunk_pages = (page_count - mapped).min(IOBUFFER_MAX_PAGE_CAPACITY);
-        for (idx, pfn) in pfns[..chunk_pages].iter_mut().enumerate() {
-            *pfn = (phys_base + ((mapped + idx) * IOBUFFER_PAGE_SIZE) as u64) >> 12;
-        }
-        iommu::map_pages(
+    device_mmu
+        .map_range(
             domain,
-            iova_base + (mapped * IOBUFFER_PAGE_SIZE) as u64,
-            &pfns[..chunk_pages],
+            iova_base,
+            phys_base,
+            len,
+            DeviceMmuMapPermissions::ReadWrite,
         )
-        .map_err(map_iommu_error)?;
-        mapped += chunk_pages;
-    }
-
-    Ok(())
+        .map_err(map_device_mmu_error)
 }
 
 fn map_buffer_frames_to_iova(
-    domain: &IommuDomain,
+    device_mmu: &DeviceMmuSystem,
+    domain: &Arc<DeviceMmuDomain>,
     iova_base: u64,
     buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    device_page_size: usize,
 ) -> Result<(), DmaMapError> {
     let mut iova_cursor = iova_base;
 
     for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
-        for_each_covered_page_run(frames, frame_offset, byte_len, |phys_base, page_count| {
-            map_phys_run_to_iova(domain, iova_cursor, phys_base, page_count)?;
-            iova_cursor = iova_cursor
-                .checked_add((page_count * IOBUFFER_PAGE_SIZE) as u64)
-                .ok_or(DmaMapError::InvalidSize)?;
-            Ok(())
-        })
+        for_each_covered_page_run(
+            frames,
+            frame_offset,
+            byte_len,
+            device_page_size,
+            |phys_base, page_count| {
+                map_phys_run_to_iova(
+                    device_mmu,
+                    domain,
+                    iova_cursor,
+                    phys_base,
+                    page_count,
+                    device_page_size,
+                )?;
+
+                let advance = page_count
+                    .checked_mul(device_page_size)
+                    .ok_or(DmaMapError::InvalidSize)?;
+                iova_cursor = iova_cursor
+                    .checked_add(advance as u64)
+                    .ok_or(DmaMapError::InvalidSize)?;
+
+                Ok(())
+            },
+        )
     })
 }
 
 fn map_identity_frames(
-    domain: &IommuDomain,
+    device_mmu: &DeviceMmuSystem,
+    domain: &Arc<DeviceMmuDomain>,
     buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    device_page_size: usize,
     records: &mut PendingMappingRecords,
 ) -> Result<(), DmaMapError> {
     for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
-        for_each_covered_page_run(frames, frame_offset, byte_len, |phys_base, page_count| {
-            records.push_or_extend_identity(phys_base, page_count)?;
-            map_phys_run_to_iova(domain, phys_base, phys_base, page_count)
-        })
+        for_each_covered_page_run(
+            frames,
+            frame_offset,
+            byte_len,
+            device_page_size,
+            |phys_base, page_count| {
+                records.push_or_extend_identity(phys_base, page_count, device_page_size)?;
+                map_phys_run_to_iova(
+                    device_mmu,
+                    domain,
+                    phys_base,
+                    phys_base,
+                    page_count,
+                    device_page_size,
+                )
+            },
+        )
     })
 }
 
-fn unmap_record(domain: &IommuDomain, rec: MappingRecord) {
-    iommu::unmap_pages(domain, rec.iova_base, rec.page_count);
-    if !rec.is_identity {
-        domain.free_iova(
-            rec.iova_base,
-            rec.page_count as u64 * IOBUFFER_PAGE_SIZE as u64,
-        );
-    }
-}
-
-fn rollback_mappings(domain: &IommuDomain, records: &PendingMappingRecords) {
+fn rollback_mappings(
+    device_mmu: &DeviceMmuSystem,
+    domain: &Arc<DeviceMmuDomain>,
+    records: &PendingMappingRecords,
+) {
     for rec in records.as_slice() {
-        unmap_record(domain, *rec);
+        let _ = device_mmu.unmap_record(domain, *rec);
     }
 }
 
-fn build_scatter_segments_from_iova(
-    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
-    iova_base: u64,
-    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
-) -> Result<usize, DmaMapError> {
-    let mut count = 0usize;
-    let mut iova_cursor = iova_base;
-
-    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
-        let Some(page_count) = covered_iommu_page_count(frames, frame_offset, byte_len) else {
-            return Err(DmaMapError::InvalidSize);
-        };
-
-        append_segments_from_contiguous_iova(
-            iova_cursor,
-            frame_offset & (IOBUFFER_PAGE_SIZE - 1),
-            byte_len,
-            false,
-            segments,
-            &mut count,
-        )?;
-
-        iova_cursor = iova_cursor
-            .checked_add((page_count * IOBUFFER_PAGE_SIZE) as u64)
-            .ok_or(DmaMapError::InvalidSize)?;
-
-        Ok(())
-    })?;
-
-    Ok(count)
-}
-
-fn build_segments_from_contiguous_iova(
-    iova_base: u64,
-    page_offset: usize,
-    buffer_len: usize,
-    merge_adjacent: bool,
-    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
-) -> Result<usize, DmaMapError> {
-    let mut count = 0usize;
-    append_segments_from_contiguous_iova(
-        iova_base,
-        page_offset,
-        buffer_len,
-        merge_adjacent,
-        segments,
-        &mut count,
-    )?;
-    Ok(count)
-}
-
-fn append_segments_from_contiguous_iova(
-    iova_base: u64,
-    page_offset: usize,
-    buffer_len: usize,
-    merge_adjacent: bool,
-    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
-    count: &mut usize,
-) -> Result<(), DmaMapError> {
-    if buffer_len == 0 {
-        return Ok(());
-    }
-    if page_offset >= IOBUFFER_PAGE_SIZE {
-        return Err(DmaMapError::InvalidSize);
-    }
-
-    let page_count = page_offset
-        .checked_add(buffer_len)
-        .ok_or(DmaMapError::InvalidSize)?
-        .div_ceil(IOBUFFER_PAGE_SIZE);
-
-    let mut remaining = buffer_len;
-    for idx in 0..page_count {
-        if remaining == 0 {
-            break;
-        }
-
-        let start_in_page = if idx == 0 { page_offset } else { 0 };
-        let bytes = remaining.min(IOBUFFER_PAGE_SIZE - start_in_page);
-        let dma_addr = iova_base + (idx * IOBUFFER_PAGE_SIZE + start_in_page) as u64;
-
-        append_dma_segment(dma_addr, bytes, merge_adjacent, segments, count)?;
-        remaining -= bytes;
-    }
-
-    if remaining != 0 {
-        return Err(DmaMapError::InvalidSize);
-    }
-
-    Ok(())
-}
-
-fn build_identity_segments(
-    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
-    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
-) -> Result<usize, DmaMapError> {
-    let mut count = 0usize;
-
-    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
-        for_each_covered_data_run(frames, frame_offset, byte_len, |dma_addr, bytes| {
-            append_dma_segment(dma_addr, bytes, true, segments, &mut count)
-        })
-    })?;
-
-    Ok(count)
-}
-
-fn append_dma_segment(
-    dma_addr: u64,
-    byte_len: usize,
-    merge_adjacent: bool,
-    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
-    count: &mut usize,
-) -> Result<(), DmaMapError> {
-    if byte_len == 0 {
-        return Ok(());
-    }
-    if byte_len > u32::MAX as usize {
-        return Err(DmaMapError::InvalidSize);
-    }
-
-    if merge_adjacent && *count > 0 {
-        let prev = &mut segments[*count - 1];
-        let prev_end = prev.dma_addr + prev.byte_len as u64;
-        let merged_len = prev.byte_len as usize + byte_len;
-        if prev_end == dma_addr && merged_len <= u32::MAX as usize {
-            prev.byte_len = merged_len as u32;
-            return Ok(());
-        }
-    }
-
-    if *count >= IOBUFFER_INLINE_SEGMENT_CAPACITY {
-        return Err(DmaMapError::SegmentCapacityExceeded {
-            required: *count + 1,
-        });
-    }
-
-    segments[*count] = IoBufferDmaSegment {
-        dma_addr,
-        byte_len: byte_len as u32,
-        reserved: 0,
-    };
-    *count += 1;
-    Ok(())
+fn align_down_u64(value: u64, align: u64) -> u64 {
+    debug_assert!(align != 0);
+    value - (value % align)
 }
 
 fn align_up_u64(value: u64, align: u64) -> Result<u64, DmaMapError> {
-    debug_assert!(align.is_power_of_two());
+    debug_assert!(align != 0);
+
     value
         .checked_add(align - 1)
-        .map(|v| v & !(align - 1))
+        .map(|v| v - (v % align))
         .ok_or(DmaMapError::InvalidSize)
 }
 
 fn manager() -> &'static DmaManager {
     DMA_MANAGER
         .get()
-        .expect("DMA manager used before early IOMMU initialization")
+        .expect("DMA manager used before device-MMU initialization")
 }
 
 struct DmaManager {
-    platform: Arc<PlatformIommuInfo>,
+    device_mmu: DeviceMmuSystem,
     state: Mutex<DmaManagerState>,
 }
 
 impl DmaManager {
     fn new() -> Self {
-        let tables = ACPI_TABLES.get_tables();
-        let platform = Arc::new(discover_platform_iommu(tables.as_ref()));
         Self {
-            platform,
+            device_mmu: crate::platform::discover_required_device_mmu(
+                crate::machine::machine_info(),
+            ),
             state: Mutex::new(DmaManagerState::new()),
         }
     }
-
+    fn get_info(&self) -> DeviceMmuBackendInfo {
+        self.device_mmu.info()
+    }
     fn register_pci_pdo(
         &self,
         pdo: &Arc<DeviceObject>,
@@ -976,17 +765,41 @@ impl DmaManager {
 
         let key = device_key(pdo);
         let mut state = self.state.lock();
+
         state.devices.insert(
             key,
-            RegisteredDmaDevice {
+            Arc::new(RegisteredDmaDevice {
                 pdo: Arc::downgrade(pdo),
                 identity: RegisteredDmaIdentity::Pci(identity),
-                domain: None,
-            },
+                runtime: Mutex::new(RegisteredDmaRuntime::new()),
+            }),
         );
+
         DriverStatus::Success
     }
+    fn register_platform_pdo(
+        &self,
+        pdo: &Arc<DeviceObject>,
+        identity: DeviceMmuPlatformDeviceIdentity,
+    ) -> DriverStatus {
+        if identity.iommu_id_count == 0 {
+            return DriverStatus::InvalidParameter;
+        }
 
+        let key = device_key(pdo);
+        let mut state = self.state.lock();
+
+        state.devices.insert(
+            key,
+            Arc::new(RegisteredDmaDevice {
+                pdo: Arc::downgrade(pdo),
+                identity: RegisteredDmaIdentity::Platform(identity),
+                runtime: Mutex::new(RegisteredDmaRuntime::new()),
+            }),
+        );
+
+        DriverStatus::Success
+    }
     fn open_device_handle(
         &self,
         device: &Arc<DeviceObject>,
@@ -994,32 +807,38 @@ impl DmaManager {
         let pdo = resolve_hardware_pdo(device)?;
         let key = device_key(&pdo);
         let state = self.state.lock();
-        if let Some(entry) = state.devices.get(&key) {
-            if entry.pdo.upgrade().is_some() {
-                return Ok(DmaDeviceHandle(key as u64));
-            }
+
+        let Some(entry) = state.devices.get(&key) else {
+            return Err(DriverStatus::NoSuchDevice);
+        };
+
+        if entry.pdo.upgrade().is_some() {
+            Ok(DmaDeviceHandle(key as u64))
+        } else {
+            Err(DriverStatus::NoSuchDevice)
         }
-        Err(DriverStatus::NoSuchDevice)
     }
-}
-impl DmaManager {
+
     fn query_device_state(&self, device: &Arc<DeviceObject>) -> Option<DmaDeviceState> {
         let pdo = resolve_hardware_pdo(device).ok()?;
         let key = device_key(&pdo);
         let state = self.state.lock();
-        let entry = state.devices.get(&key)?;
+        let entry = state.devices.get(&key)?.clone();
+
         if entry.pdo.upgrade().is_none() {
             return None;
         }
+
+        let runtime = entry.runtime.lock();
+        let domain = runtime.domain.as_ref();
+
         Some(DmaDeviceState {
             registered: 1,
-            activated: if entry.domain.is_some() { 1 } else { 0 },
-            iommu_vendor: self.platform.vendor_code(),
+            activated: if domain.is_some() { 1 } else { 0 },
+            iommu_vendor: self.device_mmu.public_vendor_code(),
             reserved0: 0,
-            remapper_index: entry
-                .domain
-                .as_ref()
-                .map(|domain| domain.remapper_index)
+            remapper_index: domain
+                .map(|domain| domain.translation_unit_index())
                 .unwrap_or(u32::MAX),
             active_mappings: state
                 .pending_unmaps
@@ -1027,11 +846,7 @@ impl DmaManager {
                 .filter(|pending| pending.device_key == key)
                 .count() as u32,
             reserved1: 0,
-            domain_id: entry
-                .domain
-                .as_ref()
-                .map(|domain| domain.domain_id as u64)
-                .unwrap_or(0),
+            domain_id: domain.map(|domain| domain.domain_id()).unwrap_or(0),
         })
     }
 
@@ -1039,15 +854,132 @@ impl DmaManager {
         let Ok(pdo) = resolve_hardware_pdo(device) else {
             return DriverStatus::NoSuchDevice;
         };
+
         let key = device_key(&pdo);
-        let mut state = self.state.lock();
-        state.devices.remove(&key);
+
+        let removed = {
+            let mut state = self.state.lock();
+
+            let Some(entry) = state.devices.get(&key).cloned() else {
+                return DriverStatus::NoSuchDevice;
+            };
+
+            {
+                let mut runtime = entry.runtime.lock();
+
+                if runtime.unregistering || runtime.in_flight_maps != 0 {
+                    return DriverStatus::InvalidParameter;
+                }
+
+                if state
+                    .pending_unmaps
+                    .values()
+                    .any(|pending| pending.device_key == key)
+                {
+                    return DriverStatus::InvalidParameter;
+                }
+
+                runtime.unregistering = true;
+            }
+
+            state.devices.remove(&key)
+        };
+
+        let Some(entry) = removed else {
+            return DriverStatus::NoSuchDevice;
+        };
+
+        let (domain, attachment) = {
+            let mut runtime = entry.runtime.lock();
+
+            let attachment = runtime.attachment.take();
+            let domain = runtime.domain.take();
+
+            (domain, attachment)
+        };
+
+        if let Some(domain) = domain {
+            if let Some(attachment) = attachment {
+                self.device_mmu.detach_device(&domain, attachment);
+            }
+
+            self.device_mmu.destroy_domain(&domain);
+        }
+
         DriverStatus::Success
+    }
+
+    fn begin_mapping(&self, key: usize) -> Result<ActiveDmaMapping, DmaMapError> {
+        let registration = {
+            let state = self.state.lock();
+            state
+                .devices
+                .get(&key)
+                .cloned()
+                .ok_or(DmaMapError::NoIommu)?
+        };
+
+        let pdo = registration.pdo.upgrade().ok_or(DmaMapError::NoIommu)?;
+        let domain = {
+            let mut runtime = registration.runtime.lock();
+
+            if runtime.unregistering {
+                return Err(DmaMapError::NoIommu);
+            }
+
+            if runtime.domain.is_none() {
+                let identity = registration.identity.device_mmu_identity();
+
+                let domain = self
+                    .device_mmu
+                    .create_domain(identity)
+                    .map_err(map_device_mmu_error)?;
+
+                let attachment = match self.device_mmu.attach_device(&domain, identity) {
+                    Ok(attachment) => attachment,
+                    Err(err) => {
+                        self.device_mmu.destroy_domain(&domain);
+                        return Err(map_device_mmu_error(err));
+                    }
+                };
+
+                runtime.domain = Some(domain);
+                runtime.attachment = Some(attachment);
+            }
+
+            runtime.in_flight_maps = runtime
+                .in_flight_maps
+                .checked_add(1)
+                .ok_or(DmaMapError::InvalidSize)?;
+
+            runtime.domain.as_ref().unwrap().clone()
+        };
+
+        Ok(ActiveDmaMapping {
+            pdo,
+            domain,
+            _guard: InFlightMapGuard { registration },
+        })
+    }
+
+    fn alloc_cookie(&self) -> u64 {
+        let mut state = self.state.lock();
+        let cookie = state.next_cookie;
+        state.next_cookie = state.next_cookie.wrapping_add(1);
+        cookie
+    }
+
+    fn insert_pending_unmap(&self, cookie: u64, pending: PendingUnmap) {
+        self.state.lock().pending_unmaps.insert(cookie, pending);
+    }
+
+    fn remove_pending_unmap(&self, cookie: u64) -> Option<PendingUnmap> {
+        self.state.lock().pending_unmaps.remove(&cookie)
     }
 }
 
 struct DmaManagerState {
-    devices: BTreeMap<usize, RegisteredDmaDevice>,
+    devices: BTreeMap<usize, Arc<RegisteredDmaDevice>>,
     pending_unmaps: BTreeMap<u64, PendingUnmap>,
     next_cookie: u64,
 }
@@ -1065,19 +997,79 @@ impl DmaManagerState {
 struct RegisteredDmaDevice {
     pdo: Weak<DeviceObject>,
     identity: RegisteredDmaIdentity,
-    domain: Option<Arc<IommuDomain>>,
+    runtime: Mutex<RegisteredDmaRuntime>,
 }
+
+struct RegisteredDmaRuntime {
+    domain: Option<Arc<DeviceMmuDomain>>,
+    attachment: Option<DeviceMmuAttachment>,
+    unregistering: bool,
+    in_flight_maps: usize,
+}
+
+impl RegisteredDmaRuntime {
+    fn new() -> Self {
+        Self {
+            domain: None,
+            attachment: None,
+            unregistering: false,
+            in_flight_maps: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RegisteredDmaIdentity {
+    Pci(DmaPciDeviceIdentity),
+    Platform(DeviceMmuPlatformDeviceIdentity),
+}
+
+impl RegisteredDmaIdentity {
+    fn device_mmu_identity(self) -> DeviceMmuDeviceIdentity {
+        match self {
+            Self::Pci(identity) => DeviceMmuDeviceIdentity::Pci(identity),
+            Self::Platform(identity) => DeviceMmuDeviceIdentity::Platform(identity),
+        }
+    }
+}
+
+struct ActiveDmaMapping {
+    pdo: Arc<DeviceObject>,
+    domain: Arc<DeviceMmuDomain>,
+    _guard: InFlightMapGuard,
+}
+
+struct InFlightMapGuard {
+    registration: Arc<RegisteredDmaDevice>,
+}
+
+impl Drop for InFlightMapGuard {
+    fn drop(&mut self) {
+        let mut runtime = self.registration.runtime.lock();
+        runtime.in_flight_maps = runtime.in_flight_maps.saturating_sub(1);
+    }
+}
+
+const INLINE_MAPPING_RECORD_CAPACITY: usize = 4;
+
+const EMPTY_MAPPING_RECORD: MappingRecord = MappingRecord {
+    iova_base: 0,
+    page_count: 0,
+    is_identity: false,
+};
 
 #[derive(Clone)]
 struct PendingMappingRecords {
-    records: [MappingRecord; IOBUFFER_MAX_PAGE_CAPACITY],
+    inline: [MappingRecord; INLINE_MAPPING_RECORD_CAPACITY],
+    heap: Option<Vec<MappingRecord>>,
     len: usize,
 }
 
 impl PendingMappingRecords {
     fn new() -> Self {
         Self {
-            records: [EMPTY_MAPPING_RECORD; IOBUFFER_MAX_PAGE_CAPACITY],
+            inline: [EMPTY_MAPPING_RECORD; INLINE_MAPPING_RECORD_CAPACITY],
+            heap: None,
             len: 0,
         }
     }
@@ -1087,623 +1079,144 @@ impl PendingMappingRecords {
     }
 
     fn as_slice(&self) -> &[MappingRecord] {
-        &self.records[..self.len]
+        match self.heap.as_ref() {
+            Some(records) => records.as_slice(),
+            None => &self.inline[..self.len],
+        }
     }
 
     fn push(&mut self, rec: MappingRecord) -> Result<(), DmaMapError> {
-        if self.len >= IOBUFFER_MAX_PAGE_CAPACITY {
-            return Err(DmaMapError::PageCapacityExceeded {
-                required: self.len + 1,
-            });
+        if let Some(records) = self.heap.as_mut() {
+            records.push(rec);
+            self.len = records.len();
+            return Ok(());
         }
-        self.records[self.len] = rec;
-        self.len += 1;
+
+        if self.len < INLINE_MAPPING_RECORD_CAPACITY {
+            self.inline[self.len] = rec;
+            self.len += 1;
+            return Ok(());
+        }
+
+        let mut records = Vec::with_capacity(INLINE_MAPPING_RECORD_CAPACITY * 2);
+        records.extend_from_slice(&self.inline[..self.len]);
+        records.push(rec);
+        self.len = records.len();
+        self.heap = Some(records);
+
+        Ok(())
+    }
+
+    fn last_mut(&mut self) -> Option<&mut MappingRecord> {
+        match self.heap.as_mut() {
+            Some(records) => records.last_mut(),
+            None => self.inline[..self.len].last_mut(),
+        }
+    }
+
+    fn push_range(
+        &mut self,
+        mut iova_base: u64,
+        mut page_count: usize,
+        device_page_size: usize,
+        is_identity: bool,
+    ) -> Result<(), DmaMapError> {
+        while page_count != 0 {
+            let count = page_count.min(u32::MAX as usize);
+
+            self.push(MappingRecord {
+                iova_base,
+                page_count: count as u32,
+                is_identity,
+            })?;
+
+            let advance = (count as u64)
+                .checked_mul(device_page_size as u64)
+                .ok_or(DmaMapError::InvalidSize)?;
+
+            iova_base = iova_base
+                .checked_add(advance)
+                .ok_or(DmaMapError::InvalidSize)?;
+
+            page_count -= count;
+        }
+
         Ok(())
     }
 
     fn push_or_extend_identity(
         &mut self,
-        iova_base: u64,
-        page_count: usize,
+        mut iova_base: u64,
+        mut page_count: usize,
+        device_page_size: usize,
     ) -> Result<(), DmaMapError> {
-        let page_count_u32 = u32::try_from(page_count).map_err(|_| DmaMapError::InvalidSize)?;
-        if let Some(prev) = self.records[..self.len].last_mut() {
-            let prev_end = prev.iova_base + prev.page_count as u64 * IOBUFFER_PAGE_SIZE as u64;
-            let combined = prev.page_count as u64 + page_count_u32 as u64;
-            if prev.is_identity && prev_end == iova_base && combined <= u32::MAX as u64 {
-                prev.page_count = combined as u32;
-                return Ok(());
+        while page_count != 0 {
+            let count = page_count.min(u32::MAX as usize);
+
+            if let Some(prev) = self.last_mut() {
+                let prev_len = (prev.page_count as u64)
+                    .checked_mul(device_page_size as u64)
+                    .ok_or(DmaMapError::InvalidSize)?;
+
+                let prev_end = prev
+                    .iova_base
+                    .checked_add(prev_len)
+                    .ok_or(DmaMapError::InvalidSize)?;
+
+                let combined = prev.page_count as u64 + count as u64;
+
+                if prev.is_identity && prev_end == iova_base && combined <= u32::MAX as u64 {
+                    prev.page_count = combined as u32;
+
+                    let advance = (count as u64)
+                        .checked_mul(device_page_size as u64)
+                        .ok_or(DmaMapError::InvalidSize)?;
+
+                    iova_base = iova_base
+                        .checked_add(advance)
+                        .ok_or(DmaMapError::InvalidSize)?;
+
+                    page_count -= count;
+                    continue;
+                }
             }
+
+            self.push(MappingRecord {
+                iova_base,
+                page_count: count as u32,
+                is_identity: true,
+            })?;
+
+            let advance = (count as u64)
+                .checked_mul(device_page_size as u64)
+                .ok_or(DmaMapError::InvalidSize)?;
+
+            iova_base = iova_base
+                .checked_add(advance)
+                .ok_or(DmaMapError::InvalidSize)?;
+
+            page_count -= count;
         }
-        self.push(MappingRecord {
-            iova_base,
-            page_count: page_count_u32,
-            is_identity: true,
-        })
+
+        Ok(())
     }
 }
-
-const EMPTY_MAPPING_RECORD: MappingRecord = MappingRecord {
-    iova_base: 0,
-    page_count: 0,
-    is_identity: false,
-};
 
 struct PendingUnmap {
     device_key: usize,
-    domain: Arc<IommuDomain>,
+    domain: Arc<DeviceMmuDomain>,
     records: PendingMappingRecords,
 }
 
-#[derive(Clone, Copy)]
-enum RegisteredDmaIdentity {
-    Pci(DmaPciDeviceIdentity),
-}
-
-#[derive(Debug)]
-pub enum PlatformIommuInfo {
-    Intel(IntelPlatformIommuInfo),
-    Amd(AmdPlatformIommuInfo),
-}
-
-impl PlatformIommuInfo {
-    fn vendor_code(&self) -> u8 {
-        match self {
-            PlatformIommuInfo::Intel(_) => DMA_IOMMU_VENDOR_INTEL_DMAR,
-            PlatformIommuInfo::Amd(_) => DMA_IOMMU_VENDOR_AMD_IVRS,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct IntelPlatformIommuInfo {
-    pub host_address_width: u8,
-    pub flags: u8,
-    pub remapper_units: Vec<IntelRemapperUnit>,
-    pub reserved_regions: Vec<IntelReservedRegion>,
-}
-
-#[derive(Debug)]
-pub struct IntelRemapperUnit {
-    pub segment: u16,
-    pub register_base: u64,
-    pub flags: u8,
-    pub include_all: bool,
-    pub proximity_domain: Option<u32>,
-    pub device_scopes: Vec<IntelDeviceScope>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IntelReservedRegion {
-    pub segment: u16,
-    pub base_address: u64,
-    pub limit_address: u64,
-    pub allow_all: bool,
-    pub device_scopes: Vec<IntelDeviceScope>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IntelDeviceScope {
-    pub scope_type: u8,
-    pub enumeration_id: u8,
-    pub start_bus: u8,
-    pub path: Vec<IntelPciPath>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct IntelPciPath {
-    pub device: u8,
-    pub function: u8,
-}
-
-#[derive(Debug)]
-pub struct AmdPlatformIommuInfo {
-    pub ivinfo_raw: u32,
-    pub efr_supported: bool,
-    pub dma_guard_opt_in: bool,
-    pub guest_virtual_address_size: u8,
-    pub physical_address_size: u8,
-    pub virtual_address_size: u8,
-    pub ht_ats_reserved: bool,
-    pub remapper_units: Vec<AmdRemapperUnit>,
-    pub reserved_regions: Vec<AmdReservedRegion>,
-}
-
-#[derive(Debug)]
-pub struct AmdRemapperUnit {
-    pub block_type: u8,
-    pub flags: u8,
-    pub device_id: u16,
-    pub capability_offset: u16,
-    pub register_base: u64,
-    pub segment: u16,
-    pub unit_info: u16,
-    pub feature_reporting: u32,
-    pub efr_image: Option<u64>,
-    pub device_entries: Vec<AmdIvhdDeviceEntry>,
-}
-
-#[derive(Debug)]
-pub struct AmdReservedRegion {
-    pub block_type: u8,
-    pub flags: u8,
-    pub segment: u16,
-    pub requester_id_start: Option<u16>,
-    pub requester_id_end: Option<u16>,
-    pub applies_to_all: bool,
-    pub base_address: u64,
-    pub limit_address: u64,
-}
-
-#[derive(Debug, Clone)]
-pub enum AmdIvhdDeviceEntry {
-    Pad4,
-    All {
-        settings: u8,
-    },
-    Select {
-        requester_id: u16,
-        settings: u8,
-    },
-    StartRange {
-        requester_id: u16,
-        settings: u8,
-    },
-    EndRange {
-        requester_id: u16,
-        settings: u8,
-    },
-    Pad8,
-    AliasSelect {
-        requester_id: u16,
-        settings: u8,
-        used_id: u16,
-    },
-    AliasStartRange {
-        requester_id: u16,
-        settings: u8,
-        used_id: u16,
-    },
-    ExtSelect {
-        requester_id: u16,
-        settings: u8,
-        extended_data: u32,
-    },
-    ExtStartRange {
-        requester_id: u16,
-        settings: u8,
-        extended_data: u32,
-    },
-    Special {
-        requester_id: u16,
-        settings: u8,
-        handle: u8,
-        used_id: u16,
-        variety: u8,
-    },
-    AcpiHid {
-        requester_id: u16,
-        settings: u8,
-        hardware_id: u64,
-        compatible_id: u64,
-        uid_type: u8,
-        uid_length: u8,
-    },
-    Unknown {
-        entry_type: u8,
-        raw: Vec<u8>,
-    },
-}
-fn discover_platform_iommu(tables: &AcpiTables<ACPIImpl>) -> PlatformIommuInfo {
-    match detect_boot_iommu_vendor() {
-        BootIommuVendor::Intel => PlatformIommuInfo::Intel(parse_intel_dmar(tables)),
-        BootIommuVendor::Amd => PlatformIommuInfo::Amd(parse_amd_ivrs(tables)),
-        BootIommuVendor::Unknown => {
-            if has_table::<DmarTable>(tables) {
-                PlatformIommuInfo::Intel(parse_intel_dmar(tables))
-            } else if has_table::<IvrsTable>(tables) {
-                PlatformIommuInfo::Amd(parse_amd_ivrs(tables))
-            } else {
-                panic!("mandatory IOMMU policy: neither DMAR nor IVRS is present")
-            }
-        }
-    }
-}
-
-fn parse_intel_dmar(tables: &AcpiTables<ACPIImpl>) -> IntelPlatformIommuInfo {
-    let table = require_table::<DmarTable>(tables, "DMAR");
-    let bytes = table_bytes(&table);
-    let payload = bytes
-        .get(size_of::<DmarTable>()..)
-        .expect("DMAR payload is truncated");
-
-    let host_address_width = table.width;
-    let flags = table.flags;
-    let mut remapper_units = Vec::new();
-    let mut reserved_regions = Vec::new();
-    let mut affinities = Vec::new();
-
-    let mut offset = 0usize;
-    while offset < payload.len() {
-        if offset + size_of::<DmarSubtableHeader>() > payload.len() {
-            panic!("DMAR subtable header is truncated");
-        }
-
-        let header = read_packed::<DmarSubtableHeader>(payload, offset);
-        let length = header.length as usize;
-        if length < size_of::<DmarSubtableHeader>() || offset + length > payload.len() {
-            panic!("DMAR subtable length is invalid");
-        }
-
-        let subtable = &payload[offset..offset + length];
-        match header.subtable_type {
-            DMAR_TYPE_HARDWARE_UNIT => {
-                if length < size_of::<DmarHardwareUnit>() {
-                    panic!("DMAR hardware unit is too short");
-                }
-                let unit = read_packed::<DmarHardwareUnit>(payload, offset);
-                let scopes = parse_intel_device_scopes(&subtable[size_of::<DmarHardwareUnit>()..]);
-                remapper_units.push(IntelRemapperUnit {
-                    segment: unit.segment,
-                    register_base: unit.address,
-                    flags: unit.flags,
-                    include_all: (unit.flags & DMAR_INCLUDE_ALL) != 0,
-                    proximity_domain: None,
-                    device_scopes: scopes,
-                });
-            }
-            DMAR_TYPE_RESERVED_MEMORY => {
-                if length < size_of::<DmarReservedMemory>() {
-                    panic!("DMAR reserved memory structure is too short");
-                }
-                let reserved = read_packed::<DmarReservedMemory>(payload, offset);
-                let scopes =
-                    parse_intel_device_scopes(&subtable[size_of::<DmarReservedMemory>()..]);
-                if reserved.end_address < reserved.base_address {
-                    panic!("DMAR reserved region has an inverted address range");
-                }
-                reserved_regions.push(IntelReservedRegion {
-                    segment: reserved.segment,
-                    base_address: reserved.base_address,
-                    limit_address: reserved.end_address,
-                    allow_all: (reserved.flags & DMAR_ALLOW_ALL) != 0,
-                    device_scopes: scopes,
-                });
-            }
-            DMAR_TYPE_HARDWARE_AFFINITY => {
-                if length < size_of::<DmarHardwareAffinity>() {
-                    panic!("DMAR hardware affinity structure is too short");
-                }
-                let affinity = read_packed::<DmarHardwareAffinity>(payload, offset);
-                affinities.push((affinity.base_address, affinity.proximity_domain));
-            }
-            _ => {}
-        }
-
-        offset += length;
-    }
-
-    if remapper_units.is_empty() {
-        panic!("mandatory IOMMU policy: DMAR contains no remapping hardware units");
-    }
-
-    for unit in remapper_units.iter_mut() {
-        if let Some((_, proximity_domain)) = affinities
-            .iter()
-            .find(|(base, _)| *base == unit.register_base)
-        {
-            unit.proximity_domain = Some(*proximity_domain);
-        }
-    }
-
-    IntelPlatformIommuInfo {
-        host_address_width,
-        flags,
-        remapper_units,
-        reserved_regions,
-    }
-}
-
-fn parse_amd_ivrs(tables: &AcpiTables<ACPIImpl>) -> AmdPlatformIommuInfo {
-    let table = require_table::<IvrsTable>(tables, "IVRS");
-    let bytes = table_bytes(&table);
-    let payload = bytes
-        .get(size_of::<IvrsTable>()..)
-        .expect("IVRS payload is truncated");
-
-    let info = table.info;
-    let target_ivhd_type = select_amd_ivhd_type(payload);
-    let mut remapper_units = Vec::new();
-    let mut reserved_regions = Vec::new();
-
-    let mut offset = 0usize;
-    while offset < payload.len() {
-        if offset + size_of::<IvrsHeader>() > payload.len() {
-            panic!("IVRS block header is truncated");
-        }
-
-        let header = read_packed::<IvrsHeader>(payload, offset);
-        let length = header.length as usize;
-        if length < size_of::<IvrsHeader>() || offset + length > payload.len() {
-            panic!("IVRS block length is invalid");
-        }
-
-        let block = &payload[offset..offset + length];
-        match header.block_type {
-            IVRS_TYPE_HARDWARE_10 | IVRS_TYPE_HARDWARE_11 | IVRS_TYPE_HARDWARE_40 => {
-                if header.block_type != target_ivhd_type {
-                    offset += length;
-                    continue;
-                }
-
-                if length < IVRS_HARDWARE_MIN_LENGTH {
-                    panic!("IVRS hardware block is too short");
-                }
-
-                let capability_offset = read_u16(block, 6);
-                let register_base = read_u64(block, 8);
-                let segment = read_u16(block, 16);
-                let unit_info = read_u16(block, 18);
-                let feature_reporting = if length >= 24 { read_u32(block, 20) } else { 0 };
-                if (feature_reporting & IVHD_ATTR_HATDIS) != 0 {
-                    panic!(
-                        "iommu: AMD IVRS reports host DMA translation disabled for remapper at {:#x}; if using QEMU, pass -device amd-iommu,dma-translation=on,dma-remap=on",
-                        register_base
-                    );
-                }
-                let (efr_image, device_entries_offset) =
-                    if header.block_type == IVRS_TYPE_HARDWARE_10 {
-                        (None, 24usize)
-                    } else {
-                        if length < 40 {
-                            panic!("extended IVRS hardware block is too short");
-                        }
-                        (Some(read_u64(block, 24)), 40usize)
-                    };
-
-                let device_entries = parse_amd_device_entries(
-                    block
-                        .get(device_entries_offset..)
-                        .expect("IVRS device entries are truncated"),
-                );
-
-                remapper_units.push(AmdRemapperUnit {
-                    block_type: header.block_type,
-                    flags: header.flags,
-                    device_id: header.device_id,
-                    capability_offset,
-                    register_base,
-                    segment,
-                    unit_info,
-                    feature_reporting,
-                    efr_image,
-                    device_entries,
-                });
-            }
-            IVRS_TYPE_MEMORY_ALL | IVRS_TYPE_MEMORY_SPECIFIED | IVRS_TYPE_MEMORY_RANGE => {
-                if length < size_of::<IvrsMemoryBlock>() {
-                    panic!("IVRS memory definition block is too short");
-                }
-                let memory = read_packed::<IvrsMemoryBlock>(payload, offset);
-                if memory.memory_length == 0 {
-                    panic!("IVRS memory definition block has zero length");
-                }
-                let limit_address = memory
-                    .start_address
-                    .checked_add(memory.memory_length - 1)
-                    .expect("IVRS memory definition range overflowed");
-                let (applies_to_all, requester_id_start, requester_id_end) = match header.block_type
-                {
-                    IVRS_TYPE_MEMORY_ALL => (true, None, None),
-                    IVRS_TYPE_MEMORY_SPECIFIED => {
-                        (false, Some(header.device_id), Some(header.device_id))
-                    }
-                    IVRS_TYPE_MEMORY_RANGE => {
-                        (false, Some(header.device_id), Some(memory.aux_data))
-                    }
-                    _ => unreachable!(),
-                };
-
-                reserved_regions.push(AmdReservedRegion {
-                    block_type: header.block_type,
-                    flags: header.flags,
-                    segment: 0,
-                    requester_id_start,
-                    requester_id_end,
-                    applies_to_all,
-                    base_address: memory.start_address,
-                    limit_address,
-                });
-            }
-            _ => {}
-        }
-
-        offset += length;
-    }
-
-    if remapper_units.is_empty() {
-        panic!("mandatory IOMMU policy: IVRS contains no IVHD remapper blocks");
-    }
-
-    AmdPlatformIommuInfo {
-        ivinfo_raw: info,
-        efr_supported: (info & 0x1) != 0,
-        dma_guard_opt_in: (info & 0x2) != 0,
-        guest_virtual_address_size: ((info >> 5) & 0x7) as u8,
-        physical_address_size: ((info >> 8) & 0x7f) as u8,
-        virtual_address_size: ((info >> 15) & 0x7f) as u8,
-        ht_ats_reserved: (info & (1 << 22)) != 0,
-        remapper_units,
-        reserved_regions,
-    }
-}
-
-// Linux selects one IVHD type for the whole IVRS walk so compatibility
-// blocks describing the same physical IOMMU do not get instantiated twice.
-fn select_amd_ivhd_type(payload: &[u8]) -> u8 {
-    let mut offset = 0usize;
-    let mut target_device_id = None;
-    let mut target_ivhd_type = None;
-
-    while offset < payload.len() {
-        if offset + size_of::<IvrsHeader>() > payload.len() {
-            panic!("IVRS block header is truncated");
-        }
-
-        let header = read_packed::<IvrsHeader>(payload, offset);
-        let length = header.length as usize;
-        if length < size_of::<IvrsHeader>() || offset + length > payload.len() {
-            panic!("IVRS block length is invalid");
-        }
-
-        match header.block_type {
-            IVRS_TYPE_HARDWARE_10 | IVRS_TYPE_HARDWARE_11 | IVRS_TYPE_HARDWARE_40 => {
-                let device_id = *target_device_id.get_or_insert(header.device_id);
-                if header.device_id == device_id {
-                    target_ivhd_type = Some(match target_ivhd_type {
-                        Some(existing) if existing > header.block_type => existing,
-                        _ => header.block_type,
-                    });
-                }
-            }
-            _ => {}
-        }
-
-        offset += length;
-    }
-
-    target_ivhd_type.unwrap_or(IVRS_TYPE_HARDWARE_10)
-}
-
-fn parse_intel_device_scopes(bytes: &[u8]) -> Vec<IntelDeviceScope> {
-    let mut scopes = Vec::new();
-    let mut offset = 0usize;
-
-    while offset < bytes.len() {
-        if offset + size_of::<DmarDeviceScopeHeader>() > bytes.len() {
-            panic!("DMAR device scope header is truncated");
-        }
-        let header = read_packed::<DmarDeviceScopeHeader>(bytes, offset);
-        let length = header.length as usize;
-        if length < size_of::<DmarDeviceScopeHeader>() || offset + length > bytes.len() {
-            panic!("DMAR device scope length is invalid");
-        }
-
-        let path_bytes = &bytes[offset + size_of::<DmarDeviceScopeHeader>()..offset + length];
-        if (path_bytes.len() % size_of::<DmarPciPath>()) != 0 {
-            panic!("DMAR device scope path is malformed");
-        }
-
-        let mut path = Vec::with_capacity(path_bytes.len() / size_of::<DmarPciPath>());
-        let mut path_offset = 0usize;
-        while path_offset < path_bytes.len() {
-            let step = read_packed::<DmarPciPath>(path_bytes, path_offset);
-            path.push(IntelPciPath {
-                device: step.device,
-                function: step.function,
-            });
-            path_offset += size_of::<DmarPciPath>();
-        }
-
-        scopes.push(IntelDeviceScope {
-            scope_type: header.entry_type,
-            enumeration_id: header.enumeration_id,
-            start_bus: header.bus,
-            path,
-        });
-        offset += length;
-    }
-
-    scopes
-}
-
-fn parse_amd_device_entries(bytes: &[u8]) -> Vec<AmdIvhdDeviceEntry> {
-    let mut entries = Vec::new();
-    let mut offset = 0usize;
-
-    while offset < bytes.len() {
-        if offset + IVRS_DEVICE_ENTRY_MIN_LENGTH > bytes.len() {
-            panic!("IVRS device entry header is truncated");
-        }
-
-        let entry_type = bytes[offset];
-        let entry_length = amd_device_entry_length(entry_type);
-        if offset + entry_length > bytes.len() {
-            panic!("IVRS device entry overruns its IVHD block");
-        }
-
-        let requester_id = read_u16(bytes, offset + 1);
-        let settings = bytes[offset + 3];
-        let entry = match entry_type {
-            IVRS_DEVICE_PAD4 => AmdIvhdDeviceEntry::Pad4,
-            IVRS_DEVICE_ALL => AmdIvhdDeviceEntry::All { settings },
-            IVRS_DEVICE_SELECT => AmdIvhdDeviceEntry::Select {
-                requester_id,
-                settings,
-            },
-            IVRS_DEVICE_START_RANGE => AmdIvhdDeviceEntry::StartRange {
-                requester_id,
-                settings,
-            },
-            IVRS_DEVICE_END_RANGE => AmdIvhdDeviceEntry::EndRange {
-                requester_id,
-                settings,
-            },
-            IVRS_DEVICE_PAD8 => AmdIvhdDeviceEntry::Pad8,
-            IVRS_DEVICE_ALIAS_SELECT => AmdIvhdDeviceEntry::AliasSelect {
-                requester_id,
-                settings,
-                used_id: read_u16(bytes, offset + 5),
-            },
-            IVRS_DEVICE_ALIAS_START_RANGE => AmdIvhdDeviceEntry::AliasStartRange {
-                requester_id,
-                settings,
-                used_id: read_u16(bytes, offset + 5),
-            },
-            IVRS_DEVICE_EXT_SELECT => AmdIvhdDeviceEntry::ExtSelect {
-                requester_id,
-                settings,
-                extended_data: read_u32(bytes, offset + 4),
-            },
-            IVRS_DEVICE_EXT_START_RANGE => AmdIvhdDeviceEntry::ExtStartRange {
-                requester_id,
-                settings,
-                extended_data: read_u32(bytes, offset + 4),
-            },
-            IVRS_DEVICE_SPECIAL => AmdIvhdDeviceEntry::Special {
-                requester_id,
-                settings,
-                handle: bytes[offset + 4],
-                used_id: read_u16(bytes, offset + 5),
-                variety: bytes[offset + 7],
-            },
-            IVRS_DEVICE_ACPI_HID => AmdIvhdDeviceEntry::AcpiHid {
-                requester_id,
-                settings,
-                hardware_id: read_u64(bytes, offset + 4),
-                compatible_id: read_u64(bytes, offset + 12),
-                uid_type: bytes[offset + 20],
-                uid_length: bytes[offset + 21],
-            },
-            _ => AmdIvhdDeviceEntry::Unknown {
-                entry_type,
-                raw: bytes[offset..offset + entry_length].to_vec(),
-            },
-        };
-
-        entries.push(entry);
-        offset += entry_length;
-    }
-
-    entries
-}
 fn resolve_hardware_pdo(device: &Arc<DeviceObject>) -> Result<Arc<DeviceObject>, DriverStatus> {
     let Some(devnode_weak) = device.dev_node.get() else {
         return Err(DriverStatus::NoSuchDevice);
     };
+
     let Some(devnode) = devnode_weak.upgrade() else {
         return Err(DriverStatus::NoSuchDevice);
     };
+
     devnode.get_pdo().ok_or(DriverStatus::NoSuchDevice)
 }
 
@@ -1714,218 +1227,3 @@ fn device_key(device: &Arc<DeviceObject>) -> usize {
 fn compute_pci_requester_id(bus: u8, device: u8, function: u8) -> u16 {
     ((bus as u16) << 8) | ((device as u16) << 3) | function as u16
 }
-
-fn has_table<T: AcpiTable>(tables: &AcpiTables<ACPIImpl>) -> bool {
-    tables.find_table::<T>().is_ok()
-}
-
-fn require_table<T: AcpiTable>(
-    tables: &AcpiTables<ACPIImpl>,
-    name: &str,
-) -> PhysicalMapping<ACPIImpl, T> {
-    match tables.find_table::<T>() {
-        Ok(table) => table,
-        Err(err) => panic!(
-            "mandatory IOMMU policy: ACPI {} is missing or invalid: {:?}",
-            name, err
-        ),
-    }
-}
-
-fn table_bytes<'a, H: AcpiHandler, T>(table: &'a PhysicalMapping<H, T>) -> &'a [u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            table.virtual_start().as_ptr().cast::<u8>(),
-            table.region_length(),
-        )
-    }
-}
-
-fn read_packed<T: Copy>(bytes: &[u8], offset: usize) -> T {
-    assert!(offset + size_of::<T>() <= bytes.len());
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<T>()) }
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> u16 {
-    let slice = bytes
-        .get(offset..offset + 2)
-        .expect("ACPI field is truncated");
-    u16::from_le_bytes([slice[0], slice[1]])
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    let slice = bytes
-        .get(offset..offset + 4)
-        .expect("ACPI field is truncated");
-    u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]])
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    let slice = bytes
-        .get(offset..offset + 8)
-        .expect("ACPI field is truncated");
-    u64::from_le_bytes([
-        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-    ])
-}
-
-fn amd_device_entry_length(entry_type: u8) -> usize {
-    match entry_type {
-        IVRS_DEVICE_ACPI_HID => 32,
-        _ => 4usize << (entry_type >> 6),
-    }
-}
-
-fn detect_boot_iommu_vendor() -> BootIommuVendor {
-    let cpuid = CpuId::new();
-    let Some(vendor) = cpuid.get_vendor_info() else {
-        return BootIommuVendor::Unknown;
-    };
-
-    match vendor.as_str() {
-        "GenuineIntel" => BootIommuVendor::Intel,
-        "AuthenticAMD" => BootIommuVendor::Amd,
-        _ => BootIommuVendor::Unknown,
-    }
-}
-
-enum BootIommuVendor {
-    Intel,
-    Amd,
-    Unknown,
-}
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DmarTable {
-    header: SdtHeader,
-    width: u8,
-    flags: u8,
-    reserved: [u8; 10],
-}
-
-unsafe impl AcpiTable for DmarTable {
-    const SIGNATURE: Signature = Signature::DMAR;
-
-    fn header(&self) -> &SdtHeader {
-        &self.header
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DmarSubtableHeader {
-    subtable_type: u16,
-    length: u16,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DmarHardwareUnit {
-    header: DmarSubtableHeader,
-    flags: u8,
-    reserved: u8,
-    segment: u16,
-    address: u64,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DmarReservedMemory {
-    header: DmarSubtableHeader,
-    flags: u16,
-    segment: u16,
-    base_address: u64,
-    end_address: u64,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DmarHardwareAffinity {
-    header: DmarSubtableHeader,
-    reserved: u32,
-    base_address: u64,
-    proximity_domain: u32,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DmarDeviceScopeHeader {
-    entry_type: u8,
-    length: u8,
-    reserved: u16,
-    enumeration_id: u8,
-    bus: u8,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DmarPciPath {
-    device: u8,
-    function: u8,
-}
-
-const DMAR_TYPE_HARDWARE_UNIT: u16 = 0;
-const DMAR_TYPE_RESERVED_MEMORY: u16 = 1;
-const DMAR_TYPE_HARDWARE_AFFINITY: u16 = 3;
-const DMAR_INCLUDE_ALL: u8 = 1;
-const DMAR_ALLOW_ALL: u16 = 1;
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct IvrsTable {
-    header: SdtHeader,
-    info: u32,
-    reserved: u64,
-}
-
-unsafe impl AcpiTable for IvrsTable {
-    const SIGNATURE: Signature = Signature::IVRS;
-
-    fn header(&self) -> &SdtHeader {
-        &self.header
-    }
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct IvrsHeader {
-    block_type: u8,
-    flags: u8,
-    length: u16,
-    device_id: u16,
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct IvrsMemoryBlock {
-    header: IvrsHeader,
-    aux_data: u16,
-    reserved: u64,
-    start_address: u64,
-    memory_length: u64,
-}
-
-const IVRS_HARDWARE_MIN_LENGTH: usize = 20;
-const IVRS_DEVICE_ENTRY_MIN_LENGTH: usize = 4;
-
-const IVRS_TYPE_HARDWARE_10: u8 = 0x10;
-const IVRS_TYPE_HARDWARE_11: u8 = 0x11;
-const IVRS_TYPE_HARDWARE_40: u8 = 0x40;
-const IVRS_TYPE_MEMORY_ALL: u8 = 0x20;
-const IVRS_TYPE_MEMORY_SPECIFIED: u8 = 0x21;
-const IVRS_TYPE_MEMORY_RANGE: u8 = 0x22;
-
-const IVHD_ATTR_HATDIS: u32 = 1 << 0;
-
-const IVRS_DEVICE_PAD4: u8 = 0x00;
-const IVRS_DEVICE_ALL: u8 = 0x01;
-const IVRS_DEVICE_SELECT: u8 = 0x02;
-const IVRS_DEVICE_START_RANGE: u8 = 0x03;
-const IVRS_DEVICE_END_RANGE: u8 = 0x04;
-const IVRS_DEVICE_PAD8: u8 = 0x40;
-const IVRS_DEVICE_ALIAS_SELECT: u8 = 0x42;
-const IVRS_DEVICE_ALIAS_START_RANGE: u8 = 0x43;
-const IVRS_DEVICE_EXT_SELECT: u8 = 0x46;
-const IVRS_DEVICE_EXT_START_RANGE: u8 = 0x47;
-const IVRS_DEVICE_SPECIAL: u8 = 0x48;
-const IVRS_DEVICE_ACPI_HID: u8 = 0xF0;

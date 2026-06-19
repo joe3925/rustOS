@@ -15,10 +15,7 @@ allocator-mimalloc = []
 allocator-buddy = []
 
 [dependencies]
-x86_64 = "=0.15.2"
 spin = "0.10.0"
-pic8259 = "0.10.1"
-pc-keyboard = "0.7.0"
 bitflags = "2.6.0"
 strum = { version = "0.24", default-features = false, features = ["derive"] }
 strum_macros = "0.24"
@@ -28,7 +25,6 @@ rand_xoshiro = { version = "0.7.0", default-features = false }
 rand_core = "0.9.0"
 crc-any = "2.0.0"
 embedded-graphics = "0.8.1"
-raw-cpuid = "11.5.0"
 acpi = "5.2.0"
 goblin = { version = "0.10.0", features = [
     "endian_fd",
@@ -50,25 +46,31 @@ serde_json = { version = "1.0.140", default-features = false, features = [
 buddy_system_allocator = "0.11.0"
 toml = { version = "0.9.5", default-features = false, features = ["parse"] }
 libm = { version = "0.2", default-features = false }
-kernel_types = { path = "../kernel_types", default-features = false, features = [
+kernel_types = { path = "../libs/kernel_types", default-features = false, features = [
     "async-ffi-slab",
     "async-ffi-slab-slots-512",
     "async-ffi-slab-slot-bytes-64k",
 ] }
-kernel_abi = { path = "../kernel_abi" }
-kernel_routing = { path = "../kernel_routing", default-features = false, features = [
+kernel_abi = { path = "../libs/kernel_abi" }
+kernel_routing = { path = "../libs/kernel_routing", default-features = false, features = [
     "kernel_link",
 ] }
 crossbeam-queue = { version = "0.3.12", default-features = false, features = [
     "alloc",
 ] }
-kernel_executor = { path = "../kernel_executor" }
-kernel_macros = { path = "../kernel_macros" }
-kernel_sync = { path = "../kernel_sync", default-features = false }
+kernel_executor = { path = "../libs/kernel_executor" }
+kernel_macros = { path = "../libs/kernel_macros" }
+kernel_sync = { path = "../libs/kernel_sync", default-features = false }
 crossbeam-epoch = { version = "0.9", default-features = false, features = [
     "alloc",
 ] }
 cfg-if = "1.0.4"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = "=0.15.2"
+pic8259 = "0.10.1"
+pc-keyboard = "0.7.0"
+raw-cpuid = "11.5.0"
 
 
 [dependencies.lazy_static]

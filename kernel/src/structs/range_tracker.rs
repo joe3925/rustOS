@@ -1,6 +1,8 @@
+use crate::memory::paging::base_page_size;
 use alloc::vec::Vec;
 use spin::{Mutex, MutexGuard};
-use x86_64::VirtAddr;
+
+use kernel_types::arch::VirtAddr;
 
 pub struct AllocationIter<'a> {
     guard: MutexGuard<'a, Vec<(u64, u64)>>,
@@ -37,19 +39,31 @@ pub struct RangeTracker {
 
     pub start: u64,
     pub end: u64,
+    granularity: u64,
 }
 
 impl RangeTracker {
     pub fn new(start: u64, end: u64) -> Self {
+        Self::new_with_granularity(start, end, base_page_size())
+    }
+
+    pub fn new_with_granularity(start: u64, end: u64, granularity: u64) -> Self {
         Self {
             allocations: Mutex::new(Vec::new()),
             start,
             end,
+            granularity,
         }
     }
 
+    fn align_size(&self, size: u64) -> Option<u64> {
+        align_up(size, self.granularity)
+    }
+
     pub fn alloc(&self, base: u64, size: u64) -> Result<VirtAddr, RangeAllocationError> {
-        let aligned_size = (size + 0xFFF) & !0xFFF;
+        let aligned_size = self
+            .align_size(size)
+            .ok_or(RangeAllocationError::OutOfRange)?;
         let mut lock = self.allocations.lock();
         if (base < self.start || base + aligned_size > self.end) {
             return Err(RangeAllocationError::OutOfRange);
@@ -74,7 +88,9 @@ impl RangeTracker {
     }
 
     pub fn dealloc(&self, base: u64, size: u64) {
-        let aligned_size = (size + 0xFFF) & !0xFFF;
+        let Some(aligned_size) = self.align_size(size) else {
+            return;
+        };
         let mut lock = self.allocations.lock();
         if let Some(index) = lock
             .iter()
@@ -86,7 +102,7 @@ impl RangeTracker {
 
     // Finds a free region of at least `size` bytes and allocates it
     pub fn alloc_auto(&self, size: u64) -> Option<VirtAddr> {
-        let aligned_size = (size + 0xFFF) & !0xFFF;
+        let aligned_size = self.align_size(size)?;
         let mut lock = self.allocations.lock();
 
         // Sort existing allocations by base address
@@ -120,8 +136,12 @@ impl RangeTracker {
     }
 
     pub fn alloc_auto_aligned(&self, size: u64, alignment: u64) -> Option<VirtAddr> {
-        let aligned_size = (size + 0xFFF) & !0xFFF;
-        if aligned_size == 0 || alignment < 0x1000 || (alignment & (alignment - 1)) != 0 {
+        let aligned_size = self.align_size(size)?;
+        if aligned_size == 0
+            || alignment < self.granularity
+            || (alignment & (alignment - 1)) != 0
+            || (alignment % self.granularity) != 0
+        {
             return None;
         }
 

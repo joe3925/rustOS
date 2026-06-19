@@ -12,7 +12,7 @@ use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use dev_ext::DevExt;
 use kernel_api::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::memory::map_mmio_region;
+use kernel_api::memory::{PhysAddr, map_mmio_region};
 use kernel_api::pnp::{
     DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
     pnp_create_child_devnode_and_pdo_with_init,
@@ -20,7 +20,6 @@ use kernel_api::pnp::{
 use kernel_api::request::{Pnp, RequestHandle};
 use kernel_api::runtime::spawn_blocking;
 use kernel_api::status::DriverStatus;
-use kernel_api::x86_64::PhysAddr;
 use kernel_api::{println, request_handler};
 use spin::RwLock;
 
@@ -99,7 +98,7 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
             return Err(());
         }
 
-        // Inform firmware we are using APIC mode so _PRT returns GSIs
+        // Inform firmware we want global system interrupt routing from _PRT.
         if let Ok(pic_path) = AmlName::from_str("\\_PIC") {
             let args = ::aml::value::Args([
                 Some(::aml::value::AmlValue::Integer(1)),

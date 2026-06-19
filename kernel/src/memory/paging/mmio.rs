@@ -1,104 +1,66 @@
 use spin::Mutex;
 
+use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
-use x86_64::{
-    PhysAddr, VirtAddr,
-    structures::paging::{Mapper as _, Page, PageTableFlags, Size1GiB, Size2MiB, Size4KiB},
-};
 
-use crate::{
-    cpu::get_cpu_info,
-    memory::paging::{
-        frame_alloc::BootInfoFrameAllocator,
-        paging::{TlbFlush, align_up_4k, map_contiguous_physical_range},
-        tables::init_mapper,
-        virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range},
-    },
-    util::boot_info,
-};
+use super::layout::{align_down, align_up_to_base_page, base_page_size, largest_mapping_size_for};
+use super::map::{map_contiguous_physical_range, unmap_range_keep_frames_unchecked};
+use super::types::LocalTlbFlush;
+use super::virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range};
 
 static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
 
-const GIB: u64 = 1 << 30;
-const MIB2: u64 = 2 * 1024 * 1024;
-const KIB4: u64 = 4 * 1024;
-
-#[inline(always)]
-fn is_pow2(x: u64) -> bool {
-    x != 0 && (x & (x - 1)) == 0
-}
-
-#[inline(always)]
-fn is_valid_mmio_va_alignment(x: u64) -> bool {
-    is_pow2(x) && x >= KIB4 && (x & (KIB4 - 1)) == 0
-}
-
-#[inline(always)]
-fn choose_mmio_va_alignment(aligned_phys: u64, total_size: u64, supports_1g: bool) -> u64 {
-    if supports_1g && total_size >= GIB && (aligned_phys & (GIB - 1)) == 0 {
-        return GIB;
-    }
-    if total_size >= MIB2 && (aligned_phys & (MIB2 - 1)) == 0 {
-        return MIB2;
-    }
-    KIB4
-}
-
-pub extern "C" fn map_mmio_region(
-    mmio_base: PhysAddr,
-    mmio_size: u64,
+pub fn map_physical_pages(
+    phys: PhysAddr,
+    size: u64,
+    cache: PhysicalMappingCache,
 ) -> Result<VirtAddr, PageMapError> {
-    let phys_addr = mmio_base.as_u64();
-    let off = phys_addr & 0xFFF;
+    let base_page = base_page_size();
+    let phys_addr = phys.as_u64();
+    let off = phys_addr % base_page;
     let aligned_phys = phys_addr - off;
-    let total_size = align_up_4k(mmio_size + off);
+    let total_size = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
 
-    let supports_1g = get_cpu_info()
-        .get_extended_processor_and_feature_identifiers()
-        .expect("CPUID unavailable")
-        .has_1gib_pages();
-
-    let va_align = choose_mmio_va_alignment(aligned_phys, total_size, supports_1g);
-    map_mmio_region_aligned(mmio_base, mmio_size, va_align)
+    let va_alignment = largest_mapping_size_for(total_size, Some(aligned_phys));
+    map_physical_pages_aligned(phys, size, va_alignment, cache)
 }
 
-pub extern "C" fn map_mmio_region_aligned(
-    mmio_base: PhysAddr,
-    mmio_size: u64,
+pub fn map_physical_pages_aligned(
+    phys: PhysAddr,
+    size: u64,
     va_alignment: u64,
+    cache: PhysicalMappingCache,
 ) -> Result<VirtAddr, PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
-    if mmio_size == 0 {
-        return Err(PageMapError::TranslationFailed());
-    }
-    if !is_valid_mmio_va_alignment(va_alignment) {
+    if size == 0 {
         return Err(PageMapError::TranslationFailed());
     }
 
-    let phys_addr = mmio_base.as_u64();
-    let off = phys_addr & 0xFFF;
-    let aligned_phys = phys_addr - off;
-    let total_size = align_up_4k(mmio_size + off);
+    let base_page = base_page_size();
+    if va_alignment < base_page || !va_alignment.is_power_of_two() || va_alignment % base_page != 0
+    {
+        return Err(PageMapError::TranslationFailed());
+    }
+
+    let phys_addr = phys.as_u64();
+    let off = phys_addr % base_page;
+    let aligned_phys = align_down(phys_addr, base_page).ok_or(PageMapError::TranslationFailed())?;
+    let total_size = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
 
     let virtual_addr = allocate_auto_kernel_range_aligned(total_size, va_alignment)
         .ok_or(PageMapError::NoMemory())?;
 
-    let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-
-    let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
     if let Err(err) = unsafe {
         map_contiguous_physical_range(
-            &mut mapper,
-            &mut frame_allocator,
             virtual_addr,
             PhysAddr::new(aligned_phys),
             total_size,
-            base_flags,
-            TlbFlush::Flush,
+            flags,
+            Some(cache),
+            LocalTlbFlush::Flush,
         )
     } {
         deallocate_kernel_range(virtual_addr, total_size);
@@ -108,59 +70,22 @@ pub extern "C" fn map_mmio_region_aligned(
     Ok(VirtAddr::new(virtual_addr.as_u64() + off))
 }
 
-pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+pub fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
     if size == 0 {
         return Ok(());
     }
 
-    let off = base.as_u64() & 0xFFF;
+    let base_page = base_page_size();
+    let off = base.as_u64() % base_page;
     let start = VirtAddr::new(base.as_u64() - off);
-    let total = align_up_4k(size + off);
+    let total = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
 
-    let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(
-        boot_info
-            .physical_memory_offset
-            .into_option()
-            .expect("missing phys-mem offset"),
-    );
-
-    let mut mapper = init_mapper(phys_mem_offset);
-
-    let mut cur = start;
-    let mut remaining = total;
-
-    while remaining > 0 {
-        if remaining >= GIB && (cur.as_u64() & (GIB - 1)) == 0 {
-            let page = Page::<Size1GiB>::containing_address(cur);
-            if let Ok((_frame, flush)) = mapper.unmap(page) {
-                flush.flush();
-                cur += GIB;
-                remaining -= GIB;
-                continue;
-            }
-        }
-
-        if remaining >= MIB2 && (cur.as_u64() & (MIB2 - 1)) == 0 {
-            let page = Page::<Size2MiB>::containing_address(cur);
-            if let Ok((_frame, flush)) = mapper.unmap(page) {
-                flush.flush();
-                cur += MIB2;
-                remaining -= MIB2;
-                continue;
-            }
-        }
-
-        let page = Page::<Size4KiB>::containing_address(cur);
-        if let Ok((_frame, flush)) = mapper.unmap(page) {
-            flush.flush();
-        }
-
-        cur += KIB4;
-        remaining -= KIB4;
+    unsafe {
+        unmap_range_keep_frames_unchecked(start, total);
     }
+    deallocate_kernel_range(start, total);
 
     Ok(())
 }

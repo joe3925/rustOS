@@ -1,0 +1,15 @@
+cargo-features = ["profile-rustflags"]
+
+[package]
+name = "kernel_sys"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel_types = { path = "../kernel_types" }
+acpi = "5.0.0"
+spin = "0.10.0"

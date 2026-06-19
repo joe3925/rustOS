@@ -1,4 +1,3 @@
-// lib.rs (or main driver file)
 #![no_std]
 #![no_main]
 #![feature(const_option_ops)]
@@ -9,7 +8,6 @@ mod dev_ext;
 mod msix;
 
 use alloc::{sync::Arc, vec::Vec};
-use core::arch::asm;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
@@ -27,7 +25,7 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
     kernel_types::{io::DeviceControlHandler, pnp::DeviceIds, request::RequestData},
-    memory::unmap_mmio_region,
+    memory::{VirtAddr, unmap_mmio_region},
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -185,7 +183,7 @@ fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
 
 #[derive(Clone, Copy)]
 struct MapToUnmap {
-    base: kernel_api::x86_64::VirtAddr,
+    base: VirtAddr,
     size: u64,
 }
 
@@ -193,7 +191,7 @@ struct MapToUnmap {
 struct BusWork {
     seg: McfgSegment,
     bus: u8,
-    bus_base: kernel_api::x86_64::VirtAddr,
+    bus_base: VirtAddr,
 }
 
 pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
@@ -219,17 +217,22 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
     let prt_arc: Arc<[PrtEntry]> = Arc::from(prt_vec.clone());
 
     if segments.is_none() {
-        println!("[PCI] No ECAM segments; falling back to legacy CFG#1 scan.");
+        if !dev_ext::platform_config_access_available() {
+            println!("[PCI] no ECAM segments and no platform PCI config access");
+            return DriverStatus::NotImplemented;
+        }
+
+        println!("[PCI] No ECAM segments; scanning through platform PCI config access.");
         for bus in 0u8..=255 {
             for dev in 0u8..32 {
-                let ht = match dev_ext::header_type_legacy(bus, dev) {
+                let ht = match dev_ext::header_type_config(bus, dev) {
                     Some(v) => v,
                     None => continue,
                 };
                 let multi = (ht & 0x80) != 0;
                 let func_span = if multi { 0u8..8 } else { 0u8..1 };
                 for func in func_span {
-                    if let Some(mut p) = dev_ext::probe_function_legacy(bus, dev, func) {
+                    if let Some(mut p) = dev_ext::probe_function_config(bus, dev, func) {
                         resolve_gsi(&mut p, prt_vec.as_slice());
                         make_pdo_for_function(&devnode, &p);
                     }

@@ -12,10 +12,10 @@ use kernel_api::acpi::mcfg::Mcfg;
 use kernel_api::device::DevNode;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
+use kernel_api::kernel_types::pci::EcamSegment;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
-use kernel_api::memory::map_mmio_region;
-use kernel_api::memory::unmap_mmio_region;
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpMinorFunction;
 use kernel_api::pnp::PnpVtable;
@@ -26,21 +26,11 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::request::{Pnp, RequestHandle};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
-use kernel_api::x86_64::PhysAddr;
-use kernel_api::x86_64::VirtAddr;
-use kernel_api::x86_64::instructions::port::Port;
-use spin::Mutex;
 pub const PAGE_SIZE: usize = 4096;
 #[repr(C)]
 pub struct KernelAmlHandler;
 
-#[repr(C)]
-pub struct McfgSeg {
-    pub base: u64,
-    pub seg: u16,
-    pub sb: u8,
-    pub eb: u8,
-}
+pub type McfgSeg = EcamSegment;
 
 /// Volatile read/write helper that tolerates unaligned MMIO addresses.
 #[repr(C, packed)]
@@ -49,12 +39,12 @@ struct VolatileUnaligned<T>(T);
 #[inline]
 unsafe fn read_volatile_unaligned<T: Copy>(ptr: *const u8) -> T {
     // Cast through an align(1) wrapper so the volatile access is well-defined.
-    read_volatile(ptr as *const VolatileUnaligned<T>).0
+    unsafe { read_volatile(ptr as *const VolatileUnaligned<T>).0 }
 }
 
 #[inline]
 unsafe fn write_volatile_unaligned<T: Copy>(ptr: *mut u8, val: T) {
-    write_volatile(ptr as *mut VolatileUnaligned<T>, VolatileUnaligned(val));
+    unsafe { write_volatile(ptr as *mut VolatileUnaligned<T>, VolatileUnaligned(val)) };
 }
 
 #[inline]
@@ -97,15 +87,21 @@ unsafe fn mmio_write<T: Copy>(paddr: usize, val: T) {
     unsafe { unmap_phys_window(va, size) };
 }
 
-static PCI_CFG_LOCK: Mutex<()> = Mutex::new(());
-
 #[inline]
-fn pci_cfg_addr(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
-    0x8000_0000u32
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((off as u32) & 0xFC)
+fn ecam_cfg_phys_addr(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Option<usize> {
+    let tables = get_acpi_tables();
+    let map = tables.find_table::<Mcfg>().ok()?;
+    let raw = unsafe {
+        core::slice::from_raw_parts(
+            map.virtual_start().as_ptr() as *const u8,
+            map.region_length(),
+        )
+    };
+
+    parse_mcfg(raw)
+        .into_iter()
+        .find(|entry| entry.seg == seg && entry.contains_bus(bus))
+        .map(|entry| entry.config_space_phys_addr(bus, dev, func, off) as usize)
 }
 
 impl Handler for KernelAmlHandler {
@@ -144,59 +140,30 @@ impl Handler for KernelAmlHandler {
     }
 
     #[inline]
-    fn read_io_u8(&self, port: u16) -> u8 {
-        unsafe {
-            let mut p = Port::<u8>::new(port);
-            p.read()
-        }
+    fn read_io_u8(&self, _port: u16) -> u8 {
+        0
     }
     #[inline]
-    fn read_io_u16(&self, port: u16) -> u16 {
-        unsafe {
-            let mut p = Port::<u16>::new(port);
-            p.read()
-        }
+    fn read_io_u16(&self, _port: u16) -> u16 {
+        0
     }
     #[inline]
-    fn read_io_u32(&self, port: u16) -> u32 {
-        unsafe {
-            let mut p = Port::<u32>::new(port);
-            p.read()
-        }
+    fn read_io_u32(&self, _port: u16) -> u32 {
+        0
     }
 
     #[inline]
-    fn write_io_u8(&self, port: u16, v: u8) {
-        unsafe {
-            let mut p = Port::<u8>::new(port);
-            p.write(v)
-        }
-    }
+    fn write_io_u8(&self, _port: u16, _v: u8) {}
     #[inline]
-    fn write_io_u16(&self, port: u16, v: u16) {
-        unsafe {
-            let mut p = Port::<u16>::new(port);
-            p.write(v)
-        }
-    }
+    fn write_io_u16(&self, _port: u16, _v: u16) {}
     #[inline]
-    fn write_io_u32(&self, port: u16, v: u32) {
-        unsafe {
-            let mut p = Port::<u32>::new(port);
-            p.write(v)
-        }
-    }
+    fn write_io_u32(&self, _port: u16, _v: u32) {}
 
     #[inline]
-    fn read_pci_u32(&self, _seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
-        let _g = PCI_CFG_LOCK.lock();
-        let addr = pci_cfg_addr(bus, dev, func, off);
-        unsafe {
-            let mut cf8 = Port::<u32>::new(0xCF8);
-            let mut cfc = Port::<u32>::new(0xCFC);
-            cf8.write(addr);
-            cfc.read()
-        }
+    fn read_pci_u32(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
+        ecam_cfg_phys_addr(seg, bus, dev, func, off & !3)
+            .map(|addr| unsafe { mmio_read::<u32>(addr) })
+            .unwrap_or(u32::MAX)
     }
 
     #[inline]
@@ -214,14 +181,9 @@ impl Handler for KernelAmlHandler {
     }
 
     #[inline]
-    fn write_pci_u32(&self, _seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u32) {
-        let _g = PCI_CFG_LOCK.lock();
-        let addr = pci_cfg_addr(bus, dev, func, off);
-        unsafe {
-            let mut cf8 = Port::<u32>::new(0xCF8);
-            let mut cfc = Port::<u32>::new(0xCFC);
-            cf8.write(addr);
-            cfc.write(val);
+    fn write_pci_u32(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u32) {
+        if let Some(addr) = ecam_cfg_phys_addr(seg, bus, dev, func, off & !3) {
+            unsafe { mmio_write::<u32>(addr, val) };
         }
     }
 
@@ -402,15 +364,10 @@ pub fn create_pnp_bus_from_acpi(
             )
         };
         for e in parse_mcfg(raw) {
-            if e.seg == seg && !(e.eb < sb || e.sb > eb) {
-                let csb = sb.max(e.sb);
-                let ceb = eb.min(e.eb);
-                ecam.push(McfgSeg {
-                    base: e.base,
-                    seg: e.seg,
-                    sb: csb,
-                    eb: ceb,
-                });
+            if e.seg == seg && !(e.end_bus < sb || e.start_bus > eb) {
+                let csb = sb.max(e.start_bus);
+                let ceb = eb.min(e.end_bus);
+                ecam.push(McfgSeg::new(e.base, e.seg, csb, ceb));
             }
         }
     }
@@ -744,7 +701,7 @@ fn parse_mcfg(raw: &[u8]) -> alloc::vec::Vec<McfgSeg> {
         let seg = u16::from_le_bytes(raw[off + 8..off + 10].try_into().unwrap());
         let sb = raw[off + 10];
         let eb = raw[off + 11];
-        v.push(McfgSeg { base, seg, sb, eb });
+        v.push(McfgSeg::new(base, seg, sb, eb));
         off += 16;
     }
     v
@@ -756,8 +713,8 @@ pub fn append_ecam_list(out: &mut Vec<u8>, segs: &[McfgSeg]) {
     for s in segs {
         out.extend_from_slice(&s.base.to_le_bytes());
         out.extend_from_slice(&s.seg.to_le_bytes());
-        out.push(s.sb);
-        out.push(s.eb);
+        out.push(s.start_bus);
+        out.push(s.end_bus);
     }
 }
 
