@@ -1,14 +1,20 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::Debug;
 
+use crate::drivers::ACPI::ACPIImpl;
 use crate::machine::MachineInfo;
+use crate::machine::MachineInterruptInfo;
 use crate::memory::device_mmu::{
     DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
 };
 use crate::memory::paging::types::UserVmLayout;
+use acpi::AcpiTables;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{MsiMessage, MsiRequest};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::pci::PciConfigAddress;
+use kernel_types::runtime::BlockOnThreadState;
 use kernel_types::status::PageMapError;
 
 use crate::memory::paging::{
@@ -26,6 +32,8 @@ pub trait Platform {
 }
 
 pub trait CpuPlatform: Platform {
+    const MAX_CPUS: usize;
+
     fn current_cpu_id() -> usize;
     fn current_logical_id() -> usize;
     fn cpu_topology_ids() -> Vec<u8>;
@@ -36,7 +44,16 @@ pub trait CpuPlatform: Platform {
     fn broadcast_panic_stop();
 }
 
-pub trait InterruptPlatform: Platform {
+pub trait InterruptPlatform: CpuPlatform {
+    type InterruptFrame;
+
+    const DYNAMIC_VECTOR_START: u8;
+    const DYNAMIC_VECTOR_END: u8;
+
+    fn scheduler_ipi_vector() -> u8;
+    fn timer_interrupt_vector() -> u8;
+    fn tlb_shootdown_vector() -> u8;
+
     fn interrupts_enabled() -> bool;
     fn current_is_in_interrupt() -> bool;
     fn disable_interrupts();
@@ -46,6 +63,19 @@ pub trait InterruptPlatform: Platform {
     fn end_interrupt(vector: u8);
     fn send_ipi(target_platform_cpu_id: usize, vector: u8) -> bool;
     fn compose_msi_message(request: &MsiRequest) -> Option<MsiMessage>;
+    fn is_reserved_vector(vector: u8) -> bool;
+
+    fn is_dynamic_vector(vector: u8) -> bool {
+        vector >= Self::DYNAMIC_VECTOR_START
+            && vector <= Self::DYNAMIC_VECTOR_END
+            && !Self::is_reserved_vector(vector)
+    }
+
+    fn gsi_to_vector(gsi: u8) -> Option<u8>;
+    fn vector_to_gsi(vector: u8) -> Option<u8>;
+    fn unmask_gsi_any_cpu(gsi: u8, vector: u8);
+    fn enter_interrupt() -> bool;
+    fn leave_interrupt(was_in_interrupt: bool);
 }
 
 pub trait TimerPlatform: Platform {
@@ -126,6 +156,51 @@ pub trait DeviceMmuPlatform: Platform {
         machine: &MachineInfo,
     ) -> DeviceMmuDiscoveryResult<Option<DeviceMmuSystem>>;
 }
+
+pub trait MachinePlatform: Platform {
+    fn discover_interrupt_info_from_acpi(
+        tables: &AcpiTables<ACPIImpl>,
+    ) -> Option<MachineInterruptInfo>;
+}
+
+pub trait TaskPlatform: CpuPlatform {
+    type TaskEntry: Copy + Send + Sync + 'static;
+    type TaskContext: Copy + Debug + Send + Sync + 'static;
+    type FpuState: Default + Debug + Send + Sync + 'static;
+    type KernelTls: Debug + Send + Sync + 'static;
+
+    fn idle_task_entry() -> Self::TaskEntry;
+    fn new_user_task_context(
+        entry_point: Self::TaskEntry,
+        context: usize,
+        stack_top: VirtAddr,
+    ) -> Self::TaskContext;
+    fn new_kernel_task_context(
+        entry_point: Self::TaskEntry,
+        context: usize,
+        stack_top: VirtAddr,
+    ) -> Self::TaskContext;
+    fn mark_idle_task_context(context: &mut Self::TaskContext);
+    unsafe fn restore_task_context(context: &Self::TaskContext, target: *mut Self::TaskContext);
+
+    fn save_fpu_state(state: &mut Self::FpuState);
+    fn restore_fpu_state(state: &Self::FpuState);
+
+    fn new_kernel_tls() -> Option<Self::KernelTls>;
+    fn kernel_tls_thread_pointer(tls: &Self::KernelTls) -> u64;
+    fn activate_kernel_tls(thread_pointer: u64);
+    fn ensure_current_thread_runtime_initialized();
+    fn current_block_on_thread_state() -> Arc<BlockOnThreadState>;
+    fn request_task_yield();
+}
+
+pub trait DebugPlatform: Platform {
+    fn breakpoint();
+    fn fatal_reset() -> !;
+}
+
+pub const MAX_CPUS: usize = <ActivePlatform as CpuPlatform>::MAX_CPUS;
+
 pub fn user_vm_layout() -> UserVmLayout {
     <ActivePlatform as PagingPlatform>::user_virtual_layout()
 }
@@ -189,6 +264,18 @@ pub fn enable_interrupts_and_halt() {
     <ActivePlatform as InterruptPlatform>::enable_interrupts_and_halt();
 }
 
+pub fn scheduler_ipi_vector() -> u8 {
+    <ActivePlatform as InterruptPlatform>::scheduler_ipi_vector()
+}
+
+pub fn timer_interrupt_vector() -> u8 {
+    <ActivePlatform as InterruptPlatform>::timer_interrupt_vector()
+}
+
+pub fn tlb_shootdown_vector() -> u8 {
+    <ActivePlatform as InterruptPlatform>::tlb_shootdown_vector()
+}
+
 pub fn end_interrupt(vector: u8) {
     <ActivePlatform as InterruptPlatform>::end_interrupt(vector);
 }
@@ -199,6 +286,39 @@ pub fn send_ipi(target_platform_cpu_id: usize, vector: u8) -> bool {
 
 pub fn compose_msi_message(request: &MsiRequest) -> Option<MsiMessage> {
     <ActivePlatform as InterruptPlatform>::compose_msi_message(request)
+}
+
+pub fn is_reserved_vector(vector: u8) -> bool {
+    <ActivePlatform as InterruptPlatform>::is_reserved_vector(vector)
+}
+
+pub fn is_dynamic_vector(vector: u8) -> bool {
+    <ActivePlatform as InterruptPlatform>::is_dynamic_vector(vector)
+}
+
+pub fn dynamic_vector_range() -> core::ops::RangeInclusive<u8> {
+    <ActivePlatform as InterruptPlatform>::DYNAMIC_VECTOR_START
+        ..=<ActivePlatform as InterruptPlatform>::DYNAMIC_VECTOR_END
+}
+
+pub fn gsi_to_vector(gsi: u8) -> Option<u8> {
+    <ActivePlatform as InterruptPlatform>::gsi_to_vector(gsi)
+}
+
+pub fn vector_to_gsi(vector: u8) -> Option<u8> {
+    <ActivePlatform as InterruptPlatform>::vector_to_gsi(vector)
+}
+
+pub fn unmask_gsi_any_cpu(gsi: u8, vector: u8) {
+    <ActivePlatform as InterruptPlatform>::unmask_gsi_any_cpu(gsi, vector);
+}
+
+pub fn enter_interrupt() -> bool {
+    <ActivePlatform as InterruptPlatform>::enter_interrupt()
+}
+
+pub fn leave_interrupt(was_in_interrupt: bool) {
+    <ActivePlatform as InterruptPlatform>::leave_interrupt(was_in_interrupt);
 }
 
 pub fn wait_duration(time: core::time::Duration) {
@@ -251,6 +371,12 @@ pub fn discover_device_mmu(
     <ActivePlatform as DeviceMmuPlatform>::discover_device_mmu(machine)
 }
 
+pub fn discover_interrupt_info_from_acpi(
+    tables: &AcpiTables<ACPIImpl>,
+) -> Option<MachineInterruptInfo> {
+    <ActivePlatform as MachinePlatform>::discover_interrupt_info_from_acpi(tables)
+}
+
 pub fn discover_required_device_mmu(machine: &MachineInfo) -> DeviceMmuSystem {
     match discover_device_mmu(machine) {
         Ok(Some(device_mmu)) => device_mmu,
@@ -276,4 +402,75 @@ pub fn discover_required_device_mmu(machine: &MachineInfo) -> DeviceMmuSystem {
             )
         }
     }
+}
+
+pub fn idle_task_entry() -> <ActivePlatform as TaskPlatform>::TaskEntry {
+    <ActivePlatform as TaskPlatform>::idle_task_entry()
+}
+
+pub fn new_user_task_context(
+    entry_point: <ActivePlatform as TaskPlatform>::TaskEntry,
+    context: usize,
+    stack_top: VirtAddr,
+) -> <ActivePlatform as TaskPlatform>::TaskContext {
+    <ActivePlatform as TaskPlatform>::new_user_task_context(entry_point, context, stack_top)
+}
+
+pub fn new_kernel_task_context(
+    entry_point: <ActivePlatform as TaskPlatform>::TaskEntry,
+    context: usize,
+    stack_top: VirtAddr,
+) -> <ActivePlatform as TaskPlatform>::TaskContext {
+    <ActivePlatform as TaskPlatform>::new_kernel_task_context(entry_point, context, stack_top)
+}
+
+pub fn mark_idle_task_context(context: &mut <ActivePlatform as TaskPlatform>::TaskContext) {
+    <ActivePlatform as TaskPlatform>::mark_idle_task_context(context);
+}
+
+pub unsafe fn restore_task_context(
+    context: &<ActivePlatform as TaskPlatform>::TaskContext,
+    target: *mut <ActivePlatform as TaskPlatform>::TaskContext,
+) {
+    unsafe { <ActivePlatform as TaskPlatform>::restore_task_context(context, target) };
+}
+
+pub fn save_fpu_state(state: &mut <ActivePlatform as TaskPlatform>::FpuState) {
+    <ActivePlatform as TaskPlatform>::save_fpu_state(state);
+}
+
+pub fn restore_fpu_state(state: &<ActivePlatform as TaskPlatform>::FpuState) {
+    <ActivePlatform as TaskPlatform>::restore_fpu_state(state);
+}
+
+pub fn new_kernel_tls() -> Option<<ActivePlatform as TaskPlatform>::KernelTls> {
+    <ActivePlatform as TaskPlatform>::new_kernel_tls()
+}
+
+pub fn kernel_tls_thread_pointer(tls: &<ActivePlatform as TaskPlatform>::KernelTls) -> u64 {
+    <ActivePlatform as TaskPlatform>::kernel_tls_thread_pointer(tls)
+}
+
+pub fn activate_kernel_tls(thread_pointer: u64) {
+    <ActivePlatform as TaskPlatform>::activate_kernel_tls(thread_pointer);
+}
+
+pub fn ensure_current_thread_runtime_initialized() {
+    <ActivePlatform as TaskPlatform>::ensure_current_thread_runtime_initialized();
+}
+
+pub fn current_block_on_thread_state() -> Arc<BlockOnThreadState> {
+    <ActivePlatform as TaskPlatform>::current_block_on_thread_state()
+}
+
+pub fn request_task_yield() {
+    <ActivePlatform as TaskPlatform>::request_task_yield();
+}
+
+pub fn breakpoint() {
+    <ActivePlatform as DebugPlatform>::breakpoint();
+}
+
+pub fn fatal_reset() -> ! {
+    <ActivePlatform as DebugPlatform>::fatal_reset()
 }

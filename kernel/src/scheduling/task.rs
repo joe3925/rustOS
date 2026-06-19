@@ -1,13 +1,10 @@
-use crate::arch::scheduling::task_return_trampoline;
-use crate::arch::VirtAddr;
-use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::{
     allocate_kernel_stack, base_page_size, deallocate_kernel_stack, map_range, StackSize,
 };
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
 use crate::scheduling::scheduler::default_task_sched_binding;
-use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
+use crate::scheduling::state::{FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
 use crate::vec::Vec;
 use alloc::boxed::Box;
@@ -15,15 +12,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use kernel_types::arch::PageFlags;
+use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
 use spin::Mutex;
 use spin::RwLock;
-pub type TaskEntry = crate::arch::scheduling::TaskEntry;
-
-const C_SHADOW_SPACE_BYTES: u64 = 32;
-const RETURN_ADDRESS_BYTES: u64 = 8;
-const C_ENTRY_FRAME_BYTES: u64 = RETURN_ADDRESS_BYTES + C_SHADOW_SPACE_BYTES;
+pub type TaskEntry = <platform::ActivePlatform as platform::TaskPlatform>::TaskEntry;
 
 pub const IDLE_UUID_UPPER: u64 = 0x1c82f35548bcbe24;
 pub const IDLE_MAGIC_LOWER: u64 = 0x890189d70ecaca7f;
@@ -53,9 +46,6 @@ pub struct TaskRef {
     /// - park_current() consumes it (swap to 0)
     /// This prevents lost wakeups via the commit-point handshake
     permit: AtomicU8,
-
-    /// Why this task is blocked (for diagnostics)
-    block_reason: AtomicU32,
 
     /// Intrusive wait queue link - holds task ID of next waiter (or WAIT_QUEUE_NONE)
     /// Used for mutex, condvar, channel wait queues
@@ -271,7 +261,7 @@ impl TaskRef {
         };
 
         unsafe {
-            map_range(VirtAddr::new(gp).into(), page_size, flags, false)?;
+            map_range(VirtAddr::new(gp), page_size, flags, false)?;
         }
 
         let stack_top = self.stack_start.load(Ordering::Acquire);
@@ -298,7 +288,7 @@ impl TaskRef {
 
         self.guard_page.store(0, Ordering::Release);
         self.stack_size.store(0, Ordering::Release);
-        deallocate_kernel_stack(VirtAddr::new(stack_top).into());
+        deallocate_kernel_stack(VirtAddr::new(stack_top));
     }
 }
 
@@ -356,26 +346,11 @@ impl Task {
         parent_pid: u64,
         sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
-        let gdt = PER_CPU_GDT.lock();
         let cpu_id = platform::current_cpu_id();
-        let platform_cpu_id = platform::current_logical_id();
 
         let stack_top = stack_pointer.as_u64();
         let guard_page = initial_guard_page(stack_top, stack_size);
-
-        let mut state = State::new(0);
-        state.rip = entry_point as u64;
-        state.rcx = context as u64;
-        state.rsp = initial_c_entry_rsp(stack_top);
-        state.rflags = 0x0000_0202;
-
-        unsafe {
-            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
-        }
-
-        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
-        state.cs = selectors.user_code_selector.0 as u64 | 3;
-        state.ss = selectors.user_data_selector.0 as u64 | 3;
+        let state = platform::new_user_task_context(entry_point, context, stack_pointer);
 
         let inner_task = Task {
             name,
@@ -399,7 +374,6 @@ impl Task {
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
             permit: AtomicU8::new(0),
-            block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
@@ -440,30 +414,17 @@ impl Task {
         parent_pid: u64,
         sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
-        let gdt = PER_CPU_GDT.lock();
         let cpu_id = platform::current_cpu_id();
-        let platform_cpu_id = platform::current_logical_id();
 
         let stack_top = allocate_kernel_stack(stack_size).expect("Failed to allocate stack");
         let stack_top_u64 = stack_top.as_u64();
         let guard_page = initial_guard_page(stack_top_u64, stack_size.as_bytes());
+        let state = platform::new_kernel_task_context(entry_point, context, stack_top);
 
-        let mut state = State::new(0);
-        state.rip = entry_point as u64;
-        state.rcx = context as u64;
-        state.rsp = initial_c_entry_rsp(stack_top_u64);
-        state.rflags = 0x0000_0202;
-
-        unsafe {
-            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
-        }
-
-        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
-        state.cs = selectors.kernel_code_selector.0 as u64;
-        state.ss = selectors.kernel_data_selector.0 as u64;
-
-        let kernel_tls = KernelTls::for_kernel_thread();
-        let tls_thread_pointer = kernel_tls.as_ref().map_or(0, KernelTls::thread_pointer);
+        let kernel_tls = platform::new_kernel_tls();
+        let tls_thread_pointer = kernel_tls
+            .as_ref()
+            .map_or(0, platform::kernel_tls_thread_pointer);
 
         let inner_task = Task {
             name,
@@ -487,7 +448,6 @@ impl Task {
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
             permit: AtomicU8::new(0),
-            block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
@@ -532,12 +492,12 @@ impl Task {
 
     #[inline(always)]
     pub fn save_fpu_state(&mut self) {
-        self.fpu_state.save();
+        platform::save_fpu_state(&mut self.fpu_state);
     }
 
     #[inline(always)]
     pub fn restore_fpu_state(&mut self) {
-        self.fpu_state.restore();
+        platform::restore_fpu_state(&self.fpu_state);
     }
 }
 
@@ -555,11 +515,6 @@ fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
     }
 }
 
-fn initial_c_entry_rsp(stack_top: u64) -> u64 {
-    // On the current PE/COFF MSVC target, extern "C" uses the Windows x64 ABI:
-    // [rsp] return address, [rsp+8..rsp+40) caller-allocated shadow space.
-    (stack_top & !0xf).saturating_sub(C_ENTRY_FRAME_BYTES)
-}
 pub(crate) struct CurrentTask {
     ptr: AtomicPtr<TaskRef>,
 }

@@ -14,7 +14,6 @@ use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 
 use crate::{
-    arch::VirtAddr,
     executable::pe_loadable::PELoader,
     object_manager::{Object, ObjectPayload, OBJECT_MANAGER},
     platform,
@@ -26,7 +25,7 @@ use crate::{
     scheduling::scheduler::SCHEDULER,
     structs::range_tracker::RangeTracker,
 };
-use kernel_types::arch::PageFlags;
+use kernel_types::arch::{PageFlags, VirtAddr};
 
 use kernel_types::status::LoadError;
 

@@ -2,13 +2,13 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::format_ident;
 use quote::quote;
-use syn::Data;
-use syn::DeriveInput;
 use syn::parse::{Parse, ParseStream};
 use syn::visit::Visit;
+use syn::Data;
+use syn::DeriveInput;
 use syn::{
-    FnArg, GenericParam, ImplItemFn, ItemFn, Pat, ReturnType, Token, Type, WhereClause,
-    parse_macro_input,
+    parse_macro_input, FnArg, GenericParam, ImplItemFn, ItemFn, Pat, ReturnType, Token, Type,
+    WhereClause,
 };
 
 #[derive(Default)]
@@ -1219,122 +1219,11 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
 
     let wrapper = if has_error_code {
         quote! {
-            #[unsafe(naked)]
-            #vis extern "C" fn #wrapper_ident() {
-                ::core::arch::naked_asm!(
-                    "cli",
-
-                    "push r15",
-                    "push r14",
-                    "push r13",
-                    "push r12",
-                    "push r11",
-                    "push r10",
-                    "push r9",
-                    "push r8",
-                    "push rdi",
-                    "push rsi",
-                    "push rbp",
-                    "push rbx",
-                    "push rdx",
-                    "push rcx",
-                    "push rax",
-
-                    "mov  rdx, [rsp + 120]",
-
-                    "mov  rax, [rsp + 128]",
-                    "mov  [rsp + 120], rax",
-                    "mov  rax, [rsp + 136]",
-                    "mov  [rsp + 128], rax",
-                    "mov  rax, [rsp + 144]",
-                    "mov  [rsp + 136], rax",
-                    "mov  rax, [rsp + 152]",
-                    "mov  [rsp + 144], rax",
-                    "mov  rax, [rsp + 160]",
-                    "mov  [rsp + 152], rax",
-
-                    "mov  rcx, rsp",
-                    "mov  rbx, rsp",
-                    "cld",
-                    "and  rsp, -16",
-                    "sub  rsp, 32",
-                    "call {handler}",
-                    "mov  rsp, rbx",
-
-                    "pop  rax",
-                    "pop  rcx",
-                    "pop  rdx",
-                    "pop  rbx",
-                    "pop  rbp",
-                    "pop  rsi",
-                    "pop  rdi",
-                    "pop  r8",
-                    "pop  r9",
-                    "pop  r10",
-                    "pop  r11",
-                    "pop  r12",
-                    "pop  r13",
-                    "pop  r14",
-                    "pop  r15",
-
-                    "iretq",
-
-                    handler = sym #inner_ident,
-                );
-            }
+            crate::x86_exception_handler_wrapper!(#vis #wrapper_ident, #inner_ident, error_code);
         }
     } else {
         quote! {
-            #[unsafe(naked)]
-            #vis extern "C" fn #wrapper_ident() {
-                ::core::arch::naked_asm!(
-                    "cli",
-
-                    "push r15",
-                    "push r14",
-                    "push r13",
-                    "push r12",
-                    "push r11",
-                    "push r10",
-                    "push r9",
-                    "push r8",
-                    "push rdi",
-                    "push rsi",
-                    "push rbp",
-                    "push rbx",
-                    "push rdx",
-                    "push rcx",
-                    "push rax",
-
-                    "mov  rcx, rsp",
-                    "mov  rbx, rsp",
-                    "cld",
-                    "and  rsp, -16",
-                    "sub  rsp, 32",
-                    "call {handler}",
-                    "mov  rsp, rbx",
-
-                    "pop  rax",
-                    "pop  rcx",
-                    "pop  rdx",
-                    "pop  rbx",
-                    "pop  rbp",
-                    "pop  rsi",
-                    "pop  rdi",
-                    "pop  r8",
-                    "pop  r9",
-                    "pop  r10",
-                    "pop  r11",
-                    "pop  r12",
-                    "pop  r13",
-                    "pop  r14",
-                    "pop  r15",
-
-                    "iretq",
-
-                    handler = sym #inner_ident,
-                );
-            }
+            crate::x86_exception_handler_wrapper!(#vis #wrapper_ident, #inner_ident, no_error_code);
         }
     };
 

@@ -2,12 +2,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
-use kernel_sync::{ParkReason, Platform, ThreadEntry};
+use kernel_sync::{Platform, ThreadEntry};
 
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::scheduling::state::BlockReason;
 use crate::scheduling::task::{Task, TaskHandle, WAIT_QUEUE_NONE};
 use crate::scheduling::tls;
 
@@ -67,8 +66,8 @@ impl Platform for KernelPlatform {
     }
 
     #[inline]
-    fn park_current(reason: ParkReason) {
-        SCHEDULER.park_current(map_block_reason(reason));
+    fn park_current() {
+        SCHEDULER.park_current();
     }
 
     fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
@@ -79,22 +78,6 @@ impl Platform for KernelPlatform {
     #[inline]
     fn prepare_blocking_worker() {
         tls::ensure_current_thread_runtime_initialized();
-    }
-}
-
-#[inline]
-fn map_block_reason(reason: ParkReason) -> BlockReason {
-    match reason {
-        ParkReason::None => BlockReason::None,
-        ParkReason::MutexLock => BlockReason::MutexLock,
-        ParkReason::ChannelRecv => BlockReason::ChannelRecv,
-        ParkReason::ChannelSend => BlockReason::ChannelSend,
-        ParkReason::CondvarWait => BlockReason::CondvarWait,
-        ParkReason::Sleep => BlockReason::Sleep,
-        ParkReason::IoWait => BlockReason::IoWait,
-        ParkReason::FutexWait => BlockReason::FutexWait,
-        ParkReason::TaskJoin => BlockReason::TaskJoin,
-        ParkReason::IrqWait => BlockReason::IrqWait,
     }
 }
 

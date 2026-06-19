@@ -1,4 +1,4 @@
-use crate::platform::{ParkReason, Platform};
+use crate::platform::Platform;
 use crate::sleep_mutex::SleepMutexGuard;
 use crate::wait_queue::WaitQueue;
 
@@ -20,7 +20,7 @@ impl<P: Platform> Condvar<P> {
         drop(guard);
 
         if enqueued {
-            P::park_current(ParkReason::CondvarWait);
+            P::park_current();
         }
 
         let _ = self.waiters.clear_current_if_queued();

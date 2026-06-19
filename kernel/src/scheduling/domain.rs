@@ -1,12 +1,12 @@
-use crate::arch::MAX_CPUS;
-use crate::scheduling::task::TaskHandle;
+use crate::{platform::MAX_CPUS, scheduling::task::TaskHandle};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const CPU_SET_WORD_BITS: usize = u64::BITS as usize;
-const CPU_SET_WORDS: usize = (MAX_CPUS + CPU_SET_WORD_BITS - 1) / CPU_SET_WORD_BITS;
+const CPU_SET_WORDS: usize =
+    (crate::platform::MAX_CPUS + CPU_SET_WORD_BITS - 1) / CPU_SET_WORD_BITS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainId(pub u16);

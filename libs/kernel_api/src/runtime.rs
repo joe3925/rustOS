@@ -10,8 +10,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use kernel_sys::{elapsed, kernel_cycle_counter, kernel_cycle_counter_frequency_hz, stopwatch_new};
-use kernel_types::arch::x86::X86Platform;
-use kernel_types::arch::PlatformInfo;
+use kernel_types::arch::{Platform, PlatformInfo};
 use spin::Mutex;
 
 use kernel_sys::{
@@ -209,7 +208,7 @@ pub fn try_steal_blocking_one() -> bool {
 
 #[inline(always)]
 pub fn cycle_counter() -> u64 {
-    <X86Platform as PlatformInfo>::cycle_counter()
+    <Platform as PlatformInfo>::cycle_counter()
 }
 
 #[inline(always)]

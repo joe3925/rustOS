@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::platform::{ParkReason, Platform};
+use crate::platform::Platform;
 use crate::wait_queue::WaitQueue;
 
 pub struct SleepMutex<P: Platform, T> {
@@ -53,7 +53,7 @@ impl<P: Platform, T> SleepMutex<P, T> {
                 return guard;
             }
 
-            P::park_current(ParkReason::MutexLock);
+            P::park_current();
         }
     }
 

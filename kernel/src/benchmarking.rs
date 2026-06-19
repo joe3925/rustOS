@@ -47,7 +47,6 @@ use kernel_types::ProstMessage;
 use serde_json::{json, Value};
 use spin::{Mutex, Once};
 
-use crate::arch::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
 pub const BENCH_ENABLED: bool = false;
 
@@ -603,7 +602,7 @@ fn bench_capture_metrics(core_id: usize, ts: u64) {
         return;
     }
 
-    let heap_used = interrupts::without_interrupts(used_memory) as u64;
+    let heap_used = platform::with_interrupts_disabled(used_memory) as u64;
 
     let mut used_bytes = physical_used_bytes();
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
@@ -910,7 +909,7 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
         return;
     }
 
-    let heap_used = interrupts::without_interrupts(used_memory) as u64;
+    let heap_used = platform::with_interrupts_disabled(used_memory) as u64;
 
     let mut used_bytes = physical_used_bytes();
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);

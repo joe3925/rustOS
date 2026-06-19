@@ -1,13 +1,13 @@
 use self::ApicErrors::{AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
-use crate::arch::drivers::timer_driver::set_num_cores;
-use crate::cpu::{self, get_cpu_info};
-use crate::gdt::PER_CPU_GDT;
-use crate::idt::load_idt;
+use super::super::cpu::{self, get_cpu_info};
+use super::super::gdt::PER_CPU_GDT;
+use super::super::idt::load_idt;
+use super::super::syscalls::syscall::syscall_init;
+use super::timer_driver::set_num_cores;
 use crate::machine::MachineInterruptInfo;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu_vec::PerCpuVec;
-use crate::syscalls::syscall::syscall_init;
 use crate::util::{boot_info, CORE_LOCK, CPU_ID, INIT_LOCK};
 use crate::KERNEL_INITIALIZED;
 use alloc::boxed::Box;

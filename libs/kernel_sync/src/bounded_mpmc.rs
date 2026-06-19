@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};
-use crate::platform::{ParkReason, Platform};
+use crate::platform::Platform;
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +135,7 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
                 Ok(BoundedWaitQueueEnqueue::Woken) => continue,
                 Err(BoundedWaitQueueError::AlreadyQueued) => {
                     if self.inner.receivers_waiting.is_current_enqueued() {
-                        P::park_current(ParkReason::ChannelRecv);
+                        P::park_current();
                         self.inner.receivers_waiting.clear_current_if_queued();
                     }
 
@@ -179,7 +179,7 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
                 continue;
             }
 
-            P::park_current(ParkReason::ChannelRecv);
+            P::park_current();
             self.inner.receivers_waiting.clear_current_if_queued();
         }
     }

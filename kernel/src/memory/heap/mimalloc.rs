@@ -15,9 +15,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 
-use crate::arch::interrupts::without_interrupts;
-use crate::arch::{align_up, interrupts, VirtAddr};
-use kernel_types::arch::PageFlags;
+use kernel_types::arch::{PageFlags, VirtAddr};
 
 const MIMALLOC_STATS_ENABLED: bool = false;
 const MIMALLOC_OS_ALLOC_ZEROES: bool = false;
@@ -509,7 +507,7 @@ impl RangeAllocator {
         let region_start = region.start_addr();
         let region_end = region.end_addr();
 
-        let alloc_start = align_up(region_start as u64, align as u64) as usize;
+        let alloc_start = align_up_const(region_start, align);
         let alloc_end = alloc_start.checked_add(size).ok_or(())?;
 
         if alloc_end > region_end {
@@ -650,7 +648,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
         let start_addr = VirtAddr::new(run_addr as u64);
 
-        let res = without_interrupts(|| {
+        let res = platform::with_interrupts_disabled(|| {
             map_fresh_kernel_range_no_flush(start_addr.into(), run_size as u64, flags, true)
         });
 
@@ -747,7 +745,7 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
         let run_addr = tracker.track_start + run_start * MIMALLOC_COMMIT_GRANULARITY;
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
 
-        without_interrupts(|| unsafe {
+        platform::with_interrupts_disabled(|| unsafe {
             unmap_range_unchecked(VirtAddr::new(run_addr as u64).into(), run_size as u64);
         });
 
@@ -770,7 +768,7 @@ fn mimalloc_record_commit_cycles(start: u64) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void {
-    let ptr = without_interrupts(|| {
+    let ptr = platform::with_interrupts_disabled(|| {
         MIMALLOC_OS_ALLOCATOR
             .lock()
             .alloc(size, alignment)
@@ -791,7 +789,9 @@ pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *m
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
     if !addr.is_null() {
-        without_interrupts(|| MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size));
+        platform::with_interrupts_disabled(|| {
+            MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size)
+        });
     }
 }
 
@@ -841,8 +841,8 @@ pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}
 
 #[no_mangle]
 pub extern "C" fn rustos_mi_thread_yield() {
-    if interrupts::are_enabled() {
-        interrupts::hlt();
+    if platform::interrupts_enabled() {
+        platform::enable_interrupts_and_halt();
     } else {
         core::hint::spin_loop();
     }

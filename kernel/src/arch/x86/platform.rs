@@ -1,8 +1,13 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
 use super::memory::iommu::X86DeviceMmu;
+use super::scheduling::state::{FpuState, State};
+use super::scheduling::{idle_task, task_return_trampoline, TaskEntry};
+use crate::drivers::ACPI::ACPIImpl;
 use crate::machine::MachineInfo;
+use crate::machine::MachineInterruptInfo;
 use crate::memory::device_mmu::{
     DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
 };
@@ -15,6 +20,7 @@ use kernel_types::irq::{
     MsiMessage, MsiRequest, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
 };
 use kernel_types::pci::PciConfigAddress;
+use kernel_types::runtime::BlockOnThreadState;
 use kernel_types::{
     arch::{PageFlags, PhysAddr, VirtAddr},
     memory::PhysicalMappingCache,
@@ -24,27 +30,32 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::{PageSize, Size1GiB, Size2MiB, Size4KiB};
 
-use crate::arch::drivers::interrupt_index::{
+use super::cpu::get_cpu_info;
+use super::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_logical_ids, apic_program_period_ns, calibrate_tsc,
     current_cpu_id as x86_current_cpu_id, current_is_in_interrupt_atomic,
     get_current_logical_id as x86_current_logical_id, init_percpu_gs, send_eoi as x86_send_eoi,
     wait_duration as x86_wait_duration, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
     APIC, APIC_START_PERIOD, PICS, TSC_HZ,
 };
-use crate::arch::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TIMER_TIME_SCHED};
-use crate::cpu::get_cpu_info;
-use crate::gdt::PER_CPU_GDT;
-use crate::idt::load_idt;
+use super::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TIMER_TIME_SCHED};
+use super::gdt::PER_CPU_GDT;
+use super::idt::load_idt;
 use crate::platform::{
-    AddressSpacePlatform, CpuPlatform, DeviceMmuPlatform, InterruptPlatform,
-    PageTableFrameAllocator, PagingPlatform, PciConfigPlatform, Platform, TimerPlatform,
+    AddressSpacePlatform, CpuPlatform, DebugPlatform, DeviceMmuPlatform, InterruptPlatform,
+    MachinePlatform, PageTableFrameAllocator, PagingPlatform, PciConfigPlatform, Platform,
+    TaskPlatform, TimerPlatform,
 };
 use crate::println;
 use crate::structs::stopwatch::Stopwatch;
-use crate::syscalls::syscall::syscall_init;
+use acpi::AcpiTables;
+use x86_64::structures::idt::InterruptStackFrame;
 
 pub struct X86Platform;
 
+const C_SHADOW_SPACE_BYTES: u64 = 32;
+const RETURN_ADDRESS_BYTES: u64 = 8;
+const C_ENTRY_FRAME_BYTES: u64 = RETURN_ADDRESS_BYTES + C_SHADOW_SPACE_BYTES;
 const PCI_CFG1_ADDR: u16 = 0xCF8;
 const PCI_CFG1_DATA: u16 = 0xCFC;
 static PCI_CFG1_LOCK: Mutex<()> = Mutex::new(());
@@ -80,11 +91,13 @@ impl Platform for X86Platform {
             PICS.lock().initialize();
         }
         Self::disable_interrupts();
-        syscall_init();
+        super::syscalls::syscall::syscall_init();
     }
 }
 
 impl CpuPlatform for X86Platform {
+    const MAX_CPUS: usize = super::MAX_CPUS;
+
     fn current_cpu_id() -> usize {
         x86_current_cpu_id()
     }
@@ -146,6 +159,23 @@ impl CpuPlatform for X86Platform {
 }
 
 impl InterruptPlatform for X86Platform {
+    type InterruptFrame = InterruptStackFrame;
+
+    const DYNAMIC_VECTOR_START: u8 = super::idt::DYNAMIC_VECTOR_START;
+    const DYNAMIC_VECTOR_END: u8 = super::idt::DYNAMIC_VECTOR_END;
+
+    fn scheduler_ipi_vector() -> u8 {
+        super::idt::SCHED_IPI_VECTOR
+    }
+
+    fn timer_interrupt_vector() -> u8 {
+        super::drivers::interrupt_index::InterruptIndex::Timer.as_u8()
+    }
+
+    fn tlb_shootdown_vector() -> u8 {
+        super::idt::TLB_FLUSH_VECTOR
+    }
+
     fn interrupts_enabled() -> bool {
         x86_64::instructions::interrupts::are_enabled()
     }
@@ -234,6 +264,47 @@ impl InterruptPlatform for X86Platform {
 
         Some(MsiMessage::new(address, data))
     }
+
+    fn is_reserved_vector(vector: u8) -> bool {
+        vector == super::idt::SYSCALL_VECTOR
+    }
+
+    fn gsi_to_vector(gsi: u8) -> Option<u8> {
+        if gsi < super::idt::MAX_GSI {
+            Some(super::drivers::interrupt_index::InterruptIndex::Timer.as_u8() + gsi)
+        } else {
+            None
+        }
+    }
+
+    fn vector_to_gsi(vector: u8) -> Option<u8> {
+        let base = super::drivers::interrupt_index::InterruptIndex::Timer.as_u8();
+        let gsi = vector.wrapping_sub(base);
+
+        if gsi < super::idt::MAX_GSI {
+            Some(gsi)
+        } else {
+            None
+        }
+    }
+
+    fn unmask_gsi_any_cpu(gsi: u8, vector: u8) {
+        APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
+            gsi,
+            vector,
+            x86_current_logical_id(),
+        );
+    }
+
+    fn enter_interrupt() -> bool {
+        current_is_in_interrupt_atomic().swap(true, core::sync::atomic::Ordering::AcqRel)
+    }
+
+    fn leave_interrupt(was_in_interrupt: bool) {
+        if !was_in_interrupt {
+            current_is_in_interrupt_atomic().store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 impl TimerPlatform for X86Platform {
@@ -242,9 +313,9 @@ impl TimerPlatform for X86Platform {
     }
 
     fn calibrate_boot_timer() {
-        let tsc_start = crate::cpu::get_cycles();
+        let tsc_start = super::cpu::get_cycles();
         wait_using_pit_50ms();
-        let tsc_end = crate::cpu::get_cycles();
+        let tsc_end = super::cpu::get_cycles();
         calibrate_tsc(tsc_start, tsc_end, 50);
     }
 
@@ -254,11 +325,11 @@ impl TimerPlatform for X86Platform {
     }
 
     fn cycle_counter() -> u64 {
-        crate::cpu::get_cycles()
+        super::cpu::get_cycles()
     }
 
     fn ordered_cycle_counter() -> u64 {
-        crate::cpu::get_ordered_cycles()
+        super::cpu::get_ordered_cycles()
     }
 
     fn cycle_counter_frequency_hz() -> u64 {
@@ -285,39 +356,39 @@ impl TimerPlatform for X86Platform {
 }
 
 impl AddressSpacePlatform for X86Platform {
-    type Root = crate::arch::memory::paging::address_space::Root;
+    type Root = super::memory::paging::address_space::Root;
 
     fn init_kernel_root() {
-        crate::arch::memory::paging::address_space::init_kernel_root();
+        super::memory::paging::address_space::init_kernel_root();
     }
 
     fn kernel_root() -> Self::Root {
-        crate::arch::memory::paging::address_space::kernel_root()
+        super::memory::paging::address_space::kernel_root()
     }
 
     fn current_root() -> Self::Root {
-        crate::arch::memory::paging::address_space::current_root()
+        super::memory::paging::address_space::current_root()
     }
 
     unsafe fn switch_root(root: Self::Root) {
-        unsafe { crate::arch::memory::paging::address_space::switch_root(root) }
+        unsafe { super::memory::paging::address_space::switch_root(root) }
     }
 
     fn root_to_phys(root: Self::Root) -> PhysAddr {
-        crate::arch::memory::paging::address_space::root_to_phys(root)
+        super::memory::paging::address_space::root_to_phys(root)
     }
 
     fn create_user_root<A: PageTableFrameAllocator>(
         allocator: &mut A,
     ) -> Result<Self::Root, PageMapError> {
-        crate::arch::memory::paging::address_space::create_user_root(allocator)
+        super::memory::paging::address_space::create_user_root(allocator)
     }
 
     unsafe fn destroy_user_root<A: PageTableFrameAllocator>(
         root: Self::Root,
         allocator: &mut A,
     ) -> Result<(), PageMapError> {
-        unsafe { crate::arch::memory::paging::address_space::destroy_user_root(root, allocator) }
+        unsafe { super::memory::paging::address_space::destroy_user_root(root, allocator) }
     }
 }
 
@@ -351,7 +422,7 @@ impl PagingPlatform for X86Platform {
         }
     }
     fn kernel_virtual_layout() -> KernelVirtualLayout {
-        crate::arch::memory::paging::layout::kernel_virtual_layout()
+        super::memory::paging::layout::kernel_virtual_layout()
     }
 
     unsafe fn map_leaf<A: PageTableFrameAllocator>(
@@ -364,7 +435,7 @@ impl PagingPlatform for X86Platform {
         flush: LocalTlbFlush,
     ) -> Result<(), PageMapError> {
         unsafe {
-            crate::arch::memory::paging::mapper::map_leaf(
+            super::memory::paging::mapper::map_leaf(
                 allocator, virt, phys, size, flags, cache, flush,
             )
         }
@@ -378,30 +449,24 @@ impl PagingPlatform for X86Platform {
         flush: LocalTlbFlush,
     ) -> Result<Option<PhysAddr>, PageMapError> {
         unsafe {
-            crate::arch::memory::paging::mapper::unmap_leaf(
-                allocator,
-                virt,
-                size,
-                disposition,
-                flush,
-            )
+            super::memory::paging::mapper::unmap_leaf(allocator, virt, size, disposition, flush)
         }
     }
 
     fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping> {
-        crate::arch::memory::paging::mapper::resolve_mapping(virt)
+        super::memory::paging::mapper::resolve_mapping(virt)
     }
 
     fn local_flush_tlb_all() {
-        crate::arch::memory::paging::tlb::local_flush_tlb_all();
+        super::memory::paging::tlb::local_flush_tlb_all();
     }
 
     fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64) {
-        crate::arch::memory::paging::tlb::local_flush_tlb_range(start, size, stride);
+        super::memory::paging::tlb::local_flush_tlb_range(start, size, stride);
     }
 
     fn broadcast_tlb_shootdown() -> bool {
-        crate::arch::memory::paging::tlb::broadcast_tlb_shootdown()
+        super::memory::paging::tlb::broadcast_tlb_shootdown()
     }
 }
 
@@ -470,4 +535,126 @@ impl DeviceMmuPlatform for X86Platform {
 
         Ok(Some(DeviceMmuSystem::from_backend(backend)))
     }
+}
+
+impl MachinePlatform for X86Platform {
+    fn discover_interrupt_info_from_acpi(
+        tables: &AcpiTables<ACPIImpl>,
+    ) -> Option<MachineInterruptInfo> {
+        super::machine::discover_interrupt_info_from_acpi(tables)
+    }
+}
+
+impl TaskPlatform for X86Platform {
+    type TaskEntry = TaskEntry;
+    type TaskContext = State;
+    type FpuState = FpuState;
+    type KernelTls = super::scheduling::tls::KernelTls;
+
+    fn idle_task_entry() -> Self::TaskEntry {
+        idle_task
+    }
+
+    fn new_user_task_context(
+        entry_point: Self::TaskEntry,
+        context: usize,
+        stack_top: VirtAddr,
+    ) -> Self::TaskContext {
+        let gdt = PER_CPU_GDT.lock();
+        let platform_cpu_id = Self::current_logical_id();
+        let mut state = State::new(0);
+        state.rip = entry_point as u64;
+        state.rcx = context as u64;
+        state.rsp = initial_c_entry_rsp(stack_top.as_u64());
+        state.rflags = 0x0000_0202;
+
+        unsafe {
+            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
+        }
+
+        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
+        state.cs = selectors.user_code_selector.0 as u64 | 3;
+        state.ss = selectors.user_data_selector.0 as u64 | 3;
+        state
+    }
+
+    fn new_kernel_task_context(
+        entry_point: Self::TaskEntry,
+        context: usize,
+        stack_top: VirtAddr,
+    ) -> Self::TaskContext {
+        let gdt = PER_CPU_GDT.lock();
+        let platform_cpu_id = Self::current_logical_id();
+        let mut state = State::new(0);
+        state.rip = entry_point as u64;
+        state.rcx = context as u64;
+        state.rsp = initial_c_entry_rsp(stack_top.as_u64());
+        state.rflags = 0x0000_0202;
+
+        unsafe {
+            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
+        }
+
+        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
+        state.cs = selectors.kernel_code_selector.0 as u64;
+        state.ss = selectors.kernel_data_selector.0 as u64;
+        state
+    }
+
+    fn mark_idle_task_context(context: &mut Self::TaskContext) {
+        context.r10 = crate::scheduling::task::IDLE_UUID_UPPER;
+        context.r11 = crate::scheduling::task::IDLE_MAGIC_LOWER;
+    }
+
+    unsafe fn restore_task_context(context: &Self::TaskContext, target: *mut Self::TaskContext) {
+        unsafe { context.restore(target) };
+    }
+
+    fn save_fpu_state(state: &mut Self::FpuState) {
+        state.save();
+    }
+
+    fn restore_fpu_state(state: &Self::FpuState) {
+        state.restore();
+    }
+
+    fn new_kernel_tls() -> Option<Self::KernelTls> {
+        super::scheduling::tls::KernelTls::for_kernel_thread()
+    }
+
+    fn kernel_tls_thread_pointer(tls: &Self::KernelTls) -> u64 {
+        tls.thread_pointer()
+    }
+
+    fn activate_kernel_tls(thread_pointer: u64) {
+        super::scheduling::tls::activate(thread_pointer);
+    }
+
+    fn ensure_current_thread_runtime_initialized() {
+        super::scheduling::tls::ensure_current_thread_runtime_initialized();
+    }
+
+    fn current_block_on_thread_state() -> Arc<BlockOnThreadState> {
+        super::scheduling::tls::current_block_on_thread_state()
+    }
+
+    fn request_task_yield() {
+        unsafe { super::syscalls::task_yield_interrupt() };
+    }
+}
+
+impl DebugPlatform for X86Platform {
+    fn breakpoint() {
+        super::instructions::breakpoint();
+    }
+
+    fn fatal_reset() -> ! {
+        super::instructions::triple_fault()
+    }
+}
+
+fn initial_c_entry_rsp(stack_top: u64) -> u64 {
+    // On the PE/COFF MSVC target, extern "C" uses the Windows x64 ABI:
+    // [rsp] return address, [rsp+8..rsp+40) caller-allocated shadow space.
+    (stack_top & !0xf).saturating_sub(C_ENTRY_FRAME_BYTES)
 }

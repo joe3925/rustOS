@@ -1,8 +1,5 @@
-use crate::arch::scheduling::idle_task;
-use crate::arch::MAX_CPUS;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::idt::SCHED_IPI_VECTOR;
-use crate::idt::{InterruptGuard, NestedInterruptEnableGuard};
+use crate::idt::InterruptGuard;
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
 use crate::scheduling::domain::{
@@ -10,7 +7,7 @@ use crate::scheduling::domain::{
 };
 use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding};
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::state::{BlockReason, SchedState, State};
+use crate::scheduling::state::{SchedState, State};
 use crate::scheduling::task::CurrentTask;
 use crate::scheduling::task::Task;
 use crate::scheduling::task::TaskError;
@@ -120,10 +117,15 @@ impl Scheduler {
 
     #[inline(always)]
     fn build_core(&self, cpu_id: usize, platform_cpu_id: usize) -> Arc<CoreScheduler> {
-        let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
+        let idle = Task::new_kernel_mode(
+            platform::idle_task_entry(),
+            0,
+            StackSize::Tiny,
+            "".into(),
+            0,
+        );
 
-        idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
-        idle.inner.write().context.r11 = 0x890189d70ecaca7f;
+        platform::mark_idle_task_context(&mut idle.inner.write().context);
 
         let _idle_id = self.register_task_no_reap(idle.clone());
         idle.set_target_cpu(cpu_id);
@@ -150,10 +152,10 @@ impl Scheduler {
             cores.len()
         );
         assert!(
-            cpu_id < MAX_CPUS,
+            cpu_id < platform::MAX_CPUS,
             "cpu id {} exceeds scheduler domain cpu capacity {}",
             cpu_id,
-            MAX_CPUS
+            platform::MAX_CPUS
         );
 
         let platform_cpu_id = platform::current_logical_id();
@@ -234,7 +236,7 @@ impl Scheduler {
         }
 
         if let Some(core) = self.core(cpu) {
-            let _ = platform::send_ipi(core.platform_cpu_id, SCHED_IPI_VECTOR);
+            let _ = platform::send_ipi(core.platform_cpu_id, platform::scheduler_ipi_vector());
         }
     }
 
@@ -338,7 +340,7 @@ impl Scheduler {
         }
     }
 
-    pub fn park_current(&self, _reason: BlockReason) {
+    pub fn park_current(&self) {
         if !platform::interrupts_enabled() {
             panic!("Attempt to park with interrupts disabled, this will always cause a deadlock");
         }
@@ -418,7 +420,7 @@ impl Scheduler {
         self.restore_thread_local_storage(&next);
 
         let ctx_guard = next.inner.read();
-        unsafe { ctx_guard.context.restore(state) };
+        unsafe { platform::restore_task_context(&ctx_guard.context, state) };
 
         prev_task
     }
@@ -685,7 +687,7 @@ impl Scheduler {
         };
 
         if !is_idle {
-            platform::end_interrupt(SCHED_IPI_VECTOR);
+            platform::end_interrupt(platform::scheduler_ipi_vector());
             return;
         }
 
@@ -694,7 +696,7 @@ impl Scheduler {
         let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(t) => t,
             None => {
-                platform::end_interrupt(SCHED_IPI_VECTOR);
+                platform::end_interrupt(platform::scheduler_ipi_vector());
                 return;
             }
         };
@@ -702,10 +704,10 @@ impl Scheduler {
         self.restore_page_table(&next);
         self.restore_thread_local_storage(&next);
 
-        platform::end_interrupt(SCHED_IPI_VECTOR);
+        platform::end_interrupt(platform::scheduler_ipi_vector());
 
         let ctx_guard = next.inner.read();
-        unsafe { ctx_guard.context.restore(state) };
+        unsafe { platform::restore_task_context(&ctx_guard.context, state) };
     }
 }
 
@@ -716,7 +718,7 @@ pub extern "C" fn ipi_handler_c(state: *mut State) {
     }
 
     if platform::current_is_in_interrupt() {
-        platform::end_interrupt(SCHED_IPI_VECTOR);
+        platform::end_interrupt(platform::scheduler_ipi_vector());
         return;
     }
 
@@ -748,7 +750,7 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
 
 #[no_mangle]
 pub extern "C" fn ipi_eoi_only() {
-    platform::end_interrupt(SCHED_IPI_VECTOR);
+    platform::end_interrupt(platform::scheduler_ipi_vector());
 }
 
 pub extern "C" fn kernel_task_end() -> ! {

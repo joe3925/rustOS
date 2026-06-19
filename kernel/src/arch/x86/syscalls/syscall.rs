@@ -1,7 +1,7 @@
-use crate::arch::drivers::interrupt_index::get_current_logical_id;
+use super::super::drivers::interrupt_index::get_current_logical_id;
+use super::super::gdt::PER_CPU_GDT;
 
 use crate::executable::program::{Message, UserHandle};
-use crate::gdt::PER_CPU_GDT;
 use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;

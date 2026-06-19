@@ -21,9 +21,9 @@ pub struct MachineInfo {
 impl MachineInfo {
     fn discover() -> Self {
         let firmware = FirmwareResources::discover();
-        let interrupt_info = firmware.acpi_tables().and_then(|tables| {
-            crate::arch::machine::discover_interrupt_info_from_acpi(tables.as_ref())
-        });
+        let interrupt_info = firmware
+            .acpi_tables()
+            .and_then(|tables| crate::platform::discover_interrupt_info_from_acpi(tables.as_ref()));
 
         Self {
             firmware,

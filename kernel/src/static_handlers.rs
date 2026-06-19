@@ -11,7 +11,6 @@ use kernel_executor::runtime::runtime::{
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::object_manager::OmError;
 
-use crate::arch::{interrupts, syscalls};
 use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
@@ -649,7 +648,7 @@ static BLOCKING_INIT: Once = Once::new();
 #[no_mangle]
 pub unsafe extern "C" fn task_yield() {
     crate::platform::with_interrupts_disabled(|| {
-        unsafe { syscalls::task_yield_interrupt() };
+        crate::platform::request_task_yield();
     });
 }
 

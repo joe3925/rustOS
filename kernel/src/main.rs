@@ -46,7 +46,6 @@ mod structs;
 mod sync_platform;
 mod syscalls;
 mod util;
-pub(crate) use arch::{cpu, exception_handlers, gdt};
 
 use crate::util::{panic_common, KERNEL_INITIALIZED};
 

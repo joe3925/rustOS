@@ -6,7 +6,7 @@ use alloc::alloc::Global;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 
-use crate::arch::{PhysAddr, VirtAddr};
+use kernel_types::arch::{PhysAddr, VirtAddr};
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]

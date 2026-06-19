@@ -231,59 +231,6 @@ pub enum PageMapFailure {
     ParentEntryHugePage,
 }
 
-#[cfg(target_arch = "x86_64")]
-impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size4KiB>>
-    for PageMapError
-{
-    fn from(
-        e: x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size4KiB>,
-    ) -> Self {
-        PageMapError::Page4KiB(PageMapFailure::from(e))
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size2MiB>>
-    for PageMapError
-{
-    fn from(
-        e: x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size2MiB>,
-    ) -> Self {
-        PageMapError::Page2MiB(PageMapFailure::from(e))
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-impl From<x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size1GiB>>
-    for PageMapError
-{
-    fn from(
-        e: x86_64::structures::paging::mapper::MapToError<x86_64::structures::paging::Size1GiB>,
-    ) -> Self {
-        PageMapError::Page1GiB(PageMapFailure::from(e))
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-impl<S> From<x86_64::structures::paging::mapper::MapToError<S>> for PageMapFailure
-where
-    S: x86_64::structures::paging::page::PageSize,
-{
-    fn from(e: x86_64::structures::paging::mapper::MapToError<S>) -> Self {
-        match e {
-            x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed => {
-                PageMapFailure::FrameAllocationFailed
-            }
-            x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_) => {
-                PageMapFailure::PageAlreadyMapped
-            }
-            x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage => {
-                PageMapFailure::ParentEntryHugePage
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 #[repr(u32)]
 pub enum TaskError {

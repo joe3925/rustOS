@@ -1,6 +1,5 @@
 extern crate rand_xoshiro;
 
-use crate::arch::VirtAddr;
 use crate::benchmarking::BenchWindow;
 use crate::boot_packages;
 use crate::console::Screen;
@@ -19,10 +18,8 @@ use crate::memory::paging::{
     boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked, KernelFrameAllocator,
 };
 use crate::platform::{current_cpu_id, cycle_counter};
-use kernel_executor::global_async::GlobalAsyncExecutor;
-use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::init_executor_platform;
-use kernel_executor::runtime::runtime::spawn_detached;
+use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
@@ -30,7 +27,6 @@ use crate::{println, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
-use core::arch::asm;
 use core::cmp::max;
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -38,6 +34,9 @@ use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel_abi::BootInfo;
+use kernel_executor::global_async::GlobalAsyncExecutor;
+use kernel_executor::runtime::runtime::spawn_detached;
+use kernel_types::arch::VirtAddr;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;
@@ -200,23 +199,6 @@ pub extern "C" fn kernel_main(ctx: usize) {
     });
     println!("");
 }
-#[no_mangle]
-#[inline(never)]
-pub extern "C" fn trigger_guard_page_overflow() -> ! {
-    let task = SCHEDULER
-        .get_current_task(current_cpu_id())
-        .expect("no current task");
-    let guard = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
-    let target = (guard + 0x800) & !0xFu64;
-    unsafe {
-        asm!(
-            "mov rsp, {0}",
-            "mov qword ptr [rsp], 0",
-            in(reg) target,
-            options(noreturn)
-        );
-    }
-}
 #[inline(never)]
 fn halt_loop() -> ! {
     crate::platform::halt()
@@ -320,11 +302,11 @@ pub extern "C" fn trigger_stack_overflow() {
 #[inline(never)]
 pub extern "C" fn trigger_triple_fault() -> ! {
     crate::platform::disable_interrupts();
-    crate::arch::instructions::triple_fault()
+    crate::platform::fatal_reset()
 }
 
 pub fn trigger_breakpoint() {
-    crate::arch::instructions::breakpoint();
+    crate::platform::breakpoint();
 }
 
 pub fn test_full_heap() {

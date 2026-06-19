@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_queue::SegQueue;
 
-use crate::platform::{ParkReason, Platform};
+use crate::platform::Platform;
 use crate::wait_queue::WaitQueue;
 use kernel_types::io::TreiberStack;
 
@@ -166,7 +166,7 @@ impl<P: Platform, T> Receiver<P, T> {
             if !self.inner.receivers_waiting.is_current_enqueued() {
                 continue;
             }
-            P::park_current(ParkReason::ChannelRecv);
+            P::park_current();
             self.inner.receivers_waiting.clear_current_if_queued();
         }
     }

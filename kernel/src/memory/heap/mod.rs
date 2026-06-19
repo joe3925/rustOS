@@ -14,14 +14,13 @@ pub fn mimalloc_thread_done() {
     ALLOCATOR.mimalloc_thread_done();
 }
 
-use crate::arch::VirtAddr;
 use crate::memory::heap::allocator::KernelAllocator;
 #[cfg(feature = "allocator-mimalloc")]
 use crate::memory::paging::frame_alloc::boot_usable_bytes;
 use crate::memory::paging::{align_up_to_base_page, map_range};
 #[cfg(feature = "allocator-mimalloc")]
 use core::sync::atomic::{AtomicUsize, Ordering};
-use kernel_types::arch::PageFlags;
+use kernel_types::arch::{PageFlags, VirtAddr};
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
 #[cfg(feature = "allocator-buddy")]

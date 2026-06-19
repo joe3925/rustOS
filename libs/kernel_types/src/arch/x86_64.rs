@@ -1,5 +1,6 @@
-use crate::arch::{PagingPlatform, PhysAddr, PlatformInfo, TranslatedBlock, VirtAddr};
+use crate::arch::{PageFlags, PagingPlatform, PhysAddr, PlatformInfo, TranslatedBlock, VirtAddr};
 use crate::port::PortAccess;
+use crate::status::{PageMapError, PageMapFailure};
 use x86_64::structures::paging::{
     PageSize, PageTable, PageTableFlags, Size1GiB, Size2MiB, Size4KiB,
 };
@@ -195,4 +196,127 @@ impl PortAccess for Platform {
     unsafe fn write_u32(port: u16, value: u32) {
         unsafe { <Self as PortIoPlatform>::write_port_u32(port, value) }
     }
+}
+
+impl From<x86_64::VirtAddr> for VirtAddr {
+    fn from(value: x86_64::VirtAddr) -> Self {
+        Self::new(value.as_u64())
+    }
+}
+
+impl From<VirtAddr> for x86_64::VirtAddr {
+    fn from(value: VirtAddr) -> Self {
+        x86_64::VirtAddr::new(value.as_u64())
+    }
+}
+
+impl From<x86_64::PhysAddr> for PhysAddr {
+    fn from(value: x86_64::PhysAddr) -> Self {
+        Self::new(value.as_u64())
+    }
+}
+
+impl From<PhysAddr> for x86_64::PhysAddr {
+    fn from(value: PhysAddr) -> Self {
+        x86_64::PhysAddr::new(value.as_u64())
+    }
+}
+
+impl From<PageTableFlags> for PageFlags {
+    fn from(value: PageTableFlags) -> Self {
+        Self::from_bits_truncate(value.bits())
+    }
+}
+
+impl From<PageFlags> for PageTableFlags {
+    fn from(value: PageFlags) -> Self {
+        PageTableFlags::from_bits_truncate(value.bits())
+    }
+}
+
+impl From<x86_64::structures::paging::mapper::MapToError<Size4KiB>> for PageMapError {
+    fn from(e: x86_64::structures::paging::mapper::MapToError<Size4KiB>) -> Self {
+        PageMapError::Page4KiB(PageMapFailure::from(e))
+    }
+}
+
+impl From<x86_64::structures::paging::mapper::MapToError<Size2MiB>> for PageMapError {
+    fn from(e: x86_64::structures::paging::mapper::MapToError<Size2MiB>) -> Self {
+        PageMapError::Page2MiB(PageMapFailure::from(e))
+    }
+}
+
+impl From<x86_64::structures::paging::mapper::MapToError<Size1GiB>> for PageMapError {
+    fn from(e: x86_64::structures::paging::mapper::MapToError<Size1GiB>) -> Self {
+        PageMapError::Page1GiB(PageMapFailure::from(e))
+    }
+}
+
+impl<S> From<x86_64::structures::paging::mapper::MapToError<S>> for PageMapFailure
+where
+    S: x86_64::structures::paging::page::PageSize,
+{
+    fn from(e: x86_64::structures::paging::mapper::MapToError<S>) -> Self {
+        match e {
+            x86_64::structures::paging::mapper::MapToError::FrameAllocationFailed => {
+                PageMapFailure::FrameAllocationFailed
+            }
+            x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_) => {
+                PageMapFailure::PageAlreadyMapped
+            }
+            x86_64::structures::paging::mapper::MapToError::ParentEntryHugePage => {
+                PageMapFailure::ParentEntryHugePage
+            }
+        }
+    }
+}
+
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __chkstk() {
+    core::arch::naked_asm!(
+        "test rax, rax",
+        "jnz 2f",
+        "mov rax, rcx",
+        "2:",
+        "mov r10, rax",
+        "mov r11, rsp",
+        "cmp r10, 0x1000",
+        "jb 4f",
+        "3:",
+        "sub r11, 0x1000",
+        "test byte ptr [r11], 0",
+        "sub r10, 0x1000",
+        "cmp r10, 0x1000",
+        "jae 3b",
+        "4:",
+        "sub r11, r10",
+        "test byte ptr [r11], 0",
+        "ret"
+    );
+}
+
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __chkstk_ms() {
+    core::arch::naked_asm!(
+        "test rax, rax",
+        "jnz 2f",
+        "mov rax, rcx",
+        "2:",
+        "mov r10, rax",
+        "mov r11, rsp",
+        "cmp r10, 0x1000",
+        "jb 4f",
+        "3:",
+        "sub r11, 0x1000",
+        "test byte ptr [r11], 0",
+        "sub r10, 0x1000",
+        "cmp r10, 0x1000",
+        "jae 3b",
+        "4:",
+        "sub r11, r10",
+        "test byte ptr [r11], 0",
+        "ret"
+    );
 }

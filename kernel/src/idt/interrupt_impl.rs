@@ -13,7 +13,9 @@ use kernel_types::irq::{
 };
 use spin::{Mutex, Once};
 
-use crate::arch::idt::{irq_platform, InterruptFrame};
+use crate::platform::{self, ActivePlatform, InterruptPlatform};
+
+pub type InterruptFrame = <ActivePlatform as InterruptPlatform>::InterruptFrame;
 
 const MAX_HANDLERS_PER_VECTOR: usize = 4;
 const MAX_TOTAL_REGISTRATIONS: usize = 64;
@@ -540,11 +542,11 @@ struct VectorAllocator;
 
 impl VectorAllocator {
     fn is_dynamic(vector: u8) -> bool {
-        irq_platform::is_dynamic_vector(vector)
+        platform::is_dynamic_vector(vector)
     }
 
     fn alloc() -> Option<u8> {
-        for vec in irq_platform::DYNAMIC_VECTOR_START..=irq_platform::DYNAMIC_VECTOR_END {
+        for vec in platform::dynamic_vector_range() {
             if Self::reserve(vec) {
                 return Some(vec);
             }
@@ -851,7 +853,7 @@ impl IrqManager {
     }
 
     fn dispatch(&self, vector: u8, frame: &mut InterruptFrame) {
-        let cpu = irq_platform::current_cpu_id();
+        let cpu = platform::current_cpu_id() as u32;
         let slot = &self.vectors[vector as usize];
         let regs = slot.regs.read();
 
@@ -864,7 +866,7 @@ impl IrqManager {
             }
         }
 
-        irq_platform::send_eoi(vector);
+        platform::end_interrupt(vector);
     }
 }
 
@@ -881,7 +883,7 @@ fn null_handle() -> IrqHandle {
 extern "C" fn dummy_drop(_: usize) {}
 
 pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
-    if irq_platform::is_reserved_vector(vector) {
+    if platform::is_reserved_vector(vector) {
         return null_handle();
     }
 
@@ -911,8 +913,8 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     };
 
     if first_for_vector {
-        if let Some(gsi) = irq_platform::vector_to_gsi(vector) {
-            irq_platform::unmask_gsi_any_cpu(gsi, vector);
+        if let Some(gsi) = platform::vector_to_gsi(vector) {
+            platform::unmask_gsi_any_cpu(gsi, vector);
         }
     }
 
@@ -920,7 +922,7 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
 }
 
 pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
-    let Some(vector) = irq_platform::gsi_to_vector(gsi) else {
+    let Some(vector) = platform::gsi_to_vector(gsi) else {
         return null_handle();
     };
 
@@ -940,7 +942,7 @@ pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     };
 
     if first_for_vector {
-        irq_platform::unmask_gsi_any_cpu(gsi, vector);
+        platform::unmask_gsi_any_cpu(gsi, vector);
     }
 
     handle
@@ -1020,8 +1022,7 @@ pub struct InterruptGuard {
 
 impl InterruptGuard {
     pub fn new() -> Self {
-        let was_in_interrupt =
-            irq_platform::current_is_in_interrupt_atomic().swap(true, Ordering::AcqRel);
+        let was_in_interrupt = platform::enter_interrupt();
         InterruptGuard { was_in_interrupt }
     }
 
@@ -1033,8 +1034,6 @@ impl InterruptGuard {
 
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
-        if !self.was_in_interrupt {
-            irq_platform::current_is_in_interrupt_atomic().store(false, Ordering::Release);
-        }
+        platform::leave_interrupt(self.was_in_interrupt);
     }
 }

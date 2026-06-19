@@ -1,20 +1,5 @@
 use alloc::string::String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ParkReason {
-    None = 0,
-    MutexLock = 1,
-    ChannelRecv = 2,
-    ChannelSend = 3,
-    CondvarWait = 4,
-    Sleep = 5,
-    IoWait = 6,
-    FutexWait = 7,
-    TaskJoin = 8,
-    IrqWait = 9,
-}
-
 pub type ThreadEntry = extern "C" fn(usize);
 
 /// Static platform binding used by the sync primitives.
@@ -33,7 +18,7 @@ pub trait Platform: Sized + 'static {
     fn is_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
 
     fn unpark(task: &Self::Task);
-    fn park_current(reason: ParkReason);
+    fn park_current();
 
     fn spawn_thread(name: String, entry: ThreadEntry, context: usize);
 

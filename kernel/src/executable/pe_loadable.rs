@@ -1,7 +1,6 @@
 use core::mem::transmute;
 use core::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 
-use crate::arch::VirtAddr;
 use crate::file_system::file::File;
 use crate::memory::paging::base_page_size;
 use crate::platform;
@@ -15,6 +14,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
+use kernel_types::arch::VirtAddr;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::{

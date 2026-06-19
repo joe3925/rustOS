@@ -30,16 +30,38 @@ fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(
     Ok(())
 }
 
-fn machine_from_target(target: &str) -> &'static str {
-    if target.contains("aarch64") {
-        "ARM64"
-    } else if target.contains("arm") {
-        "ARM"
-    } else if target.contains("i686") || (target.contains("x86") && !target.contains("x86_64")) {
-        "X86"
-    } else {
-        "X64"
+struct KernelTarget {
+    machine: &'static str,
+    dlltool_machine: &'static str,
+    mimalloc: Option<MimallocTarget>,
+}
+
+struct MimallocTarget {
+    clang_target: &'static str,
+    flags: &'static [&'static str],
+}
+
+fn kernel_target(target: &str) -> Result<KernelTarget, Box<dyn Error>> {
+    if target.contains("x86_64") {
+        return Ok(KernelTarget {
+            machine: "X64",
+            dlltool_machine: "i386:x86-64",
+            mimalloc: Some(MimallocTarget {
+                clang_target: "x86_64-pc-windows-msvc",
+                flags: &["-mno-red-zone", "-mcmodel=large"],
+            }),
+        });
     }
+
+    if target.contains("aarch64") {
+        return Ok(KernelTarget {
+            machine: "ARM64",
+            dlltool_machine: "arm64",
+            mimalloc: None,
+        });
+    }
+
+    Err(format!("unsupported kernel target architecture: {target}").into())
 }
 
 fn generate_import_library(
@@ -90,29 +112,31 @@ impl ImportLibTool {
         target: &str,
         def_path: &PathBuf,
         lib_out: &PathBuf,
-    ) -> Result<std::process::ExitStatus, std::io::Error> {
+    ) -> Result<std::process::ExitStatus, Box<dyn Error>> {
+        let target = kernel_target(target)?;
+
         match self {
-            Self::LlvmDlltool => tool_command(self.name())
+            Self::LlvmDlltool => Ok(tool_command(self.name())
                 .arg("-d")
                 .arg(def_path)
                 .arg("-l")
                 .arg(lib_out)
                 .arg("-m")
-                .arg("i386:x86-64")
-                .status(),
-            Self::LlvmLib => tool_command(self.name())
+                .arg(target.dlltool_machine)
+                .status()?),
+            Self::LlvmLib => Ok(tool_command(self.name())
                 .arg("/NOLOGO")
                 .arg(format!("/DEF:{}", def_path.display()))
-                .arg(format!("/MACHINE:{}", machine_from_target(target)))
+                .arg(format!("/MACHINE:{}", target.machine))
                 .arg(format!("/OUT:{}", lib_out.display()))
-                .status(),
-            Self::LldLink => tool_command(self.name())
+                .status()?),
+            Self::LldLink => Ok(tool_command(self.name())
                 .arg("/lib")
                 .arg("/NOLOGO")
                 .arg(format!("/DEF:{}", def_path.display()))
-                .arg(format!("/MACHINE:{}", machine_from_target(target)))
+                .arg(format!("/MACHINE:{}", target.machine))
                 .arg(format!("/OUT:{}", lib_out.display()))
-                .status(),
+                .status()?),
         }
     }
 }
@@ -134,11 +158,13 @@ fn compile_mimalloc(
     println!("cargo:rerun-if-changed={}", include_dir.display());
     println!("cargo:rerun-if-changed={}", src_dir.display());
 
-    if !target.contains("x86_64") {
-        panic!("rustOS mimalloc platform is currently implemented for x86_64 only");
-    }
+    let target_config = kernel_target(target)?;
+    let mimalloc_target = target_config
+        .mimalloc
+        .ok_or_else(|| format!("rustOS mimalloc platform is not implemented for {target}"))?;
 
     let mut build = cc::Build::new();
+    let clang_target_flag = format!("--target={}", mimalloc_target.clang_target);
 
     build
         .compiler("clang")
@@ -148,7 +174,7 @@ fn compile_mimalloc(
         .file(manifest_dir.join("c").join("mimalloc_static.c"))
         .file(manifest_dir.join("c").join("mimalloc_rustos_platform.c"))
         .file(manifest_dir.join("c").join("rustos_libc.c"))
-        .flag("--target=x86_64-pc-windows-msvc")
+        .flag(&clang_target_flag)
         .flag("-U_WIN32")
         .flag("-U_WIN64")
         .flag("-U_MSC_VER")
@@ -158,8 +184,6 @@ fn compile_mimalloc(
         .flag("-ffreestanding")
         .flag("-fno-builtin")
         .flag("-fno-stack-protector")
-        .flag("-mno-red-zone")
-        .flag("-mcmodel=large")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-unused-function")
         .flag("-Wno-unused-macros")
@@ -171,6 +195,10 @@ fn compile_mimalloc(
         .define("MI_RUSTOS_HIGH_HALF", "1")
         .define("NDEBUG", "1")
         .define("MI_USE_BUILTIN_THREAD_POINTER", "0");
+
+    for flag in mimalloc_target.flags {
+        build.flag(flag);
+    }
 
     let objects = build.compile_intermediates();
     let lib_out = out_dir.join("rustos_mimalloc.lib");

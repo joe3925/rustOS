@@ -6,7 +6,7 @@ use spin::Mutex;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 
-use crate::cpu::get_cpu_info;
+use super::cpu::get_cpu_info;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::structs::per_cpu_vec::PerCpuVec;
 

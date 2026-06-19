@@ -4,8 +4,9 @@ use kernel_types::arch::VirtAddr;
 use x86_64::instructions;
 use x86_64::VirtAddr as X86VirtAddr;
 
-use crate::arch::drivers::interrupt_index::{send_eoi, IpiDest, IpiKind, LocalApic, APIC};
-use crate::idt::{InterruptGuard, TLB_FLUSH_VECTOR};
+use super::super::super::drivers::interrupt_index::{send_eoi, IpiDest, IpiKind, LocalApic, APIC};
+use super::super::super::idt::TLB_FLUSH_VECTOR;
+use crate::idt::InterruptGuard;
 
 pub fn local_flush_tlb_all() {
     instructions::tlb::flush_all();

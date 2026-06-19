@@ -17,7 +17,7 @@ pub use bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueError};
 pub use channel::channel;
 pub use condvar::Condvar;
 pub use mpmc::mpmc_channel;
-pub use platform::{ParkReason, Platform, ThreadEntry};
+pub use platform::{Platform, ThreadEntry};
 pub use sleep_mutex::{SleepMutex, SleepMutexGuard};
 pub use thread_pool::{
     BoundedJobs, BoundedJobsConfig, BoundedThreadPool, Job, JobFn, JobQueue, QueueSendError,

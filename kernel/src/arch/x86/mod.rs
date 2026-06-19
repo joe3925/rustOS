@@ -41,17 +41,6 @@ pub mod instructions {
     use core::arch::asm;
     use x86_64::structures::idt::InterruptDescriptorTable;
 
-    pub unsafe fn trigger_guard_page_overflow(target: u64) -> ! {
-        unsafe {
-            asm!(
-                "mov rsp, {0}",
-                "mov qword ptr [rsp], 0",
-                in(reg) target,
-                options(noreturn)
-            );
-        }
-    }
-
     pub fn invalid_opcode() -> ! {
         unsafe {
             asm!("ud2", options(noreturn));
@@ -82,8 +71,12 @@ pub mod paging {
 }
 
 pub use platform::X86Platform as PlatformImpl;
-pub use x86_64::align_up;
-pub use x86_64::structures::paging::PageTableFlags as PageFlags;
-pub use x86_64::{PhysAddr, VirtAddr};
 
 pub const MAX_CPUS: usize = 256;
+
+#[macro_export]
+macro_rules! platform_driver_target_dir {
+    () => {
+        "x86_64-rustos-driver"
+    };
+}

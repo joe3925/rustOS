@@ -3,7 +3,6 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_types::arch::VirtAddr;
 
-use crate::arch::MAX_CPUS;
 use crate::platform::{ActivePlatform, PagingPlatform};
 use crate::KERNEL_INITIALIZED;
 
@@ -12,11 +11,13 @@ use super::types::TlbShootdownRange;
 
 const TLB_SHOOTDOWN_MODE_FULL: usize = 0;
 const TLB_SHOOTDOWN_MODE_RANGES: usize = 1;
-const TLB_SHOOTDOWN_RANGE_FLUSH_LIMIT: u64 = MAX_CPUS as u64 * u64::BITS as u64 / 4;
+const TLB_SHOOTDOWN_RANGE_FLUSH_LIMIT: u64 =
+    crate::platform::MAX_CPUS as u64 * u64::BITS as u64 / 4;
 
 static TLB_SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static TLB_SHOOTDOWN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static TLB_SHOOTDOWN_ACKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static TLB_SHOOTDOWN_ACKS: [AtomicU64; crate::platform::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::platform::MAX_CPUS];
 static TLB_SHOOTDOWN_MODE: AtomicUsize = AtomicUsize::new(TLB_SHOOTDOWN_MODE_FULL);
 static TLB_SHOOTDOWN_RANGES: AtomicPtr<TlbShootdownRange> = AtomicPtr::new(null_mut());
 static TLB_SHOOTDOWN_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -41,7 +42,7 @@ pub fn handle_remote_tlb_shootdown() {
     flush_current_tlb_shootdown_request();
 
     let cpu = crate::platform::current_cpu_id();
-    if cpu < MAX_CPUS {
+    if cpu < crate::platform::MAX_CPUS {
         let sequence = TLB_SHOOTDOWN_SEQUENCE.load(Ordering::SeqCst);
         TLB_SHOOTDOWN_ACKS[cpu].store(sequence, Ordering::SeqCst);
     }
@@ -55,10 +56,10 @@ fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
     }
 
     assert!(
-        cpu_count <= MAX_CPUS,
+        cpu_count <= crate::platform::MAX_CPUS,
         "TLB shootdown CPU count {} exceeds ack table size {}",
         cpu_count,
-        MAX_CPUS
+        crate::platform::MAX_CPUS
     );
     assert!(
         crate::platform::interrupts_enabled(),
@@ -80,7 +81,7 @@ fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
 
     let sent = <ActivePlatform as PagingPlatform>::broadcast_tlb_shootdown();
     flush_tlb_shootdown_request(ranges);
-    if current_cpu < MAX_CPUS {
+    if current_cpu < crate::platform::MAX_CPUS {
         TLB_SHOOTDOWN_ACKS[current_cpu].store(sequence, Ordering::SeqCst);
     }
 

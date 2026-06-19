@@ -4,86 +4,27 @@ use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
 
-use crate::arch::drivers::interrupt_index::InterruptIndex;
-use crate::arch::drivers::timer_driver::timer_interrupt_entry;
-use crate::arch::memory::paging::tlb::tlb_flush_entry;
-use crate::arch::scheduling::{ipi_entry, yield_interrupt_entry};
-use crate::exception_handlers::exception_handlers;
-use crate::gdt::{
+use super::drivers::interrupt_index::InterruptIndex;
+use super::drivers::timer_driver::timer_interrupt_entry;
+use super::exception_handlers::exception_handlers;
+use super::gdt::{
     DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, SCHED_IPI_IST_INDEX, TIMER_IST_INDEX,
     YIELD_IST_INDEX,
 };
+use super::memory::paging::tlb::tlb_flush_entry;
+use super::scheduling::{ipi_entry, yield_interrupt_entry};
 use crate::scheduling::scheduler::KernelFpuGuard;
 
 use crate::idt::{irq_dispatch, InterruptGuard};
 
 pub type InterruptFrame = InterruptStackFrame;
 
-pub const SCHED_IPI_VECTOR: u8 = 0xF2;
-pub const TLB_FLUSH_VECTOR: u8 = 0xF3;
-
-pub(crate) mod irq_platform {
-    use core::sync::atomic::AtomicBool;
-
-    use crate::arch::drivers::interrupt_index::{
-        current_cpu_id as arch_current_cpu_id, current_is_in_interrupt_atomic as arch_in_interrupt,
-        get_current_logical_id, send_eoi as arch_send_eoi, InterruptIndex, APIC,
-    };
-
-    pub(crate) const DYNAMIC_VECTOR_START: u8 = 0x60;
-    pub(crate) const DYNAMIC_VECTOR_END: u8 = 0xEF;
-    const SYSCALL_VECTOR: u8 = 0x80;
-    const MAX_GSI: u8 = 64;
-
-    pub(crate) fn is_reserved_vector(vector: u8) -> bool {
-        vector == SYSCALL_VECTOR
-    }
-
-    pub(crate) fn is_dynamic_vector(vector: u8) -> bool {
-        vector >= DYNAMIC_VECTOR_START
-            && vector <= DYNAMIC_VECTOR_END
-            && !is_reserved_vector(vector)
-    }
-
-    pub(crate) fn gsi_to_vector(gsi: u8) -> Option<u8> {
-        if gsi < MAX_GSI {
-            Some(InterruptIndex::Timer.as_u8() + gsi)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn vector_to_gsi(vector: u8) -> Option<u8> {
-        let base = InterruptIndex::Timer.as_u8();
-        let gsi = vector.wrapping_sub(base);
-
-        if gsi < MAX_GSI {
-            Some(gsi)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn current_cpu_id() -> u32 {
-        arch_current_cpu_id() as u32
-    }
-
-    pub(crate) fn send_eoi(vector: u8) {
-        arch_send_eoi(vector);
-    }
-
-    pub(crate) fn unmask_gsi_any_cpu(gsi: u8, vector: u8) {
-        APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
-            gsi,
-            vector,
-            get_current_logical_id(),
-        );
-    }
-
-    pub(crate) fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
-        arch_in_interrupt()
-    }
-}
+pub(crate) const SCHED_IPI_VECTOR: u8 = 0xF2;
+pub(crate) const TLB_FLUSH_VECTOR: u8 = 0xF3;
+pub(crate) const DYNAMIC_VECTOR_START: u8 = 0x60;
+pub(crate) const DYNAMIC_VECTOR_END: u8 = 0xEF;
+pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
+pub(crate) const MAX_GSI: u8 = 64;
 
 pub struct NestedInterruptEnableGuard {
     disable_on_drop: bool,
