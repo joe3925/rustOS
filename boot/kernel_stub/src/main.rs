@@ -19,12 +19,11 @@ use kernel_abi::{
     BootInfo, KernelSection, KernelSections, KernelSymbol, KernelSymbolString, KernelSymbols,
     KernelTextSection, MemoryRegion, MemoryRegionKind, MemoryRegions, Optional,
     MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
-    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, RUSTOS_BOOT_INFO_MAGIC,
-    RUSTOS_BOOT_INFO_VERSION,
+    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES,
 };
 use platform::{
-    ActivePlatform, BootloaderMemoryRegion, BootloaderPlatform, KernelImagePermissions,
-    KernelImagePlatform, LoadedKernel, PhysRange, Platform,
+    ActivePlatform, BootInfoParts, BootloaderMemoryRegion, BootloaderPlatform,
+    KernelImagePermissions, KernelImagePlatform, LoadedKernel, PhysRange, Platform,
 };
 
 type ActiveBootInfo = BootInfo<<ActivePlatform as Platform>::BootArchInfo>;
@@ -310,23 +309,13 @@ fn build_handoff(
     let tls_directory =
         translate_kernel_tls_directory::<ActivePlatform>(loaded.image_base, loaded.image_size)?;
     let (kernel_import_count, kernel_export_count) = translate_kernel_symbols()?;
-    let (ramdisk_addr, ramdisk_len) = ActivePlatform::ramdisk(boot_info);
 
     unsafe {
-        let common_boot_info = ActiveBootInfo {
-            magic: RUSTOS_BOOT_INFO_MAGIC,
-            version: RUSTOS_BOOT_INFO_VERSION,
-            flags: 0,
-            rsdp_addr: Optional::None,
-            arch_info:
-                <<ActivePlatform as Platform>::BootArchInfo as kernel_abi::BootArchInfo>::EMPTY,
+        let parts = BootInfoParts {
             memory_regions: MemoryRegions {
                 ptr: addr_of_mut!(ABI_MEMORY_REGIONS).cast::<MemoryRegion>(),
                 len: memory_region_count,
             },
-            framebuffer: ActivePlatform::framebuffer(boot_info),
-            fdt_header: ActivePlatform::fdt_header(boot_info),
-            tls_template: Optional::None,
             kernel_imports: KernelSymbols {
                 ptr: addr_of_mut!(ABI_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
                 len: kernel_import_count,
@@ -335,25 +324,16 @@ fn build_handoff(
                 ptr: addr_of_mut!(ABI_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
                 len: kernel_export_count,
             },
-            ramdisk_addr,
-            ramdisk_len,
-            kernel_addr: 0,
-            kernel_len: loaded.image_size,
-            kernel_image_offset: 0,
-            kernel_image_base: loaded.image_base,
-            kernel_image_size: loaded.image_size,
-            kernel_entry: loaded.entry,
             kernel_text,
             kernel_sections: KernelSections {
                 ptr: addr_of_mut!(ABI_KERNEL_SECTIONS).cast::<KernelSection>(),
                 len: section_count,
             },
-            stub_base: ActivePlatform::stub_image_base(),
-            stub_size: ActivePlatform::stub_image_size(boot_info),
+            loaded_kernel: loaded,
+            tls_directory,
         };
 
-        let boot_info =
-            ActivePlatform::finalize_boot_info(boot_info, common_boot_info, tls_directory)?;
+        let boot_info = ActivePlatform::finalize_boot_info(boot_info, parts)?;
         ABI_BOOT_INFO = boot_info;
 
         Ok(&mut *addr_of_mut!(ABI_BOOT_INFO))

@@ -130,7 +130,6 @@ unsafe fn copy_boot_info(src: &ActiveBootInfo) {
         memory_regions,
         framebuffer: copy_framebuffer(&src.framebuffer),
         fdt_header: src.fdt_header,
-        tls_template: src.tls_template,
         kernel_imports,
         kernel_exports,
         ramdisk_addr: src.ramdisk_addr,

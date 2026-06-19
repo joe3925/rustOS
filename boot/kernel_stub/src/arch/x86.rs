@@ -12,6 +12,7 @@ use kernel_abi::arch::{
 };
 use kernel_abi::{
     BootInfo, FdtHeader, FrameBuffer, FrameBufferInfo, MemoryRegionKind, Optional, PixelFormat,
+    RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION,
 };
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::{
@@ -21,8 +22,8 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::platform::{
-    BootloaderMemoryRegion, BootloaderPlatform, KernelImagePermissions, KernelImagePlatform,
-    PhysRange, Platform,
+    BootInfoParts, BootloaderMemoryRegion, BootloaderPlatform, KernelImagePermissions,
+    KernelImagePlatform, PhysRange, Platform,
 };
 
 pub struct X86Platform;
@@ -294,64 +295,88 @@ impl BootloaderPlatform for X86Platform {
         })
     }
 
-    fn framebuffer(bootloader_info: &mut Self::BootloaderInfo) -> Optional<FrameBuffer> {
-        match bootloader_info.framebuffer.as_mut() {
-            Some(fb) => {
-                let info = fb.info();
-                let buffer = fb.buffer_mut();
-                Optional::Some(unsafe {
-                    FrameBuffer::new(
-                        buffer.as_mut_ptr() as u64,
-                        FrameBufferInfo {
-                            byte_len: info.byte_len,
-                            width: info.width,
-                            height: info.height,
-                            pixel_format: translate_pixel_format(info.pixel_format),
-                            bytes_per_pixel: info.bytes_per_pixel,
-                            stride: info.stride,
-                        },
-                    )
-                })
-            }
-            None => Optional::None,
-        }
-    }
-
-    fn fdt_header(_bootloader_info: &Self::BootloaderInfo) -> Optional<*const FdtHeader> {
-        Optional::None
-    }
-
-    fn ramdisk(bootloader_info: &Self::BootloaderInfo) -> (Optional<u64>, u64) {
-        (
-            translate_optional(bootloader_info.ramdisk_addr),
-            bootloader_info.ramdisk_len,
-        )
-    }
-
-    fn stub_image_base() -> u64 {
-        STUB_IMAGE_BASE
-    }
-
-    fn stub_image_size(bootloader_info: &Self::BootloaderInfo) -> u64 {
-        crate::align_up(
-            bootloader_info.kernel_len.max(Self::base_page_size()),
-            Self::base_page_size(),
-        )
-    }
-
     fn finalize_boot_info(
         bootloader_info: &mut Self::BootloaderInfo,
-        mut boot_info: BootInfo<Self::BootArchInfo>,
-        tls_directory: Optional<Self::TlsDirectory>,
+        parts: BootInfoParts<Self::TlsDirectory>,
     ) -> Result<BootInfo<Self::BootArchInfo>, &'static str> {
         let arch_info = X86BootArchInfo {
             recursive_index: translate_optional(bootloader_info.recursive_index),
-            pe_tls_directory: tls_directory,
+            pe_tls_directory: parts.tls_directory,
         };
-        boot_info.rsdp_addr = translate_optional(bootloader_info.rsdp_addr);
-        boot_info.arch_info = arch_info;
-        Ok(boot_info)
+        let (ramdisk_addr, ramdisk_len) = ramdisk(bootloader_info);
+
+        Ok(BootInfo {
+            magic: RUSTOS_BOOT_INFO_MAGIC,
+            version: RUSTOS_BOOT_INFO_VERSION,
+            flags: 0,
+            rsdp_addr: translate_optional(bootloader_info.rsdp_addr),
+            arch_info,
+            memory_regions: parts.memory_regions,
+            framebuffer: framebuffer(bootloader_info),
+            fdt_header: fdt_header(bootloader_info),
+            kernel_imports: parts.kernel_imports,
+            kernel_exports: parts.kernel_exports,
+            ramdisk_addr,
+            ramdisk_len,
+            kernel_addr: 0,
+            kernel_len: parts.loaded_kernel.image_size,
+            kernel_image_offset: 0,
+            kernel_image_base: parts.loaded_kernel.image_base,
+            kernel_image_size: parts.loaded_kernel.image_size,
+            kernel_entry: parts.loaded_kernel.entry,
+            kernel_text: parts.kernel_text,
+            kernel_sections: parts.kernel_sections,
+            stub_base: stub_image_base(),
+            stub_size: stub_image_size(bootloader_info),
+        })
     }
+}
+
+fn framebuffer(bootloader_info: &mut BootloaderBootInfo) -> Optional<FrameBuffer> {
+    match bootloader_info.framebuffer.as_mut() {
+        Some(fb) => {
+            let info = fb.info();
+            let buffer = fb.buffer_mut();
+            Optional::Some(unsafe {
+                FrameBuffer::new(
+                    buffer.as_mut_ptr() as u64,
+                    FrameBufferInfo {
+                        byte_len: info.byte_len,
+                        width: info.width,
+                        height: info.height,
+                        pixel_format: translate_pixel_format(info.pixel_format),
+                        bytes_per_pixel: info.bytes_per_pixel,
+                        stride: info.stride,
+                    },
+                )
+            })
+        }
+        None => Optional::None,
+    }
+}
+
+fn fdt_header(_bootloader_info: &BootloaderBootInfo) -> Optional<*const FdtHeader> {
+    Optional::None
+}
+
+fn ramdisk(bootloader_info: &BootloaderBootInfo) -> (Optional<u64>, u64) {
+    (
+        translate_optional(bootloader_info.ramdisk_addr),
+        bootloader_info.ramdisk_len,
+    )
+}
+
+fn stub_image_base() -> u64 {
+    STUB_IMAGE_BASE
+}
+
+fn stub_image_size(bootloader_info: &BootloaderBootInfo) -> u64 {
+    crate::align_up(
+        bootloader_info
+            .kernel_len
+            .max(X86Platform::base_page_size()),
+        X86Platform::base_page_size(),
+    )
 }
 
 pub struct BootFrameAllocator {

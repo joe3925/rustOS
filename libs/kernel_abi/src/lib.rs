@@ -38,7 +38,6 @@ pub struct BootInfo<A: BootArchInfo = EmptyArchInfo> {
     pub memory_regions: MemoryRegions,
     pub framebuffer: Optional<FrameBuffer>,
     pub fdt_header: Optional<*const FdtHeader>,
-    pub tls_template: Optional<TlsTemplate>,
     pub kernel_imports: KernelSymbols,
     pub kernel_exports: KernelSymbols,
     pub ramdisk_addr: Optional<u64>,
@@ -69,7 +68,6 @@ impl<A: BootArchInfo> BootInfo<A> {
             },
             framebuffer: Optional::None,
             fdt_header: Optional::None,
-            tls_template: Optional::None,
             kernel_imports: KernelSymbols {
                 ptr: core::ptr::null(),
                 len: 0,
@@ -252,14 +250,6 @@ pub enum PixelFormat {
         green_position: u8,
         blue_position: u8,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct TlsTemplate {
-    pub start_addr: u64,
-    pub file_size: u64,
-    pub mem_size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

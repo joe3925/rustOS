@@ -1,7 +1,7 @@
 use goblin::pe::tls::ImageTlsDirectory;
 use kernel_abi::{
-    BootArchInfo as KernelBootArchInfo, BootInfo, FdtHeader, FrameBuffer, MemoryRegionKind,
-    Optional,
+    BootArchInfo as KernelBootArchInfo, BootInfo, KernelSections, KernelSymbols, KernelTextSection,
+    MemoryRegionKind, MemoryRegions, Optional,
 };
 
 pub type ActivePlatform = crate::arch::PlatformImpl;
@@ -37,6 +37,16 @@ pub struct BootloaderMemoryRegion {
 pub struct KernelImagePermissions {
     pub writable: bool,
     pub executable: bool,
+}
+
+pub struct BootInfoParts<TlsDirectory> {
+    pub memory_regions: MemoryRegions,
+    pub kernel_imports: KernelSymbols,
+    pub kernel_exports: KernelSymbols,
+    pub kernel_sections: KernelSections,
+    pub kernel_text: Optional<KernelTextSection>,
+    pub loaded_kernel: LoadedKernel,
+    pub tls_directory: Optional<TlsDirectory>,
 }
 
 pub trait Platform {
@@ -104,15 +114,8 @@ pub trait BootloaderPlatform: KernelImagePlatform {
         Ok(())
     }
 
-    fn framebuffer(bootloader_info: &mut Self::BootloaderInfo) -> Optional<FrameBuffer>;
-    fn fdt_header(bootloader_info: &Self::BootloaderInfo) -> Optional<*const FdtHeader>;
-    fn ramdisk(bootloader_info: &Self::BootloaderInfo) -> (Optional<u64>, u64);
-    fn stub_image_base() -> u64;
-    fn stub_image_size(bootloader_info: &Self::BootloaderInfo) -> u64;
-
     fn finalize_boot_info(
         bootloader_info: &mut Self::BootloaderInfo,
-        boot_info: BootInfo<Self::BootArchInfo>,
-        tls_directory: Optional<Self::TlsDirectory>,
+        parts: BootInfoParts<Self::TlsDirectory>,
     ) -> Result<BootInfo<Self::BootArchInfo>, &'static str>;
 }
