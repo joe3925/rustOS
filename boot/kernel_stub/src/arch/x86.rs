@@ -1,10 +1,10 @@
 use core::arch::asm;
 
 use bootloader_api::config::Mapping;
-use bootloader_api::info::{
-    MemoryRegionKind as BootMemoryRegionKind, PixelFormat as BootPixelFormat,
-};
-use bootloader_api::{entry_point, BootInfo as BootloaderBootInfo, BootloaderConfig};
+use bootloader_api::info;
+use bootloader_api::info::MemoryRegionKind::{Bootloader, UnknownBios, UnknownUefi, Usable};
+use bootloader_api::info::PixelFormat::{Bgr, Rgb, Unknown, U8};
+use bootloader_api::{entry_point, BootloaderConfig};
 use goblin::pe::header::COFF_MACHINE_X86_64;
 use kernel_abi::arch::{
     PeTlsDirectory, X86BootArchInfo, KERNEL_PE_BASE, STUB_DYNAMIC_RANGE_END,
@@ -47,7 +47,7 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 
 entry_point!(stub_start, config = &BOOTLOADER_CONFIG);
 
-fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
+fn stub_start(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     crate::start(boot_info)
 }
 
@@ -256,7 +256,7 @@ impl KernelImagePlatform for X86Platform {
 }
 
 impl BootloaderPlatform for X86Platform {
-    type BootloaderInfo = BootloaderBootInfo;
+    type BootloaderInfo = bootloader_api::BootInfo;
 
     fn init_mapper(
         bootloader_info: &Self::BootloaderInfo,
@@ -332,7 +332,7 @@ impl BootloaderPlatform for X86Platform {
     }
 }
 
-fn framebuffer(bootloader_info: &mut BootloaderBootInfo) -> Optional<FrameBuffer> {
+fn framebuffer(bootloader_info: &mut bootloader_api::BootInfo) -> Optional<FrameBuffer> {
     match bootloader_info.framebuffer.as_mut() {
         Some(fb) => {
             let info = fb.info();
@@ -355,11 +355,11 @@ fn framebuffer(bootloader_info: &mut BootloaderBootInfo) -> Optional<FrameBuffer
     }
 }
 
-fn fdt_header(_bootloader_info: &BootloaderBootInfo) -> Optional<*const FdtHeader> {
+fn fdt_header(_bootloader_info: &bootloader_api::BootInfo) -> Optional<*const FdtHeader> {
     Optional::None
 }
 
-fn ramdisk(bootloader_info: &BootloaderBootInfo) -> (Optional<u64>, u64) {
+fn ramdisk(bootloader_info: &bootloader_api::BootInfo) -> (Optional<u64>, u64) {
     (
         translate_optional(bootloader_info.ramdisk_addr),
         bootloader_info.ramdisk_len,
@@ -370,7 +370,7 @@ fn stub_image_base() -> u64 {
     STUB_IMAGE_BASE
 }
 
-fn stub_image_size(bootloader_info: &BootloaderBootInfo) -> u64 {
+fn stub_image_size(bootloader_info: &bootloader_api::BootInfo) -> u64 {
     crate::align_up(
         bootloader_info
             .kernel_len
@@ -380,13 +380,13 @@ fn stub_image_size(bootloader_info: &BootloaderBootInfo) -> u64 {
 }
 
 pub struct BootFrameAllocator {
-    regions: *const bootloader_api::info::MemoryRegion,
+    regions: *const info::MemoryRegion,
     len: usize,
     next_frame: u64,
 }
 
 impl BootFrameAllocator {
-    fn new(boot_info: &BootloaderBootInfo) -> Self {
+    fn new(boot_info: &bootloader_api::BootInfo) -> Self {
         Self {
             regions: boot_info.memory_regions.as_ptr(),
             len: boot_info.memory_regions.len(),
@@ -394,7 +394,7 @@ impl BootFrameAllocator {
         }
     }
 
-    fn regions(&self) -> &[bootloader_api::info::MemoryRegion] {
+    fn regions(&self) -> &[info::MemoryRegion] {
         unsafe { core::slice::from_raw_parts(self.regions, self.len) }
     }
 }
@@ -404,7 +404,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
         let mut best: Option<u64> = None;
 
         for region in self.regions() {
-            if region.kind != BootMemoryRegionKind::Usable || region.end <= region.start {
+            if region.kind != Usable || region.end <= region.start {
                 continue;
             }
 
@@ -422,23 +422,21 @@ unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
     }
 }
 
-fn translate_memory_kind(kind: BootMemoryRegionKind) -> MemoryRegionKind {
+fn translate_memory_kind(kind: info::MemoryRegionKind) -> MemoryRegionKind {
     match kind {
-        BootMemoryRegionKind::Usable => MemoryRegionKind::Usable,
-        BootMemoryRegionKind::Bootloader => MemoryRegionKind::Bootloader,
-        BootMemoryRegionKind::UnknownUefi(value) | BootMemoryRegionKind::UnknownBios(value) => {
-            MemoryRegionKind::Unknown(value)
-        }
+        Usable => MemoryRegionKind::Usable,
+        Bootloader => MemoryRegionKind::Bootloader,
+        UnknownUefi(value) | UnknownBios(value) => MemoryRegionKind::Unknown(value),
         _ => MemoryRegionKind::Reserved,
     }
 }
 
-fn translate_pixel_format(pixel_format: BootPixelFormat) -> PixelFormat {
+fn translate_pixel_format(pixel_format: info::PixelFormat) -> PixelFormat {
     match pixel_format {
-        BootPixelFormat::Rgb => PixelFormat::Rgb,
-        BootPixelFormat::Bgr => PixelFormat::Bgr,
-        BootPixelFormat::U8 => PixelFormat::U8,
-        BootPixelFormat::Unknown {
+        Rgb => PixelFormat::Rgb,
+        Bgr => PixelFormat::Bgr,
+        U8 => PixelFormat::U8,
+        Unknown {
             red_position,
             green_position,
             blue_position,
@@ -451,7 +449,7 @@ fn translate_pixel_format(pixel_format: BootPixelFormat) -> PixelFormat {
     }
 }
 
-fn translate_optional<T>(value: bootloader_api::info::Optional<T>) -> Optional<T> {
+fn translate_optional<T>(value: info::Optional<T>) -> Optional<T> {
     match value.into_option() {
         Some(value) => Optional::Some(value),
         None => Optional::None,

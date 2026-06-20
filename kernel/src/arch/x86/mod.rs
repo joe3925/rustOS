@@ -70,7 +70,7 @@ pub mod paging {
     };
 }
 
-pub use platform::X86Platform as PlatformImpl;
+pub type PlatformImpl = platform::X86Platform;
 
 pub const MAX_CPUS: usize = 256;
 

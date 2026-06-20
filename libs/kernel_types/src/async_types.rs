@@ -9,7 +9,7 @@ use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
-use spin::Mutex as SpinMutex;
+use spin::Mutex;
 
 use core::mem;
 use core::sync::atomic::AtomicUsize;
@@ -53,7 +53,7 @@ fn pop_waiter(list: &mut Vec<Waiter>) -> Option<Waker> {
 #[repr(C)]
 pub struct AsyncMutex<T> {
     locked: AtomicBool,
-    waiters: SpinMutex<Vec<Waiter>>,
+    waiters: Mutex<Vec<Waiter>>,
     next_waiter_id: AtomicUsize,
     data: UnsafeCell<T>,
 }
@@ -83,7 +83,7 @@ impl<T> AsyncMutex<T> {
     pub const fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
-            waiters: SpinMutex::new(Vec::new()),
+            waiters: Mutex::new(Vec::new()),
             next_waiter_id: AtomicUsize::new(0),
             data: UnsafeCell::new(value),
         }
@@ -290,8 +290,8 @@ unsafe impl<T: Send + Sync> Sync for AsyncMutexOwnedGuard<T> {}
 pub struct AsyncRwLock<T> {
     state: AtomicIsize,
     waiting_writers: AtomicUsize,
-    r_waiters: SpinMutex<Vec<Waiter>>,
-    w_waiters: SpinMutex<Vec<Waiter>>,
+    r_waiters: Mutex<Vec<Waiter>>,
+    w_waiters: Mutex<Vec<Waiter>>,
     next_waiter_id: AtomicUsize,
     data: UnsafeCell<T>,
 }
@@ -340,8 +340,8 @@ impl<T> AsyncRwLock<T> {
         Self {
             state: AtomicIsize::new(0),
             waiting_writers: AtomicUsize::new(0),
-            r_waiters: SpinMutex::new(Vec::new()),
-            w_waiters: SpinMutex::new(Vec::new()),
+            r_waiters: Mutex::new(Vec::new()),
+            w_waiters: Mutex::new(Vec::new()),
             next_waiter_id: AtomicUsize::new(0),
             data: UnsafeCell::new(value),
         }

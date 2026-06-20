@@ -1,8 +1,8 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -310,7 +310,7 @@ fn ensure_kernel_import_library(root: &Path) -> Result<(), String> {
     let lld_link = find_tool_in_augmented_path("lld-link").ok_or_else(|| {
         "could not find lld-link for kernel import library generation".to_string()
     })?;
-    let mut command = ProcessCommand::new(lld_link);
+    let mut command = Command::new(lld_link);
     command
         .arg("/lib")
         .arg("/NOLOGO")
@@ -360,9 +360,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn cargo(dir: &Path) -> ProcessCommand {
+fn cargo(dir: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut command = ProcessCommand::new(cargo);
+    let mut command = Command::new(cargo);
     command.current_dir(dir);
 
     if let Some(path) = path_with_rust_linkers() {
@@ -382,10 +382,7 @@ fn path_with_rust_linkers() -> Option<OsString> {
 
 fn rust_linker_paths() -> Vec<PathBuf> {
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let output = match ProcessCommand::new(rustc)
-        .args(["--print", "sysroot"])
-        .output()
-    {
+    let output = match Command::new(rustc).args(["--print", "sysroot"]).output() {
         Ok(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
@@ -598,7 +595,7 @@ fn qemu_prefixes(qemu: &Path) -> Vec<PathBuf> {
 
     if qemu
         .components()
-        .any(|component| component.as_os_str() == std::ffi::OsStr::new("Cellar"))
+        .any(|component| component.as_os_str() == OsStr::new("Cellar"))
     {
         if let Some(version_dir) = qemu.parent().and_then(|bin_dir| bin_dir.parent()) {
             prefixes.push(version_dir.to_path_buf());
@@ -738,7 +735,7 @@ fn qemu_accel(qemu: &Path, options: &QemuOptions) -> String {
 }
 
 fn qemu_supports_accel(qemu: &Path, accel: &str) -> bool {
-    let output = match ProcessCommand::new(qemu).args(["-accel", "help"]).output() {
+    let output = match Command::new(qemu).args(["-accel", "help"]).output() {
         Ok(output) => output,
         Err(_) => return false,
     };
@@ -782,7 +779,7 @@ fn spawn_qemu_detached(
     debug: bool,
     gdb_port: u16,
 ) -> Result<(), String> {
-    let mut command = ProcessCommand::new(qemu);
+    let mut command = Command::new(qemu);
     command
         .args(args)
         .current_dir(root)
@@ -814,7 +811,7 @@ fn spawn_qemu_detached(
 }
 
 fn run_qemu_foreground(root: &Path, qemu: &Path, args: &[OsString]) -> Result<(), String> {
-    let status = ProcessCommand::new(qemu)
+    let status = Command::new(qemu)
         .args(args)
         .current_dir(root)
         .status()
@@ -931,7 +928,7 @@ fn require_file(path: PathBuf, name: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn run(mut command: ProcessCommand, step: &str) -> Result<(), String> {
+fn run(mut command: Command, step: &str) -> Result<(), String> {
     let status = command
         .status()
         .map_err(|err| format!("failed to start {step}: {err}"))?;

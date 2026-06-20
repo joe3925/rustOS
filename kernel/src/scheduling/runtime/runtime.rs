@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use kernel_executor::platform::{self as exec_platform, ExecutorPlatform, Job};
+use kernel_executor::platform::{self, ExecutorPlatform, Job};
 use spin::Once;
 
 use crate::static_handlers::{print, task_yield};
@@ -84,5 +84,5 @@ impl ExecutorPlatform for KernelExecutorPlatform {
 static PLATFORM: KernelExecutorPlatform = KernelExecutorPlatform::new();
 
 pub fn init_executor_platform() {
-    exec_platform::init(&PLATFORM);
+    platform::init(&PLATFORM);
 }

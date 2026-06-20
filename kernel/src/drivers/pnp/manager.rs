@@ -1,4 +1,4 @@
-use super::driver_index::{self as idx, HwIndex};
+use super::driver_index::{self, HwIndex};
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, OBJECT_MANAGER};
@@ -110,7 +110,7 @@ impl PnpManager {
     }
 
     pub async fn rebuild_index(&self) -> Result<(), RegError> {
-        let hw = idx::build_hw_index().await?;
+        let hw = driver_index::build_hw_index().await?;
         *self.hw.write() = Arc::new(hw);
         Ok(())
     }
@@ -413,7 +413,7 @@ impl PnpManager {
         let mut uppers: Vec<Item> = Vec::new();
 
         for id in ids {
-            let key = idx::escape_key(id);
+            let key = driver_index::escape_key(id);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{key}/{pos}");
                 if let Ok(children) = list_keys(&base).await {
@@ -440,7 +440,7 @@ impl PnpManager {
         }
 
         if let Some(class) = class_opt {
-            let key = idx::escape_key(class);
+            let key = driver_index::escape_key(class);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{key}/{pos}");
                 if let Ok(children) = list_keys(&base).await {
@@ -492,7 +492,7 @@ impl PnpManager {
         for pos in ["lower", "upper"] {
             let base = alloc::format!(
                 "SYSTEM/CurrentControlSet/Filters/driver/{}/{}",
-                idx::escape_key(function_service),
+                driver_index::escape_key(function_service),
                 pos
             );
             if let Ok(children) = list_keys(&base).await {

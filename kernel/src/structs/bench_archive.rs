@@ -1,5 +1,5 @@
 use alloc::{string::String, vec::Vec};
-use async_lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use async_lock::{Mutex, MutexGuard};
 use kernel_types::{
     bench_archive::{
         BenchArchiveFormat, BenchArchiveRecordKind, BenchArchiveRecordMeta, BENCH_ARCHIVE_FORMAT,
@@ -22,7 +22,7 @@ impl BenchArchiveFormatExt for BenchArchiveFormat {
 
 pub struct BenchArchive {
     path: String,
-    state: AsyncMutex<BenchArchiveState>,
+    state: Mutex<BenchArchiveState>,
 }
 
 struct BenchArchiveState {
@@ -32,7 +32,7 @@ struct BenchArchiveState {
 
 pub struct BenchArchivePersist<'a> {
     archive: &'a BenchArchive,
-    state: AsyncMutexGuard<'a, BenchArchiveState>,
+    state: MutexGuard<'a, BenchArchiveState>,
     persist_id: u64,
 }
 
@@ -76,7 +76,7 @@ impl BenchArchive {
     fn new(path: String) -> Self {
         Self {
             path,
-            state: AsyncMutex::new(BenchArchiveState {
+            state: Mutex::new(BenchArchiveState {
                 next_record_sequence: 1,
                 next_persist_id: 1,
             }),

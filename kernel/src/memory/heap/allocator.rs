@@ -19,7 +19,7 @@ use spin::Mutex;
 // TODO: without interrupts usage in mimalloc is temporary. Heaps need to be fragmented for interrupts, panics, and normal execution before merging to main
 cfg_if::cfg_if! {
     if #[cfg(feature = "allocator-mimalloc")] {
-        use crate::memory::heap::mimalloc as mi;
+        use crate::memory::heap::mimalloc;
 
         pub struct KernelAllocator {
             bootstrap: BuddyLocked,
@@ -43,7 +43,7 @@ cfg_if::cfg_if! {
 
                 let _guard = self.enable_lock.lock();
                 if !self.mimalloc_enabled.load(Ordering::Acquire) {
-                    unsafe { mi::enable_mimalloc_impl(); }
+                    unsafe { mimalloc::enable_mimalloc_impl(); }
                     self.mimalloc_enabled.store(true, Ordering::Release);
                 }
             }
@@ -58,12 +58,12 @@ cfg_if::cfg_if! {
                     if platform::current_is_in_interrupt() {
                         panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
                     }
-                    unsafe { mi::mimalloc_thread_done_impl(); }
+                    unsafe { mimalloc::mimalloc_thread_done_impl(); }
                 }
             }
 
             pub fn free_memory(&self) -> usize {
-                self.bootstrap.free_memory() + mi::get_mimalloc_free_memory()
+                self.bootstrap.free_memory() + mimalloc::get_mimalloc_free_memory()
             }
         }
 
@@ -73,7 +73,7 @@ cfg_if::cfg_if! {
                     if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
-                    mi::mimalloc_alloc(layout)
+                    mimalloc::mimalloc_alloc(layout)
                 } else {
                     self.bootstrap.alloc(layout)
                 }
@@ -84,7 +84,7 @@ cfg_if::cfg_if! {
                     if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
-                    mi::mimalloc_alloc_zeroed(layout)
+                    mimalloc::mimalloc_alloc_zeroed(layout)
                 } else {
                     let ptr = self.bootstrap.alloc(layout);
                     if !ptr.is_null() {
@@ -100,11 +100,11 @@ cfg_if::cfg_if! {
                     return;
                 }
 
-                if mi::ptr_is_mimalloc(ptr) {
+                if mimalloc::ptr_is_mimalloc(ptr) {
                     if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
-                    mi::mimalloc_dealloc(ptr, layout)
+                    mimalloc::mimalloc_dealloc(ptr, layout)
                 } else {
                     self.bootstrap.dealloc(ptr, layout)
                 }
@@ -115,11 +115,11 @@ cfg_if::cfg_if! {
                     return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
                 }
 
-                if mi::ptr_is_mimalloc(ptr) {
+                if mimalloc::ptr_is_mimalloc(ptr) {
                     if platform::current_is_in_interrupt() {
                         panic!("Cannot accses allocator from interrupt");
                     }
-                    mi::mimalloc_realloc(ptr, layout, new_size)
+                    mimalloc::mimalloc_realloc(ptr, layout, new_size)
                 } else {
                     let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
                     let new_ptr = self.alloc(new_layout);

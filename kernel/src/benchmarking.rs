@@ -43,7 +43,7 @@ use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::{DeviceControl, RequestHandle, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
-use kernel_types::ProstMessage;
+use kernel_types::Message;
 use serde_json::{json, Value};
 use spin::{Mutex, Once};
 

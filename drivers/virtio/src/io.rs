@@ -38,7 +38,7 @@ impl DeviceRead for VirtioPdoIo {
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Read<'data>>,
         buf_len: usize,
-    ) -> kernel_api::pnp::DriverStep {
+    ) -> DriverStep {
         virtio_pdo_read_impl(pdo, req, buf_len).await
     }
 }
@@ -49,7 +49,7 @@ impl DeviceWrite for VirtioPdoIo {
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Write<'data>>,
         buf_len: usize,
-    ) -> kernel_api::pnp::DriverStep {
+    ) -> DriverStep {
         virtio_pdo_write_impl(pdo, req, buf_len).await
     }
 }
@@ -59,7 +59,7 @@ impl DeviceFlush for VirtioPdoIo {
     async fn handler<'req, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Flush>,
-    ) -> kernel_api::pnp::DriverStep {
+    ) -> DriverStep {
         virtio_pdo_flush_impl(pdo, req).await
     }
 }
@@ -69,7 +69,7 @@ impl DeviceControlHandler for VirtioPdoIo {
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
-    ) -> kernel_api::pnp::DriverStep {
+    ) -> DriverStep {
         virtio_pdo_ioctl_impl(pdo, req).await
     }
 }

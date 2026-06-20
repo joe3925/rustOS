@@ -23,7 +23,7 @@ use kernel_api::{
     },
     pnp::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-        driver_set_evt_device_add, pnp_forward_request_to_next_lower,
+        DriverStep, driver_set_evt_device_add, pnp_forward_request_to_next_lower,
     },
     request::{DeviceControl, Flush, Pnp, Read, RequestHandle, TraversalPolicy, Write},
     request_handler,
@@ -48,26 +48,26 @@ impl DeviceRead for DiskIo {
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Read<'data>>,
         _buf_len: usize,
-    ) -> kernel_api::pnp::DriverStep {
+    ) -> DriverStep {
         let body = &req.read().body;
         let off = body.offset;
         let total = body.len;
 
         if unlikely(total == 0) {
             cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
+            return DriverStep::complete(DriverStatus::Success);
         }
 
         if unlikely(!has_from_device_buffer(&body.buffer, total)) {
             cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+            return DriverStep::complete(DriverStatus::InsufficientResources);
         }
 
         let dx = disk_ext(&dev);
         if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
             if let Err(st) = query_props_sync(&dev).await {
                 cold_path();
-                return kernel_api::pnp::DriverStep::complete(st);
+                return DriverStep::complete(st);
             }
         }
 
@@ -77,11 +77,11 @@ impl DeviceRead for DiskIo {
         if unlikely(!aligned) {
             cold_path();
             req.write().status = DriverStatus::InvalidParameter;
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+            return DriverStep::complete(DriverStatus::InvalidParameter);
         }
 
         req.write().traversal_policy = TraversalPolicy::ForwardLower;
-        kernel_api::pnp::DriverStep::Continue
+        DriverStep::Continue
     }
 }
 
@@ -91,26 +91,26 @@ impl DeviceWrite for DiskIo {
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Write<'data>>,
         _buf_len: usize,
-    ) -> kernel_api::pnp::DriverStep {
+    ) -> DriverStep {
         let body = &req.read().body;
         let off = body.offset;
         let total = body.len;
 
         if unlikely(total == 0) {
             cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
+            return DriverStep::complete(DriverStatus::Success);
         }
 
         if unlikely(!has_to_device_buffer(&body.buffer, total)) {
             cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+            return DriverStep::complete(DriverStatus::InsufficientResources);
         }
 
         let dx = disk_ext(&dev);
         if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
             if let Err(st) = query_props_sync(&dev).await {
                 cold_path();
-                return kernel_api::pnp::DriverStep::complete(st);
+                return DriverStep::complete(st);
             }
         }
 
@@ -120,11 +120,11 @@ impl DeviceWrite for DiskIo {
         if unlikely(!aligned) {
             cold_path();
             req.write().status = DriverStatus::InvalidParameter;
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+            return DriverStep::complete(DriverStatus::InvalidParameter);
         }
 
         req.write().traversal_policy = TraversalPolicy::ForwardLower;
-        kernel_api::pnp::DriverStep::Continue
+        DriverStep::Continue
     }
 }
 
@@ -133,8 +133,8 @@ impl DeviceFlush for DiskIo {
     async fn handler<'req, 'b>(
         _dev: &Arc<DeviceObject>,
         _req: &'b mut RequestHandle<'req, Flush>,
-    ) -> kernel_api::pnp::DriverStep {
-        kernel_api::pnp::DriverStep::Continue
+    ) -> DriverStep {
+        DriverStep::Continue
     }
 }
 
@@ -143,7 +143,7 @@ impl DeviceControlHandler for DiskIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
-    ) -> kernel_api::pnp::DriverStep {
+    ) -> DriverStep {
         let code = req.read().body.code;
 
         match code {
@@ -161,7 +161,7 @@ impl DeviceControlHandler for DiskIo {
                 let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
                 if unlikely(st != DriverStatus::Success) {
                     cold_path();
-                    return kernel_api::pnp::DriverStep::complete(st);
+                    return DriverStep::complete(st);
                 }
 
                 let mut info_opt = {
@@ -182,14 +182,14 @@ impl DeviceControlHandler for DiskIo {
                     Some(di) => di,
                     None => {
                         cold_path();
-                        return kernel_api::pnp::DriverStep::complete(DriverStatus::Unsuccessful);
+                        return DriverStep::complete(DriverStatus::Unsuccessful);
                     }
                 };
 
                 req.write().body.set_data_t::<DiskInfo>(info);
-                kernel_api::pnp::DriverStep::complete(DriverStatus::Success)
+                DriverStep::complete(DriverStatus::Success)
             }
-            _ => kernel_api::pnp::DriverStep::Continue,
+            _ => DriverStep::Continue,
         }
     }
 }
@@ -226,7 +226,7 @@ pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 pub extern "C" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> kernel_api::pnp::DriverStep {
+) -> DriverStep {
     dev_init.ops.read.register::<DiskIo>();
     dev_init.ops.write.register::<DiskIo>();
     dev_init.ops.device_control.register::<DiskIo>();
@@ -237,15 +237,15 @@ pub extern "C" fn disk_device_add(
     dev_init.pnp_vtable = Some(pnp_vt);
 
     dev_init.set_dev_ext_default::<DiskExt>();
-    kernel_api::pnp::DriverStep::complete(DriverStatus::Success)
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
 async fn disk_pnp_remove<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'req, Pnp<'data>>,
-) -> kernel_api::pnp::DriverStep {
-    kernel_api::pnp::DriverStep::Continue
+) -> DriverStep {
+    DriverStep::Continue
 }
 
 #[inline]

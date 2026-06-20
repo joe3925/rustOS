@@ -12,7 +12,7 @@ use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
-use futures::future::FutureExt as FuturesFutureExt;
+use futures::future::FutureExt;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
     Described, FromDevice, IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBuffer, ToDevice,
