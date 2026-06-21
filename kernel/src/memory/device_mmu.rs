@@ -1,4 +1,5 @@
 use crate::structs::range_tracker::RangeTracker;
+use alloc::vec::Vec;
 use alloc::sync::Arc;
 use kernel_types::disk_profile::{
     B_IOMMU_INVALIDATION, C_IOMMU_INVALIDATIONS, C_IOMMU_PAGE_TABLE_UPDATES, C_IOVA_ALLOCATIONS,
@@ -6,6 +7,7 @@ use kernel_types::disk_profile::{
 };
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaPciDeviceIdentity;
+use spin::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceMmuError {
@@ -143,7 +145,16 @@ pub struct DeviceMmuDomain {
     translation_unit_index: u32,
     capabilities: DeviceMmuCapabilities,
     iova_tracker: RangeTracker,
+    iova_cache: Mutex<Vec<CachedIovaRange>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedIovaRange {
+    base: u64,
+    size: u64,
+}
+
+const MAX_CACHED_IOVA_RANGES: usize = 64;
 
 impl DeviceMmuDomain {
     pub fn new(info: DeviceMmuDomainInfo) -> DeviceMmuResult<Self> {
@@ -163,6 +174,7 @@ impl DeviceMmuDomain {
                 info.iova_end,
                 granularity,
             ),
+            iova_cache: Mutex::new(Vec::new()),
         })
     }
 
@@ -188,7 +200,15 @@ impl DeviceMmuDomain {
 
     #[inline]
     pub fn alloc_iova(&self, size: u64) -> Option<u64> {
-        let result = self.iova_tracker.alloc_auto(size).map(|addr| addr.as_u64());
+        let result = {
+            let mut cache = self.iova_cache.lock();
+            cache
+                .iter()
+                .position(|range| range.size == size)
+                .map(|index| cache.swap_remove(index).base)
+        }
+        .or_else(|| self.iova_tracker.alloc_auto(size).map(|addr| addr.as_u64()));
+
         if result.is_some() {
             crate::disk_profile::add_counter(C_IOVA_ALLOCATIONS, 1);
         }
@@ -197,6 +217,13 @@ impl DeviceMmuDomain {
 
     #[inline]
     pub fn free_iova(&self, base: u64, size: u64) {
+        let mut cache = self.iova_cache.lock();
+        if cache.len() < MAX_CACHED_IOVA_RANGES {
+            cache.push(CachedIovaRange { base, size });
+            return;
+        }
+        drop(cache);
+
         crate::disk_profile::add_counter(C_IOVA_FREES, 1);
         self.iova_tracker.dealloc(base, size);
     }

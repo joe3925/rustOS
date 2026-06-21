@@ -1,7 +1,7 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
@@ -45,6 +45,10 @@ pub struct QueueState {
     pub use_indirect: bool,
     /// Per-descriptor-head completion slots, sized to the virtqueue depth.
     pub completion_slots: CompletionTable,
+    /// Device-owned used-ring index. The DMA ring outlives the queue state.
+    pub used_idx: *const AtomicU16,
+    /// Last used-ring index fully drained under the queue write lock.
+    pub last_drained_used_idx: AtomicU16,
 }
 
 unsafe impl Send for QueueState {}
@@ -54,6 +58,12 @@ impl QueueState {
     #[inline]
     pub fn vq_ref(&self) -> RwLockReadGuard<'_, Virtqueue> {
         self.queue.read()
+    }
+
+    #[inline]
+    pub fn has_pending_used(&self) -> bool {
+        let used_idx = unsafe { (*self.used_idx).load(Ordering::Acquire) };
+        used_idx != self.last_drained_used_idx.load(Ordering::Acquire)
     }
 }
 

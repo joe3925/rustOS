@@ -7,7 +7,6 @@ use crate::memory::device_mmu::DeviceMmuError;
 use crate::memory::device_mmu::DeviceMmuMapPermissions;
 use crate::memory::device_mmu::DeviceMmuSystem;
 use crate::memory::device_mmu::MappingRecord;
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
@@ -849,7 +848,8 @@ impl DmaManager {
                 .unwrap_or(u32::MAX),
             active_mappings: state
                 .pending_unmaps
-                .values()
+                .iter()
+                .filter_map(|slot| slot.as_ref())
                 .filter(|pending| pending.device_key == key)
                 .count() as u32,
             reserved1: 0,
@@ -880,7 +880,8 @@ impl DmaManager {
 
                 if state
                     .pending_unmaps
-                    .values()
+                    .iter()
+                    .filter_map(|slot| slot.as_ref())
                     .any(|pending| pending.device_key == key)
                 {
                     return DriverStatus::InvalidParameter;
@@ -971,33 +972,60 @@ impl DmaManager {
 
     fn alloc_cookie(&self) -> u64 {
         let mut state = self.state.lock();
-        let cookie = state.next_cookie;
-        state.next_cookie = state.next_cookie.wrapping_add(1);
-        cookie
+        state.alloc_cookie()
     }
 
     fn insert_pending_unmap(&self, cookie: u64, pending: PendingUnmap) {
-        self.state.lock().pending_unmaps.insert(cookie, pending);
+        self.state.lock().insert_pending_unmap(cookie, pending);
     }
 
     fn remove_pending_unmap(&self, cookie: u64) -> Option<PendingUnmap> {
-        self.state.lock().pending_unmaps.remove(&cookie)
+        self.state.lock().remove_pending_unmap(cookie)
     }
 }
 
 struct DmaManagerState {
-    devices: BTreeMap<usize, Arc<RegisteredDmaDevice>>,
-    pending_unmaps: BTreeMap<u64, PendingUnmap>,
-    next_cookie: u64,
+    devices: alloc::collections::BTreeMap<usize, Arc<RegisteredDmaDevice>>,
+    pending_unmaps: Vec<Option<PendingUnmap>>,
+    free_cookies: Vec<u64>,
 }
 
 impl DmaManagerState {
     fn new() -> Self {
         Self {
-            devices: BTreeMap::new(),
-            pending_unmaps: BTreeMap::new(),
-            next_cookie: 1,
+            devices: alloc::collections::BTreeMap::new(),
+            pending_unmaps: Vec::new(),
+            free_cookies: Vec::new(),
         }
+    }
+
+    fn alloc_cookie(&mut self) -> u64 {
+        if let Some(cookie) = self.free_cookies.pop() {
+            return cookie;
+        }
+
+        let index = self.pending_unmaps.len();
+        self.pending_unmaps.push(None);
+        (index as u64).saturating_add(1)
+    }
+
+    fn insert_pending_unmap(&mut self, cookie: u64, pending: PendingUnmap) {
+        let Some(index) = cookie.checked_sub(1).and_then(|v| usize::try_from(v).ok()) else {
+            return;
+        };
+
+        if let Some(slot) = self.pending_unmaps.get_mut(index) {
+            *slot = Some(pending);
+        }
+    }
+
+    fn remove_pending_unmap(&mut self, cookie: u64) -> Option<PendingUnmap> {
+        let index = cookie.checked_sub(1).and_then(|v| usize::try_from(v).ok())?;
+        let pending = self.pending_unmaps.get_mut(index)?.take();
+        if pending.is_some() {
+            self.free_cookies.push(cookie);
+        }
+        pending
     }
 }
 

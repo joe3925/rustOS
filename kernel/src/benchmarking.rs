@@ -3564,8 +3564,8 @@ fn print_disk_profile_snapshots(profiles: &[kernel_types::disk_profile::DiskProf
     println!();
 
     for snap in profiles {
-        let logical_writes = snap.counters[kernel_types::disk_profile::C_LOGICAL_FILE_WRITES]
-            .max(1);
+        let logical_writes =
+            snap.counters[kernel_types::disk_profile::C_LOGICAL_FILE_WRITES].max(1);
         print!("{:>8}K", snap.active_size / 1024);
         for value in snap.buckets_ns {
             print!(" {:>28}", value / logical_writes);

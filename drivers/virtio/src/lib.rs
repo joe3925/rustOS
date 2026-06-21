@@ -20,7 +20,7 @@ use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
@@ -617,6 +617,8 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
             }
         };
 
+        let used_idx = vq.used_idx_ptr();
+
         queue_states.push(QueueState {
             queue: RwLock::new(vq),
             arena,
@@ -628,6 +630,8 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
             submitting_tasks: AtomicU32::new(0),
             use_indirect: init_result.indirect_desc_supported,
             completion_slots,
+            used_idx,
+            last_drained_used_idx: AtomicU16::new(0),
         });
     }
 
@@ -865,6 +869,10 @@ impl<'a> Drop for SubmitTasksGuard<'a> {
 }
 
 pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
+    if likely(!qs.has_pending_used()) {
+        return 0;
+    }
+
     let mut drained = 0usize;
     dp::add_counter(C_LOCK_ACQUISITIONS, 1);
     let profile_start = dp::timestamp_ns();
@@ -886,6 +894,8 @@ pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
         }
         drained += 1;
     }
+    qs.last_drained_used_idx
+        .store(vq.last_used_idx(), Ordering::Release);
     if drained != 0 {
         dp::add_counter(C_VIRTIO_COMPLETIONS, drained as u64);
         dp::add_elapsed(B_INTERRUPT_COMPLETION_HANDLING, profile_start);
