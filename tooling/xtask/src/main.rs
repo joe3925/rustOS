@@ -70,6 +70,7 @@ struct QemuOptions {
     detach: bool,
     no_build: bool,
     dry_run: bool,
+    console_serial: bool,
     gdb_port: u16,
 }
 
@@ -109,6 +110,7 @@ impl Cli {
                     detach: false,
                     no_build: false,
                     dry_run: false,
+                    console_serial: false,
                     gdb_port: DEFAULT_GDB_PORT,
                 };
 
@@ -119,6 +121,7 @@ impl Cli {
                         "--detach" => options.detach = true,
                         "--no-build" => options.no_build = true,
                         "--dry-run" => options.dry_run = true,
+                        "--console-serial" => options.console_serial = true,
                         "--gdb-port" => {
                             let port = args
                                 .next()
@@ -132,6 +135,10 @@ impl Cli {
                             return Err(format!("unknown qemu argument `{other}`\n\n{}", usage()))
                         }
                     }
+                }
+
+                if options.detach && options.console_serial {
+                    return Err("--console-serial cannot be used with --detach".to_string());
                 }
 
                 Ok(Self {
@@ -170,7 +177,7 @@ fn usage() -> String {
         "  cargo run -p xtask",
         "  cargo run -p xtask -- --release",
         "  cargo run -p xtask -- build [--drivers] [--release]",
-        "  cargo run -p xtask -- qemu [--debug] [--detach] [--no-build] [--dry-run] [--release] [--gdb-port PORT]",
+        "  cargo run -p xtask -- qemu [--debug] [--detach] [--console-serial] [--no-build] [--dry-run] [--release] [--gdb-port PORT]",
         "",
         "environment:",
         "  RUSTOS_QEMU       path to the active platform QEMU executable",
@@ -182,11 +189,16 @@ fn usage() -> String {
         "  RUSTOS_QEMU_ACCEL QEMU accelerator, overrides the default",
         "  RUSTOS_QEMU_MEMORY QEMU memory size, defaults to 8G",
         "  RUSTOS_QEMU_SMP   QEMU CPU count",
+        "  RUSTOS_QEMU_SERIAL QEMU serial backend used unless --console-serial is passed",
     ]
     .join("\n")
 }
 
 fn run_qemu(root: &Path, options: QemuOptions) -> Result<(), String> {
+    if options.detach && options.console_serial {
+        return Err("--console-serial cannot be used with --detach".to_string());
+    }
+
     if !options.no_build {
         ensure_kernel_import_library(root)?;
         build_drivers(root, options.release)?;
@@ -293,8 +305,9 @@ fn build_drivers(root: &Path, release: bool) -> Result<(), String> {
 fn ensure_kernel_import_library(root: &Path) -> Result<(), String> {
     let target_dir = root.join("target");
     let kernel_lib = target_dir.join("kernel.lib");
+    let exports_path = root.join("kernel").join("src").join("exports.rs");
 
-    if kernel_lib.is_file() {
+    if kernel_lib.is_file() && !is_source_newer(&exports_path, &kernel_lib)? {
         return Ok(());
     }
 
@@ -324,6 +337,19 @@ fn ensure_kernel_import_library(root: &Path) -> Result<(), String> {
     }
 
     run(command, "generating kernel import library")
+}
+
+fn is_source_newer(source: &Path, artifact: &Path) -> Result<bool, String> {
+    let source_modified = fs::metadata(source)
+        .map_err(|err| format!("failed to stat {}: {err}", source.display()))?
+        .modified()
+        .map_err(|err| format!("failed to read mtime for {}: {err}", source.display()))?;
+    let artifact_modified = fs::metadata(artifact)
+        .map_err(|err| format!("failed to stat {}: {err}", artifact.display()))?
+        .modified()
+        .map_err(|err| format!("failed to read mtime for {}: {err}", artifact.display()))?;
+
+    Ok(source_modified > artifact_modified)
 }
 
 fn generate_kernel_def(root: &Path, def_path: &Path) -> Result<(), String> {
@@ -661,6 +687,11 @@ fn qemu_args(
 ) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| "8G".to_string());
     let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
+    let serial = if options.console_serial {
+        "stdio".to_string()
+    } else {
+        env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "stdio".to_string())
+    };
     let accel = qemu_accel(qemu, options);
     let iommu_device = qemu_iommu_device(&accel);
     let gdb = format!("tcp::{}", options.gdb_port);
@@ -706,6 +737,12 @@ fn qemu_args(
         args.extend(["-drive".into(), firmware_drive.into()]);
     }
 
+    args.extend(["-serial".into(), serial.into()]);
+
+    if options.console_serial {
+        args.extend(["-monitor".into(), "none".into()]);
+    }
+
     args.extend([
         "-vga".into(),
         "std".into(),
@@ -720,6 +757,7 @@ fn qemu_args(
 
     Ok(args)
 }
+
 fn qemu_accel(qemu: &Path, options: &QemuOptions) -> String {
     if let Ok(accel) = env::var("RUSTOS_QEMU_ACCEL") {
         if !accel.is_empty() {
