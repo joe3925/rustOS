@@ -88,6 +88,7 @@ impl BlockDev {
             len,
             no_buffer: false,
             buffer,
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -133,6 +134,7 @@ impl BlockDev {
             no_buffer,
             owner: self.current_owner.load(Ordering::Acquire),
             buffer,
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 

@@ -19,7 +19,7 @@ use embedded_graphics::Drawable;
 use kernel_abi::PixelFormat;
 use kernel_types::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
-const FRAMEBUFFER_CONSOLE: bool = false;
+const FRAMEBUFFER_CONSOLE: bool = true;
 const FONT_HEIGHT: usize = 18;
 const FONT_WIDTH: usize = 9;
 const TAB_SPACES: usize = 4;

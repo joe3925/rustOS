@@ -766,6 +766,7 @@ where
                 no_buffer: false,
                 owner: 0,
                 buffer: io_buf,
+                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             });
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -932,19 +933,22 @@ where
                 }
             }
         } else {
-            let mut read_guards = Vec::with_capacity(run_len);
+            const MAX_BATCH: usize = 8;
+            if unlikely(run_len > MAX_BATCH) {
+                return Err(CacheError::InvalidIoBuffer);
+            }
+            let mut read_guards: [Option<spin::RwLockReadGuard<'_, _>>; MAX_BATCH] = core::array::from_fn(|_| None);
+            let mut segments: [&[u8]; MAX_BATCH] = [&[]; MAX_BATCH];
 
-            for prepared in run {
-                read_guards.push(prepared.page.data.read());
+            for (i, prepared) in run.iter().enumerate() {
+                let guard = prepared.page.data.read();
+                let bytes_ptr = guard.bytes.as_ptr();
+                let bytes_len = guard.bytes.len();
+                read_guards[i] = Some(guard);
+                segments[i] = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len) };
             }
 
-            let mut segments = Vec::with_capacity(run_len);
-
-            for guard in &read_guards {
-                segments.push(&guard.bytes[..]);
-            }
-
-            let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..]) {
+            let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..run_len]) {
                 Ok(io_buf) => io_buf,
                 Err(_) => {
                     cold_path();
@@ -1021,10 +1025,10 @@ where
         }
 
         let max_blocks_per_buffer = self.max_blocks_per_flush_run(max_blocks_per_run);
-        let run_capacity = max_blocks_per_buffer.min(keys.len());
+        let run_capacity = max_blocks_per_buffer.max(keys.len().min(16 * max_blocks_per_buffer));
 
         let mut run_scratch = FlushRunScratchLease::new(&self.flush_scratch);
-        let run = run_scratch.run_mut();
+        let run = run_scratch.run.as_mut().unwrap();
 
         run.clear();
         if run.capacity() < run_capacity {
@@ -1033,20 +1037,34 @@ where
 
         let mut writebacks = 0usize;
         let mut result = Ok(());
+        let mut num_runs = 0;
+        let mut blocks_in_current_run = 0;
 
         for lba in keys {
-            let contiguous = run
+            let mut contiguous = run
                 .last()
                 .map(|last| last.lba.checked_add(1) == Some(*lba))
                 .unwrap_or(true);
 
-            if !contiguous || run.len() >= max_blocks_per_buffer {
-                match Self::flush_prepared_run(
+            if contiguous && blocks_in_current_run >= max_blocks_per_buffer {
+                contiguous = false;
+            }
+
+            let mut needs_flush = false;
+            if !run.is_empty() && !contiguous {
+                if num_runs >= 16 {
+                    needs_flush = true;
+                }
+            }
+
+            if needs_flush || run.len() >= run_capacity {
+                match Self::flush_prepared_runs_chained(
                     &self.backend,
                     &self.stats,
                     &self.dirty_pages,
                     &self.writeback_notifier,
                     run.as_slice(),
+                    run_scratch.writes.as_mut().unwrap(),
                 )
                 .await
                 {
@@ -1059,6 +1077,9 @@ where
                 }
 
                 run.clear();
+                num_runs = 0;
+                blocks_in_current_run = 0;
+                contiguous = false; // Reset contiguous state
             }
 
             if result.is_err() {
@@ -1067,65 +1088,28 @@ where
             }
 
             let Some(page) = self.page_for_flush_key(*lba, filter) else {
-                cold_path();
-
-                if !run.is_empty() {
-                    match Self::flush_prepared_run(
-                        &self.backend,
-                        &self.stats,
-                        &self.dirty_pages,
-                        &self.writeback_notifier,
-                        run.as_slice(),
-                    )
-                    .await
-                    {
-                        Ok(flushed) => writebacks += flushed,
-                        Err(err) => {
-                            cold_path();
-                            result = Err(err);
-                            break;
-                        }
-                    }
-
-                    run.clear();
-                }
-
                 continue;
             };
 
             if let Some(prepared) = Self::prepare_flush_page(&self.stats, *lba, page) {
                 run.push(prepared);
-            } else if !run.is_empty() {
-                cold_path();
-
-                match Self::flush_prepared_run(
-                    &self.backend,
-                    &self.stats,
-                    &self.dirty_pages,
-                    &self.writeback_notifier,
-                    run.as_slice(),
-                )
-                .await
-                {
-                    Ok(flushed) => writebacks += flushed,
-                    Err(err) => {
-                        cold_path();
-                        result = Err(err);
-                        break;
-                    }
+                if run.len() == 1 || !contiguous {
+                    num_runs += 1;
+                    blocks_in_current_run = 1;
+                } else {
+                    blocks_in_current_run += 1;
                 }
-
-                run.clear();
             }
         }
 
         if result.is_ok() && !run.is_empty() {
-            match Self::flush_prepared_run(
+            match Self::flush_prepared_runs_chained(
                 &self.backend,
                 &self.stats,
                 &self.dirty_pages,
                 &self.writeback_notifier,
                 run.as_slice(),
+                run_scratch.writes.as_mut().unwrap(),
             )
             .await
             {
@@ -1142,6 +1126,125 @@ where
         result.map(|()| writebacks)
     }
 
+    async fn flush_prepared_runs_chained(
+        backend: &Arc<B>,
+        stats: &Arc<StatsInner>,
+        dirty_pages: &Arc<AtomicUsize>,
+        writeback_notifier: &WritebackNotifier,
+        pages: &[PreparedFlushPage<BLOCK_SIZE>],
+        writes: &mut alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; 8]>,
+    ) -> Result<usize, CacheError<B::Error>> {
+        if pages.is_empty() {
+            return Ok(0);
+        }
+
+        const MAX_BATCH: usize = 8;
+        let mut total_flushed = 0;
+
+        for chunk in pages.chunks(MAX_BATCH) {
+            let mut read_guards: [Option<spin::RwLockReadGuard<'_, _>>; MAX_BATCH] =
+                core::array::from_fn(|_| None);
+            let mut segments: [&[u8]; MAX_BATCH] = [&[]; MAX_BATCH];
+
+            for (i, p) in chunk.iter().enumerate() {
+                let guard = p.page.data.read();
+                let bytes_ptr = guard.bytes.as_ptr();
+                let bytes_len = guard.bytes.len();
+                read_guards[i] = Some(guard);
+                segments[i] = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len) };
+            }
+
+            let max_blocks = Self::max_blocks_per_dma_request();
+            writes.fill_with(|| None);
+            let mut req_handle = None;
+            let mut prev_write_ptr: *mut kernel_api::request::Write<'_> = core::ptr::null_mut();
+
+            let mut start_idx = 0;
+            let mut write_idx = 0;
+
+            for i in 1..=chunk.len() {
+                if i == chunk.len() || chunk[i].lba != chunk[i - 1].lba + 1 || (i - start_idx) >= max_blocks {
+                    let run_len = i - start_idx;
+                    let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(
+                        &segments[start_idx..i],
+                    ) {
+                        Ok(buf) => buf,
+                        Err(_) => {
+                            Self::finish_prepared_flush_pages(
+                                stats,
+                                dirty_pages,
+                                writeback_notifier,
+                                chunk,
+                                false,
+                            );
+                            return Err(CacheError::InvalidIoBuffer);
+                        }
+                    };
+
+                    let io_buf_static = unsafe { core::mem::transmute(io_buf) };
+
+                    let write = kernel_api::request::Write {
+                        offset: chunk[start_idx].lba * BLOCK_SIZE as u64,
+                        len: run_len * BLOCK_SIZE,
+                        no_buffer: false,
+                        owner: 0,
+                        buffer: io_buf_static,
+                        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    };
+
+                    if write_idx == 0 {
+                        req_handle = Some(kernel_api::request::RequestHandle::new(write));
+                        prev_write_ptr = &mut req_handle.as_mut().unwrap().write().body as *mut _;
+                    } else {
+                        writes[write_idx] = Some(write);
+                        let curr_ptr = writes[write_idx].as_mut().unwrap() as *mut _;
+                        unsafe { &*prev_write_ptr }
+                            .next
+                            .store(curr_ptr, core::sync::atomic::Ordering::Release);
+                        prev_write_ptr = curr_ptr;
+                    }
+
+                    start_idx = i;
+                    write_idx += 1;
+                }
+            }
+
+            let mut req = req_handle.unwrap();
+            req.set_traversal_policy(kernel_api::request::TraversalPolicy::ForwardLower);
+
+            let status = backend.write_request(&mut req).await;
+
+            match status {
+                Ok(()) => {
+                    stats
+                        .backend_writes
+                        .fetch_add(chunk.len() as u64, core::sync::atomic::Ordering::Relaxed);
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        chunk,
+                        true,
+                    );
+                    total_flushed += chunk.len();
+                }
+                Err(err) => {
+                    cold_path();
+                    Self::finish_prepared_flush_pages(
+                        stats,
+                        dirty_pages,
+                        writeback_notifier,
+                        chunk,
+                        false,
+                    );
+                    return Err(CacheError::Backend(err));
+                }
+            }
+        }
+
+        Ok(total_flushed)
+    }
+
     fn max_blocks_per_flush_run(&self, max_blocks_per_run: usize) -> usize {
         max_blocks_per_run
             .max(1)
@@ -1152,8 +1255,9 @@ where
     fn max_blocks_per_dma_request() -> usize {
         let dma_page_size = dma_base_page_size().max(1);
         let segments_per_block = BLOCK_SIZE.div_ceil(dma_page_size).max(1);
+        let max_segments_per_block_unaligned = segments_per_block + 1;
         IOBUFFER_MAX_DMA_SEGMENT_CAPACITY
-            .checked_div(segments_per_block)
+            .checked_div(max_segments_per_block_unaligned)
             .unwrap_or(0)
             .max(1)
     }

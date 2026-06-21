@@ -290,6 +290,7 @@ async fn read_from_lower_async(
         len,
         no_buffer: false,
         buffer: io_buf,
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 

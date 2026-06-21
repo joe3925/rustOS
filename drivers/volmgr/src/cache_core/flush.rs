@@ -40,6 +40,7 @@ impl FlushFilter<'_> {
 pub(super) struct FlushScratch<const BLOCK_SIZE: usize> {
     pub(super) keys: Vec<u64>,
     pub(super) run: Vec<PreparedFlushPage<BLOCK_SIZE>>,
+    pub(super) writes: Option<alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; 8]>>,
 }
 
 impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
@@ -51,6 +52,7 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
         Self {
             keys: Vec::with_capacity(scratch_key_capacity),
             run: Vec::with_capacity(run_capacity),
+            writes: Some(alloc::boxed::Box::new(core::array::from_fn(|_| None))),
         }
     }
 
@@ -61,20 +63,25 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
 }
 
 pub(super) struct FlushRunScratchLease<'a, const BLOCK_SIZE: usize> {
-    scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
-    run: Option<Vec<PreparedFlushPage<BLOCK_SIZE>>>,
+    pub(super) scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
+    pub(super) run: Option<Vec<PreparedFlushPage<BLOCK_SIZE>>>,
+    pub(super) writes: Option<alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; 8]>>,
 }
 
 impl<'a, const BLOCK_SIZE: usize> FlushRunScratchLease<'a, BLOCK_SIZE> {
     pub(super) fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>) -> Self {
-        let run = {
+        let (run, writes) = {
             let mut scratch = scratch.lock();
-            core::mem::take(&mut scratch.run)
+            (
+                core::mem::take(&mut scratch.run),
+                scratch.writes.take().unwrap_or_else(|| alloc::boxed::Box::new(core::array::from_fn(|_| None)))
+            )
         };
 
         Self {
             scratch,
             run: Some(run),
+            writes: Some(writes),
         }
     }
 
@@ -87,6 +94,7 @@ impl<'a, const BLOCK_SIZE: usize> FlushRunScratchLease<'a, BLOCK_SIZE> {
 
 impl<const BLOCK_SIZE: usize> Drop for FlushRunScratchLease<'_, BLOCK_SIZE> {
     fn drop(&mut self) {
+        let writes = self.writes.take();
         let Some(mut run) = self.run.take() else {
             return;
         };
@@ -96,6 +104,9 @@ impl<const BLOCK_SIZE: usize> Drop for FlushRunScratchLease<'_, BLOCK_SIZE> {
         let mut scratch = self.scratch.lock();
         if scratch.run.capacity() < run.capacity() {
             scratch.run = run;
+        }
+        if writes.is_some() && scratch.writes.is_none() {
+            scratch.writes = writes;
         }
     }
 }
@@ -110,5 +121,3 @@ pub(crate) struct FlushJobHandle<E> {
     pub(super) future: Shared<FfiFuture<()>>,
     pub(super) result: Arc<Mutex<Option<Result<(), CacheError<E>>>>>,
 }
-
-// pooled page vectors removed; streaming batching used instead.

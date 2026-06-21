@@ -514,6 +514,7 @@ async fn bench_read_via_request(
             len,
             no_buffer: false,
             buffer: io_buf,
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 

@@ -1,19 +1,5 @@
-use alloc::sync::Arc;
-use core::hint::{cold_path, unlikely};
-use kernel_api::benchmark::{
-    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
-    BenchSweepResult,
-};
-use kernel_api::device::DeviceObject;
-use kernel_api::disk_profile as dp;
-use kernel_api::kernel_types::dma::{FromDevice, IoBufferDmaSegment, ToDevice};
-use kernel_api::kernel_types::disk_profile::{C_FLUSH_BARRIER_REQUESTS, C_LOCK_ACQUISITIONS};
-use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
-use kernel_api::pnp::DriverStep;
-use kernel_api::request::{DeviceControl, Flush, Read, RequestHandle, Write};
-use kernel_api::request_handler;
-use kernel_api::status::DriverStatus;
-
+use crate::B_VIRTIO_QUEUE_NOTIFY;
+use crate::C_VIRTIO_QUEUE_KICKS;
 use crate::blk::{SubmitRequestError, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 use crate::dev_ext::{ChildExt, DevExt, DevExtInner, QueueState};
 use crate::temp_benchmark::{
@@ -25,6 +11,21 @@ use crate::{
     complete_req, drain_queue_completions, map_request_buffer, virtio_device_error,
     wait_completion_hybrid,
 };
+use alloc::sync::Arc;
+use core::hint::{cold_path, unlikely};
+use kernel_api::benchmark::{
+    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
+    BenchSweepResult,
+};
+use kernel_api::device::DeviceObject;
+use kernel_api::disk_profile as dp;
+use kernel_api::kernel_types::disk_profile::{C_FLUSH_BARRIER_REQUESTS, C_LOCK_ACQUISITIONS};
+use kernel_api::kernel_types::dma::{FromDevice, IoBufferDmaSegment, ToDevice};
+use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
+use kernel_api::pnp::DriverStep;
+use kernel_api::request::{DeviceControl, Flush, Read, RequestHandle, Write};
+use kernel_api::request_handler;
+use kernel_api::status::DriverStatus;
 
 pub(crate) struct VirtioPdoIo;
 
@@ -234,23 +235,59 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let status = 'transfer: {
-        let buffer = &req.read().body.buffer;
+    const MAX_CHAIN: usize = 8;
+    let mut completions: [Option<crate::completion::CompletionToken<'_>>; MAX_CHAIN] =
+        core::array::from_fn(|_| None);
+    let mut mapped_buffers: [Option<_>; MAX_CHAIN] = core::array::from_fn(|_| None);
+    let mut count = 0;
+    let mut current_ptr: *const Read = &req.read().body as *const _;
+
+    qs.submitting_tasks
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let mut force_notify = false;
+    let mut status = DriverStatus::Success;
+
+    'transfer: while !current_ptr.is_null() {
+        if unlikely(count >= MAX_CHAIN) {
+            cold_path();
+            status = DriverStatus::InvalidParameter;
+            break 'transfer;
+        }
+
+        let current = unsafe { &*current_ptr };
+        let offset = current.offset;
+        let len = current.len;
+
+        if unlikely(len == 0) {
+            current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+            continue;
+        }
+        if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
+            cold_path();
+            status = DriverStatus::InvalidParameter;
+            break 'transfer;
+        }
+
+        let sector = offset >> 9;
+        let buffer = &current.buffer;
         if unlikely(buffer.len() < len) {
             cold_path();
-            break 'transfer DriverStatus::InvalidParameter;
+            status = DriverStatus::InvalidParameter;
+            break 'transfer;
         }
+
         let mapped_buffer = match map_request_buffer::<FromDevice>(&parent, buffer) {
             Ok(b) => b,
-            Err(status) => {
+            Err(st) => {
                 cold_path();
-                break 'transfer status;
+                status = st;
+                break 'transfer;
             }
         };
 
         let completion = loop {
             let completion = match qs.completion_slots.alloc() {
-                Some(completion) => completion,
+                Some(c) => c,
                 None => {
                     cold_path();
                     let drained = drain_queue_completions(qs);
@@ -282,24 +319,24 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                     Ok(h) => {
                         qs.completion_slots
                             .attach(h, completion.as_ref().expect("completion missing"));
-                        let queue_full = vq.num_free == 0;
-                        let _submit_guard = SubmitTasksGuard::new(
-                            &qs.submitting_tasks,
-                            &vq,
-                            inner.notify_base,
-                            inner.notify_off_multiplier,
-                            queue_full,
-                        );
+                        if vq.num_free == 0 {
+                            force_notify = true;
+                        }
                         true
                     }
                     Err(SubmitRequestError::QueueFull) => {
                         cold_path();
+                        force_notify = true;
+                        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+                        let profile_start = dp::timestamp_ns();
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
                         false
                     }
                     Err(SubmitRequestError::TooManyDataSegments) => {
                         cold_path();
-                        break 'transfer too_many_dma_segments_status("read");
+                        status = too_many_dma_segments_status("read");
+                        break 'transfer;
                     }
                 }
             };
@@ -321,18 +358,52 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
             .await;
         };
 
-        match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
-            Ok(device_status) => blk_status_to_driver_status("read", device_status),
-            Err(_) => {
-                cold_path();
-                virtio_device_error(
-                    "virtio-blk: read failed: completion canceled before device status",
-                )
+        mapped_buffers[count] = Some(mapped_buffer);
+        completions[count] = Some(completion);
+        count += 1;
+        current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+    }
+
+    if qs
+        .submitting_tasks
+        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
+        == 1
+        || force_notify
+    {
+        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+        let profile_start = dp::timestamp_ns();
+        dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+        let mut vq = qs.queue.write();
+        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+    }
+
+    let mut final_status = status;
+
+    for i in 0..count {
+        if let Some(completion) = completions[i].take() {
+            match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
+                Ok(device_status) => {
+                    let st = blk_status_to_driver_status("read", device_status);
+                    if st != DriverStatus::Success && final_status == DriverStatus::Success {
+                        final_status = st;
+                    }
+                }
+                Err(_) => {
+                    cold_path();
+                    let st = virtio_device_error(
+                        "virtio-blk: read failed: completion canceled before device status",
+                    );
+                    if final_status == DriverStatus::Success {
+                        final_status = st;
+                    }
+                }
             }
         }
-    };
+        let _ = mapped_buffers[i].take(); // Drop mapping to unmap and copy bounce buffers back
+    }
 
-    complete_req(req, status)
+    complete_req(req, final_status)
 }
 #[inline(always)]
 pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
@@ -366,23 +437,59 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let status = 'transfer: {
-        let buffer = &req.read().body.buffer;
+    const MAX_CHAIN: usize = 8;
+    let mut completions: [Option<crate::completion::CompletionToken<'_>>; MAX_CHAIN] =
+        core::array::from_fn(|_| None);
+    let mut mapped_buffers: [Option<_>; MAX_CHAIN] = core::array::from_fn(|_| None);
+    let mut count = 0;
+    let mut current_ptr: *const Write = &req.read().body as *const _;
+
+    qs.submitting_tasks
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let mut force_notify = false;
+    let mut status = DriverStatus::Success;
+
+    'transfer: while !current_ptr.is_null() {
+        if unlikely(count >= MAX_CHAIN) {
+            cold_path();
+            status = DriverStatus::InvalidParameter;
+            break 'transfer;
+        }
+
+        let current = unsafe { &*current_ptr };
+        let offset = current.offset;
+        let len = current.len;
+
+        if unlikely(len == 0) {
+            current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+            continue;
+        }
+        if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
+            cold_path();
+            status = DriverStatus::InvalidParameter;
+            break 'transfer;
+        }
+
+        let sector = offset >> 9;
+        let buffer = &current.buffer;
         if unlikely(buffer.len() < len) {
             cold_path();
-            break 'transfer DriverStatus::InvalidParameter;
+            status = DriverStatus::InvalidParameter;
+            break 'transfer;
         }
+
         let mapped_buffer = match map_request_buffer::<ToDevice>(&parent, buffer) {
             Ok(b) => b,
-            Err(status) => {
+            Err(st) => {
                 cold_path();
-                break 'transfer status;
+                status = st;
+                break 'transfer;
             }
         };
 
         let completion = loop {
             let completion = match qs.completion_slots.alloc() {
-                Some(completion) => completion,
+                Some(c) => c,
                 None => {
                     cold_path();
                     let drained = drain_queue_completions(qs);
@@ -414,24 +521,24 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                     Ok(h) => {
                         qs.completion_slots
                             .attach(h, completion.as_ref().expect("completion missing"));
-                        let queue_full = vq.num_free == 0;
-                        let _submit_guard = SubmitTasksGuard::new(
-                            &qs.submitting_tasks,
-                            &vq,
-                            inner.notify_base,
-                            inner.notify_off_multiplier,
-                            queue_full,
-                        );
+                        if vq.num_free == 0 {
+                            force_notify = true;
+                        }
                         true
                     }
                     Err(SubmitRequestError::QueueFull) => {
                         cold_path();
+                        force_notify = true;
+                        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+                        let profile_start = dp::timestamp_ns();
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
                         false
                     }
                     Err(SubmitRequestError::TooManyDataSegments) => {
                         cold_path();
-                        break 'transfer too_many_dma_segments_status("write");
+                        status = too_many_dma_segments_status("write");
+                        break 'transfer;
                     }
                 }
             };
@@ -453,18 +560,52 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
             .await;
         };
 
-        match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
-            Ok(device_status) => blk_status_to_driver_status("write", device_status),
-            Err(_) => {
-                cold_path();
-                virtio_device_error(
-                    "virtio-blk: write failed: completion canceled before device status",
-                )
+        mapped_buffers[count] = Some(mapped_buffer);
+        completions[count] = Some(completion);
+        count += 1;
+        current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+    }
+
+    if qs
+        .submitting_tasks
+        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
+        == 1
+        || force_notify
+    {
+        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+        let profile_start = dp::timestamp_ns();
+        dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+        let mut vq = qs.queue.write();
+        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+    }
+
+    let mut final_status = status;
+
+    for i in 0..count {
+        if let Some(completion) = completions[i].take() {
+            match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
+                Ok(device_status) => {
+                    let st = blk_status_to_driver_status("write", device_status);
+                    if st != DriverStatus::Success && final_status == DriverStatus::Success {
+                        final_status = st;
+                    }
+                }
+                Err(_) => {
+                    cold_path();
+                    let st = virtio_device_error(
+                        "virtio-blk: write failed: completion canceled before device status",
+                    );
+                    if final_status == DriverStatus::Success {
+                        final_status = st;
+                    }
+                }
             }
         }
-    };
+        let _ = mapped_buffers[i].take(); // Drop mapping to unmap and copy bounce buffers back
+    }
 
-    complete_req(req, status)
+    complete_req(req, final_status)
 }
 #[inline(always)]
 pub(crate) async fn virtio_pdo_flush_impl<'req, 'b>(

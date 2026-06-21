@@ -32,6 +32,7 @@ impl<const BLOCK_SIZE: usize> RequestPool<BLOCK_SIZE> {
             no_buffer: false,
             owner: 0,
             buffer: IoBuffer::<Described, ToDevice>::from_slice(&[]),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         })
     }
 

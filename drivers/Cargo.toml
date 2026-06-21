@@ -19,7 +19,7 @@ resolver = "2"
 [workspace.dependencies]
 kernel_api = { path = "../libs/kernel_api", default-features = false, features = [
     "async-ffi-slab",
-    "async-ffi-slab-slots-256",
+    "async-ffi-slab-slots-16",
     "async-ffi-slab-slot-bytes-8k",
 ] }
 

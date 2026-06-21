@@ -194,6 +194,7 @@ impl VolumeCacheBackend for CacheBackend {
                 len: total_len,
                 no_buffer: false,
                 buffer,
+                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             });
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -311,6 +312,7 @@ impl VolumeCacheBackend for CacheBackend {
                 no_buffer: false,
                 owner: 0,
                 buffer,
+                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             });
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -452,6 +454,7 @@ async fn forward_no_buffer_read(target: IoTarget, offset: u64, dst: &mut [u8]) -
         len,
         no_buffer: true,
         buffer: io_buf,
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     pnp_send_request(target, &mut req).await
@@ -471,6 +474,7 @@ async fn forward_no_buffer_write(
         no_buffer: true,
         owner,
         buffer: io_buf,
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     pnp_send_request(target, &mut req).await

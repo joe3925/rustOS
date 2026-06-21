@@ -134,6 +134,7 @@ fn device_ops_registers_typed_handlers() {
         len: 4,
         no_buffer: false,
         buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut buffer),
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     assert_eq!(handle.read().body.offset, 0);
     assert_eq!(handle.read().body.len, 4);

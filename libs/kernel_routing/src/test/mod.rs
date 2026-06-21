@@ -193,6 +193,7 @@ fn read_request_invokes_matching_io_handler_and_updates_buffer() {
         len: 12,
         no_buffer: false,
         buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut out),
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
 
     let status = block_on_ready(send_request(dev, &mut handle));
@@ -211,6 +212,7 @@ fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
         no_buffer: false,
         owner: 0,
         buffer: IoBuffer::<Described, ToDevice>::from_slice(&input[..1]),
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
 
     assert_eq!(
@@ -229,6 +231,7 @@ fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
         no_buffer: false,
         owner: 0,
         buffer: IoBuffer::<Described, ToDevice>::from_slice(&input),
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -296,6 +299,7 @@ fn continuing_handler_can_forward_to_lower_handler() {
         len: 3,
         no_buffer: false,
         buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut out),
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
