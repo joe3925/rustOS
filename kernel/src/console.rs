@@ -82,6 +82,15 @@ struct QueuedPrintWriter {
     slot: PrintSlot,
 }
 
+struct SerialPrintWriter;
+
+impl fmt::Write for SerialPrintWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        crate::arch::serial_write_bytes(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl QueuedPrintWriter {
     fn new() -> Self {
         Self {
@@ -594,6 +603,8 @@ fn try_flush_print_queue() -> bool {
 }
 
 pub(crate) fn _print(args: fmt::Arguments) {
+    let _ = SerialPrintWriter.write_fmt(args);
+
     if PRINT_QUEUE_FULL_PANIC.load(Ordering::Acquire) {
         let _ = try_flush_print_queue();
         return;

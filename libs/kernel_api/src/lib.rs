@@ -11,6 +11,7 @@ pub use kernel_types;
 pub use acpi;
 pub use kernel_macros::request_handler;
 pub mod benchmark;
+pub mod disk_profile;
 pub mod dma;
 pub mod fs;
 pub mod irq;

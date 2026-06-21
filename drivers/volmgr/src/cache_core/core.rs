@@ -15,7 +15,7 @@ use core::task::{Context, Poll};
 use futures::future::FutureExt;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBuffer, ToDevice,
+    Described, FromDevice, IOBUFFER_MAX_DMA_SEGMENT_CAPACITY, IoBuffer, ToDevice,
 };
 use kernel_api::println;
 use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
@@ -1152,7 +1152,7 @@ where
     fn max_blocks_per_dma_request() -> usize {
         let dma_page_size = dma_base_page_size().max(1);
         let segments_per_block = BLOCK_SIZE.div_ceil(dma_page_size).max(1);
-        IOBUFFER_INLINE_SEGMENT_CAPACITY
+        IOBUFFER_MAX_DMA_SEGMENT_CAPACITY
             .checked_div(segments_per_block)
             .unwrap_or(0)
             .max(1)
@@ -1240,12 +1240,6 @@ where
         filter: &FlushFilter<'_>,
         max_blocks_per_run: usize,
     ) -> Result<(usize, usize), CacheError<B::Error>> {
-        if let FlushFilter::Owner(owner) = filter {
-            return self
-                .flush_owner_streaming_batched(*owner, max_blocks_per_run)
-                .await;
-        }
-
         let mut keys = {
             let mut scratch = self.flush_scratch.lock();
             scratch.reset();

@@ -293,8 +293,9 @@ fn build_drivers(root: &Path, release: bool) -> Result<(), String> {
 fn ensure_kernel_import_library(root: &Path) -> Result<(), String> {
     let target_dir = root.join("target");
     let kernel_lib = target_dir.join("kernel.lib");
+    let exports_path = root.join("kernel").join("src").join("exports.rs");
 
-    if kernel_lib.is_file() {
+    if kernel_lib.is_file() && !is_source_newer(&exports_path, &kernel_lib)? {
         return Ok(());
     }
 
@@ -324,6 +325,19 @@ fn ensure_kernel_import_library(root: &Path) -> Result<(), String> {
     }
 
     run(command, "generating kernel import library")
+}
+
+fn is_source_newer(source: &Path, artifact: &Path) -> Result<bool, String> {
+    let source_modified = fs::metadata(source)
+        .map_err(|err| format!("failed to stat {}: {err}", source.display()))?
+        .modified()
+        .map_err(|err| format!("failed to read mtime for {}: {err}", source.display()))?;
+    let artifact_modified = fs::metadata(artifact)
+        .map_err(|err| format!("failed to stat {}: {err}", artifact.display()))?
+        .modified()
+        .map_err(|err| format!("failed to read mtime for {}: {err}", artifact.display()))?;
+
+    Ok(source_modified > artifact_modified)
 }
 
 fn generate_kernel_def(root: &Path, def_path: &Path) -> Result<(), String> {
@@ -661,6 +675,7 @@ fn qemu_args(
 ) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| "8G".to_string());
     let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
+    let serial = env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "stdio".to_string());
     let accel = qemu_accel(qemu, options);
     let iommu_device = qemu_iommu_device(&accel);
     let gdb = format!("tcp::{}", options.gdb_port);
@@ -707,6 +722,8 @@ fn qemu_args(
     }
 
     args.extend([
+        "-serial".into(),
+        serial.into(),
         "-vga".into(),
         "std".into(),
         "-drive".into(),

@@ -14,6 +14,7 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
+use kernel_types::disk_profile::DiskProfileSnapshot;
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
@@ -257,6 +258,12 @@ unsafe extern "C" {
     );
     pub fn bench_kernel_span_begin(tag: BenchTag, object_id: BenchObjectId) -> BenchSpanGuard;
     pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
+    pub fn disk_profile_begin_size(size: u64);
+    pub fn disk_profile_add_counter(id: u32, value: u64);
+    pub fn disk_profile_add_bucket_ns(id: u32, value: u64);
+    pub fn disk_profile_set_enabled(enabled: bool);
+    pub fn disk_profile_timestamp_ns() -> u64;
+    pub fn disk_profile_snapshot(out: &mut DiskProfileSnapshot);
 
     // Async Runtime (global)
     pub fn kernel_spawn_ffi(fut: FfiFuture<()>);

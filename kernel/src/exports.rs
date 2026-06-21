@@ -1,4 +1,5 @@
 use crate::alloc::string::ToString;
+use crate::disk_profile::*;
 use crate::export;
 use crate::function;
 use crate::get_rva;
@@ -125,6 +126,12 @@ export! {
     bench_kernel_window_start,
     bench_kernel_window_destroy,
     bench_kernel_window_create,
+    disk_profile_begin_size,
+    disk_profile_set_enabled,
+    disk_profile_add_counter,
+    disk_profile_add_bucket_ns,
+    disk_profile_timestamp_ns,
+    disk_profile_snapshot,
 
     kernel_platform_cpu_ids,
     kernel_irq_compose_msi_message,

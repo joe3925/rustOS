@@ -5,6 +5,7 @@ pub mod idt;
 pub(crate) mod machine;
 pub mod memory;
 pub mod platform;
+pub(crate) mod serial;
 pub(crate) mod scheduling;
 
 pub mod drivers {

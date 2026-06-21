@@ -51,6 +51,10 @@ use kernel_types::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
+    disk_profile::{
+        B_VIRTUAL_TO_PHYSICAL_TRANSLATION, C_HEAP_ALLOCATIONS, C_PHYSICAL_FRAME_TRANSLATIONS,
+        C_SCHED_WAKEUPS_CONTEXT_SWITCHES,
+    },
     dma::{
         DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
         DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
@@ -83,6 +87,7 @@ pub extern "C" fn get_current_platform_cpu_id() -> usize {
 }
 
 pub extern "C" fn wake_task(id: u64) {
+    crate::disk_profile::add_counter(C_SCHED_WAKEUPS_CONTEXT_SWITCHES, 1);
     if let Some(task) = SCHEDULER.get_task_by_id(id) {
         SCHEDULER.unpark(&task);
     }
@@ -95,6 +100,7 @@ pub extern "C" fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_alloc(layout: Layout) -> *mut u8 {
+    crate::disk_profile::add_counter(C_HEAP_ALLOCATIONS, 1);
     unsafe { GlobalAlloc::alloc(&crate::memory::heap::ALLOCATOR, layout) }
 }
 
@@ -257,10 +263,12 @@ pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
+    crate::arch::serial_write_bytes(str.as_bytes());
     CONSOLE.lock().print(str.as_bytes());
 }
 #[unsafe(no_mangle)]
 pub fn routing_print_impl(s: &str) {
+    crate::arch::serial_write_bytes(s.as_bytes());
     CONSOLE.lock().print(s.as_bytes());
 }
 #[unsafe(no_mangle)]
@@ -901,7 +909,11 @@ pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 
 #[no_mangle]
 pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    crate::memory::paging::resolve_virtual_range_frame(addr)
+    crate::disk_profile::add_counter(C_PHYSICAL_FRAME_TRANSLATIONS, 1);
+    let profile_start = crate::disk_profile::timestamp_ns();
+    let result = crate::memory::paging::resolve_virtual_range_frame(addr);
+    crate::disk_profile::add_elapsed(B_VIRTUAL_TO_PHYSICAL_TRANSLATION, profile_start);
+    result
 }
 
 // ============================================================================

@@ -37,6 +37,10 @@ use crate::{
     util::TOTAL_TIME,
 };
 use kernel_executor::runtime::runtime::spawn_detached;
+use kernel_types::disk_profile::{
+    B_FILE_FLUSH_WRITE_THROUGH, B_FILE_WRITE_ENTRY_TO_CACHE_LOOKUP, C_LOGICAL_FILE_WRITES,
+    C_LOGICAL_WRITE_BYTES,
+};
 
 #[derive(Debug)]
 pub struct File {
@@ -211,9 +215,13 @@ impl File {
     }
 
     pub async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FileStatus> {
+        crate::disk_profile::add_counter(C_LOGICAL_FILE_WRITES, 1);
+        crate::disk_profile::add_counter(C_LOGICAL_WRITE_BYTES, data.len() as u64);
+        let profile_start = crate::disk_profile::timestamp_ns();
         let (wr, st) = file_provider::provider()
             .write_at(self.fs_file_id, offset, data, self.write_through)
             .await;
+        crate::disk_profile::add_elapsed(B_FILE_WRITE_ENTRY_TO_CACHE_LOOKUP, profile_start);
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
@@ -259,9 +267,11 @@ impl File {
     }
 
     pub async fn flush(&self) -> Result<(), FileStatus> {
+        let profile_start = crate::disk_profile::timestamp_ns();
         let (res, st) = file_provider::provider()
             .flush_handle(self.fs_file_id)
             .await;
+        crate::disk_profile::add_elapsed(B_FILE_FLUSH_WRITE_THROUGH, profile_start);
 
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);

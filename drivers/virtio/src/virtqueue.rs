@@ -165,7 +165,7 @@ impl Virtqueue {
         }
     }
     /// Free a descriptor back to the free list.
-    fn free_desc(&mut self, idx: u16) {
+    pub(crate) fn free_desc(&mut self, idx: u16) {
         let desc = self.desc_ptr(idx);
         unsafe {
             (*desc).flags = 0;

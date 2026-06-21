@@ -15,7 +15,7 @@ use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
-use crate::{platform, println, vec};
+use crate::{platform, print, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -3493,6 +3493,87 @@ const DISK_BENCH_SIZES: &[usize] = &[
     // 64 * 1024 * 1024,
 ];
 
+const DISK_PROFILE_COUNTER_NAMES: &[&str] = &[
+    "logical_file_writes",
+    "fs_cache_writes",
+    "backend_block_requests",
+    "virtio_submissions",
+    "virtio_queue_kicks",
+    "virtio_completions",
+    "flush_barrier_requests",
+    "dma_map_calls",
+    "dma_unmap_calls",
+    "iommu_page_table_updates",
+    "iova_allocations",
+    "iova_frees",
+    "physical_frame_translations",
+    "scatter_gather_segments",
+    "bytes_copied",
+    "memcpy_calls",
+    "heap_allocations",
+    "arc_clones",
+    "lock_acquisitions",
+    "sched_wakeups_context_switches",
+    "fat_metadata_writes",
+    "directory_metadata_writes",
+    "logical_write_bytes",
+    "backend_write_bytes",
+    "iommu_invalidations",
+    "virtio_submission_bytes",
+];
+
+const DISK_PROFILE_BUCKET_NAMES: &[&str] = &[
+    "file_entry_cache_lookup",
+    "fat_cluster_translation",
+    "cache_page_lookup",
+    "dirty_page_preparation",
+    "iobuffer_construction",
+    "virtual_to_physical_translation",
+    "dma_map",
+    "iommu_invalidation",
+    "virtio_descriptor_setup",
+    "virtio_queue_notify",
+    "waiting_for_completion",
+    "interrupt_completion_handling",
+    "dma_unmap",
+    "file_flush_write_through",
+    "metadata_flush",
+];
+
+fn print_disk_profile_snapshots(profiles: &[kernel_types::disk_profile::DiskProfileSnapshot]) {
+    println!("\n[disk-profile] counters totals");
+    print!("{:>8}", "size");
+    for name in DISK_PROFILE_COUNTER_NAMES {
+        print!(" {:>28}", name);
+    }
+    println!();
+
+    for snap in profiles {
+        print!("{:>8}K", snap.active_size / 1024);
+        for value in snap.counters {
+            print!(" {:>28}", value);
+        }
+        println!();
+    }
+
+    println!("\n[disk-profile] timing ns per logical write");
+    print!("{:>8}", "size");
+    for name in DISK_PROFILE_BUCKET_NAMES {
+        print!(" {:>28}", name);
+    }
+    println!();
+
+    for snap in profiles {
+        let logical_writes = snap.counters[kernel_types::disk_profile::C_LOGICAL_FILE_WRITES]
+            .max(1);
+        print!("{:>8}K", snap.active_size / 1024);
+        for value in snap.buckets_ns {
+            print!(" {:>28}", value / logical_writes);
+        }
+        println!();
+    }
+}
+
 #[inline(always)]
 fn mib_per_sec(bytes: u64, elapsed_ns: u128) -> f64 {
     if elapsed_ns == 0 {
@@ -3661,6 +3742,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
     let mut sizes = Vec::new();
     let mut write_ns_per_op = Vec::new();
     let mut read_ns_per_op = Vec::new();
+    let mut profile_snapshots = Vec::new();
 
     for &size in DISK_BENCH_SIZES {
         let mut write_bytes = 0u64;
@@ -3671,7 +3753,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         let mut read_ops = 0u64;
         let mut read_ns = 0u128;
 
+        crate::disk_profile::begin_size(size as u64);
+
         for _ in 0..passes {
+            crate::disk_profile::set_enabled(true);
+
             let mut offset = 0u64;
             let mut ops = 0u64;
 
@@ -3708,6 +3794,8 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             write_ops += ops;
             write_ns += disk_bench_elapsed_ns(start_ns);
 
+            crate::disk_profile::set_enabled(false);
+
             let mut offset = 0u64;
             let mut ops = 0u64;
             let mut checksum = 0u64;
@@ -3738,6 +3826,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             read_ops += ops;
             read_ns += disk_bench_elapsed_ns(start_ns);
         }
+
+        crate::disk_profile::set_enabled(false);
+        let mut profile_snapshot = kernel_types::disk_profile::DiskProfileSnapshot::default();
+        crate::disk_profile::snapshot(&mut profile_snapshot);
+        profile_snapshots.push(profile_snapshot);
 
         let wr_ns_op = if write_ops == 0 {
             0
@@ -3777,6 +3870,8 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         write_ns_per_op.push(wr_ns_op);
         read_ns_per_op.push(rd_ns_op);
     }
+
+    print_disk_profile_snapshots(&profile_snapshots);
 
     if let Some((intercept, slope)) = lin_regress_overhead(&sizes, &write_ns_per_op) {
         println!(

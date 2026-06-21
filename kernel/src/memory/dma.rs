@@ -12,6 +12,7 @@ use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use kernel_types::device::DeviceObject;
+use kernel_types::disk_profile::{B_DMA_MAP, B_DMA_UNMAP, C_DMA_MAP_CALLS, C_DMA_UNMAP_CALLS};
 use kernel_types::dma::BorrowedDmaMapping;
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaDeviceHandle;
@@ -143,6 +144,8 @@ pub fn map_buffer_ref<'map, 'buffer>(
     buffer: &'map IoBuffer<'buffer, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
 ) -> Result<BorrowedDmaMapping<'map>, DmaMapError> {
+    crate::disk_profile::add_counter(C_DMA_MAP_CALLS, 1);
+    let profile_start = crate::disk_profile::timestamp_ns();
     let m = manager();
 
     let key = match resolve_hardware_pdo(device) {
@@ -193,6 +196,7 @@ pub fn map_buffer_ref<'map, 'buffer>(
         },
     );
 
+    crate::disk_profile::add_elapsed(B_DMA_MAP, profile_start);
     Ok(mapping)
 }
 
@@ -357,6 +361,8 @@ fn prepare_dma_mapping(
 }
 
 extern "C" fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
+    crate::disk_profile::add_counter(C_DMA_UNMAP_CALLS, 1);
+    let profile_start = crate::disk_profile::timestamp_ns();
     let m = manager();
 
     let Some(pending) = m.remove_pending_unmap(cookie as u64) else {
@@ -366,6 +372,7 @@ extern "C" fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
     for rec in pending.records.as_slice() {
         let _ = m.device_mmu.unmap_record(&pending.domain, *rec);
     }
+    crate::disk_profile::add_elapsed(B_DMA_UNMAP, profile_start);
 }
 
 fn map_device_mmu_error(err: DeviceMmuError) -> DmaMapError {

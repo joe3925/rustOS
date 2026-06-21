@@ -26,6 +26,7 @@ use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::disk_profile as dp;
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
@@ -33,6 +34,10 @@ use kernel_api::irq::{
 };
 use kernel_api::kernel_types::dma::{
     BorrowedDmaMapping, Described, DmaMappingStrategy, IoBuffer, IoBufferDirection, IoBufferState,
+};
+use kernel_api::kernel_types::disk_profile::{
+    B_INTERRUPT_COMPLETION_HANDLING, B_VIRTIO_QUEUE_NOTIFY, B_WAITING_FOR_COMPLETION,
+    C_LOCK_ACQUISITIONS, C_VIRTIO_COMPLETIONS, C_VIRTIO_QUEUE_KICKS,
 };
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
@@ -86,6 +91,7 @@ pub(crate) async fn wait_completion_hybrid<F>(
 where
     F: Future,
 {
+    let profile_start = dp::timestamp_ns();
     let mut completion = core::pin::pin!(completion);
     let timer = KernelStopwatch::start();
     let spin_cycles = duration_to_cycle_counter_ticks(spin_for, timer.cycle_counter_frequency_hz());
@@ -100,6 +106,7 @@ where
         })
         .await
         {
+            dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
             return result;
         }
 
@@ -108,6 +115,7 @@ where
         }
     }
     let res = completion.await;
+    dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
     res
 }
 // Request helpers
@@ -848,13 +856,18 @@ impl<'a> Drop for SubmitTasksGuard<'a> {
     fn drop(&mut self) {
         let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
         if likely(self.force_notify || prev == 1) {
+            dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+            let profile_start = dp::timestamp_ns();
             self.vq.notify(self.notify_base, self.notify_off_multiplier);
+            dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
         }
     }
 }
 
 pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
     let mut drained = 0usize;
+    dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+    let profile_start = dp::timestamp_ns();
     let mut vq = qs.queue.write();
     while let Some((head, _len)) = vq.pop_used() {
         if unlikely(head as usize >= qs.completion_slots.len()) {
@@ -872,6 +885,10 @@ pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
             panic!("virtio: completed descriptor had no waiter");
         }
         drained += 1;
+    }
+    if drained != 0 {
+        dp::add_counter(C_VIRTIO_COMPLETIONS, drained as u64);
+        dp::add_elapsed(B_INTERRUPT_COMPLETION_HANDLING, profile_start);
     }
     drained
 }

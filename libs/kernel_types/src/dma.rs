@@ -58,6 +58,7 @@ pub const IOBUFFER_INLINE_PAGE_CAPACITY: usize = 8;
 pub const IOBUFFER_INLINE_FRAME_CAPACITY: usize = IOBUFFER_INLINE_PAGE_CAPACITY;
 pub const IOBUFFER_INLINE_EXTENT_CAPACITY: usize = 8;
 pub const IOBUFFER_INLINE_SEGMENT_CAPACITY: usize = 32;
+pub const IOBUFFER_MAX_DMA_SEGMENT_CAPACITY: usize = 128;
 
 /// Region described from one or more virtual borrows.
 ///

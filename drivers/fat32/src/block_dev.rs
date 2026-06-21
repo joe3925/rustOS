@@ -5,7 +5,12 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, IoKind, Read, Seek, SeekFrom, Write};
 use kernel_api::{
+    disk_profile as dp,
     kernel_types::{
+        disk_profile::{
+            B_IOBUFFER_CONSTRUCTION, C_ARC_CLONES, C_DIRECTORY_METADATA_WRITES,
+            C_FAT_METADATA_WRITES, C_FS_CACHE_WRITES,
+        },
         dma::{Described, FromDevice, IoBuffer, ToDevice},
         io::IoTarget,
     },
@@ -102,12 +107,26 @@ impl BlockDev {
         &mut self,
         offset: u64,
         src: &[u8],
-        _kind: IoKind,
+        kind: IoKind,
     ) -> Result<(), DriverStatus> {
         let no_buffer = false;
+        dp::add_counter(C_ARC_CLONES, 1);
         let volume = self.volume.clone();
         let len = src.len();
+        match kind {
+            IoKind::Data => {
+                dp::add_counter(C_FS_CACHE_WRITES, 1);
+            }
+            IoKind::Fat => {
+                dp::add_counter(C_FAT_METADATA_WRITES, 1);
+            }
+            IoKind::Metadata => {
+                dp::add_counter(C_DIRECTORY_METADATA_WRITES, 1);
+            }
+        }
+        let profile_start = dp::timestamp_ns();
         let buffer = IoBuffer::<Described, ToDevice>::from_slice(src);
+        dp::add_elapsed(B_IOBUFFER_CONSTRUCTION, profile_start);
         let mut req = RequestHandle::new(WriteRequest {
             offset,
             len,

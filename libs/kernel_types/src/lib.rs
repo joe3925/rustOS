@@ -21,6 +21,7 @@ pub mod bench_archive;
 pub mod benchmark;
 pub mod bounded_mpmc;
 pub mod device;
+pub mod disk_profile;
 pub mod dma;
 pub mod fdt;
 pub mod fixed_slab;

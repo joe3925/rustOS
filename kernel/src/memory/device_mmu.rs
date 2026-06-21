@@ -1,5 +1,9 @@
 use crate::structs::range_tracker::RangeTracker;
 use alloc::sync::Arc;
+use kernel_types::disk_profile::{
+    B_IOMMU_INVALIDATION, C_IOMMU_INVALIDATIONS, C_IOMMU_PAGE_TABLE_UPDATES, C_IOVA_ALLOCATIONS,
+    C_IOVA_FREES,
+};
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaPciDeviceIdentity;
 
@@ -184,11 +188,16 @@ impl DeviceMmuDomain {
 
     #[inline]
     pub fn alloc_iova(&self, size: u64) -> Option<u64> {
-        self.iova_tracker.alloc_auto(size).map(|addr| addr.as_u64())
+        let result = self.iova_tracker.alloc_auto(size).map(|addr| addr.as_u64());
+        if result.is_some() {
+            crate::disk_profile::add_counter(C_IOVA_ALLOCATIONS, 1);
+        }
+        result
     }
 
     #[inline]
     pub fn free_iova(&self, base: u64, size: u64) {
+        crate::disk_profile::add_counter(C_IOVA_FREES, 1);
         self.iova_tracker.dealloc(base, size);
     }
 }
@@ -328,6 +337,7 @@ impl DeviceMmuSystem {
             return Err(DeviceMmuError::InvalidRange);
         }
 
+        crate::disk_profile::add_counter(C_IOMMU_PAGE_TABLE_UPDATES, len / page_size);
         self.backend.map_range(domain, iova, phys, len, permissions)
     }
 
@@ -393,7 +403,11 @@ impl DeviceMmuSystem {
     }
 
     pub fn invalidate_domain(&self, domain: &DeviceMmuDomain) -> DeviceMmuResult<()> {
-        self.backend.invalidate_domain(domain)
+        crate::disk_profile::add_counter(C_IOMMU_INVALIDATIONS, 1);
+        let profile_start = crate::disk_profile::timestamp_ns();
+        let result = self.backend.invalidate_domain(domain);
+        crate::disk_profile::add_elapsed(B_IOMMU_INVALIDATION, profile_start);
+        result
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
