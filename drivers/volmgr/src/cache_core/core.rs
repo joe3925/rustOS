@@ -1322,7 +1322,7 @@ where
     }
 
     async fn flush_until_clean(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::All, true)
+        self.flush_until_filtered_clean(&FlushFilter::All, true, usize::MAX)
             .await
     }
 
@@ -1387,13 +1387,9 @@ where
         &self,
         filter: &FlushFilter<'_>,
         force_device_flush: bool,
+        max_blocks_per_run: usize,
     ) -> Result<(usize, usize), CacheError<B::Error>> {
         self.check_open()?;
-        let max_blocks_per_run = if force_device_flush {
-            usize::MAX
-        } else {
-            self.cfg.flush_parallelism.max(1)
-        };
         let (matched, writebacks) = self
             .flush_filtered_batched(filter, max_blocks_per_run)
             .await?;
@@ -1412,11 +1408,12 @@ where
         &self,
         filter: &FlushFilter<'_>,
         force_device_flush: bool,
+        max_blocks_per_run: usize,
     ) -> Result<(), CacheError<B::Error>> {
         loop {
             let dirty_before = self.dirty_pages.load(Ordering::Acquire);
             let (_, writebacks) = self
-                .flush_internal_filtered(filter, force_device_flush)
+                .flush_internal_filtered(filter, force_device_flush, max_blocks_per_run)
                 .await?;
             if matches!(
                 self.filtered_writeback_state(filter),
@@ -1438,7 +1435,7 @@ where
             let dirty_after = self.dirty_pages.load(Ordering::Acquire);
             if dirty_after >= dirty_before {
                 let (_, retry_writebacks) = self
-                    .flush_internal_filtered(filter, force_device_flush)
+                    .flush_internal_filtered(filter, force_device_flush, max_blocks_per_run)
                     .await?;
                 if retry_writebacks == 0 {
                     if matches!(
@@ -1454,21 +1451,24 @@ where
         Ok(())
     }
 
-    async fn flush_internal_range(
+    async fn flush_internal_range_to_backend(
         &self,
         block_range: Range<u64>,
     ) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::BlockRange(&block_range), true)
+        self.flush_until_filtered_clean(&FlushFilter::BlockRange(&block_range), false, usize::MAX)
             .await
     }
 
     async fn flush_internal_all(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::All, true)
+        self.flush_until_filtered_clean(&FlushFilter::All, true, usize::MAX)
             .await
     }
 
-    async fn flush_internal_owner(&self, owner: u64) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::Owner(owner), true)
+    async fn flush_internal_owner_to_backend(
+        &self,
+        owner: u64,
+    ) -> Result<(), CacheError<B::Error>> {
+        self.flush_until_filtered_clean(&FlushFilter::Owner(owner), false, usize::MAX)
             .await
     }
 
@@ -1508,7 +1508,10 @@ where
                 break;
             };
 
-            let (matched, writebacks) = match self.flush_internal_filtered(&filter, false).await {
+            let (matched, writebacks) = match self
+                .flush_internal_filtered(&filter, false, self.cfg.flush_parallelism.max(1))
+                .await
+            {
                 Ok(pass) => pass,
                 Err(err) => {
                     cold_path();
@@ -1574,7 +1577,7 @@ where
 
         let cache = Arc::clone(cache);
         spawn_detached(async move {
-            if let Err(err) = cache.flush_internal_owner(owner).await {
+            if let Err(err) = cache.flush_internal_owner_to_backend(owner).await {
                 cold_path();
                 println!(
                     "volmgr: VolumeCache::flush_owner_background owner {} failed: {:?}",
@@ -1588,7 +1591,8 @@ where
         &self,
         block_range: Range<u64>,
     ) -> Result<usize, CacheError<B::Error>> {
-        self.flush_internal_range(block_range.clone()).await?;
+        self.flush_internal_range_to_backend(block_range.clone())
+            .await?;
 
         let mut removed = 0usize;
         let mut i = 0usize;
@@ -1837,7 +1841,9 @@ where
 
     async fn write_through_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
         VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, data, 0).await?;
-        self.flush_range(offset, data.len()).await
+        let block_range =
+            VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, data.len())?;
+        self.flush_internal_range_to_backend(block_range).await
     }
 
     async fn write_through_at_owned(
@@ -1847,7 +1853,9 @@ where
         owner: u64,
     ) -> Result<(), Self::Error> {
         VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, data, owner).await?;
-        self.flush_range(offset, data.len()).await
+        let block_range =
+            VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, data.len())?;
+        self.flush_internal_range_to_backend(block_range).await
     }
 
     async fn flush(&self) -> Result<(), Self::Error> {
@@ -1855,12 +1863,12 @@ where
     }
 
     async fn flush_owner(&self, owner: u64) -> Result<(), Self::Error> {
-        self.flush_internal_owner(owner).await
+        self.flush_internal_owner_to_backend(owner).await
     }
 
     async fn flush_range(&self, offset: u64, len: usize) -> Result<(), Self::Error> {
         let block_range = VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
-        self.flush_internal_range(block_range).await
+        self.flush_internal_range_to_backend(block_range).await
     }
 
     async fn invalidate_range(&self, offset: u64, len: usize) -> Result<usize, Self::Error> {
