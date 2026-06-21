@@ -19,7 +19,7 @@ use embedded_graphics::Drawable;
 use kernel_abi::PixelFormat;
 use kernel_types::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
-
+const FRAMEBUFFER_CONSOLE: bool = false;
 const FONT_HEIGHT: usize = 18;
 const FONT_WIDTH: usize = 9;
 const TAB_SPACES: usize = 4;
@@ -604,29 +604,30 @@ fn try_flush_print_queue() -> bool {
 
 pub(crate) fn _print(args: fmt::Arguments) {
     let _ = SerialPrintWriter.write_fmt(args);
-
-    if PRINT_QUEUE_FULL_PANIC.load(Ordering::Acquire) {
-        let _ = try_flush_print_queue();
-        return;
-    }
-
-    if let Some(mut c) = CONSOLE.try_lock() {
-        c.flush_queued_prints();
-        let _ = c.write_fmt(args);
-        c.flush_pending();
-        c.flush_queued_prints();
-        return;
-    }
-
-    queue_print(args);
-
-    let mut tries = 0usize;
-    while tries < PRINT_FLUSH_TRIES {
-        if try_flush_print_queue() {
+    if (FRAMEBUFFER_CONSOLE) {
+        if PRINT_QUEUE_FULL_PANIC.load(Ordering::Acquire) {
+            let _ = try_flush_print_queue();
             return;
         }
 
-        core::hint::spin_loop();
-        tries += 1;
+        if let Some(mut c) = CONSOLE.try_lock() {
+            c.flush_queued_prints();
+            let _ = c.write_fmt(args);
+            c.flush_pending();
+            c.flush_queued_prints();
+            return;
+        }
+
+        queue_print(args);
+
+        let mut tries = 0usize;
+        while tries < PRINT_FLUSH_TRIES {
+            if try_flush_print_queue() {
+                return;
+            }
+
+            core::hint::spin_loop();
+            tries += 1;
+        }
     }
 }

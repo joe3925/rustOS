@@ -3,6 +3,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -223,7 +225,7 @@ fn run_qemu(root: &Path, options: QemuOptions) -> Result<(), String> {
     if options.detach {
         spawn_qemu_detached(root, &qemu, &args, options.debug, options.gdb_port)
     } else {
-        run_qemu_foreground(root, &qemu, &args)
+        run_qemu_foreground(root, &qemu, &args, options.console_serial)
     }
 }
 
@@ -687,11 +689,7 @@ fn qemu_args(
 ) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| "8G".to_string());
     let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
-    let serial = if options.console_serial {
-        "stdio".to_string()
-    } else {
-        env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "stdio".to_string())
-    };
+    let serial = qemu_serial_arg(root, options)?;
     let accel = qemu_accel(qemu, options);
     let iommu_device = qemu_iommu_device(&accel);
     let gdb = format!("tcp::{}", options.gdb_port);
@@ -737,12 +735,6 @@ fn qemu_args(
         args.extend(["-drive".into(), firmware_drive.into()]);
     }
 
-    args.extend(["-serial".into(), serial.clone().into()]);
-
-    if options.console_serial {
-        args.extend(["-monitor".into(), "none".into()]);
-    }
-
     args.extend([
         "-serial".into(),
         serial.into(),
@@ -758,6 +750,20 @@ fn qemu_args(
     ]);
 
     Ok(args)
+}
+
+fn qemu_serial_log_path(root: &Path) -> PathBuf {
+    root.join("target").join("qemu-com1.log")
+}
+
+fn qemu_serial_arg(root: &Path, options: &QemuOptions) -> Result<String, String> {
+    if options.console_serial {
+        let path = qemu_serial_log_path(root);
+        let path = qemu_path_string(root, &path)?;
+        Ok(format!("file:{path}"))
+    } else {
+        Ok(env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "stdio".to_string()))
+    }
 }
 
 fn qemu_accel(qemu: &Path, options: &QemuOptions) -> String {
@@ -850,14 +856,108 @@ fn spawn_qemu_detached(
     Ok(())
 }
 
-fn run_qemu_foreground(root: &Path, qemu: &Path, args: &[OsString]) -> Result<(), String> {
-    let status = Command::new(qemu)
-        .args(args)
-        .current_dir(root)
-        .status()
-        .map_err(|err| format!("failed to launch QEMU {}: {err}", qemu.display()))?;
+fn run_qemu_foreground(
+    root: &Path,
+    qemu: &Path,
+    args: &[OsString],
+    console_serial: bool,
+) -> Result<(), String> {
+    if !console_serial {
+        let status = Command::new(qemu)
+            .args(args)
+            .current_dir(root)
+            .status()
+            .map_err(|err| format!("failed to launch QEMU {}: {err}", qemu.display()))?;
+
+        return check_status(status, "running QEMU");
+    }
+
+    let serial_log = qemu_serial_log_path(root);
+
+    if let Some(parent) = serial_log.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create serial log directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(&serial_log, [])
+        .map_err(|err| format!("failed to clear {}: {err}", serial_log.display()))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let tail_stop = Arc::clone(&stop);
+    let tail_path = serial_log.clone();
+    let tail = thread::spawn(move || tail_serial_file(&tail_path, &tail_stop));
+
+    let status_result = Command::new(qemu).args(args).current_dir(root).status();
+
+    stop.store(true, Ordering::Release);
+    let _ = tail.join();
+
+    let status =
+        status_result.map_err(|err| format!("failed to launch QEMU {}: {err}", qemu.display()))?;
 
     check_status(status, "running QEMU")
+}
+
+fn tail_serial_file(path: &Path, stop: &AtomicBool) {
+    use std::io::{Read, Seek, Write};
+
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 4096];
+
+    loop {
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+        };
+
+        if let Ok(metadata) = file.metadata() {
+            if metadata.len() < offset {
+                offset = metadata.len();
+            }
+        }
+
+        if file.seek(std::io::SeekFrom::Start(offset)).is_err() {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+
+        match file.read(&mut buffer) {
+            Ok(0) => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(read) => {
+                offset += read as u64;
+                let _ = std::io::stdout().write_all(&buffer[..read]);
+                let _ = std::io::stdout().flush();
+            }
+            Err(_) => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
 }
 
 fn wait_for_qemu_to_settle(child: &mut Child) -> Result<(), String> {

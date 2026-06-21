@@ -23,7 +23,7 @@
   {
     "label": "no dbg full chain",
     "command": "cargo",
-    "args": ["run", "-p", "xtask", "--", "qemu"],
+    "args": ["run", "-p", "xtask", "--", "qemu", "--console-serial"],
     "cwd": "$ZED_WORKTREE_ROOT",
     "allow_concurrent_runs": false,
   },
