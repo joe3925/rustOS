@@ -3477,7 +3477,7 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 100 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 256 * 1024 * 1024;
 
 const DISK_BENCH_SIZES: &[usize] = &[
