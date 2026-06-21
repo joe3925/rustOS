@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_GDB_PORT: u16 = 1234;
+const DEFAULT_META_PORT: u16 = 4322;
 const ACTIVE_PLATFORM: PlatformConfig = PlatformConfig {
     kernel_target_json: "x86_64-rustos-kernel.json",
     kernel_target_dir: "x86_64-rustos-kernel",
@@ -74,6 +75,10 @@ struct QemuOptions {
     dry_run: bool,
     console_serial: bool,
     gdb_port: u16,
+    /// Enable the COM2 LLDB metadata socket.
+    lldb_meta: bool,
+    /// TCP port for the COM2 LLDB metadata socket.
+    meta_port: u16,
 }
 
 impl Cli {
@@ -114,6 +119,8 @@ impl Cli {
                     dry_run: false,
                     console_serial: false,
                     gdb_port: DEFAULT_GDB_PORT,
+                    lldb_meta: false,
+                    meta_port: DEFAULT_META_PORT,
                 };
 
                 while let Some(arg) = args.next() {
@@ -131,6 +138,15 @@ impl Cli {
                             options.gdb_port = port
                                 .parse()
                                 .map_err(|_| format!("invalid gdb port `{port}`"))?;
+                        }
+                        "--lldb-meta" => options.lldb_meta = true,
+                        "--meta-port" => {
+                            let port = args
+                                .next()
+                                .ok_or_else(|| "--meta-port requires a port".to_string())?;
+                            options.meta_port = port
+                                .parse()
+                                .map_err(|_| format!("invalid meta port `{port}`"))?;
                         }
                         "-h" | "--help" => return Err(usage()),
                         other => {
@@ -179,7 +195,7 @@ fn usage() -> String {
         "  cargo run -p xtask",
         "  cargo run -p xtask -- --release",
         "  cargo run -p xtask -- build [--drivers] [--release]",
-        "  cargo run -p xtask -- qemu [--debug] [--detach] [--console-serial] [--no-build] [--dry-run] [--release] [--gdb-port PORT]",
+        "  cargo run -p xtask -- qemu [--debug] [--detach] [--console-serial] [--no-build] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
         "",
         "environment:",
         "  RUSTOS_QEMU       path to the active platform QEMU executable",
@@ -192,6 +208,12 @@ fn usage() -> String {
         "  RUSTOS_QEMU_MEMORY QEMU memory size, defaults to 8G",
         "  RUSTOS_QEMU_SMP   QEMU CPU count",
         "  RUSTOS_QEMU_SERIAL QEMU serial backend used unless --console-serial is passed",
+        "",
+        "serial ports:",
+        "  COM1 (0x3F8)  normal kernel log output (controlled by RUSTOS_QEMU_SERIAL)",
+        "  COM2 (0x2F8)  structured debugger metadata, enabled with --lldb-meta",
+        "                host TCP port defaults to 4322 (override with --meta-port)",
+        "                connect with: .zed/lldb/rustos_meta.py via rustos-meta-connect",
     ]
     .join("\n")
 }
@@ -735,9 +757,22 @@ fn qemu_args(
         args.extend(["-drive".into(), firmware_drive.into()]);
     }
 
+    args.extend(["-serial".into(), serial.into()]);
+
+    if options.lldb_meta {
+        let meta_chardev = format!(
+            "socket,id=rustos_meta,host=127.0.0.1,port={},server=on,wait=off,nodelay=on",
+            options.meta_port
+        );
+        args.extend([
+            "-chardev".into(),
+            meta_chardev.into(),
+            "-serial".into(),
+            "chardev:rustos_meta".into(),
+        ]);
+    }
+
     args.extend([
-        "-serial".into(),
-        serial.into(),
         "-vga".into(),
         "std".into(),
         "-drive".into(),

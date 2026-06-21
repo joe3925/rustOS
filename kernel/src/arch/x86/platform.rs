@@ -94,6 +94,7 @@ impl Platform for X86Platform {
         }
         Self::disable_interrupts();
         super::syscalls::syscall::syscall_init();
+        super::debug_meta::init_debug_metadata_transport();
     }
 }
 
@@ -146,6 +147,7 @@ impl CpuPlatform for X86Platform {
     fn halt() -> ! {
         unsafe {
             loop {
+                super::debug_meta::poll_rx_once();
                 core::arch::asm!("hlt;", options(nomem, nostack, preserves_flags));
             }
         }

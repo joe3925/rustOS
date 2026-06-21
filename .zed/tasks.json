@@ -16,7 +16,7 @@
   {
     "label": "debug kernel qemu",
     "command": "cargo",
-    "args": ["run", "-p", "xtask", "--", "qemu", "--debug", "--detach"],
+    "args": ["run", "-p", "xtask", "--", "qemu", "--debug", "--detach", "--lldb-meta"],
     "cwd": "$ZED_WORKTREE_ROOT",
     "allow_concurrent_runs": false,
   },
