@@ -1,18 +1,3 @@
-"""
-rustos_meta.py — LLDB Python script for dynamic RustOS driver symbol loading.
-
-Usage (from Zed postRunCommands / LLDB):
-    command script import ".zed/lldb/rustos_meta.py"
-    rustos-meta-connect 127.0.0.1 4322 "drivers/target/x86_64-rustos-driver/debug/deps"
-
-Protocol (kernel/src/debug_metadata.rs):
-    RUSTOS_MODULE_BEGIN id=<N> name="<name>" path="<path>" preferred=0x<HEX> loaded=0x<HEX>
-    RUSTOS_MODULE_SECTION id=<N> name="<section>" addr=0x<HEX> size=0x<HEX>
-    RUSTOS_MODULE_END id=<N>
-    RUSTOS_META_HELLO version=1          (host → kernel)
-    RUSTOS_META_HELLO_ACK version=1      (kernel → host, then full snapshot)
-"""
-
 from __future__ import annotations
 
 import os
@@ -34,7 +19,9 @@ class _Section:
 class _PendingModule:
     __slots__ = ("id", "name", "path", "preferred", "loaded", "sections")
 
-    def __init__(self, module_id: int, name: str, path: str, preferred: int, loaded: int) -> None:
+    def __init__(
+        self, module_id: int, name: str, path: str, preferred: int, loaded: int
+    ) -> None:
         self.id = module_id
         self.name = name
         self.path = path
@@ -46,7 +33,15 @@ class _PendingModule:
 class _LoadedModule:
     __slots__ = ("id", "name", "abs_path", "preferred", "loaded", "sections")
 
-    def __init__(self, module_id: int, name: str, abs_path: str, preferred: int, loaded: int, sections: List[_Section]) -> None:
+    def __init__(
+        self,
+        module_id: int,
+        name: str,
+        abs_path: str,
+        preferred: int,
+        loaded: int,
+        sections: List[_Section],
+    ) -> None:
         self.id = module_id
         self.name = name
         self.abs_path = abs_path
@@ -79,12 +74,18 @@ class _MetaConnection:
             self._sock.settimeout(None)
             self._sock.sendall(self.HELLO_MSG)
         except OSError as exc:
-            self._print(f"[rustos-meta] ERROR: could not connect to {self._host}:{self._port}: {exc}")
+            self._print(
+                f"[rustos-meta] ERROR: could not connect to {self._host}:{self._port}: {exc}"
+            )
             return False
 
-        self._thread = threading.Thread(target=self._reader_loop, name="rustos-meta-reader", daemon=True)
+        self._thread = threading.Thread(
+            target=self._reader_loop, name="rustos-meta-reader", daemon=True
+        )
         self._thread.start()
-        self._print(f"[rustos-meta] connected to {self._host}:{self._port}, driver dir: {self._driver_dir}")
+        self._print(
+            f"[rustos-meta] connected to {self._host}:{self._port}, driver dir: {self._driver_dir}"
+        )
         return True
 
     def stop(self) -> None:
@@ -114,7 +115,9 @@ class _MetaConnection:
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 try:
-                    self._process_line(line.rstrip(b"\r").decode("utf-8", errors="replace"))
+                    self._process_line(
+                        line.rstrip(b"\r").decode("utf-8", errors="replace")
+                    )
                 except Exception as exc:
                     self._print(f"[rustos-meta] WARNING: {exc!r}")
 
@@ -136,14 +139,16 @@ class _MetaConnection:
             return
         try:
             module_id = int(tokens["id"])
-            name      = tokens["name"]
-            path      = tokens.get("path", "")
+            name = tokens["name"]
+            path = tokens.get("path", "")
             preferred = int(tokens["preferred"], 16)
-            loaded    = int(tokens["loaded"], 16)
+            loaded = int(tokens["loaded"], 16)
         except (KeyError, ValueError) as exc:
             self._print(f"[rustos-meta] WARNING: bad MODULE_BEGIN ({exc!r}): {line!r}")
             return
-        self._pending[module_id] = _PendingModule(module_id, name, path, preferred, loaded)
+        self._pending[module_id] = _PendingModule(
+            module_id, name, path, preferred, loaded
+        )
 
     def _handle_section(self, line: str) -> None:
         tokens = self._parse_kv(line, "RUSTOS_MODULE_SECTION")
@@ -151,11 +156,13 @@ class _MetaConnection:
             return
         try:
             module_id = int(tokens["id"])
-            name      = tokens["name"]
-            addr      = int(tokens["addr"], 16)
-            size      = int(tokens["size"], 16)
+            name = tokens["name"]
+            addr = int(tokens["addr"], 16)
+            size = int(tokens["size"], 16)
         except (KeyError, ValueError) as exc:
-            self._print(f"[rustos-meta] WARNING: bad MODULE_SECTION ({exc!r}): {line!r}")
+            self._print(
+                f"[rustos-meta] WARNING: bad MODULE_SECTION ({exc!r}): {line!r}"
+            )
             return
         pending = self._pending.get(module_id)
         if pending is None:
@@ -181,10 +188,19 @@ class _MetaConnection:
 
         abs_path = self._resolve_path(pending.name, pending.path)
         if abs_path is None:
-            self._print(f"[rustos-meta] WARNING: could not locate '{pending.name}' on host — skipping")
+            self._print(
+                f"[rustos-meta] WARNING: could not locate '{pending.name}' on host — skipping"
+            )
             return
 
-        module = _LoadedModule(pending.id, pending.name, abs_path, pending.preferred, pending.loaded, pending.sections)
+        module = _LoadedModule(
+            pending.id,
+            pending.name,
+            abs_path,
+            pending.preferred,
+            pending.loaded,
+            pending.sections,
+        )
         self._loaded[key] = module
 
         with self._queue_lock:
@@ -200,31 +216,44 @@ class _MetaConnection:
 
     def _load_module_in_lldb(self, module: _LoadedModule) -> None:
         with self._lldb_lock:
-            self._print(f"[rustos-meta] loading '{module.name}' at {module.loaded:#018x} ({len(module.sections)} sections)")
+            self._print(
+                f"[rustos-meta] loading '{module.name}' at {module.loaded:#018x} ({len(module.sections)} sections)"
+            )
             self._run_lldb(f'target modules add "{module.abs_path}"')
 
             if module.sections:
-                section_args = " ".join(f'{s.name} {s.addr:#x}' for s in module.sections)
-                result = self._run_lldb(f'target modules load --file "{module.abs_path}" {section_args}')
+                section_args = " ".join(
+                    f"{s.name} {s.addr:#x}" for s in module.sections
+                )
+                result = self._run_lldb(
+                    f'target modules load --file "{module.abs_path}" {section_args}'
+                )
                 if result is not None and result.GetError():
                     for s in module.sections:
-                        self._run_lldb(f'target modules load --file "{module.abs_path}" {s.name} {s.addr:#x}')
+                        self._run_lldb(
+                            f'target modules load --file "{module.abs_path}" {s.name} {s.addr:#x}'
+                        )
 
     def _run_lldb(self, cmd: str):
         try:
             interp = self._debugger.GetCommandInterpreter()
             import lldb
+
             result = lldb.SBCommandReturnObject()
             interp.HandleCommand(cmd, result)
             if not result.Succeeded():
-                self._print(f"[rustos-meta] LLDB error for `{cmd}`: {result.GetError()}")
+                self._print(
+                    f"[rustos-meta] LLDB error for `{cmd}`: {result.GetError()}"
+                )
             return result
         except Exception as exc:
             self._print(f"[rustos-meta] exception running `{cmd}`: {exc!r}")
             return None
 
     def _resolve_path(self, name: str, kernel_path: str) -> Optional[str]:
-        kernel_basename = os.path.basename(kernel_path.replace("\\", "/")) if kernel_path else name
+        kernel_basename = (
+            os.path.basename(kernel_path.replace("\\", "/")) if kernel_path else name
+        )
 
         for candidate_name in (kernel_basename, name):
             candidate = os.path.abspath(os.path.join(self._driver_dir, candidate_name))
@@ -242,7 +271,7 @@ class _MetaConnection:
 
     @staticmethod
     def _parse_kv(line: str, prefix: str) -> Optional[Dict[str, str]]:
-        rest = line[len(prefix):].strip()
+        rest = line[len(prefix) :].strip()
         try:
             parts = shlex.split(rest)
         except ValueError:
@@ -292,7 +321,9 @@ class _RustosMetaConnectCommand:
         result.SetStatus(0)
 
     def get_short_help(self) -> str:
-        return "Connect to RustOS COM2 metadata socket for dynamic driver symbol loading"
+        return (
+            "Connect to RustOS COM2 metadata socket for dynamic driver symbol loading"
+        )
 
     def get_long_help(self) -> str:
         return (
@@ -307,4 +338,6 @@ def __lldb_init_module(debugger, internal_dict) -> None:
     debugger.HandleCommand(
         "command script add -c rustos_meta._RustosMetaConnectCommand rustos-meta-connect"
     )
-    print("[rustos-meta] loaded — use 'rustos-meta-connect HOST PORT DRIVER_DIR' to start")
+    print(
+        "[rustos-meta] loaded — use 'rustos-meta-connect HOST PORT DRIVER_DIR' to start"
+    )
