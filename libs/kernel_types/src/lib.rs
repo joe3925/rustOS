@@ -58,14 +58,15 @@ pub type EvtDriverDeviceAdd =
 pub type EvtDriverUnload =
     extern "C" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
-pub type EvtIoRead = for<'req, 'data, 'b> extern "C" fn(
+pub type EvtIoRead = for<'req, 'io, 'b> extern "C" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Read<'data>>,
+    &'b mut RequestHandle<'req, Read<'io>>,
     usize,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoWrite = for<'req, 'data, 'b> extern "C" fn(
+
+pub type EvtIoWrite = for<'req, 'io, 'b> extern "C" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Write<'data>>,
+    &'b mut RequestHandle<'req, Write<'io>>,
     usize,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoDeviceControl = for<'req, 'data, 'b> extern "C" fn(

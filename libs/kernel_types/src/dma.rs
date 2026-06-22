@@ -346,18 +346,32 @@ pub enum IoBufferBackingDesc<'data> {
 
 #[derive(Clone, Copy)]
 enum BackingMemory<'data> {
+    /// No CPU-addressable backing is available through this object.
+    /// Used for physical-only buffers described by frames/extents.
     None,
+
+    /// A single contiguous read-only virtual buffer.
+    /// Allows reconstructing `&[u8]` for valid leased ranges.
     SingleRead {
-        ptr: *const u8,
+        ptr: usize,
         len: usize,
         _data: PhantomData<&'data [u8]>,
     },
+
+    /// A single contiguous writable virtual buffer.
+    /// Allows reconstructing `&[u8]` and `&mut [u8]` for valid leased ranges.
     SingleWrite {
-        ptr: *mut u8,
+        ptr: usize,
         len: usize,
         _data: PhantomData<&'data mut [u8]>,
     },
+
+    /// Multiple read-only virtual segments.
+    /// The segment pointers are represented through extents/frames, not stored here.
     SegmentedRead(PhantomData<&'data [u8]>),
+
+    /// Multiple writable virtual segments.
+    /// The segment pointers are represented through extents/frames, not stored here.
     SegmentedWrite(PhantomData<&'data mut [u8]>),
 }
 
@@ -739,23 +753,29 @@ impl<'data> IoBufferBacking<'data> {
         Ok(())
     }
 
-    pub fn create_to_device<'backing>(
-        &'backing self,
-        offset: usize,
-        len: usize,
-    ) -> Result<IoBuffer<'backing, 'data, Described, ToDevice>, IoBufferError> {
-        self.ensure_virtual_backed()?;
-        let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE, STATE_DESCRIBED)?;
-        Ok(IoBuffer::new(self, handle))
-    }
-
     pub fn create_from_device<'backing>(
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'data, Described, FromDevice>, IoBufferError> {
+    ) -> Result<IoBuffer<'backing, 'backing, Described, FromDevice>, IoBufferError>
+    where
+        'data: 'backing,
+    {
         self.ensure_writable_virtual_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE, STATE_DESCRIBED)?;
+        Ok(IoBuffer::new(self, handle))
+    }
+
+    pub fn create_to_device<'backing>(
+        &'backing self,
+        offset: usize,
+        len: usize,
+    ) -> Result<IoBuffer<'backing, 'backing, Described, ToDevice>, IoBufferError>
+    where
+        'data: 'backing,
+    {
+        self.ensure_virtual_backed()?;
+        let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE, STATE_DESCRIBED)?;
         Ok(IoBuffer::new(self, handle))
     }
 
@@ -763,7 +783,10 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'data, Described, Bidirectional>, IoBufferError> {
+    ) -> Result<IoBuffer<'backing, 'backing, Described, Bidirectional>, IoBufferError>
+    where
+        'data: 'backing,
+    {
         self.ensure_writable_virtual_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL, STATE_DESCRIBED)?;
         Ok(IoBuffer::new(self, handle))
@@ -773,7 +796,10 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'data, PhysFramed, ToDevice>, IoBufferError> {
+    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, ToDevice>, IoBufferError>
+    where
+        'data: 'backing,
+    {
         self.ensure_phys_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE, STATE_PHYS_FRAMED)?;
         Ok(IoBuffer::new(self, handle))
@@ -783,7 +809,10 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'data, PhysFramed, FromDevice>, IoBufferError> {
+    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, FromDevice>, IoBufferError>
+    where
+        'data: 'backing,
+    {
         self.ensure_phys_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE, STATE_PHYS_FRAMED)?;
         Ok(IoBuffer::new(self, handle))
@@ -793,7 +822,10 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'data, PhysFramed, Bidirectional>, IoBufferError> {
+    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, Bidirectional>, IoBufferError>
+    where
+        'data: 'backing,
+    {
         self.ensure_phys_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL, STATE_PHYS_FRAMED)?;
         Ok(IoBuffer::new(self, handle))
@@ -1177,7 +1209,7 @@ impl<'backing, 'data, State: VirtualBackedIoBufferState, Access: IoBufferAccess>
         let snapshot = self.snapshot().ok()?;
         match self.backing.memory {
             BackingMemory::SingleRead { ptr, len, .. } => {
-                checked_slice(ptr, len, snapshot.start, snapshot.len)
+                checked_slice(ptr as *const u8, len, snapshot.start, snapshot.len)
             }
             BackingMemory::SingleWrite { ptr, len, .. } => {
                 checked_slice(ptr as *const u8, len, snapshot.start, snapshot.len)
@@ -1194,7 +1226,7 @@ impl<'backing, 'data, State: VirtualBackedIoBufferState, Access: WritableIoBuffe
         let snapshot = self.snapshot().ok()?;
         match self.backing.memory {
             BackingMemory::SingleWrite { ptr, len, .. } => {
-                checked_slice_mut(ptr, len, snapshot.start, snapshot.len)
+                checked_slice_mut(ptr as *mut u8, len, snapshot.start, snapshot.len)
             }
             _ => None,
         }
@@ -1748,7 +1780,7 @@ fn build_backing<'data>(
     match desc {
         IoBufferBackingDesc::Slice(bytes) => build_virtual_backing(
             BackingMemory::SingleRead {
-                ptr: bytes.as_ptr(),
+                ptr: bytes.as_ptr() as usize,
                 len: bytes.len(),
                 _data: PhantomData,
             },
@@ -1756,7 +1788,7 @@ fn build_backing<'data>(
         ),
         IoBufferBackingDesc::SliceMut(bytes) => build_virtual_backing(
             BackingMemory::SingleWrite {
-                ptr: bytes.as_mut_ptr(),
+                ptr: bytes.as_mut_ptr() as usize,
                 len: bytes.len(),
                 _data: PhantomData,
             },
@@ -2505,4 +2537,59 @@ pub fn copy_to_io_buffer_frames(
     }
 
     remaining == 0
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaBufferRegion<'frames> {
+    pub frame_offset: usize,
+    pub byte_len: usize,
+    pub frames: &'frames [IoBufferPageFrame],
+}
+
+impl<'frames> DmaBufferRegion<'frames> {
+    pub const fn new(
+        frame_offset: usize,
+        byte_len: usize,
+        frames: &'frames [IoBufferPageFrame],
+    ) -> Self {
+        Self {
+            frame_offset,
+            byte_len,
+            frames,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaBufferView<'regions, 'frames> {
+    pub byte_len: usize,
+    pub regions: &'regions [DmaBufferRegion<'frames>],
+}
+
+impl<'regions, 'frames> DmaBufferView<'regions, 'frames> {
+    pub const fn new(byte_len: usize, regions: &'regions [DmaBufferRegion<'frames>]) -> Self {
+        Self { byte_len, regions }
+    }
+
+    pub fn len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+}
+
+#[repr(C)]
+#[derive(Clone)]
+pub struct DmaMappedBuffer {
+    pub layout: IoBufferDmaMappingLayout,
+    pub mapped_by: Arc<DeviceObject>,
+    pub unmap: DmaUnmapFn,
+    pub cookie: usize,
 }

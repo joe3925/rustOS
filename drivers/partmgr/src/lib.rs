@@ -13,6 +13,8 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_api::dma::dma::IoBufferBackingConfig;
+use kernel_api::dma::dma::{IoBufferBacking, IoBufferBackingDesc};
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceRead, DeviceWrite, DiskInfo, GptHeader, GptPartitionEntry,
@@ -284,12 +286,20 @@ async fn read_from_lower_async(
     len: usize,
 ) -> Result<Box<[u8]>, DriverStatus> {
     let mut data = vec![0u8; len];
-    let io_buf = IoBuffer::<Described, FromDevice>::from_slice_mut(&mut data[..]);
+    let io_buf = IoBufferBacking::new(
+        IoBufferBackingDesc::SliceMut(&mut data),
+        IoBufferBackingConfig::default(),
+    )
+    .expect("io_buf creation for read_from_lower_async failed");
     let mut child_req = RequestHandle::new(Read {
         offset,
         len,
         no_buffer: false,
-        buffer: io_buf,
+        buffer: Some(
+            io_buf
+                .create_from_device(0, len)
+                .expect("io_buf creation for read_from_lower_async failed"),
+        ),
         next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);

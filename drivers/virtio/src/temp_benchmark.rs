@@ -1,8 +1,8 @@
 use crate::blk::{SubmitRequestError, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::completion::CompletionToken;
 use crate::dev_ext::{DevExtInner, QueueState};
-use crate::{SubmitTasksGuard, drain_queue_completions, virtio_data_mapping_strategy};
-use alloc::{sync::Arc, vec::Vec};
+use crate::{SubmitTasksGuard, drain_queue_completions};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::hint::spin_loop;
 use core::pin::Pin;
 use core::task::Poll;
@@ -12,7 +12,8 @@ use kernel_api::benchmark::{
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    Described, DmaMapped, FromDevice, IoBuffer, IoBufferDmaSegments, PhysFramed,
+    DmaMapped, FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+    IoBufferDmaSegments, PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -23,9 +24,9 @@ use kernel_api::request::{Read, RequestHandle, TraversalPolicy};
 use kernel_api::runtime::{cycle_counter, spawn};
 use kernel_api::status::DriverStatus;
 use spin::Mutex;
+
 pub const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 pub const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
-
 pub const IOCTL_BLOCK_BENCH_SWEEP_BOTH: u32 = 0xB000_8004;
 
 struct BenchConfig {
@@ -39,10 +40,6 @@ impl BenchConfig {
         inner: &DevExtInner,
         params: &BenchSweepParams,
     ) -> Result<Self, DriverStatus> {
-        let request_size = (params.request_size.max(512) & !511)
-            .min(bench_max_request_size(inner))
-            .max(512);
-
         if params.start_sector >= inner.capacity {
             return Err(DriverStatus::InvalidParameter);
         }
@@ -51,22 +48,28 @@ impl BenchConfig {
             .capacity
             .saturating_sub(params.start_sector)
             .saturating_mul(512);
+
+        let request_size = align_bench_request_size(params.request_size);
+
         if available_bytes < request_size as u64 {
             return Err(DriverStatus::InvalidParameter);
         }
 
         let max_q = bench_max_inflight_queue0(inner);
+
         let requested_inflight = if params.max_inflight == 0 {
             max_q as u16
         } else {
             params.max_inflight
         };
+
         let max_queue_inflight = requested_inflight.min(max_q as u16).max(1);
 
         let total_bytes = params
             .total_bytes
             .max(request_size as u64)
             .min(available_bytes);
+
         let requests_per_run = (total_bytes / request_size as u64)
             .max(1)
             .min(u32::MAX as u64) as u32;
@@ -79,9 +82,10 @@ impl BenchConfig {
     }
 }
 
-fn bench_max_request_size(inner: &DevExtInner) -> u32 {
-    let q0 = inner.get_queue(0);
-    q0.max_request_bytes.max(512) & !511
+#[inline]
+fn align_bench_request_size(request_size: u32) -> u32 {
+    let request_size = request_size.max(512) & !511;
+    request_size.max(512)
 }
 
 fn bench_max_inflight_queue0(inner: &DevExtInner) -> usize {
@@ -92,13 +96,15 @@ fn bench_max_inflight_queue0(inner: &DevExtInner) -> usize {
 struct BenchDmaBuffer {
     base_va: VirtAddr,
     alloc_bytes: usize,
-    mapped: Option<IoBuffer<'static, DmaMapped<PhysFramed>, FromDevice>>,
+    backing_addr: usize,
+    mapped: Option<IoBuffer<'static, 'static, DmaMapped<PhysFramed>, FromDevice>>,
 }
 
 impl BenchDmaBuffer {
     fn new_read(parent: &Arc<DeviceObject>, byte_len: u32) -> Result<Self, DriverStatus> {
         let byte_len = byte_len as usize;
         let alloc_bytes = byte_len.div_ceil(dma_base_page_size()) * dma_base_page_size();
+
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         let base_va = allocate_auto_kernel_range_mapped_contiguous(alloc_bytes as u64, flags)
             .map_err(|_| DriverStatus::InsufficientResources)?;
@@ -107,16 +113,67 @@ impl BenchDmaBuffer {
             core::ptr::write_bytes(base_va.as_u64() as *mut u8, 0, alloc_bytes);
         }
 
-        let slice =
+        let slice: &'static mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(base_va.as_u64() as *mut u8, byte_len) };
-        let phys_framed =
-            IoBuffer::<Described, FromDevice>::from_slice_mut(slice).into_phys_framed();
-        let strategy = virtio_data_mapping_strategy(&phys_framed);
-        let mapped = match kernel_api::dma::map_buffer(parent, phys_framed, strategy) {
+
+        let backing = match IoBufferBacking::new(
+            IoBufferBackingDesc::SliceMut(slice),
+            IoBufferBackingConfig::worst_case_for_len(byte_len),
+        ) {
+            Ok(backing) => backing,
+            Err(_) => {
+                unsafe {
+                    unmap_range(base_va, alloc_bytes as u64);
+                }
+
+                deallocate_kernel_range(base_va, alloc_bytes as u64);
+                return Err(DriverStatus::InsufficientResources);
+            }
+        };
+
+        let backing_addr = Box::into_raw(Box::new(backing)) as usize;
+        let backing_ref = unsafe { &*(backing_addr as *const IoBufferBacking<'static>) };
+
+        let described = match backing_ref.create_from_device(0, byte_len) {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                unsafe {
+                    drop(Box::from_raw(backing_addr as *mut IoBufferBacking<'static>));
+                    unmap_range(base_va, alloc_bytes as u64);
+                }
+
+                deallocate_kernel_range(base_va, alloc_bytes as u64);
+                return Err(DriverStatus::InvalidParameter);
+            }
+        };
+
+        let phys_framed = match described.into_phys_framed() {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                unsafe {
+                    drop(Box::from_raw(backing_addr as *mut IoBufferBacking<'static>));
+                    unmap_range(base_va, alloc_bytes as u64);
+                }
+
+                deallocate_kernel_range(base_va, alloc_bytes as u64);
+                return Err(DriverStatus::InvalidParameter);
+            }
+        };
+
+        let mapped = match kernel_api::dma::map_buffer(
+            parent,
+            phys_framed,
+            kernel_api::dma::dma::DmaMappingStrategy::SingleContiguous,
+        ) {
             Ok(mapped) => mapped,
             Err((phys_framed, _)) => {
                 drop(phys_framed);
-                unsafe { unmap_range(base_va, alloc_bytes as u64) };
+
+                unsafe {
+                    drop(Box::from_raw(backing_addr as *mut IoBufferBacking<'static>));
+                    unmap_range(base_va, alloc_bytes as u64);
+                }
+
                 deallocate_kernel_range(base_va, alloc_bytes as u64);
                 return Err(DriverStatus::InsufficientResources);
             }
@@ -125,6 +182,7 @@ impl BenchDmaBuffer {
         Ok(Self {
             base_va,
             alloc_bytes,
+            backing_addr,
             mapped: Some(mapped),
         })
     }
@@ -137,17 +195,28 @@ impl BenchDmaBuffer {
     }
 
     fn destroy(&mut self) {
-        if let Some(mapped) = self.mapped.take() {
-            let phys_framed = kernel_api::dma::unmap_buffer(mapped);
-            drop(phys_framed);
+        drop(self.mapped.take());
+
+        if self.backing_addr != 0 {
+            unsafe {
+                drop(Box::from_raw(
+                    self.backing_addr as *mut IoBufferBacking<'static>,
+                ));
+            }
+
+            self.backing_addr = 0;
         }
 
         if self.alloc_bytes == 0 {
             return;
         }
 
-        unsafe { unmap_range(self.base_va, self.alloc_bytes as u64) };
+        unsafe {
+            unmap_range(self.base_va, self.alloc_bytes as u64);
+        }
+
         deallocate_kernel_range(self.base_va, self.alloc_bytes as u64);
+
         self.base_va = VirtAddr::new(0);
         self.alloc_bytes = 0;
     }
@@ -188,15 +257,18 @@ fn submit_bench_read<'a>(
     request_size: u32,
 ) -> Result<Option<BenchInflight<'a>>, DriverStatus> {
     let dma_buffer = BenchDmaBuffer::new_read(parent, request_size)?;
+
     let completion = match bench_queue.completion_slots.alloc() {
         Some(completion) => completion,
         None => return Ok(None),
     };
+
     let mut completion = Some(completion);
     let mut start_cycles = 0u64;
 
     let submitted = {
         let mut vq = bench_queue.queue.write();
+
         match bench_queue.arena.submit_request(
             &mut vq,
             VIRTIO_BLK_T_IN,
@@ -208,7 +280,9 @@ fn submit_bench_read<'a>(
                 bench_queue
                     .completion_slots
                     .attach(head, completion.as_ref().expect("completion missing"));
+
                 let queue_full = vq.num_free == 0;
+
                 let _submit_guard = SubmitTasksGuard::new(
                     &bench_queue.submitting_tasks,
                     &vq,
@@ -216,6 +290,7 @@ fn submit_bench_read<'a>(
                     inner.notify_off_multiplier,
                     queue_full,
                 );
+
                 start_cycles = cycle_counter();
                 true
             }
@@ -251,6 +326,7 @@ fn record_completion(
     first_error: &mut Option<DriverStatus>,
 ) {
     let end_cycles = cycle_counter();
+
     if status == VIRTIO_BLK_S_OK {
         lat_samples.push(end_cycles.saturating_sub(inflight.start_cycles));
     } else if first_error.is_none() {
@@ -259,6 +335,7 @@ fn record_completion(
 
     *completed = completed.saturating_add(1);
     *batch_completed = batch_completed.saturating_add(1);
+
     drop(inflight);
 }
 
@@ -271,6 +348,7 @@ fn collect_ready_completions(
     first_error: &mut Option<DriverStatus>,
 ) -> Result<bool, DriverStatus> {
     let mut made_progress = false;
+
     for slot in slots.iter_mut().take(batch_submitted) {
         let status = match slot.as_mut() {
             Some(inflight) => match inflight.completion.try_recv() {
@@ -288,6 +366,7 @@ fn collect_ready_completions(
 
         if let Some(status) = status {
             let inflight = slot.take().expect("ready benchmark slot disappeared");
+
             record_completion(
                 inflight,
                 status,
@@ -296,6 +375,7 @@ fn collect_ready_completions(
                 batch_completed,
                 first_error,
             );
+
             made_progress = true;
         }
     }
@@ -309,6 +389,7 @@ async fn await_one_irq_completion<'a>(
 ) -> Result<(BenchInflight<'a>, u8), DriverStatus> {
     core::future::poll_fn(|cx| {
         let mut has_pending = false;
+
         for slot in slots.iter_mut().take(batch_submitted) {
             let poll_result = match slot.as_mut() {
                 Some(inflight) => {
@@ -346,6 +427,7 @@ async fn await_one_irq_completion<'a>(
 
 async fn yield_once() {
     let mut done = false;
+
     core::future::poll_fn(|cx| {
         if done {
             Poll::Ready(())
@@ -401,12 +483,15 @@ async fn bench_reads_direct(
                 }
                 None => {
                     let drained = drain_queue_completions(bench_queue);
+
                     if drained == 0 {
                         yield_once().await;
                     }
+
                     if batch_submitted == 0 {
                         continue;
                     }
+
                     break;
                 }
             }
@@ -418,6 +503,7 @@ async fn bench_reads_direct(
 
         let mut batch_completed = 0usize;
         let mut first_error: Option<DriverStatus> = None;
+
         while batch_completed < batch_submitted {
             if collect_ready_completions(
                 &mut slots,
@@ -435,6 +521,7 @@ async fn bench_reads_direct(
                 let (inflight_req, status) =
                     await_one_irq_completion(&mut slots, batch_submitted).await?;
                 let wait_end = cycle_counter();
+
                 irq_wait_wall_cycles =
                     irq_wait_wall_cycles.saturating_add(wait_end.saturating_sub(wait_start));
 
@@ -448,6 +535,7 @@ async fn bench_reads_direct(
                 );
             } else {
                 let drained = drain_queue_completions(bench_queue);
+
                 if drained == 0 {
                     bench_spin_chunk_and_count(&mut busy_cycles);
                 }
@@ -476,6 +564,7 @@ async fn bench_reads_direct(
             .iter()
             .copied()
             .fold(0u64, |acc, sample| acc.saturating_add(sample));
+
         lat_samples.sort_unstable();
 
         result.total_cycles = sum_lat;
@@ -504,25 +593,54 @@ async fn bench_read_via_request(
     completion: Arc<Mutex<Option<BenchRequestCompletion>>>,
 ) {
     let mut data = Vec::new();
+
     let status = if data.try_reserve_exact(len).is_err() {
         DriverStatus::InsufficientResources
     } else {
         data.resize(len, 0);
-        let io_buf = IoBuffer::<Described, FromDevice>::from_slice_mut(&mut data[..]);
+
+        let backing = match IoBufferBacking::new(
+            IoBufferBackingDesc::SliceMut(&mut data[..]),
+            IoBufferBackingConfig::worst_case_for_len(len),
+        ) {
+            Ok(backing) => backing,
+            Err(_) => {
+                *completion.lock() = Some(BenchRequestCompletion {
+                    status: DriverStatus::InsufficientResources,
+                    cycles: 0,
+                });
+                return;
+            }
+        };
+
+        let io_buf = match backing.create_from_device(0, len) {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                *completion.lock() = Some(BenchRequestCompletion {
+                    status: DriverStatus::InvalidParameter,
+                    cycles: 0,
+                });
+                return;
+            }
+        };
+
         let mut req = RequestHandle::new(Read {
             offset,
             len,
             no_buffer: false,
-            buffer: io_buf,
+            buffer: Some(io_buf),
             next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
+
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let start_cycles = cycle_counter();
         let status = pnp_send_request(target, &mut req).await;
         let end_cycles = cycle_counter();
         let cycles = end_cycles.saturating_sub(start_cycles);
+
         drop(req);
+        drop(backing);
 
         *completion.lock() = Some(BenchRequestCompletion { status, cycles });
         return;
@@ -558,6 +676,7 @@ async fn bench_reads_request(
             let len = bench_cfg.request_size as usize;
 
             completions.push(completion.clone());
+
             joins.push(spawn(bench_read_via_request(
                 target.clone(),
                 offset,
@@ -574,6 +693,7 @@ async fn bench_reads_request(
         }
 
         let mut first_error: Option<DriverStatus> = None;
+
         for completion in completions {
             let completed_request = completion.lock().take().ok_or_else(|| {
                 benchmark_device_error("virtio-blk: request benchmark completion missing")
@@ -604,6 +724,7 @@ async fn bench_reads_request(
             .iter()
             .copied()
             .fold(0u64, |acc, sample| acc.saturating_add(sample));
+
         lat_samples.sort_unstable();
 
         result.total_cycles = sum_lat;
@@ -630,14 +751,19 @@ fn bench_inflight_levels(max_inflight: usize) -> Vec<usize> {
     let mut lvl = 1usize;
 
     let max_levels = BenchSweepResult::default().levels.len();
+
     while lvl < max_inflight && levels.len() + 1 < max_levels {
         levels.push(lvl);
+
         let next = lvl.saturating_mul(2);
+
         if next == lvl {
             break;
         }
+
         lvl = next;
     }
+
     if levels.len() < max_levels && *levels.last().unwrap_or(&0) != max_inflight {
         levels.push(max_inflight);
     }
@@ -658,6 +784,7 @@ pub async fn bench_sweep_params(
     } else {
         params.max_inflight as usize
     };
+
     let max_inflight = requested_inflight
         .max(1)
         .min(bench_cfg.max_queue_inflight as usize)
@@ -667,8 +794,8 @@ pub async fn bench_sweep_params(
 
     let mut result = BenchSweepResult::default();
     let current_sector: u64 = params.start_sector;
+
     for level in levels {
-        //println!("Starting level: {}", level);
         if (result.used as usize) >= result.levels.len() {
             break;
         }
@@ -706,6 +833,7 @@ pub async fn bench_sweep_params_request(
     } else {
         params.max_inflight as usize
     };
+
     let max_inflight = requested_inflight
         .max(1)
         .min(bench_cfg.max_queue_inflight as usize)
@@ -715,6 +843,7 @@ pub async fn bench_sweep_params_request(
 
     let mut result = BenchSweepResult::default();
     let current_sector: u64 = params.start_sector;
+
     for level in levels {
         if (result.used as usize) >= result.levels.len() {
             break;
@@ -741,18 +870,8 @@ pub fn sanitize_bench_params(inner: &DevExtInner, mut p: BenchSweepParams) -> Be
     if p.request_size == 0 {
         p.request_size = 64 * 1024;
     }
-    p.request_size &= !511;
-    if p.request_size < 512 {
-        p.request_size = 512;
-    }
-    p.request_size = p.request_size.min(bench_max_request_size(inner)).max(512) & !511;
 
-    if p.total_bytes == 0 {
-        p.total_bytes = p.request_size as u64;
-    }
-    if p.total_bytes < p.request_size as u64 {
-        p.total_bytes = p.request_size as u64;
-    }
+    p.request_size = align_bench_request_size(p.request_size);
 
     if p.start_sector >= inner.capacity {
         p.start_sector = 0;
@@ -762,6 +881,21 @@ pub fn sanitize_bench_params(inner: &DevExtInner, mut p: BenchSweepParams) -> Be
         .capacity
         .saturating_sub(p.start_sector)
         .saturating_mul(512);
+
+    let max_available_request = (available_bytes.min(u32::MAX as u64) as u32) & !511;
+
+    if max_available_request >= 512 && p.request_size > max_available_request {
+        p.request_size = max_available_request;
+    }
+
+    if p.total_bytes == 0 {
+        p.total_bytes = p.request_size as u64;
+    }
+
+    if p.total_bytes < p.request_size as u64 {
+        p.total_bytes = p.request_size as u64;
+    }
+
     if available_bytes >= p.request_size as u64 && p.total_bytes > available_bytes {
         p.total_bytes = available_bytes - (available_bytes % p.request_size as u64);
     }
@@ -796,11 +930,13 @@ const BENCH_SPIN_CHUNK: u32 = 256;
 #[inline]
 pub fn bench_spin_chunk_and_count(busy_cycles: &mut u64) {
     let t0 = cycle_counter();
+
     let mut i = 0u32;
     while i < BENCH_SPIN_CHUNK {
         spin_loop();
         i += 1;
     }
+
     let t1 = cycle_counter();
     *busy_cycles = busy_cycles.saturating_add(t1.saturating_sub(t0));
 }
@@ -810,5 +946,6 @@ fn percentile_index_permille(n: usize, permille: usize) -> usize {
     if n == 0 {
         return 0;
     }
+
     ((n - 1) * permille) / 1000
 }

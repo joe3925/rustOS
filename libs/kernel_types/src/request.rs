@@ -1062,17 +1062,18 @@ pub trait RequestKind {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct Read<'data> {
+pub struct Read<'io> {
     pub offset: u64,
     pub len: usize,
     pub no_buffer: bool,
-    pub buffer: IoBuffer<'data, Described, FromDevice>,
+    pub buffer: Option<IoBuffer<'io, 'io, Described, FromDevice>>,
     pub next: core::sync::atomic::AtomicPtr<Self>,
 }
 
-impl<'data> Read<'data> {
+impl<'io> Read<'io> {
     pub fn append_next(&self, next: *mut Self) {
         let mut curr = self as *const Self as *mut Self;
+
         loop {
             let curr_ref = unsafe { &*curr };
             let old = curr_ref.next.compare_exchange(
@@ -1081,6 +1082,7 @@ impl<'data> Read<'data> {
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Acquire,
             );
+
             match old {
                 Ok(_) => break,
                 Err(existing) => curr = existing,
@@ -1095,19 +1097,19 @@ impl RequestKind for Read<'_> {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct Write<'data> {
+pub struct Write<'io> {
     pub offset: u64,
     pub len: usize,
     pub no_buffer: bool,
-    /// File-level owner tag. 0 = unowned (included in all targeted flushes).
     pub owner: u64,
-    pub buffer: IoBuffer<'data, Described, ToDevice>,
+    pub buffer: Option<IoBuffer<'io, 'io, Described, ToDevice>>,
     pub next: core::sync::atomic::AtomicPtr<Self>,
 }
 
-impl<'data> Write<'data> {
+impl<'io> Write<'io> {
     pub fn append_next(&self, next: *mut Self) {
         let mut curr = self as *const Self as *mut Self;
+
         loop {
             let curr_ref = unsafe { &*curr };
             let old = curr_ref.next.compare_exchange(
@@ -1116,6 +1118,7 @@ impl<'data> Write<'data> {
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Acquire,
             );
+
             match old {
                 Ok(_) => break,
                 Err(existing) => curr = existing,

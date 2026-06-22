@@ -1,9 +1,11 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::ptr::NonNull;
 
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::{self, dma_base_page_size};
 use kernel_api::kernel_types::dma::{
-    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IoBuffer, PhysFramed,
+    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IoBuffer, IoBufferBacking,
+    IoBufferBackingConfig, IoBufferBackingDesc, PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -14,7 +16,8 @@ struct DmaChunk {
     byte_offset: usize,
     byte_len: usize,
     dma_addr: u64,
-    buffer: Option<IoBuffer<'static, DmaMapped<PhysFramed>, Bidirectional>>,
+    backing: Option<NonNull<IoBufferBacking<'static>>>,
+    buffer: Option<IoBuffer<'static, 'static, DmaMapped<PhysFramed>, Bidirectional>>,
 }
 
 pub struct ContiguousDmaRegion {
@@ -33,7 +36,9 @@ impl ContiguousDmaRegion {
         mapped_bytes: usize,
         chunk_multiple: usize,
     ) -> Option<Self> {
-        let alloc_bytes = mapped_bytes.div_ceil(dma_base_page_size()) * dma_base_page_size();
+        let page_size = dma_base_page_size();
+        let alloc_bytes = mapped_bytes.div_ceil(page_size) * page_size;
+
         Self::new_with_alloc(device, mapped_bytes, alloc_bytes, chunk_multiple)
     }
 
@@ -91,13 +96,57 @@ impl ContiguousDmaRegion {
             let buf_ptr = (base_va.as_u64() as *mut u8).wrapping_add(byte_offset);
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, byte_len) };
 
-            let buffer =
-                IoBuffer::<Described, Bidirectional>::from_slice_mut(buf).into_phys_framed();
+            let backing = match IoBufferBacking::new(
+                IoBufferBackingDesc::SliceMut(buf),
+                IoBufferBackingConfig::worst_case_for_len(byte_len),
+            ) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    region.destroy();
+                    return None;
+                }
+            };
+
+            let backing_ptr = NonNull::from(Box::leak(Box::new(backing)));
+
+            let backing_ref = unsafe { backing_ptr.as_ref() };
+
+            let buffer = match backing_ref.create_bidirectional(0, byte_len) {
+                Ok(buffer) => buffer,
+                Err(_) => {
+                    unsafe {
+                        drop(Box::from_raw(backing_ptr.as_ptr()));
+                    }
+
+                    region.destroy();
+                    return None;
+                }
+            };
+
+            let buffer = match buffer.into_phys_framed() {
+                Ok(buffer) => buffer,
+                Err((buffer, _)) => {
+                    drop(buffer);
+
+                    unsafe {
+                        drop(Box::from_raw(backing_ptr.as_ptr()));
+                    }
+
+                    region.destroy();
+                    return None;
+                }
+            };
 
             let mapped = match dma::map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
             {
                 Ok(mapped) => mapped,
-                Err(_) => {
+                Err((buffer, _)) => {
+                    drop(buffer);
+
+                    unsafe {
+                        drop(Box::from_raw(backing_ptr.as_ptr()));
+                    }
+
                     region.destroy();
                     return None;
                 }
@@ -105,13 +154,23 @@ impl ContiguousDmaRegion {
 
             let segments = mapped.dma_segments();
             let Some(segment) = segments.first() else {
-                let _ = dma::unmap_buffer(mapped);
+                drop(mapped);
+
+                unsafe {
+                    drop(Box::from_raw(backing_ptr.as_ptr()));
+                }
+
                 region.destroy();
                 return None;
             };
 
             if segments.len() != 1 || segment.byte_len as usize != byte_len {
-                let _ = dma::unmap_buffer(mapped);
+                drop(mapped);
+
+                unsafe {
+                    drop(Box::from_raw(backing_ptr.as_ptr()));
+                }
+
                 region.destroy();
                 return None;
             }
@@ -120,6 +179,7 @@ impl ContiguousDmaRegion {
                 byte_offset,
                 byte_len,
                 dma_addr: segment.dma_addr,
+                backing: Some(backing_ptr),
                 buffer: Some(mapped),
             });
 
@@ -145,7 +205,8 @@ impl ContiguousDmaRegion {
         }
 
         self.chunks.iter().find_map(|chunk| {
-            let chunk_end = chunk.byte_offset + chunk.byte_len;
+            let chunk_end = chunk.byte_offset.checked_add(chunk.byte_len)?;
+
             if byte_offset < chunk.byte_offset || byte_offset >= chunk_end {
                 return None;
             }
@@ -156,18 +217,27 @@ impl ContiguousDmaRegion {
 
     pub fn destroy(&mut self) {
         for chunk in &mut self.chunks {
-            if let Some(buffer) = chunk.buffer.take() {
-                let _ = dma::unmap_buffer(buffer);
+            drop(chunk.buffer.take());
+
+            if let Some(backing) = chunk.backing.take() {
+                unsafe {
+                    drop(Box::from_raw(backing.as_ptr()));
+                }
             }
         }
+
         self.chunks.clear();
 
         if self.alloc_bytes == 0 {
             return;
         }
 
-        unsafe { unmap_range(self.base_va, self.alloc_bytes as u64) };
+        unsafe {
+            unmap_range(self.base_va, self.alloc_bytes as u64);
+        }
+
         deallocate_kernel_range(self.base_va, self.alloc_bytes as u64);
+
         self.base_va = VirtAddr::new(0);
         self.alloc_bytes = 0;
         self.mapped_bytes = 0;

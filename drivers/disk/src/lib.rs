@@ -24,8 +24,8 @@ use kernel_api::{
         request::RequestData,
     },
     pnp::{
-        DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-        DriverStep, driver_set_evt_device_add, pnp_forward_request_to_next_lower,
+        DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
+        driver_set_evt_device_add, pnp_forward_request_to_next_lower,
     },
     request::{DeviceControl, Flush, Pnp, Read, RequestHandle, TraversalPolicy, Write},
     request_handler,
@@ -59,8 +59,10 @@ impl DeviceRead for DiskIo {
             cold_path();
             return DriverStep::complete(DriverStatus::Success);
         }
-
-        if unlikely(!has_from_device_buffer(&body.buffer, total)) {
+        let Some(buffer) = body.buffer.as_ref() else {
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        };
+        if unlikely(!has_from_device_buffer(buffer, total)) {
             cold_path();
             return DriverStep::complete(DriverStatus::InsufficientResources);
         }
@@ -105,8 +107,10 @@ impl DeviceWrite for DiskIo {
             cold_path();
             return DriverStep::complete(DriverStatus::Success);
         }
-
-        if unlikely(!has_to_device_buffer(&body.buffer, total)) {
+        let Some(buffer) = body.buffer.as_ref() else {
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        };
+        if unlikely(!has_to_device_buffer(&buffer, total)) {
             cold_path();
             return DriverStep::complete(DriverStatus::InsufficientResources);
         }
@@ -199,11 +203,11 @@ impl DeviceControlHandler for DiskIo {
     }
 }
 
-fn has_from_device_buffer(buffer: &IoBuffer<'_, Described, FromDevice>, len: usize) -> bool {
+fn has_from_device_buffer(buffer: &IoBuffer<'_, '_, Described, FromDevice>, len: usize) -> bool {
     buffer.len() >= len
 }
 
-fn has_to_device_buffer(buffer: &IoBuffer<'_, Described, ToDevice>, len: usize) -> bool {
+fn has_to_device_buffer(buffer: &IoBuffer<'_, '_, Described, ToDevice>, len: usize) -> bool {
     buffer.len() >= len
 }
 

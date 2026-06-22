@@ -614,9 +614,9 @@ impl<T> IoHandler<T> {
 pub trait DeviceRead {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'io, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'data>>,
+        req: &'b mut RequestHandle<'req, Read<'io>>,
         len: usize,
     ) -> FfiFuture<DriverStep>;
 }
@@ -624,9 +624,9 @@ pub trait DeviceRead {
 pub trait DeviceWrite {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'io, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'data>>,
+        req: &'b mut RequestHandle<'req, Write<'io>>,
         len: usize,
     ) -> FfiFuture<DriverStep>;
 }

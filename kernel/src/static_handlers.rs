@@ -56,8 +56,8 @@ use kernel_types::{
         C_SCHED_WAKEUPS_CONTEXT_SWITCHES,
     },
     dma::{
-        DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
-        DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
+        DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappedBuffer,
+        DmaMappingStrategy, DmaPciDeviceIdentity,
     },
     fdt::FdtHeader,
     fs::{OpenFlags, Path},
@@ -230,31 +230,12 @@ pub extern "C" fn kernel_dma_query_device_state(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_dma_map_buffer<'a>(
+pub extern "C" fn kernel_dma_map_buffer<'regions, 'frames>(
     device: &Arc<DeviceObject>,
-    buffer: IoBuffer<'a, PhysFramed, ToDevice>,
+    buffer: &DmaBufferView<'regions, 'frames>,
     strategy: DmaMappingStrategy,
-) -> Result<
-    IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
-    (IoBuffer<'a, PhysFramed, ToDevice>, DmaMapError),
-> {
+) -> Result<DmaMappedBuffer, DmaMapError> {
     dma::map_buffer(device, buffer, strategy)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_dma_unmap_buffer<'a>(
-    buffer: IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
-) -> IoBuffer<'a, PhysFramed, ToDevice> {
-    dma::unmap_buffer(buffer)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
-    device: &Arc<DeviceObject>,
-    buffer: &'map IoBuffer<'buffer, PhysFramed, ToDevice>,
-    strategy: DmaMappingStrategy,
-) -> Result<kernel_types::dma::BorrowedDmaMapping<'map>, DmaMapError> {
-    dma::map_buffer_ref(device, buffer, strategy)
 }
 
 #[no_mangle]

@@ -6,7 +6,7 @@ use kernel_api::kernel_types::disk_profile::{
     B_VIRTIO_DESCRIPTOR_SETUP, C_SCATTER_GATHER_SEGMENTS, C_VIRTIO_SUBMISSION_BYTES,
     C_VIRTIO_SUBMISSIONS,
 };
-use kernel_api::kernel_types::dma::{IoBufferDmaSegment, IOBUFFER_MAX_DMA_SEGMENT_CAPACITY};
+use kernel_api::kernel_types::dma::IoBufferDmaSegment;
 use kernel_api::memory::VirtAddr;
 
 use crate::dma_region::ContiguousDmaRegion;
@@ -219,12 +219,6 @@ pub fn reset_device(common_cfg: VirtAddr) {
     unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, 0) };
 }
 
-/// Maximum data descriptors accepted from an `IoBuffer` DMA mapping.
-pub const MAX_DATA_DESCRIPTORS: usize = IOBUFFER_MAX_DMA_SEGMENT_CAPACITY;
-/// Maximum descriptors in an indirect table.
-/// 1 for header + data descriptors + 1 for status.
-pub const MAX_INDIRECT_DESCRIPTORS: usize = MAX_DATA_DESCRIPTORS + 2;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitRequestError {
     QueueFull,
@@ -236,7 +230,7 @@ pub struct BlkSlot {
     pub header: VirtioBlkReqHeader, // 16 bytes
     pub status: u8,                 // 1 byte
     pub padding: [u8; 15],          // padding to keep array aligned
-    pub indirect_table: [VirtqDesc; MAX_INDIRECT_DESCRIPTORS],
+    pub indirect_table: [VirtqDesc; 256],
 }
 
 pub struct BlkIoSlots {
@@ -320,11 +314,6 @@ impl BlkIoSlots {
                 if unlikely(seg.byte_len == 0) {
                     cold_path();
                     continue;
-                }
-                if unlikely(segment_count == MAX_DATA_DESCRIPTORS) {
-                    cold_path();
-                    vq.free_desc(head);
-                    return Err(SubmitRequestError::TooManyDataSegments);
                 }
 
                 (*table_ptr.add(desc_count)).addr = seg.dma_addr;

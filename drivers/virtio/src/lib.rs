@@ -27,18 +27,20 @@ use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState}
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::disk_profile as dp;
+use kernel_api::dma::dma::DmaMapped;
+use kernel_api::dma::dma::IoBufferAccess;
+use kernel_api::dma::dma::PhysFramed;
+use kernel_api::dma::dma::ToDevice;
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::{
-    BorrowedDmaMapping, Described, DmaMappingStrategy, IoBuffer, IoBufferDirection, IoBufferState,
-};
 use kernel_api::kernel_types::disk_profile::{
     B_INTERRUPT_COMPLETION_HANDLING, B_VIRTIO_QUEUE_NOTIFY, B_WAITING_FOR_COMPLETION,
     C_LOCK_ACQUISITIONS, C_VIRTIO_COMPLETIONS, C_VIRTIO_QUEUE_KICKS,
 };
+use kernel_api::kernel_types::dma::{Described, DmaMappingStrategy, IoBuffer, IoBufferState};
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
@@ -152,34 +154,19 @@ pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> Driver
     }
 }
 
-pub(crate) fn virtio_data_mapping_strategy<State, D>(
-    buffer: &IoBuffer<'_, State, D>,
-) -> DmaMappingStrategy
-where
-    State: IoBufferState,
-    D: IoBufferDirection,
-{
-    if buffer.is_single_extent() {
-        DmaMappingStrategy::SingleContiguous
-    } else {
-        DmaMappingStrategy::ScatterGather
-    }
-}
-
-pub(crate) fn map_request_buffer<'map, 'buffer, Direction>(
+pub(crate) fn map_request_buffer<'buffer, D>(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBuffer<'buffer, Described, Direction>,
-) -> Result<BorrowedDmaMapping<'map>, DriverStatus>
+    buffer: IoBuffer<'buffer, 'buffer, Described, D>,
+) -> Result<IoBuffer<'buffer, 'buffer, DmaMapped<PhysFramed>, D>, DriverStatus>
 where
-    Direction: IoBufferDirection + 'map,
+    D: IoBufferAccess,
 {
-    let phys_framed = buffer.as_phys_framed();
-    kernel_api::dma::map_buffer_ref(
-        device,
-        phys_framed,
-        virtio_data_mapping_strategy(phys_framed),
-    )
-    .map_err(|_| DriverStatus::InsufficientResources)
+    let phys_framed = buffer
+        .into_phys_framed()
+        .map_err(|_| DriverStatus::InvalidParameter)?;
+
+    kernel_api::dma::map_buffer(device, phys_framed, DmaMappingStrategy::SingleContiguous)
+        .map_err(|_| DriverStatus::InsufficientResources)
 }
 
 #[cfg(not(test))]
@@ -574,12 +561,6 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
         };
 
         let vq_capacity = vq.size as usize;
-        let max_data_segments = core::cmp::min(
-            blk::MAX_INDIRECT_DESCRIPTORS.saturating_sub(2),
-            vq_capacity.saturating_sub(2),
-        );
-
-        let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
         let completion_slots = match completion::CompletionTable::new(vq_capacity) {
             Some(slots) => slots,
@@ -622,8 +603,6 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
         queue_states.push(QueueState {
             queue: RwLock::new(vq),
             arena,
-            max_request_bytes,
-            max_data_segments: max_data_segments as u16,
             irq_handle: UnsafeCell::new(irq_handle),
             msix_vector,
             msix_table_index,

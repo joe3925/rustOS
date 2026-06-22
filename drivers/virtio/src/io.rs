@@ -19,6 +19,10 @@ use kernel_api::benchmark::{
 };
 use kernel_api::device::DeviceObject;
 use kernel_api::disk_profile as dp;
+use kernel_api::dma::dma::DmaMapped;
+use kernel_api::dma::dma::IoBuffer;
+use kernel_api::dma::dma::IoBufferAccess;
+use kernel_api::dma::dma::PhysFramed;
 use kernel_api::kernel_types::disk_profile::{C_FLUSH_BARRIER_REQUESTS, C_LOCK_ACQUISITIONS};
 use kernel_api::kernel_types::dma::{FromDevice, IoBufferDmaSegment, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
@@ -26,7 +30,6 @@ use kernel_api::pnp::DriverStep;
 use kernel_api::request::{DeviceControl, Flush, Read, RequestHandle, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
-
 pub(crate) struct VirtioPdoIo;
 
 fn too_many_dma_segments_status(operation: &str) -> DriverStatus {
@@ -204,6 +207,13 @@ fn get_parent_inner(
     let inner = dx.inner.get().ok_or(DriverStatus::DeviceNotReady)?.clone();
     Ok((parent, inner))
 }
+struct PendingOp<'data, D>
+where
+    D: IoBufferAccess,
+{
+    sector: u64,
+    mapped_buffer: IoBuffer<'data, 'data, DmaMapped<PhysFramed>, D>,
+}
 #[inline(always)]
 pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
@@ -217,6 +227,7 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
             return complete_req(req, s);
         }
     };
+
     let (offset, len) = {
         let r = req.read();
         (r.body.offset, r.body.len)
@@ -226,161 +237,205 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
         cold_path();
         return complete_req(req, DriverStatus::Success);
     }
+
     if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
         cold_path();
         return complete_req(req, DriverStatus::InvalidParameter);
     }
 
-    let sector = offset >> 9;
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
     const MAX_CHAIN: usize = 8;
+
+    let mut pending: [Option<PendingOp<'data, FromDevice>>; MAX_CHAIN] =
+        core::array::from_fn(|_| None);
     let mut completions: [Option<crate::completion::CompletionToken<'_>>; MAX_CHAIN] =
         core::array::from_fn(|_| None);
-    let mut mapped_buffers: [Option<_>; MAX_CHAIN] = core::array::from_fn(|_| None);
-    let mut count = 0;
-    let mut current_ptr: *const Read = &req.read().body as *const _;
 
-    qs.submitting_tasks
-        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let mut pending_count = 0usize;
+    let mut submitted_count = 0usize;
     let mut force_notify = false;
     let mut status = DriverStatus::Success;
 
-    'transfer: while !current_ptr.is_null() {
-        if unlikely(count >= MAX_CHAIN) {
-            cold_path();
-            status = DriverStatus::InvalidParameter;
-            break 'transfer;
-        }
+    {
+        let mut guard = req.write();
+        let mut current_ptr: *mut Read<'data> = &mut guard.body;
 
-        let current = unsafe { &*current_ptr };
-        let offset = current.offset;
-        let len = current.len;
-
-        if unlikely(len == 0) {
-            current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
-            continue;
-        }
-        if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
-            cold_path();
-            status = DriverStatus::InvalidParameter;
-            break 'transfer;
-        }
-
-        let sector = offset >> 9;
-        let buffer = &current.buffer;
-        if unlikely(buffer.len() < len) {
-            cold_path();
-            status = DriverStatus::InvalidParameter;
-            break 'transfer;
-        }
-
-        let mapped_buffer = match map_request_buffer::<FromDevice>(&parent, buffer) {
-            Ok(b) => b,
-            Err(st) => {
+        while !current_ptr.is_null() {
+            if unlikely(pending_count >= MAX_CHAIN) {
                 cold_path();
-                status = st;
-                break 'transfer;
+                status = DriverStatus::InvalidParameter;
+                break;
             }
-        };
 
-        let completion = loop {
-            let completion = match qs.completion_slots.alloc() {
-                Some(c) => c,
-                None => {
+            let current = unsafe { &mut *current_ptr };
+            let next_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+
+            let offset = current.offset;
+            let len = current.len;
+
+            if unlikely(len == 0) {
+                current_ptr = next_ptr;
+                continue;
+            }
+
+            if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
+                cold_path();
+                status = DriverStatus::InvalidParameter;
+                break;
+            }
+
+            let Some(buffer) = current.buffer.take() else {
+                cold_path();
+                status = DriverStatus::InvalidParameter;
+                break;
+            };
+
+            if unlikely(buffer.len() < len) {
+                cold_path();
+                status = DriverStatus::InvalidParameter;
+                break;
+            }
+
+            let mapped_buffer = match map_request_buffer(&parent, buffer) {
+                Ok(b) => b,
+                Err(st) => {
                     cold_path();
-                    let drained = drain_queue_completions(qs);
-                    if unlikely(drained == 0) {
-                        let mut done = false;
-                        core::future::poll_fn(|cx| {
-                            if done {
-                                core::task::Poll::Ready(())
-                            } else {
-                                done = true;
-                                cx.waker().wake_by_ref();
-                                core::task::Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
-                    continue;
-                }
-            };
-            let mut completion = Some(completion);
-            let submitted = {
-                dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-                let mut vq = qs.queue.write();
-                let segments = mapped_buffer.dma_segments();
-                match qs
-                    .arena
-                    .submit_request(&mut vq, VIRTIO_BLK_T_IN, sector, segments, false)
-                {
-                    Ok(h) => {
-                        qs.completion_slots
-                            .attach(h, completion.as_ref().expect("completion missing"));
-                        if vq.num_free == 0 {
-                            force_notify = true;
-                        }
-                        true
-                    }
-                    Err(SubmitRequestError::QueueFull) => {
-                        cold_path();
-                        force_notify = true;
-                        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
-                        let profile_start = dp::timestamp_ns();
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
-                        false
-                    }
-                    Err(SubmitRequestError::TooManyDataSegments) => {
-                        cold_path();
-                        status = too_many_dma_segments_status("read");
-                        break 'transfer;
-                    }
+                    status = st;
+                    break;
                 }
             };
 
-            if submitted {
-                break completion.take().expect("completion missing");
-            }
+            pending[pending_count] = Some(PendingOp {
+                sector: offset >> 9,
+                mapped_buffer,
+            });
 
-            let mut done = false;
-            core::future::poll_fn(|cx| {
-                if done {
-                    core::task::Poll::Ready(())
-                } else {
-                    done = true;
-                    cx.waker().wake_by_ref();
-                    core::task::Poll::Pending
-                }
-            })
-            .await;
-        };
-
-        mapped_buffers[count] = Some(mapped_buffer);
-        completions[count] = Some(completion);
-        count += 1;
-        current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+            pending_count += 1;
+            current_ptr = next_ptr;
+        }
     }
 
-    if qs
-        .submitting_tasks
-        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
-        == 1
-        || force_notify
-    {
-        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
-        let profile_start = dp::timestamp_ns();
-        dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-        let mut vq = qs.queue.write();
-        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+    if status == DriverStatus::Success && pending_count != 0 {
+        qs.submitting_tasks
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+
+        'submit: for i in 0..pending_count {
+            let completion = loop {
+                let completion = match qs.completion_slots.alloc() {
+                    Some(c) => c,
+                    None => {
+                        cold_path();
+
+                        let drained = drain_queue_completions(qs);
+                        if unlikely(drained == 0) {
+                            let mut done = false;
+                            core::future::poll_fn(|cx| {
+                                if done {
+                                    core::task::Poll::Ready(())
+                                } else {
+                                    done = true;
+                                    cx.waker().wake_by_ref();
+                                    core::task::Poll::Pending
+                                }
+                            })
+                            .await;
+                        }
+
+                        continue;
+                    }
+                };
+
+                let mut completion = Some(completion);
+
+                let submitted = {
+                    dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+
+                    let mut vq = qs.queue.write();
+                    let pending_read = pending[i].as_ref().expect("pending read missing");
+                    let segments = pending_read.mapped_buffer.dma_segments();
+
+                    match qs.arena.submit_request(
+                        &mut vq,
+                        VIRTIO_BLK_T_IN,
+                        pending_read.sector,
+                        segments,
+                        false,
+                    ) {
+                        Ok(h) => {
+                            qs.completion_slots
+                                .attach(h, completion.as_ref().expect("completion missing"));
+
+                            if vq.num_free == 0 {
+                                force_notify = true;
+                            }
+
+                            true
+                        }
+                        Err(SubmitRequestError::QueueFull) => {
+                            cold_path();
+                            force_notify = true;
+
+                            dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+                            let profile_start = dp::timestamp_ns();
+
+                            vq.notify(inner.notify_base, inner.notify_off_multiplier);
+
+                            dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+                            false
+                        }
+                        Err(SubmitRequestError::TooManyDataSegments) => {
+                            cold_path();
+                            status = too_many_dma_segments_status("read");
+                            break 'submit;
+                        }
+                    }
+                };
+
+                if submitted {
+                    break completion.take().expect("completion missing");
+                }
+
+                let mut done = false;
+                core::future::poll_fn(|cx| {
+                    if done {
+                        core::task::Poll::Ready(())
+                    } else {
+                        done = true;
+                        cx.waker().wake_by_ref();
+                        core::task::Poll::Pending
+                    }
+                })
+                .await;
+            };
+
+            completions[submitted_count] = Some(completion);
+            submitted_count += 1;
+        }
+
+        if qs
+            .submitting_tasks
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
+            == 1
+            || force_notify
+        {
+            dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+
+            let profile_start = dp::timestamp_ns();
+
+            dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+
+            let mut vq = qs.queue.write();
+            vq.notify(inner.notify_base, inner.notify_off_multiplier);
+
+            dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+        }
     }
 
     let mut final_status = status;
 
-    for i in 0..count {
+    for i in 0..submitted_count {
         if let Some(completion) = completions[i].take() {
             match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
                 Ok(device_status) => {
@@ -391,16 +446,21 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                 }
                 Err(_) => {
                     cold_path();
+
                     let st = virtio_device_error(
                         "virtio-blk: read failed: completion canceled before device status",
                     );
+
                     if final_status == DriverStatus::Success {
                         final_status = st;
                     }
                 }
             }
         }
-        let _ = mapped_buffers[i].take(); // Drop mapping to unmap and copy bounce buffers back
+    }
+
+    for i in 0..pending_count {
+        let _ = pending[i].take();
     }
 
     complete_req(req, final_status)
@@ -428,161 +488,206 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
         cold_path();
         return complete_req(req, DriverStatus::Success);
     }
+
     if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
         cold_path();
         return complete_req(req, DriverStatus::InvalidParameter);
     }
 
-    let sector = offset >> 9;
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
     const MAX_CHAIN: usize = 8;
+
+    let mut pending: [Option<PendingOp<'data, ToDevice>>; MAX_CHAIN] =
+        core::array::from_fn(|_| None);
     let mut completions: [Option<crate::completion::CompletionToken<'_>>; MAX_CHAIN] =
         core::array::from_fn(|_| None);
-    let mut mapped_buffers: [Option<_>; MAX_CHAIN] = core::array::from_fn(|_| None);
-    let mut count = 0;
-    let mut current_ptr: *const Write = &req.read().body as *const _;
 
-    qs.submitting_tasks
-        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let mut pending_count = 0usize;
+    let mut submitted_count = 0usize;
     let mut force_notify = false;
     let mut status = DriverStatus::Success;
 
-    'transfer: while !current_ptr.is_null() {
-        if unlikely(count >= MAX_CHAIN) {
-            cold_path();
-            status = DriverStatus::InvalidParameter;
-            break 'transfer;
-        }
+    {
+        let mut req_guard = req.write();
+        let mut current_ptr: *mut Write<'data> = &mut req_guard.body;
 
-        let current = unsafe { &*current_ptr };
-        let offset = current.offset;
-        let len = current.len;
-
-        if unlikely(len == 0) {
-            current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
-            continue;
-        }
-        if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
-            cold_path();
-            status = DriverStatus::InvalidParameter;
-            break 'transfer;
-        }
-
-        let sector = offset >> 9;
-        let buffer = &current.buffer;
-        if unlikely(buffer.len() < len) {
-            cold_path();
-            status = DriverStatus::InvalidParameter;
-            break 'transfer;
-        }
-
-        let mapped_buffer = match map_request_buffer::<ToDevice>(&parent, buffer) {
-            Ok(b) => b,
-            Err(st) => {
+        while !current_ptr.is_null() {
+            if unlikely(pending_count >= MAX_CHAIN) {
                 cold_path();
-                status = st;
-                break 'transfer;
+                status = DriverStatus::InvalidParameter;
+                break;
             }
-        };
 
-        let completion = loop {
-            let completion = match qs.completion_slots.alloc() {
-                Some(c) => c,
-                None => {
+            let current = unsafe { &mut *current_ptr };
+            let next_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+
+            let offset = current.offset;
+            let len = current.len;
+
+            if unlikely(len == 0) {
+                current_ptr = next_ptr;
+                continue;
+            }
+
+            if unlikely((offset & 0x1FF) != 0 || (len & 0x1FF) != 0) {
+                cold_path();
+                status = DriverStatus::InvalidParameter;
+                break;
+            }
+
+            let Some(buffer) = current.buffer.take() else {
+                cold_path();
+                status = DriverStatus::InvalidParameter;
+                break;
+            };
+
+            if unlikely(buffer.len() < len) {
+                cold_path();
+                status = DriverStatus::InvalidParameter;
+                break;
+            }
+
+            let mapped_buffer = match map_request_buffer(&parent, buffer) {
+                Ok(b) => b,
+                Err(st) => {
                     cold_path();
-                    let drained = drain_queue_completions(qs);
-                    if unlikely(drained == 0) {
-                        let mut done = false;
-                        core::future::poll_fn(|cx| {
-                            if done {
-                                core::task::Poll::Ready(())
-                            } else {
-                                done = true;
-                                cx.waker().wake_by_ref();
-                                core::task::Poll::Pending
-                            }
-                        })
-                        .await;
-                    }
-                    continue;
-                }
-            };
-            let mut completion = Some(completion);
-            let submitted = {
-                dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-                let mut vq = qs.queue.write();
-                let segments = mapped_buffer.dma_segments();
-                match qs
-                    .arena
-                    .submit_request(&mut vq, VIRTIO_BLK_T_OUT, sector, segments, true)
-                {
-                    Ok(h) => {
-                        qs.completion_slots
-                            .attach(h, completion.as_ref().expect("completion missing"));
-                        if vq.num_free == 0 {
-                            force_notify = true;
-                        }
-                        true
-                    }
-                    Err(SubmitRequestError::QueueFull) => {
-                        cold_path();
-                        force_notify = true;
-                        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
-                        let profile_start = dp::timestamp_ns();
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
-                        false
-                    }
-                    Err(SubmitRequestError::TooManyDataSegments) => {
-                        cold_path();
-                        status = too_many_dma_segments_status("write");
-                        break 'transfer;
-                    }
+                    status = st;
+                    break;
                 }
             };
 
-            if submitted {
-                break completion.take().expect("completion missing");
-            }
+            pending[pending_count] = Some(PendingOp {
+                sector: offset >> 9,
+                mapped_buffer,
+            });
 
-            let mut done = false;
-            core::future::poll_fn(|cx| {
-                if done {
-                    core::task::Poll::Ready(())
-                } else {
-                    done = true;
-                    cx.waker().wake_by_ref();
-                    core::task::Poll::Pending
-                }
-            })
-            .await;
-        };
-
-        mapped_buffers[count] = Some(mapped_buffer);
-        completions[count] = Some(completion);
-        count += 1;
-        current_ptr = current.next.load(core::sync::atomic::Ordering::Acquire);
+            pending_count += 1;
+            current_ptr = next_ptr;
+        }
     }
 
-    if qs
-        .submitting_tasks
-        .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
-        == 1
-        || force_notify
-    {
-        dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
-        let profile_start = dp::timestamp_ns();
-        dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-        let mut vq = qs.queue.write();
-        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-        dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+    if status == DriverStatus::Success && pending_count != 0 {
+        qs.submitting_tasks
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+
+        'submit: for i in 0..pending_count {
+            let pending_write = pending[i].as_ref().expect("pending write missing");
+
+            let completion = loop {
+                let completion = match qs.completion_slots.alloc() {
+                    Some(c) => c,
+                    None => {
+                        cold_path();
+
+                        let drained = drain_queue_completions(qs);
+                        if unlikely(drained == 0) {
+                            let mut done = false;
+                            core::future::poll_fn(|cx| {
+                                if done {
+                                    core::task::Poll::Ready(())
+                                } else {
+                                    done = true;
+                                    cx.waker().wake_by_ref();
+                                    core::task::Poll::Pending
+                                }
+                            })
+                            .await;
+                        }
+
+                        continue;
+                    }
+                };
+
+                let mut completion = Some(completion);
+
+                let submitted = {
+                    dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+
+                    let mut vq = qs.queue.write();
+                    let segments = pending_write.mapped_buffer.dma_segments();
+
+                    match qs.arena.submit_request(
+                        &mut vq,
+                        VIRTIO_BLK_T_OUT,
+                        pending_write.sector,
+                        segments,
+                        true,
+                    ) {
+                        Ok(h) => {
+                            qs.completion_slots
+                                .attach(h, completion.as_ref().expect("completion missing"));
+
+                            if vq.num_free == 0 {
+                                force_notify = true;
+                            }
+
+                            true
+                        }
+                        Err(SubmitRequestError::QueueFull) => {
+                            cold_path();
+                            force_notify = true;
+
+                            dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+                            let profile_start = dp::timestamp_ns();
+
+                            vq.notify(inner.notify_base, inner.notify_off_multiplier);
+
+                            dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+                            false
+                        }
+                        Err(SubmitRequestError::TooManyDataSegments) => {
+                            cold_path();
+                            status = too_many_dma_segments_status("write");
+                            break 'submit;
+                        }
+                    }
+                };
+
+                if submitted {
+                    break completion.take().expect("completion missing");
+                }
+
+                let mut done = false;
+                core::future::poll_fn(|cx| {
+                    if done {
+                        core::task::Poll::Ready(())
+                    } else {
+                        done = true;
+                        cx.waker().wake_by_ref();
+                        core::task::Poll::Pending
+                    }
+                })
+                .await;
+            };
+
+            completions[submitted_count] = Some(completion);
+            submitted_count += 1;
+        }
+
+        if qs
+            .submitting_tasks
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel)
+            == 1
+            || force_notify
+        {
+            dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
+
+            let profile_start = dp::timestamp_ns();
+
+            dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+
+            let mut vq = qs.queue.write();
+            vq.notify(inner.notify_base, inner.notify_off_multiplier);
+
+            dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
+        }
     }
 
     let mut final_status = status;
 
-    for i in 0..count {
+    for i in 0..submitted_count {
         if let Some(completion) = completions[i].take() {
             match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
                 Ok(device_status) => {
@@ -593,16 +698,21 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                 }
                 Err(_) => {
                     cold_path();
+
                     let st = virtio_device_error(
                         "virtio-blk: write failed: completion canceled before device status",
                     );
+
                     if final_status == DriverStatus::Success {
                         final_status = st;
                     }
                 }
             }
         }
-        let _ = mapped_buffers[i].take(); // Drop mapping to unmap and copy bounce buffers back
+    }
+
+    for i in 0..pending_count {
+        let _ = pending[i].take();
     }
 
     complete_req(req, final_status)
