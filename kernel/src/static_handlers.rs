@@ -232,7 +232,7 @@ pub extern "C" fn kernel_dma_query_device_state(
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_map_buffer<'regions, 'frames>(
     device: &Arc<DeviceObject>,
-    buffer: &DmaBufferView<'regions, 'frames>,
+    buffer: &DmaBufferView<'regions>,
     strategy: DmaMappingStrategy,
 ) -> Result<DmaMappedBuffer, DmaMapError> {
     dma::map_buffer(device, buffer, strategy)

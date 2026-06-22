@@ -106,7 +106,7 @@ unsafe extern "C" {
     pub fn kernel_dma_query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState>;
     pub fn kernel_dma_map_buffer<'regions, 'frames>(
         device: &Arc<DeviceObject>,
-        buffer: &DmaBufferView<'regions, 'frames>,
+        buffer: &DmaBufferView<'regions>,
         strategy: DmaMappingStrategy,
     ) -> Result<DmaMappedBuffer, DmaMapError>;
 

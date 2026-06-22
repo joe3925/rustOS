@@ -254,6 +254,7 @@ impl IoBufferExtent {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoBufferError {
+    AllocationFailed,
     PageCapacityExceeded {
         required: usize,
         capacity: usize,
@@ -380,6 +381,78 @@ struct BuiltBacking<'data> {
     byte_len: usize,
     extents: Vec<IoBufferExtent>,
     frames: Vec<IoBufferPageFrame>,
+}
+
+pub struct IoBufferBackingScratch {
+    extents: Vec<IoBufferExtent>,
+    frames: Vec<IoBufferPageFrame>,
+    leases: Box<[LeaseSlot]>,
+    dma_records: Vec<DmaRecord>,
+}
+
+impl Default for IoBufferBackingScratch {
+    fn default() -> Self {
+        Self {
+            extents: Vec::new(),
+            frames: Vec::new(),
+            leases: Vec::<LeaseSlot>::new().into_boxed_slice(),
+            dma_records: Vec::new(),
+        }
+    }
+}
+
+impl IoBufferBackingScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(config: IoBufferBackingConfig) -> Result<Self, IoBufferError> {
+        let mut scratch = Self::new();
+        scratch.ensure_capacity(config)?;
+        Ok(scratch)
+    }
+
+    pub fn clear(&mut self) {
+        self.extents.clear();
+        self.frames.clear();
+
+        for slot in self.leases.iter_mut() {
+            *slot = LeaseSlot::free();
+        }
+
+        for record in self.dma_records.iter_mut() {
+            *record = DmaRecord::empty();
+        }
+    }
+
+    pub fn ensure_capacity(&mut self, config: IoBufferBackingConfig) -> Result<(), IoBufferError> {
+        if self.leases.len() < config.lease_capacity {
+            let mut leases = Vec::new();
+            leases
+                .try_reserve_exact(config.lease_capacity)
+                .map_err(|_| IoBufferError::AllocationFailed)?;
+
+            for _ in 0..config.lease_capacity {
+                leases.push(LeaseSlot::free());
+            }
+
+            self.leases = leases.into_boxed_slice();
+        }
+
+        if self.dma_records.len() < config.dma_record_capacity {
+            if self.dma_records.capacity() < config.dma_record_capacity {
+                self.dma_records
+                    .try_reserve_exact(config.dma_record_capacity - self.dma_records.capacity())
+                    .map_err(|_| IoBufferError::AllocationFailed)?;
+            }
+
+            while self.dma_records.len() < config.dma_record_capacity {
+                self.dma_records.push(DmaRecord::empty());
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub type DmaUnmapFn = extern "C" fn(&Arc<DeviceObject>, usize);
@@ -665,16 +738,73 @@ impl<'data> IoBufferBacking<'data> {
         desc: IoBufferBackingDesc<'data>,
         config: IoBufferBackingConfig,
     ) -> Result<Self, IoBufferError> {
-        let built = build_backing(desc)?;
+        Self::from_scratch(desc, config, IoBufferBackingScratch::new())
+    }
+
+    pub fn from_scratch(
+        desc: IoBufferBackingDesc<'data>,
+        config: IoBufferBackingConfig,
+        mut scratch: IoBufferBackingScratch,
+    ) -> Result<Self, IoBufferError> {
+        scratch.clear();
+        scratch.ensure_capacity(config)?;
+
+        let (memory, byte_len) =
+            build_backing_into(desc, &mut scratch.extents, &mut scratch.frames)?;
+
+        let IoBufferBackingScratch {
+            extents,
+            frames,
+            leases,
+            dma_records,
+        } = scratch;
+
         Ok(Self {
-            memory: built.memory,
-            byte_len: built.byte_len,
-            extents: built.extents,
-            frames: built.frames,
-            leases: RwLock::new(make_lease_slots(config.lease_capacity)),
+            memory,
+            byte_len,
+            extents,
+            frames,
+            leases: RwLock::new(leases),
             lease_alloc_lock: Mutex::new(()),
-            dma_records: Mutex::new(make_dma_records(config.dma_record_capacity)),
+            dma_records: Mutex::new(dma_records),
         })
+    }
+
+    pub fn into_scratch(self) -> IoBufferBackingScratch {
+        debug_assert_eq!(self.active_lease_count(), 0);
+
+        debug_assert!({
+            let records = self.dma_records.lock();
+            !records.iter().any(|record| record.active)
+        });
+
+        let IoBufferBacking {
+            mut extents,
+            mut frames,
+            leases,
+            dma_records,
+            ..
+        } = self;
+
+        extents.clear();
+        frames.clear();
+
+        let mut leases = leases.into_inner();
+        for slot in leases.iter_mut() {
+            *slot = LeaseSlot::free();
+        }
+
+        let mut dma_records = dma_records.into_inner();
+        for record in dma_records.iter_mut() {
+            *record = DmaRecord::empty();
+        }
+
+        IoBufferBackingScratch {
+            extents,
+            frames,
+            leases,
+            dma_records,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -719,19 +849,17 @@ impl<'data> IoBufferBacking<'data> {
         self.reject_active_leases()?;
         self.reject_active_dma_records()?;
 
-        let built = build_backing(desc)?;
-        self.memory = built.memory;
-        self.byte_len = built.byte_len;
-
+        self.memory = BackingMemory::None;
+        self.byte_len = 0;
         self.extents.clear();
-        self.extents.reserve(built.extents.len());
-        self.extents.extend_from_slice(&built.extents);
-
         self.frames.clear();
-        self.frames.reserve(built.frames.len());
-        self.frames.extend_from_slice(&built.frames);
 
+        let (memory, byte_len) = build_backing_into(desc, &mut self.extents, &mut self.frames)?;
+
+        self.memory = memory;
+        self.byte_len = byte_len;
         self.clear_dma_records();
+
         Ok(())
     }
 
@@ -739,18 +867,7 @@ impl<'data> IoBufferBacking<'data> {
         &mut self,
         desc: IoBufferBackingDesc<'data>,
     ) -> Result<(), IoBufferError> {
-        self.reject_active_leases()?;
-        self.reject_active_dma_records()?;
-
-        let built = build_backing(desc)?;
-        self.memory = built.memory;
-        self.byte_len = built.byte_len;
-        self.extents = built.extents;
-        self.frames = built.frames;
-        self.extents.shrink_to_fit();
-        self.frames.shrink_to_fit();
-        self.clear_dma_records();
-        Ok(())
+        self.redescribe(desc)
     }
 
     pub fn create_from_device<'backing>(
@@ -1178,7 +1295,17 @@ impl<'backing, 'data, State: IoBufferState, Access: IoBufferAccess>
             Err(err) => Err((ManuallyDrop::into_inner(this), err)),
         }
     }
+    pub fn dma_buffer_view(&self) -> Result<DmaBufferView<'_>, IoBufferError> {
+        let snapshot = self.snapshot()?;
 
+        Ok(DmaBufferView::from_iobuffer_parts(
+            snapshot.len,
+            &self.backing.extents,
+            &self.backing.frames,
+            snapshot.start,
+            snapshot.len,
+        ))
+    }
     pub fn regions(&self) -> IoBufferRegionIter<'_> {
         let snapshot = self.snapshot().unwrap_or(LeaseSnapshot {
             generation: 0,
@@ -1777,72 +1904,10 @@ fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 fn build_backing<'data>(
     desc: IoBufferBackingDesc<'data>,
 ) -> Result<BuiltBacking<'data>, IoBufferError> {
-    match desc {
-        IoBufferBackingDesc::Slice(bytes) => build_virtual_backing(
-            BackingMemory::SingleRead {
-                ptr: bytes.as_ptr() as usize,
-                len: bytes.len(),
-                _data: PhantomData,
-            },
-            &[(bytes.as_ptr() as usize, bytes.len())],
-        ),
-        IoBufferBackingDesc::SliceMut(bytes) => build_virtual_backing(
-            BackingMemory::SingleWrite {
-                ptr: bytes.as_mut_ptr() as usize,
-                len: bytes.len(),
-                _data: PhantomData,
-            },
-            &[(bytes.as_mut_ptr() as usize, bytes.len())],
-        ),
-        IoBufferBackingDesc::Segments(segments) => {
-            let mut regions = Vec::with_capacity(segments.len());
-            for segment in segments {
-                regions.push((segment.as_ptr() as usize, segment.len()));
-            }
-            build_virtual_backing(BackingMemory::SegmentedRead(PhantomData), &regions)
-        }
-        IoBufferBackingDesc::SegmentsMut(segments) => {
-            validate_mut_segments_disjoint(&segments)?;
-            let mut regions = Vec::with_capacity(segments.len());
-            for segment in segments {
-                regions.push((segment.as_ptr() as usize, segment.len()));
-            }
-            build_virtual_backing(BackingMemory::SegmentedWrite(PhantomData), &regions)
-        }
-        IoBufferBackingDesc::Frames {
-            frame_offset,
-            byte_len,
-            frames,
-        } => build_physical_backing(frame_offset, byte_len, frames),
-        IoBufferBackingDesc::PhysicalExtents { frames, extents } => {
-            build_physical_extent_backing(frames, extents)
-        }
-    }
-}
-
-fn build_virtual_backing<'data>(
-    memory: BackingMemory<'data>,
-    regions: &[(usize, usize)],
-) -> Result<BuiltBacking<'data>, IoBufferError> {
     let mut extents = Vec::new();
     let mut frames = Vec::new();
-    let mut byte_len = 0usize;
 
-    for &(virt_addr, len) in regions {
-        let first_frame = frames.len();
-        let (frame_count, frame_offset) =
-            describe_virtual_buffer_to_frames(virt_addr, len, &mut frames)?;
-        extents.push(IoBufferExtent::new(
-            Some(virt_addr),
-            frame_offset,
-            len,
-            first_frame,
-            frame_count,
-        ));
-        byte_len = byte_len
-            .checked_add(len)
-            .ok_or(IoBufferError::LengthOverflow)?;
-    }
+    let (memory, byte_len) = build_backing_into(desc, &mut extents, &mut frames)?;
 
     Ok(BuiltBacking {
         memory,
@@ -1852,13 +1917,146 @@ fn build_virtual_backing<'data>(
     })
 }
 
-fn build_physical_backing<'data>(
+fn build_backing_into<'data>(
+    desc: IoBufferBackingDesc<'data>,
+    extents: &mut Vec<IoBufferExtent>,
+    frames: &mut Vec<IoBufferPageFrame>,
+) -> Result<(BackingMemory<'data>, usize), IoBufferError> {
+    extents.clear();
+    frames.clear();
+
+    match desc {
+        IoBufferBackingDesc::Slice(bytes) => {
+            let memory = BackingMemory::SingleRead {
+                ptr: bytes.as_ptr() as usize,
+                len: bytes.len(),
+                _data: PhantomData,
+            };
+
+            let byte_len = build_virtual_backing_from_iter(
+                core::iter::once((bytes.as_ptr() as usize, bytes.len())),
+                extents,
+                frames,
+            )?;
+
+            Ok((memory, byte_len))
+        }
+        IoBufferBackingDesc::SliceMut(bytes) => {
+            let memory = BackingMemory::SingleWrite {
+                ptr: bytes.as_mut_ptr() as usize,
+                len: bytes.len(),
+                _data: PhantomData,
+            };
+
+            let byte_len = build_virtual_backing_from_iter(
+                core::iter::once((bytes.as_mut_ptr() as usize, bytes.len())),
+                extents,
+                frames,
+            )?;
+
+            Ok((memory, byte_len))
+        }
+        IoBufferBackingDesc::Segments(segments) => {
+            let memory = BackingMemory::SegmentedRead(PhantomData);
+
+            let byte_len = build_virtual_backing_from_iter(
+                segments
+                    .iter()
+                    .map(|segment| (segment.as_ptr() as usize, segment.len())),
+                extents,
+                frames,
+            )?;
+
+            Ok((memory, byte_len))
+        }
+        IoBufferBackingDesc::SegmentsMut(segments) => {
+            validate_mut_segments_disjoint(&segments)?;
+
+            let memory = BackingMemory::SegmentedWrite(PhantomData);
+
+            let byte_len = build_virtual_backing_from_iter(
+                segments
+                    .iter()
+                    .map(|segment| (segment.as_ptr() as usize, segment.len())),
+                extents,
+                frames,
+            )?;
+
+            Ok((memory, byte_len))
+        }
+        IoBufferBackingDesc::Frames {
+            frame_offset,
+            byte_len,
+            frames: source_frames,
+        } => {
+            let byte_len = build_physical_backing_into(
+                frame_offset,
+                byte_len,
+                source_frames,
+                extents,
+                frames,
+            )?;
+
+            Ok((BackingMemory::None, byte_len))
+        }
+        IoBufferBackingDesc::PhysicalExtents {
+            frames: source_frames,
+            extents: source_extents,
+        } => {
+            let byte_len =
+                build_physical_extent_backing_into(source_frames, source_extents, extents, frames)?;
+
+            Ok((BackingMemory::None, byte_len))
+        }
+    }
+}
+
+fn build_virtual_backing_from_iter<I>(
+    regions: I,
+    extents: &mut Vec<IoBufferExtent>,
+    frames: &mut Vec<IoBufferPageFrame>,
+) -> Result<usize, IoBufferError>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
+    let mut byte_len = 0usize;
+
+    for (virt_addr, len) in regions {
+        let first_frame = frames.len();
+
+        let (frame_count, frame_offset) =
+            describe_virtual_buffer_to_frames(virt_addr, len, frames)?;
+
+        extents
+            .try_reserve_exact(1)
+            .map_err(|_| IoBufferError::AllocationFailed)?;
+
+        extents.push(IoBufferExtent::new(
+            Some(virt_addr),
+            frame_offset,
+            len,
+            first_frame,
+            frame_count,
+        ));
+
+        byte_len = byte_len
+            .checked_add(len)
+            .ok_or(IoBufferError::LengthOverflow)?;
+    }
+
+    Ok(byte_len)
+}
+
+fn build_physical_backing_into(
     frame_offset: usize,
     byte_len: usize,
-    frames: &[IoBufferPageFrame],
-) -> Result<BuiltBacking<'data>, IoBufferError> {
-    validate_physical_frames(frame_offset, byte_len, frames)?;
-    let virtual_addr = frames.first().and_then(|frame| {
+    source_frames: &[IoBufferPageFrame],
+    extents: &mut Vec<IoBufferExtent>,
+    frames: &mut Vec<IoBufferPageFrame>,
+) -> Result<usize, IoBufferError> {
+    validate_physical_frames(frame_offset, byte_len, source_frames)?;
+
+    let virtual_addr = source_frames.first().and_then(|frame| {
         let base = frame.cpu_address().as_u64() as usize;
         if base == 0 {
             None
@@ -1867,33 +2065,47 @@ fn build_physical_backing<'data>(
         }
     });
 
-    let extents = alloc::vec![IoBufferExtent::new(
+    extents
+        .try_reserve_exact(1)
+        .map_err(|_| IoBufferError::AllocationFailed)?;
+
+    frames
+        .try_reserve_exact(source_frames.len())
+        .map_err(|_| IoBufferError::AllocationFailed)?;
+
+    extents.push(IoBufferExtent::new(
         virtual_addr,
         frame_offset,
         byte_len,
         0,
-        frames.len(),
-    )];
+        source_frames.len(),
+    ));
 
-    Ok(BuiltBacking {
-        memory: BackingMemory::None,
-        byte_len,
-        extents,
-        frames: frames.to_vec(),
-    })
+    frames.extend_from_slice(source_frames);
+
+    Ok(byte_len)
 }
 
-fn build_physical_extent_backing<'data>(
-    frames: &[IoBufferPageFrame],
-    extents: &[IoBufferExtent],
-) -> Result<BuiltBacking<'data>, IoBufferError> {
-    let byte_len = validate_physical_extents(frames, extents)?;
-    Ok(BuiltBacking {
-        memory: BackingMemory::None,
-        byte_len,
-        extents: extents.to_vec(),
-        frames: frames.to_vec(),
-    })
+fn build_physical_extent_backing_into(
+    source_frames: &[IoBufferPageFrame],
+    source_extents: &[IoBufferExtent],
+    extents: &mut Vec<IoBufferExtent>,
+    frames: &mut Vec<IoBufferPageFrame>,
+) -> Result<usize, IoBufferError> {
+    let byte_len = validate_physical_extents(source_frames, source_extents)?;
+
+    extents
+        .try_reserve_exact(source_extents.len())
+        .map_err(|_| IoBufferError::AllocationFailed)?;
+
+    frames
+        .try_reserve_exact(source_frames.len())
+        .map_err(|_| IoBufferError::AllocationFailed)?;
+
+    extents.extend_from_slice(source_extents);
+    frames.extend_from_slice(source_frames);
+
+    Ok(byte_len)
 }
 
 fn describe_virtual_buffer_to_frames(
@@ -1931,6 +2143,10 @@ fn describe_virtual_buffer_to_frames(
         let current_base_va = current
             .checked_sub(offset)
             .ok_or(IoBufferError::TranslationFailed { virt_addr: current })?;
+
+        frames
+            .try_reserve_exact(1)
+            .map_err(|_| IoBufferError::AllocationFailed)?;
 
         frames.push(IoBufferPageFrame::new(
             translated.phys_addr,
@@ -2558,30 +2774,77 @@ impl<'frames> DmaBufferRegion<'frames> {
             frames,
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.byte_len == 0
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DmaBufferView<'regions, 'frames> {
-    pub byte_len: usize,
-    pub regions: &'regions [DmaBufferRegion<'frames>],
-}
-
-impl<'regions, 'frames> DmaBufferView<'regions, 'frames> {
-    pub const fn new(byte_len: usize, regions: &'regions [DmaBufferRegion<'frames>]) -> Self {
-        Self { byte_len, regions }
+    #[inline]
+    pub const fn frame_offset(&self) -> usize {
+        self.frame_offset
     }
 
-    pub fn len(&self) -> usize {
+    #[inline]
+    pub const fn len(&self) -> usize {
         self.byte_len
     }
 
+    #[inline]
+    pub const fn page_frames(&self) -> &'frames [IoBufferPageFrame] {
+        self.frames
+    }
     pub fn is_empty(&self) -> bool {
         self.byte_len == 0
+    }
+}
+
+pub enum DmaBufferRegionSource<'a> {
+    Slice(&'a [DmaBufferRegion<'a>]),
+
+    IoBuffer {
+        extents: &'a [IoBufferExtent],
+        frames: &'a [IoBufferPageFrame],
+        start: usize,
+        len: usize,
+    },
+}
+
+pub struct DmaBufferView<'a> {
+    byte_len: usize,
+    source: DmaBufferRegionSource<'a>,
+}
+
+impl<'a> DmaBufferView<'a> {
+    pub const fn new(byte_len: usize, regions: &'a [DmaBufferRegion<'a>]) -> Self {
+        Self {
+            byte_len,
+            source: DmaBufferRegionSource::Slice(regions),
+        }
+    }
+
+    pub const fn from_iobuffer_parts(
+        byte_len: usize,
+        extents: &'a [IoBufferExtent],
+        frames: &'a [IoBufferPageFrame],
+        start: usize,
+        len: usize,
+    ) -> Self {
+        Self {
+            byte_len,
+            source: DmaBufferRegionSource::IoBuffer {
+                extents,
+                frames,
+                start,
+                len,
+            },
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+
+    pub fn regions(&self) -> DmaBufferRegionIter<'a, '_> {
+        DmaBufferRegionIter::new(&self.source)
     }
 }
 
@@ -2592,4 +2855,141 @@ pub struct DmaMappedBuffer {
     pub mapped_by: Arc<DeviceObject>,
     pub unmap: DmaUnmapFn,
     pub cookie: usize,
+}
+pub struct DmaBufferRegionIter<'a, 'view> {
+    source: &'view DmaBufferRegionSource<'a>,
+    slice_index: usize,
+    extent_index: usize,
+    logical_cursor: usize,
+    view_start: usize,
+    view_end: usize,
+}
+
+impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
+    fn new(source: &'view DmaBufferRegionSource<'a>) -> Self {
+        let (view_start, view_end) = match *source {
+            DmaBufferRegionSource::Slice(_) => (0, usize::MAX),
+            DmaBufferRegionSource::IoBuffer { start, len, .. } => {
+                (start, start.saturating_add(len))
+            }
+        };
+
+        Self {
+            source,
+            slice_index: 0,
+            extent_index: 0,
+            logical_cursor: 0,
+            view_start,
+            view_end,
+        }
+    }
+}
+
+impl<'a, 'view> Iterator for DmaBufferRegionIter<'a, 'view> {
+    type Item = DmaBufferRegion<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match *self.source {
+            DmaBufferRegionSource::Slice(regions) => {
+                let region = *regions.get(self.slice_index)?;
+                self.slice_index += 1;
+                Some(region)
+            }
+            DmaBufferRegionSource::IoBuffer {
+                extents, frames, ..
+            } => self.next_iobuffer_region(extents, frames),
+        }
+    }
+}
+
+impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
+    fn next_iobuffer_region(
+        &mut self,
+        extents: &'a [IoBufferExtent],
+        frames: &'a [IoBufferPageFrame],
+    ) -> Option<DmaBufferRegion<'a>> {
+        while self.extent_index < extents.len() {
+            let extent = extents[self.extent_index];
+
+            let extent_start = self.logical_cursor;
+            let extent_end = extent_start.checked_add(extent.byte_len)?;
+
+            self.logical_cursor = extent_end;
+            self.extent_index += 1;
+
+            let start = core::cmp::max(extent_start, self.view_start);
+            let end = core::cmp::min(extent_end, self.view_end);
+
+            if start >= end {
+                continue;
+            }
+
+            let offset_in_extent = start.checked_sub(extent_start)?;
+            let region_len = end.checked_sub(start)?;
+
+            let (first_frame, frame_count, frame_offset) = extent_subrange_frames_for_dma_region(
+                extent,
+                frames,
+                offset_in_extent,
+                region_len,
+            )?;
+
+            let frame_end = first_frame.checked_add(frame_count)?;
+            let region_frames = frames.get(first_frame..frame_end)?;
+
+            return Some(DmaBufferRegion::new(
+                frame_offset,
+                region_len,
+                region_frames,
+            ));
+        }
+
+        None
+    }
+}
+
+fn extent_subrange_frames_for_dma_region(
+    extent: IoBufferExtent,
+    frames: &[IoBufferPageFrame],
+    offset_in_extent: usize,
+    len: usize,
+) -> Option<(usize, usize, usize)> {
+    let mut frame_index = extent.first_frame;
+    let frame_end = extent.first_frame.checked_add(extent.frame_count)?;
+    let mut frame_offset = extent.frame_offset.checked_add(offset_in_extent)?;
+
+    while frame_index < frame_end {
+        let frame_len = frames.get(frame_index)?.byte_len as usize;
+
+        if frame_offset < frame_len {
+            break;
+        }
+
+        frame_offset -= frame_len;
+        frame_index += 1;
+    }
+
+    if frame_index >= frame_end {
+        return None;
+    }
+
+    let first_frame = frame_index;
+    let first_offset = frame_offset;
+    let mut remaining = len;
+
+    while frame_index < frame_end && remaining != 0 {
+        let frame_len = frames.get(frame_index)?.byte_len as usize;
+        let available = frame_len.saturating_sub(frame_offset);
+        let take = core::cmp::min(available, remaining);
+
+        remaining -= take;
+        frame_index += 1;
+        frame_offset = 0;
+    }
+
+    if remaining == 0 {
+        Some((first_frame, frame_index - first_frame, first_offset))
+    } else {
+        None
+    }
 }

@@ -1,14 +1,12 @@
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::cmp::min;
 use core::marker::PhantomData;
 
 use kernel_types::device::DeviceObject;
 pub use kernel_types::dma;
 use kernel_types::dma::{
-    DmaBufferRegion, DmaBufferView, DmaMapError, DmaMapped, DmaMappedBuffer, DmaMappingStrategy,
-    IoBuffer, IoBufferAccess, IoBufferDmaSegment, IoBufferError, IoBufferPageFrame,
-    MappableIoBufferState,
+    DmaBufferView, DmaMapError, DmaMapped, DmaMappedBuffer, DmaMappingStrategy, IoBuffer,
+    IoBufferAccess, IoBufferDmaSegment, IoBufferError, IoBufferPageFrame, MappableIoBufferState,
 };
 use kernel_types::status::DriverStatus;
 
@@ -52,16 +50,20 @@ where
     S: MappableIoBufferState,
     A: IoBufferAccess,
 {
-    let regions = match describe_dma_buffer(&buffer) {
-        Ok(regions) => regions,
+    let view = match describe_dma_buffer(&buffer) {
+        Ok(view) => view,
         Err(err) => return Err((buffer, err)),
     };
 
-    let view = DmaBufferView::new(buffer.len(), regions.as_slice());
     let mapped = match unsafe { kernel_sys::kernel_dma_map_buffer(device, &view, strategy) } {
         Ok(mapped) => mapped,
-        Err(err) => return Err((buffer, err)),
+        Err(err) => {
+            drop(view);
+            return Err((buffer, err));
+        }
     };
+
+    drop(view);
 
     match buffer.apply_dma_mapping(
         mapped.layout,
@@ -99,8 +101,7 @@ where
     S: MappableIoBufferState,
     A: IoBufferAccess,
 {
-    let regions = describe_dma_buffer(buffer)?;
-    let view = DmaBufferView::new(buffer.len(), regions.as_slice());
+    let view = describe_dma_buffer(buffer)?;
     let mapped = unsafe { kernel_sys::kernel_dma_map_buffer(device, &view, strategy) }?;
 
     Ok(BorrowedDmaMapping {
@@ -109,14 +110,14 @@ where
         unmap: mapped.unmap,
         cookie: mapped.cookie,
         byte_len: buffer.len(),
-        regions,
+        view,
         _buffer: PhantomData,
     })
 }
 
 fn describe_dma_buffer<'map, 'backing, 'data, S, A>(
     buffer: &'map IoBuffer<'backing, 'data, S, A>,
-) -> Result<Vec<DmaBufferRegion<'map>>, DmaMapError>
+) -> Result<DmaBufferView<'map>, DmaMapError>
 where
     S: MappableIoBufferState,
     A: IoBufferAccess,
@@ -125,16 +126,19 @@ where
         return Err(DmaMapError::InvalidSize);
     }
 
-    let mut regions = Vec::new();
-    let mut described_len = 0usize;
+    let view = buffer
+        .dma_buffer_view()
+        .map_err(|_| DmaMapError::InvalidSize)?;
 
-    for region in buffer.regions() {
+    let mut described_len = 0usize;
+    let mut region_count = 0usize;
+
+    for region in view.regions() {
         if region.is_empty() {
             continue;
         }
 
-        let frames = region.page_frames();
-        if frames.is_empty() {
+        if region.page_frames().is_empty() {
             return Err(DmaMapError::InvalidSize);
         }
 
@@ -142,18 +146,14 @@ where
             .checked_add(region.len())
             .ok_or(DmaMapError::InvalidSize)?;
 
-        regions.push(DmaBufferRegion::new(
-            region.frame_offset(),
-            region.len(),
-            frames,
-        ));
+        region_count += 1;
     }
 
-    if regions.is_empty() || described_len != buffer.len() {
+    if region_count == 0 || described_len != buffer.len() {
         return Err(DmaMapError::InvalidSize);
     }
 
-    Ok(regions)
+    Ok(view)
 }
 
 fn unmap_kernel_mapping(mapped: DmaMappedBuffer) {
@@ -178,7 +178,7 @@ pub struct BorrowedDmaMapping<'map> {
     unmap: dma::DmaUnmapFn,
     cookie: usize,
     byte_len: usize,
-    regions: Vec<DmaBufferRegion<'map>>,
+    view: DmaBufferView<'map>,
     _buffer: PhantomData<&'map ()>,
 }
 
@@ -196,7 +196,7 @@ impl<'map> BorrowedDmaMapping<'map> {
     }
 
     pub fn dma_segments(&self) -> BorrowedDmaSegmentIter<'_, 'map> {
-        BorrowedDmaSegmentIter::new(self.layout, self.byte_len, self.regions.as_slice())
+        BorrowedDmaSegmentIter::new(self.layout, self.byte_len, &self.view)
     }
 
     pub fn segment_count(&self) -> usize {
@@ -214,9 +214,9 @@ impl<'map> Drop for BorrowedDmaMapping<'map> {
     }
 }
 
-pub struct BorrowedDmaSegmentIter<'regions, 'frames> {
+pub struct BorrowedDmaSegmentIter<'view, 'frames> {
     layout: dma::IoBufferDmaMappingLayout,
-    regions: &'regions [DmaBufferRegion<'frames>],
+    regions: kernel_types::dma::DmaBufferRegionIter<'frames, 'view>,
     byte_len: usize,
     index: usize,
     remaining: usize,
@@ -224,24 +224,24 @@ pub struct BorrowedDmaSegmentIter<'regions, 'frames> {
     page_offset: usize,
     page_size: usize,
     iova_cursor: u64,
-    region_index: usize,
     region_page_index: usize,
     region_page_count: usize,
     region_remaining: usize,
+    identity_frames: &'frames [IoBufferPageFrame],
     identity_frame_index: usize,
     identity_frame_offset: usize,
     identity_remaining: usize,
 }
 
-impl<'regions, 'frames> BorrowedDmaSegmentIter<'regions, 'frames> {
+impl<'view, 'frames> BorrowedDmaSegmentIter<'view, 'frames> {
     fn new(
         layout: dma::IoBufferDmaMappingLayout,
         byte_len: usize,
-        regions: &'regions [DmaBufferRegion<'frames>],
+        view: &'view DmaBufferView<'frames>,
     ) -> Self {
         Self {
             layout,
-            regions,
+            regions: view.regions(),
             byte_len,
             index: 0,
             remaining: byte_len,
@@ -249,10 +249,10 @@ impl<'regions, 'frames> BorrowedDmaSegmentIter<'regions, 'frames> {
             page_offset: 0,
             page_size: 0,
             iova_cursor: 0,
-            region_index: 0,
             region_page_index: 0,
             region_page_count: 0,
             region_remaining: 0,
+            identity_frames: &[],
             identity_frame_index: 0,
             identity_frame_offset: 0,
             identity_remaining: 0,
@@ -268,6 +268,7 @@ impl<'regions, 'frames> BorrowedDmaSegmentIter<'regions, 'frames> {
                 }
 
                 self.index = 1;
+
                 Some(IoBufferDmaSegment {
                     dma_addr,
                     byte_len: byte_len.try_into().ok()?,
@@ -331,6 +332,10 @@ impl<'regions, 'frames> BorrowedDmaSegmentIter<'regions, 'frames> {
     }
 
     fn next_scatter_gather_segment(&mut self) -> Option<IoBufferDmaSegment> {
+        if self.page_size == 0 {
+            return None;
+        }
+
         loop {
             if self.region_remaining != 0 {
                 let segment = next_page_chunk_segment(
@@ -352,16 +357,17 @@ impl<'regions, 'frames> BorrowedDmaSegmentIter<'regions, 'frames> {
                 return segment;
             }
 
-            while self.region_index < self.regions.len() {
-                let region = self.regions[self.region_index];
-                self.region_index += 1;
-
-                if region.byte_len == 0 {
+            while let Some(region) = self.regions.next() {
+                if region.is_empty() {
                     continue;
                 }
 
-                self.page_offset = region.frame_offset % self.page_size;
-                self.region_remaining = region.byte_len;
+                if region.page_frames().is_empty() {
+                    return None;
+                }
+
+                self.page_offset = region.frame_offset() % self.page_size;
+                self.region_remaining = region.len();
                 self.region_page_count = page_chunk_segment_count(
                     self.page_offset,
                     self.region_remaining,
@@ -381,24 +387,27 @@ impl<'regions, 'frames> BorrowedDmaSegmentIter<'regions, 'frames> {
         loop {
             if self.identity_remaining != 0 {
                 return next_identity_segment_limited(
-                    self.regions[self.region_index - 1].frames,
+                    self.identity_frames,
                     &mut self.identity_frame_index,
                     &mut self.identity_frame_offset,
                     &mut self.identity_remaining,
                 );
             }
 
-            while self.region_index < self.regions.len() {
-                let region = self.regions[self.region_index];
-                self.region_index += 1;
-
-                if region.byte_len == 0 {
+            while let Some(region) = self.regions.next() {
+                if region.is_empty() {
                     continue;
                 }
 
+                let frames = region.page_frames();
+                if frames.is_empty() {
+                    return None;
+                }
+
+                self.identity_frames = frames;
                 self.identity_frame_index = 0;
-                self.identity_frame_offset = region.frame_offset;
-                self.identity_remaining = region.byte_len;
+                self.identity_frame_offset = region.frame_offset();
+                self.identity_remaining = region.len();
                 break;
             }
 
@@ -409,15 +418,17 @@ impl<'regions, 'frames> BorrowedDmaSegmentIter<'regions, 'frames> {
     }
 }
 
-impl<'regions, 'frames> Iterator for BorrowedDmaSegmentIter<'regions, 'frames> {
+impl<'view, 'frames> Iterator for BorrowedDmaSegmentIter<'view, 'frames> {
     type Item = IoBufferDmaSegment;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.remaining != 0 {
             let mut segment = self.next_uncropped()?;
             let take = min(segment.byte_len as usize, self.remaining);
+
             segment.byte_len = take as u32;
             self.remaining -= take;
+
             return Some(segment);
         }
 
@@ -452,6 +463,7 @@ fn next_page_chunk_segment(
     let bytes = (*remaining)
         .min(page_size - start_in_page)
         .min(u32::MAX as usize);
+
     let dma_addr = iova_base.checked_add((*index * page_size + start_in_page) as u64)?;
 
     *remaining -= bytes;
@@ -501,12 +513,14 @@ fn next_identity_segment_limited(
     while *remaining > 0 && *frame_index < frames.len() {
         let next = frames[*frame_index];
         let expected = dma_addr.checked_add(byte_len as u64)?;
+
         if next.phys_addr != expected {
             break;
         }
 
         let add_len = (*remaining).min(next.byte_len as usize);
         let merged_len = byte_len.checked_add(add_len)?;
+
         if merged_len > u32::MAX as usize {
             break;
         }

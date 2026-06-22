@@ -9,8 +9,6 @@ pub struct CacheConfig {
     pub flush_parallelism: usize,
     pub write_allocate: bool,
     pub read_allocate: bool,
-    pub lazy_page_allocation: bool,
-    pub lazy_index_allocation: bool,
     /// When page allocation/reclaim cannot supply a cache page, bypass the cache
     /// and issue the current request directly to the lower device.
     pub direct_io_on_no_free_pages: bool,
@@ -38,22 +36,12 @@ impl CacheConfig {
             flush_parallelism: 4,
             write_allocate: true,
             read_allocate: true,
-            lazy_page_allocation: false,
-            lazy_index_allocation: false,
             direct_io_on_no_free_pages: true,
             dirty_high_watermark_blocks: high,
             dirty_low_watermark_blocks: low,
         }
     }
 
-    pub const fn with_lazy_page_allocation(mut self, enabled: bool) -> Self {
-        self.lazy_page_allocation = enabled;
-        self
-    }
-    pub const fn with_lazy_index_allocation(mut self, enabled: bool) -> Self {
-        self.lazy_index_allocation = enabled;
-        self
-    }
     pub const fn with_direct_io_on_no_free_pages(mut self, enabled: bool) -> Self {
         self.direct_io_on_no_free_pages = enabled;
         self
@@ -109,14 +97,10 @@ impl<E: Clone> Clone for CacheError<E> {
 
 /// Backend I/O interface used by the cache.
 ///
-/// Implement this on your volume device wrapper (or a small adapter around it).
-///
-/// Requirements:
-/// - `read_phys_framed` and `write_phys_framed` operate on one or more contiguous logical blocks.
-/// - `lba` is a logical block index, not a byte offset.
-/// - `flush_device` should commit device-side writeback state (if any).
-
-// Ffi future is used instead of BoxFuture here because we already have slab alloc for Ffi future.
+/// `read_phys_framed` and `write_phys_framed` receive an already-created
+/// `IoBuffer` lease. The lease is owned by the backend future for the lifetime
+/// of the lower request. `write_request` is used by cache flush batching so a
+/// caller can pass a chain of `Write` requests directly.
 pub trait VolumeCacheBackend: Send + Sync + 'static {
     type Error: Send + Sync + core::fmt::Debug + 'static;
 
@@ -124,29 +108,25 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: IoBuffer<'buffer, Described, FromDevice>,
+        buffer: IoBuffer<'buffer, 'buffer, Described, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>>;
+
     fn write_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut RequestHandle<'req, Write<'data>>,
     ) -> FfiFuture<Result<(), Self::Error>>;
+
     fn write_phys_framed<'a, 'buffer>(
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: IoBuffer<'buffer, Described, ToDevice>,
+        buffer: IoBuffer<'buffer, 'buffer, Described, ToDevice>,
     ) -> FfiFuture<Result<(), Self::Error>>;
+
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
 }
 
 /// Async cache operations exposed to the rest of the volume driver.
-///
-/// Implementers should support unaligned byte offsets and lengths by internally
-/// doing block-sized reads/writes as needed.
-///
-/// `write_at` is write-back (cached) when configured to allocate; it may defer device writes.
-/// `write_through_at` should not return until the written range is pushed to the backend.
-/// `flush_background_pass` should start background work and return quickly.
 pub trait VolumeCacheOps {
     type Error;
 

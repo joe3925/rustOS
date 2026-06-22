@@ -62,7 +62,7 @@ struct PreparedDmaMapping {
 
 pub fn map_buffer(
     device: &Arc<DeviceObject>,
-    buffer: &DmaBufferView<'_, '_>,
+    buffer: &DmaBufferView<'_>,
     strategy: DmaMappingStrategy,
 ) -> Result<DmaMappedBuffer, DmaMapError> {
     crate::disk_profile::add_counter(C_DMA_MAP_CALLS, 1);
@@ -106,7 +106,7 @@ pub fn map_buffer(
 fn prepare_dma_mapping(
     device_mmu: &DeviceMmuSystem,
     domain: &Arc<DeviceMmuDomain>,
-    buffer: &DmaBufferView<'_, '_>,
+    buffer: &DmaBufferView<'_>,
     strategy: DmaMappingStrategy,
 ) -> Result<PreparedDmaMapping, DmaMapError> {
     let device_page_size_u64 = domain.device_page_size();
@@ -292,29 +292,34 @@ fn map_device_mmu_error(err: DeviceMmuError) -> DmaMapError {
 }
 
 fn validate_dma_buffer(
-    buffer: &DmaBufferView<'_, '_>,
+    buffer: &DmaBufferView<'_>,
     device_page_size: usize,
 ) -> Result<(), DmaMapError> {
-    if buffer.is_empty() || buffer.regions.is_empty() {
+    if buffer.is_empty() {
         return Err(DmaMapError::InvalidSize);
     }
 
     let mut described_len = 0usize;
-    for region in buffer.regions {
-        if region.byte_len == 0 {
+    let mut region_count = 0usize;
+
+    for region in buffer.regions() {
+        if region.is_empty() {
             continue;
         }
 
-        if region.frames.is_empty() {
+        let frames = region.page_frames();
+        if frames.is_empty() {
             return Err(DmaMapError::InvalidSize);
         }
 
         described_len = described_len
-            .checked_add(region.byte_len)
+            .checked_add(region.len())
             .ok_or(DmaMapError::InvalidSize)?;
+
+        region_count += 1;
     }
 
-    if described_len != buffer.len() {
+    if region_count == 0 || described_len != buffer.len() {
         return Err(DmaMapError::InvalidSize);
     }
 
@@ -328,23 +333,26 @@ fn validate_dma_buffer(
 
     Ok(())
 }
-
-fn for_each_buffer_extent<F>(buffer: &DmaBufferView<'_, '_>, mut f: F) -> Result<(), DmaMapError>
+fn for_each_buffer_extent<F>(buffer: &DmaBufferView<'_>, mut f: F) -> Result<(), DmaMapError>
 where
     F: FnMut(&[IoBufferPageFrame], usize, usize) -> Result<(), DmaMapError>,
 {
-    for region in buffer.regions {
-        if region.byte_len == 0 {
+    for region in buffer.regions() {
+        if region.is_empty() {
             continue;
         }
 
-        f(region.frames, region.frame_offset, region.byte_len)?;
+        let frames = region.page_frames();
+        let frame_offset = region.frame_offset();
+        let byte_len = region.len();
+
+        f(frames, frame_offset, byte_len)?;
     }
 
     Ok(())
 }
 
-fn buffer_frames_cover_extents(buffer: &DmaBufferView<'_, '_>) -> bool {
+fn buffer_frames_cover_extents(buffer: &DmaBufferView<'_>) -> bool {
     for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
         if frames_cover_buffer(frames, frame_offset, byte_len) {
             Ok(())
@@ -355,29 +363,35 @@ fn buffer_frames_cover_extents(buffer: &DmaBufferView<'_, '_>) -> bool {
     .is_ok()
 }
 
-fn first_dma_page_offset(buffer: &DmaBufferView<'_, '_>, device_page_size: usize) -> Option<usize> {
-    for region in buffer.regions {
-        if region.byte_len != 0 {
-            return Some(region.frame_offset % device_page_size);
+fn first_dma_page_offset(buffer: &DmaBufferView<'_>, device_page_size: usize) -> Option<usize> {
+    if device_page_size == 0 {
+        return None;
+    }
+
+    for region in buffer.regions() {
+        if !region.is_empty() {
+            return Some(region.frame_offset() % device_page_size);
         }
     }
 
     None
 }
 
-fn buffer_supports_contiguous_iova(
-    buffer: &DmaBufferView<'_, '_>,
-    device_page_size: usize,
-) -> bool {
+fn buffer_supports_contiguous_iova(buffer: &DmaBufferView<'_>, device_page_size: usize) -> bool {
+    if device_page_size == 0 {
+        return false;
+    }
+
     let mut logical_len = 0usize;
     let mut first_offset = None;
 
-    for region in buffer.regions {
-        if region.byte_len == 0 {
+    for region in buffer.regions() {
+        if region.is_empty() {
             continue;
         }
 
-        let start_offset = region.frame_offset % device_page_size;
+        let byte_len = region.len();
+        let start_offset = region.frame_offset() % device_page_size;
 
         match first_offset {
             Some(_) if start_offset != 0 => return false,
@@ -385,7 +399,7 @@ fn buffer_supports_contiguous_iova(
             _ => {}
         }
 
-        let Some(next_logical_len) = logical_len.checked_add(region.byte_len) else {
+        let Some(next_logical_len) = logical_len.checked_add(byte_len) else {
             return false;
         };
 
@@ -436,7 +450,7 @@ fn frames_cover_buffer(
 }
 
 fn covered_iommu_page_count_for_buffer(
-    buffer: &DmaBufferView<'_, '_>,
+    buffer: &DmaBufferView<'_>,
     device_page_size: usize,
 ) -> Option<usize> {
     let mut total = 0usize;
@@ -552,7 +566,7 @@ fn map_buffer_frames_to_iova(
     device_mmu: &DeviceMmuSystem,
     domain: &Arc<DeviceMmuDomain>,
     iova_base: u64,
-    buffer: &DmaBufferView<'_, '_>,
+    buffer: &DmaBufferView<'_>,
     device_page_size: usize,
 ) -> Result<(), DmaMapError> {
     let mut iova_cursor = iova_base;
@@ -589,7 +603,7 @@ fn map_buffer_frames_to_iova(
 fn map_identity_frames(
     device_mmu: &DeviceMmuSystem,
     domain: &Arc<DeviceMmuDomain>,
-    buffer: &DmaBufferView<'_, '_>,
+    buffer: &DmaBufferView<'_>,
     device_page_size: usize,
     records: &mut PendingMappingRecords,
 ) -> Result<(), DmaMapError> {

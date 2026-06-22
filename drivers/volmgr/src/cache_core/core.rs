@@ -1,9 +1,9 @@
-use crate::alloc::vec::Vec;
 use crate::cache::{CacheIndex, CacheIndexFactory, DefaultIndexFactory};
 use crate::cache_traits::{
     CacheConfig, CacheError, CacheStats, VolumeCacheBackend, VolumeCacheOps,
 };
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cmp::min;
 use core::future::Future;
 use core::hint::{cold_path, likely, unlikely};
@@ -12,22 +12,22 @@ use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
-use futures::future::FutureExt;
-use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IOBUFFER_MAX_DMA_SEGMENT_CAPACITY, IoBuffer, ToDevice,
+    Described, FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+    ToDevice,
+};
+use kernel_api::memory::{
+    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
+    deallocate_kernel_range, unmap_range,
 };
 use kernel_api::println;
 use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
-use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
-use super::flush::{
-    FlushFilter, FlushJobHandle, FlushRunScratchLease, FlushScratch, PreparedFlushPage,
-};
 use super::notify::WritebackNotifier;
-use super::page::{Page, PagePool, PageUseGuard};
+
+const MAX_WRITE_CHAIN: usize = 64;
 
 struct StatsInner {
     read_hits: AtomicU64,
@@ -100,9 +100,45 @@ impl<I> Shard<I> {
     }
 }
 
-enum WriteAcquire<const BLOCK_SIZE: usize> {
-    Cached(Arc<Page<BLOCK_SIZE>>),
-    Direct(Arc<Page<BLOCK_SIZE>>),
+struct CachePage {
+    slot: usize,
+    dirty: AtomicBool,
+    writeback: AtomicBool,
+    owner: AtomicU64,
+    generation: AtomicU64,
+    wb_generation: AtomicU64,
+    data_lock: RwLock<()>,
+}
+
+impl CachePage {
+    fn new(slot: usize) -> Self {
+        Self {
+            slot,
+            dirty: AtomicBool::new(false),
+            writeback: AtomicBool::new(false),
+            owner: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            wb_generation: AtomicU64::new(0),
+            data_lock: RwLock::new(()),
+        }
+    }
+
+    fn reset_for_lba(&self, _lba: u64) {
+        self.dirty.store(false, Ordering::Release);
+        self.writeback.store(false, Ordering::Release);
+        self.owner.store(0, Ordering::Release);
+        self.generation.store(0, Ordering::Release);
+        self.wb_generation.store(0, Ordering::Release);
+    }
+
+    fn is_evictable(&self) -> bool {
+        !self.dirty.load(Ordering::Acquire) && !self.writeback.load(Ordering::Acquire)
+    }
+}
+
+enum WriteAcquire {
+    Cached(Arc<CachePage>),
+    Direct,
 }
 
 enum WritebackWaitResult {
@@ -116,10 +152,66 @@ enum FilteredWritebackState {
     ActiveWriteback,
 }
 
+enum FlushFilter<'a> {
+    All,
+    BlockRange(&'a Range<u64>),
+    Owner(u64),
+}
+
+impl FlushFilter<'_> {
+    fn matches(&self, lba: u64, page: &CachePage) -> bool {
+        match self {
+            FlushFilter::All => true,
+            FlushFilter::BlockRange(range) => lba >= range.start && lba < range.end,
+            FlushFilter::Owner(owner) => {
+                *owner != 0 && page.owner.load(Ordering::Acquire) == *owner
+            }
+        }
+    }
+}
+
+struct PreparedFlushPage {
+    lba: u64,
+    slot: usize,
+    page: Arc<CachePage>,
+    wb_generation: u64,
+}
+
+struct PreparedRun {
+    start: usize,
+    end: usize,
+}
+
+struct FlushScratch {
+    keys: Vec<u64>,
+    prepared: Vec<PreparedFlushPage>,
+    runs: Vec<PreparedRun>,
+}
+
+impl FlushScratch {
+    fn new(capacity_blocks: usize) -> Result<Self, ()> {
+        let mut keys = Vec::new();
+        let mut prepared = Vec::new();
+        let mut runs = Vec::new();
+
+        keys.try_reserve_exact(capacity_blocks).map_err(|_| ())?;
+        prepared
+            .try_reserve_exact(capacity_blocks)
+            .map_err(|_| ())?;
+        runs.try_reserve_exact(capacity_blocks).map_err(|_| ())?;
+
+        Ok(Self {
+            keys,
+            prepared,
+            runs,
+        })
+    }
+}
+
 struct WritebackProgressWait<'cache, 'filter, 'range, B, const BLOCK_SIZE: usize, F>
 where
     B: VolumeCacheBackend,
-    F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
+    F: CacheIndexFactory<Arc<CachePage>>,
 {
     cache: &'cache VolumeCache<B, BLOCK_SIZE, F>,
     filter: &'filter FlushFilter<'range>,
@@ -129,7 +221,7 @@ impl<'cache, 'filter, 'range, B, const BLOCK_SIZE: usize, F> Future
     for WritebackProgressWait<'cache, 'filter, 'range, B, BLOCK_SIZE, F>
 where
     B: VolumeCacheBackend,
-    F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
+    F: CacheIndexFactory<Arc<CachePage>>,
 {
     type Output = WritebackWaitResult;
 
@@ -159,20 +251,22 @@ where
 pub(crate) struct VolumeCache<B, const BLOCK_SIZE: usize, F = DefaultIndexFactory>
 where
     B: VolumeCacheBackend,
-    F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
+    F: CacheIndexFactory<Arc<CachePage>>,
 {
     backend: Arc<B>,
     shards: Vec<Mutex<Shard<F::Index>>>,
-    page_pool: Option<PagePool<BLOCK_SIZE>>,
+    free_pages: Mutex<Vec<Arc<CachePage>>>,
+    direct_page: Mutex<Option<Arc<CachePage>>>,
+    flush_scratch: Mutex<FlushScratch>,
+    cache_base: VirtAddr,
+    cache_bytes: usize,
+    cache_backing: Option<IoBufferBacking<'static>>,
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     dirty_pages: Arc<AtomicUsize>,
     writeback_notifier: WritebackNotifier,
     background_writeback_active: AtomicBool,
     closed: AtomicBool,
-    flush_job: Mutex<Option<Arc<FlushJobHandle<B::Error>>>>,
-    flush_job_id: AtomicU64,
-    flush_scratch: Mutex<FlushScratch<BLOCK_SIZE>>,
     _index_factory: PhantomData<F>,
 }
 
@@ -188,7 +282,7 @@ where
 impl<B, const BLOCK_SIZE: usize, F> VolumeCache<B, BLOCK_SIZE, F>
 where
     B: VolumeCacheBackend,
-    F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
+    F: CacheIndexFactory<Arc<CachePage>>,
 {
     pub fn new_with_index(
         backend: Arc<B>,
@@ -220,6 +314,42 @@ where
             cfg.dirty_low_watermark_blocks = cfg.dirty_high_watermark_blocks;
         }
 
+        let backing_blocks = cfg
+            .capacity_blocks
+            .checked_add(1)
+            .ok_or(CacheError::InvalidConfig)?;
+
+        let cache_bytes = backing_blocks
+            .checked_mul(BLOCK_SIZE)
+            .ok_or(CacheError::InvalidConfig)?;
+
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let cache_base = allocate_auto_kernel_range_mapped_contiguous(cache_bytes as u64, flags)
+            .map_err(|_| CacheError::InvalidIoBuffer)?;
+
+        unsafe {
+            core::ptr::write_bytes(cache_base.as_u64() as *mut u8, 0, cache_bytes);
+        }
+
+        let cache_slice: &'static mut [u8] =
+            unsafe { core::slice::from_raw_parts_mut(cache_base.as_u64() as *mut u8, cache_bytes) };
+
+        let mut backing_cfg = IoBufferBackingConfig::worst_case_for_len(cache_bytes);
+        backing_cfg.lease_capacity = backing_cfg.lease_capacity.max(MAX_WRITE_CHAIN);
+        backing_cfg.dma_record_capacity = backing_cfg.dma_record_capacity.max(MAX_WRITE_CHAIN);
+
+        let cache_backing =
+            match IoBufferBacking::new(IoBufferBackingDesc::SliceMut(cache_slice), backing_cfg) {
+                Ok(backing) => backing,
+                Err(_) => {
+                    unsafe {
+                        unmap_range(cache_base, cache_bytes as u64);
+                    }
+                    deallocate_kernel_range(cache_base, cache_bytes as u64);
+                    return Err(CacheError::InvalidIoBuffer);
+                }
+            };
+
         let shard_count = cfg.shards;
         let per_shard = (cfg.capacity_blocks + shard_count - 1) / shard_count;
         let mut shards = Vec::with_capacity(shard_count);
@@ -227,41 +357,92 @@ where
         let mut i = 0usize;
         while i < shard_count {
             let mut index = factory.build(per_shard);
-            if !cfg.lazy_index_allocation {
-                index.reserve_or_panic(per_shard);
-            }
+            index.reserve_or_panic(per_shard);
             shards.push(Mutex::new(Shard::new(index, per_shard)));
             i += 1;
         }
 
-        let page_pool = if cfg.lazy_page_allocation {
-            None
-        } else {
-            Some(PagePool::new(cfg.capacity_blocks).ok_or(CacheError::InvalidIoBuffer)?)
-        };
+        let mut free_pages = Vec::new();
+        free_pages
+            .try_reserve_exact(cfg.capacity_blocks)
+            .map_err(|_| CacheError::InvalidIoBuffer)?;
+
+        let mut slot = cfg.capacity_blocks;
+        while slot != 0 {
+            slot -= 1;
+            free_pages.push(Arc::new(CachePage::new(slot)));
+        }
+
+        let direct_page = Arc::new(CachePage::new(cfg.capacity_blocks));
+        let flush_scratch =
+            FlushScratch::new(cfg.capacity_blocks).map_err(|_| CacheError::InvalidIoBuffer)?;
 
         Ok(Self {
             backend,
             shards,
-            page_pool,
+            free_pages: Mutex::new(free_pages),
+            direct_page: Mutex::new(Some(direct_page)),
+            flush_scratch: Mutex::new(flush_scratch),
+            cache_base,
+            cache_bytes,
+            cache_backing: Some(cache_backing),
             cfg,
             stats: Arc::new(StatsInner::new()),
             dirty_pages: Arc::new(AtomicUsize::new(0)),
             writeback_notifier: WritebackNotifier::new(),
             background_writeback_active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            flush_job: Mutex::new(None),
-            flush_job_id: AtomicU64::new(0),
-            flush_scratch: Mutex::new(FlushScratch::new(
-                cfg.flush_parallelism,
-                cfg.capacity_blocks,
-            )),
             _index_factory: PhantomData,
         })
     }
 
+    #[inline]
     fn block_size_u64() -> u64 {
         BLOCK_SIZE as u64
+    }
+
+    #[inline]
+    fn page_offset(slot: usize) -> usize {
+        slot * BLOCK_SIZE
+    }
+
+    #[inline]
+    fn cache_backing(&self) -> Result<&IoBufferBacking<'static>, CacheError<B::Error>> {
+        self.cache_backing
+            .as_ref()
+            .ok_or(CacheError::InvalidIoBuffer)
+    }
+
+    #[inline]
+    unsafe fn page_slice(&self, page: &CachePage) -> &[u8] {
+        let ptr = (self.cache_base.as_u64() as usize + Self::page_offset(page.slot)) as *const u8;
+        core::slice::from_raw_parts(ptr, BLOCK_SIZE)
+    }
+
+    #[inline]
+    unsafe fn page_slice_mut(&self, page: &CachePage) -> &mut [u8] {
+        let ptr = (self.cache_base.as_u64() as usize + Self::page_offset(page.slot)) as *mut u8;
+        core::slice::from_raw_parts_mut(ptr, BLOCK_SIZE)
+    }
+
+    fn create_cache_from_device_buffer<'a>(
+        &'a self,
+        page: &CachePage,
+        len: usize,
+    ) -> Result<IoBuffer<'a, 'a, Described, FromDevice>, CacheError<B::Error>> {
+        self.cache_backing()?
+            .create_from_device(Self::page_offset(page.slot), len)
+            .map_err(|_| CacheError::InvalidIoBuffer)
+    }
+
+    fn create_cache_to_device_buffer<'a>(
+        &'a self,
+        page: &CachePage,
+        len: usize,
+    ) -> Result<IoBuffer<'a, 'a, Described, ToDevice>, CacheError<B::Error>> {
+        self.cache_backing()?
+            .create_to_device(Self::page_offset(page.slot), len)
+            .map_err(|_| CacheError::InvalidIoBuffer)
     }
 
     fn check_open(&self) -> Result<(), CacheError<B::Error>> {
@@ -272,7 +453,7 @@ where
         Ok(())
     }
 
-    fn mark_cached_page_dirty(&self, _lba: u64, page: &Page<BLOCK_SIZE>, owner: u64) {
+    fn mark_cached_page_dirty(&self, page: &CachePage, owner: u64) {
         page.owner.store(owner, Ordering::Release);
         page.generation.fetch_add(1, Ordering::AcqRel);
 
@@ -299,50 +480,37 @@ where
         Ok(start_block..end_block)
     }
 
-    fn start_flush_job_background(cache: &Arc<Self>) {
-        if unlikely(cache.closed.load(Ordering::Acquire)) {
-            cold_path();
-            return;
-        }
-
-        let cache = Arc::clone(cache);
-        spawn_detached(async move {
-            let _ = cache.ensure_flush_job().await;
-        });
-    }
-
     fn shard_index(&self, lba: u64) -> usize {
         (lba as usize) % self.shards.len()
     }
 
-    async fn try_get_page(&self, lba: u64) -> Option<Arc<Page<BLOCK_SIZE>>> {
+    async fn try_get_page(&self, lba: u64) -> Option<Arc<CachePage>> {
         let idx = self.shard_index(lba);
         let mut shard = self.shards[idx].lock();
         shard.index.get(&lba).map(|page| Arc::clone(&*page))
     }
 
-    fn page_can_be_reclaimed(page: &Arc<Page<BLOCK_SIZE>>) -> bool {
+    fn page_can_be_reclaimed(page: &Arc<CachePage>) -> bool {
         page.is_evictable() && Arc::strong_count(page) == 1
     }
 
-    fn page_can_be_flushed_for_reclaim(page: &Arc<Page<BLOCK_SIZE>>) -> bool {
+    fn page_can_be_flushed_for_reclaim(page: &Arc<CachePage>) -> bool {
         page.dirty.load(Ordering::Acquire)
             && !page.writeback.load(Ordering::Acquire)
-            && page.active_ops.load(Ordering::Acquire) == 0
             && Arc::strong_count(page) == 1
     }
 
-    fn recycle_or_drop_page(&self, page: Arc<Page<BLOCK_SIZE>>) {
-        if let Some(pool) = &self.page_pool {
-            pool.push(page);
+    fn recycle_or_drop_page(&self, page: Arc<CachePage>) {
+        if Arc::strong_count(&page) == 1 {
+            page.reset_for_lba(0);
+            self.free_pages.lock().push(page);
         }
     }
 
-    /// Reclaims clean pages using the shard's least-recently-used clean page.
     fn reclaim_page_from_shard_locked(
         &self,
         shard: &mut Shard<F::Index>,
-    ) -> Option<Arc<Page<BLOCK_SIZE>>> {
+    ) -> Option<Arc<CachePage>> {
         let reclaim_key = shard
             .index
             .oldest_matching(|_, page| Self::page_can_be_reclaimed(page));
@@ -352,22 +520,18 @@ where
         }
 
         if let Some(lba) = reclaim_key {
-            let Some(mut page) = shard.index.remove(&lba) else {
+            let Some(page) = shard.index.remove(&lba) else {
                 return None;
             };
             self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-            if let Some(inner) = Arc::get_mut(&mut page) {
-                inner.reset_for_reuse();
-                return Some(page);
-            }
+            page.reset_for_lba(0);
+            return Some(page);
         }
 
         None
     }
 
-    fn try_reclaim_cache_page(&self, preferred_idx: usize) -> Option<Arc<Page<BLOCK_SIZE>>> {
-        // The cache is sharded, so eviction is approximate LRU: prefer the
-        // target shard's oldest clean page, then fall back to other shards.
+    fn try_reclaim_cache_page(&self, preferred_idx: usize) -> Option<Arc<CachePage>> {
         {
             let mut shard = self.shards[preferred_idx].lock();
             if let Some(page) = self.reclaim_page_from_shard_locked(&mut shard) {
@@ -383,7 +547,6 @@ where
                     return Some(page);
                 }
             }
-
             idx += 1;
         }
 
@@ -393,7 +556,7 @@ where
     fn oldest_dirty_reclaim_candidate_in_shard(
         &self,
         shard_idx: usize,
-    ) -> Option<(u64, Arc<Page<BLOCK_SIZE>>)> {
+    ) -> Option<(u64, Arc<CachePage>)> {
         let shard = self.shards[shard_idx].lock();
         let lba = shard
             .index
@@ -405,7 +568,7 @@ where
     fn oldest_dirty_reclaim_candidate(
         &self,
         preferred_idx: usize,
-    ) -> Option<(u64, Arc<Page<BLOCK_SIZE>>)> {
+    ) -> Option<(u64, Arc<CachePage>)> {
         if let Some(candidate) = self.oldest_dirty_reclaim_candidate_in_shard(preferred_idx) {
             return Some(candidate);
         }
@@ -435,16 +598,21 @@ where
             return Ok(true);
         };
 
-        let run = [prepared];
-        Self::flush_prepared_run(
-            &self.backend,
-            &self.stats,
-            &self.dirty_pages,
-            &self.writeback_notifier,
-            &run,
-        )
-        .await?;
-
+        let prepared = [prepared];
+        let mut runs = {
+            let mut scratch = self.flush_scratch.lock();
+            core::mem::take(&mut scratch.runs)
+        };
+        runs.clear();
+        let result = self
+            .flush_prepared_pages_chained_with_runs(&prepared, &mut runs)
+            .await;
+        runs.clear();
+        {
+            let mut scratch = self.flush_scratch.lock();
+            scratch.runs = runs;
+        }
+        result?;
         Ok(true)
     }
 
@@ -458,28 +626,15 @@ where
         }
     }
 
-    async fn acquire_cache_page(
-        &self,
-        lba: u64,
-    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        if unlikely(self.cfg.lazy_page_allocation) {
-            cold_path();
-            return Ok(Arc::new(
-                Page::new_zeroed().ok_or(CacheError::InvalidIoBuffer)?,
-            ));
-        }
-
-        if let Some(pool) = &self.page_pool {
-            if let Some(mut page) = pool.pop() {
-                if let Some(inner) = Arc::get_mut(&mut page) {
-                    inner.reset_for_reuse();
-                    return Ok(page);
-                }
-            }
+    async fn acquire_cache_page(&self, lba: u64) -> Result<Arc<CachePage>, CacheError<B::Error>> {
+        if let Some(page) = self.free_pages.lock().pop() {
+            page.reset_for_lba(lba);
+            return Ok(page);
         }
 
         let preferred_idx = self.shard_index(lba);
         if let Some(page) = self.try_reclaim_cache_page(preferred_idx) {
+            page.reset_for_lba(lba);
             return Ok(page);
         }
 
@@ -498,6 +653,7 @@ where
             }
 
             if let Some(page) = self.try_reclaim_cache_page(preferred_idx) {
+                page.reset_for_lba(lba);
                 return Ok(page);
             }
 
@@ -507,11 +663,7 @@ where
         Err(CacheError::NoFreePages)
     }
 
-    async fn insert_page_or_get_existing(
-        &self,
-        lba: u64,
-        page: Arc<Page<BLOCK_SIZE>>,
-    ) -> Arc<Page<BLOCK_SIZE>> {
+    async fn insert_page_or_get_existing(&self, lba: u64, page: Arc<CachePage>) -> Arc<CachePage> {
         let idx = self.shard_index(lba);
         let mut shard = self.shards[idx].lock();
 
@@ -535,49 +687,43 @@ where
         page
     }
 
-    async fn read_block_into_unique_page(
+    async fn read_block_into_page(
         &self,
         lba: u64,
-        page: &mut Arc<Page<BLOCK_SIZE>>,
+        page: &Arc<CachePage>,
     ) -> Result<(), CacheError<B::Error>> {
-        let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
         let bytes_read = {
-            let data = page.data.get_mut();
-            let io_buf = IoBuffer::<Described, FromDevice>::from_slice_mut(&mut data.bytes[..]);
+            let _data_guard = page.data_lock.write();
+            let io_buf = self.create_cache_from_device_buffer(page, BLOCK_SIZE)?;
             self.backend
                 .read_phys_framed(lba, 1, io_buf)
                 .await
                 .map_err(CacheError::Backend)?
         };
+
         if unlikely(bytes_read > BLOCK_SIZE) {
             cold_path();
             return Err(CacheError::InvalidIoBuffer);
         }
+
         if unlikely(bytes_read < BLOCK_SIZE) {
             cold_path();
-            let data = page.data.get_mut();
-            data.bytes[bytes_read..].fill(0);
+            let _data_guard = page.data_lock.write();
+            unsafe {
+                self.page_slice_mut(page)[bytes_read..].fill(0);
+            }
         }
 
         self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    async fn load_detached_page_from_backend(
-        &self,
-        lba: u64,
-    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        let mut page = Arc::new(Page::new_zeroed().ok_or(CacheError::InvalidIoBuffer)?);
-        self.read_block_into_unique_page(lba, &mut page).await?;
-        Ok(page)
-    }
-
     async fn load_cache_page_from_backend(
         &self,
         lba: u64,
-    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        let mut page = self.acquire_cache_page(lba).await?;
-        match self.read_block_into_unique_page(lba, &mut page).await {
+    ) -> Result<Arc<CachePage>, CacheError<B::Error>> {
+        let page = self.acquire_cache_page(lba).await?;
+        match self.read_block_into_page(lba, &page).await {
             Ok(()) => Ok(page),
             Err(e) => {
                 self.recycle_or_drop_page(page);
@@ -586,42 +732,10 @@ where
         }
     }
 
-    fn fill_unique_page_from_full_block_write(
-        page: &mut Arc<Page<BLOCK_SIZE>>,
-        src: &[u8],
-    ) -> Result<(), CacheError<B::Error>> {
-        let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
-        let data = page.data.get_mut();
-        data.bytes[..].copy_from_slice(src);
-        Ok(())
-    }
-
-    async fn new_cache_page_from_full_block_write(
-        &self,
-        lba: u64,
-        src: &[u8],
-    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        let mut page = self.acquire_cache_page(lba).await?;
-        if let Err(e) = Self::fill_unique_page_from_full_block_write(&mut page, src) {
-            self.recycle_or_drop_page(page);
-            return Err(e);
-        }
-        Ok(page)
-    }
-
-    fn new_detached_page_from_full_block_write(
-        &self,
-        src: &[u8],
-    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        let mut page = Arc::new(Page::new_zeroed().ok_or(CacheError::InvalidIoBuffer)?);
-        Self::fill_unique_page_from_full_block_write(&mut page, src)?;
-        Ok(page)
-    }
-
     async fn get_or_create_read_page(
         &self,
         lba: u64,
-    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
+    ) -> Result<Arc<CachePage>, CacheError<B::Error>> {
         if let Some(page) = self.try_get_page(lba).await {
             self.stats.read_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(page);
@@ -632,7 +746,7 @@ where
 
         if unlikely(!self.cfg.read_allocate) {
             cold_path();
-            return self.load_detached_page_from_backend(lba).await;
+            return Err(CacheError::NoFreePages);
         }
 
         let loaded = self.load_cache_page_from_backend(lba).await?;
@@ -645,7 +759,7 @@ where
         block_off: usize,
         write_len: usize,
         src_for_full: &[u8],
-    ) -> Result<WriteAcquire<BLOCK_SIZE>, CacheError<B::Error>> {
+    ) -> Result<WriteAcquire, CacheError<B::Error>> {
         if let Some(page) = self.try_get_page(lba).await {
             self.stats.write_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(WriteAcquire::Cached(page));
@@ -656,27 +770,98 @@ where
 
         let is_full_block = block_off == 0 && write_len == BLOCK_SIZE;
 
-        if self.cfg.write_allocate {
-            if is_full_block {
-                let page = self
-                    .new_cache_page_from_full_block_write(lba, src_for_full)
-                    .await?;
-                let page = self.insert_page_or_get_existing(lba, page).await;
-                return Ok(WriteAcquire::Cached(page));
-            }
-
-            let page = self.load_cache_page_from_backend(lba).await?;
-            let page = self.insert_page_or_get_existing(lba, page).await;
-            return Ok(WriteAcquire::Cached(page));
+        if !self.cfg.write_allocate {
+            return Ok(WriteAcquire::Direct);
         }
 
+        let page = self.acquire_cache_page(lba).await?;
         if is_full_block {
-            let page = self.new_detached_page_from_full_block_write(src_for_full)?;
-            return Ok(WriteAcquire::Direct(page));
+            {
+                let _guard = page.data_lock.write();
+                unsafe {
+                    self.page_slice_mut(&page).copy_from_slice(src_for_full);
+                }
+            }
+        } else {
+            if let Err(e) = self.read_block_into_page(lba, &page).await {
+                self.recycle_or_drop_page(page);
+                return Err(e);
+            }
         }
 
-        let page = self.load_detached_page_from_backend(lba).await?;
-        Ok(WriteAcquire::Direct(page))
+        let page = self.insert_page_or_get_existing(lba, page).await;
+        Ok(WriteAcquire::Cached(page))
+    }
+
+    async fn read_block_into_direct_page(
+        &self,
+        lba: u64,
+        page: &Arc<CachePage>,
+    ) -> Result<usize, CacheError<B::Error>> {
+        let bytes_read = {
+            let _data_guard = page.data_lock.write();
+            let io_buf = self.create_cache_from_device_buffer(page, BLOCK_SIZE)?;
+            self.backend
+                .read_phys_framed(lba, 1, io_buf)
+                .await
+                .map_err(CacheError::Backend)?
+        };
+
+        if unlikely(bytes_read > BLOCK_SIZE) {
+            cold_path();
+            return Err(CacheError::InvalidIoBuffer);
+        }
+
+        if unlikely(bytes_read < BLOCK_SIZE) {
+            cold_path();
+            let _data_guard = page.data_lock.write();
+            unsafe {
+                self.page_slice_mut(page)[bytes_read..].fill(0);
+            }
+        }
+
+        self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(bytes_read)
+    }
+
+    async fn write_block_from_direct_page(
+        &self,
+        lba: u64,
+        page: &Arc<CachePage>,
+        owner: u64,
+    ) -> Result<(), CacheError<B::Error>> {
+        let buffer = self.create_cache_to_device_buffer(page, BLOCK_SIZE)?;
+
+        let mut req = RequestHandle::new(Write {
+            offset: lba * BLOCK_SIZE as u64,
+            len: BLOCK_SIZE,
+            no_buffer: false,
+            owner,
+            buffer: Some(buffer),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        });
+
+        req.set_traversal_policy(TraversalPolicy::ForwardLower);
+
+        let status = self.backend.write_request(&mut req).await;
+        drop(req);
+
+        status.map_err(CacheError::Backend)?;
+        self.stats.backend_writes.fetch_add(1, Ordering::Relaxed);
+        self.stats.direct_writebacks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn take_direct_page(&self) -> Result<Arc<CachePage>, CacheError<B::Error>> {
+        self.direct_page
+            .lock()
+            .take()
+            .ok_or(CacheError::NoFreePages)
+    }
+
+    fn restore_direct_page(&self, page: Arc<CachePage>) {
+        page.reset_for_lba(0);
+        *self.direct_page.lock() = Some(page);
     }
 
     async fn direct_read_at(
@@ -689,6 +874,8 @@ where
             return Ok(());
         }
 
+        let page = self.take_direct_page()?;
+        let mut result = Ok(());
         let mut dst_pos = 0usize;
         let mut cur_off = offset;
         let bs_u64 = Self::block_size_u64();
@@ -697,32 +884,41 @@ where
             let lba = cur_off / bs_u64;
             let block_off = (cur_off % bs_u64) as usize;
             let take = min(BLOCK_SIZE - block_off, out.len() - dst_pos);
-            let page = self.load_detached_page_from_backend(lba).await?;
+
+            if let Err(err) = self.read_block_into_direct_page(lba, &page).await {
+                result = Err(err);
+                break;
+            }
 
             {
-                let data = page.data.read();
-                out[dst_pos..dst_pos + take]
-                    .copy_from_slice(&data.bytes[block_off..block_off + take]);
+                let _guard = page.data_lock.read();
+                unsafe {
+                    out[dst_pos..dst_pos + take]
+                        .copy_from_slice(&self.page_slice(&page)[block_off..block_off + take]);
+                }
             }
 
             dst_pos += take;
             cur_off += take as u64;
         }
 
-        Ok(())
+        self.restore_direct_page(page);
+        result
     }
 
     async fn direct_write_at(
         &self,
         offset: u64,
         data: &[u8],
-        _owner: u64,
+        owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
         if unlikely(data.is_empty()) {
             cold_path();
             return Ok(());
         }
 
+        let page = self.take_direct_page()?;
+        let mut result = Ok(());
         let mut src_pos = 0usize;
         let mut cur_off = offset;
         let bs_u64 = Self::block_size_u64();
@@ -731,62 +927,45 @@ where
             let lba = cur_off / bs_u64;
             let block_off = (cur_off % bs_u64) as usize;
             let take = min(BLOCK_SIZE - block_off, data.len() - src_pos);
-            let src = &data[src_pos..src_pos + take];
 
-            if block_off == 0 && take == BLOCK_SIZE {
-                let page = self.new_detached_page_from_full_block_write(src)?;
-                self.direct_write_page(lba, &page).await?;
-            } else {
-                let page = self.load_detached_page_from_backend(lba).await?;
-                {
-                    let mut page_data = page.data.write();
-                    page_data.bytes[block_off..block_off + take].copy_from_slice(src);
+            if block_off != 0 || take != BLOCK_SIZE {
+                if let Err(err) = self.read_block_into_direct_page(lba, &page).await {
+                    result = Err(err);
+                    break;
                 }
-                self.direct_write_page(lba, &page).await?;
+            }
+
+            {
+                let _guard = page.data_lock.write();
+                unsafe {
+                    if block_off == 0 && take == BLOCK_SIZE {
+                        self.page_slice_mut(&page)
+                            .copy_from_slice(&data[src_pos..src_pos + take]);
+                    } else {
+                        self.page_slice_mut(&page)[block_off..block_off + take]
+                            .copy_from_slice(&data[src_pos..src_pos + take]);
+                    }
+                }
+            }
+
+            if let Err(err) = self.write_block_from_direct_page(lba, &page, owner).await {
+                result = Err(err);
+                break;
             }
 
             src_pos += take;
             cur_off += take as u64;
         }
 
-        Ok(())
-    }
-
-    async fn direct_write_page(
-        &self,
-        lba: u64,
-        page: &Arc<Page<BLOCK_SIZE>>,
-    ) -> Result<(), CacheError<B::Error>> {
-        {
-            let data_guard = page.data.read();
-            let io_buf = IoBuffer::<Described, ToDevice>::from_slice(&data_guard.bytes[..]);
-            let mut req = RequestHandle::new(Write {
-                offset: lba * BLOCK_SIZE as u64,
-                len: BLOCK_SIZE,
-                no_buffer: false,
-                owner: 0,
-                buffer: io_buf,
-                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            });
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-            self.backend
-                .write_request(&mut req)
-                .await
-                .map_err(CacheError::Backend)?;
-        }
-
-        self.stats.backend_writes.fetch_add(1, Ordering::Relaxed);
-        self.stats.direct_writebacks.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        self.restore_direct_page(page);
+        result
     }
 
     fn prepare_flush_page(
         stats: &StatsInner,
         lba: u64,
-        page: Arc<Page<BLOCK_SIZE>>,
-    ) -> Option<PreparedFlushPage<BLOCK_SIZE>> {
+        page: Arc<CachePage>,
+    ) -> Option<PreparedFlushPage> {
         stats.flush_attempts.fetch_add(1, Ordering::Relaxed);
 
         if unlikely(!page.dirty.load(Ordering::Acquire)) {
@@ -812,18 +991,13 @@ where
         page.wb_generation.store(wb_generation, Ordering::Release);
         Some(PreparedFlushPage {
             lba,
+            slot: page.slot,
             page,
             wb_generation,
         })
     }
 
-    fn finish_prepared_flush_pages(
-        stats: &StatsInner,
-        dirty_pages: &AtomicUsize,
-        writeback_notifier: &WritebackNotifier,
-        pages: &[PreparedFlushPage<BLOCK_SIZE>],
-        success: bool,
-    ) {
+    fn finish_prepared_flush_pages(&self, pages: &[PreparedFlushPage], success: bool) {
         let mut completed_writebacks = 0usize;
 
         for prepared in pages {
@@ -832,179 +1006,168 @@ where
                 if cur_gen == prepared.wb_generation
                     && prepared.page.dirty.swap(false, Ordering::AcqRel)
                 {
-                    dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                    self.dirty_pages.fetch_sub(1, Ordering::AcqRel);
                 }
-                stats.flush_success.fetch_add(1, Ordering::Relaxed);
+                self.stats.flush_success.fetch_add(1, Ordering::Relaxed);
             } else if !prepared.page.dirty.swap(true, Ordering::AcqRel) {
                 cold_path();
-                dirty_pages.fetch_add(1, Ordering::AcqRel);
+                self.dirty_pages.fetch_add(1, Ordering::AcqRel);
             }
             prepared.page.writeback.store(false, Ordering::Release);
             completed_writebacks += 1;
         }
 
         if completed_writebacks != 0 {
-            writeback_notifier.notify_all();
+            self.writeback_notifier.notify_all();
         }
     }
 
-    async fn flush_prepared_run(
-        backend: &Arc<B>,
-        stats: &Arc<StatsInner>,
-        dirty_pages: &Arc<AtomicUsize>,
-        writeback_notifier: &WritebackNotifier,
-        run: &[PreparedFlushPage<BLOCK_SIZE>],
+    fn collect_prepared_runs_into(
+        pages: &[PreparedFlushPage],
+        runs: &mut Vec<PreparedRun>,
+    ) -> Result<(), CacheError<B::Error>> {
+        runs.clear();
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        if runs.capacity() < pages.len() {
+            cold_path();
+            return Err(CacheError::InvalidIoBuffer);
+        }
+
+        let mut start = 0usize;
+        let mut i = 1usize;
+        while i <= pages.len() {
+            let split = if i == pages.len() {
+                true
+            } else {
+                pages[i].lba != pages[i - 1].lba + 1 || pages[i].slot != pages[i - 1].slot + 1
+            };
+
+            if split {
+                runs.push(PreparedRun { start, end: i });
+                start = i;
+            }
+            i += 1;
+        }
+
+        Ok(())
+    }
+
+    async fn flush_prepared_pages_chained_with_runs(
+        &self,
+        pages: &[PreparedFlushPage],
+        runs: &mut Vec<PreparedRun>,
     ) -> Result<usize, CacheError<B::Error>> {
-        // TODO: allow this to be configured
-        const INLINE_RUNS: usize = 8;
-        const INLINE_SEGMENTS: usize = INLINE_RUNS;
-
-        let run_len = run.len();
-
-        if run_len == 0 {
+        if pages.is_empty() {
             return Ok(0);
         }
 
-        if run_len.checked_mul(BLOCK_SIZE).is_none() {
-            cold_path();
-            Self::finish_prepared_flush_pages(stats, dirty_pages, writeback_notifier, run, false);
-            return Err(CacheError::OffsetOverflow);
-        }
+        Self::collect_prepared_runs_into(pages, runs)?;
 
-        if run_len <= INLINE_RUNS && run_len <= INLINE_SEGMENTS {
-            let mut read_guards = [const { None }; INLINE_RUNS];
-            let mut segments: [&[u8]; INLINE_SEGMENTS] = [&[]; INLINE_SEGMENTS];
+        let mut total_flushed = 0usize;
+        let mut run_base = 0usize;
 
-            for idx in 0..run_len {
-                read_guards[idx] = Some(run[idx].page.data.read());
+        while run_base < runs.len() {
+            let run_end = min(run_base + MAX_WRITE_CHAIN, runs.len());
+            let chain_runs = &runs[run_base..run_end];
+            let first_run = &chain_runs[0];
+            let first_page = &pages[first_run.start];
+            let first_blocks = first_run.end - first_run.start;
+            let first_len = first_blocks
+                .checked_mul(BLOCK_SIZE)
+                .ok_or(CacheError::OffsetOverflow)?;
+
+            // `prepare_flush_page` sets writeback=true. Writers must wait while this is set,
+            // so these bytes are stable for the lower request without holding a Vec of page guards
+            // across the await.
+            let first_buffer = self.create_cache_to_device_buffer(&first_page.page, first_len)?;
+            let mut req = RequestHandle::new(Write {
+                offset: first_page.lba * BLOCK_SIZE as u64,
+                len: first_len,
+                no_buffer: false,
+                owner: first_page.page.owner.load(Ordering::Acquire),
+                buffer: Some(first_buffer),
+                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            });
+
+            let mut extra_writes = Vec::new();
+            if chain_runs.len() > 1 {
+                extra_writes
+                    .try_reserve_exact(chain_runs.len() - 1)
+                    .map_err(|_| CacheError::InvalidIoBuffer)?;
             }
 
-            for idx in 0..run_len {
-                let guard = unsafe { read_guards.get_unchecked(idx).as_ref().unwrap_unchecked() };
-
-                segments[idx] = &guard.bytes[..];
-            }
-
-            let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..run_len])
             {
-                Ok(io_buf) => io_buf,
-                Err(_) => {
-                    cold_path();
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        run,
-                        false,
-                    );
-                    return Err(CacheError::InvalidIoBuffer);
+                let mut req_write = req.write();
+                let mut prev_write_ptr: *mut Write<'_> = &mut req_write.body;
+
+                let mut chain_idx = 1usize;
+                while chain_idx < chain_runs.len() {
+                    let run = &chain_runs[chain_idx];
+                    let page = &pages[run.start];
+                    let blocks = run.end - run.start;
+                    let byte_len = blocks
+                        .checked_mul(BLOCK_SIZE)
+                        .ok_or(CacheError::OffsetOverflow)?;
+
+                    let buffer = self.create_cache_to_device_buffer(&page.page, byte_len)?;
+                    extra_writes.push(Write {
+                        offset: page.lba * BLOCK_SIZE as u64,
+                        len: byte_len,
+                        no_buffer: false,
+                        owner: page.page.owner.load(Ordering::Acquire),
+                        buffer: Some(buffer),
+                        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+                    });
+
+                    let curr_ptr = extra_writes.last_mut().unwrap() as *mut Write<'_>;
+                    unsafe {
+                        (*prev_write_ptr)
+                            .next
+                            .store(curr_ptr, core::sync::atomic::Ordering::Release);
+                    }
+                    prev_write_ptr = curr_ptr;
+                    chain_idx += 1;
                 }
-            };
+            }
 
-            let write_res = backend
-                .write_phys_framed(run[0].lba, run_len, io_buf)
-                .await
-                .map_err(CacheError::Backend);
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+            let status = self.backend.write_request(&mut req).await;
 
-            match write_res {
+            drop(req);
+            drop(extra_writes);
+
+            let page_start = chain_runs[0].start;
+            let page_end = chain_runs[chain_runs.len() - 1].end;
+            let flushed_pages = &pages[page_start..page_end];
+
+            match status {
                 Ok(()) => {
-                    stats
+                    self.stats
                         .backend_writes
-                        .fetch_add(run_len as u64, Ordering::Relaxed);
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        run,
-                        true,
-                    );
-                    Ok(run_len)
+                        .fetch_add(flushed_pages.len() as u64, Ordering::Relaxed);
+                    self.finish_prepared_flush_pages(flushed_pages, true);
+                    total_flushed += flushed_pages.len();
                 }
                 Err(err) => {
                     cold_path();
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        run,
-                        false,
-                    );
-                    Err(err)
+                    self.finish_prepared_flush_pages(flushed_pages, false);
+                    return Err(CacheError::Backend(err));
                 }
             }
-        } else {
-            const MAX_BATCH: usize = 8;
-            if unlikely(run_len > MAX_BATCH) {
-                return Err(CacheError::InvalidIoBuffer);
-            }
-            let mut read_guards: [Option<spin::RwLockReadGuard<'_, _>>; MAX_BATCH] = core::array::from_fn(|_| None);
-            let mut segments: [&[u8]; MAX_BATCH] = [&[]; MAX_BATCH];
 
-            for (i, prepared) in run.iter().enumerate() {
-                let guard = prepared.page.data.read();
-                let bytes_ptr = guard.bytes.as_ptr();
-                let bytes_len = guard.bytes.len();
-                read_guards[i] = Some(guard);
-                segments[i] = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len) };
-            }
-
-            let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..run_len]) {
-                Ok(io_buf) => io_buf,
-                Err(_) => {
-                    cold_path();
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        run,
-                        false,
-                    );
-                    return Err(CacheError::InvalidIoBuffer);
-                }
-            };
-
-            let write_res = backend
-                .write_phys_framed(run[0].lba, run_len, io_buf)
-                .await
-                .map_err(CacheError::Backend);
-
-            match write_res {
-                Ok(()) => {
-                    stats
-                        .backend_writes
-                        .fetch_add(run_len as u64, Ordering::Relaxed);
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        run,
-                        true,
-                    );
-                    Ok(run_len)
-                }
-                Err(err) => {
-                    cold_path();
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        run,
-                        false,
-                    );
-                    Err(err)
-                }
-            }
+            run_base = run_end;
         }
+
+        Ok(total_flushed)
     }
 
-    fn page_for_flush_key(
-        &self,
-        lba: u64,
-        filter: &FlushFilter<'_>,
-    ) -> Option<Arc<Page<BLOCK_SIZE>>> {
+    fn page_for_flush_key(&self, lba: u64, filter: &FlushFilter<'_>) -> Option<Arc<CachePage>> {
         let shard_idx = self.shard_index(lba);
         let shard = self.shards[shard_idx].lock();
-        let page: &Arc<Page<BLOCK_SIZE>> = shard.index.peek(&lba)?;
+        let page: &Arc<CachePage> = shard.index.peek(&lba)?;
         if likely(page.dirty.load(Ordering::Acquire) && filter.matches(lba, page)) {
             Some(Arc::clone(page))
         } else {
@@ -1017,338 +1180,64 @@ where
         &self,
         filter: &FlushFilter<'_>,
         keys: &[u64],
-        max_blocks_per_run: usize,
     ) -> Result<usize, CacheError<B::Error>> {
         if unlikely(keys.is_empty()) {
             cold_path();
             return Ok(0);
         }
 
-        let max_blocks_per_buffer = self.max_blocks_per_flush_run(max_blocks_per_run);
-        let run_capacity = max_blocks_per_buffer.max(keys.len().min(16 * max_blocks_per_buffer));
+        let (mut prepared, mut runs) = {
+            let mut scratch = self.flush_scratch.lock();
+            let prepared = core::mem::take(&mut scratch.prepared);
+            let runs = core::mem::take(&mut scratch.runs);
+            (prepared, runs)
+        };
 
-        let mut run_scratch = FlushRunScratchLease::new(&self.flush_scratch);
-        let run = run_scratch.run.as_mut().unwrap();
+        prepared.clear();
+        runs.clear();
 
-        run.clear();
-        if run.capacity() < run_capacity {
-            run.reserve(run_capacity - run.capacity());
-        }
+        let mut result = Ok(0usize);
 
-        let mut writebacks = 0usize;
-        let mut result = Ok(());
-        let mut num_runs = 0;
-        let mut blocks_in_current_run = 0;
-
-        for lba in keys {
-            let mut contiguous = run
-                .last()
-                .map(|last| last.lba.checked_add(1) == Some(*lba))
-                .unwrap_or(true);
-
-            if contiguous && blocks_in_current_run >= max_blocks_per_buffer {
-                contiguous = false;
-            }
-
-            let mut needs_flush = false;
-            if !run.is_empty() && !contiguous {
-                if num_runs >= 16 {
-                    needs_flush = true;
-                }
-            }
-
-            if needs_flush || run.len() >= run_capacity {
-                match Self::flush_prepared_runs_chained(
-                    &self.backend,
-                    &self.stats,
-                    &self.dirty_pages,
-                    &self.writeback_notifier,
-                    run.as_slice(),
-                    run_scratch.writes.as_mut().unwrap(),
-                )
-                .await
-                {
-                    Ok(flushed) => writebacks += flushed,
-                    Err(err) => {
-                        cold_path();
-                        result = Err(err);
-                        break;
-                    }
-                }
-
-                run.clear();
-                num_runs = 0;
-                blocks_in_current_run = 0;
-                contiguous = false; // Reset contiguous state
-            }
-
-            if result.is_err() {
-                cold_path();
-                break;
-            }
-
-            let Some(page) = self.page_for_flush_key(*lba, filter) else {
-                continue;
-            };
-
-            if let Some(prepared) = Self::prepare_flush_page(&self.stats, *lba, page) {
-                run.push(prepared);
-                if run.len() == 1 || !contiguous {
-                    num_runs += 1;
-                    blocks_in_current_run = 1;
-                } else {
-                    blocks_in_current_run += 1;
-                }
-            }
-        }
-
-        if result.is_ok() && !run.is_empty() {
-            match Self::flush_prepared_runs_chained(
-                &self.backend,
-                &self.stats,
-                &self.dirty_pages,
-                &self.writeback_notifier,
-                run.as_slice(),
-                run_scratch.writes.as_mut().unwrap(),
-            )
-            .await
-            {
-                Ok(flushed) => writebacks += flushed,
-                Err(err) => {
-                    cold_path();
-                    result = Err(err);
-                }
-            }
-        }
-
-        run.clear();
-
-        result.map(|()| writebacks)
-    }
-
-    async fn flush_prepared_runs_chained(
-        backend: &Arc<B>,
-        stats: &Arc<StatsInner>,
-        dirty_pages: &Arc<AtomicUsize>,
-        writeback_notifier: &WritebackNotifier,
-        pages: &[PreparedFlushPage<BLOCK_SIZE>],
-        writes: &mut alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; 8]>,
-    ) -> Result<usize, CacheError<B::Error>> {
-        if pages.is_empty() {
-            return Ok(0);
-        }
-
-        const MAX_BATCH: usize = 8;
-        let mut total_flushed = 0;
-
-        for chunk in pages.chunks(MAX_BATCH) {
-            let mut read_guards: [Option<spin::RwLockReadGuard<'_, _>>; MAX_BATCH] =
-                core::array::from_fn(|_| None);
-            let mut segments: [&[u8]; MAX_BATCH] = [&[]; MAX_BATCH];
-
-            for (i, p) in chunk.iter().enumerate() {
-                let guard = p.page.data.read();
-                let bytes_ptr = guard.bytes.as_ptr();
-                let bytes_len = guard.bytes.len();
-                read_guards[i] = Some(guard);
-                segments[i] = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len) };
-            }
-
-            let max_blocks = Self::max_blocks_per_dma_request();
-            writes.fill_with(|| None);
-            let mut req_handle = None;
-            let mut prev_write_ptr: *mut kernel_api::request::Write<'_> = core::ptr::null_mut();
-
-            let mut start_idx = 0;
-            let mut write_idx = 0;
-
-            for i in 1..=chunk.len() {
-                if i == chunk.len() || chunk[i].lba != chunk[i - 1].lba + 1 || (i - start_idx) >= max_blocks {
-                    let run_len = i - start_idx;
-                    let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(
-                        &segments[start_idx..i],
-                    ) {
-                        Ok(buf) => buf,
-                        Err(_) => {
-                            Self::finish_prepared_flush_pages(
-                                stats,
-                                dirty_pages,
-                                writeback_notifier,
-                                chunk,
-                                false,
-                            );
-                            return Err(CacheError::InvalidIoBuffer);
-                        }
-                    };
-
-                    let io_buf_static = unsafe { core::mem::transmute(io_buf) };
-
-                    let write = kernel_api::request::Write {
-                        offset: chunk[start_idx].lba * BLOCK_SIZE as u64,
-                        len: run_len * BLOCK_SIZE,
-                        no_buffer: false,
-                        owner: 0,
-                        buffer: io_buf_static,
-                        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                    };
-
-                    if write_idx == 0 {
-                        req_handle = Some(kernel_api::request::RequestHandle::new(write));
-                        prev_write_ptr = &mut req_handle.as_mut().unwrap().write().body as *mut _;
-                    } else {
-                        writes[write_idx] = Some(write);
-                        let curr_ptr = writes[write_idx].as_mut().unwrap() as *mut _;
-                        unsafe { &*prev_write_ptr }
-                            .next
-                            .store(curr_ptr, core::sync::atomic::Ordering::Release);
-                        prev_write_ptr = curr_ptr;
-                    }
-
-                    start_idx = i;
-                    write_idx += 1;
-                }
-            }
-
-            let mut req = req_handle.unwrap();
-            req.set_traversal_policy(kernel_api::request::TraversalPolicy::ForwardLower);
-
-            let status = backend.write_request(&mut req).await;
-
-            match status {
-                Ok(()) => {
-                    stats
-                        .backend_writes
-                        .fetch_add(chunk.len() as u64, core::sync::atomic::Ordering::Relaxed);
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        chunk,
-                        true,
-                    );
-                    total_flushed += chunk.len();
-                }
-                Err(err) => {
-                    cold_path();
-                    Self::finish_prepared_flush_pages(
-                        stats,
-                        dirty_pages,
-                        writeback_notifier,
-                        chunk,
-                        false,
-                    );
-                    return Err(CacheError::Backend(err));
-                }
-            }
-        }
-
-        Ok(total_flushed)
-    }
-
-    fn max_blocks_per_flush_run(&self, max_blocks_per_run: usize) -> usize {
-        max_blocks_per_run
-            .max(1)
-            .min(self.cfg.capacity_blocks.saturating_sub(1).max(1))
-            .min(Self::max_blocks_per_dma_request())
-    }
-
-    fn max_blocks_per_dma_request() -> usize {
-        let dma_page_size = dma_base_page_size().max(1);
-        let segments_per_block = BLOCK_SIZE.div_ceil(dma_page_size).max(1);
-        let max_segments_per_block_unaligned = segments_per_block + 1;
-        IOBUFFER_MAX_DMA_SEGMENT_CAPACITY
-            .checked_div(max_segments_per_block_unaligned)
-            .unwrap_or(0)
-            .max(1)
-    }
-
-    async fn flush_owner_streaming_batched(
-        &self,
-        owner: u64,
-        max_blocks_per_run: usize,
-    ) -> Result<(usize, usize), CacheError<B::Error>> {
-        if unlikely(owner == 0) {
+        if prepared.capacity() < keys.len() {
             cold_path();
-            return Ok((0, 0));
-        }
-
-        let filter = FlushFilter::Owner(owner);
-        let chunk_limit = self
-            .max_blocks_per_flush_run(max_blocks_per_run)
-            .max(self.cfg.flush_parallelism.max(1));
-
-        let mut matched = 0usize;
-        let mut writebacks = 0usize;
-        let mut shard_idx = 0usize;
-
-        while shard_idx < self.shards.len() {
-            let mut start = 0usize;
-
-            loop {
-                let (walked, mut keys) = {
-                    let mut scratch = self.flush_scratch.lock();
-                    let mut keys = core::mem::take(&mut scratch.keys);
-
-                    keys.clear();
-                    if keys.capacity() < chunk_limit {
-                        keys.reserve(chunk_limit - keys.capacity());
-                    }
-
-                    let walked = {
-                        let shard = self.shards[shard_idx].lock();
-                        shard.index.for_each_chunk(start, chunk_limit, |lba, page| {
-                            if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
-                                keys.push(lba);
-                            }
-                        })
-                    };
-
-                    (walked, keys)
+            result = Err(CacheError::InvalidIoBuffer);
+        } else {
+            for lba in keys {
+                let Some(page) = self.page_for_flush_key(*lba, filter) else {
+                    continue;
                 };
 
-                if walked == 0 {
-                    let mut scratch = self.flush_scratch.lock();
-                    if scratch.keys.capacity() < keys.capacity() {
-                        scratch.keys = keys;
-                    }
-                    break;
+                if let Some(page) = Self::prepare_flush_page(&self.stats, *lba, page) {
+                    prepared.push(page);
                 }
-
-                if !keys.is_empty() {
-                    keys.sort_unstable();
-                    matched += keys.len();
-                    writebacks += self
-                        .flush_sorted_candidate_keys_batched(&filter, &keys, max_blocks_per_run)
-                        .await?;
-                }
-
-                {
-                    let mut scratch = self.flush_scratch.lock();
-                    keys.clear();
-                    if scratch.keys.capacity() < keys.capacity() {
-                        scratch.keys = keys;
-                    }
-                }
-
-                start += walked;
             }
 
-            shard_idx += 1;
+            result = self
+                .flush_prepared_pages_chained_with_runs(&prepared, &mut runs)
+                .await;
         }
 
-        Ok((matched, writebacks))
+        prepared.clear();
+        runs.clear();
+        {
+            let mut scratch = self.flush_scratch.lock();
+            scratch.prepared = prepared;
+            scratch.runs = runs;
+        }
+
+        result
     }
 
     async fn flush_filtered_batched(
         &self,
         filter: &FlushFilter<'_>,
-        max_blocks_per_run: usize,
     ) -> Result<(usize, usize), CacheError<B::Error>> {
         let mut keys = {
             let mut scratch = self.flush_scratch.lock();
-            scratch.reset();
             core::mem::take(&mut scratch.keys)
         };
+
+        keys.clear();
 
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
@@ -1364,20 +1253,21 @@ where
         keys.sort_unstable();
         let matched = keys.len();
         let writebacks = self
-            .flush_sorted_candidate_keys_batched(filter, &keys, max_blocks_per_run)
-            .await?;
+            .flush_sorted_candidate_keys_batched(filter, &keys)
+            .await;
 
+        keys.clear();
         {
             let mut scratch = self.flush_scratch.lock();
             scratch.keys = keys;
-            scratch.reset();
         }
 
-        Ok((matched, writebacks))
+        writebacks.map(|writebacks| (matched, writebacks))
     }
 
     fn filtered_writeback_state(&self, filter: &FlushFilter<'_>) -> FilteredWritebackState {
         let mut has_dirty = false;
+        let mut has_active_writeback = false;
         let mut shard_idx = 0usize;
 
         while shard_idx < self.shards.len() {
@@ -1385,24 +1275,14 @@ where
             shard.index.for_each(|lba, page| {
                 if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
                     has_dirty = true;
+                    if page.writeback.load(Ordering::Acquire) {
+                        has_active_writeback = true;
+                    }
                 }
             });
 
-            if has_dirty {
-                let mut has_active_writeback = false;
-                shard.index.for_each(|lba, page| {
-                    if !has_active_writeback
-                        && page.dirty.load(Ordering::Acquire)
-                        && page.writeback.load(Ordering::Acquire)
-                        && filter.matches(lba, page)
-                    {
-                        has_active_writeback = true;
-                    }
-                });
-
-                if has_active_writeback {
-                    return FilteredWritebackState::ActiveWriteback;
-                }
+            if has_active_writeback {
+                return FilteredWritebackState::ActiveWriteback;
             }
 
             shard_idx += 1;
@@ -1426,77 +1306,17 @@ where
     }
 
     async fn flush_until_clean(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::All, true, usize::MAX)
+        self.flush_until_filtered_clean(&FlushFilter::All, true)
             .await
-    }
-
-    async fn finish_flush_job(&self, id: u64) {
-        let mut job = self.flush_job.lock();
-        if job.as_ref().map(|h| h.id == id).unwrap_or(false) {
-            job.take();
-        }
-    }
-
-    pub(crate) async fn ensure_flush_job(self: &Arc<Self>) -> Arc<FlushJobHandle<B::Error>> {
-        let mut job_guard = self.flush_job.lock();
-        if let Some(handle) = job_guard.as_ref() {
-            return Arc::clone(handle);
-        }
-
-        let id = self
-            .flush_job_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-
-        let result_slot = Arc::new(Mutex::new(None));
-        let result_slot_clone = Arc::clone(&result_slot);
-        let cache = Arc::clone(self);
-
-        let job_future = spawn(async move {
-            let outcome = cache.flush_until_clean().await;
-            if let Err(err) = &outcome {
-                println!(
-                    "volmgr: VolumeCache::ensure_flush_job job {} failed: {:?}",
-                    id, err
-                );
-            }
-            {
-                let mut slot = result_slot_clone.lock();
-                *slot = Some(outcome);
-            }
-            cache.finish_flush_job(id).await;
-        })
-        .shared();
-
-        let handle = Arc::new(FlushJobHandle {
-            id,
-            future: job_future.clone(),
-            result: result_slot,
-        });
-
-        *job_guard = Some(Arc::clone(&handle));
-        handle
-    }
-
-    pub(crate) async fn wait_for_flush_job(self: &Arc<Self>) -> Result<(), CacheError<B::Error>>
-    where
-        B::Error: Clone,
-    {
-        let handle = self.ensure_flush_job().await;
-        handle.future.clone().await;
-        handle.result.lock().as_ref().cloned().unwrap_or(Ok(()))
     }
 
     async fn flush_internal_filtered(
         &self,
         filter: &FlushFilter<'_>,
         force_device_flush: bool,
-        max_blocks_per_run: usize,
     ) -> Result<(usize, usize), CacheError<B::Error>> {
         self.check_open()?;
-        let (matched, writebacks) = self
-            .flush_filtered_batched(filter, max_blocks_per_run)
-            .await?;
+        let (matched, writebacks) = self.flush_filtered_batched(filter).await?;
 
         if writebacks != 0 || (force_device_flush && matched == 0) {
             self.backend
@@ -1512,13 +1332,13 @@ where
         &self,
         filter: &FlushFilter<'_>,
         force_device_flush: bool,
-        max_blocks_per_run: usize,
     ) -> Result<(), CacheError<B::Error>> {
         loop {
             let dirty_before = self.dirty_pages.load(Ordering::Acquire);
             let (_, writebacks) = self
-                .flush_internal_filtered(filter, force_device_flush, max_blocks_per_run)
+                .flush_internal_filtered(filter, force_device_flush)
                 .await?;
+
             if matches!(
                 self.filtered_writeback_state(filter),
                 FilteredWritebackState::Clean
@@ -1539,15 +1359,15 @@ where
             let dirty_after = self.dirty_pages.load(Ordering::Acquire);
             if dirty_after >= dirty_before {
                 let (_, retry_writebacks) = self
-                    .flush_internal_filtered(filter, force_device_flush, max_blocks_per_run)
+                    .flush_internal_filtered(filter, force_device_flush)
                     .await?;
-                if retry_writebacks == 0 {
-                    if matches!(
+                if retry_writebacks == 0
+                    && matches!(
                         self.wait_for_writeback_progress(filter).await,
                         WritebackWaitResult::Clean
-                    ) {
-                        break;
-                    }
+                    )
+                {
+                    break;
                 }
             }
         }
@@ -1559,12 +1379,12 @@ where
         &self,
         block_range: Range<u64>,
     ) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::BlockRange(&block_range), false, usize::MAX)
+        self.flush_until_filtered_clean(&FlushFilter::BlockRange(&block_range), false)
             .await
     }
 
     async fn flush_internal_all(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::All, true, usize::MAX)
+        self.flush_until_filtered_clean(&FlushFilter::All, true)
             .await
     }
 
@@ -1572,7 +1392,7 @@ where
         &self,
         owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::Owner(owner), false, usize::MAX)
+        self.flush_until_filtered_clean(&FlushFilter::Owner(owner), false)
             .await
     }
 
@@ -1583,11 +1403,7 @@ where
         }
 
         let dirty = self.dirty_pages.load(Ordering::Acquire);
-        if likely(dirty == 0) {
-            return false;
-        }
-
-        dirty >= self.cfg.dirty_high_watermark_blocks
+        dirty != 0 && dirty >= self.cfg.dirty_high_watermark_blocks
     }
 
     async fn background_writeback_loop(&self) {
@@ -1603,36 +1419,31 @@ where
                 break;
             }
 
-            let high = self.cfg.dirty_high_watermark_blocks;
-            let low = self.cfg.dirty_low_watermark_blocks;
-
-            let filter = if dirty_before >= high {
-                FlushFilter::All
-            } else {
+            if dirty_before < self.cfg.dirty_high_watermark_blocks {
                 break;
-            };
+            }
 
-            let (matched, writebacks) = match self
-                .flush_internal_filtered(&filter, false, self.cfg.flush_parallelism.max(1))
-                .await
-            {
-                Ok(pass) => pass,
-                Err(err) => {
-                    cold_path();
-                    println!(
-                        "volmgr: VolumeCache::background_writeback_loop failed: {:?}",
-                        err
-                    );
-                    break;
-                }
-            };
+            let (matched, writebacks) =
+                match self.flush_internal_filtered(&FlushFilter::All, false).await {
+                    Ok(pass) => pass,
+                    Err(err) => {
+                        cold_path();
+                        println!(
+                            "volmgr: VolumeCache::background_writeback_loop failed: {:?}",
+                            err
+                        );
+                        break;
+                    }
+                };
 
             let dirty_after = self.dirty_pages.load(Ordering::Acquire);
             if matched == 0 || writebacks == 0 || dirty_after >= dirty_before {
                 break;
             }
 
-            if dirty_after <= low && !self.should_start_background_writeback() {
+            if dirty_after <= self.cfg.dirty_low_watermark_blocks
+                && !self.should_start_background_writeback()
+            {
                 break;
             }
         }
@@ -1699,32 +1510,37 @@ where
             .await?;
 
         let mut removed = 0usize;
-        let mut i = 0usize;
+        let mut shard_idx = 0usize;
 
-        while i < self.shards.len() {
-            let mut shard = self.shards[i].lock();
-            let mut keys = Vec::new();
-
-            shard.index.for_each(|k, _| {
-                if k >= block_range.start && k < block_range.end {
-                    keys.push(k);
-                }
-            });
-
-            let mut j = 0usize;
-            while j < keys.len() {
-                if let Some(page) = shard.index.peek(&keys[j]) {
-                    if Self::page_can_be_reclaimed(page) {
-                        if let Some(page) = shard.index.remove(&keys[j]) {
-                            self.recycle_or_drop_page(page);
+        while shard_idx < self.shards.len() {
+            loop {
+                let remove_key = {
+                    let shard = self.shards[shard_idx].lock();
+                    let mut found = None;
+                    shard.index.for_each(|k, page| {
+                        if found.is_none()
+                            && k >= block_range.start
+                            && k < block_range.end
+                            && Self::page_can_be_reclaimed(page)
+                        {
+                            found = Some(k);
                         }
-                        removed += 1;
-                    }
+                    });
+                    found
+                };
+
+                let Some(key) = remove_key else {
+                    break;
+                };
+
+                let mut shard = self.shards[shard_idx].lock();
+                if let Some(page) = shard.index.remove(&key) {
+                    self.recycle_or_drop_page(page);
+                    removed += 1;
                 }
-                j += 1;
             }
 
-            i += 1;
+            shard_idx += 1;
         }
 
         Ok(removed)
@@ -1756,7 +1572,6 @@ where
         }
 
         let cache = Arc::clone(self);
-
         spawn_detached(async move {
             let mut lba = range.start;
             while lba < range.end {
@@ -1779,7 +1594,6 @@ where
         });
     }
 
-    /// Shared write implementation that optionally tags pages with an owner.
     async fn write_at_inner(
         cache: &Arc<Self>,
         offset: u64,
@@ -1812,7 +1626,7 @@ where
                 Err(CacheError::NoFreePages) if cache.cfg.direct_io_on_no_free_pages => {
                     cold_path();
                     if !no_free_flush_started {
-                        Self::start_flush_job_background(cache);
+                        Self::maybe_start_background_writeback(cache);
                         no_free_flush_started = true;
                     }
                     cache
@@ -1830,30 +1644,27 @@ where
 
             match acquired {
                 WriteAcquire::Cached(page) => {
-                    let _use_guard = PageUseGuard::new(&page);
-
-                    {
-                        let mut page_data = page.data.write();
-                        page_data.bytes[block_off..block_off + take]
-                            .copy_from_slice(&data[src_pos..src_pos + take]);
+                    while page.writeback.load(Ordering::Acquire) {
+                        match cache.wait_for_writeback_progress(&FlushFilter::All).await {
+                            WritebackWaitResult::Clean | WritebackWaitResult::NeedsFlush => break,
+                        }
                     }
 
-                    cache.mark_cached_page_dirty(lba, &page, owner);
+                    {
+                        let _guard = page.data_lock.write();
+                        unsafe {
+                            cache.page_slice_mut(&page)[block_off..block_off + take]
+                                .copy_from_slice(&data[src_pos..src_pos + take]);
+                        }
+                    }
+
+                    cache.mark_cached_page_dirty(&page, owner);
                 }
-                WriteAcquire::Direct(page) => {
+                WriteAcquire::Direct => {
                     cold_path();
-                    {
-                        let mut page_data = page.data.write();
-                        page_data.bytes[block_off..block_off + take]
-                            .copy_from_slice(&data[src_pos..src_pos + take]);
-                    }
-
-                    if likely(owner == 0) {
-                        page.mark_dirty();
-                    } else {
-                        page.mark_dirty_with_owner(owner);
-                    }
-                    cache.direct_write_page(lba, &page).await?;
+                    cache
+                        .direct_write_at(cur_off, &data[src_pos..src_pos + take], owner)
+                        .await?;
                 }
             }
 
@@ -1865,11 +1676,28 @@ where
     }
 }
 
+impl<B, const BLOCK_SIZE: usize, F> Drop for VolumeCache<B, BLOCK_SIZE, F>
+where
+    B: VolumeCacheBackend,
+    F: CacheIndexFactory<Arc<CachePage>>,
+{
+    fn drop(&mut self) {
+        drop(self.cache_backing.take());
+        if self.cache_bytes != 0 {
+            unsafe {
+                unmap_range(self.cache_base, self.cache_bytes as u64);
+            }
+            deallocate_kernel_range(self.cache_base, self.cache_bytes as u64);
+            self.cache_bytes = 0;
+        }
+    }
+}
+
 impl<B, const BLOCK_SIZE: usize, F> VolumeCacheOps for Arc<VolumeCache<B, BLOCK_SIZE, F>>
 where
     B: VolumeCacheBackend,
     B::Error: Clone,
-    F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
+    F: CacheIndexFactory<Arc<CachePage>>,
 {
     type Error = CacheError<B::Error>;
 
@@ -1897,7 +1725,7 @@ where
                 Err(CacheError::NoFreePages) if self.cfg.direct_io_on_no_free_pages => {
                     cold_path();
                     if !no_free_flush_started {
-                        VolumeCache::<B, BLOCK_SIZE, F>::start_flush_job_background(self);
+                        VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
                         no_free_flush_started = true;
                     }
                     self.direct_read_at(cur_off, &mut out[dst_pos..dst_pos + take])
@@ -1911,12 +1739,13 @@ where
                     return Err(err);
                 }
             };
-            let _use_guard = PageUseGuard::new(&page);
 
             {
-                let data = page.data.read();
-                out[dst_pos..dst_pos + take]
-                    .copy_from_slice(&data.bytes[block_off..block_off + take]);
+                let _guard = page.data_lock.read();
+                unsafe {
+                    out[dst_pos..dst_pos + take]
+                        .copy_from_slice(&self.page_slice(&page)[block_off..block_off + take]);
+                }
             }
 
             dst_pos += take;
@@ -1984,29 +1813,36 @@ where
         self.check_open()?;
 
         let mut removed = 0usize;
-        let mut i = 0usize;
+        let mut shard_idx = 0usize;
 
-        while i < self.shards.len() {
-            let mut shard = self.shards[i].lock();
-            let mut keys = Vec::new();
+        while shard_idx < self.shards.len() {
+            loop {
+                let remove_key = {
+                    let shard = self.shards[shard_idx].lock();
+                    let mut found = None;
+                    shard.index.for_each(|k, page| {
+                        if found.is_none()
+                            && VolumeCache::<B, BLOCK_SIZE, F>::page_can_be_reclaimed(page)
+                        {
+                            found = Some(k);
+                        }
+                    });
+                    found
+                };
 
-            shard.index.for_each(|k, v| {
-                if VolumeCache::<B, BLOCK_SIZE, F>::page_can_be_reclaimed(v) {
-                    keys.push(k);
-                }
-            });
+                let Some(key) = remove_key else {
+                    break;
+                };
 
-            let mut j = 0usize;
-            while j < keys.len() {
-                if let Some(page) = shard.index.remove(&keys[j]) {
+                let mut shard = self.shards[shard_idx].lock();
+                if let Some(page) = shard.index.remove(&key) {
                     self.recycle_or_drop_page(page);
                     removed += 1;
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                 }
-                j += 1;
             }
 
-            i += 1;
+            shard_idx += 1;
         }
 
         Ok(removed)
@@ -2020,16 +1856,17 @@ where
 
         let cache = Arc::clone(self);
         spawn_detached(async move {
-            let _ = cache.ensure_flush_job().await;
+            let _ = cache.flush_internal_all().await;
         });
     }
+
     async fn flush_async(&self) {
         if unlikely(self.closed.load(Ordering::Acquire)) {
             cold_path();
             return;
         }
 
-        let _ = self.ensure_flush_job().await;
+        let _ = self.flush_internal_all().await;
     }
 
     async fn stats(&self) -> CacheStats {
