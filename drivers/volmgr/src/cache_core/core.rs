@@ -239,27 +239,74 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let observed_epoch = this.cache.writeback_notifier.epoch();
 
-        match this.cache.filtered_writeback_state(this.filter) {
-            FilteredWritebackState::Clean => Poll::Ready(WritebackWaitResult::Clean),
-            FilteredWritebackState::NeedsFlush => Poll::Ready(WritebackWaitResult::NeedsFlush),
-            FilteredWritebackState::ActiveWriteback => {
-                if this
-                    .cache
-                    .writeback_notifier
-                    .register_if_unchanged(observed_epoch, cx.waker())
-                {
-                    Poll::Pending
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+        loop {
+            let observed_epoch = this.cache.writeback_notifier.epoch();
+
+            match this.cache.filtered_writeback_state(this.filter) {
+                FilteredWritebackState::Clean => return Poll::Ready(WritebackWaitResult::Clean),
+                FilteredWritebackState::NeedsFlush => {
+                    return Poll::Ready(WritebackWaitResult::NeedsFlush);
+                }
+                FilteredWritebackState::ActiveWriteback => {
+                    if this
+                        .cache
+                        .writeback_notifier
+                        .register_if_unchanged(observed_epoch, cx.waker())
+                    {
+                        return Poll::Pending;
+                    }
                 }
             }
         }
     }
 }
+struct FlushSlotWait<'cache, B, const BLOCK_SIZE: usize, F>
+where
+    B: VolumeCacheBackend,
+    F: CacheIndexFactory<Arc<CachePage>>,
+{
+    cache: &'cache VolumeCache<B, BLOCK_SIZE, F>,
+}
 
+impl<'cache, B, const BLOCK_SIZE: usize, F> Future for FlushSlotWait<'cache, B, BLOCK_SIZE, F>
+where
+    B: VolumeCacheBackend,
+    F: CacheIndexFactory<Arc<CachePage>>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let cache = self.cache;
+
+        loop {
+            if cache
+                .flush_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Poll::Ready(());
+            }
+
+            let observed_epoch = cache.writeback_notifier.epoch();
+
+            if cache
+                .flush_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Poll::Ready(());
+            }
+
+            if cache
+                .writeback_notifier
+                .register_if_unchanged(observed_epoch, cx.waker())
+            {
+                return Poll::Pending;
+            }
+        }
+    }
+}
 pub(crate) struct VolumeCache<B, const BLOCK_SIZE: usize, F = DefaultIndexFactory>
 where
     B: VolumeCacheBackend,
@@ -476,27 +523,7 @@ where
     }
 
     async fn wait_for_flush_slot(&self) {
-        loop {
-            if self
-                .flush_active
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return;
-            }
-
-            let mut yielded = false;
-            core::future::poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            })
-            .await;
-        }
+        FlushSlotWait { cache: self }.await
     }
 
     fn mark_cached_page_dirty(&self, page: &CachePage, owner: u64) {
