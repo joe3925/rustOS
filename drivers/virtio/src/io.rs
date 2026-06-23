@@ -1,8 +1,11 @@
 use crate::B_VIRTIO_QUEUE_NOTIFY;
 use crate::C_VIRTIO_QUEUE_KICKS;
 use crate::blk::{SubmitRequestError, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
-use crate::completion::CompletionToken;
 use crate::dev_ext::{ChildExt, DevExt, DevExtInner, QueueState};
+use crate::outstanding::{
+    PendingBlockOp, PendingOpBatch, PendingOpLease, PendingOpPool, SubmittedCompletion,
+    SubmittedCompletionBatch, VIRTIO_QUEUE_BATCH_LIMIT,
+};
 use crate::temp_benchmark::{
     IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
     bench_sweep, bench_sweep_params, bench_sweep_params_request, sanitize_bench_params,
@@ -11,8 +14,9 @@ use crate::{
     IOCTL_BLOCK_FLUSH, SubmitTasksGuard, blk_status_to_driver_status, complete_req,
     drain_queue_completions, map_request_buffer, virtio_device_error, wait_completion_hybrid,
 };
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
+use core::sync::atomic::{AtomicPtr, Ordering};
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
     BenchSweepResult,
@@ -30,6 +34,7 @@ use kernel_api::pnp::DriverStep;
 use kernel_api::request::{DeviceControl, Flush, Read, RequestHandle, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
+
 pub(crate) struct VirtioPdoIo;
 
 fn too_many_dma_segments_status(operation: &str) -> DriverStatus {
@@ -87,11 +92,13 @@ async fn submit_virtio_no_data_request(
     if req_type == VIRTIO_BLK_T_FLUSH {
         dp::add_counter(C_FLUSH_BARRIER_REQUESTS, 1);
     }
+
     let completion = loop {
         let completion = match qs.completion_slots.alloc() {
             Some(completion) => completion,
             None => {
                 cold_path();
+
                 let drained = drain_queue_completions(qs);
                 if unlikely(drained == 0) {
                     let mut done = false;
@@ -106,12 +113,15 @@ async fn submit_virtio_no_data_request(
                     })
                     .await;
                 }
+
                 continue;
             }
         };
+
         let mut completion = Some(completion);
         let submitted = {
             dp::add_counter(C_LOCK_ACQUISITIONS, 1);
+
             let mut vq = qs.queue.write();
             match qs.arena.submit_request(
                 &mut vq,
@@ -203,8 +213,10 @@ fn get_parent_inner(
         .try_devext::<DevExt>()
         .map_err(|_| DriverStatus::NoSuchDevice)?;
     let inner = dx.inner.get().ok_or(DriverStatus::DeviceNotReady)?.clone();
+
     Ok((parent, inner))
 }
+
 struct DmaSegmentByteWindow<I>
 where
     I: Iterator<Item = IoBufferDmaSegment>,
@@ -331,20 +343,6 @@ where
     }
 }
 
-const VIRTIO_QUEUE_BATCH_LIMIT: usize = 64;
-struct SubmittedCompletion<'a> {
-    completion: CompletionToken<'a>,
-    byte_len: usize,
-}
-struct PendingBlockOp<'data, D>
-where
-    D: IoBufferAccess,
-{
-    sector: u64,
-    len: usize,
-    mapped_buffer: IoBuffer<'data, 'data, DmaMapped<PhysFramed>, D>,
-}
-
 #[derive(Clone, Copy)]
 struct PendingBlockCursor {
     op_index: usize,
@@ -353,38 +351,38 @@ struct PendingBlockCursor {
 }
 
 impl PendingBlockCursor {
-    fn new<D>(ops: &[PendingBlockOp<'_, D>]) -> Self
+    fn new<D>(ops: &PendingOpBatch<'_, '_, D>) -> Self
     where
-        D: IoBufferAccess,
+        D: IoBufferAccess + 'static,
     {
         Self {
             op_index: 0,
             byte_offset: 0,
-            sector: ops.first().map(|op| op.sector).unwrap_or(0),
+            sector: if ops.is_empty() { 0 } else { ops.get(0).sector },
         }
     }
 
     #[inline]
-    fn done<D>(&self, ops: &[PendingBlockOp<'_, D>]) -> bool
+    fn done<D>(&self, ops: &PendingOpBatch<'_, '_, D>) -> bool
     where
-        D: IoBufferAccess,
+        D: IoBufferAccess + 'static,
     {
         self.op_index >= ops.len()
     }
 
-    fn advance<D>(&mut self, ops: &[PendingBlockOp<'_, D>], chunk_len: usize)
+    fn advance<D>(&mut self, ops: &PendingOpBatch<'_, '_, D>, chunk_len: usize)
     where
-        D: IoBufferAccess,
+        D: IoBufferAccess + 'static,
     {
         self.byte_offset += chunk_len;
         self.sector += (chunk_len as u64) >> 9;
 
-        if self.byte_offset == ops[self.op_index].len {
+        if self.byte_offset == ops.get(self.op_index).len {
             self.op_index += 1;
             self.byte_offset = 0;
 
             if self.op_index < ops.len() {
-                self.sector = ops[self.op_index].sector;
+                self.sector = ops.get(self.op_index).sector;
             }
         }
     }
@@ -414,14 +412,33 @@ async fn yield_once() {
     .await;
 }
 
+async fn wait_for_pending_op_slot<'pool, 'data, D>(
+    qs: &QueueState,
+    pool: &'pool PendingOpPool<D>,
+) -> PendingOpLease<'pool, 'data, D>
+where
+    D: IoBufferAccess + 'static,
+{
+    loop {
+        if let Some(lease) = pool.alloc() {
+            return lease;
+        }
+
+        let drained = drain_queue_completions(qs);
+        if unlikely(drained == 0) {
+            yield_once().await;
+        }
+    }
+}
+
 async fn wait_submitted_batch(
     qs: &QueueState,
-    completions: Vec<SubmittedCompletion<'_>>,
+    completions: &mut SubmittedCompletionBatch<'_, '_>,
     operation: &str,
 ) -> DriverStatus {
     let mut final_status = DriverStatus::Success;
 
-    for submitted in completions {
+    while let Some(submitted) = completions.pop() {
         let status =
             match wait_completion_hybrid(qs, submitted.completion, submitted.byte_len).await {
                 Ok(device_status) => blk_status_to_driver_status(operation, device_status),
@@ -442,12 +459,12 @@ async fn submit_block_ops_to_queue<D>(
     inner: &DevExtInner,
     qs: &QueueState,
     req_type: u32,
-    ops: &[PendingBlockOp<'_, D>],
+    ops: &PendingOpBatch<'_, '_, D>,
     is_write: bool,
     operation: &str,
 ) -> DriverStatus
 where
-    D: IoBufferAccess,
+    D: IoBufferAccess + 'static,
 {
     if ops.is_empty() {
         return DriverStatus::Success;
@@ -456,7 +473,7 @@ where
     let mut cursor = PendingBlockCursor::new(ops);
 
     while !cursor.done(ops) {
-        let mut completions: Vec<SubmittedCompletion<'_>> = Vec::new();
+        let mut completions = SubmittedCompletionBatch::new(&qs.submitted_completions);
         let mut submitted_any = false;
         let mut queue_or_slot_pressure = false;
 
@@ -471,7 +488,23 @@ where
                     break;
                 }
 
-                let op = &ops[cursor.op_index];
+                let Some(mut submitted_slot) = qs.submitted_completions.alloc() else {
+                    cold_path();
+                    queue_or_slot_pressure = true;
+                    break;
+                };
+
+                let completion = match qs.completion_slots.alloc() {
+                    Some(completion) => completion,
+                    None => {
+                        cold_path();
+                        drop(submitted_slot);
+                        queue_or_slot_pressure = true;
+                        break;
+                    }
+                };
+
+                let op = ops.get(cursor.op_index);
                 let remaining = op.len - cursor.byte_offset;
 
                 let chunk_len =
@@ -480,13 +513,15 @@ where
                         Ok(chunk_len) => chunk_len,
                         Err(status) => {
                             cold_path();
+                            drop(completion);
+                            drop(submitted_slot);
 
                             if submitted_any {
                                 notify_queue(inner, &vq);
                                 drop(vq);
 
                                 let wait_status =
-                                    wait_submitted_batch(qs, completions, operation).await;
+                                    wait_submitted_batch(qs, &mut completions, operation).await;
 
                                 if wait_status != DriverStatus::Success {
                                     return wait_status;
@@ -496,15 +531,6 @@ where
                             return status;
                         }
                     };
-
-                let completion = match qs.completion_slots.alloc() {
-                    Some(completion) => completion,
-                    None => {
-                        cold_path();
-                        queue_or_slot_pressure = true;
-                        break;
-                    }
-                };
 
                 let segments = DmaSegmentByteWindow::new(
                     op.mapped_buffer.dma_segments().iter(),
@@ -518,10 +544,11 @@ where
                 {
                     Ok(head) => {
                         qs.completion_slots.attach(head, &completion);
-                        completions.push(SubmittedCompletion {
+                        submitted_slot.write(SubmittedCompletion {
                             completion,
                             byte_len: chunk_len,
                         });
+                        completions.push(submitted_slot);
 
                         submitted_any = true;
                         cursor.advance(ops, chunk_len);
@@ -534,19 +561,21 @@ where
                     Err(SubmitRequestError::QueueFull) => {
                         cold_path();
                         drop(completion);
+                        drop(submitted_slot);
                         queue_or_slot_pressure = true;
                         break;
                     }
                     Err(SubmitRequestError::TooManyDataSegments) => {
                         cold_path();
                         drop(completion);
+                        drop(submitted_slot);
 
                         if submitted_any {
                             notify_queue(inner, &vq);
                             drop(vq);
 
                             let wait_status =
-                                wait_submitted_batch(qs, completions, operation).await;
+                                wait_submitted_batch(qs, &mut completions, operation).await;
 
                             if wait_status != DriverStatus::Success {
                                 return wait_status;
@@ -571,7 +600,7 @@ where
             continue;
         }
 
-        let status = wait_submitted_batch(qs, completions, operation).await;
+        let status = wait_submitted_batch(qs, &mut completions, operation).await;
         if status != DriverStatus::Success {
             return status;
         }
@@ -609,60 +638,127 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let mut final_status = DriverStatus::Success;
-    let mut pending: Vec<PendingBlockOp<'data, FromDevice>> = Vec::new();
-
-    {
+    let mut cursor_addr = {
         let mut guard = req.write();
+        (&mut guard.body as *mut Read<'data>) as usize
+    };
 
-        for read in guard.body.iter_mut() {
+    let mut final_status = DriverStatus::Success;
+    let mut pending = PendingOpBatch::new(&qs.read_ops);
+
+    loop {
+        if pending.is_full() {
+            let status =
+                submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read")
+                    .await;
+            pending.clear();
+
+            if status != DriverStatus::Success {
+                final_status = status;
+                break;
+            }
+        }
+
+        if cursor_addr == 0 {
+            break;
+        }
+
+        let candidate = {
+            let _guard = req.write();
+            let read = unsafe { &mut *(cursor_addr as *mut Read<'data>) };
+            let next_addr = read.next.load(Ordering::Acquire) as usize;
             let offset = read.offset;
             let len = read.len;
 
             if unlikely(len == 0) {
-                continue;
+                cursor_addr = next_addr;
+                None
+            } else {
+                match validate_common_block_io(offset, len) {
+                    Ok(()) => match read.buffer.as_ref() {
+                        Some(buffer) if buffer.len() >= len => Some((offset, len, next_addr)),
+                        Some(_) => {
+                            cold_path();
+                            final_status = DriverStatus::InvalidParameter;
+                            None
+                        }
+                        None => {
+                            cold_path();
+                            final_status = DriverStatus::InvalidParameter;
+                            None
+                        }
+                    },
+                    Err(status) => {
+                        final_status = status;
+                        None
+                    }
+                }
             }
+        };
 
-            if let Err(status) = validate_common_block_io(offset, len) {
-                final_status = status;
-                break;
-            }
+        if final_status != DriverStatus::Success {
+            break;
+        }
 
-            let Some(buffer) = read.buffer.take() else {
-                cold_path();
-                final_status = DriverStatus::InvalidParameter;
-                break;
-            };
+        let Some((offset, len, next_addr)) = candidate else {
+            continue;
+        };
 
-            if unlikely(buffer.len() < len) {
-                cold_path();
-                final_status = DriverStatus::InvalidParameter;
-                break;
-            }
+        let mut lease = match qs.read_ops.alloc() {
+            Some(lease) => lease,
+            None if !pending.is_empty() => {
+                let status =
+                    submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read")
+                        .await;
+                pending.clear();
 
-            let mapped_buffer = match map_request_buffer(&parent, buffer) {
-                Ok(buffer) => buffer,
-                Err(status) => {
-                    cold_path();
+                if status != DriverStatus::Success {
                     final_status = status;
                     break;
                 }
-            };
 
-            pending.push(PendingBlockOp {
-                sector: offset >> 9,
-                len,
-                mapped_buffer,
-            });
-        }
+                continue;
+            }
+            None => wait_for_pending_op_slot(qs, &qs.read_ops).await,
+        };
+
+        let buffer = {
+            let _guard = req.write();
+            let read = unsafe { &mut *(cursor_addr as *mut Read<'data>) };
+
+            match read.buffer.take() {
+                Some(buffer) => buffer,
+                None => {
+                    cold_path();
+                    final_status = DriverStatus::InvalidParameter;
+                    break;
+                }
+            }
+        };
+
+        let mapped_buffer = match map_request_buffer(&parent, buffer) {
+            Ok(buffer) => buffer,
+            Err(status) => {
+                cold_path();
+                final_status = status;
+                break;
+            }
+        };
+
+        lease.write(PendingBlockOp {
+            sector: offset >> 9,
+            len,
+            mapped_buffer,
+        });
+
+        pending.push(lease);
+        cursor_addr = next_addr;
     }
 
-    if final_status != DriverStatus::Success {
-        return complete_req(req, final_status);
+    if final_status == DriverStatus::Success && !pending.is_empty() {
+        final_status =
+            submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read").await;
     }
-
-    final_status =
-        submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read").await;
 
     complete_req(req, final_status)
 }
@@ -683,60 +779,133 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let mut final_status = DriverStatus::Success;
-    let mut pending: Vec<PendingBlockOp<'data, ToDevice>> = Vec::new();
-
-    {
+    let mut cursor_addr = {
         let mut guard = req.write();
+        (&mut guard.body as *mut Write<'data>) as usize
+    };
 
-        for write in guard.body.iter_mut() {
+    let mut final_status = DriverStatus::Success;
+    let mut pending = PendingOpBatch::new(&qs.write_ops);
+
+    loop {
+        if pending.is_full() {
+            let status =
+                submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_OUT, &pending, true, "write")
+                    .await;
+            pending.clear();
+
+            if status != DriverStatus::Success {
+                final_status = status;
+                break;
+            }
+        }
+
+        if cursor_addr == 0 {
+            break;
+        }
+
+        let candidate = {
+            let _guard = req.write();
+            let write = unsafe { &mut *(cursor_addr as *mut Write<'data>) };
+            let next_addr = write.next.load(Ordering::Acquire) as usize;
             let offset = write.offset;
             let len = write.len;
 
             if unlikely(len == 0) {
-                continue;
+                cursor_addr = next_addr;
+                None
+            } else {
+                match validate_common_block_io(offset, len) {
+                    Ok(()) => match write.buffer.as_ref() {
+                        Some(buffer) if buffer.len() >= len => Some((offset, len, next_addr)),
+                        Some(_) => {
+                            cold_path();
+                            final_status = DriverStatus::InvalidParameter;
+                            None
+                        }
+                        None => {
+                            cold_path();
+                            final_status = DriverStatus::InvalidParameter;
+                            None
+                        }
+                    },
+                    Err(status) => {
+                        final_status = status;
+                        None
+                    }
+                }
             }
+        };
 
-            if let Err(status) = validate_common_block_io(offset, len) {
-                final_status = status;
-                break;
-            }
+        if final_status != DriverStatus::Success {
+            break;
+        }
 
-            let Some(buffer) = write.buffer.take() else {
-                cold_path();
-                final_status = DriverStatus::InvalidParameter;
-                break;
-            };
+        let Some((offset, len, next_addr)) = candidate else {
+            continue;
+        };
 
-            if unlikely(buffer.len() < len) {
-                cold_path();
-                final_status = DriverStatus::InvalidParameter;
-                break;
-            }
+        let mut lease = match qs.write_ops.alloc() {
+            Some(lease) => lease,
+            None if !pending.is_empty() => {
+                let status = submit_block_ops_to_queue(
+                    &inner,
+                    qs,
+                    VIRTIO_BLK_T_OUT,
+                    &pending,
+                    true,
+                    "write",
+                )
+                .await;
+                pending.clear();
 
-            let mapped_buffer = match map_request_buffer(&parent, buffer) {
-                Ok(buffer) => buffer,
-                Err(status) => {
-                    cold_path();
+                if status != DriverStatus::Success {
                     final_status = status;
                     break;
                 }
-            };
 
-            pending.push(PendingBlockOp {
-                sector: offset >> 9,
-                len,
-                mapped_buffer,
-            });
-        }
+                continue;
+            }
+            None => wait_for_pending_op_slot(qs, &qs.write_ops).await,
+        };
+
+        let buffer = {
+            let _guard = req.write();
+            let write = unsafe { &mut *(cursor_addr as *mut Write<'data>) };
+
+            match write.buffer.take() {
+                Some(buffer) => buffer,
+                None => {
+                    cold_path();
+                    final_status = DriverStatus::InvalidParameter;
+                    break;
+                }
+            }
+        };
+
+        let mapped_buffer = match map_request_buffer(&parent, buffer) {
+            Ok(buffer) => buffer,
+            Err(status) => {
+                cold_path();
+                final_status = status;
+                break;
+            }
+        };
+
+        lease.write(PendingBlockOp {
+            sector: offset >> 9,
+            len,
+            mapped_buffer,
+        });
+
+        pending.push(lease);
+        cursor_addr = next_addr;
     }
 
-    if final_status != DriverStatus::Success {
-        return complete_req(req, final_status);
+    if final_status == DriverStatus::Success && !pending.is_empty() {
+        final_status =
+            submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_OUT, &pending, true, "write").await;
     }
-
-    final_status =
-        submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_OUT, &pending, true, "write").await;
 
     complete_req(req, final_status)
 }
@@ -747,6 +916,7 @@ pub(crate) async fn virtio_pdo_flush_impl<'req, 'b>(
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
 }
+
 #[inline(always)]
 pub(crate) async fn virtio_pdo_ioctl_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,

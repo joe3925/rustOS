@@ -1,7 +1,9 @@
 use crate::cache::{CacheIndex, CacheIndexFactory, DefaultIndexFactory};
+use crate::cache_core::flush::FlushRunScratchLease;
 use crate::cache_traits::{
     CacheConfig, CacheError, CacheStats, VolumeCacheBackend, VolumeCacheOps,
 };
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::min;
@@ -30,6 +32,7 @@ use super::notify::WritebackNotifier;
 
 pub const MAX_WRITE_CHAIN: usize = 64;
 const FLUSH_WRITE_CHAIN: usize = MAX_WRITE_CHAIN;
+const CACHE_GRANULE: usize = 1024;
 
 struct FlushActiveGuard<'a> {
     active: &'a AtomicBool,
@@ -116,8 +119,9 @@ impl<I> Shard<I> {
 
 struct CachePage {
     slot: usize,
-    dirty: AtomicBool,
-    writeback: AtomicBool,
+    valid_mask: AtomicU64,
+    dirty_mask: AtomicU64,
+    writeback_mask: AtomicU64,
     owner: AtomicU64,
     generation: AtomicU64,
     wb_generation: AtomicU64,
@@ -128,8 +132,9 @@ impl CachePage {
     fn new(slot: usize) -> Self {
         Self {
             slot,
-            dirty: AtomicBool::new(false),
-            writeback: AtomicBool::new(false),
+            valid_mask: AtomicU64::new(0),
+            dirty_mask: AtomicU64::new(0),
+            writeback_mask: AtomicU64::new(0),
             owner: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             wb_generation: AtomicU64::new(0),
@@ -138,15 +143,17 @@ impl CachePage {
     }
 
     fn reset_for_lba(&self, _lba: u64) {
-        self.dirty.store(false, Ordering::Release);
-        self.writeback.store(false, Ordering::Release);
+        self.valid_mask.store(0, Ordering::Release);
+        self.dirty_mask.store(0, Ordering::Release);
+        self.writeback_mask.store(0, Ordering::Release);
         self.owner.store(0, Ordering::Release);
         self.generation.store(0, Ordering::Release);
         self.wb_generation.store(0, Ordering::Release);
     }
 
     fn is_evictable(&self) -> bool {
-        !self.dirty.load(Ordering::Acquire) && !self.writeback.load(Ordering::Acquire)
+        self.dirty_mask.load(Ordering::Acquire) == 0
+            && self.writeback_mask.load(Ordering::Acquire) == 0
     }
 }
 
@@ -184,27 +191,31 @@ impl FlushFilter<'_> {
     }
 }
 
-struct PreparedFlushPage {
+struct PreparedFlushExtent {
     lba: u64,
     slot: usize,
     page: Arc<CachePage>,
+    granule_start: usize,
+    granule_count: usize,
+    bits: u64,
     wb_generation: u64,
 }
 
-struct PreparedRun {
-    start: usize,
-    end: usize,
+pub struct PreparedRun {
+    pub start: usize,
+    pub end: usize,
 }
 
-struct FlushScratch {
-    keys: Vec<u64>,
-    prepared: Vec<PreparedFlushPage>,
-    runs: Vec<PreparedRun>,
-    extents: Vec<PreparedRun>,
+pub struct FlushScratch {
+    pub keys: Vec<u64>,
+    pub prepared: Vec<PreparedFlushExtent>,
+    pub runs: Vec<PreparedRun>,
+    pub extents: Vec<PreparedRun>,
+    pub writes: Option<Box<[Option<Write<'static>>; MAX_WRITE_CHAIN]>>,
 }
 
 impl FlushScratch {
-    fn new(capacity_blocks: usize) -> Result<Self, ()> {
+    fn new(capacity_blocks: usize, prepared_capacity: usize) -> Result<Self, ()> {
         let mut keys = Vec::new();
         let mut prepared = Vec::new();
         let mut runs = Vec::new();
@@ -212,17 +223,28 @@ impl FlushScratch {
 
         keys.try_reserve_exact(capacity_blocks).map_err(|_| ())?;
         prepared
-            .try_reserve_exact(capacity_blocks)
+            .try_reserve_exact(prepared_capacity.max(1))
             .map_err(|_| ())?;
-        runs.try_reserve_exact(capacity_blocks).map_err(|_| ())?;
-        extents.try_reserve_exact(capacity_blocks).map_err(|_| ())?;
+        runs.try_reserve_exact(prepared_capacity.max(1))
+            .map_err(|_| ())?;
+        extents
+            .try_reserve_exact(prepared_capacity.max(1))
+            .map_err(|_| ())?;
 
         Ok(Self {
             keys,
             prepared,
             runs,
             extents,
+            writes: Some(Box::new(core::array::from_fn(|_| None))),
         })
+    }
+
+    fn reset(&mut self) {
+        self.keys.clear();
+        self.prepared.clear();
+        self.runs.clear();
+        self.extents.clear();
     }
 }
 
@@ -355,7 +377,12 @@ where
         mut cfg: CacheConfig,
         factory: F,
     ) -> Result<Self, CacheError<B::Error>> {
-        if unlikely(BLOCK_SIZE == 0 || cfg.capacity_blocks == 0) {
+        if unlikely(
+            BLOCK_SIZE == 0
+                || cfg.capacity_blocks == 0
+                || BLOCK_SIZE % CACHE_GRANULE != 0
+                || BLOCK_SIZE / CACHE_GRANULE > 64,
+        ) {
             cold_path();
             return Err(CacheError::InvalidConfig);
         }
@@ -418,12 +445,18 @@ where
 
         let shard_count = cfg.shards;
         let per_shard = (cfg.capacity_blocks + shard_count - 1) / shard_count;
-        let mut shards = Vec::with_capacity(shard_count);
+
+        let index_reserve = cfg.capacity_blocks;
+
+        let mut shards = Vec::new();
+        shards
+            .try_reserve_exact(shard_count)
+            .map_err(|_| CacheError::InsufficientResources)?;
 
         let mut i = 0usize;
         while i < shard_count {
-            let mut index = factory.build(per_shard);
-            index.reserve_or_panic(per_shard);
+            let mut index = factory.build(index_reserve);
+            index.reserve_or_panic(index_reserve);
             shards.push(Mutex::new(Shard::new(index, per_shard)));
             i += 1;
         }
@@ -440,7 +473,7 @@ where
         }
 
         let direct_page = Arc::new(CachePage::new(cfg.capacity_blocks));
-        let flush_scratch = FlushScratch::new(cfg.capacity_blocks)
+        let flush_scratch = FlushScratch::new(cfg.capacity_blocks, FLUSH_WRITE_CHAIN)
             .map_err(|_| CacheError::InsufficientResources)?;
 
         Ok(Self {
@@ -474,6 +507,67 @@ where
     }
 
     #[inline]
+    fn granules_per_block() -> usize {
+        BLOCK_SIZE / CACHE_GRANULE
+    }
+
+    #[inline]
+    fn full_granule_mask() -> u64 {
+        let granules = Self::granules_per_block();
+        if granules == 64 {
+            u64::MAX
+        } else {
+            (1u64 << granules) - 1
+        }
+    }
+
+    #[inline]
+    fn granule_mask(granule_start: usize, granule_count: usize) -> u64 {
+        if granule_count == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << granule_count) - 1) << granule_start
+        }
+    }
+
+    #[inline]
+    fn granule_mask_for_range(block_off: usize, len: usize) -> Result<u64, CacheError<B::Error>> {
+        if unlikely(len == 0) {
+            cold_path();
+            return Ok(0);
+        }
+
+        let end = block_off
+            .checked_add(len)
+            .ok_or(CacheError::OffsetOverflow)?;
+        let granule_start = block_off / CACHE_GRANULE;
+        let granule_end = (end + CACHE_GRANULE - 1) / CACHE_GRANULE;
+        let granule_count = granule_end
+            .checked_sub(granule_start)
+            .ok_or(CacheError::OffsetOverflow)?;
+
+        Ok(Self::granule_mask(granule_start, granule_count))
+    }
+
+    #[inline]
+    fn range_covers_whole_granules(block_off: usize, len: usize) -> bool {
+        block_off % CACHE_GRANULE == 0 && len % CACHE_GRANULE == 0
+    }
+
+    #[inline]
+    fn first_mask_run(mask: u64) -> Option<(usize, usize, u64)> {
+        if mask == 0 {
+            return None;
+        }
+
+        let start = mask.trailing_zeros() as usize;
+        let shifted = mask >> start;
+        let count = (!shifted).trailing_zeros() as usize;
+        let bits = Self::granule_mask(start, count);
+        Some((start, count, bits))
+    }
+
+    #[inline]
     fn cache_backing(&self) -> Result<&IoBufferBacking<'static>, CacheError<B::Error>> {
         self.cache_backing.as_ref().ok_or(CacheError::InvalidConfig)
     }
@@ -490,15 +584,44 @@ where
         core::slice::from_raw_parts_mut(ptr, BLOCK_SIZE)
     }
 
+    fn create_cache_from_device_buffer_at<'a>(
+        &'a self,
+        page: &CachePage,
+        block_off: usize,
+        len: usize,
+    ) -> Result<IoBuffer<'a, 'a, Described, FromDevice>, CacheError<B::Error>> {
+        let start = Self::page_offset(page.slot)
+            .checked_add(block_off)
+            .ok_or(CacheError::OffsetOverflow)?;
+
+        self.cache_backing()?
+            .create_from_device(start, len)
+            .map_err(|err| {
+                cold_path();
+                CacheError::InvalidIoBuffer(err)
+            })
+    }
+
     fn create_cache_from_device_buffer<'a>(
         &'a self,
         page: &CachePage,
         len: usize,
     ) -> Result<IoBuffer<'a, 'a, Described, FromDevice>, CacheError<B::Error>> {
-        let start = Self::page_offset(page.slot);
+        self.create_cache_from_device_buffer_at(page, 0, len)
+    }
+
+    fn create_cache_to_device_buffer_at<'a>(
+        &'a self,
+        page: &CachePage,
+        block_off: usize,
+        len: usize,
+    ) -> Result<IoBuffer<'a, 'a, Described, ToDevice>, CacheError<B::Error>> {
+        let start = Self::page_offset(page.slot)
+            .checked_add(block_off)
+            .ok_or(CacheError::OffsetOverflow)?;
 
         self.cache_backing()?
-            .create_from_device(start, len)
+            .create_to_device(start, len)
             .map_err(|err| {
                 cold_path();
                 CacheError::InvalidIoBuffer(err)
@@ -510,14 +633,7 @@ where
         page: &CachePage,
         len: usize,
     ) -> Result<IoBuffer<'a, 'a, Described, ToDevice>, CacheError<B::Error>> {
-        let start = Self::page_offset(page.slot);
-
-        self.cache_backing()?
-            .create_to_device(start, len)
-            .map_err(|err| {
-                cold_path();
-                CacheError::InvalidIoBuffer(err)
-            })
+        self.create_cache_to_device_buffer_at(page, 0, len)
     }
 
     async fn write_slice_to_backend(
@@ -575,12 +691,48 @@ where
         FlushSlotWait { cache: self }.await
     }
 
-    fn mark_cached_page_dirty(&self, page: &CachePage, owner: u64) {
+    fn mark_cached_page_dirty_range(&self, page: &CachePage, owner: u64, bits: u64) {
+        if unlikely(bits == 0) {
+            cold_path();
+            return;
+        }
+
         page.owner.store(owner, Ordering::Release);
+        page.valid_mask.fetch_or(bits, Ordering::AcqRel);
         page.generation.fetch_add(1, Ordering::AcqRel);
 
-        if !page.dirty.swap(true, Ordering::AcqRel) {
+        if page.dirty_mask.fetch_or(bits, Ordering::AcqRel) == 0 {
             self.dirty_pages.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn clear_cached_page_dirty_range(&self, page: &CachePage, bits: u64) {
+        if unlikely(bits == 0) {
+            cold_path();
+            return;
+        }
+
+        let mut old = page.dirty_mask.load(Ordering::Acquire);
+        loop {
+            let new = old & !bits;
+            if new == old {
+                return;
+            }
+
+            match page.dirty_mask.compare_exchange_weak(
+                old,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if old != 0 && new == 0 {
+                        self.dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    return;
+                }
+                Err(cur) => old = cur,
+            }
         }
     }
 
@@ -617,8 +769,8 @@ where
     }
 
     fn page_can_be_flushed_for_reclaim(page: &Arc<CachePage>) -> bool {
-        page.dirty.load(Ordering::Acquire)
-            && !page.writeback.load(Ordering::Acquire)
+        page.dirty_mask.load(Ordering::Acquire) != 0
+            && page.writeback_mask.load(Ordering::Acquire) == 0
             && Arc::strong_count(page) == 1
     }
 
@@ -716,7 +868,16 @@ where
             return Ok(false);
         };
 
-        let Some(prepared) = Self::prepare_flush_page(&self.stats, lba, page) else {
+        let dirty = page.dirty_mask.load(Ordering::Acquire)
+            & !page.writeback_mask.load(Ordering::Acquire)
+            & Self::full_granule_mask();
+        let Some((granule_start, granule_count, bits)) = Self::first_mask_run(dirty) else {
+            return Ok(true);
+        };
+
+        let Some(prepared) =
+            Self::prepare_flush_extent(&self.stats, lba, page, granule_start, granule_count, bits)
+        else {
             return Ok(true);
         };
 
@@ -822,6 +983,54 @@ where
         page
     }
 
+    async fn read_extent_into_page(
+        &self,
+        lba: u64,
+        page: &Arc<CachePage>,
+        block_off: usize,
+        len: usize,
+    ) -> Result<(), CacheError<B::Error>> {
+        if unlikely(len == 0) {
+            cold_path();
+            return Ok(());
+        }
+
+        let offset = lba
+            .checked_mul(BLOCK_SIZE as u64)
+            .and_then(|base| base.checked_add(block_off as u64))
+            .ok_or(CacheError::OffsetOverflow)?;
+
+        let bits = Self::granule_mask_for_range(block_off, len)?;
+
+        {
+            let _data_guard = page.data_lock.write();
+
+            if page.valid_mask.load(Ordering::Acquire) & bits == bits {
+                return Ok(());
+            }
+
+            let io_buf = self.create_cache_from_device_buffer_at(page, block_off, len)?;
+            let mut req = RequestHandle::new(Read {
+                offset,
+                len,
+                no_buffer: false,
+                buffer: Some(io_buf),
+                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            });
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+
+            self.backend
+                .read_request(&mut req)
+                .await
+                .map_err(CacheError::Backend)?;
+
+            page.valid_mask.fetch_or(bits, Ordering::AcqRel);
+        }
+
+        self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn read_block_into_page(
         &self,
         lba: u64,
@@ -849,7 +1058,41 @@ where
             }
         }
 
+        page.valid_mask
+            .store(Self::full_granule_mask(), Ordering::Release);
         self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn ensure_page_range_valid(
+        &self,
+        lba: u64,
+        page: &Arc<CachePage>,
+        block_off: usize,
+        len: usize,
+    ) -> Result<(), CacheError<B::Error>> {
+        let needed = Self::granule_mask_for_range(block_off, len)?;
+        let mut missing = needed & !page.valid_mask.load(Ordering::Acquire);
+
+        while missing != 0 {
+            let Some((granule_start, granule_count, bits)) = Self::first_mask_run(missing) else {
+                break;
+            };
+
+            let read_off = granule_start
+                .checked_mul(CACHE_GRANULE)
+                .ok_or(CacheError::OffsetOverflow)?;
+            let read_len = granule_count
+                .checked_mul(CACHE_GRANULE)
+                .ok_or(CacheError::OffsetOverflow)?;
+
+            self.read_extent_into_page(lba, page, read_off, read_len)
+                .await?;
+
+            missing = needed & !page.valid_mask.load(Ordering::Acquire);
+            missing &= !bits;
+        }
+
         Ok(())
     }
 
@@ -891,9 +1134,9 @@ where
     async fn get_or_create_write_page(
         &self,
         lba: u64,
-        block_off: usize,
-        write_len: usize,
-        src_for_full: &[u8],
+        _block_off: usize,
+        _write_len: usize,
+        _src_for_full: &[u8],
     ) -> Result<WriteAcquire, CacheError<B::Error>> {
         if let Some(page) = self.try_get_page(lba).await {
             self.stats.write_hits.fetch_add(1, Ordering::Relaxed);
@@ -903,25 +1146,11 @@ where
         cold_path();
         self.stats.write_misses.fetch_add(1, Ordering::Relaxed);
 
-        let is_full_block = block_off == 0 && write_len == BLOCK_SIZE;
-
         if !self.cfg.write_allocate {
             return Ok(WriteAcquire::Direct);
         }
 
         let page = self.acquire_cache_page(lba).await?;
-        if is_full_block {
-            {
-                let _guard = page.data_lock.write();
-                unsafe {
-                    self.page_slice_mut(&page).copy_from_slice(src_for_full);
-                }
-            }
-        } else if let Err(e) = self.read_block_into_page(lba, &page).await {
-            self.recycle_or_drop_page(page);
-            return Err(e);
-        }
-
         let page = self.insert_page_or_get_existing(lba, page).await;
         Ok(WriteAcquire::Cached(page))
     }
@@ -953,6 +1182,8 @@ where
             }
         }
 
+        page.valid_mask
+            .store(Self::full_granule_mask(), Ordering::Release);
         self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
         Ok(bytes_read)
     }
@@ -1044,6 +1275,9 @@ where
                 break;
             }
 
+            self.ensure_page_range_valid(lba, &page, block_off, take)
+                .await?;
+
             {
                 let _guard = page.data_lock.read();
                 unsafe {
@@ -1130,28 +1364,44 @@ where
         result
     }
 
-    fn prepare_flush_page(
+    fn prepare_flush_extent(
         stats: &StatsInner,
         lba: u64,
         page: Arc<CachePage>,
-    ) -> Option<PreparedFlushPage> {
+        granule_start: usize,
+        granule_count: usize,
+        bits: u64,
+    ) -> Option<PreparedFlushExtent> {
         stats.flush_attempts.fetch_add(1, Ordering::Relaxed);
 
-        if unlikely(!page.dirty.load(Ordering::Acquire)) {
+        if unlikely(page.dirty_mask.load(Ordering::Acquire) & bits == 0) {
             cold_path();
             stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
-        if unlikely(page.writeback.swap(true, Ordering::AcqRel)) {
-            cold_path();
-            stats.flush_skipped_busy.fetch_add(1, Ordering::Relaxed);
-            return None;
+        let mut old = page.writeback_mask.load(Ordering::Acquire);
+        loop {
+            if unlikely(old & bits != 0) {
+                cold_path();
+                stats.flush_skipped_busy.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+
+            match page.writeback_mask.compare_exchange_weak(
+                old,
+                old | bits,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(cur) => old = cur,
+            }
         }
 
-        if unlikely(!page.dirty.load(Ordering::Acquire)) {
+        if unlikely(page.dirty_mask.load(Ordering::Acquire) & bits == 0) {
             cold_path();
-            page.writeback.store(false, Ordering::Release);
+            page.writeback_mask.fetch_and(!bits, Ordering::AcqRel);
             stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -1159,32 +1409,40 @@ where
         let wb_generation = page.generation.load(Ordering::Acquire);
         page.wb_generation.store(wb_generation, Ordering::Release);
 
-        Some(PreparedFlushPage {
+        Some(PreparedFlushExtent {
             lba,
             slot: page.slot,
             page,
+            granule_start,
+            granule_count,
+            bits,
             wb_generation,
         })
     }
 
-    fn finish_prepared_flush_pages(&self, pages: &[PreparedFlushPage], success: bool) {
+    fn finish_prepared_flush_extents(&self, extents: &[PreparedFlushExtent], success: bool) {
         let mut completed_writebacks = 0usize;
 
-        for prepared in pages {
+        for prepared in extents {
             if likely(success) {
                 let cur_gen = prepared.page.generation.load(Ordering::Acquire);
-                if cur_gen == prepared.wb_generation
-                    && prepared.page.dirty.swap(false, Ordering::AcqRel)
-                {
-                    self.dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                if cur_gen == prepared.wb_generation {
+                    self.clear_cached_page_dirty_range(&prepared.page, prepared.bits);
                 }
                 self.stats.flush_success.fetch_add(1, Ordering::Relaxed);
-            } else if !prepared.page.dirty.swap(true, Ordering::AcqRel) {
-                cold_path();
+            } else if prepared
+                .page
+                .dirty_mask
+                .fetch_or(prepared.bits, Ordering::AcqRel)
+                == 0
+            {
                 self.dirty_pages.fetch_add(1, Ordering::AcqRel);
             }
 
-            prepared.page.writeback.store(false, Ordering::Release);
+            prepared
+                .page
+                .writeback_mask
+                .fetch_and(!prepared.bits, Ordering::AcqRel);
             completed_writebacks += 1;
         }
 
@@ -1193,8 +1451,34 @@ where
         }
     }
 
+    #[inline]
+    fn prepared_extent_starts_new_extent(
+        prepared: &[PreparedFlushExtent],
+        lba: u64,
+        slot: usize,
+        granule_start: usize,
+    ) -> bool {
+        let Some(prev) = prepared.last() else {
+            return true;
+        };
+
+        let prev_logical_end = prev
+            .lba
+            .saturating_mul(BLOCK_SIZE as u64)
+            .saturating_add(((prev.granule_start + prev.granule_count) * CACHE_GRANULE) as u64);
+        let cur_logical_start = lba
+            .saturating_mul(BLOCK_SIZE as u64)
+            .saturating_add((granule_start * CACHE_GRANULE) as u64);
+
+        let prev_cache_end = Self::page_offset(prev.slot)
+            .saturating_add((prev.granule_start + prev.granule_count) * CACHE_GRANULE);
+        let cur_cache_start = Self::page_offset(slot).saturating_add(granule_start * CACHE_GRANULE);
+
+        prev_logical_end != cur_logical_start || prev_cache_end != cur_cache_start
+    }
+
     fn collect_prepared_runs_into(
-        pages: &[PreparedFlushPage],
+        pages: &[PreparedFlushExtent],
         runs: &mut Vec<PreparedRun>,
     ) -> Result<(), CacheError<B::Error>> {
         runs.clear();
@@ -1215,7 +1499,12 @@ where
             let split = if i == pages.len() {
                 true
             } else {
-                pages[i].lba != pages[i - 1].lba + 1
+                Self::prepared_extent_starts_new_extent(
+                    &pages[..i],
+                    pages[i].lba,
+                    pages[i].slot,
+                    pages[i].granule_start,
+                )
             };
 
             if split {
@@ -1230,69 +1519,53 @@ where
     }
 
     fn collect_cache_slot_extents_into(
-        pages: &[PreparedFlushPage],
+        _pages: &[PreparedFlushExtent],
         logical_runs: &[PreparedRun],
         extents: &mut Vec<PreparedRun>,
     ) -> Result<(), CacheError<B::Error>> {
         extents.clear();
 
-        if logical_runs.is_empty() {
-            return Ok(());
-        }
-
-        if extents.capacity() < pages.len() {
+        if extents.capacity() < logical_runs.len() {
             cold_path();
             return Err(CacheError::InsufficientResources);
         }
 
-        let mut run_idx = 0usize;
-        while run_idx < logical_runs.len() {
-            let logical_run = &logical_runs[run_idx];
-
-            if logical_run.start >= logical_run.end {
-                run_idx += 1;
-                continue;
-            }
-
-            let mut start = logical_run.start;
-            let mut i = logical_run.start + 1;
-
-            while i <= logical_run.end {
-                let split = if i == logical_run.end {
-                    true
-                } else {
-                    pages[i].lba != pages[i - 1].lba + 1 || pages[i].slot != pages[i - 1].slot + 1
-                };
-
-                if split {
-                    extents.push(PreparedRun { start, end: i });
-                    start = i;
-                }
-
-                i += 1;
-            }
-
-            run_idx += 1;
+        for run in logical_runs {
+            extents.push(PreparedRun {
+                start: run.start,
+                end: run.end,
+            });
         }
 
         Ok(())
     }
 
-    fn extent_byte_len(extent: &PreparedRun) -> Result<usize, CacheError<B::Error>> {
-        let blocks = extent
-            .end
-            .checked_sub(extent.start)
+    fn extent_byte_len(
+        pages: &[PreparedFlushExtent],
+        extent: &PreparedRun,
+    ) -> Result<usize, CacheError<B::Error>> {
+        if unlikely(extent.start >= extent.end) {
+            cold_path();
+            return Ok(0);
+        }
+
+        let first = &pages[extent.start];
+        let last = &pages[extent.end - 1];
+        let start = Self::page_offset(first.slot)
+            .checked_add(first.granule_start * CACHE_GRANULE)
+            .ok_or(CacheError::OffsetOverflow)?;
+        let end = Self::page_offset(last.slot)
+            .checked_add((last.granule_start + last.granule_count) * CACHE_GRANULE)
             .ok_or(CacheError::OffsetOverflow)?;
 
-        blocks
-            .checked_mul(BLOCK_SIZE)
-            .ok_or(CacheError::OffsetOverflow)
+        end.checked_sub(start).ok_or(CacheError::OffsetOverflow)
     }
 
     async fn write_cache_extents_chain_to_backend(
         &self,
-        pages: &[PreparedFlushPage],
+        pages: &[PreparedFlushExtent],
         extents: &[PreparedRun],
+        writes: &mut [Option<kernel_api::request::Write<'static>>; MAX_WRITE_CHAIN],
     ) -> Result<(), CacheError<B::Error>> {
         if unlikely(extents.is_empty()) {
             cold_path();
@@ -1303,12 +1576,22 @@ where
 
         let first_extent = &extents[0];
         let first_page = &pages[first_extent.start];
-        let first_len = Self::extent_byte_len(first_extent)?;
+
+        let first_block_off = first_page
+            .granule_start
+            .checked_mul(CACHE_GRANULE)
+            .ok_or(CacheError::OffsetOverflow)?;
+
+        let first_len = Self::extent_byte_len(pages, first_extent)?;
+
         let first_offset = first_page
             .lba
             .checked_mul(BLOCK_SIZE as u64)
+            .and_then(|base| base.checked_add(first_block_off as u64))
             .ok_or(CacheError::OffsetOverflow)?;
-        let first_buffer = self.create_cache_to_device_buffer(&first_page.page, first_len)?;
+
+        let first_buffer =
+            self.create_cache_to_device_buffer_at(&first_page.page, first_block_off, first_len)?;
 
         let mut req = RequestHandle::new(Write {
             offset: first_offset,
@@ -1319,12 +1602,8 @@ where
             next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
 
-        let mut extra_writes = Vec::new();
-        if extents.len() > 1 {
-            extra_writes
-                .try_reserve_exact(extents.len() - 1)
-                .map_err(|_| CacheError::InsufficientResources)?;
-        }
+        let mut initialized = 0usize;
+        let mut result = Ok(());
 
         {
             let mut req_write = req.write();
@@ -1334,24 +1613,64 @@ where
             while chain_idx < extents.len() {
                 let extent = &extents[chain_idx];
                 let first_page = &pages[extent.start];
-                let byte_len = Self::extent_byte_len(extent)?;
-                let offset = first_page
+
+                let block_off = match first_page.granule_start.checked_mul(CACHE_GRANULE) {
+                    Some(block_off) => block_off,
+                    None => {
+                        result = Err(CacheError::OffsetOverflow);
+                        break;
+                    }
+                };
+
+                let byte_len = match Self::extent_byte_len(pages, extent) {
+                    Ok(byte_len) => byte_len,
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                };
+
+                let offset = match first_page
                     .lba
                     .checked_mul(BLOCK_SIZE as u64)
-                    .ok_or(CacheError::OffsetOverflow)?;
-                let buffer = self.create_cache_to_device_buffer(&first_page.page, byte_len)?;
+                    .and_then(|base| base.checked_add(block_off as u64))
+                {
+                    Some(offset) => offset,
+                    None => {
+                        result = Err(CacheError::OffsetOverflow);
+                        break;
+                    }
+                };
 
-                extra_writes.push(Write {
+                let buffer = match self.create_cache_to_device_buffer_at(
+                    &first_page.page,
+                    block_off,
+                    byte_len,
+                ) {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                };
+
+                let write = Write {
                     offset,
                     len: byte_len,
                     no_buffer: false,
                     owner: first_page.page.owner.load(Ordering::Acquire),
                     buffer: Some(buffer),
                     next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                });
+                };
 
-                let curr_write_ptr =
-                    extra_writes.last_mut().expect("extra write disappeared") as *mut Write<'_>;
+                let write_static: Write<'static> = unsafe { core::mem::transmute(write) };
+
+                let slot = chain_idx - 1;
+                writes[slot] = Some(write_static);
+                initialized += 1;
+
+                let curr_write_ptr = writes[slot].as_mut().expect("flush write slot disappeared")
+                    as *mut Write<'static> as *mut Write<'_>;
 
                 unsafe {
                     (*prev_write_ptr)
@@ -1364,14 +1683,24 @@ where
             }
         }
 
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-        let status = self.backend.write_request(&mut req).await;
+        if result.is_ok() {
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+            result = self
+                .backend
+                .write_request(&mut req)
+                .await
+                .map_err(CacheError::Backend);
+        }
 
         drop(req);
-        drop(extra_writes);
 
-        status.map_err(CacheError::Backend)
+        let mut i = 0usize;
+        while i < initialized {
+            writes[i] = None;
+            i += 1;
+        }
+
+        result
     }
 
     fn page_for_flush_key(&self, lba: u64, filter: &FlushFilter<'_>) -> Option<Arc<CachePage>> {
@@ -1379,24 +1708,12 @@ where
         let shard = self.shards[shard_idx].lock();
         let page: &Arc<CachePage> = shard.index.peek(&lba)?;
 
-        if likely(page.dirty.load(Ordering::Acquire) && filter.matches(lba, page)) {
+        if likely(page.dirty_mask.load(Ordering::Acquire) != 0 && filter.matches(lba, page)) {
             Some(Arc::clone(page))
         } else {
             cold_path();
             None
         }
-    }
-    #[inline]
-    fn prepared_page_starts_new_extent(
-        prepared: &[PreparedFlushPage],
-        lba: u64,
-        slot: usize,
-    ) -> bool {
-        let Some(prev) = prepared.last() else {
-            return true;
-        };
-
-        prev.lba.checked_add(1) != Some(lba) || prev.slot.checked_add(1) != Some(slot)
     }
 
     fn prepare_flush_chain_from_keys(
@@ -1404,7 +1721,7 @@ where
         filter: &FlushFilter<'_>,
         keys: &[u64],
         key_cursor: &mut usize,
-        prepared: &mut Vec<PreparedFlushPage>,
+        prepared: &mut Vec<PreparedFlushExtent>,
     ) -> Result<bool, CacheError<B::Error>> {
         prepared.clear();
 
@@ -1418,32 +1735,54 @@ where
                 continue;
             };
 
-            let starts_new_extent = Self::prepared_page_starts_new_extent(prepared, lba, page.slot);
+            let mut dirty = page.dirty_mask.load(Ordering::Acquire)
+                & !page.writeback_mask.load(Ordering::Acquire)
+                & Self::full_granule_mask();
 
-            if starts_new_extent && extent_count == FLUSH_WRITE_CHAIN {
-                break;
-            }
+            while dirty != 0 {
+                let Some((granule_start, granule_count, bits)) = Self::first_mask_run(dirty) else {
+                    break;
+                };
 
-            if prepared.len() == prepared.capacity() {
-                if prepared.is_empty() {
-                    cold_path();
-                    return Err(CacheError::InsufficientResources);
+                let starts_new_extent = Self::prepared_extent_starts_new_extent(
+                    prepared,
+                    lba,
+                    page.slot,
+                    granule_start,
+                );
+
+                if starts_new_extent && extent_count == FLUSH_WRITE_CHAIN {
+                    return Ok(!prepared.is_empty());
                 }
 
-                break;
+                if prepared.len() == prepared.capacity() {
+                    if prepared.is_empty() {
+                        cold_path();
+                        return Err(CacheError::InsufficientResources);
+                    }
+
+                    return Ok(true);
+                }
+
+                if let Some(prepared_extent) = Self::prepare_flush_extent(
+                    &self.stats,
+                    lba,
+                    Arc::clone(&page),
+                    granule_start,
+                    granule_count,
+                    bits,
+                ) {
+                    if starts_new_extent {
+                        extent_count += 1;
+                    }
+
+                    prepared.push(prepared_extent);
+                }
+
+                dirty &= !bits;
             }
 
             *key_cursor += 1;
-
-            let Some(prepared_page) = Self::prepare_flush_page(&self.stats, lba, page) else {
-                continue;
-            };
-
-            if starts_new_extent {
-                extent_count += 1;
-            }
-
-            prepared.push(prepared_page);
         }
 
         Ok(!prepared.is_empty())
@@ -1451,7 +1790,7 @@ where
 
     async fn flush_prepared_pages_chained_with_runs(
         &self,
-        pages: &[PreparedFlushPage],
+        pages: &[PreparedFlushExtent],
         logical_runs: &mut Vec<PreparedRun>,
         extents: &mut Vec<PreparedRun>,
     ) -> Result<usize, CacheError<B::Error>> {
@@ -1464,12 +1803,19 @@ where
 
         if unlikely(extents.len() > FLUSH_WRITE_CHAIN) {
             cold_path();
-            self.finish_prepared_flush_pages(pages, false);
+            self.finish_prepared_flush_extents(pages, false);
             return Err(CacheError::InsufficientResources);
         }
+        let mut lease: FlushRunScratchLease<'_, BLOCK_SIZE> =
+            FlushRunScratchLease::new(&self.flush_scratch);
+
+        let writes = lease
+            .writes
+            .as_mut()
+            .expect("flush write scratch lease used after drop");
 
         let status = self
-            .write_cache_extents_chain_to_backend(pages, extents)
+            .write_cache_extents_chain_to_backend(pages, extents, writes)
             .await;
 
         match status {
@@ -1477,12 +1823,12 @@ where
                 self.stats
                     .backend_writes
                     .fetch_add(pages.len() as u64, Ordering::Relaxed);
-                self.finish_prepared_flush_pages(pages, true);
+                self.finish_prepared_flush_extents(pages, true);
                 Ok(pages.len())
             }
             Err(err) => {
                 cold_path();
-                self.finish_prepared_flush_pages(pages, false);
+                self.finish_prepared_flush_extents(pages, false);
                 Err(err)
             }
         }
@@ -1587,7 +1933,7 @@ where
         while shard_idx < self.shards.len() {
             let shard = self.shards[shard_idx].lock();
             shard.index.for_each(|lba, page| {
-                if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
+                if page.dirty_mask.load(Ordering::Acquire) != 0 && filter.matches(lba, page) {
                     keys.push(lba);
                 }
             });
@@ -1623,9 +1969,9 @@ where
             let shard = self.shards[shard_idx].lock();
 
             shard.index.for_each(|lba, page| {
-                if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
+                if page.dirty_mask.load(Ordering::Acquire) != 0 && filter.matches(lba, page) {
                     has_dirty = true;
-                    if page.writeback.load(Ordering::Acquire) {
+                    if page.writeback_mask.load(Ordering::Acquire) != 0 {
                         has_active_writeback = true;
                     }
                 }
@@ -1815,7 +2161,6 @@ where
         let cache_for_task = Arc::clone(cache);
 
         spawn_detached(async move {
-            println!("writeback");
             cache_for_task.background_writeback_loop().await;
             cache_for_task
                 .background_writeback_active
@@ -2035,10 +2380,18 @@ where
 
             match acquired {
                 WriteAcquire::Cached(page) => {
-                    while page.writeback.load(Ordering::Acquire) {
+                    let bits = Self::granule_mask_for_range(block_off, take)?;
+
+                    while page.writeback_mask.load(Ordering::Acquire) & bits != 0 {
                         match cache.wait_for_writeback_progress(&FlushFilter::All).await {
                             WritebackWaitResult::Clean | WritebackWaitResult::NeedsFlush => break,
                         }
+                    }
+
+                    if !Self::range_covers_whole_granules(block_off, take) {
+                        cache
+                            .ensure_page_range_valid(lba, &page, block_off, take)
+                            .await?;
                     }
 
                     {
@@ -2047,9 +2400,8 @@ where
                             cache.page_slice_mut(&page)[block_off..block_off + take]
                                 .copy_from_slice(&data[src_pos..src_pos + take]);
                         }
+                        cache.mark_cached_page_dirty_range(&page, owner, bits);
                     }
-
-                    cache.mark_cached_page_dirty(&page, owner);
                 }
                 WriteAcquire::Direct => {
                     cold_path();
@@ -2345,6 +2697,9 @@ where
                     return Err(err);
                 }
             };
+
+            self.ensure_page_range_valid(lba, &page, block_off, take)
+                .await?;
 
             {
                 let _guard = page.data_lock.read();

@@ -10,6 +10,7 @@ mod completion;
 mod dev_ext;
 mod dma_region;
 mod io;
+mod outstanding;
 mod pci;
 mod temp_benchmark;
 mod virtqueue;
@@ -66,7 +67,7 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 const PIC_BASE_VECTOR: u8 = 0x20;
 
 const COMPLETION_POLL_MIN_NS: u64 = 2_000;
-const COMPLETION_POLL_MAX_NS: u64 = 1_000_000;
+const COMPLETION_POLL_MAX_NS: u64 = 500_000;
 const COMPLETION_FIT_MIN_SAMPLES: u64 = 32;
 const COMPLETION_FIT_FALLBACK_BASE_NS: u64 = 5_000;
 const COMPLETION_FIT_FALLBACK_NS_PER_KIB: u64 = 1_250;
@@ -161,7 +162,9 @@ pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
     }
 
     let ns = ((pred_num + (pred_den / 2)) / pred_den) as u64;
-
+    // if (byte_len == 1024) {
+    //     println!("1024 bytes: ns {}", ns)
+    // }
     if ns > COMPLETION_POLL_MAX_NS {
         None
     } else {
@@ -720,6 +723,99 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
             }
         };
 
+        let read_ops = match outstanding::PendingOpPool::new(vq_capacity) {
+            Some(pool) => pool,
+            None => {
+                println!(
+                    "virtio-blk: failed to create read outstanding pool for queue {} with size {}",
+                    i, vq.size
+                );
+
+                for qs in queue_states.iter() {
+                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                        h.unregister();
+                    }
+                    if let Some(vec) = qs.msix_vector {
+                        let _ = irq_free_vector(vec);
+                    }
+                    qs.queue
+                        .try_write()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
+                }
+                vq.destroy();
+                for mut remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
+                }
+                for &(_idx, va, sz) in &mapped_bars {
+                    let _ = unmap_mmio_region(va, sz);
+                }
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        };
+
+        let write_ops = match outstanding::PendingOpPool::new(vq_capacity) {
+            Some(pool) => pool,
+            None => {
+                println!(
+                    "virtio-blk: failed to create write outstanding pool for queue {} with size {}",
+                    i, vq.size
+                );
+
+                for qs in queue_states.iter() {
+                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                        h.unregister();
+                    }
+                    if let Some(vec) = qs.msix_vector {
+                        let _ = irq_free_vector(vec);
+                    }
+                    qs.queue
+                        .try_write()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
+                }
+                vq.destroy();
+                for mut remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
+                }
+                for &(_idx, va, sz) in &mapped_bars {
+                    let _ = unmap_mmio_region(va, sz);
+                }
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        };
+
+        let submitted_completions = match outstanding::SubmittedCompletionPool::new(vq_capacity) {
+            Some(pool) => pool,
+            None => {
+                println!(
+                    "virtio-blk: failed to create submitted completion pool for queue {} with size {}",
+                    i, vq.size
+                );
+
+                for qs in queue_states.iter() {
+                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                        h.unregister();
+                    }
+                    if let Some(vec) = qs.msix_vector {
+                        let _ = irq_free_vector(vec);
+                    }
+                    qs.queue
+                        .try_write()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
+                }
+                vq.destroy();
+                for mut remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
+                }
+                for &(_idx, va, sz) in &mapped_bars {
+                    let _ = unmap_mmio_region(va, sz);
+                }
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        };
+
         let used_idx = vq.used_idx_ptr();
 
         queue_states.push(QueueState {
@@ -731,6 +827,9 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
             submitting_tasks: AtomicU32::new(0),
             use_indirect: init_result.indirect_desc_supported,
             completion_slots,
+            read_ops,
+            write_ops,
+            submitted_completions,
             used_idx,
             last_drained_used_idx: AtomicU16::new(0),
         });
