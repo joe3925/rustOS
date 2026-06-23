@@ -648,12 +648,12 @@ impl FileSystem for Fat32Fs {
                                 Err(e) => Err(map_fatfs_err(&e)),
                             }
                         };
-                        let lower_flush = if unlikely(write_through) && res.is_ok() {
+                        let lower_flush = if write_through && res.is_ok() {
                             LowerFlush::Blocking
                         } else {
                             LowerFlush::None
                         };
-                        let flush_err = if unlikely(write_through) {
+                        let flush_err = if write_through {
                             flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
                         } else {
                             restore_cached_file(&vdx, fs_file_id, file);
@@ -1073,12 +1073,12 @@ impl FileSystem for Fat32Fs {
                                     }
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 };
-                                let lower_flush = if unlikely(write_through) && res.is_ok() {
+                                let lower_flush = if write_through && res.is_ok() {
                                     LowerFlush::Blocking
                                 } else {
                                     LowerFlush::None
                                 };
-                                let flush_err = if unlikely(write_through) {
+                                let flush_err = if write_through {
                                     flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
                                 } else {
                                     restore_cached_file(&vdx, fs_file_id, file);

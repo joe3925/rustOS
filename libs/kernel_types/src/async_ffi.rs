@@ -394,31 +394,27 @@ static RUST_WAKER_BOX_VTABLE: FfiWakerVTable = FfiWakerVTable {
 };
 
 fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
-    let mut w = Some(w);
-    let mut ptr_box: *mut RustWakerBox = ptr::null_mut();
-
     #[cfg(feature = "async-ffi-slab")]
     {
         if let Some(p) = WAKER_TO_FFI_POOL.try_alloc(RustWakerBox {
             refs: AtomicUsize::new(1),
-            waker: w.take().unwrap(),
+            // TODO: it is possible to get rid of this clone
+            waker: w.clone(),
         }) {
-            ptr_box = p.as_ptr();
+            return FfiWaker {
+                data: p.as_ptr() as *const (),
+                vtable: &RUST_WAKER_BOX_VTABLE,
+            };
         }
     }
 
-    if ptr_box.is_null() {
-        let ww = w.take().unwrap();
-        let boxed = Box::new(RustWakerBox {
-            refs: AtomicUsize::new(1),
-            waker: ww,
-        });
-
-        ptr_box = Box::into_raw(boxed);
-    }
+    let boxed = Box::new(RustWakerBox {
+        refs: AtomicUsize::new(1),
+        waker: w,
+    });
 
     FfiWaker {
-        data: ptr_box as *const (),
+        data: Box::into_raw(boxed) as *const (),
         vtable: &RUST_WAKER_BOX_VTABLE,
     }
 }

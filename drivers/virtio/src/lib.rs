@@ -20,6 +20,7 @@ use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
 use core::panic::PanicInfo;
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
@@ -63,8 +64,110 @@ use virtqueue::Virtqueue;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
-pub(crate) const COMPLETION_POLL_TIME: Duration = Duration::from_nanos(1494117);
 
+const COMPLETION_POLL_MIN_NS: u64 = 2_000;
+const COMPLETION_POLL_MAX_NS: u64 = 1_000_000;
+const COMPLETION_FIT_MIN_SAMPLES: u64 = 32;
+const COMPLETION_FIT_FALLBACK_BASE_NS: u64 = 5_000;
+const COMPLETION_FIT_FALLBACK_NS_PER_KIB: u64 = 1_250;
+const COMPLETION_FIT_MAX_SAMPLE_NS: u64 = 2_000_000;
+const COMPLETION_FIT_MAX_X_KIB: u64 = 1024 * 1024;
+
+static COMPLETION_FIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_X: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_Y: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_XY: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_X2: AtomicU64 = AtomicU64::new(0);
+#[inline]
+fn completion_fit_x(byte_len: usize) -> u64 {
+    if byte_len == 0 {
+        return 0;
+    }
+
+    let kib = ((byte_len as u64).saturating_add(1023)) >> 10;
+    kib.max(1).min(COMPLETION_FIT_MAX_X_KIB)
+}
+
+#[inline]
+fn completion_fallback_poll_ns(byte_len: usize) -> Option<usize> {
+    let x = completion_fit_x(byte_len);
+
+    if x == 0 {
+        return None;
+    }
+
+    let ns = COMPLETION_FIT_FALLBACK_BASE_NS
+        .saturating_add(x.saturating_mul(COMPLETION_FIT_FALLBACK_NS_PER_KIB));
+
+    if ns > COMPLETION_POLL_MAX_NS {
+        None
+    } else {
+        Some(ns.max(COMPLETION_POLL_MIN_NS) as usize)
+    }
+}
+
+#[inline]
+fn record_completion_fit_sample(byte_len: usize, elapsed_ns: u64) {
+    let x = completion_fit_x(byte_len);
+
+    if x == 0 {
+        return;
+    }
+
+    let y = elapsed_ns.min(COMPLETION_FIT_MAX_SAMPLE_NS);
+    let xy = x.saturating_mul(y);
+    let x2 = x.saturating_mul(x);
+
+    COMPLETION_FIT_SUM_X.fetch_add(x, Ordering::Relaxed);
+    COMPLETION_FIT_SUM_Y.fetch_add(y, Ordering::Relaxed);
+    COMPLETION_FIT_SUM_XY.fetch_add(xy, Ordering::Relaxed);
+    COMPLETION_FIT_SUM_X2.fetch_add(x2, Ordering::Relaxed);
+    COMPLETION_FIT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
+    let x = completion_fit_x(byte_len);
+
+    if x == 0 {
+        return None;
+    }
+
+    let n = COMPLETION_FIT_COUNT.load(Ordering::Relaxed);
+
+    if n < COMPLETION_FIT_MIN_SAMPLES {
+        return completion_fallback_poll_ns(byte_len);
+    }
+
+    let n = n as i128;
+    let x = x as i128;
+    let sum_x = COMPLETION_FIT_SUM_X.load(Ordering::Relaxed) as i128;
+    let sum_y = COMPLETION_FIT_SUM_Y.load(Ordering::Relaxed) as i128;
+    let sum_xy = COMPLETION_FIT_SUM_XY.load(Ordering::Relaxed) as i128;
+    let sum_x2 = COMPLETION_FIT_SUM_X2.load(Ordering::Relaxed) as i128;
+
+    let denom = n * sum_x2 - sum_x * sum_x;
+
+    if denom <= 0 {
+        return completion_fallback_poll_ns(byte_len);
+    }
+
+    let slope_num = n * sum_xy - sum_x * sum_y;
+    let pred_num = sum_y * denom - slope_num * sum_x + slope_num * x * n;
+    let pred_den = n * denom;
+
+    if pred_num <= 0 || pred_den <= 0 {
+        return completion_fallback_poll_ns(byte_len);
+    }
+
+    let ns = ((pred_num + (pred_den / 2)) / pred_den) as u64;
+
+    if ns > COMPLETION_POLL_MAX_NS {
+        None
+    } else {
+        Some(ns.max(COMPLETION_POLL_MIN_NS) as usize)
+    }
+}
 #[inline]
 fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64 {
     if unlikely(frequency_hz == 0) {
@@ -88,15 +191,27 @@ fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64
 pub(crate) async fn wait_completion_hybrid<F>(
     qs: &QueueState,
     completion: F,
-    spin_for: Duration,
+    byte_len: usize,
 ) -> F::Output
 where
     F: Future,
 {
     let profile_start = dp::timestamp_ns();
     let mut completion = core::pin::pin!(completion);
+
+    let Some(poll_ns) = virtio_completion_should_poll(byte_len) else {
+        let result = completion.await;
+        let elapsed_ns = dp::timestamp_ns().saturating_sub(profile_start);
+        record_completion_fit_sample(byte_len, elapsed_ns);
+        dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
+        return result;
+    };
+
     let timer = KernelStopwatch::start();
-    let spin_cycles = duration_to_cycle_counter_ticks(spin_for, timer.cycle_counter_frequency_hz());
+    let spin_cycles = duration_to_cycle_counter_ticks(
+        Duration::from_nanos(poll_ns as u64),
+        timer.cycle_counter_frequency_hz(),
+    );
     let start_cycles = timer.start_cycles();
 
     loop {
@@ -108,6 +223,8 @@ where
         })
         .await
         {
+            let elapsed_ns = dp::timestamp_ns().saturating_sub(profile_start);
+            record_completion_fit_sample(byte_len, elapsed_ns);
             dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
             return result;
         }
@@ -115,10 +232,15 @@ where
         if spin_cycles == 0 || cycle_counter().wrapping_sub(start_cycles) >= spin_cycles {
             break;
         }
+
+        core::hint::spin_loop();
     }
-    let res = completion.await;
+
+    let result = completion.await;
+    let elapsed_ns = dp::timestamp_ns().saturating_sub(profile_start);
+    record_completion_fit_sample(byte_len, elapsed_ns);
     dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
-    res
+    result
 }
 // Request helpers
 #[inline(always)]

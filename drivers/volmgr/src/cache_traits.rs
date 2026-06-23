@@ -1,7 +1,7 @@
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::dma::dma::IoBufferError;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
-use kernel_api::request::{RequestHandle, Write};
+use kernel_api::request::{Read, RequestHandle, Write};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
@@ -10,27 +10,45 @@ pub struct CacheConfig {
     pub flush_parallelism: usize,
     pub write_allocate: bool,
     pub read_allocate: bool,
-    /// When page allocation/reclaim cannot supply a cache page, bypass the cache
-    /// and issue the current request directly to the lower device.
     pub direct_io_on_no_free_pages: bool,
-    /// Start background writeback when dirty pages reach this count.
     pub dirty_high_watermark_blocks: usize,
-    /// Background writeback keeps flushing until dirty pages drop to this count.
     pub dirty_low_watermark_blocks: usize,
+    pub direct_io_scratch_pool_entries: usize,
 }
 
 impl CacheConfig {
-    pub const fn new(capacity_blocks: usize) -> Self {
-        let high = if capacity_blocks > 4 {
-            (capacity_blocks * 3) / 4
+    pub const fn new(
+        capacity_blocks: usize,
+        dirty_high_watermark_percent: u8,
+        dirty_low_watermark_percent: u8,
+    ) -> Self {
+        let high_percent = if dirty_high_watermark_percent > 100 {
+            100usize
+        } else {
+            dirty_high_watermark_percent as usize
+        };
+
+        let low_percent = if dirty_low_watermark_percent > 100 {
+            100usize
+        } else {
+            dirty_low_watermark_percent as usize
+        };
+
+        let high = if capacity_blocks == 0 || high_percent == 0 {
+            0
         } else {
             capacity_blocks
+                .saturating_mul(high_percent)
+                .saturating_add(99)
+                / 100
         };
-        let low = if capacity_blocks > 4 {
-            capacity_blocks / 2
-        } else {
-            0
-        };
+
+        let mut low = capacity_blocks.saturating_mul(low_percent) / 100;
+
+        if low > high {
+            low = high;
+        }
+
         Self {
             capacity_blocks,
             shards: 16,
@@ -40,6 +58,7 @@ impl CacheConfig {
             direct_io_on_no_free_pages: true,
             dirty_high_watermark_blocks: high,
             dirty_low_watermark_blocks: low,
+            direct_io_scratch_pool_entries: 4,
         }
     }
 
@@ -51,6 +70,11 @@ impl CacheConfig {
     pub const fn with_dirty_watermarks(mut self, high_blocks: usize, low_blocks: usize) -> Self {
         self.dirty_high_watermark_blocks = high_blocks;
         self.dirty_low_watermark_blocks = low_blocks;
+        self
+    }
+
+    pub const fn with_direct_io_scratch_pool_entries(mut self, entries: usize) -> Self {
+        self.direct_io_scratch_pool_entries = entries;
         self
     }
 }
@@ -98,14 +122,13 @@ impl<E: Clone> Clone for CacheError<E> {
     }
 }
 
-/// Backend I/O interface used by the cache.
-///
-/// `read_phys_framed` and `write_phys_framed` receive an already-created
-/// `IoBuffer` lease. The lease is owned by the backend future for the lifetime
-/// of the lower request. `write_request` is used by cache flush batching so a
-/// caller can pass a chain of `Write` requests directly.
 pub trait VolumeCacheBackend: Send + Sync + 'static {
     type Error: Send + Sync + core::fmt::Debug + 'static;
+
+    fn read_request<'a, 'req, 'data>(
+        &'a self,
+        req: &'a mut RequestHandle<'req, Read<'data>>,
+    ) -> FfiFuture<Result<(), Self::Error>>;
 
     fn read_phys_framed<'a, 'buffer>(
         &'a self,
@@ -129,9 +152,18 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
 }
 
-/// Async cache operations exposed to the rest of the volume driver.
 pub trait VolumeCacheOps {
     type Error;
+
+    async fn read_request<'req, 'data>(
+        &self,
+        req: &mut RequestHandle<'req, Read<'data>>,
+    ) -> Result<(), Self::Error>;
+
+    async fn write_request<'req, 'data>(
+        &self,
+        req: &mut RequestHandle<'req, Write<'data>>,
+    ) -> Result<(), Self::Error>;
 
     async fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), Self::Error>;
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error>;

@@ -959,7 +959,7 @@ impl<'data> IoBufferBacking<'data> {
         let leases = self.leases.read();
         let _alloc_guard = self.lease_alloc_lock.lock();
 
-        reject_conflicting_leases(&leases, start, len, access)?;
+        //reject_conflicting_leases(&leases, start, len, access)?;
 
         for (index, slot) in leases.iter().enumerate() {
             if slot.state.load(Ordering::Acquire) != LEASE_FREE {

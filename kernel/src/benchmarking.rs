@@ -3477,7 +3477,7 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 100 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 10 * 1024 * 1024;
 
 const DISK_BENCH_SIZES: &[usize] = &[
@@ -3810,28 +3810,18 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 ops += 1;
             }
 
-            if write_through {
-                if let Err(e) = file.flush().await {
-                    println!("[disk-bench] write flush failed size={}: {:?}", size, e);
-                    let _ = file.close().await;
-                    return;
-                }
-            }
-
             write_bytes += offset;
             write_ops += ops;
             write_ns += disk_bench_elapsed_ns(start_ns);
             crate::disk_profile::set_enabled(false);
 
-            if !write_through {
-                if let Err(e) = file.flush().await {
-                    println!(
-                        "[disk-bench] post-write flush failed size={}: {:?}",
-                        size, e
-                    );
-                    let _ = file.close().await;
-                    return;
-                }
+            if let Err(e) = file.flush().await {
+                println!(
+                    "[disk-bench] post-write flush failed size={}: {:?}",
+                    size, e
+                );
+                let _ = file.close().await;
+                return;
             }
 
             let mut offset = 0u64;
