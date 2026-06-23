@@ -617,7 +617,6 @@ pub trait DeviceRead {
     extern "C" fn handler<'req, 'io, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Read<'io>>,
-        len: usize,
     ) -> FfiFuture<DriverStep>;
 }
 
@@ -627,7 +626,6 @@ pub trait DeviceWrite {
     extern "C" fn handler<'req, 'io, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Write<'io>>,
-        len: usize,
     ) -> FfiFuture<DriverStep>;
 }
 

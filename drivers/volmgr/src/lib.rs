@@ -64,9 +64,8 @@ impl DeviceRead for VolPdoIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Read<'data>>,
-        buf_len: usize,
     ) -> DriverStep {
-        vol_pdo_read_impl(dev, req, buf_len).await
+        vol_pdo_read_impl(dev, req).await
     }
 }
 
@@ -75,9 +74,8 @@ impl DeviceWrite for VolPdoIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Write<'data>>,
-        buf_len: usize,
     ) -> DriverStep {
-        vol_pdo_write_impl(dev, req, buf_len).await
+        vol_pdo_write_impl(dev, req).await
     }
 }
 
@@ -466,7 +464,7 @@ fn cache_error_status(context: &str, err: CacheError<DriverStatus>) -> DriverSta
             cold_path();
             println!("volmgr: {} cache error: {:?}", context, err);
             match err {
-                CacheError::InvalidIoBuffer => DriverStatus::InvalidParameter,
+                CacheError::InvalidIoBuffer(_) => DriverStatus::InvalidParameter,
                 _ => DriverStatus::Unsuccessful,
             }
         }
@@ -657,7 +655,6 @@ pub async fn vol_enumerate_devices<'a, 'b>(
 async fn vol_pdo_read_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Read<'data>>,
-    buf_len: usize,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
@@ -693,9 +690,7 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let mut len = len_req;
-    len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(len, req_data_len);
+    let len = core::cmp::min(len_req, req_data_len);
 
     if unlikely(len == 0) {
         cold_path();
@@ -755,7 +750,6 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
 async fn vol_pdo_write_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Write<'data>>,
-    buf_len: usize,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(&dev);
 
@@ -792,9 +786,7 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let mut len = len_req;
-    len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(len, req_data_len);
+    let len = core::cmp::min(len_req, req_data_len);
 
     if unlikely(len == 0) {
         cold_path();

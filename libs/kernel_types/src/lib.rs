@@ -61,13 +61,11 @@ pub type EvtDriverUnload =
 pub type EvtIoRead = for<'req, 'io, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Read<'io>>,
-    usize,
 ) -> FfiFuture<DriverStep>;
 
 pub type EvtIoWrite = for<'req, 'io, 'b> extern "C" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'req, Write<'io>>,
-    usize,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoDeviceControl = for<'req, 'data, 'b> extern "C" fn(
     &Arc<DeviceObject>,

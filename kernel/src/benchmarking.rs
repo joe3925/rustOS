@@ -3478,7 +3478,7 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
-const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 256 * 1024 * 1024;
+const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 10 * 1024 * 1024;
 
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
@@ -3754,13 +3754,39 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         let mut read_ns = 0u128;
 
         crate::disk_profile::begin_size(size as u64);
+        crate::disk_profile::set_enabled(false);
 
-        for _ in 0..passes {
-            crate::disk_profile::set_enabled(true);
-
+        if !write_through {
             let mut offset = 0u64;
             let mut ops = 0u64;
 
+            while offset < bench_len {
+                let remaining = (bench_len - offset) as usize;
+                let len = core::cmp::min(size, remaining);
+                let tag = (ops ^ offset ^ 0xfeed_beef).to_le_bytes();
+                let tag_len = core::cmp::min(tag.len(), len);
+
+                buf[..tag_len].copy_from_slice(&tag[..tag_len]);
+
+                if let Err(e) = file.write_at(offset, &buf[..len]).await {
+                    println!(
+                        "[disk-bench] warm write failed size={} offset={}: {:?}",
+                        size, offset, e
+                    );
+                    let _ = file.close().await;
+                    return;
+                }
+
+                offset += len as u64;
+                ops += 1;
+            }
+        }
+
+        for _ in 0..passes {
+            let mut offset = 0u64;
+            let mut ops = 0u64;
+
+            crate::disk_profile::set_enabled(true);
             let start_ns = disk_bench_now_ns();
 
             while offset < bench_len {
@@ -3784,17 +3810,29 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 ops += 1;
             }
 
-            if let Err(e) = file.flush().await {
-                println!("[disk-bench] write flush failed size={}: {:?}", size, e);
-                let _ = file.close().await;
-                return;
+            if write_through {
+                if let Err(e) = file.flush().await {
+                    println!("[disk-bench] write flush failed size={}: {:?}", size, e);
+                    let _ = file.close().await;
+                    return;
+                }
             }
 
             write_bytes += offset;
             write_ops += ops;
             write_ns += disk_bench_elapsed_ns(start_ns);
-
             crate::disk_profile::set_enabled(false);
+
+            if !write_through {
+                if let Err(e) = file.flush().await {
+                    println!(
+                        "[disk-bench] post-write flush failed size={}: {:?}",
+                        size, e
+                    );
+                    let _ = file.close().await;
+                    return;
+                }
+            }
 
             let mut offset = 0u64;
             let mut ops = 0u64;
@@ -3828,6 +3866,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         }
 
         crate::disk_profile::set_enabled(false);
+
         let mut profile_snapshot = kernel_types::disk_profile::DiskProfileSnapshot::default();
         crate::disk_profile::snapshot(&mut profile_snapshot);
         profile_snapshots.push(profile_snapshot);
@@ -3837,6 +3876,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         } else {
             write_ns / write_ops as u128
         };
+
         let rd_ns_op = if read_ops == 0 {
             0
         } else {

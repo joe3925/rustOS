@@ -13,6 +13,9 @@ use crate::dma_region::ContiguousDmaRegion;
 use crate::pci;
 use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, VirtqDesc, Virtqueue};
 
+pub const BLK_INDIRECT_DESC_CAPACITY: usize = 256;
+pub const BLK_MAX_DATA_SEGMENTS_PER_REQUEST: usize = BLK_INDIRECT_DESC_CAPACITY - 2;
+
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 pub const VIRTIO_STATUS_DRIVER: u8 = 2;
 pub const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
@@ -227,10 +230,10 @@ pub enum SubmitRequestError {
 
 #[repr(C)]
 pub struct BlkSlot {
-    pub header: VirtioBlkReqHeader, // 16 bytes
-    pub status: u8,                 // 1 byte
-    pub padding: [u8; 15],          // padding to keep array aligned
-    pub indirect_table: [VirtqDesc; 256],
+    pub header: VirtioBlkReqHeader,
+    pub status: u8,
+    pub padding: [u8; 15],
+    pub indirect_table: [VirtqDesc; BLK_INDIRECT_DESC_CAPACITY],
 }
 
 pub struct BlkIoSlots {
@@ -275,10 +278,12 @@ impl BlkIoSlots {
         is_write: bool,
     ) -> Result<u16, SubmitRequestError> {
         let profile_start = dp::timestamp_ns();
+
         let Some(head) = vq.alloc_desc() else {
             cold_path();
             return Err(SubmitRequestError::QueueFull);
         };
+
         let slot_ptr = self.get_slot_ptr(head);
 
         let slot_dma_base = self
@@ -300,7 +305,6 @@ impl BlkIoSlots {
             let mut desc_count = 0usize;
             let table_ptr = (*slot_ptr).indirect_table.as_mut_ptr();
 
-            // Header
             (*table_ptr.add(desc_count)).addr = header_phys;
             (*table_ptr.add(desc_count)).len = core::mem::size_of::<VirtioBlkReqHeader>() as u32;
             (*table_ptr.add(desc_count)).flags = VRING_DESC_F_NEXT;
@@ -310,22 +314,37 @@ impl BlkIoSlots {
             let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
             let mut segment_count = 0usize;
             let mut segment_bytes = 0u64;
+
             for seg in data_segments {
                 if unlikely(seg.byte_len == 0) {
                     cold_path();
                     continue;
                 }
 
+                if unlikely(desc_count + 2 > BLK_INDIRECT_DESC_CAPACITY) {
+                    cold_path();
+                    vq.free_desc(head);
+                    dp::add_elapsed(B_VIRTIO_DESCRIPTOR_SETUP, profile_start);
+                    return Err(SubmitRequestError::TooManyDataSegments);
+                }
+
                 (*table_ptr.add(desc_count)).addr = seg.dma_addr;
                 (*table_ptr.add(desc_count)).len = seg.byte_len;
                 (*table_ptr.add(desc_count)).flags = data_flags | VRING_DESC_F_NEXT;
                 (*table_ptr.add(desc_count)).next = (desc_count + 1) as u16;
+
                 desc_count += 1;
                 segment_count += 1;
-                segment_bytes += seg.byte_len as u64;
+                segment_bytes = segment_bytes.saturating_add(seg.byte_len as u64);
             }
 
-            // Status
+            if unlikely(desc_count + 1 > BLK_INDIRECT_DESC_CAPACITY) {
+                cold_path();
+                vq.free_desc(head);
+                dp::add_elapsed(B_VIRTIO_DESCRIPTOR_SETUP, profile_start);
+                return Err(SubmitRequestError::TooManyDataSegments);
+            }
+
             (*table_ptr.add(desc_count)).addr = status_phys;
             (*table_ptr.add(desc_count)).len = 1;
             (*table_ptr.add(desc_count)).flags = VRING_DESC_F_WRITE;
@@ -339,6 +358,7 @@ impl BlkIoSlots {
             dp::add_counter(C_SCATTER_GATHER_SEGMENTS, segment_count as u64);
             dp::add_counter(C_VIRTIO_SUBMISSION_BYTES, segment_bytes);
         }
+
         dp::add_elapsed(B_VIRTIO_DESCRIPTOR_SETUP, profile_start);
 
         Ok(head)

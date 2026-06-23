@@ -273,12 +273,92 @@ pub struct ChildExt {
 
 struct IdePdoIo;
 
+#[inline]
+fn ide_lba_sectors(offset: u64, len: usize) -> Result<Option<(u32, u32)>, DriverStatus> {
+    if len == 0 {
+        return Ok(None);
+    }
+
+    if (offset & 0x1ff) != 0 || (len & 0x1ff) != 0 {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    let sector_count = len >> 9;
+    if sector_count == 0 || sector_count > u32::MAX as usize {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    let lba = offset >> 9;
+    let sectors = sector_count as u32;
+
+    let Some(end_lba) = lba.checked_add(sectors as u64) else {
+        return Err(DriverStatus::InvalidParameter);
+    };
+
+    if end_lba > (1u64 << 28) {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    Ok(Some((lba as u32, sectors)))
+}
+
+fn validate_ide_read_chain<'data>(first: &Read<'data>) -> Result<bool, DriverStatus> {
+    let mut any = false;
+
+    for read in first.iter() {
+        let Some((_lba, _sectors)) = ide_lba_sectors(read.offset, read.len)? else {
+            continue;
+        };
+
+        if read.no_buffer {
+            return Err(DriverStatus::InvalidParameter);
+        }
+
+        let Some(buffer) = read.buffer.as_ref() else {
+            return Err(DriverStatus::InvalidParameter);
+        };
+
+        if read_buffer_cursor(buffer, read.len).is_none() {
+            return Err(DriverStatus::InsufficientResources);
+        }
+
+        any = true;
+    }
+
+    Ok(any)
+}
+
+fn validate_ide_write_chain<'data>(first: &Write<'data>) -> Result<bool, DriverStatus> {
+    let mut any = false;
+
+    for write in first.iter() {
+        let Some((_lba, _sectors)) = ide_lba_sectors(write.offset, write.len)? else {
+            continue;
+        };
+
+        if write.no_buffer {
+            return Err(DriverStatus::InvalidParameter);
+        }
+
+        let Some(buffer) = write.buffer.as_ref() else {
+            return Err(DriverStatus::InvalidParameter);
+        };
+
+        if write_buffer_cursor(buffer, write.len).is_none() {
+            return Err(DriverStatus::InsufficientResources);
+        }
+
+        any = true;
+    }
+
+    Ok(any)
+}
+
 impl DeviceRead for IdePdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Read<'data>>,
-        _buf_len: usize,
     ) -> DriverStep {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
@@ -299,49 +379,79 @@ impl DeviceRead for IdePdoIo {
             Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
         };
 
-        let (offset, len) = {
+        let any = {
             let r = req.read();
-            (r.body.offset, r.body.len)
+            match validate_ide_read_chain(&r.body) {
+                Ok(any) => any,
+                Err(status) => return complete_req(req, status),
+            }
         };
 
-        if len == 0 {
+        if !any {
             return complete_req(req, DriverStatus::Success);
         }
-
-        if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
-        }
-
-        let lba = offset >> 9;
-        let sectors = (len / 512) as u32;
-
-        if sectors == 0 || (lba >> 28) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
-        }
-
-        let cursor = {
-            let r = req.read();
-            let Some(buffer) = r.body.buffer.as_ref() else {
-                return complete_req(req, DriverStatus::InvalidParameter);
-            };
-
-            let Some(cursor) = read_buffer_cursor(buffer, len) else {
-                return complete_req(req, DriverStatus::InsufficientResources);
-            };
-
-            cursor
-        };
 
         let dh = cdx.dh.load(Ordering::Acquire);
         let irq = unsafe { dx.irq() };
 
         let mut ctrl = dx.controller.lock().await;
-        let read_status =
-            if ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await {
-                DriverStatus::Success
-            } else {
-                DriverStatus::Unsuccessful
+        let mut chain_index = 0usize;
+        let mut read_status = DriverStatus::Success;
+
+        loop {
+            let next = {
+                let r = req.read();
+                let mut out = Ok(None);
+
+                for (idx, read) in r.body.iter().enumerate() {
+                    if idx < chain_index {
+                        continue;
+                    }
+
+                    chain_index = idx + 1;
+
+                    let (lba, sectors) = match ide_lba_sectors(read.offset, read.len) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(status) => {
+                            out = Err(status);
+                            break;
+                        }
+                    };
+
+                    let Some(buffer) = read.buffer.as_ref() else {
+                        out = Err(DriverStatus::InvalidParameter);
+                        break;
+                    };
+
+                    let Some(cursor) = read_buffer_cursor(buffer, read.len) else {
+                        out = Err(DriverStatus::InsufficientResources);
+                        break;
+                    };
+
+                    out = Ok(Some((lba, sectors, cursor)));
+                    break;
+                }
+
+                out
             };
+
+            let Some((lba, sectors, cursor)) = (match next {
+                Ok(v) => v,
+                Err(status) => {
+                    read_status = status;
+                    break;
+                }
+            }) else {
+                break;
+            };
+
+            if !ata_pio_read_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
+                read_status = DriverStatus::Unsuccessful;
+                break;
+            }
+        }
+
         drop(ctrl);
 
         complete_req(req, read_status)
@@ -353,7 +463,6 @@ impl DeviceWrite for IdePdoIo {
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Write<'data>>,
-        _buf_len: usize,
     ) -> DriverStep {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
@@ -374,51 +483,80 @@ impl DeviceWrite for IdePdoIo {
             Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
         };
 
-        let (offset, len) = {
+        let any = {
             let r = req.read();
-            (r.body.offset, r.body.len)
+            match validate_ide_write_chain(&r.body) {
+                Ok(any) => any,
+                Err(status) => return complete_req(req, status),
+            }
         };
 
-        if len == 0 {
+        if !any {
             return complete_req(req, DriverStatus::Success);
         }
-
-        if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
-        }
-
-        let lba = offset >> 9;
-        let sectors = (len / 512) as u32;
-
-        if sectors == 0 || (lba >> 28) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
-        }
-
-        let cursor = {
-            let r = req.read();
-            let Some(buffer) = r.body.buffer.as_ref() else {
-                return complete_req(req, DriverStatus::InvalidParameter);
-            };
-
-            let Some(cursor) = write_buffer_cursor(buffer, len) else {
-                return complete_req(req, DriverStatus::InsufficientResources);
-            };
-
-            cursor
-        };
 
         let dh = cdx.dh.load(Ordering::Acquire);
         let irq = unsafe { dx.irq() };
 
         let mut ctrl = dx.controller.lock().await;
-        let ok = ata_pio_write_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await;
-        drop(ctrl);
+        let mut chain_index = 0usize;
+        let mut write_status = DriverStatus::Success;
 
-        let write_status = if ok {
-            DriverStatus::Success
-        } else {
-            DriverStatus::Unsuccessful
-        };
+        loop {
+            let next = {
+                let r = req.read();
+                let mut out = Ok(None);
+
+                for (idx, write) in r.body.iter().enumerate() {
+                    if idx < chain_index {
+                        continue;
+                    }
+
+                    chain_index = idx + 1;
+
+                    let (lba, sectors) = match ide_lba_sectors(write.offset, write.len) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(status) => {
+                            out = Err(status);
+                            break;
+                        }
+                    };
+
+                    let Some(buffer) = write.buffer.as_ref() else {
+                        out = Err(DriverStatus::InvalidParameter);
+                        break;
+                    };
+
+                    let Some(cursor) = write_buffer_cursor(buffer, write.len) else {
+                        out = Err(DriverStatus::InsufficientResources);
+                        break;
+                    };
+
+                    out = Ok(Some((lba, sectors, cursor)));
+                    break;
+                }
+
+                out
+            };
+
+            let Some((lba, sectors, cursor)) = (match next {
+                Ok(v) => v,
+                Err(status) => {
+                    write_status = status;
+                    break;
+                }
+            }) else {
+                break;
+            };
+
+            if !ata_pio_write_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
+                write_status = DriverStatus::Unsuccessful;
+                break;
+            }
+        }
+
+        drop(ctrl);
 
         complete_req(req, write_status)
     }

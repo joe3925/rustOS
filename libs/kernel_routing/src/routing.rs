@@ -128,8 +128,7 @@ impl<'io> IoSlotRequest for Read<'io> {
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Self>,
     ) -> FfiFuture<DriverStep> {
-        let len = handle.read().body.len;
-        handler(dev, handle, len)
+        handler(dev, handle)
     }
 }
 
@@ -147,8 +146,7 @@ impl<'io> IoSlotRequest for Write<'io> {
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Self>,
     ) -> FfiFuture<DriverStep> {
-        let len = handle.read().body.len;
-        handler(dev, handle, len)
+        handler(dev, handle)
     }
 }
 impl IoSlotRequest for Flush {

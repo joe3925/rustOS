@@ -1,4 +1,5 @@
 use crate::alloc::vec::Vec;
+use crate::cache_core::core::MAX_WRITE_CHAIN;
 use alloc::sync::Arc;
 use core::ops::Range;
 use core::sync::atomic::Ordering;
@@ -9,6 +10,9 @@ use spin::Mutex;
 
 use super::page::Page;
 use crate::cache_traits::CacheError;
+
+const FLUSH_WRITE_CHAIN: usize = MAX_WRITE_CHAIN;
+const FLUSH_EXTRA_WRITES: usize = FLUSH_WRITE_CHAIN - 1;
 
 pub(super) enum FlushFilter<'a> {
     /// Flush all dirty pages.
@@ -40,7 +44,8 @@ impl FlushFilter<'_> {
 pub(super) struct FlushScratch<const BLOCK_SIZE: usize> {
     pub(super) keys: Vec<u64>,
     pub(super) run: Vec<PreparedFlushPage<BLOCK_SIZE>>,
-    pub(super) writes: Option<alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; 8]>>,
+    pub(super) writes:
+        Option<alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; FLUSH_WRITE_CHAIN]>>,
 }
 
 impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
@@ -65,7 +70,8 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
 pub(super) struct FlushRunScratchLease<'a, const BLOCK_SIZE: usize> {
     pub(super) scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
     pub(super) run: Option<Vec<PreparedFlushPage<BLOCK_SIZE>>>,
-    pub(super) writes: Option<alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; 8]>>,
+    pub(super) writes:
+        Option<alloc::boxed::Box<[Option<kernel_api::request::Write<'static>>; FLUSH_WRITE_CHAIN]>>,
 }
 
 impl<'a, const BLOCK_SIZE: usize> FlushRunScratchLease<'a, BLOCK_SIZE> {
@@ -74,7 +80,10 @@ impl<'a, const BLOCK_SIZE: usize> FlushRunScratchLease<'a, BLOCK_SIZE> {
             let mut scratch = scratch.lock();
             (
                 core::mem::take(&mut scratch.run),
-                scratch.writes.take().unwrap_or_else(|| alloc::boxed::Box::new(core::array::from_fn(|_| None)))
+                scratch
+                    .writes
+                    .take()
+                    .unwrap_or_else(|| alloc::boxed::Box::new(core::array::from_fn(|_| None))),
             )
         };
 

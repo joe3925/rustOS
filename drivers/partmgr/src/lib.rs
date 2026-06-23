@@ -91,16 +91,123 @@ struct PartDevExt {
 
 struct PartitionPdoIo;
 
+fn partition_len_bytes(start_lba: u64, end_lba: u64) -> Option<u64> {
+    if end_lba < start_lba {
+        return None;
+    }
+
+    end_lba
+        .checked_sub(start_lba)?
+        .checked_add(1)?
+        .checked_mul(512)
+}
+
+fn validate_partition_read_chain<'io>(
+    first: &Read<'io>,
+    part_bytes: u64,
+    block_size: u64,
+) -> Result<(), DriverStatus> {
+    for read in first.iter() {
+        if read.len == 0 {
+            continue;
+        }
+
+        if !read.no_buffer {
+            let Some(buffer) = read.buffer.as_ref() else {
+                return Err(DriverStatus::InvalidParameter);
+            };
+
+            if buffer.len() < read.len {
+                return Err(DriverStatus::InvalidParameter);
+            }
+        }
+
+        let end = read
+            .offset
+            .checked_add(read.len as u64)
+            .ok_or(DriverStatus::InvalidParameter)?;
+
+        if end > part_bytes {
+            return Err(DriverStatus::InvalidParameter);
+        }
+
+        if read.offset % block_size != 0 || !(read.len as u64).is_multiple_of(block_size) {
+            return Err(DriverStatus::InvalidParameter);
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_partition_write_chain<'io>(
+    first: &Write<'io>,
+    part_bytes: u64,
+    block_size: u64,
+) -> Result<(), DriverStatus> {
+    for write in first.iter() {
+        if write.len == 0 {
+            continue;
+        }
+
+        if !write.no_buffer {
+            let Some(buffer) = write.buffer.as_ref() else {
+                return Err(DriverStatus::InvalidParameter);
+            };
+
+            if buffer.len() < write.len {
+                return Err(DriverStatus::InvalidParameter);
+            }
+        }
+
+        let end = write
+            .offset
+            .checked_add(write.len as u64)
+            .ok_or(DriverStatus::InvalidParameter)?;
+
+        if end > part_bytes {
+            return Err(DriverStatus::InvalidParameter);
+        }
+
+        if write.offset % block_size != 0 || !(write.len as u64).is_multiple_of(block_size) {
+            return Err(DriverStatus::InvalidParameter);
+        }
+    }
+
+    Ok(())
+}
+
+fn translate_read_chain<'io>(first: &mut Read<'io>, base: u64) -> Result<(), DriverStatus> {
+    for read in first.iter_mut() {
+        read.offset = read
+            .offset
+            .checked_add(base)
+            .ok_or(DriverStatus::InvalidParameter)?;
+    }
+
+    Ok(())
+}
+
+fn translate_write_chain<'io>(first: &mut Write<'io>, base: u64) -> Result<(), DriverStatus> {
+    for write in first.iter_mut() {
+        write.offset = write
+            .offset
+            .checked_add(base)
+            .ok_or(DriverStatus::InvalidParameter)?;
+    }
+
+    Ok(())
+}
+
 impl DeviceRead for PartitionPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         device: &Arc<DeviceObject>,
         request: &'b mut RequestHandle<'req, Read<'data>>,
-        buf_len: usize,
     ) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
         let start_lba = *dx.start_lba.get().unwrap();
         let end_lba = *dx.end_lba.get().unwrap();
+
         let block_size = match dx.block_size.get() {
             Some(v) if *v != 0 => *v as u64,
             _ => {
@@ -109,39 +216,39 @@ impl DeviceRead for PartitionPdoIo {
             }
         };
 
-        let off_res = {
-            let body = &request.read().body;
-            let offset = body.offset;
-            let len = body.len;
-            if unlikely(buf_len != len) {
+        let part_bytes = match partition_len_bytes(start_lba, end_lba) {
+            Some(bytes) => bytes,
+            None => {
                 cold_path();
-                Err(DriverStatus::InvalidParameter)
-            } else {
-                let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-                if unlikely(offset + (buf_len as u64) > part_bytes) {
-                    cold_path();
-                    Err(DriverStatus::InvalidParameter)
-                } else if unlikely(
-                    offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
-                ) {
-                    cold_path();
-                    Err(DriverStatus::InvalidParameter)
-                } else {
-                    Ok(offset)
-                }
-            }
-        };
-        let off = match off_res {
-            Ok(v) => v,
-            Err(st) => {
-                cold_path();
-                return DriverStep::complete(st);
+                return DriverStep::complete(DriverStatus::InvalidParameter);
             }
         };
 
-        let phys_off = off + ((start_lba as u64) << 9);
+        let base = match start_lba.checked_mul(512) {
+            Some(base) => base,
+            None => {
+                cold_path();
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
+        };
+
+        {
+            let body = &request.read().body;
+            if let Err(status) = validate_partition_read_chain(body, part_bytes, block_size) {
+                cold_path();
+                return DriverStep::complete(status);
+            }
+        }
+
+        {
+            let mut req = request.write();
+            if let Err(status) = translate_read_chain(&mut req.body, base) {
+                cold_path();
+                return DriverStep::complete(status);
+            }
+        }
+
         request.set_traversal_policy(TraversalPolicy::ForwardLower);
-        request.write().body.offset = phys_off;
 
         let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
 
@@ -154,11 +261,11 @@ impl DeviceWrite for PartitionPdoIo {
     async fn handler<'req, 'data, 'b>(
         device: &Arc<DeviceObject>,
         request: &'b mut RequestHandle<'req, Write<'data>>,
-        buf_len: usize,
     ) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
         let start_lba = *dx.start_lba.get().unwrap();
         let end_lba = *dx.end_lba.get().unwrap();
+
         let block_size = match dx.block_size.get() {
             Some(v) if *v != 0 => *v as u64,
             _ => {
@@ -167,48 +274,45 @@ impl DeviceWrite for PartitionPdoIo {
             }
         };
 
-        let off_res = {
+        let part_bytes = match partition_len_bytes(start_lba, end_lba) {
+            Some(bytes) => bytes,
+            None => {
+                cold_path();
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
+        };
+
+        let base = match start_lba.checked_mul(512) {
+            Some(base) => base,
+            None => {
+                cold_path();
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
+        };
+
+        {
             let body = &request.read().body;
-            let offset = body.offset;
-            let len = body.len;
-            if unlikely(buf_len != len) {
+            if let Err(status) = validate_partition_write_chain(body, part_bytes, block_size) {
                 cold_path();
-                Err(DriverStatus::InvalidParameter)
-            } else {
-                let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-                if unlikely(offset + (buf_len as u64) > part_bytes) {
-                    cold_path();
-                    Err(DriverStatus::InvalidParameter)
-                } else if unlikely(
-                    offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
-                ) {
-                    cold_path();
-                    Err(DriverStatus::InvalidParameter)
-                } else {
-                    Ok(offset)
-                }
+                return DriverStep::complete(status);
             }
-        };
-        let off = match off_res {
-            Ok(v) => v,
-            Err(st) => {
+        }
+
+        {
+            let mut req = request.write();
+            if let Err(status) = translate_write_chain(&mut req.body, base) {
                 cold_path();
-                return DriverStep::complete(st);
+                return DriverStep::complete(status);
             }
-        };
+        }
 
-        let phys_off = off + ((start_lba as u64) << 9);
-
-        // Move caller buffer into forwarded request to avoid copying
         request.set_traversal_policy(TraversalPolicy::ForwardLower);
-        request.write().body.offset = phys_off;
 
         let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
 
         DriverStep::complete(status)
     }
 }
-
 impl DeviceFlush for PartitionPdoIo {
     #[request_handler]
     async fn handler<'req, 'b>(

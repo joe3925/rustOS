@@ -1,4 +1,5 @@
 use kernel_api::async_ffi::FfiFuture;
+use kernel_api::dma::dma::IoBufferError;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::request::{RequestHandle, Write};
 
@@ -79,7 +80,8 @@ pub enum CacheError<E> {
     OffsetOverflow,
     Closed,
     NoFreePages,
-    InvalidIoBuffer,
+    InsufficientResources,
+    InvalidIoBuffer(IoBufferError),
 }
 
 impl<E: Clone> Clone for CacheError<E> {
@@ -90,7 +92,8 @@ impl<E: Clone> Clone for CacheError<E> {
             CacheError::OffsetOverflow => CacheError::OffsetOverflow,
             CacheError::Closed => CacheError::Closed,
             CacheError::NoFreePages => CacheError::NoFreePages,
-            CacheError::InvalidIoBuffer => CacheError::InvalidIoBuffer,
+            CacheError::InsufficientResources => CacheError::InsufficientResources,
+            CacheError::InvalidIoBuffer(e) => CacheError::InvalidIoBuffer(*e),
         }
     }
 }
