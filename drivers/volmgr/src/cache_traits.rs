@@ -1,5 +1,5 @@
 use kernel_api::async_ffi::FfiFuture;
-use kernel_api::dma::dma::IoBufferError;
+use kernel_api::dma::dma::{IoBufferBacking, IoBufferError};
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::request::{Read, RequestHandle, Write};
 
@@ -13,6 +13,7 @@ pub struct CacheConfig {
     pub direct_io_on_no_free_pages: bool,
     pub dirty_high_watermark_blocks: usize,
     pub dirty_low_watermark_blocks: usize,
+    pub dma_map_entire_cache: bool,
     pub direct_io_scratch_pool_entries: usize,
 }
 
@@ -58,6 +59,7 @@ impl CacheConfig {
             direct_io_on_no_free_pages: true,
             dirty_high_watermark_blocks: high,
             dirty_low_watermark_blocks: low,
+            dma_map_entire_cache: true,
             direct_io_scratch_pool_entries: 4,
         }
     }
@@ -150,6 +152,8 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
     ) -> FfiFuture<Result<(), Self::Error>>;
 
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
+
+    fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> FfiFuture<Result<(), Self::Error>>;
 }
 
 pub trait VolumeCacheOps {

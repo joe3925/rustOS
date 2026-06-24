@@ -72,7 +72,6 @@ const ACCESS_FROM_DEVICE: u8 = 2;
 const ACCESS_BIDIRECTIONAL: u8 = 3;
 const STATE_DESCRIBED: u8 = 1;
 const STATE_PHYS_FRAMED: u8 = 2;
-const STATE_DMA_MAPPED: u8 = 3;
 const NO_DMA_RECORD: usize = usize::MAX;
 
 pub const fn iobuffer_worst_case_lease_count(byte_len: usize) -> usize {
@@ -85,8 +84,6 @@ pub const fn iobuffer_worst_case_lease_count(byte_len: usize) -> usize {
 
 pub enum Described {}
 pub enum PhysFramed {}
-pub struct DmaMapped<Source = Described>(PhantomData<fn() -> Source>);
-
 pub enum ToDevice {}
 pub enum FromDevice {}
 pub enum Bidirectional {}
@@ -124,15 +121,10 @@ impl sealed::IoBufferState for PhysFramed {
     const KIND: u8 = STATE_PHYS_FRAMED;
 }
 
-impl<S: sealed::IoBufferState> sealed::IoBufferState for DmaMapped<S> {
-    const KIND: u8 = STATE_DMA_MAPPED;
-}
-
 impl sealed::MappableState for Described {}
 impl sealed::MappableState for PhysFramed {}
 
 impl sealed::VirtualBackedState for Described {}
-impl<S: sealed::VirtualBackedState> sealed::VirtualBackedState for DmaMapped<S> {}
 
 impl sealed::IoBufferAccess for ToDevice {}
 impl sealed::IoBufferAccess for FromDevice {}
@@ -303,6 +295,9 @@ pub enum IoBufferError {
     TranslationFailed {
         virt_addr: usize,
     },
+    DmaMappingNotFound,
+    DmaMappingAccessDenied,
+    DmaMappingRangeNotCovered,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -569,9 +564,11 @@ impl From<IoBufferDmaMappingLayout> for DmaSegmentLayout {
 
 struct DmaRecord {
     active: bool,
+    persistent: bool,
     ref_count: usize,
     mapped_start: usize,
     mapped_len: usize,
+    access: u8,
     layout: DmaSegmentLayout,
     drop_ctx: Option<DmaDropContext>,
 }
@@ -580,15 +577,16 @@ impl DmaRecord {
     fn empty() -> Self {
         Self {
             active: false,
+            persistent: false,
             ref_count: 0,
             mapped_start: 0,
             mapped_len: 0,
+            access: 0,
             layout: DmaSegmentLayout::None,
             drop_ctx: None,
         }
     }
 }
-
 struct LeaseSlot {
     state: AtomicU8,
     generation: AtomicU32,
@@ -740,7 +738,44 @@ impl<'data> IoBufferBacking<'data> {
     ) -> Result<Self, IoBufferError> {
         Self::from_scratch(desc, config, IoBufferBackingScratch::new())
     }
+    pub fn attach_persistent_dma_mapping(
+        &self,
+        mapped_start: usize,
+        mapped_len: usize,
+        access: u8,
+        layout: IoBufferDmaMappingLayout,
+        mapped_by: Arc<DeviceObject>,
+        unmap: DmaUnmapFn,
+        cookie: usize,
+    ) -> Result<(), IoBufferError> {
+        self.validate_range(mapped_start, mapped_len)?;
+        validate_dma_mapping_layout(&layout)?;
 
+        let mut records = self.dma_records.lock();
+        for record in records.iter_mut() {
+            if record.active {
+                continue;
+            }
+
+            record.active = true;
+            record.persistent = true;
+            record.ref_count = 1;
+            record.mapped_start = mapped_start;
+            record.mapped_len = mapped_len;
+            record.access = access;
+            record.layout = DmaSegmentLayout::from(layout);
+            record.drop_ctx = Some(DmaDropContext {
+                mapped_by,
+                unmap,
+                cookie,
+            });
+            return Ok(());
+        }
+
+        Err(IoBufferError::DmaRecordCapacityExceeded {
+            capacity: records.len(),
+        })
+    }
     pub fn from_scratch(
         desc: IoBufferBackingDesc<'data>,
         config: IoBufferBackingConfig,
@@ -778,32 +813,33 @@ impl<'data> IoBufferBacking<'data> {
             !records.iter().any(|record| record.active)
         });
 
-        let IoBufferBacking {
-            mut extents,
-            mut frames,
-            leases,
-            dma_records,
-            ..
-        } = self;
+        let this = ManuallyDrop::new(self);
 
-        extents.clear();
-        frames.clear();
+        unsafe {
+            let mut extents = ptr::read(&this.extents);
+            let mut frames = ptr::read(&this.frames);
+            let leases = ptr::read(&this.leases);
+            let dma_records = ptr::read(&this.dma_records);
 
-        let mut leases = leases.into_inner();
-        for slot in leases.iter_mut() {
-            *slot = LeaseSlot::free();
-        }
+            extents.clear();
+            frames.clear();
 
-        let mut dma_records = dma_records.into_inner();
-        for record in dma_records.iter_mut() {
-            *record = DmaRecord::empty();
-        }
+            let mut leases = leases.into_inner();
+            for slot in leases.iter_mut() {
+                *slot = LeaseSlot::free();
+            }
 
-        IoBufferBackingScratch {
-            extents,
-            frames,
-            leases,
-            dma_records,
+            let mut dma_records = dma_records.into_inner();
+            for record in dma_records.iter_mut() {
+                *record = DmaRecord::empty();
+            }
+
+            IoBufferBackingScratch {
+                extents,
+                frames,
+                leases,
+                dma_records,
+            }
         }
     }
 
@@ -947,7 +983,91 @@ impl<'data> IoBufferBacking<'data> {
         let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL, STATE_PHYS_FRAMED)?;
         Ok(IoBuffer::new(self, handle))
     }
+    pub fn create_dma_to_device<'backing>(
+        &'backing self,
+        offset: usize,
+        len: usize,
+    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, ToDevice>, IoBufferError>
+    where
+        'data: 'backing,
+    {
+        self.ensure_phys_backed()?;
+        let record = self.retain_persistent_dma_record_for_range(offset, len, ACCESS_TO_DEVICE)?;
 
+        let lease = match self.create_lease_with_dma_record(
+            offset,
+            len,
+            ACCESS_TO_DEVICE,
+            STATE_PHYS_FRAMED,
+            record,
+        ) {
+            Ok(lease) => lease,
+            Err(err) => {
+                self.release_dma_record(record);
+                return Err(err);
+            }
+        };
+
+        Ok(IoBuffer::new(self, lease))
+    }
+
+    pub fn create_dma_from_device<'backing>(
+        &'backing self,
+        offset: usize,
+        len: usize,
+    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, FromDevice>, IoBufferError>
+    where
+        'data: 'backing,
+    {
+        self.ensure_phys_backed()?;
+        let record =
+            self.retain_persistent_dma_record_for_range(offset, len, ACCESS_FROM_DEVICE)?;
+
+        let lease = match self.create_lease_with_dma_record(
+            offset,
+            len,
+            ACCESS_FROM_DEVICE,
+            STATE_PHYS_FRAMED,
+            record,
+        ) {
+            Ok(lease) => lease,
+            Err(err) => {
+                self.release_dma_record(record);
+                return Err(err);
+            }
+        };
+
+        Ok(IoBuffer::new(self, lease))
+    }
+
+    pub fn create_dma_bidirectional<'backing>(
+        &'backing self,
+        offset: usize,
+        len: usize,
+    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, Bidirectional>, IoBufferError>
+    where
+        'data: 'backing,
+    {
+        self.ensure_phys_backed()?;
+        let record =
+            self.retain_persistent_dma_record_for_range(offset, len, ACCESS_BIDIRECTIONAL)?;
+
+        let lease = match self.create_lease_with_dma_record(
+            offset,
+            len,
+            ACCESS_BIDIRECTIONAL,
+            STATE_PHYS_FRAMED,
+            record,
+        ) {
+            Ok(lease) => lease,
+            Err(err) => {
+                self.release_dma_record(record);
+                return Err(err);
+            }
+        };
+
+        Ok(IoBuffer::new(self, lease))
+    }
     fn create_lease(
         &self,
         start: usize,
@@ -956,17 +1076,205 @@ impl<'data> IoBufferBacking<'data> {
         desc_state: u8,
     ) -> Result<LeaseHandle, IoBufferError> {
         self.validate_range(start, len)?;
+
+        let dma_record =
+            match self.try_retain_persistent_dma_record_for_range(start, len, access)? {
+                Some(record) => record,
+                None => NO_DMA_RECORD,
+            };
+
         let leases = self.leases.read();
         let _alloc_guard = self.lease_alloc_lock.lock();
-
-        //reject_conflicting_leases(&leases, start, len, access)?;
 
         for (index, slot) in leases.iter().enumerate() {
             if slot.state.load(Ordering::Acquire) != LEASE_FREE {
                 continue;
             }
 
-            let generation = slot.activate(start, len, access, desc_state, NO_DMA_RECORD)?;
+            match slot.activate(start, len, access, desc_state, dma_record) {
+                Ok(generation) => {
+                    return Ok(LeaseHandle { index, generation });
+                }
+                Err(err) => {
+                    if dma_record != NO_DMA_RECORD {
+                        self.release_dma_record(dma_record);
+                    }
+
+                    return Err(err);
+                }
+            }
+        }
+
+        if dma_record != NO_DMA_RECORD {
+            self.release_dma_record(dma_record);
+        }
+
+        Err(IoBufferError::LeaseCapacityExceeded {
+            capacity: leases.len(),
+        })
+    }
+    fn retain_persistent_dma_record_for_range(
+        &self,
+        start: usize,
+        len: usize,
+        access: u8,
+    ) -> Result<usize, IoBufferError> {
+        let end = start
+            .checked_add(len)
+            .ok_or(IoBufferError::LengthOverflow)?;
+
+        let mut access_denied = false;
+        let mut records = self.dma_records.lock();
+
+        for (index, record) in records.iter_mut().enumerate() {
+            if !record.active || !record.persistent {
+                continue;
+            }
+
+            let mapped_end = record
+                .mapped_start
+                .checked_add(record.mapped_len)
+                .ok_or(IoBufferError::LengthOverflow)?;
+
+            if start < record.mapped_start || end > mapped_end {
+                continue;
+            }
+
+            if !dma_access_allows(record.access, access) {
+                access_denied = true;
+                continue;
+            }
+
+            record.ref_count = record
+                .ref_count
+                .checked_add(1)
+                .ok_or(IoBufferError::LengthOverflow)?;
+
+            return Ok(index);
+        }
+
+        if access_denied {
+            Err(IoBufferError::DmaMappingAccessDenied)
+        } else {
+            Err(IoBufferError::DmaMappingNotFound)
+        }
+    }
+    fn try_retain_persistent_dma_record_for_range(
+        &self,
+        start: usize,
+        len: usize,
+        access: u8,
+    ) -> Result<Option<usize>, IoBufferError> {
+        let end = start
+            .checked_add(len)
+            .ok_or(IoBufferError::LengthOverflow)?;
+
+        let mut records = self.dma_records.lock();
+
+        for (index, record) in records.iter_mut().enumerate() {
+            if !record.active || !record.persistent {
+                continue;
+            }
+
+            let mapped_end = record
+                .mapped_start
+                .checked_add(record.mapped_len)
+                .ok_or(IoBufferError::LengthOverflow)?;
+
+            if start < record.mapped_start || end > mapped_end {
+                continue;
+            }
+
+            if !dma_access_allows(record.access, access) {
+                continue;
+            }
+
+            record.ref_count = record
+                .ref_count
+                .checked_add(1)
+                .ok_or(IoBufferError::LengthOverflow)?;
+
+            return Ok(Some(index));
+        }
+
+        Ok(None)
+    }
+    fn persistent_dma_record_snapshot_for_range(
+        &self,
+        start: usize,
+        len: usize,
+        access: u8,
+    ) -> Result<Option<(usize, usize, DmaSegmentLayout)>, IoBufferError> {
+        let end = start
+            .checked_add(len)
+            .ok_or(IoBufferError::LengthOverflow)?;
+
+        let records = self.dma_records.lock();
+
+        for record in records.iter() {
+            if !record.active || !record.persistent {
+                continue;
+            }
+
+            let mapped_end = record
+                .mapped_start
+                .checked_add(record.mapped_len)
+                .ok_or(IoBufferError::LengthOverflow)?;
+
+            if start < record.mapped_start || end > mapped_end {
+                continue;
+            }
+
+            if !dma_access_allows(record.access, access) {
+                continue;
+            }
+
+            return Ok(Some((
+                record.mapped_start,
+                record.mapped_len,
+                record.layout,
+            )));
+        }
+
+        Ok(None)
+    }
+    fn dma_record_snapshot_for_lease(
+        &self,
+        snapshot: LeaseSnapshot,
+    ) -> Result<Option<(usize, usize, DmaSegmentLayout)>, IoBufferError> {
+        if snapshot.dma_record != NO_DMA_RECORD {
+            let (mapped_start, mapped_len, layout) =
+                self.dma_record_snapshot(snapshot.dma_record)?;
+
+            return Ok(Some((mapped_start, mapped_len, layout)));
+        }
+
+        self.persistent_dma_record_snapshot_for_range(snapshot.start, snapshot.len, snapshot.access)
+    }
+    fn create_lease_with_dma_record(
+        &self,
+        start: usize,
+        len: usize,
+        access: u8,
+        desc_state: u8,
+        record: usize,
+    ) -> Result<LeaseHandle, IoBufferError> {
+        self.validate_range(start, len)?;
+        let leases = self.leases.read();
+        let _alloc_guard = self.lease_alloc_lock.lock();
+
+        // reject_conflicting_leases(&leases, start, len, access)?;
+
+        for (index, slot) in leases.iter().enumerate() {
+            if slot.state.load(Ordering::Acquire) != LEASE_FREE {
+                continue;
+            }
+
+            let generation = match slot.activate(start, len, access, desc_state, record) {
+                Ok(generation) => generation,
+                Err(err) => return Err(err),
+            };
+
             return Ok(LeaseHandle { index, generation });
         }
 
@@ -974,7 +1282,6 @@ impl<'data> IoBufferBacking<'data> {
             capacity: leases.len(),
         })
     }
-
     fn split_lease(&self, handle: LeaseHandle, mid: usize) -> Result<LeaseHandle, IoBufferError> {
         let leases = self.leases.read();
         let _alloc_guard = self.lease_alloc_lock.lock();
@@ -1083,15 +1390,10 @@ impl<'data> IoBufferBacking<'data> {
         if old != NO_DMA_RECORD {
             self.release_dma_record(old);
         }
-        slot.desc_state.store(STATE_DMA_MAPPED, Ordering::Release);
         Ok(())
     }
 
-    fn clear_lease_dma_record(
-        &self,
-        handle: LeaseHandle,
-        new_state: u8,
-    ) -> Result<(), IoBufferError> {
+    fn clear_lease_dma_record(&self, handle: LeaseHandle) -> Result<(), IoBufferError> {
         let leases = self.leases.read();
         let slot = leases
             .get(handle.index)
@@ -1099,7 +1401,6 @@ impl<'data> IoBufferBacking<'data> {
         validate_snapshot(slot, handle)?;
 
         let old = slot.dma_record.swap(NO_DMA_RECORD, Ordering::AcqRel);
-        slot.desc_state.store(new_state, Ordering::Release);
         if old != NO_DMA_RECORD {
             self.release_dma_record(old);
         }
@@ -1124,6 +1425,8 @@ impl<'data> IoBufferBacking<'data> {
             }
 
             record.active = true;
+            record.persistent = false;
+            record.access = ACCESS_BIDIRECTIONAL;
             record.ref_count = 1;
             record.mapped_start = mapped_start;
             record.mapped_len = mapped_len;
@@ -1171,8 +1474,11 @@ impl<'data> IoBufferBacking<'data> {
             }
 
             record.active = false;
+            record.persistent = false;
+            record.ref_count = 0;
             record.mapped_start = 0;
             record.mapped_len = 0;
+            record.access = 0;
             record.layout = DmaSegmentLayout::None;
             record.drop_ctx.take()
         };
@@ -1249,7 +1555,43 @@ impl<'data> IoBufferBacking<'data> {
         }
     }
 }
+impl<'data> Drop for IoBufferBacking<'data> {
+    fn drop(&mut self) {
+        loop {
+            let drop_ctx = {
+                let mut records = self.dma_records.lock();
+                let mut found = None;
 
+                for record in records.iter_mut() {
+                    if !record.active {
+                        continue;
+                    }
+
+                    record.active = false;
+                    record.persistent = false;
+                    record.ref_count = 0;
+                    record.mapped_start = 0;
+                    record.mapped_len = 0;
+                    record.access = 0;
+                    record.layout = DmaSegmentLayout::None;
+
+                    found = record.drop_ctx.take();
+                    break;
+                }
+
+                found
+            };
+
+            match drop_ctx {
+                Some(ctx) => ctx.run(),
+                None => break,
+            }
+        }
+    }
+}
+fn dma_access_allows(mapped: u8, requested: u8) -> bool {
+    mapped == ACCESS_BIDIRECTIONAL || mapped == requested
+}
 pub struct IoBuffer<'backing, 'data, State: IoBufferState, Access: IoBufferAccess> {
     backing: &'backing IoBufferBacking<'data>,
     lease: LeaseHandle,
@@ -1375,8 +1717,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Describe
     }
 }
 
-impl<'backing, 'data, Source: MappableIoBufferState, Access: IoBufferAccess>
-    IoBuffer<'backing, 'data, Source, Access>
+impl<'backing, 'data, State: MappableIoBufferState, Access: IoBufferAccess>
+    IoBuffer<'backing, 'data, State, Access>
 {
     pub fn apply_dma_mapping(
         self,
@@ -1384,7 +1726,7 @@ impl<'backing, 'data, Source: MappableIoBufferState, Access: IoBufferAccess>
         mapped_by: Arc<DeviceObject>,
         unmap: DmaUnmapFn,
         cookie: usize,
-    ) -> Result<IoBuffer<'backing, 'data, DmaMapped<Source>, Access>, (Self, IoBufferError)> {
+    ) -> Result<Self, (Self, IoBufferError)> {
         let this = ManuallyDrop::new(self);
         let backing = this.backing;
         let lease = this.lease;
@@ -1413,23 +1755,27 @@ impl<'backing, 'data, Source: MappableIoBufferState, Access: IoBufferAccess>
             }
         }
     }
-}
 
-impl<'backing, 'data, Source: MappableIoBufferState, Access: IoBufferAccess>
-    IoBuffer<'backing, 'data, DmaMapped<Source>, Access>
-{
-    pub fn remove_dma_mapping(
-        self,
-    ) -> Result<IoBuffer<'backing, 'data, Source, Access>, (Self, IoBufferError)> {
+    pub fn remove_dma_mapping(self) -> Result<Self, (Self, IoBufferError)> {
         let this = ManuallyDrop::new(self);
         let backing = this.backing;
         let lease = this.lease;
-        let new_state = <Source as sealed::IoBufferState>::KIND;
 
-        match backing.clear_lease_dma_record(lease, new_state) {
+        match backing.clear_lease_dma_record(lease) {
             Ok(()) => Ok(IoBuffer::new(backing, lease)),
             Err(err) => Err((ManuallyDrop::into_inner(this), err)),
         }
+    }
+
+    pub fn is_dma_mapped(&self) -> bool {
+        let Ok(snapshot) = self.snapshot() else {
+            return false;
+        };
+
+        self.backing
+            .dma_record_snapshot_for_lease(snapshot)
+            .map(|record| record.is_some())
+            .unwrap_or(false)
     }
 
     pub fn dma_segments(&self) -> IoBufferDmaSegments<'_> {
@@ -1437,12 +1783,8 @@ impl<'backing, 'data, Source: MappableIoBufferState, Access: IoBufferAccess>
             return IoBufferDmaSegments::empty(&self.backing.extents, &self.backing.frames);
         };
 
-        if snapshot.dma_record == NO_DMA_RECORD {
-            return IoBufferDmaSegments::empty(&self.backing.extents, &self.backing.frames);
-        }
-
-        let Ok((mapped_start, mapped_len, layout)) =
-            self.backing.dma_record_snapshot(snapshot.dma_record)
+        let Ok(Some((mapped_start, mapped_len, layout))) =
+            self.backing.dma_record_snapshot_for_lease(snapshot)
         else {
             return IoBufferDmaSegments::empty(&self.backing.extents, &self.backing.frames);
         };

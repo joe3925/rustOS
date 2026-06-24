@@ -6,10 +6,6 @@ use crate::outstanding::{
     PendingBlockOp, PendingOpBatch, PendingOpLease, PendingOpPool, SubmittedCompletion,
     SubmittedCompletionBatch, VIRTIO_QUEUE_BATCH_LIMIT,
 };
-use crate::temp_benchmark::{
-    IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
-    bench_sweep, bench_sweep_params, bench_sweep_params_request, sanitize_bench_params,
-};
 use crate::{
     IOCTL_BLOCK_FLUSH, SubmitTasksGuard, blk_status_to_driver_status, complete_req,
     drain_queue_completions, map_request_buffer, virtio_device_error, wait_completion_hybrid,
@@ -23,7 +19,6 @@ use kernel_api::benchmark::{
 };
 use kernel_api::device::DeviceObject;
 use kernel_api::disk_profile as dp;
-use kernel_api::dma::dma::DmaMapped;
 use kernel_api::dma::dma::IoBuffer;
 use kernel_api::dma::dma::IoBufferAccess;
 use kernel_api::dma::dma::PhysFramed;
@@ -79,7 +74,8 @@ impl DeviceControlHandler for VirtioPdoIo {
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
     ) -> DriverStep {
-        virtio_pdo_ioctl_impl(pdo, req).await
+        DriverStep::complete(DriverStatus::NotImplemented)
+        //virtio_pdo_ioctl_impl(pdo, req).await
     }
 }
 
@@ -295,7 +291,7 @@ fn largest_sector_aligned_prefix(bytes_before: usize, seg_len: usize) -> Option<
 }
 
 fn next_indirect_chunk_len<D>(
-    buffer: &IoBuffer<'_, '_, DmaMapped<PhysFramed>, D>,
+    buffer: &IoBuffer<'_, '_, PhysFramed, D>,
     byte_offset: usize,
     remaining_len: usize,
 ) -> Result<usize, DriverStatus>
@@ -306,8 +302,8 @@ where
     let mut bytes = 0usize;
     let mut best = 0usize;
 
-    let segments =
-        DmaSegmentByteWindow::new(buffer.dma_segments().iter(), byte_offset, remaining_len);
+    let dma_segments = buffer.dma_segments();
+    let segments = DmaSegmentByteWindow::new(dma_segments.iter(), byte_offset, remaining_len);
 
     for seg in segments {
         if seg.byte_len == 0 {
@@ -532,11 +528,9 @@ where
                         }
                     };
 
-                let segments = DmaSegmentByteWindow::new(
-                    op.mapped_buffer.dma_segments().iter(),
-                    cursor.byte_offset,
-                    chunk_len,
-                );
+                let dma_segments = op.mapped_buffer.dma_segments();
+                let segments =
+                    DmaSegmentByteWindow::new(dma_segments.iter(), cursor.byte_offset, chunk_len);
 
                 match qs
                     .arena
@@ -917,117 +911,117 @@ pub(crate) async fn virtio_pdo_flush_impl<'req, 'b>(
     complete_req(req, DriverStatus::Success)
 }
 
-#[inline(always)]
-pub(crate) async fn virtio_pdo_ioctl_impl<'req, 'data, 'b>(
-    pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
-) -> DriverStep {
-    let code = req.read().body.code;
+// #[inline(always)]
+// pub(crate) async fn virtio_pdo_ioctl_impl<'req, 'data, 'b>(
+//     pdo: &Arc<DeviceObject>,
+//     req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+// ) -> DriverStep {
+//     let code = req.read().body.code;
 
-    match code {
-        IOCTL_BLOCK_FLUSH => {
-            let status = flush_virtio_cache(pdo).await;
-            complete_req(req, status)
-        }
+//     match code {
+//         IOCTL_BLOCK_FLUSH => {
+//             let status = flush_virtio_cache(pdo).await;
+//             complete_req(req, status)
+//         }
 
-        IOCTL_BLOCK_BENCH_SWEEP => {
-            let (parent, inner) = match get_parent_inner(pdo) {
-                Ok(v) => v,
-                Err(s) => return complete_req(req, s),
-            };
+//         IOCTL_BLOCK_BENCH_SWEEP => {
+//             let (parent, inner) = match get_parent_inner(pdo) {
+//                 Ok(v) => v,
+//                 Err(s) => return complete_req(req, s),
+//             };
 
-            match bench_sweep(&parent, &inner, true).await {
-                Ok(r) => {
-                    {
-                        req.write().set_data_t(r);
-                    }
-                    complete_req(req, DriverStatus::Success)
-                }
-                Err(e) => complete_req(req, e),
-            }
-        }
+//             match bench_sweep(&parent, &inner, true).await {
+//                 Ok(r) => {
+//                     {
+//                         req.write().set_data_t(r);
+//                     }
+//                     complete_req(req, DriverStatus::Success)
+//                 }
+//                 Err(e) => complete_req(req, e),
+//             }
+//         }
 
-        IOCTL_BLOCK_BENCH_SWEEP_POLLING => {
-            let (parent, inner) = match get_parent_inner(pdo) {
-                Ok(v) => v,
-                Err(s) => return complete_req(req, s),
-            };
+//         IOCTL_BLOCK_BENCH_SWEEP_POLLING => {
+//             let (parent, inner) = match get_parent_inner(pdo) {
+//                 Ok(v) => v,
+//                 Err(s) => return complete_req(req, s),
+//             };
 
-            match bench_sweep(&parent, &inner, false).await {
-                Ok(r) => {
-                    {
-                        req.write().set_data_t(r);
-                    }
-                    complete_req(req, DriverStatus::Success)
-                }
-                Err(e) => complete_req(req, e),
-            }
-        }
+//             match bench_sweep(&parent, &inner, false).await {
+//                 Ok(r) => {
+//                     {
+//                         req.write().set_data_t(r);
+//                     }
+//                     complete_req(req, DriverStatus::Success)
+//                 }
+//                 Err(e) => complete_req(req, e),
+//             }
+//         }
 
-        IOCTL_BLOCK_BENCH_SWEEP_BOTH => {
-            let (parent, inner) = match get_parent_inner(pdo) {
-                Ok(v) => v,
-                Err(s) => return complete_req(req, s),
-            };
+//         IOCTL_BLOCK_BENCH_SWEEP_BOTH => {
+//             let (parent, inner) = match get_parent_inner(pdo) {
+//                 Ok(v) => v,
+//                 Err(s) => return complete_req(req, s),
+//             };
 
-            let params_in = {
-                req.data()
-                    .read_only()
-                    .view::<BenchSweepParams>()
-                    .copied()
-                    .unwrap_or_default()
-            };
-            let params_used = sanitize_bench_params(&inner, params_in);
-            let request = if (params_used.flags & BENCH_FLAG_REQUEST) != 0 {
-                match bench_sweep_params_request(pdo, &inner, &params_used).await {
-                    Ok(r) => r,
-                    Err(e) => return complete_req(req, e),
-                }
-            } else {
-                BenchSweepResult::default()
-            };
+//             let params_in = {
+//                 req.data()
+//                     .read_only()
+//                     .view::<BenchSweepParams>()
+//                     .copied()
+//                     .unwrap_or_default()
+//             };
+//             let params_used = sanitize_bench_params(&inner, params_in);
+//             let request = if (params_used.flags & BENCH_FLAG_REQUEST) != 0 {
+//                 match bench_sweep_params_request(pdo, &inner, &params_used).await {
+//                     Ok(r) => r,
+//                     Err(e) => return complete_req(req, e),
+//                 }
+//             } else {
+//                 BenchSweepResult::default()
+//             };
 
-            let irq = if (params_used.flags & BENCH_FLAG_IRQ) != 0 {
-                match bench_sweep_params(&parent, &inner, &params_used, true).await {
-                    Ok(r) => r,
-                    Err(e) => return complete_req(req, e),
-                }
-            } else {
-                BenchSweepResult::default()
-            };
+//             let irq = if (params_used.flags & BENCH_FLAG_IRQ) != 0 {
+//                 match bench_sweep_params(&parent, &inner, &params_used, true).await {
+//                     Ok(r) => r,
+//                     Err(e) => return complete_req(req, e),
+//                 }
+//             } else {
+//                 BenchSweepResult::default()
+//             };
 
-            let poll = if (params_used.flags & BENCH_FLAG_POLL) != 0 {
-                match bench_sweep_params(&parent, &inner, &params_used, false).await {
-                    Ok(r) => r,
-                    Err(e) => return complete_req(req, e),
-                }
-            } else {
-                BenchSweepResult::default()
-            };
+//             let poll = if (params_used.flags & BENCH_FLAG_POLL) != 0 {
+//                 match bench_sweep_params(&parent, &inner, &params_used, false).await {
+//                     Ok(r) => r,
+//                     Err(e) => return complete_req(req, e),
+//                 }
+//             } else {
+//                 BenchSweepResult::default()
+//             };
 
-            let qs0 = inner.get_queue(0);
-            let qsz = qs0.vq_ref().size;
+//             let qs0 = inner.get_queue(0);
+//             let qsz = qs0.vq_ref().size;
 
-            let msix_enabled = inner.queues.iter().any(|q| q.msix_vector.is_some());
+//             let msix_enabled = inner.queues.iter().any(|q| q.msix_vector.is_some());
 
-            let out = BenchSweepBothResult {
-                params_used,
-                irq,
-                poll,
-                request,
-                queue_count: inner.queue_count as u16,
-                queue0_size: qsz,
-                indirect_enabled: if inner.indirect_desc_enabled { 1 } else { 0 },
-                msix_enabled: if msix_enabled { 1 } else { 0 },
-                _pad0: 0,
-            };
+//             let out = BenchSweepBothResult {
+//                 params_used,
+//                 irq,
+//                 poll,
+//                 request,
+//                 queue_count: inner.queue_count as u16,
+//                 queue0_size: qsz,
+//                 indirect_enabled: if inner.indirect_desc_enabled { 1 } else { 0 },
+//                 msix_enabled: if msix_enabled { 1 } else { 0 },
+//                 _pad0: 0,
+//             };
 
-            {
-                req.write().set_data_t(out);
-            }
-            complete_req(req, DriverStatus::Success)
-        }
+//             {
+//                 req.write().set_data_t(out);
+//             }
+//             complete_req(req, DriverStatus::Success)
+//         }
 
-        _ => complete_req(req, DriverStatus::NotImplemented),
-    }
-}
+//         _ => complete_req(req, DriverStatus::NotImplemented),
+//     }
+// }

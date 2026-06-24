@@ -6,13 +6,14 @@
 #![allow(async_fn_in_trait)]
 
 extern crate alloc;
-
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::hint::{cold_path, unlikely};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::async_ffi::FutureExt;
+use kernel_api::dma::dma::IoBufferBacking;
+use kernel_api::pnp::PnpMinorFunction::RegisterDmaBacking;
 use kernel_api::println;
 
 use kernel_api::device::DevExtRef;
@@ -20,11 +21,11 @@ use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
-use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushOwner, DeviceRead, DeviceWrite,
 };
+use kernel_api::kernel_types::io::{DmaBacking, IoTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::DeviceRelationType;
@@ -453,6 +454,37 @@ impl VolumeCacheBackend for CacheBackend {
         }
         .into_ffi()
     }
+    fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> FfiFuture<Result<(), Self::Error>> {
+        async move {
+            let payload = DmaBacking { backing: &*backing };
+
+            let mut req = RequestHandle::new(Pnp {
+                request: PnpRequest {
+                    minor_function: PnpMinorFunction::RegisterDmaBacking,
+                    relation: DeviceRelationType::TargetDeviceRelation,
+                    id_type: QueryIdType::CompatibleIds,
+                    ids_out: Vec::new(),
+                    data_out: RequestData::from_t(payload),
+                },
+            });
+
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+
+            let status = pnp_send_request(self.target.clone(), &mut req).await;
+
+            if unlikely(status != DriverStatus::Success) {
+                cold_path();
+                println!(
+                    "volmgr: CacheBackend::dma_map_cache lower RegisterDmaBacking failed: {}",
+                    status
+                );
+                return Err(status);
+            }
+
+            Ok(())
+        }
+        .into_ffi()
+    }
 }
 
 #[cfg(not(test))]
@@ -666,11 +698,16 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         0x48, 0x61, 0x68, 0x21, 0x49, 0x64, 0x6F, 0x6E, 0x74, 0x4E, 0x65, 0x66, 0x64, 0x45, 0x46,
         0x49,
     ];
+    const MICROSOFT_RESERVED: [u8; 16] = [
+        0x16, 0xE3, 0xC9, 0xE3, 0x5C, 0x0B, 0xB8, 0x4D, 0x81, 0x7D, 0xF9, 0x2D, 0xF0, 0x02, 0x15,
+        0xAE,
+    ];
 
     let ptype = ent.partition_type_guid;
-    if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT {
+    if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT || ptype == MICROSOFT_RESERVED {
         return DriverStep::Continue;
     }
+    println!("volume made guid: {:#?}", ptype);
 
     let part_guid_s = guid_to_string(&ent.unique_partition_guid);
     let name = alloc::format!("Volume{}", &part_guid_s[..8]);
@@ -716,7 +753,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
             let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
             // TODO: set this based on system memory and maybe volume size
             let mut cfg = CacheConfig::new(CACHE_CAPACITY_BYTES / BLOCK_SIZE, 50, 25);
-            match VolCache::new(backend, cfg) {
+            match VolCache::new(backend, cfg).await {
                 Ok(cache) => {
                     pdx.cache.call_once(|| Arc::new(cache));
                 }

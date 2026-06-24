@@ -20,6 +20,7 @@ use kernel_types::dma::DmaMapError;
 use kernel_types::dma::DmaMappedBuffer;
 use kernel_types::dma::DmaMappingStrategy;
 use kernel_types::dma::DmaPciDeviceIdentity;
+use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::IoBufferDmaMappingLayout;
 use kernel_types::dma::IoBufferPageFrame;
 use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
@@ -59,7 +60,63 @@ struct PreparedDmaMapping {
     records: PendingMappingRecords,
     layout: IoBufferDmaMappingLayout,
 }
+pub fn map_persistent_contiguous_backing<'backing, 'data>(
+    device: &Arc<DeviceObject>,
+    backing: &'backing IoBufferBacking<'data>,
+) -> Result<(), DmaMapError>
+where
+    'data: 'backing,
+{
+    const ACCESS_BIDIRECTIONAL: u8 = 3;
 
+    if backing.is_empty() {
+        return Err(DmaMapError::InvalidSize);
+    }
+
+    let buffer = backing
+        .create_phys_bidirectional(0, backing.len())
+        .map_err(|_| DmaMapError::InvalidSize)?;
+
+    let view = buffer
+        .dma_buffer_view()
+        .map_err(|_| DmaMapError::InvalidSize)?;
+
+    let mapped = match map_buffer(device, &view, DmaMappingStrategy::SingleContiguous) {
+        Ok(mapped) => mapped,
+        Err(err) => {
+            drop(view);
+            drop(buffer);
+            return Err(err);
+        }
+    };
+
+    drop(view);
+    drop(buffer);
+
+    match mapped.layout {
+        IoBufferDmaMappingLayout::Contiguous { byte_len, .. } if byte_len == backing.len() => {
+            match backing.attach_persistent_dma_mapping(
+                0,
+                backing.len(),
+                ACCESS_BIDIRECTIONAL,
+                mapped.layout,
+                mapped.mapped_by.clone(),
+                mapped.unmap,
+                mapped.cookie,
+            ) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    (mapped.unmap)(&mapped.mapped_by, mapped.cookie);
+                    Err(DmaMapError::InvalidSize)
+                }
+            }
+        }
+        _ => {
+            (mapped.unmap)(&mapped.mapped_by, mapped.cookie);
+            Err(DmaMapError::RemappingUnavailable)
+        }
+    }
+}
 pub fn map_buffer(
     device: &Arc<DeviceObject>,
     buffer: &DmaBufferView<'_>,

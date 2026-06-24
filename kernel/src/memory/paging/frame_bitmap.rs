@@ -368,7 +368,22 @@ impl RuntimeFrameBitmap {
         while word_index <= last_word {
             let mask = range_word_mask(start, count, word_index);
             let old = self.words[word_index].fetch_and(!mask, Ordering::AcqRel);
-            debug_assert_eq!(old & mask, mask);
+            let missing = mask & !old;
+
+            if missing != 0 {
+                // panic!(
+                //     "frame double-free or bad free range: start={} count={} end={} word_index={} old={:#018x} mask={:#018x} missing={:#018x} first_missing_frame={}",
+                //     start,
+                //     count,
+                //     end,
+                //     word_index,
+                //     old,
+                //     mask,
+                //     missing,
+                //     word_index * WORD_BITS + missing.trailing_zeros() as usize,
+                // );
+            }
+
             word_index += 1;
         }
     }

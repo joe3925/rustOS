@@ -1,5 +1,6 @@
 use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
+use crate::dma::IoBufferBacking;
 use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
 use crate::request::{
@@ -943,4 +944,9 @@ impl DeviceOps {
             fs: FsSlot::empty(),
         }
     }
+}
+#[repr(C)]
+#[derive(kernel_macros::RequestPayload)]
+pub struct DmaBacking<'data> {
+    pub backing: &'data IoBufferBacking<'data>,
 }

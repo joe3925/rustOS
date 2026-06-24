@@ -1,12 +1,12 @@
 use alloc::sync::Arc;
 use core::cmp::min;
 use core::marker::PhantomData;
-
 use kernel_types::device::DeviceObject;
 pub use kernel_types::dma;
+use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::{
-    DmaBufferView, DmaMapError, DmaMapped, DmaMappedBuffer, DmaMappingStrategy, IoBuffer,
-    IoBufferAccess, IoBufferDmaSegment, IoBufferError, IoBufferPageFrame, MappableIoBufferState,
+    DmaBufferView, DmaMapError, DmaMappedBuffer, DmaMappingStrategy, IoBuffer, IoBufferAccess,
+    IoBufferDmaSegment, IoBufferError, IoBufferPageFrame, MappableIoBufferState,
 };
 use kernel_types::status::DriverStatus;
 
@@ -42,10 +42,7 @@ pub fn map_buffer<'backing, 'data, S, A>(
     device: &Arc<DeviceObject>,
     buffer: IoBuffer<'backing, 'data, S, A>,
     strategy: DmaMappingStrategy,
-) -> Result<
-    IoBuffer<'backing, 'data, DmaMapped<S>, A>,
-    (IoBuffer<'backing, 'data, S, A>, DmaMapError),
->
+) -> Result<IoBuffer<'backing, 'data, S, A>, (IoBuffer<'backing, 'data, S, A>, DmaMapError)>
 where
     S: MappableIoBufferState,
     A: IoBufferAccess,
@@ -79,16 +76,26 @@ where
     }
 }
 
+pub fn try_unmap_buffer<'backing, 'data, S, A>(
+    buffer: IoBuffer<'backing, 'data, S, A>,
+) -> Result<IoBuffer<'backing, 'data, S, A>, (IoBuffer<'backing, 'data, S, A>, IoBufferError)>
+where
+    S: MappableIoBufferState,
+    A: IoBufferAccess,
+{
+    buffer.remove_dma_mapping()
+}
+
 pub fn unmap_buffer<'backing, 'data, S, A>(
-    buffer: IoBuffer<'backing, 'data, DmaMapped<S>, A>,
+    buffer: IoBuffer<'backing, 'data, S, A>,
 ) -> IoBuffer<'backing, 'data, S, A>
 where
     S: MappableIoBufferState,
     A: IoBufferAccess,
 {
-    match buffer.remove_dma_mapping() {
+    match try_unmap_buffer(buffer) {
         Ok(buffer) => buffer,
-        Err((_buffer, _err)) => panic!("mapped IoBuffer lost its DMA record"),
+        Err((_buffer, _err)) => panic!("IoBuffer is not DMA mapped"),
     }
 }
 
@@ -535,4 +542,11 @@ fn next_identity_segment_limited(
         byte_len: byte_len as u32,
         reserved: 0,
     })
+}
+
+pub fn map_persistent_contiguous_backing(
+    device: &Arc<DeviceObject>,
+    backing: &IoBufferBacking<'_>,
+) -> Result<(), DmaMapError> {
+    unsafe { kernel_sys::kernel_dma_map_persistent_contiguous_backing(device, backing) }
 }

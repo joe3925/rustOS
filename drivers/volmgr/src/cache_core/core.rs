@@ -362,8 +362,8 @@ impl<B, const BLOCK_SIZE: usize> VolumeCache<B, BLOCK_SIZE, DefaultIndexFactory>
 where
     B: VolumeCacheBackend,
 {
-    pub fn new(backend: Arc<B>, cfg: CacheConfig) -> Result<Self, CacheError<B::Error>> {
-        Self::new_with_index(backend, cfg, DefaultIndexFactory)
+    pub async fn new(backend: Arc<B>, cfg: CacheConfig) -> Result<Self, CacheError<B::Error>> {
+        Self::new_with_index(backend, cfg, DefaultIndexFactory).await
     }
 }
 
@@ -372,7 +372,7 @@ where
     B: VolumeCacheBackend,
     F: CacheIndexFactory<Arc<CachePage>>,
 {
-    pub fn new_with_index(
+    pub async fn new_with_index(
         backend: Arc<B>,
         mut cfg: CacheConfig,
         factory: F,
@@ -431,27 +431,47 @@ where
         backing_cfg.lease_capacity = backing_cfg.lease_capacity.max(backing_blocks);
         backing_cfg.dma_record_capacity = backing_cfg.dma_record_capacity.max(backing_blocks);
 
-        let cache_backing =
+        let mut cache_backing =
             match IoBufferBacking::new(IoBufferBackingDesc::SliceMut(cache_slice), backing_cfg) {
                 Ok(backing) => backing,
                 Err(e) => {
                     unsafe {
                         unmap_range(cache_base, cache_bytes as u64);
                     }
+
                     deallocate_kernel_range(cache_base, cache_bytes as u64);
                     return Err(CacheError::InvalidIoBuffer(e));
                 }
             };
 
+        if cfg.dma_map_entire_cache {
+            if let Err(e) = backend.dma_map_cache(&mut cache_backing).await {
+                drop(cache_backing);
+
+                unsafe {
+                    unmap_range(cache_base, cache_bytes as u64);
+                }
+
+                deallocate_kernel_range(cache_base, cache_bytes as u64);
+                return Err(CacheError::Backend(e));
+            }
+        }
+
         let shard_count = cfg.shards;
         let per_shard = (cfg.capacity_blocks + shard_count - 1) / shard_count;
-
         let index_reserve = cfg.capacity_blocks;
 
         let mut shards = Vec::new();
-        shards
-            .try_reserve_exact(shard_count)
-            .map_err(|_| CacheError::InsufficientResources)?;
+        if shards.try_reserve_exact(shard_count).is_err() {
+            drop(cache_backing);
+
+            unsafe {
+                unmap_range(cache_base, cache_bytes as u64);
+            }
+
+            deallocate_kernel_range(cache_base, cache_bytes as u64);
+            return Err(CacheError::InsufficientResources);
+        }
 
         let mut i = 0usize;
         while i < shard_count {
@@ -462,9 +482,17 @@ where
         }
 
         let mut free_pages = Vec::new();
-        free_pages
-            .try_reserve_exact(cfg.capacity_blocks)
-            .map_err(|_| CacheError::InsufficientResources)?;
+        if free_pages.try_reserve_exact(cfg.capacity_blocks).is_err() {
+            drop(shards);
+            drop(cache_backing);
+
+            unsafe {
+                unmap_range(cache_base, cache_bytes as u64);
+            }
+
+            deallocate_kernel_range(cache_base, cache_bytes as u64);
+            return Err(CacheError::InsufficientResources);
+        }
 
         let mut slot = cfg.capacity_blocks;
         while slot != 0 {
@@ -473,8 +501,23 @@ where
         }
 
         let direct_page = Arc::new(CachePage::new(cfg.capacity_blocks));
-        let flush_scratch = FlushScratch::new(cfg.capacity_blocks, FLUSH_WRITE_CHAIN)
-            .map_err(|_| CacheError::InsufficientResources)?;
+
+        let flush_scratch = match FlushScratch::new(cfg.capacity_blocks, FLUSH_WRITE_CHAIN) {
+            Ok(scratch) => scratch,
+            Err(_) => {
+                drop(direct_page);
+                drop(free_pages);
+                drop(shards);
+                drop(cache_backing);
+
+                unsafe {
+                    unmap_range(cache_base, cache_bytes as u64);
+                }
+
+                deallocate_kernel_range(cache_base, cache_bytes as u64);
+                return Err(CacheError::InsufficientResources);
+            }
+        };
 
         Ok(Self {
             backend,

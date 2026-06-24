@@ -9,6 +9,7 @@ use kernel_executor::runtime::runtime::{
     spawn_detached as kernel_spawn_detached,
 };
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::IoBufferBacking;
 use kernel_types::object_manager::OmError;
 
 use crate::memory::heap::allocator::KernelAllocator;
@@ -228,7 +229,6 @@ pub extern "C" fn kernel_dma_query_device_state(
 ) -> Option<DmaDeviceState> {
     dma::query_device_state(device)
 }
-
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_map_buffer<'regions, 'frames>(
     device: &Arc<DeviceObject>,
@@ -237,7 +237,13 @@ pub extern "C" fn kernel_dma_map_buffer<'regions, 'frames>(
 ) -> Result<DmaMappedBuffer, DmaMapError> {
     dma::map_buffer(device, buffer, strategy)
 }
-
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_dma_map_persistent_contiguous_backing(
+    device: &Arc<DeviceObject>,
+    backing: &IoBufferBacking<'_>,
+) -> Result<(), DmaMapError> {
+    crate::memory::dma::map_persistent_contiguous_backing(device, backing)
+}
 #[no_mangle]
 pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
     crate::platform::cpu_topology_ids()

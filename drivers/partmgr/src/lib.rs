@@ -357,7 +357,24 @@ async fn partition_pdo_query_resources<'req, 'data, 'b>(
 
     DriverStep::complete(DriverStatus::Success)
 }
+#[request_handler]
+async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
+    device: &Arc<DeviceObject>,
+    request: &'b mut RequestHandle<'req, Pnp<'data>>,
+) -> DriverStep {
+    let dx = ext::<PartDevExt>(&device);
 
+    let Some(parent) = dx.parent.get() else {
+        cold_path();
+        return DriverStep::complete(DriverStatus::NoSuchDevice);
+    };
+
+    request.set_traversal_policy(TraversalPolicy::ForwardLower);
+
+    let status = pnp_send_request_to_stack_top(parent.clone(), request).await;
+
+    DriverStep::complete(status)
+}
 #[request_handler]
 pub async fn partmgr_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
@@ -411,7 +428,7 @@ async fn read_from_lower_async(
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;
 
     drop(child_req);
-
+    drop(io_buf);
     if likely(status == DriverStatus::Success) {
         Ok(data.into_boxed_slice())
     } else {
@@ -536,6 +553,10 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
         vt.set(
             PnpMinorFunction::QueryResources,
             partition_pdo_query_resources,
+        );
+        vt.set(
+            PnpMinorFunction::RegisterDmaBacking,
+            partition_pdo_register_dma_backing,
         );
         child_init.pnp_vtable = Some(vt);
         child_init.set_dev_ext_default::<PartDevExt>();

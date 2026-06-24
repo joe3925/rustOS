@@ -15,6 +15,7 @@ use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
 use kernel_types::disk_profile::DiskProfileSnapshot;
+use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::{
     DeviceMmuPlatformDeviceIdentity, DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError,
     DmaMappedBuffer, DmaMappingStrategy, DmaPciDeviceIdentity,
@@ -109,7 +110,10 @@ unsafe extern "C" {
         buffer: &DmaBufferView<'regions>,
         strategy: DmaMappingStrategy,
     ) -> Result<DmaMappedBuffer, DmaMapError>;
-
+    pub fn kernel_dma_map_persistent_contiguous_backing(
+        device: &Arc<DeviceObject>,
+        backing: &IoBufferBacking<'_>,
+    ) -> Result<(), DmaMapError>;
     // Paging / VMM
     pub fn allocate_auto_kernel_range_mapped(
         size: u64,

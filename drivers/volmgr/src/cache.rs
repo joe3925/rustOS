@@ -162,7 +162,10 @@ impl<B, const BLOCK_SIZE: usize> DefaultVolumeCache<B, BLOCK_SIZE>
 where
     B: VolumeCacheBackend,
 {
-    pub fn new_default(backend: Arc<B>, cfg: CacheConfig) -> Result<Self, CacheError<B::Error>> {
-        Self::new_with_index(backend, cfg, DefaultIndexFactory)
+    pub async fn new_default(
+        backend: Arc<B>,
+        cfg: CacheConfig,
+    ) -> Result<Self, CacheError<B::Error>> {
+        Self::new_with_index(backend, cfg, DefaultIndexFactory).await
     }
 }

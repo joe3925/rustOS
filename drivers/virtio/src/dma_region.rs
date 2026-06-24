@@ -4,8 +4,8 @@ use core::ptr::NonNull;
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::{self, dma_base_page_size};
 use kernel_api::kernel_types::dma::{
-    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IoBuffer, IoBufferBacking,
-    IoBufferBackingConfig, IoBufferBackingDesc, PhysFramed,
+    Bidirectional, DmaMappingStrategy, IoBuffer, IoBufferBacking, IoBufferBackingConfig,
+    IoBufferBackingDesc, PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -17,7 +17,7 @@ struct DmaChunk {
     byte_len: usize,
     dma_addr: u64,
     backing: Option<NonNull<IoBufferBacking<'static>>>,
-    buffer: Option<IoBuffer<'static, 'static, DmaMapped<PhysFramed>, Bidirectional>>,
+    buffer: Option<IoBuffer<'static, 'static, PhysFramed, Bidirectional>>,
 }
 
 pub struct ContiguousDmaRegion {
@@ -108,7 +108,6 @@ impl ContiguousDmaRegion {
             };
 
             let backing_ptr = NonNull::from(Box::leak(Box::new(backing)));
-
             let backing_ref = unsafe { backing_ptr.as_ref() };
 
             let buffer = match backing_ref.create_bidirectional(0, byte_len) {

@@ -12,7 +12,7 @@ use kernel_api::benchmark::{
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
-    DmaMapped, FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+    FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
     IoBufferDmaSegments, PhysFramed,
 };
 use kernel_api::memory::{

@@ -55,6 +55,7 @@ export! {
     kernel_dma_open_device_handle,
     kernel_dma_query_device_state,
     kernel_dma_map_buffer,
+    kernel_dma_map_persistent_contiguous_backing,
 
     kernel_irq_register,
     kernel_irq_register_gsi,

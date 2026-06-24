@@ -12,9 +12,8 @@ mod dma_region;
 mod io;
 mod outstanding;
 mod pci;
-mod temp_benchmark;
+//mod temp_benchmark;
 mod virtqueue;
-
 use alloc::{sync::Arc, vec, vec::Vec};
 use blk::{BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP};
 use core::cell::UnsafeCell;
@@ -29,7 +28,6 @@ use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState}
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::disk_profile as dp;
-use kernel_api::dma::dma::DmaMapped;
 use kernel_api::dma::dma::IoBufferAccess;
 use kernel_api::dma::dma::PhysFramed;
 use kernel_api::dma::dma::ToDevice;
@@ -44,6 +42,7 @@ use kernel_api::kernel_types::disk_profile::{
 };
 use kernel_api::kernel_types::dma::{Described, DmaMappingStrategy, IoBuffer, IoBufferState};
 use kernel_api::kernel_types::io::DiskInfo;
+use kernel_api::kernel_types::io::DmaBacking;
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -282,13 +281,17 @@ pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> Driver
 pub(crate) fn map_request_buffer<'buffer, D>(
     device: &Arc<DeviceObject>,
     buffer: IoBuffer<'buffer, 'buffer, Described, D>,
-) -> Result<IoBuffer<'buffer, 'buffer, DmaMapped<PhysFramed>, D>, DriverStatus>
+) -> Result<IoBuffer<'buffer, 'buffer, PhysFramed, D>, DriverStatus>
 where
     D: IoBufferAccess,
 {
     let phys_framed = buffer
         .into_phys_framed()
         .map_err(|_| DriverStatus::InvalidParameter)?;
+
+    if phys_framed.is_dma_mapped() {
+        return Ok(phys_framed);
+    }
 
     kernel_api::dma::map_buffer(device, phys_framed, DmaMappingStrategy::SingleContiguous)
         .map_err(|_| DriverStatus::InsufficientResources)
@@ -995,7 +998,10 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     pnp_vt.set(PnpMinorFunction::QueryId, virtio_pdo_query_id);
     pnp_vt.set(PnpMinorFunction::QueryResources, virtio_pdo_query_resources);
     pnp_vt.set(PnpMinorFunction::StartDevice, virtio_pdo_start);
-
+    pnp_vt.set(
+        PnpMinorFunction::RegisterDmaBacking,
+        virtio_pdo_register_dma_backing,
+    );
     let capacity = dx.inner.get().map(|i| i.capacity).unwrap_or(0);
     let total_bytes = capacity * 512;
 
@@ -1190,6 +1196,37 @@ pub async fn virtio_pdo_query_resources<'req, 'data, 'b>(
         let di = &cdx.disk_info;
         p.data_out = RequestData::from_t::<DiskInfo>(*di);
         DriverStatus::Success
+    };
+
+    complete_req(req, status)
+}
+#[request_handler]
+pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
+    pdo: &Arc<DeviceObject>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+) -> DriverStep {
+    let cdx = match pdo.try_devext::<ChildExt>() {
+        Ok(cdx) => cdx,
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+    };
+
+    let parent = match cdx.parent_device.upgrade() {
+        Some(parent) => parent,
+        None => return complete_req(req, DriverStatus::NoSuchDevice),
+    };
+
+    let backing = {
+        let r = req.read();
+
+        match r.body.request.data_out_ref().view::<DmaBacking<'data>>() {
+            Some(payload) => payload.backing,
+            None => return complete_req(req, DriverStatus::InvalidParameter),
+        }
+    };
+
+    let status = match kernel_api::dma::map_persistent_contiguous_backing(&parent, backing) {
+        Ok(()) => DriverStatus::Success,
+        Err(_) => DriverStatus::InsufficientResources,
     };
 
     complete_req(req, status)
