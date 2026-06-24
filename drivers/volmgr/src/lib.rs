@@ -707,7 +707,6 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT || ptype == MICROSOFT_RESERVED {
         return DriverStep::Continue;
     }
-    println!("volume made guid: {:#?}", ptype);
 
     let part_guid_s = guid_to_string(&ent.unique_partition_guid);
     let name = alloc::format!("Volume{}", &part_guid_s[..8]);
