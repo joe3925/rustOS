@@ -16,6 +16,7 @@ kernel_macros = { path = "../kernel_macros" }
 kernel_types = { path = "../kernel_types", default-features = false }
 kernel_sys = { path = "../kernel_sys" }
 kernel_routing = { path = "../kernel_routing" }
+kernel_protocol = { path = "../kernel_protocol" }
 libm = { version = "0.2", default-features = false }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

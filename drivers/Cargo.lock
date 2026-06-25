@@ -339,6 +339,7 @@ version = "0.1.0"
 dependencies = [
  "acpi 5.2.0",
  "kernel_macros",
+ "kernel_protocol",
  "kernel_routing",
  "kernel_sys",
  "kernel_types",
@@ -355,6 +356,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "kernel_protocol"
+version = "0.1.0"
+dependencies = [
+ "kernel_types",
 ]
 
 [[package]]

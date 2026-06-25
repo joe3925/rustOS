@@ -7,7 +7,7 @@ use core::any::{Any, TypeId, type_name};
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once, RwLock};
 
 use crate::fs::Path;
@@ -169,6 +169,36 @@ pub struct DevNode {
     pub stack: RwLock<Option<DeviceStack>>,
 }
 
+impl DevNode {
+    #[inline]
+    pub fn state(&self) -> DevNodeState {
+        match self.state.load(Ordering::Acquire) {
+            0 => DevNodeState::Empty,
+            1 => DevNodeState::Initialized,
+            2 => DevNodeState::DriversBound,
+            3 => DevNodeState::Started,
+            4 => DevNodeState::Stopped,
+            5 => DevNodeState::SurpriseRemoved,
+            6 => DevNodeState::Deleted,
+            7 => DevNodeState::Faulted,
+            _ => DevNodeState::Faulted,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceProtocolEntry {
+    pub id: u128,
+    pub version_major: u16,
+    pub version_minor: u16,
+    pub vtable: *const (),
+    pub generation: u64,
+}
+
+unsafe impl Send for DeviceProtocolEntry {}
+unsafe impl Sync for DeviceProtocolEntry {}
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct DeviceObject {
@@ -180,6 +210,9 @@ pub struct DeviceObject {
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
+    protocols: RwLock<Vec<DeviceProtocolEntry>>,
+    protocol_generation: AtomicU64,
+    generation: AtomicU64,
 }
 
 impl DeviceObject {
@@ -194,6 +227,9 @@ impl DeviceObject {
             dispatch_tickets: AtomicU32::new(0),
             dev_node: Once::new(),
             in_queue: AtomicBool::new(false),
+            protocols: RwLock::new(Vec::new()),
+            protocol_generation: AtomicU64::new(1),
+            generation: AtomicU64::new(1),
         })
     }
     // TODO: This being exclusive the binary is currently done on purpose but it may be changed.
@@ -224,6 +260,75 @@ impl DeviceObject {
 
     pub fn attach_devnode(&self, dn: &Arc<DevNode>) {
         self.dev_node.call_once(|| Arc::downgrade(dn));
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn protocol_generation(&self) -> u64 {
+        self.protocol_generation.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn bump_protocol_generation(&self) -> u64 {
+        self.protocol_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    #[inline]
+    pub fn is_removed(&self) -> bool {
+        self.dev_node
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|dn| {
+                matches!(
+                    dn.state(),
+                    DevNodeState::SurpriseRemoved | DevNodeState::Deleted
+                )
+            })
+    }
+
+    pub fn register_protocol_entry(
+        &self,
+        id: u128,
+        version_major: u16,
+        version_minor: u16,
+        vtable: *const (),
+    ) -> bool {
+        let mut protocols = self.protocols.write();
+
+        if protocols
+            .iter()
+            .any(|entry| entry.id == id && entry.version_major == version_major)
+        {
+            return false;
+        }
+
+        let generation = self.bump_protocol_generation();
+        protocols.push(DeviceProtocolEntry {
+            id,
+            version_major,
+            version_minor,
+            vtable,
+            generation,
+        });
+
+        true
+    }
+
+    pub fn find_protocol_entry(
+        &self,
+        id: u128,
+        version_major: u16,
+        min_version_minor: u16,
+    ) -> Option<DeviceProtocolEntry> {
+        self.protocols.read().iter().copied().find(|entry| {
+            entry.id == id
+                && entry.version_major == version_major
+                && entry.version_minor >= min_version_minor
+        })
     }
 }
 
