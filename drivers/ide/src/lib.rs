@@ -1,14 +1,13 @@
-// TODO: there is a memory corruption race condition somewhere that needs to be fixed.
-// the race can be triggered by sending a request then awaiting it and so on for a while. It will occur at some point shows as a GPF.
+
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 #![no_main]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
+
 extern crate alloc;
 
 mod dev_ext;
-use kernel_api::irq::IrqBorrowedHandleExt;
 
 use alloc::sync::Weak;
 use alloc::vec;
@@ -21,10 +20,13 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, IoBufferPageFrame, ToDevice};
+use kernel_api::kernel_types::dma::{
+    Described, FromDevice, IoBuffer, IoBufferAccess, IoBufferState, ToDevice,
+};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -76,74 +78,116 @@ fn continue_req<K: RequestKind>(_req: &mut RequestHandle<'_, K>) -> DriverStep {
     DriverStep::Continue
 }
 
-struct PhysCursor<'a> {
-    frames: &'a [IoBufferPageFrame],
-    frame_idx: usize,
-    frame_offset: usize,
+#[derive(Clone, Copy)]
+struct PhysRun {
+    cpu_addr: usize,
+    byte_len: usize,
+}
+
+struct PhysCursor {
+    runs: Vec<PhysRun>,
+    run_idx: usize,
+    run_offset: usize,
     remaining: usize,
 }
 
-impl<'a> PhysCursor<'a> {
-    fn from_buffer<State, Direction>(
-        buffer: &'a IoBuffer<'_, State, Direction>,
+impl PhysCursor {
+    fn from_buffer<'backing, 'data, State, Access>(
+        buffer: &IoBuffer<'backing, 'data, State, Access>,
         len: usize,
     ) -> Option<Self>
     where
-        State: kernel_api::kernel_types::dma::IoBufferState,
-        Direction: kernel_api::kernel_types::dma::IoBufferDirection,
+        State: IoBufferState,
+        Access: IoBufferAccess,
     {
-        Self::from_parts(
-            buffer.page_frames(),
-            buffer.frame_offset(),
-            buffer.len(),
-            len,
-        )
-    }
+        if buffer.len() < len {
+            return None;
+        }
 
-    fn from_parts(
-        frames: &'a [IoBufferPageFrame],
-        frame_offset: usize,
-        buffer_len: usize,
-        len: usize,
-    ) -> Option<Self> {
-        if buffer_len < len {
+        let mut runs = Vec::new();
+        let mut remaining = len;
+
+        for region in buffer.regions() {
+            if remaining == 0 {
+                break;
+            }
+
+            let mut region_remaining = core::cmp::min(region.len(), remaining);
+            let mut frame_offset = region.frame_offset();
+
+            for frame in region.page_frames() {
+                if region_remaining == 0 {
+                    break;
+                }
+
+                let frame_len = usize::try_from(frame.byte_len).ok()?;
+
+                if frame_offset >= frame_len {
+                    frame_offset -= frame_len;
+                    continue;
+                }
+
+                let cpu_base = frame.cpu_address().as_u64() as usize;
+                if cpu_base == 0 {
+                    return None;
+                }
+
+                let take = core::cmp::min(region_remaining, frame_len - frame_offset);
+                let cpu_addr = cpu_base.checked_add(frame_offset)?;
+
+                runs.push(PhysRun {
+                    cpu_addr,
+                    byte_len: take,
+                });
+
+                region_remaining -= take;
+                remaining -= take;
+                frame_offset = 0;
+            }
+
+            if region_remaining != 0 {
+                return None;
+            }
+        }
+
+        if remaining != 0 {
             return None;
         }
 
         Some(Self {
-            frames,
-            frame_idx: 0,
-            frame_offset,
+            runs,
+            run_idx: 0,
+            run_offset: 0,
             remaining: len,
         })
     }
 
-    fn phys_addr(&self) -> Option<u64> {
-        let frame = self.frames.get(self.frame_idx)?;
-        if self.frame_offset >= frame.byte_len as usize {
+    fn byte_ptr(&self) -> Option<*mut u8> {
+        let run = self.runs.get(self.run_idx)?;
+        if self.run_offset >= run.byte_len {
             return None;
         }
-        Some(frame.phys_addr + self.frame_offset as u64)
-    }
 
-    fn byte_ptr(&self) -> Option<*mut u8> {
-        let frame = self.frames.get(self.frame_idx)?;
-        Some((frame.cpu_address().as_u64() + self.frame_offset as u64) as *mut u8)
+        Some(run.cpu_addr.checked_add(self.run_offset)? as *mut u8)
     }
 
     fn advance(&mut self) -> bool {
         if self.remaining == 0 {
             return false;
         }
-        let Some(frame) = self.frames.get(self.frame_idx) else {
+
+        let Some(run) = self.runs.get(self.run_idx) else {
             return false;
         };
+
         self.remaining -= 1;
-        self.frame_offset += 1;
-        if self.frame_offset >= frame.byte_len as usize {
-            self.frame_idx += 1;
-            self.frame_offset = 0;
+        self.run_offset += 1;
+
+        if self.run_offset >= run.byte_len {
+            self.run_idx += 1;
+            self.run_offset = 0;
         }
+
         true
     }
 
@@ -151,8 +195,10 @@ impl<'a> PhysCursor<'a> {
         if self.remaining == 0 {
             return None;
         }
+
         let ptr = self.byte_ptr()? as *const u8;
         let value = unsafe { core::ptr::read(ptr) };
+
         self.advance().then_some(value)
     }
 
@@ -160,10 +206,15 @@ impl<'a> PhysCursor<'a> {
         if self.remaining == 0 {
             return false;
         }
+
         let Some(ptr) = self.byte_ptr() else {
             return false;
         };
-        unsafe { core::ptr::write(ptr, value) };
+
+        unsafe {
+            core::ptr::write(ptr, value);
+        }
+
         self.advance()
     }
 
@@ -178,22 +229,20 @@ impl<'a> PhysCursor<'a> {
     }
 }
 
-fn read_buffer_cursor<'a>(
-    buffer: &'a IoBuffer<'_, Described, FromDevice>,
+fn read_buffer_cursor<'backing, 'data>(
+    buffer: &IoBuffer<'backing, 'data, Described, FromDevice>,
     len: usize,
-) -> Option<PhysCursor<'a>> {
+) -> Option<PhysCursor> {
     PhysCursor::from_buffer(buffer, len)
 }
 
-fn write_buffer_cursor<'a>(
-    buffer: &'a IoBuffer<'_, Described, ToDevice>,
+fn write_buffer_cursor<'backing, 'data>(
+    buffer: &IoBuffer<'backing, 'data, Described, ToDevice>,
     len: usize,
-) -> Option<PhysCursor<'a>> {
+) -> Option<PhysCursor> {
     PhysCursor::from_buffer(buffer, len)
 }
 
-/// IDE interrupt service routine.
-/// `ctx` = I/O base port address, used to read the status register and clear the IRQ.
 extern "C" fn ide_isr(
     _vector: u8,
     _cpu: u32,
@@ -201,7 +250,6 @@ extern "C" fn ide_isr(
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
-    // Read the status register to acknowledge/clear the IDE interrupt.
     let io_base = ctx as u16;
     let mut status_port: Port<u8> = Port::new(io_base + 7);
     let _status = unsafe { status_port.read() };
@@ -210,6 +258,7 @@ extern "C" fn ide_isr(
         tag: 0,
         data: [0; 3],
     });
+
     true
 }
 
@@ -223,12 +272,92 @@ pub struct ChildExt {
 
 struct IdePdoIo;
 
+#[inline]
+fn ide_lba_sectors(offset: u64, len: usize) -> Result<Option<(u32, u32)>, DriverStatus> {
+    if len == 0 {
+        return Ok(None);
+    }
+
+    if (offset & 0x1ff) != 0 || (len & 0x1ff) != 0 {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    let sector_count = len >> 9;
+    if sector_count == 0 || sector_count > u32::MAX as usize {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    let lba = offset >> 9;
+    let sectors = sector_count as u32;
+
+    let Some(end_lba) = lba.checked_add(sectors as u64) else {
+        return Err(DriverStatus::InvalidParameter);
+    };
+
+    if end_lba > (1u64 << 28) {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    Ok(Some((lba as u32, sectors)))
+}
+
+fn validate_ide_read_chain<'data>(first: &Read<'data>) -> Result<bool, DriverStatus> {
+    let mut any = false;
+
+    for read in first.iter() {
+        let Some((_lba, _sectors)) = ide_lba_sectors(read.offset, read.len)? else {
+            continue;
+        };
+
+        if read.no_buffer {
+            return Err(DriverStatus::InvalidParameter);
+        }
+
+        let Some(buffer) = read.buffer.as_ref() else {
+            return Err(DriverStatus::InvalidParameter);
+        };
+
+        if read_buffer_cursor(buffer, read.len).is_none() {
+            return Err(DriverStatus::InsufficientResources);
+        }
+
+        any = true;
+    }
+
+    Ok(any)
+}
+
+fn validate_ide_write_chain<'data>(first: &Write<'data>) -> Result<bool, DriverStatus> {
+    let mut any = false;
+
+    for write in first.iter() {
+        let Some((_lba, _sectors)) = ide_lba_sectors(write.offset, write.len)? else {
+            continue;
+        };
+
+        if write.no_buffer {
+            return Err(DriverStatus::InvalidParameter);
+        }
+
+        let Some(buffer) = write.buffer.as_ref() else {
+            return Err(DriverStatus::InvalidParameter);
+        };
+
+        if write_buffer_cursor(buffer, write.len).is_none() {
+            return Err(DriverStatus::InsufficientResources);
+        }
+
+        any = true;
+    }
+
+    Ok(any)
+}
+
 impl DeviceRead for IdePdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Read<'data>>,
-        _buf_len: usize,
     ) -> DriverStep {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
@@ -249,45 +378,80 @@ impl DeviceRead for IdePdoIo {
             Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
         };
 
-        let (offset, len) = {
+        let any = {
             let r = req.read();
-            (r.body.offset, r.body.len)
+            match validate_ide_read_chain(&r.body) {
+                Ok(any) => any,
+                Err(status) => return complete_req(req, status),
+            }
         };
 
-        if len == 0 {
+        if !any {
             return complete_req(req, DriverStatus::Success);
-        }
-
-        if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
-        }
-
-        let lba = offset >> 9;
-        let sectors = (len / 512) as u32;
-
-        if sectors == 0 || (lba >> 28) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
         }
 
         let dh = cdx.dh.load(Ordering::Acquire);
         let irq = unsafe { dx.irq() };
 
-        let read_status = {
-            let buffer = &req.read().body.buffer;
-            let Some(cursor) = read_buffer_cursor(buffer, len) else {
-                return complete_req(req, DriverStatus::InsufficientResources);
+        let mut ctrl = dx.controller.lock().await;
+        let mut chain_index = 0usize;
+        let mut read_status = DriverStatus::Success;
+
+        loop {
+            let next = {
+                let r = req.read();
+                let mut out = Ok(None);
+
+                for (idx, read) in r.body.iter().enumerate() {
+                    if idx < chain_index {
+                        continue;
+                    }
+
+                    chain_index = idx + 1;
+
+                    let (lba, sectors) = match ide_lba_sectors(read.offset, read.len) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(status) => {
+                            out = Err(status);
+                            break;
+                        }
+                    };
+
+                    let Some(buffer) = read.buffer.as_ref() else {
+                        out = Err(DriverStatus::InvalidParameter);
+                        break;
+                    };
+
+                    let Some(cursor) = read_buffer_cursor(buffer, read.len) else {
+                        out = Err(DriverStatus::InsufficientResources);
+                        break;
+                    };
+
+                    out = Ok(Some((lba, sectors, cursor)));
+                    break;
+                }
+
+                out
             };
 
-            let mut ctrl = dx.controller.lock().await;
-            let status =
-                if ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await {
-                    DriverStatus::Success
-                } else {
-                    DriverStatus::Unsuccessful
-                };
-            drop(ctrl);
-            status
-        };
+            let Some((lba, sectors, cursor)) = (match next {
+                Ok(v) => v,
+                Err(status) => {
+                    read_status = status;
+                    break;
+                }
+            }) else {
+                break;
+            };
+
+            if !ata_pio_read_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
+                read_status = DriverStatus::Unsuccessful;
+                break;
+            }
+        }
+
+        drop(ctrl);
 
         complete_req(req, read_status)
     }
@@ -298,7 +462,6 @@ impl DeviceWrite for IdePdoIo {
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, Write<'data>>,
-        _buf_len: usize,
     ) -> DriverStep {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
@@ -319,46 +482,80 @@ impl DeviceWrite for IdePdoIo {
             Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
         };
 
-        let (offset, len) = {
+        let any = {
             let r = req.read();
-            (r.body.offset, r.body.len)
+            match validate_ide_write_chain(&r.body) {
+                Ok(any) => any,
+                Err(status) => return complete_req(req, status),
+            }
         };
 
-        if len == 0 {
+        if !any {
             return complete_req(req, DriverStatus::Success);
-        }
-
-        if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
-        }
-
-        let lba = offset >> 9;
-        let sectors = (len / 512) as u32;
-
-        if sectors == 0 || (lba >> 28) != 0 {
-            return complete_req(req, DriverStatus::InvalidParameter);
         }
 
         let dh = cdx.dh.load(Ordering::Acquire);
         let irq = unsafe { dx.irq() };
 
-        let write_status = {
-            let buffer = &req.read().body.buffer;
-            let Some(cursor) = write_buffer_cursor(buffer, len) else {
-                return complete_req(req, DriverStatus::InsufficientResources);
+        let mut ctrl = dx.controller.lock().await;
+        let mut chain_index = 0usize;
+        let mut write_status = DriverStatus::Success;
+
+        loop {
+            let next = {
+                let r = req.read();
+                let mut out = Ok(None);
+
+                for (idx, write) in r.body.iter().enumerate() {
+                    if idx < chain_index {
+                        continue;
+                    }
+
+                    chain_index = idx + 1;
+
+                    let (lba, sectors) = match ide_lba_sectors(write.offset, write.len) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => continue,
+                        Err(status) => {
+                            out = Err(status);
+                            break;
+                        }
+                    };
+
+                    let Some(buffer) = write.buffer.as_ref() else {
+                        out = Err(DriverStatus::InvalidParameter);
+                        break;
+                    };
+
+                    let Some(cursor) = write_buffer_cursor(buffer, write.len) else {
+                        out = Err(DriverStatus::InsufficientResources);
+                        break;
+                    };
+
+                    out = Ok(Some((lba, sectors, cursor)));
+                    break;
+                }
+
+                out
             };
 
-            let mut ctrl = dx.controller.lock().await;
-            let ok =
-                ata_pio_write_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await;
-            drop(ctrl);
+            let Some((lba, sectors, cursor)) = (match next {
+                Ok(v) => v,
+                Err(status) => {
+                    write_status = status;
+                    break;
+                }
+            }) else {
+                break;
+            };
 
-            if ok {
-                DriverStatus::Success
-            } else {
-                DriverStatus::Unsuccessful
+            if !ata_pio_write_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
+                write_status = DriverStatus::Unsuccessful;
+                break;
             }
-        };
+        }
+
+        drop(ctrl);
 
         complete_req(req, write_status)
     }
@@ -383,6 +580,7 @@ impl DeviceControlHandler for IdePdoIo {
             Some(p) => p,
             None => return complete_req(req, DriverStatus::NoSuchDevice),
         };
+
         let dx = match parent.try_devext::<DevExt>() {
             Ok(dx) => dx,
             Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
@@ -395,7 +593,9 @@ impl DeviceControlHandler for IdePdoIo {
                 let irq = unsafe { dx.irq() };
                 let mut ctrl = dx.controller.lock().await;
 
-                unsafe { ctrl.ports.command.write(ATA_CMD_FLUSH_CACHE) };
+                unsafe {
+                    ctrl.ports.command.write(ATA_CMD_FLUSH_CACHE);
+                }
 
                 let ok = wait_not_busy_async(&mut ctrl.ports, irq, TIMEOUT_MS).await;
                 drop(ctrl);
@@ -422,6 +622,7 @@ pub extern "C" fn ide_device_add(
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let mut vt = PnpVtable::new();
+
     vt.set(PnpMinorFunction::StartDevice, ide_pnp_start);
     vt.set(
         PnpMinorFunction::QueryDeviceRelations,
@@ -430,6 +631,7 @@ pub extern "C" fn ide_device_add(
 
     let init = DeviceInit::with_pnp(Some(vt));
     *dev_init = init;
+
     dev_init.set_dev_ext_from(DevExt::new(0x1F0, 0x3F4));
 
     DriverStep::complete(DriverStatus::Success)
@@ -449,12 +651,15 @@ async fn ide_pnp_start<'req, 'data, 'b>(
             data_out: RequestData::empty(),
         },
     });
+
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child_handle).await;
+
     if st != DriverStatus::NoSuchDevice {
         let qst = child_handle.read().status.clone();
         if qst != DriverStatus::Success {
             return complete_req(req, qst);
         }
+
         let binding = child_handle.read();
         let bars = {
             let data = binding
@@ -464,6 +669,7 @@ async fn ide_pnp_start<'req, 'data, 'b>(
                 .view::<Vec<u8>>()
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
+
             parse_ide_bars(data)
         };
 
@@ -478,7 +684,6 @@ async fn ide_pnp_start<'req, 'data, 'b>(
             ctrl.ports = Ports::new(cb, alt);
         }
 
-        // Register IRQ handler
         let irq_handle = if let Some(gsi) = bars.gsi {
             if gsi < 64 {
                 irq_register_isr_gsi(gsi as u8, ide_isr, cb as usize)
@@ -500,10 +705,11 @@ async fn ide_pnp_start<'req, 'data, 'b>(
             *dx.irq_handle.get() = irq_handle;
         }
 
-        // Enable interrupts: clear nIEN bit (write 0x00 instead of 0x02)
         {
             let mut ctrl = dx.controller.lock().await;
-            unsafe { ctrl.ports.control.write(0x00) };
+            unsafe {
+                ctrl.ports.control.write(0x00);
+            }
         }
 
         dx.present.store(true, Ordering::Release);
@@ -523,10 +729,12 @@ async fn ide_pnp_query_devrels<'req, 'data, 'b>(
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let relation = { req.read().body.request.relation };
+
     if relation == DeviceRelationType::BusRelations {
-        ide_enumerate_bus(&dev);
+        ide_enumerate_bus(dev);
         return complete_req(req, DriverStatus::Success);
     }
+
     continue_req(req)
 }
 
@@ -539,16 +747,15 @@ fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
         return;
     }
 
-    // Probe and identify drives while holding the controller lock.
     let mut ctrl = dx.controller.lock_blocking();
     let master_words = ata_identify_words_sync(&mut ctrl.ports, 0xE0);
     let slave_words = ata_identify_words_sync(&mut ctrl.ports, 0xF0);
     drop(ctrl);
 
-    // Create PDOs outside the lock.
     if master_words.is_some() {
         create_child_pdo(parent, 0, 0, master_words);
     }
+
     if slave_words.is_some() {
         create_child_pdo(parent, 0, 1, slave_words);
     }
@@ -567,13 +774,17 @@ fn create_child_pdo(
     let (hardware, compatible) = if let Some(words) = id_words_opt {
         let model = id_string(&words[27..=46]);
         let fw = id_string(&words[23..=26]);
+
         let mut hw = vec![];
+
         if !model.is_empty() && !fw.is_empty() {
             hw.push(alloc::format!("IDE\\Disk{model}_{fw}"));
         } else if !model.is_empty() {
             hw.push(alloc::format!("IDE\\Disk{model}"));
         }
+
         hw.push(alloc::format!("IDE\\Disk&DRV_{:02}", drive));
+
         (hw, vec!["IDE\\Disk".into(), "GenDisk".into()])
     } else {
         (
@@ -584,6 +795,7 @@ fn create_child_pdo(
 
     let class = Some("disk".to_string());
     let parent_dn = parent.dev_node.get().unwrap().upgrade().unwrap();
+
     let ids = DeviceIds {
         hardware,
         compatible,
@@ -595,9 +807,11 @@ fn create_child_pdo(
     pvt.set(PnpMinorFunction::StartDevice, ide_pdo_start);
 
     let mut child_init = DeviceInit::with_pnp(Some(pvt));
+
     child_init.ops.read.register::<IdePdoIo>();
     child_init.ops.write.register::<IdePdoIo>();
     child_init.ops.device_control.register::<IdePdoIo>();
+
     child_init.set_dev_ext_from(ChildExt {
         parent_device: Arc::downgrade(parent),
         dh: AtomicU8::new(dh),
@@ -643,6 +857,7 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
     }
 
     let mut off = 12usize;
+
     while off + 24 <= blob.len() {
         let kind = u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
         let index =
@@ -667,12 +882,14 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
             blob[off + 22],
             blob[off + 23],
         ]);
+
         off += 24;
 
         if kind == ResourceKind::Gsi as u32 {
             bars.gsi = Some(start as u32);
             continue;
         }
+
         if kind == ResourceKind::Interrupt as u32 {
             bars.irq_line = Some(start as u8);
             continue;
@@ -688,6 +905,7 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
             4 => bars.bm = start as u16,
             _ => {
                 let l = len as u16;
+
                 if bars.cmd == 0 && (l == 8 || l == 16) {
                     bars.cmd = start as u16;
                 } else if bars.ctl == 0 && (l == 4 || l == 2) {
@@ -702,6 +920,7 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
     if bars.cmd == 0 {
         bars.cmd = 0x1F0;
     }
+
     if bars.ctl == 0 {
         bars.ctl = match bars.cmd {
             0x1F0 => 0x3F4,
@@ -709,6 +928,7 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
             v => v.wrapping_add(2),
         };
     }
+
     if bars.gsi.is_none() && bars.irq_line.is_none() {
         bars.irq_line = Some(if bars.cmd == 0x170 { 15 } else { 14 });
     }
@@ -718,17 +938,22 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
 
 fn id_string(words: &[u16]) -> String {
     let mut bytes: Vec<u8> = Vec::with_capacity(words.len() * 2);
+
     for &w in words {
         bytes.push((w >> 8) as u8);
         bytes.push((w & 0xFF) as u8);
     }
+
     let s = core::str::from_utf8(&bytes)
         .unwrap_or("")
         .trim_matches(|c| c == '\0' || c == ' ');
+
     let mut out = String::with_capacity(s.len());
     let mut last_ws = false;
+
     for ch in s.chars() {
         let ws = ch.is_ascii_whitespace();
+
         if ws {
             if !last_ws {
                 out.push('_');
@@ -736,14 +961,18 @@ fn id_string(words: &[u16]) -> String {
         } else if ch.is_ascii_graphic() {
             out.push(ch);
         }
+
         last_ws = ws;
     }
+
     while out.starts_with('_') {
         out.remove(0);
     }
+
     while out.ends_with('_') {
         out.pop();
     }
+
     out
 }
 
@@ -752,15 +981,22 @@ fn ata_identify_words_sync(ports: &mut Ports, dh: u8) -> Option<[u16; 256]> {
         return None;
     }
 
-    unsafe { ports.drive_head.write(dh) };
+    unsafe {
+        ports.drive_head.write(dh);
+    }
+
     io_wait_400ns(&mut ports.control);
-    unsafe { ports.command.write(ATA_CMD_IDENTIFY) };
+
+    unsafe {
+        ports.command.write(ATA_CMD_IDENTIFY);
+    }
 
     if !wait_ready_sync(ports, TIMEOUT_MS) {
         return None;
     }
 
     let st = unsafe { ports.command.read() };
+
     if st == 0 || (st & ATA_SR_ERR) != 0 {
         return None;
     }
@@ -770,9 +1006,11 @@ fn ata_identify_words_sync(ports: &mut Ports, dh: u8) -> Option<[u16; 256]> {
     }
 
     let mut words = [0u16; 256];
+
     for i in 0..256 {
         words[i] = unsafe { ports.data.read() };
     }
+
     Some(words)
 }
 
@@ -786,7 +1024,7 @@ async fn ata_pio_read_phys_async(
     dh: u8,
     mut lba: u32,
     mut sectors: u32,
-    mut out: PhysCursor<'_>,
+    mut out: PhysCursor,
 ) -> bool {
     let p = &mut ctrl.ports;
 
@@ -799,7 +1037,11 @@ async fn ata_pio_read_phys_async(
         }
 
         let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-        unsafe { p.drive_head.write(devsel) };
+
+        unsafe {
+            p.drive_head.write(devsel);
+        }
+
         io_wait_400ns(&mut p.control);
 
         if !wait_ready_async(p, irq, TIMEOUT_MS).await {
@@ -818,12 +1060,16 @@ async fn ata_pio_read_phys_async(
             if !wait_drq_async(p, irq, TIMEOUT_MS).await {
                 return false;
             }
+
             let st = unsafe { p.command.read() };
+
             if (st & ATA_SR_DRQ) == 0 {
                 return false;
             }
+
             for _ in 0..256 {
                 let word: u16 = unsafe { p.data.read() };
+
                 if !out.write_u16_le(word) {
                     return false;
                 }
@@ -843,7 +1089,7 @@ async fn ata_pio_write_phys_async(
     dh: u8,
     mut lba: u32,
     mut sectors: u32,
-    mut data: PhysCursor<'_>,
+    mut data: PhysCursor,
 ) -> bool {
     let p = &mut ctrl.ports;
 
@@ -856,7 +1102,11 @@ async fn ata_pio_write_phys_async(
         }
 
         let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-        unsafe { p.drive_head.write(devsel) };
+
+        unsafe {
+            p.drive_head.write(devsel);
+        }
+
         io_wait_400ns(&mut p.control);
 
         if !wait_ready_async(p, irq, TIMEOUT_MS).await {
@@ -884,7 +1134,10 @@ async fn ata_pio_write_phys_async(
                 let Some(word) = data.read_u16_le() else {
                     return false;
                 };
-                unsafe { p.data.write(word) };
+
+                unsafe {
+                    p.data.write(word);
+                }
             }
         }
 
@@ -896,7 +1149,10 @@ async fn ata_pio_write_phys_async(
         return false;
     }
 
-    unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
+    unsafe {
+        p.command.write(ATA_CMD_FLUSH_CACHE);
+    }
+
     wait_not_busy_async(p, irq, TIMEOUT_MS).await
 }
 
@@ -928,48 +1184,54 @@ fn io_wait_400ns(alt: &mut Port<u8>) {
     }
 }
 
-// ── Synchronous wait helpers (used during enumeration, before IRQ is available) ──
-
 fn wait_not_busy_sync(ports: &mut Ports, timeout_ms: u64) -> bool {
     for _ in 0..timeout_ms {
         let s = unsafe { ports.command.read() };
+
         if (s & ATA_SR_BSY) == 0 {
             return true;
         }
+
         wait_duration(Duration::from_millis(1));
     }
+
     false
 }
 
 fn wait_ready_sync(ports: &mut Ports, timeout_ms: u64) -> bool {
     for _ in 0..timeout_ms {
         let s = unsafe { ports.command.read() };
+
         if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRDY) != 0 {
             return true;
         }
+
         wait_duration(Duration::from_millis(1));
     }
+
     false
 }
 
 fn wait_drq_sync(ports: &mut Ports, timeout_ms: u64) -> bool {
     for _ in 0..timeout_ms {
         let s = unsafe { ports.command.read() };
+
         if (s & ATA_SR_BSY) != 0 {
         } else if (s & ATA_SR_ERR) != 0 {
             return false;
         } else if (s & ATA_SR_DRQ) != 0 {
             return true;
         }
+
         wait_duration(Duration::from_millis(1));
     }
+
     false
 }
 
-// ── Async interrupt-driven wait helpers ──
-
 async fn wait_not_busy_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
     let s = unsafe { ports.command.read() };
+
     if (s & ATA_SR_BSY) == 0 {
         return true;
     }
@@ -979,16 +1241,21 @@ async fn wait_not_busy_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout
             tag: 0,
             data: [0; 3],
         };
+
         for _ in 0..(timeout_ms / 10).max(1) {
             let result = handle.wait(meta).await;
+
             if !irq_wait_ok(result) {
                 return false;
             }
+
             let s = unsafe { ports.command.read() };
+
             if (s & ATA_SR_BSY) == 0 {
                 return true;
             }
         }
+
         false
     } else {
         wait_not_busy_sync(ports, timeout_ms)
@@ -997,6 +1264,7 @@ async fn wait_not_busy_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout
 
 async fn wait_ready_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
     let s = unsafe { ports.command.read() };
+
     if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRDY) != 0 {
         return true;
     }
@@ -1006,16 +1274,21 @@ async fn wait_ready_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms
             tag: 0,
             data: [0; 3],
         };
+
         for _ in 0..(timeout_ms / 10).max(1) {
             let result = handle.wait(meta).await;
+
             if !irq_wait_ok(result) {
                 return false;
             }
+
             let s = unsafe { ports.command.read() };
+
             if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRDY) != 0 {
                 return true;
             }
         }
+
         false
     } else {
         wait_ready_sync(ports, timeout_ms)
@@ -1024,10 +1297,12 @@ async fn wait_ready_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms
 
 async fn wait_drq_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
     let s = unsafe { ports.command.read() };
+
     if (s & ATA_SR_BSY) == 0 {
         if (s & ATA_SR_ERR) != 0 {
             return false;
         }
+
         if (s & ATA_SR_DRQ) != 0 {
             return true;
         }
@@ -1038,40 +1313,48 @@ async fn wait_drq_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: 
             tag: 0,
             data: [0; 3],
         };
+
         for _ in 0..(timeout_ms / 10).max(1) {
             let result = handle.wait(meta).await;
+
             if !irq_wait_ok(result) {
                 return false;
             }
+
             let s = unsafe { ports.command.read() };
+
             if (s & ATA_SR_BSY) != 0 {
                 continue;
             }
+
             if (s & ATA_SR_ERR) != 0 {
                 return false;
             }
+
             if (s & ATA_SR_DRQ) != 0 {
                 return true;
             }
         }
+
         false
     } else {
         wait_drq_sync(ports, timeout_ms)
     }
 }
 
-/// Brief synchronous poll for DRQ — used for the first sector of a WRITE command
-/// where the ATA spec says no IRQ fires.
 fn wait_drq_poll_brief(ports: &mut Ports) -> bool {
     for _ in 0..1000u32 {
         let s = unsafe { ports.command.read() };
+
         if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRQ) != 0 {
             return true;
         }
+
         if (s & ATA_SR_ERR) != 0 {
             return false;
         }
     }
+
     false
 }
 
@@ -1081,11 +1364,13 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     use QueryIdType::*;
+
     let ty = { req.read().body.request.id_type };
 
     {
         let w = req.write();
         let p = &mut w.body.request;
+
         match ty {
             HardwareIds => {
                 p.ids_out.push("IDE\\Disk".into());
@@ -1111,6 +1396,7 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
             }
         }
     }
+
     complete_req(req, DriverStatus::Success)
 }
 
@@ -1121,14 +1407,13 @@ pub async fn ide_pdo_query_resources<'req, 'data, 'b>(
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
-        Err(_) => {
-            return complete_req(req, DriverStatus::NoSuchDevice);
-        }
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     let status = {
         let w = req.write();
         let p = &mut w.body.request;
+
         match cdx.disk_info.as_ref() {
             Some(di) => {
                 p.data_out = RequestData::from_t::<DiskInfo>(*di);

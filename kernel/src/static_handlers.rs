@@ -9,6 +9,7 @@ use kernel_executor::runtime::runtime::{
     spawn_detached as kernel_spawn_detached,
 };
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::IoBufferBacking;
 use kernel_types::object_manager::OmError;
 
 use crate::memory::heap::allocator::KernelAllocator;
@@ -52,8 +53,8 @@ use kernel_types::{
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::{
-        DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
-        DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
+        DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappedBuffer,
+        DmaMappingStrategy, DmaPciDeviceIdentity,
     },
     fdt::FdtHeader,
     fs::{OpenFlags, Path},
@@ -222,45 +223,33 @@ pub extern "C" fn kernel_dma_query_device_state(
 ) -> Option<DmaDeviceState> {
     dma::query_device_state(device)
 }
-
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_dma_map_buffer<'a>(
+pub extern "C" fn kernel_dma_map_buffer<'regions, 'frames>(
     device: &Arc<DeviceObject>,
-    buffer: IoBuffer<'a, PhysFramed, ToDevice>,
+    buffer: &DmaBufferView<'regions>,
     strategy: DmaMappingStrategy,
-) -> Result<
-    IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
-    (IoBuffer<'a, PhysFramed, ToDevice>, DmaMapError),
-> {
+) -> Result<DmaMappedBuffer, DmaMapError> {
     dma::map_buffer(device, buffer, strategy)
 }
-
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_dma_unmap_buffer<'a>(
-    buffer: IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
-) -> IoBuffer<'a, PhysFramed, ToDevice> {
-    dma::unmap_buffer(buffer)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
+pub extern "C" fn kernel_dma_map_persistent_contiguous_backing(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBuffer<'buffer, PhysFramed, ToDevice>,
-    strategy: DmaMappingStrategy,
-) -> Result<kernel_types::dma::BorrowedDmaMapping<'map>, DmaMapError> {
-    dma::map_buffer_ref(device, buffer, strategy)
+    backing: &IoBufferBacking<'_>,
+) -> Result<(), DmaMapError> {
+    crate::memory::dma::map_persistent_contiguous_backing(device, backing)
 }
-
 #[no_mangle]
 pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
     crate::platform::cpu_topology_ids()
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
+    crate::arch::serial_write_bytes(str.as_bytes());
     CONSOLE.lock().print(str.as_bytes());
 }
 #[unsafe(no_mangle)]
 pub fn routing_print_impl(s: &str) {
+    crate::arch::serial_write_bytes(s.as_bytes());
     CONSOLE.lock().print(s.as_bytes());
 }
 #[unsafe(no_mangle)]
@@ -531,7 +520,7 @@ pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(
 }
 
 #[no_mangle]
-pub extern "C" fn InvalidateDeviceRelations(
+pub extern "C" fn pnp_invalidate_device_relations(
     device: &Arc<DeviceObject>,
     relation: DeviceRelationType,
 ) -> FfiFuture<DriverStatus> {
@@ -901,7 +890,8 @@ pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 
 #[no_mangle]
 pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    crate::memory::paging::resolve_virtual_range_frame(addr)
+    let result = crate::memory::paging::resolve_virtual_range_frame(addr);
+    result
 }
 
 // ============================================================================

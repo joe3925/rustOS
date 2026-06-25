@@ -50,7 +50,10 @@ pub enum PnpMinorFunction {
     StartDevice,
     QueryDeviceRelations,
     QueryId,
+
+    RegisterDmaBacking,
     QueryResources,
+
     SurpriseRemoval,
     RemoveDevice,
     StopDevice,
@@ -64,7 +67,10 @@ impl PnpMinorFunction {
             | Self::SurpriseRemoval
             | Self::RemoveDevice
             | Self::StopDevice => DriverStatus::Success,
-            Self::QueryId | Self::QueryResources => DriverStatus::NotImplemented,
+
+            Self::QueryId | Self::QueryResources | Self::RegisterDmaBacking => {
+                DriverStatus::NotImplemented
+            }
         }
     }
 }

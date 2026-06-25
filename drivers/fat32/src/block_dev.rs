@@ -6,7 +6,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, IoKind, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     kernel_types::{
-        dma::{Described, FromDevice, IoBuffer, ToDevice},
+        async_ffi::{FfiFuture, FutureExt},
+        dma::{
+            IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, IoBufferBackingScratch,
+        },
         io::IoTarget,
     },
     pnp::pnp_send_request,
@@ -22,10 +25,9 @@ pub struct BlockDev {
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
-    /// Shared flush flag with VolCtrlDevExt
     pub(crate) should_flush: Arc<AtomicBool>,
-    /// Current owner tag — set once per FS op, read by prep_write_req.
     pub(crate) current_owner: Arc<AtomicU64>,
+    io_scratch: Option<IoBufferBackingScratch>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +62,7 @@ impl BlockDev {
             pos: 0,
             should_flush,
             current_owner,
+            io_scratch: Some(IoBufferBackingScratch::new()),
         }
     }
 
@@ -68,7 +71,16 @@ impl BlockDev {
         self.total_sectors.saturating_mul(self.sector_size as u64)
     }
 
-    /// Send a read, borrowing `dst` directly so the lower driver writes into it.
+    #[inline]
+    fn take_io_scratch(&mut self) -> IoBufferBackingScratch {
+        self.io_scratch.take().unwrap_or_default()
+    }
+
+    #[inline]
+    fn restore_io_scratch(&mut self, scratch: IoBufferBackingScratch) {
+        self.io_scratch = Some(scratch);
+    }
+
     async fn send_read(
         &mut self,
         offset: u64,
@@ -77,16 +89,45 @@ impl BlockDev {
     ) -> Result<(), DriverStatus> {
         let volume = self.volume.clone();
         let len = dst.len();
-        let buffer = IoBuffer::<Described, FromDevice>::from_slice_mut(dst);
+        let scratch = self.take_io_scratch();
+
+        let backing = match IoBufferBacking::from_scratch(
+            IoBufferBackingDesc::SliceMut(dst),
+            IoBufferBackingConfig::worst_case_for_len(len),
+            scratch,
+        ) {
+            Ok(backing) => backing,
+            Err(_) => {
+                cold_path();
+                self.restore_io_scratch(IoBufferBackingScratch::new());
+                return Err(DriverStatus::InsufficientResources);
+            }
+        };
+
+        let buffer = match backing.create_from_device(0, len) {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                cold_path();
+                self.restore_io_scratch(IoBufferBackingScratch::new());
+                return Err(DriverStatus::InvalidParameter);
+            }
+        };
+
         let mut req = RequestHandle::new(ReadRequest {
             offset,
             len,
             no_buffer: false,
-            buffer,
+            buffer: Some(buffer),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
+
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = pnp_send_request(volume, &mut req).await;
+
+        drop(req);
+
+        self.restore_io_scratch(backing.into_scratch());
 
         if likely(status == DriverStatus::Success) {
             Ok(())
@@ -97,27 +138,57 @@ impl BlockDev {
         }
     }
 
-    /// Send a write from an immutable source.
     async fn send_write_immut(
         &mut self,
         offset: u64,
         src: &[u8],
-        _kind: IoKind,
+        kind: IoKind,
     ) -> Result<(), DriverStatus> {
         let no_buffer = false;
+
         let volume = self.volume.clone();
         let len = src.len();
-        let buffer = IoBuffer::<Described, ToDevice>::from_slice(src);
+
+        let scratch = self.take_io_scratch();
+
+        let backing = match IoBufferBacking::from_scratch(
+            IoBufferBackingDesc::Slice(src),
+            IoBufferBackingConfig::worst_case_for_len(len),
+            scratch,
+        ) {
+            Ok(backing) => backing,
+            Err(_) => {
+                cold_path();
+                self.restore_io_scratch(IoBufferBackingScratch::new());
+                return Err(DriverStatus::InsufficientResources);
+            }
+        };
+
+        let buffer = match backing.create_to_device(0, len) {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                cold_path();
+                self.restore_io_scratch(IoBufferBackingScratch::new());
+                return Err(DriverStatus::InvalidParameter);
+            }
+        };
+
         let mut req = RequestHandle::new(WriteRequest {
             offset,
             len,
             no_buffer,
             owner: self.current_owner.load(Ordering::Acquire),
-            buffer,
+            buffer: Some(buffer),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
+
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = pnp_send_request(volume, &mut req).await;
+
+        drop(req);
+
+        self.restore_io_scratch(backing.into_scratch());
 
         if likely(status == DriverStatus::Success) {
             Ok(())
@@ -133,14 +204,17 @@ impl BlockDev {
             cold_path();
             return Ok(0);
         }
+
         let cap_bytes = self.capacity_bytes();
         if unlikely(self.pos >= cap_bytes) {
             cold_path();
             return Ok(0);
         }
+
         let len = min(dst.len(), (cap_bytes - self.pos) as usize);
         self.send_read(self.pos, &mut dst[..len], kind).await?;
         self.pos += len as u64;
+
         Ok(len)
     }
 
@@ -149,6 +223,7 @@ impl BlockDev {
             cold_path();
             return Ok(0);
         }
+
         let cap_bytes = self.capacity_bytes();
         if unlikely(self.pos >= cap_bytes) {
             cold_path();
@@ -159,17 +234,14 @@ impl BlockDev {
             );
             return Ok(0);
         }
-        let len = min(
-            src.len(),
-            (cap_bytes.checked_sub(self.pos).unwrap()) as usize,
-        );
+
+        let len = min(src.len(), cap_bytes.saturating_sub(self.pos) as usize);
         self.send_write_immut(self.pos, &src[..len], kind).await?;
         self.pos += len as u64;
+
         Ok(len)
     }
 }
-
-use kernel_api::kernel_types::async_ffi::{FfiFuture, FutureExt};
 
 impl Read for BlockDev {
     fn read<'a>(
@@ -194,6 +266,7 @@ impl Write for BlockDev {
         async move { Ok(()) }.into_ffi()
     }
 }
+
 pub fn flush(vdx: &VolCtrlDevExt) {
     vdx.pending_flush_owner
         .store(METADATA_OWNER_ID, Ordering::SeqCst);
@@ -201,15 +274,12 @@ pub fn flush(vdx: &VolCtrlDevExt) {
     vdx.should_flush.store(true, Ordering::SeqCst);
 }
 
-/// Kick a non-blocking cache flush for `owner`. The flush completes asynchronously.
 pub fn flush_owner(vdx: &VolCtrlDevExt, owner: u64) {
     vdx.pending_flush_owner.store(owner, Ordering::SeqCst);
     vdx.pending_flush_block.store(false, Ordering::SeqCst);
     vdx.should_flush.store(true, Ordering::SeqCst);
 }
 
-/// Kick a blocking cache flush for `owner`. The caller will wait until the cache
-/// confirms the data has been written (used for write-through writes and explicit flushes).
 pub fn flush_owner_blocking(vdx: &VolCtrlDevExt, owner: u64) {
     vdx.pending_flush_owner.store(owner, Ordering::SeqCst);
     vdx.pending_flush_block.store(true, Ordering::SeqCst);
@@ -219,6 +289,7 @@ pub fn flush_owner_blocking(vdx: &VolCtrlDevExt, owner: u64) {
 impl Seek for BlockDev {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
         let cap = self.capacity_bytes();
+
         let new = match pos {
             SeekFrom::Start(o) => o,
             SeekFrom::End(off) => {
@@ -243,6 +314,7 @@ impl Seek for BlockDev {
             cold_path();
             return Err(());
         }
+
         self.pos = new;
         Ok(self.pos)
     }

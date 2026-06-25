@@ -17,6 +17,8 @@ use crate::{
     EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
     EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
 };
+use core::sync::atomic::{AtomicPtr, Ordering};
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1062,11 +1064,91 @@ pub trait RequestKind {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct Read<'data> {
+pub struct Read<'io> {
     pub offset: u64,
     pub len: usize,
     pub no_buffer: bool,
-    pub buffer: IoBuffer<'data, Described, FromDevice>,
+    pub buffer: Option<IoBuffer<'io, 'io, Described, FromDevice>>,
+    pub next: AtomicPtr<Self>,
+}
+
+impl<'io> Read<'io> {
+    pub fn append_next(&self, next: *mut Self) {
+        let mut curr = self as *const Self as *mut Self;
+
+        loop {
+            let curr_ref = unsafe { &*curr };
+            let old = curr_ref.next.compare_exchange(
+                core::ptr::null_mut(),
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+
+            match old {
+                Ok(_) => break,
+                Err(existing) => curr = existing,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> ReadIter<'_, 'io> {
+        ReadIter { next: Some(self) }
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> ReadIterMut<'_, 'io> {
+        ReadIterMut {
+            next: AtomicPtr::new(self as *mut Self),
+            _marker: PhantomData,
+        }
+    }
+}
+
+pub struct ReadIter<'a, 'io> {
+    next: Option<&'a Read<'io>>,
+}
+
+impl<'a, 'io> Iterator for ReadIter<'a, 'io> {
+    type Item = &'a Read<'io>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        let next = current.next.load(Ordering::Acquire);
+
+        self.next = if next.is_null() {
+            None
+        } else {
+            Some(unsafe { &*next })
+        };
+
+        Some(current)
+    }
+}
+
+pub struct ReadIterMut<'a, 'io> {
+    next: AtomicPtr<Read<'io>>,
+    _marker: PhantomData<&'a mut Read<'io>>,
+}
+
+impl<'a, 'io> Iterator for ReadIterMut<'a, 'io> {
+    type Item = &'a mut Read<'io>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next.load(Ordering::Relaxed);
+
+        if current.is_null() {
+            return None;
+        }
+
+        let current_ref = unsafe { &mut *current };
+        let next = current_ref.next.load(Ordering::Acquire);
+
+        self.next.store(next, Ordering::Relaxed);
+
+        Some(current_ref)
+    }
 }
 
 impl RequestKind for Read<'_> {
@@ -1075,13 +1157,92 @@ impl RequestKind for Read<'_> {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct Write<'data> {
+pub struct Write<'io> {
     pub offset: u64,
     pub len: usize,
     pub no_buffer: bool,
-    /// File-level owner tag. 0 = unowned (included in all targeted flushes).
     pub owner: u64,
-    pub buffer: IoBuffer<'data, Described, ToDevice>,
+    pub buffer: Option<IoBuffer<'io, 'io, Described, ToDevice>>,
+    pub next: AtomicPtr<Self>,
+}
+
+impl<'io> Write<'io> {
+    pub fn append_next(&self, next: *mut Self) {
+        let mut curr = self as *const Self as *mut Self;
+
+        loop {
+            let curr_ref = unsafe { &*curr };
+            let old = curr_ref.next.compare_exchange(
+                core::ptr::null_mut(),
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+
+            match old {
+                Ok(_) => break,
+                Err(existing) => curr = existing,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> WriteIter<'_, 'io> {
+        WriteIter { next: Some(self) }
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> WriteIterMut<'_, 'io> {
+        WriteIterMut {
+            next: AtomicPtr::new(self as *mut Self),
+            _marker: PhantomData,
+        }
+    }
+}
+
+pub struct WriteIter<'a, 'io> {
+    next: Option<&'a Write<'io>>,
+}
+
+impl<'a, 'io> Iterator for WriteIter<'a, 'io> {
+    type Item = &'a Write<'io>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        let next = current.next.load(Ordering::Acquire);
+
+        self.next = if next.is_null() {
+            None
+        } else {
+            Some(unsafe { &*next })
+        };
+
+        Some(current)
+    }
+}
+
+pub struct WriteIterMut<'a, 'io> {
+    next: AtomicPtr<Write<'io>>,
+    _marker: PhantomData<&'a mut Write<'io>>,
+}
+
+impl<'a, 'io> Iterator for WriteIterMut<'a, 'io> {
+    type Item = &'a mut Write<'io>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next.load(Ordering::Relaxed);
+
+        if current.is_null() {
+            return None;
+        }
+
+        let current_ref = unsafe { &mut *current };
+        let next = current_ref.next.load(Ordering::Acquire);
+
+        self.next.store(next, Ordering::Relaxed);
+
+        Some(current_ref)
+    }
 }
 
 impl RequestKind for Write<'_> {

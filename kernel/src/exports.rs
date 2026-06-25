@@ -54,8 +54,7 @@ export! {
     kernel_dma_open_device_handle,
     kernel_dma_query_device_state,
     kernel_dma_map_buffer,
-    kernel_dma_unmap_buffer,
-    kernel_dma_map_buffer_ref,
+    kernel_dma_map_persistent_contiguous_backing,
 
     kernel_irq_register,
     kernel_irq_register_gsi,
@@ -93,7 +92,7 @@ export! {
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
     pnp_create_devnode_over_pdo_with_function,
-    InvalidateDeviceRelations,
+    pnp_invalidate_device_relations,
 
     driver_get_name,
     driver_get_flags,

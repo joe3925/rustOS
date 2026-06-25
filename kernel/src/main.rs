@@ -29,6 +29,7 @@ mod arch;
 mod benchmarking;
 mod console;
 mod crt;
+mod debug_metadata;
 mod drivers;
 mod executable;
 mod exports;

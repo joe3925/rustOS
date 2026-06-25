@@ -339,7 +339,8 @@ async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: boo
         should_block,
     });
     flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    pnp_send_request(volume_target, &mut flush_req).await
+    let status = pnp_send_request(volume_target, &mut flush_req).await;
+    status
 }
 
 fn capture_fs_context(
@@ -618,20 +619,22 @@ impl FileSystem for Fat32Fs {
                     Ok(state) => {
                         let mut file = state.into_file(&*fs);
                         let n = data.len();
-                        let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
+                        let seek_res = file.seek(SeekFrom::Start(offset)).await;
+                        let res = if let Err(e) = seek_res {
                             Err(map_fatfs_err(&e))
                         } else {
-                            match file.write_all(data, fatfs::IoKind::Data).await {
+                            let write_res = file.write_all(data, fatfs::IoKind::Data).await;
+                            match write_res {
                                 Ok(()) => Ok(n),
                                 Err(e) => Err(map_fatfs_err(&e)),
                             }
                         };
-                        let lower_flush = if unlikely(write_through) && res.is_ok() {
+                        let lower_flush = if write_through && res.is_ok() {
                             LowerFlush::Blocking
                         } else {
                             LowerFlush::None
                         };
-                        let flush_err = if unlikely(write_through) {
+                        let flush_err = if write_through {
                             flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
                         } else {
                             restore_cached_file(&vdx, fs_file_id, file);
@@ -1050,12 +1053,12 @@ impl FileSystem for Fat32Fs {
                                     }
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 };
-                                let lower_flush = if unlikely(write_through) && res.is_ok() {
+                                let lower_flush = if write_through && res.is_ok() {
                                     LowerFlush::Blocking
                                 } else {
                                     LowerFlush::None
                                 };
-                                let flush_err = if unlikely(write_through) {
+                                let flush_err = if write_through {
                                     flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
                                 } else {
                                     restore_cached_file(&vdx, fs_file_id, file);

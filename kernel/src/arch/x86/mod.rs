@@ -5,7 +5,9 @@ pub mod idt;
 pub(crate) mod machine;
 pub mod memory;
 pub mod platform;
+pub(crate) mod serial;
 pub(crate) mod scheduling;
+pub(crate) mod debug_meta;
 
 pub mod drivers {
     pub(crate) mod interrupt_index;

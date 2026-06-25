@@ -1,12 +1,15 @@
 use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
-use kernel_api::kernel_types::dma::{IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBufferDmaSegment};
+use kernel_api::kernel_types::dma::IoBufferDmaSegment;
 use kernel_api::memory::VirtAddr;
 
 use crate::dma_region::ContiguousDmaRegion;
 use crate::pci;
 use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, VirtqDesc, Virtqueue};
+
+pub const BLK_INDIRECT_DESC_CAPACITY: usize = 256;
+pub const BLK_MAX_DATA_SEGMENTS_PER_REQUEST: usize = BLK_INDIRECT_DESC_CAPACITY - 2;
 
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 pub const VIRTIO_STATUS_DRIVER: u8 = 2;
@@ -214,12 +217,6 @@ pub fn reset_device(common_cfg: VirtAddr) {
     unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, 0) };
 }
 
-/// Maximum data descriptors accepted from an `IoBuffer` DMA mapping.
-pub const MAX_DATA_DESCRIPTORS: usize = IOBUFFER_INLINE_SEGMENT_CAPACITY;
-/// Maximum descriptors in an indirect table.
-/// 1 for header + data descriptors + 1 for status.
-pub const MAX_INDIRECT_DESCRIPTORS: usize = MAX_DATA_DESCRIPTORS + 2;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitRequestError {
     QueueFull,
@@ -228,10 +225,10 @@ pub enum SubmitRequestError {
 
 #[repr(C)]
 pub struct BlkSlot {
-    pub header: VirtioBlkReqHeader, // 16 bytes
-    pub status: u8,                 // 1 byte
-    pub padding: [u8; 15],          // padding to keep array aligned
-    pub indirect_table: [VirtqDesc; MAX_INDIRECT_DESCRIPTORS],
+    pub header: VirtioBlkReqHeader,
+    pub status: u8,
+    pub padding: [u8; 15],
+    pub indirect_table: [VirtqDesc; BLK_INDIRECT_DESC_CAPACITY],
 }
 
 pub struct BlkIoSlots {
@@ -275,29 +272,11 @@ impl BlkIoSlots {
         data_segments: impl IntoIterator<Item = IoBufferDmaSegment>,
         is_write: bool,
     ) -> Result<u16, SubmitRequestError> {
-        let mut segments = [IoBufferDmaSegment {
-            dma_addr: 0,
-            byte_len: 0,
-            reserved: 0,
-        }; MAX_DATA_DESCRIPTORS];
-        let mut segment_count = 0usize;
-        for seg in data_segments {
-            if unlikely(seg.byte_len == 0) {
-                cold_path();
-                continue;
-            }
-            if unlikely(segment_count == MAX_DATA_DESCRIPTORS) {
-                cold_path();
-                return Err(SubmitRequestError::TooManyDataSegments);
-            }
-            segments[segment_count] = seg;
-            segment_count += 1;
-        }
-
         let Some(head) = vq.alloc_desc() else {
             cold_path();
             return Err(SubmitRequestError::QueueFull);
         };
+
         let slot_ptr = self.get_slot_ptr(head);
 
         let slot_dma_base = self
@@ -317,29 +296,50 @@ impl BlkIoSlots {
             core::ptr::write_volatile(&mut (*slot_ptr).status, 0xFF);
 
             let mut desc_count = 0usize;
-            let table = (*slot_ptr).indirect_table.as_mut_ptr();
+            let table_ptr = (*slot_ptr).indirect_table.as_mut_ptr();
 
-            // Header
-            (*table.add(desc_count)).addr = header_phys;
-            (*table.add(desc_count)).len = core::mem::size_of::<VirtioBlkReqHeader>() as u32;
-            (*table.add(desc_count)).flags = VRING_DESC_F_NEXT;
-            (*table.add(desc_count)).next = (desc_count + 1) as u16;
+            (*table_ptr.add(desc_count)).addr = header_phys;
+            (*table_ptr.add(desc_count)).len = core::mem::size_of::<VirtioBlkReqHeader>() as u32;
+            (*table_ptr.add(desc_count)).flags = VRING_DESC_F_NEXT;
+            (*table_ptr.add(desc_count)).next = (desc_count + 1) as u16;
             desc_count += 1;
 
             let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
-            for seg in &segments[..segment_count] {
-                (*table.add(desc_count)).addr = seg.dma_addr;
-                (*table.add(desc_count)).len = seg.byte_len;
-                (*table.add(desc_count)).flags = data_flags | VRING_DESC_F_NEXT;
-                (*table.add(desc_count)).next = (desc_count + 1) as u16;
+            let mut segment_count = 0usize;
+            let mut segment_bytes = 0u64;
+
+            for seg in data_segments {
+                if unlikely(seg.byte_len == 0) {
+                    cold_path();
+                    continue;
+                }
+
+                if unlikely(desc_count + 2 > BLK_INDIRECT_DESC_CAPACITY) {
+                    cold_path();
+                    vq.free_desc(head);
+                    return Err(SubmitRequestError::TooManyDataSegments);
+                }
+
+                (*table_ptr.add(desc_count)).addr = seg.dma_addr;
+                (*table_ptr.add(desc_count)).len = seg.byte_len;
+                (*table_ptr.add(desc_count)).flags = data_flags | VRING_DESC_F_NEXT;
+                (*table_ptr.add(desc_count)).next = (desc_count + 1) as u16;
+
                 desc_count += 1;
+                segment_count += 1;
+                segment_bytes = segment_bytes.saturating_add(seg.byte_len as u64);
             }
 
-            // Status
-            (*table.add(desc_count)).addr = status_phys;
-            (*table.add(desc_count)).len = 1;
-            (*table.add(desc_count)).flags = VRING_DESC_F_WRITE;
-            (*table.add(desc_count)).next = 0;
+            if unlikely(desc_count + 1 > BLK_INDIRECT_DESC_CAPACITY) {
+                cold_path();
+                vq.free_desc(head);
+                return Err(SubmitRequestError::TooManyDataSegments);
+            }
+
+            (*table_ptr.add(desc_count)).addr = status_phys;
+            (*table_ptr.add(desc_count)).len = 1;
+            (*table_ptr.add(desc_count)).flags = VRING_DESC_F_WRITE;
+            (*table_ptr.add(desc_count)).next = 0;
             desc_count += 1;
 
             let total_table_len = (desc_count * core::mem::size_of::<VirtqDesc>()) as u32;
