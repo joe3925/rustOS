@@ -1,11 +1,6 @@
 use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
-use kernel_api::disk_profile as dp;
-use kernel_api::kernel_types::disk_profile::{
-    B_VIRTIO_DESCRIPTOR_SETUP, C_SCATTER_GATHER_SEGMENTS, C_VIRTIO_SUBMISSION_BYTES,
-    C_VIRTIO_SUBMISSIONS,
-};
 use kernel_api::kernel_types::dma::IoBufferDmaSegment;
 use kernel_api::memory::VirtAddr;
 
@@ -277,8 +272,6 @@ impl BlkIoSlots {
         data_segments: impl IntoIterator<Item = IoBufferDmaSegment>,
         is_write: bool,
     ) -> Result<u16, SubmitRequestError> {
-        let profile_start = dp::timestamp_ns();
-
         let Some(head) = vq.alloc_desc() else {
             cold_path();
             return Err(SubmitRequestError::QueueFull);
@@ -324,7 +317,6 @@ impl BlkIoSlots {
                 if unlikely(desc_count + 2 > BLK_INDIRECT_DESC_CAPACITY) {
                     cold_path();
                     vq.free_desc(head);
-                    dp::add_elapsed(B_VIRTIO_DESCRIPTOR_SETUP, profile_start);
                     return Err(SubmitRequestError::TooManyDataSegments);
                 }
 
@@ -341,7 +333,6 @@ impl BlkIoSlots {
             if unlikely(desc_count + 1 > BLK_INDIRECT_DESC_CAPACITY) {
                 cold_path();
                 vq.free_desc(head);
-                dp::add_elapsed(B_VIRTIO_DESCRIPTOR_SETUP, profile_start);
                 return Err(SubmitRequestError::TooManyDataSegments);
             }
 
@@ -353,13 +344,7 @@ impl BlkIoSlots {
 
             let total_table_len = (desc_count * core::mem::size_of::<VirtqDesc>()) as u32;
             vq.push_allocated_indirect(head, indirect_phys, total_table_len);
-
-            dp::add_counter(C_VIRTIO_SUBMISSIONS, 1);
-            dp::add_counter(C_SCATTER_GATHER_SEGMENTS, segment_count as u64);
-            dp::add_counter(C_VIRTIO_SUBMISSION_BYTES, segment_bytes);
         }
-
-        dp::add_elapsed(B_VIRTIO_DESCRIPTOR_SETUP, profile_start);
 
         Ok(head)
     }

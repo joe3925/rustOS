@@ -27,7 +27,6 @@ use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::disk_profile as dp;
 use kernel_api::dma::dma::IoBufferAccess;
 use kernel_api::dma::dma::PhysFramed;
 use kernel_api::dma::dma::ToDevice;
@@ -35,10 +34,6 @@ use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
-};
-use kernel_api::kernel_types::disk_profile::{
-    B_INTERRUPT_COMPLETION_HANDLING, B_VIRTIO_QUEUE_NOTIFY, B_WAITING_FOR_COMPLETION,
-    C_LOCK_ACQUISITIONS, C_VIRTIO_COMPLETIONS, C_VIRTIO_QUEUE_KICKS,
 };
 use kernel_api::kernel_types::dma::{Described, DmaMappingStrategy, IoBuffer, IoBufferState};
 use kernel_api::kernel_types::io::DiskInfo;
@@ -198,23 +193,19 @@ pub(crate) async fn wait_completion_hybrid<F>(
 where
     F: Future,
 {
-    let profile_start = dp::timestamp_ns();
+    let profile_timer = KernelStopwatch::start();
     let mut completion = core::pin::pin!(completion);
 
     let Some(poll_ns) = virtio_completion_should_poll(byte_len) else {
         let result = completion.await;
-        let elapsed_ns = dp::timestamp_ns().saturating_sub(profile_start);
+
+        let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
         record_completion_fit_sample(byte_len, elapsed_ns);
-        dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
         return result;
     };
 
-    let timer = KernelStopwatch::start();
-    let spin_cycles = duration_to_cycle_counter_ticks(
-        Duration::from_nanos(poll_ns as u64),
-        timer.cycle_counter_frequency_hz(),
-    );
-    let start_cycles = timer.start_cycles();
+    let poll_timer = KernelStopwatch::start();
 
     loop {
         drain_queue_completions(qs);
@@ -225,13 +216,15 @@ where
         })
         .await
         {
-            let elapsed_ns = dp::timestamp_ns().saturating_sub(profile_start);
+            let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
             record_completion_fit_sample(byte_len, elapsed_ns);
-            dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
             return result;
         }
 
-        if spin_cycles == 0 || cycle_counter().wrapping_sub(start_cycles) >= spin_cycles {
+        let poll_elapsed_ns = poll_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
+        if poll_elapsed_ns >= poll_ns as u64 {
             break;
         }
 
@@ -239,9 +232,10 @@ where
     }
 
     let result = completion.await;
-    let elapsed_ns = dp::timestamp_ns().saturating_sub(profile_start);
+
+    let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
     record_completion_fit_sample(byte_len, elapsed_ns);
-    dp::add_elapsed(B_WAITING_FOR_COMPLETION, profile_start);
     result
 }
 // Request helpers
@@ -1066,10 +1060,7 @@ impl<'a> Drop for SubmitTasksGuard<'a> {
     fn drop(&mut self) {
         let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
         if likely(self.force_notify || prev == 1) {
-            dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
-            let profile_start = dp::timestamp_ns();
             self.vq.notify(self.notify_base, self.notify_off_multiplier);
-            dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
         }
     }
 }
@@ -1080,8 +1071,6 @@ pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
     }
 
     let mut drained = 0usize;
-    dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-    let profile_start = dp::timestamp_ns();
     let mut vq = qs.queue.write();
     while let Some((head, _len)) = vq.pop_used() {
         if unlikely(head as usize >= qs.completion_slots.len()) {
@@ -1102,10 +1091,6 @@ pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
     }
     qs.last_drained_used_idx
         .store(vq.last_used_idx(), Ordering::Release);
-    if drained != 0 {
-        dp::add_counter(C_VIRTIO_COMPLETIONS, drained as u64);
-        dp::add_elapsed(B_INTERRUPT_COMPLETION_HANDLING, profile_start);
-    }
     drained
 }
 

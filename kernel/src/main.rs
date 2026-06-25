@@ -30,7 +30,6 @@ mod benchmarking;
 mod console;
 mod crt;
 mod debug_metadata;
-mod disk_profile;
 mod drivers;
 mod executable;
 mod exports;

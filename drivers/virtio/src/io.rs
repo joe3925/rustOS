@@ -1,5 +1,3 @@
-use crate::B_VIRTIO_QUEUE_NOTIFY;
-use crate::C_VIRTIO_QUEUE_KICKS;
 use crate::blk::{SubmitRequestError, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 use crate::dev_ext::{ChildExt, DevExt, DevExtInner, QueueState};
 use crate::outstanding::{
@@ -18,11 +16,9 @@ use kernel_api::benchmark::{
     BenchSweepResult,
 };
 use kernel_api::device::DeviceObject;
-use kernel_api::disk_profile as dp;
 use kernel_api::dma::dma::IoBuffer;
 use kernel_api::dma::dma::IoBufferAccess;
 use kernel_api::dma::dma::PhysFramed;
-use kernel_api::kernel_types::disk_profile::{C_FLUSH_BARRIER_REQUESTS, C_LOCK_ACQUISITIONS};
 use kernel_api::kernel_types::dma::{FromDevice, IoBufferDmaSegment, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
 use kernel_api::pnp::DriverStep;
@@ -85,10 +81,6 @@ async fn submit_virtio_no_data_request(
     req_type: u32,
     operation: &str,
 ) -> DriverStatus {
-    if req_type == VIRTIO_BLK_T_FLUSH {
-        dp::add_counter(C_FLUSH_BARRIER_REQUESTS, 1);
-    }
-
     let completion = loop {
         let completion = match qs.completion_slots.alloc() {
             Some(completion) => completion,
@@ -116,8 +108,6 @@ async fn submit_virtio_no_data_request(
 
         let mut completion = Some(completion);
         let submitted = {
-            dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-
             let mut vq = qs.queue.write();
             match qs.arena.submit_request(
                 &mut vq,
@@ -386,11 +376,7 @@ impl PendingBlockCursor {
 
 #[inline]
 fn notify_queue(inner: &DevExtInner, vq: &crate::virtqueue::Virtqueue) {
-    dp::add_counter(C_VIRTIO_QUEUE_KICKS, 1);
-
-    let profile_start = dp::timestamp_ns();
     vq.notify(inner.notify_base, inner.notify_off_multiplier);
-    dp::add_elapsed(B_VIRTIO_QUEUE_NOTIFY, profile_start);
 }
 
 async fn yield_once() {
@@ -474,8 +460,6 @@ where
         let mut queue_or_slot_pressure = false;
 
         {
-            dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-
             let mut vq = qs.queue.write();
 
             while !cursor.done(ops) && completions.len() < VIRTIO_QUEUE_BATCH_LIMIT {

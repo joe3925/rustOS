@@ -5,13 +5,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, IoKind, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    disk_profile as dp,
     kernel_types::{
         async_ffi::{FfiFuture, FutureExt},
-        disk_profile::{
-            B_IOBUFFER_CONSTRUCTION, C_ARC_CLONES, C_DIRECTORY_METADATA_WRITES,
-            C_FAT_METADATA_WRITES, C_FS_CACHE_WRITES,
-        },
         dma::{
             IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, IoBufferBackingScratch,
         },
@@ -92,12 +87,8 @@ impl BlockDev {
         dst: &mut [u8],
         _kind: IoKind,
     ) -> Result<(), DriverStatus> {
-        dp::add_counter(C_ARC_CLONES, 1);
-
         let volume = self.volume.clone();
         let len = dst.len();
-        let profile_start = dp::timestamp_ns();
-
         let scratch = self.take_io_scratch();
 
         let backing = match IoBufferBacking::from_scratch(
@@ -121,8 +112,6 @@ impl BlockDev {
                 return Err(DriverStatus::InvalidParameter);
             }
         };
-
-        dp::add_elapsed(B_IOBUFFER_CONSTRUCTION, profile_start);
 
         let mut req = RequestHandle::new(ReadRequest {
             offset,
@@ -157,24 +146,8 @@ impl BlockDev {
     ) -> Result<(), DriverStatus> {
         let no_buffer = false;
 
-        dp::add_counter(C_ARC_CLONES, 1);
-
         let volume = self.volume.clone();
         let len = src.len();
-
-        match kind {
-            IoKind::Data => {
-                dp::add_counter(C_FS_CACHE_WRITES, 1);
-            }
-            IoKind::Fat => {
-                dp::add_counter(C_FAT_METADATA_WRITES, 1);
-            }
-            IoKind::Metadata => {
-                dp::add_counter(C_DIRECTORY_METADATA_WRITES, 1);
-            }
-        }
-
-        let profile_start = dp::timestamp_ns();
 
         let scratch = self.take_io_scratch();
 
@@ -199,8 +172,6 @@ impl BlockDev {
                 return Err(DriverStatus::InvalidParameter);
             }
         };
-
-        dp::add_elapsed(B_IOBUFFER_CONSTRUCTION, profile_start);
 
         let mut req = RequestHandle::new(WriteRequest {
             offset,

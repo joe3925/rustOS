@@ -10,12 +10,7 @@ use fatfs::{
     LossyOemCpConverter, NullTimeProvider, Read, RenamedFileState, SeekFrom, Write,
 };
 use kernel_api::device::DeviceObject;
-use kernel_api::disk_profile as dp;
 use kernel_api::kernel_types::async_types::AsyncMutex;
-use kernel_api::kernel_types::disk_profile::{
-    B_CACHE_PAGE_LOOKUP, B_DIRTY_PAGE_PREPARATION, B_FAT_CLUSTER_TRANSLATION,
-    B_FILE_FLUSH_WRITE_THROUGH, B_METADATA_FLUSH, C_FLUSH_BARRIER_REQUESTS, C_LOCK_ACQUISITIONS,
-};
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, pnp_send_request};
@@ -326,9 +321,7 @@ async fn flush_cached_file(
     mut file: FatFile<'_>,
     lower_flush: LowerFlush,
 ) -> Option<FileStatus> {
-    let profile_start = dp::timestamp_ns();
     let err = file.flush().await.err().map(|e| map_fatfs_err(&e));
-    dp::add_elapsed(B_FILE_FLUSH_WRITE_THROUGH, profile_start);
     restore_cached_file(vdx, fs_file_id, file);
     if likely(err.is_none()) {
         schedule_lower_flush(vdx, fs_file_id, lower_flush);
@@ -341,15 +334,12 @@ async fn flush_cached_file(
 pub struct Fat32Fs;
 
 async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
-    dp::add_counter(C_FLUSH_BARRIER_REQUESTS, 1);
-    let profile_start = dp::timestamp_ns();
     let mut flush_req = RequestHandle::new(FlushOwner {
         owner,
         should_block,
     });
     flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = pnp_send_request(volume_target, &mut flush_req).await;
-    dp::add_elapsed(B_METADATA_FLUSH, profile_start);
     status
 }
 
@@ -497,7 +487,6 @@ impl FileSystem for Fat32Fs {
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            dp::add_counter(C_LOCK_ACQUISITIONS, 1);
             let fs = fs_arc.lock().await;
             let payload = &mut req.write().body.payload;
             let params = &payload.params;
@@ -543,7 +532,6 @@ impl FileSystem for Fat32Fs {
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            dp::add_counter(C_LOCK_ACQUISITIONS, 1);
             let fs = fs_arc.lock().await;
             let payload = &mut req.write().body.payload;
             let params = &mut payload.params;
@@ -625,24 +613,17 @@ impl FileSystem for Fat32Fs {
             let data = params.data;
 
             let write_res: Result<usize, FileStatus> = {
-                dp::add_counter(C_LOCK_ACQUISITIONS, 1);
-                let profile_start = dp::timestamp_ns();
                 let state = take_cached_file_state(&vdx, fs_file_id);
-                dp::add_elapsed(B_CACHE_PAGE_LOOKUP, profile_start);
                 match state {
                     Err(e) => Err(e),
                     Ok(state) => {
                         let mut file = state.into_file(&*fs);
                         let n = data.len();
-                        let profile_start = dp::timestamp_ns();
                         let seek_res = file.seek(SeekFrom::Start(offset)).await;
-                        dp::add_elapsed(B_FAT_CLUSTER_TRANSLATION, profile_start);
                         let res = if let Err(e) = seek_res {
                             Err(map_fatfs_err(&e))
                         } else {
-                            let profile_start = dp::timestamp_ns();
                             let write_res = file.write_all(data, fatfs::IoKind::Data).await;
-                            dp::add_elapsed(B_DIRTY_PAGE_PREPARATION, profile_start);
                             match write_res {
                                 Ok(()) => Ok(n),
                                 Err(e) => Err(map_fatfs_err(&e)),
@@ -668,7 +649,6 @@ impl FileSystem for Fat32Fs {
             };
 
             if let Ok(written) = write_res {
-                dp::add_counter(C_LOCK_ACQUISITIONS, 1);
                 let mut handles = vdx.handles.lock();
                 if let Ok(ctx) = handles.ctx_mut(fs_file_id) {
                     let end = offset.saturating_add(written as u64);

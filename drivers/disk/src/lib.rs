@@ -16,9 +16,7 @@ use kernel_api::util::panic_common;
 
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    disk_profile as dp,
     kernel_types::{
-        disk_profile::{C_BACKEND_BLOCK_REQUESTS, C_BACKEND_WRITE_BYTES},
         dma::{Described, FromDevice, IoBuffer, ToDevice},
         io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo},
         request::RequestData,
@@ -174,10 +172,6 @@ impl DeviceRead for DiskIo {
             return DriverStep::complete(DriverStatus::Success);
         }
 
-        dp::add_counter(C_BACKEND_BLOCK_REQUESTS, requests);
-        // Use a read-byte counter here if you have one. This was previously using WRITE_BYTES.
-        // dp::add_counter(C_BACKEND_READ_BYTES, bytes);
-
         req.write().traversal_policy = TraversalPolicy::ForwardLower;
         DriverStep::Continue
     }
@@ -220,9 +214,6 @@ impl DeviceWrite for DiskIo {
         if requests == 0 {
             return DriverStep::complete(DriverStatus::Success);
         }
-
-        dp::add_counter(C_BACKEND_BLOCK_REQUESTS, requests);
-        dp::add_counter(C_BACKEND_WRITE_BYTES, bytes);
 
         req.write().traversal_policy = TraversalPolicy::ForwardLower;
         DriverStep::Continue
