@@ -1,5 +1,6 @@
 use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
+use crate::dma::IoBufferBacking;
 use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
 use crate::request::{
@@ -614,20 +615,18 @@ impl<T> IoHandler<T> {
 pub trait DeviceRead {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'io, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'data>>,
-        len: usize,
+        req: &'b mut RequestHandle<'req, Read<'io>>,
     ) -> FfiFuture<DriverStep>;
 }
 
 pub trait DeviceWrite {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'data, 'b>(
+    extern "C" fn handler<'req, 'io, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'data>>,
-        len: usize,
+        req: &'b mut RequestHandle<'req, Write<'io>>,
     ) -> FfiFuture<DriverStep>;
 }
 
@@ -945,4 +944,9 @@ impl DeviceOps {
             fs: FsSlot::empty(),
         }
     }
+}
+#[repr(C)]
+#[derive(kernel_macros::RequestPayload)]
+pub struct DmaBacking<'data> {
+    pub backing: &'data IoBufferBacking<'data>,
 }

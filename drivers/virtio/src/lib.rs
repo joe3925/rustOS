@@ -10,31 +10,34 @@ mod completion;
 mod dev_ext;
 mod dma_region;
 mod io;
+mod outstanding;
 mod pci;
-mod temp_benchmark;
+//mod temp_benchmark;
 mod virtqueue;
-
 use alloc::{sync::Arc, vec, vec::Vec};
 use blk::{BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP};
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::dma::dma::IoBufferAccess;
+use kernel_api::dma::dma::PhysFramed;
+use kernel_api::dma::dma::ToDevice;
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::{
-    BorrowedDmaMapping, Described, DmaMappingStrategy, IoBuffer, IoBufferDirection, IoBufferState,
-};
+use kernel_api::kernel_types::dma::{Described, DmaMappingStrategy, IoBuffer, IoBufferState};
 use kernel_api::kernel_types::io::DiskInfo;
+use kernel_api::kernel_types::io::DmaBacking;
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -56,8 +59,112 @@ use virtqueue::Virtqueue;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
-pub(crate) const COMPLETION_POLL_TIME: Duration = Duration::from_nanos(1494117);
 
+const COMPLETION_POLL_MIN_NS: u64 = 2_000;
+const COMPLETION_POLL_MAX_NS: u64 = 500_000;
+const COMPLETION_FIT_MIN_SAMPLES: u64 = 32;
+const COMPLETION_FIT_FALLBACK_BASE_NS: u64 = 5_000;
+const COMPLETION_FIT_FALLBACK_NS_PER_KIB: u64 = 1_250;
+const COMPLETION_FIT_MAX_SAMPLE_NS: u64 = 2_000_000;
+const COMPLETION_FIT_MAX_X_KIB: u64 = 1024 * 1024;
+
+static COMPLETION_FIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_X: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_Y: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_XY: AtomicU64 = AtomicU64::new(0);
+static COMPLETION_FIT_SUM_X2: AtomicU64 = AtomicU64::new(0);
+#[inline]
+fn completion_fit_x(byte_len: usize) -> u64 {
+    if byte_len == 0 {
+        return 0;
+    }
+
+    let kib = ((byte_len as u64).saturating_add(1023)) >> 10;
+    kib.max(1).min(COMPLETION_FIT_MAX_X_KIB)
+}
+
+#[inline]
+fn completion_fallback_poll_ns(byte_len: usize) -> Option<usize> {
+    let x = completion_fit_x(byte_len);
+
+    if x == 0 {
+        return None;
+    }
+
+    let ns = COMPLETION_FIT_FALLBACK_BASE_NS
+        .saturating_add(x.saturating_mul(COMPLETION_FIT_FALLBACK_NS_PER_KIB));
+
+    if ns > COMPLETION_POLL_MAX_NS {
+        None
+    } else {
+        Some(ns.max(COMPLETION_POLL_MIN_NS) as usize)
+    }
+}
+
+#[inline]
+fn record_completion_fit_sample(byte_len: usize, elapsed_ns: u64) {
+    let x = completion_fit_x(byte_len);
+
+    if x == 0 {
+        return;
+    }
+
+    let y = elapsed_ns.min(COMPLETION_FIT_MAX_SAMPLE_NS);
+    let xy = x.saturating_mul(y);
+    let x2 = x.saturating_mul(x);
+
+    COMPLETION_FIT_SUM_X.fetch_add(x, Ordering::Relaxed);
+    COMPLETION_FIT_SUM_Y.fetch_add(y, Ordering::Relaxed);
+    COMPLETION_FIT_SUM_XY.fetch_add(xy, Ordering::Relaxed);
+    COMPLETION_FIT_SUM_X2.fetch_add(x2, Ordering::Relaxed);
+    COMPLETION_FIT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
+    let x = completion_fit_x(byte_len);
+
+    if x == 0 {
+        return None;
+    }
+
+    let n = COMPLETION_FIT_COUNT.load(Ordering::Relaxed);
+
+    if n < COMPLETION_FIT_MIN_SAMPLES {
+        return completion_fallback_poll_ns(byte_len);
+    }
+
+    let n = n as i128;
+    let x = x as i128;
+    let sum_x = COMPLETION_FIT_SUM_X.load(Ordering::Relaxed) as i128;
+    let sum_y = COMPLETION_FIT_SUM_Y.load(Ordering::Relaxed) as i128;
+    let sum_xy = COMPLETION_FIT_SUM_XY.load(Ordering::Relaxed) as i128;
+    let sum_x2 = COMPLETION_FIT_SUM_X2.load(Ordering::Relaxed) as i128;
+
+    let denom = n * sum_x2 - sum_x * sum_x;
+
+    if denom <= 0 {
+        return completion_fallback_poll_ns(byte_len);
+    }
+
+    let slope_num = n * sum_xy - sum_x * sum_y;
+    let pred_num = sum_y * denom - slope_num * sum_x + slope_num * x * n;
+    let pred_den = n * denom;
+
+    if pred_num <= 0 || pred_den <= 0 {
+        return completion_fallback_poll_ns(byte_len);
+    }
+
+    let ns = ((pred_num + (pred_den / 2)) / pred_den) as u64;
+    // if (byte_len == 1024) {
+    //     println!("1024 bytes: ns {}", ns)
+    // }
+    if ns > COMPLETION_POLL_MAX_NS {
+        None
+    } else {
+        Some(ns.max(COMPLETION_POLL_MIN_NS) as usize)
+    }
+}
 #[inline]
 fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64 {
     if unlikely(frequency_hz == 0) {
@@ -81,15 +188,24 @@ fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64
 pub(crate) async fn wait_completion_hybrid<F>(
     qs: &QueueState,
     completion: F,
-    spin_for: Duration,
+    byte_len: usize,
 ) -> F::Output
 where
     F: Future,
 {
+    let profile_timer = KernelStopwatch::start();
     let mut completion = core::pin::pin!(completion);
-    let timer = KernelStopwatch::start();
-    let spin_cycles = duration_to_cycle_counter_ticks(spin_for, timer.cycle_counter_frequency_hz());
-    let start_cycles = timer.start_cycles();
+
+    let Some(poll_ns) = virtio_completion_should_poll(byte_len) else {
+        let result = completion.await;
+
+        let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
+        record_completion_fit_sample(byte_len, elapsed_ns);
+        return result;
+    };
+
+    let poll_timer = KernelStopwatch::start();
 
     loop {
         drain_queue_completions(qs);
@@ -100,15 +216,27 @@ where
         })
         .await
         {
+            let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
+            record_completion_fit_sample(byte_len, elapsed_ns);
             return result;
         }
 
-        if spin_cycles == 0 || cycle_counter().wrapping_sub(start_cycles) >= spin_cycles {
+        let poll_elapsed_ns = poll_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
+        if poll_elapsed_ns >= poll_ns as u64 {
             break;
         }
+
+        core::hint::spin_loop();
     }
-    let res = completion.await;
-    res
+
+    let result = completion.await;
+
+    let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+
+    record_completion_fit_sample(byte_len, elapsed_ns);
+    result
 }
 // Request helpers
 #[inline(always)]
@@ -144,34 +272,23 @@ pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> Driver
     }
 }
 
-pub(crate) fn virtio_data_mapping_strategy<State, D>(
-    buffer: &IoBuffer<'_, State, D>,
-) -> DmaMappingStrategy
-where
-    State: IoBufferState,
-    D: IoBufferDirection,
-{
-    if buffer.is_single_extent() {
-        DmaMappingStrategy::SingleContiguous
-    } else {
-        DmaMappingStrategy::ScatterGather
-    }
-}
-
-pub(crate) fn map_request_buffer<'map, 'buffer, Direction>(
+pub(crate) fn map_request_buffer<'buffer, D>(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBuffer<'buffer, Described, Direction>,
-) -> Result<BorrowedDmaMapping<'map>, DriverStatus>
+    buffer: IoBuffer<'buffer, 'buffer, Described, D>,
+) -> Result<IoBuffer<'buffer, 'buffer, PhysFramed, D>, DriverStatus>
 where
-    Direction: IoBufferDirection + 'map,
+    D: IoBufferAccess,
 {
-    let phys_framed = buffer.as_phys_framed();
-    kernel_api::dma::map_buffer_ref(
-        device,
-        phys_framed,
-        virtio_data_mapping_strategy(phys_framed),
-    )
-    .map_err(|_| DriverStatus::InsufficientResources)
+    let phys_framed = buffer
+        .into_phys_framed()
+        .map_err(|_| DriverStatus::InvalidParameter)?;
+
+    if phys_framed.is_dma_mapped() {
+        return Ok(phys_framed);
+    }
+
+    kernel_api::dma::map_buffer(device, phys_framed, DmaMappingStrategy::SingleContiguous)
+        .map_err(|_| DriverStatus::InsufficientResources)
 }
 
 #[cfg(not(test))]
@@ -566,12 +683,6 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
         };
 
         let vq_capacity = vq.size as usize;
-        let max_data_segments = core::cmp::min(
-            blk::MAX_INDIRECT_DESCRIPTORS.saturating_sub(2),
-            vq_capacity.saturating_sub(2),
-        );
-
-        let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
         let completion_slots = match completion::CompletionTable::new(vq_capacity) {
             Some(slots) => slots,
@@ -609,17 +720,115 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
             }
         };
 
+        let read_ops = match outstanding::PendingOpPool::new(vq_capacity) {
+            Some(pool) => pool,
+            None => {
+                println!(
+                    "virtio-blk: failed to create read outstanding pool for queue {} with size {}",
+                    i, vq.size
+                );
+
+                for qs in queue_states.iter() {
+                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                        h.unregister();
+                    }
+                    if let Some(vec) = qs.msix_vector {
+                        let _ = irq_free_vector(vec);
+                    }
+                    qs.queue
+                        .try_write()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
+                }
+                vq.destroy();
+                for mut remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
+                }
+                for &(_idx, va, sz) in &mapped_bars {
+                    let _ = unmap_mmio_region(va, sz);
+                }
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        };
+
+        let write_ops = match outstanding::PendingOpPool::new(vq_capacity) {
+            Some(pool) => pool,
+            None => {
+                println!(
+                    "virtio-blk: failed to create write outstanding pool for queue {} with size {}",
+                    i, vq.size
+                );
+
+                for qs in queue_states.iter() {
+                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                        h.unregister();
+                    }
+                    if let Some(vec) = qs.msix_vector {
+                        let _ = irq_free_vector(vec);
+                    }
+                    qs.queue
+                        .try_write()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
+                }
+                vq.destroy();
+                for mut remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
+                }
+                for &(_idx, va, sz) in &mapped_bars {
+                    let _ = unmap_mmio_region(va, sz);
+                }
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        };
+
+        let submitted_completions = match outstanding::SubmittedCompletionPool::new(vq_capacity) {
+            Some(pool) => pool,
+            None => {
+                println!(
+                    "virtio-blk: failed to create submitted completion pool for queue {} with size {}",
+                    i, vq.size
+                );
+
+                for qs in queue_states.iter() {
+                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                        h.unregister();
+                    }
+                    if let Some(vec) = qs.msix_vector {
+                        let _ = irq_free_vector(vec);
+                    }
+                    qs.queue
+                        .try_write()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
+                }
+                vq.destroy();
+                for mut remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
+                }
+                for &(_idx, va, sz) in &mapped_bars {
+                    let _ = unmap_mmio_region(va, sz);
+                }
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        };
+
+        let used_idx = vq.used_idx_ptr();
+
         queue_states.push(QueueState {
             queue: RwLock::new(vq),
             arena,
-            max_request_bytes,
-            max_data_segments: max_data_segments as u16,
             irq_handle: UnsafeCell::new(irq_handle),
             msix_vector,
             msix_table_index,
             submitting_tasks: AtomicU32::new(0),
             use_indirect: init_result.indirect_desc_supported,
             completion_slots,
+            read_ops,
+            write_ops,
+            submitted_completions,
+            used_idx,
+            last_drained_used_idx: AtomicU16::new(0),
         });
     }
 
@@ -783,7 +992,10 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     pnp_vt.set(PnpMinorFunction::QueryId, virtio_pdo_query_id);
     pnp_vt.set(PnpMinorFunction::QueryResources, virtio_pdo_query_resources);
     pnp_vt.set(PnpMinorFunction::StartDevice, virtio_pdo_start);
-
+    pnp_vt.set(
+        PnpMinorFunction::RegisterDmaBacking,
+        virtio_pdo_register_dma_backing,
+    );
     let capacity = dx.inner.get().map(|i| i.capacity).unwrap_or(0);
     let total_bytes = capacity * 512;
 
@@ -854,6 +1066,10 @@ impl<'a> Drop for SubmitTasksGuard<'a> {
 }
 
 pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
+    if likely(!qs.has_pending_used()) {
+        return 0;
+    }
+
     let mut drained = 0usize;
     let mut vq = qs.queue.write();
     while let Some((head, _len)) = vq.pop_used() {
@@ -873,6 +1089,8 @@ pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
         }
         drained += 1;
     }
+    qs.last_drained_used_idx
+        .store(vq.last_used_idx(), Ordering::Release);
     drained
 }
 
@@ -963,6 +1181,37 @@ pub async fn virtio_pdo_query_resources<'req, 'data, 'b>(
         let di = &cdx.disk_info;
         p.data_out = RequestData::from_t::<DiskInfo>(*di);
         DriverStatus::Success
+    };
+
+    complete_req(req, status)
+}
+#[request_handler]
+pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
+    pdo: &Arc<DeviceObject>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+) -> DriverStep {
+    let cdx = match pdo.try_devext::<ChildExt>() {
+        Ok(cdx) => cdx,
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+    };
+
+    let parent = match cdx.parent_device.upgrade() {
+        Some(parent) => parent,
+        None => return complete_req(req, DriverStatus::NoSuchDevice),
+    };
+
+    let backing = {
+        let r = req.read();
+
+        match r.body.request.data_out_ref().view::<DmaBacking<'data>>() {
+            Some(payload) => payload.backing,
+            None => return complete_req(req, DriverStatus::InvalidParameter),
+        }
+    };
+
+    let status = match kernel_api::dma::map_persistent_contiguous_backing(&parent, backing) {
+        Ok(()) => DriverStatus::Success,
+        Err(_) => DriverStatus::InsufficientResources,
     };
 
     complete_req(req, status)

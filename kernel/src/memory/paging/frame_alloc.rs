@@ -1,3 +1,5 @@
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_abi::{MemoryRegion, MemoryRegionKind};
@@ -13,14 +15,19 @@ use super::frame_bitmap::{
     low_reserved_frames, mark_unused_tail_bits_allocated, physical_coverage_for_ram,
     preserve_reclaimed_free_bits_limited, preserve_set_bits_limited, range_fits_bitmap, set_range,
     set_range_count_new, usable_region_bytes_below, BitmapResizeError, FrameBitmap,
+    RuntimeFrameBitmap,
 };
 use super::layout::base_page_size;
 use super::types::MappingSize;
 
 const WORD_BITS: usize = u64::BITS as usize;
+const RUNTIME_BITMAP_EMPTY: usize = 0;
+const RUNTIME_BITMAP_INITIALIZING: usize = 1;
+const RUNTIME_BITMAP_READY: usize = 2;
 
 static MEMORY_BITMAP: IrqSafeRwLock<FrameBitmap> = IrqSafeRwLock::new(FrameBitmap::new());
 static RECLAIMED_MEMORY_BITMAP: IrqSafeRwLock<FrameBitmap> = IrqSafeRwLock::new(FrameBitmap::new());
+static RUNTIME_MEMORY_BITMAP: RuntimeBitmapSlot = RuntimeBitmapSlot::new();
 
 static USED_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 static RECLAIMED_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -31,56 +38,78 @@ static NEXT_CONTIG_WORD_BASE: AtomicUsize = AtomicUsize::new(0);
 static FRAME_SIZE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LOW_RESERVED_FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+struct RuntimeBitmapSlot {
+    state: AtomicUsize,
+    bitmap: UnsafeCell<MaybeUninit<RuntimeFrameBitmap>>,
+}
+
+unsafe impl Sync for RuntimeBitmapSlot {}
+
+impl RuntimeBitmapSlot {
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(RUNTIME_BITMAP_EMPTY),
+            bitmap: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn get(&self) -> Option<&RuntimeFrameBitmap> {
+        if self.state.load(Ordering::Acquire) != RUNTIME_BITMAP_READY {
+            return None;
+        }
+
+        Some(unsafe { (*self.bitmap.get()).assume_init_ref() })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RUNTIME_BITMAP_READY
+    }
+
+    fn install(&self, bitmap: RuntimeFrameBitmap) -> Result<(), RuntimeFrameBitmap> {
+        match self.state.compare_exchange(
+            RUNTIME_BITMAP_EMPTY,
+            RUNTIME_BITMAP_INITIALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(_) => return Err(bitmap),
+        }
+
+        unsafe {
+            (*self.bitmap.get()).write(bitmap);
+        }
+
+        self.state.store(RUNTIME_BITMAP_READY, Ordering::Release);
+        Ok(())
+    }
+}
+
 pub struct KernelFrameAllocator;
 
 impl KernelFrameAllocator {
+    /// Initializes the early fixed-storage allocator from the boot memory map.
     pub fn init_from_boot_memory_map() {
         let memory_regions = &boot_info().memory_regions;
         init_from_memory_regions(memory_regions);
     }
 
+    /// Allocates one base physical frame.
     pub fn allocate_base_frame() -> Option<PhysAddr> {
-        let frame_size = cached_frame_size();
-        let low_frames = cached_low_reserved_frames();
-        let mut bm = MEMORY_BITMAP.write();
-        let words = bm.word_len();
-        let total_frames = bm.frame_capacity();
-        if words == 0 {
-            return None;
+        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
+            return allocate_base_frame_runtime(runtime);
         }
 
-        let start = NEXT_WORD_BASE.load(Ordering::Relaxed) % words;
-        for step in 0..words {
-            let word_idx = (start + step) % words;
-            let mut free = !bm.as_slice()[word_idx];
-
-            while free != 0 {
-                let free_bit = free.trailing_zeros() as usize;
-                let frame_idx = word_idx * WORD_BITS + free_bit;
-                let bit = 1u64 << free_bit;
-
-                if frame_idx >= total_frames || frame_idx < low_frames {
-                    bm.as_mut_slice()[word_idx] |= bit;
-                    free &= free - 1;
-                    continue;
-                }
-
-                bm.as_mut_slice()[word_idx] |= bit;
-                NEXT_WORD_BASE.store(word_idx, Ordering::Relaxed);
-                USED_MEMORY_BYTES.fetch_add(frame_size as usize, Ordering::Relaxed);
-
-                return Some(PhysAddr::new((frame_idx as u64) * frame_size));
-            }
-        }
-
-        None
+        allocate_base_frame_boot()
     }
 
+    /// Allocates a frame range suitable for a mapping of `size`.
     pub fn allocate_mapping_frame(size: MappingSize) -> Option<PhysAddr> {
         let frame_count = base_frame_count_for_mapping(size)?;
         Self::allocate_contiguous_frames_aligned(frame_count, frame_count)
     }
 
+    /// Allocates `frame_count` contiguous frames aligned to `align_frames`.
     pub fn allocate_contiguous_frames_aligned(
         frame_count: usize,
         align_frames: usize,
@@ -89,136 +118,39 @@ impl KernelFrameAllocator {
             return None;
         }
 
-        let frame_size = cached_frame_size();
-        let low_frames = cached_low_reserved_frames();
-        let mut bm = MEMORY_BITMAP.write();
-        let total_words = bm.word_len();
-        let total_frames = bm.frame_capacity();
-        if total_words == 0 || frame_count > total_frames {
-            return None;
+        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
+            return allocate_contiguous_frames_aligned_runtime(runtime, frame_count, align_frames);
         }
 
-        let start_word = NEXT_CONTIG_WORD_BASE.load(Ordering::Relaxed) % total_words;
-        for step in 0..total_words {
-            let word_idx = (start_word + step) % total_words;
-            let mut bit_idx = 0usize;
-
-            loop {
-                let free = !bm.as_slice()[word_idx] & (!0u64 << bit_idx);
-                if free == 0 {
-                    break;
-                }
-
-                let bit = free.trailing_zeros() as usize;
-                let raw_idx = word_idx * WORD_BITS + bit;
-                if raw_idx >= total_frames {
-                    break;
-                }
-
-                let min_idx = core::cmp::max(raw_idx, low_frames);
-                let start_idx = align_frame_index(min_idx, align_frames)?;
-                if start_idx >= total_frames {
-                    break;
-                }
-
-                let Some(end_idx) = start_idx.checked_add(frame_count) else {
-                    return None;
-                };
-                if end_idx > total_frames {
-                    break;
-                }
-
-                match first_set_bit_in_range(bm.as_slice(), start_idx, end_idx) {
-                    None => {
-                        set_range(bm.as_mut_slice(), start_idx, frame_count);
-                        let next_word = (end_idx / WORD_BITS) % total_words;
-                        NEXT_CONTIG_WORD_BASE.store(next_word, Ordering::Relaxed);
-                        USED_MEMORY_BYTES.fetch_add(
-                            frame_count.saturating_mul(frame_size as usize),
-                            Ordering::Relaxed,
-                        );
-                        return Some(PhysAddr::new((start_idx as u64) * frame_size));
-                    }
-                    Some(conflict_idx) => {
-                        let next_scan_idx = conflict_idx.saturating_add(1);
-                        if next_scan_idx >= total_frames {
-                            break;
-                        }
-
-                        if next_scan_idx / WORD_BITS != word_idx {
-                            break;
-                        }
-
-                        bit_idx = next_scan_idx & (WORD_BITS - 1);
-                    }
-                }
-            }
-        }
-
-        None
+        allocate_contiguous_frames_aligned_boot(frame_count, align_frames)
     }
 
+    /// Frees a mapping frame range allocated by `allocate_mapping_frame`.
     pub fn free_mapping_frame(base: PhysAddr, size: MappingSize) {
-        let Some(len) = base_frame_count_for_mapping(size) else {
-            return;
-        };
-        let Some(base_idx) = frame_index(base.as_u64()) else {
-            return;
-        };
-
-        if base_idx < cached_low_reserved_frames() {
+        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
+            free_mapping_frame_runtime(runtime, base, size);
             return;
         }
 
-        let mut bm = MEMORY_BITMAP.write();
-        if !range_fits_bitmap(&bm, base_idx, len) {
-            return;
-        }
-
-        clear_range(bm.as_mut_slice(), base_idx, len);
-        USED_MEMORY_BYTES.fetch_sub(
-            len.saturating_mul(cached_frame_size() as usize),
-            Ordering::Relaxed,
-        );
+        free_mapping_frame_boot(base, size);
     }
 
+    /// Releases an already-reserved mapping frame range back to the allocator.
     pub fn release_reserved_mapping_frame(base: PhysAddr, size: MappingSize) {
-        let Some(len) = base_frame_count_for_mapping(size) else {
-            return;
-        };
-        let Some(base_idx) = frame_index(base.as_u64()) else {
-            return;
-        };
-
-        if base_idx < cached_low_reserved_frames() {
+        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
+            release_reserved_mapping_frame_runtime(runtime, base, size);
             return;
         }
 
-        let mut bm = MEMORY_BITMAP.write();
-        if !range_fits_bitmap(&bm, base_idx, len) {
-            return;
-        }
-
-        if !frame_range_is_boot_info_usable(base_idx, len) {
-            let mut reclaimed = RECLAIMED_MEMORY_BITMAP.write();
-            let reclaimed_frames = reclaimed.frame_capacity();
-            let newly_reclaimed =
-                set_range_count_new(reclaimed.as_mut_slice(), reclaimed_frames, base_idx, len);
-            if newly_reclaimed != 0 {
-                RECLAIMED_MEMORY_BYTES.fetch_add(
-                    newly_reclaimed.saturating_mul(cached_frame_size() as usize),
-                    Ordering::Relaxed,
-                );
-            }
-        }
-
-        clear_range(bm.as_mut_slice(), base_idx, len);
+        release_reserved_mapping_frame_boot(base, size);
     }
 
+    /// Returns total usable bytes currently covered by the allocator.
     pub fn total_usable_bytes() -> u64 {
         total_usable_bytes()
     }
 
+    /// Returns bytes allocated through this allocator.
     pub fn used_bytes() -> u64 {
         used_bytes()
     }
@@ -241,6 +173,7 @@ impl PageTableFrameAllocator for KernelPageTableFrameAllocator {
     }
 }
 
+/// Initializes the fixed early bitmap without heap allocation.
 pub fn init_from_memory_regions(memory_regions: &[MemoryRegion]) {
     let frame_size = base_page_size();
     let frame_size_usize = usize::try_from(frame_size).unwrap_or(usize::MAX);
@@ -292,15 +225,18 @@ pub fn init_from_memory_regions(memory_regions: &[MemoryRegion]) {
     let mut reclaimed = RECLAIMED_MEMORY_BITMAP.write();
     reclaimed.reset_to_boot_storage();
     reclaimed.as_mut_slice().fill(0);
+
     let cap = reclaimed.frame_capacity();
     clear_unused_tail_bits(reclaimed.as_mut_slice(), cap);
 }
 
+/// Returns total usable bytes covered by boot memory plus reclaimed reserved memory.
 pub fn total_usable_bytes() -> u64 {
     BOOT_USABLE_BYTES_COVERED.load(Ordering::Relaxed) as u64
         + RECLAIMED_MEMORY_BYTES.load(Ordering::Relaxed) as u64
 }
 
+/// Returns total usable bytes described by the firmware memory map.
 pub fn boot_usable_bytes() -> u64 {
     let cached = BOOT_USABLE_BYTES_TOTAL.load(Ordering::Relaxed);
     if cached != 0 {
@@ -315,38 +251,44 @@ pub fn boot_usable_bytes() -> u64 {
         .sum()
 }
 
+/// Returns bytes allocated through this allocator.
 pub fn used_bytes() -> u64 {
     USED_MEMORY_BYTES.load(Ordering::Relaxed) as u64
 }
 
+/// Performs the heap-available handoff from fixed boot bitmap to runtime atomic bitmap.
 pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeError> {
     let memory_regions = &boot_info().memory_regions;
     let physical_coverage_bytes = physical_coverage_for_ram(memory_regions, total_ram_bytes)?;
     let (new_frames, new_words) = bitmap_layout_for_physical_coverage(physical_coverage_bytes)?;
 
-    {
-        let bm = MEMORY_BITMAP.read();
-        if bm.frame_capacity() == new_frames && bm.word_len() == new_words {
+    if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
+        if runtime.frame_capacity() == new_frames && runtime.word_len() == new_words {
             refresh_boot_usable_stats(memory_regions, physical_coverage_bytes);
             return Ok(());
         }
+
+        return Err(BitmapResizeError::RuntimeAllocatorAlreadyInitialized);
     }
 
     let mut new_bitmap = build_memory_bitmap(memory_regions, new_frames, new_words)?;
     let mut new_reclaimed = heap_bitmap(new_words, 0)?;
+    let atomic_storage = RuntimeFrameBitmap::reserved_atomic_storage(new_words)?;
 
-    let old_bitmap_heap;
-    let old_reclaimed_heap;
-
-    {
-        let mut bm = MEMORY_BITMAP.write();
+    let old_reclaimed_heap = {
+        let bm = MEMORY_BITMAP.write();
         let mut reclaimed = RECLAIMED_MEMORY_BITMAP.write();
+
+        if RUNTIME_MEMORY_BITMAP.is_ready() {
+            return Err(BitmapResizeError::RuntimeAllocatorAlreadyInitialized);
+        }
 
         if allocated_usable_frame_exists_at_or_above(&bm, &reclaimed, new_frames) {
             return Err(BitmapResizeError::AllocatedFramesWouldBeTruncated);
         }
 
         let common_frames = core::cmp::min(bm.frame_capacity(), new_frames);
+
         preserve_set_bits_limited(new_bitmap.as_mut_slice(), bm.as_slice(), common_frames);
         preserve_reclaimed_free_bits_limited(
             new_bitmap.as_mut_slice(),
@@ -364,9 +306,10 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
         clear_unused_tail_bits(new_reclaimed.as_mut_slice(), new_frames);
 
         let reclaimed_frames = count_set_bits_up_to(new_reclaimed.as_slice(), new_frames);
+        let runtime_bitmap =
+            RuntimeFrameBitmap::from_words_preallocated(new_bitmap, new_frames, atomic_storage)?;
 
-        old_bitmap_heap = bm.replace_with_heap_storage(new_bitmap, new_frames);
-        old_reclaimed_heap = reclaimed.replace_with_heap_storage(new_reclaimed, new_frames);
+        let old_reclaimed_heap = reclaimed.replace_with_heap_storage(new_reclaimed, new_frames);
 
         NEXT_WORD_BASE.store(0, Ordering::Relaxed);
         NEXT_CONTIG_WORD_BASE.store(0, Ordering::Relaxed);
@@ -375,12 +318,296 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
             Ordering::Relaxed,
         );
         refresh_boot_usable_stats(memory_regions, physical_coverage_bytes);
-    }
 
-    drop(old_bitmap_heap);
+        RUNTIME_MEMORY_BITMAP
+            .install(runtime_bitmap)
+            .map_err(|_| BitmapResizeError::RuntimeAllocatorAlreadyInitialized)?;
+
+        old_reclaimed_heap
+    };
+
     drop(old_reclaimed_heap);
 
     Ok(())
+}
+
+fn allocate_base_frame_runtime(runtime: &RuntimeFrameBitmap) -> Option<PhysAddr> {
+    let frame = runtime.alloc_frame()?;
+    let frame_size = cached_frame_size();
+
+    let Some(phys) = checked_frame_phys(frame, frame_size) else {
+        runtime.free_frame(frame);
+        return None;
+    };
+
+    USED_MEMORY_BYTES.fetch_add(frame_size as usize, Ordering::Relaxed);
+
+    Some(PhysAddr::new(phys))
+}
+/// wait free if count = 1
+fn allocate_contiguous_frames_aligned_runtime(
+    runtime: &RuntimeFrameBitmap,
+    frame_count: usize,
+    align_frames: usize,
+) -> Option<PhysAddr> {
+    let start = runtime.alloc_contiguous_frames_aligned(frame_count, align_frames)?;
+    let frame_size = cached_frame_size();
+
+    let Some(phys) = checked_frame_phys(start, frame_size) else {
+        runtime.free_contiguous_frames(start, frame_count);
+        return None;
+    };
+
+    USED_MEMORY_BYTES.fetch_add(
+        frame_count.saturating_mul(frame_size as usize),
+        Ordering::Relaxed,
+    );
+
+    Some(PhysAddr::new(phys))
+}
+
+fn free_mapping_frame_runtime(runtime: &RuntimeFrameBitmap, base: PhysAddr, size: MappingSize) {
+    let Some(len) = base_frame_count_for_mapping(size) else {
+        return;
+    };
+    let Some(base_idx) = frame_index(base.as_u64()) else {
+        return;
+    };
+
+    if base_idx < cached_low_reserved_frames() {
+        return;
+    }
+
+    let Some(end) = base_idx.checked_add(len) else {
+        return;
+    };
+
+    if end > runtime.frame_capacity() {
+        return;
+    }
+
+    runtime.free_contiguous_frames(base_idx, len);
+
+    USED_MEMORY_BYTES.fetch_sub(
+        len.saturating_mul(cached_frame_size() as usize),
+        Ordering::Relaxed,
+    );
+}
+
+fn release_reserved_mapping_frame_runtime(
+    runtime: &RuntimeFrameBitmap,
+    base: PhysAddr,
+    size: MappingSize,
+) {
+    let Some(len) = base_frame_count_for_mapping(size) else {
+        return;
+    };
+    let Some(base_idx) = frame_index(base.as_u64()) else {
+        return;
+    };
+
+    if base_idx < cached_low_reserved_frames() {
+        return;
+    }
+
+    let Some(end) = base_idx.checked_add(len) else {
+        return;
+    };
+
+    if end > runtime.frame_capacity() {
+        return;
+    }
+
+    if !frame_range_is_boot_info_usable(base_idx, len) {
+        let mut reclaimed = RECLAIMED_MEMORY_BITMAP.write();
+        let reclaimed_frames = reclaimed.frame_capacity();
+        let newly_reclaimed =
+            set_range_count_new(reclaimed.as_mut_slice(), reclaimed_frames, base_idx, len);
+
+        if newly_reclaimed != 0 {
+            RECLAIMED_MEMORY_BYTES.fetch_add(
+                newly_reclaimed.saturating_mul(cached_frame_size() as usize),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    runtime.free_contiguous_frames(base_idx, len);
+}
+
+fn allocate_base_frame_boot() -> Option<PhysAddr> {
+    let frame_size = cached_frame_size();
+    let low_frames = cached_low_reserved_frames();
+    let mut bm = MEMORY_BITMAP.write();
+    let words = bm.word_len();
+    let total_frames = bm.frame_capacity();
+
+    if words == 0 {
+        return None;
+    }
+
+    let start = NEXT_WORD_BASE.load(Ordering::Relaxed) % words;
+
+    for step in 0..words {
+        let word_idx = (start + step) % words;
+        let mut free = !bm.as_slice()[word_idx];
+
+        while free != 0 {
+            let free_bit = free.trailing_zeros() as usize;
+            let frame_idx = word_idx * WORD_BITS + free_bit;
+            let bit = 1u64 << free_bit;
+
+            if frame_idx >= total_frames || frame_idx < low_frames {
+                bm.as_mut_slice()[word_idx] |= bit;
+                free &= free - 1;
+                continue;
+            }
+
+            bm.as_mut_slice()[word_idx] |= bit;
+            NEXT_WORD_BASE.store(word_idx, Ordering::Relaxed);
+            USED_MEMORY_BYTES.fetch_add(frame_size as usize, Ordering::Relaxed);
+
+            return Some(PhysAddr::new((frame_idx as u64) * frame_size));
+        }
+    }
+
+    None
+}
+
+fn allocate_contiguous_frames_aligned_boot(
+    frame_count: usize,
+    align_frames: usize,
+) -> Option<PhysAddr> {
+    let frame_size = cached_frame_size();
+    let low_frames = cached_low_reserved_frames();
+    let mut bm = MEMORY_BITMAP.write();
+    let total_words = bm.word_len();
+    let total_frames = bm.frame_capacity();
+
+    if total_words == 0 || frame_count > total_frames {
+        return None;
+    }
+
+    let start_word = NEXT_CONTIG_WORD_BASE.load(Ordering::Relaxed) % total_words;
+
+    for step in 0..total_words {
+        let word_idx = (start_word + step) % total_words;
+        let mut bit_idx = 0usize;
+
+        loop {
+            let free = !bm.as_slice()[word_idx] & (!0u64 << bit_idx);
+            if free == 0 {
+                break;
+            }
+
+            let bit = free.trailing_zeros() as usize;
+            let raw_idx = word_idx * WORD_BITS + bit;
+            if raw_idx >= total_frames {
+                break;
+            }
+
+            let min_idx = core::cmp::max(raw_idx, low_frames);
+            let start_idx = align_frame_index(min_idx, align_frames)?;
+            if start_idx >= total_frames {
+                break;
+            }
+
+            let Some(end_idx) = start_idx.checked_add(frame_count) else {
+                return None;
+            };
+            if end_idx > total_frames {
+                break;
+            }
+
+            match first_set_bit_in_range(bm.as_slice(), start_idx, end_idx) {
+                None => {
+                    set_range(bm.as_mut_slice(), start_idx, frame_count);
+
+                    let next_word = (end_idx / WORD_BITS) % total_words;
+                    NEXT_CONTIG_WORD_BASE.store(next_word, Ordering::Relaxed);
+
+                    USED_MEMORY_BYTES.fetch_add(
+                        frame_count.saturating_mul(frame_size as usize),
+                        Ordering::Relaxed,
+                    );
+
+                    return Some(PhysAddr::new((start_idx as u64) * frame_size));
+                }
+                Some(conflict_idx) => {
+                    let next_scan_idx = conflict_idx.saturating_add(1);
+                    if next_scan_idx >= total_frames {
+                        break;
+                    }
+
+                    if next_scan_idx / WORD_BITS != word_idx {
+                        break;
+                    }
+
+                    bit_idx = next_scan_idx & (WORD_BITS - 1);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn free_mapping_frame_boot(base: PhysAddr, size: MappingSize) {
+    let Some(len) = base_frame_count_for_mapping(size) else {
+        return;
+    };
+    let Some(base_idx) = frame_index(base.as_u64()) else {
+        return;
+    };
+
+    if base_idx < cached_low_reserved_frames() {
+        return;
+    }
+
+    let mut bm = MEMORY_BITMAP.write();
+    if !range_fits_bitmap(&bm, base_idx, len) {
+        return;
+    }
+
+    clear_range(bm.as_mut_slice(), base_idx, len);
+    USED_MEMORY_BYTES.fetch_sub(
+        len.saturating_mul(cached_frame_size() as usize),
+        Ordering::Relaxed,
+    );
+}
+
+fn release_reserved_mapping_frame_boot(base: PhysAddr, size: MappingSize) {
+    let Some(len) = base_frame_count_for_mapping(size) else {
+        return;
+    };
+    let Some(base_idx) = frame_index(base.as_u64()) else {
+        return;
+    };
+
+    if base_idx < cached_low_reserved_frames() {
+        return;
+    }
+
+    let mut bm = MEMORY_BITMAP.write();
+    if !range_fits_bitmap(&bm, base_idx, len) {
+        return;
+    }
+
+    if !frame_range_is_boot_info_usable(base_idx, len) {
+        let mut reclaimed = RECLAIMED_MEMORY_BITMAP.write();
+        let reclaimed_frames = reclaimed.frame_capacity();
+        let newly_reclaimed =
+            set_range_count_new(reclaimed.as_mut_slice(), reclaimed_frames, base_idx, len);
+
+        if newly_reclaimed != 0 {
+            RECLAIMED_MEMORY_BYTES.fetch_add(
+                newly_reclaimed.saturating_mul(cached_frame_size() as usize),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    clear_range(bm.as_mut_slice(), base_idx, len);
 }
 
 fn allocated_usable_frame_exists_at_or_above(
@@ -430,6 +657,7 @@ fn frame_range_is_boot_info_usable(base_idx: usize, len: usize) -> bool {
         if region.kind != MemoryRegionKind::Usable {
             return false;
         }
+
         base >= region.start && end_excl <= region.end
     })
 }
@@ -443,6 +671,7 @@ fn base_frame_count_for_mapping(size: MappingSize) -> Option<usize> {
     if size.bytes == 0 || size.bytes % frame_size != 0 {
         return None;
     }
+
     usize::try_from(size.bytes / frame_size).ok()
 }
 
@@ -451,6 +680,7 @@ fn frame_index(phys: u64) -> Option<usize> {
     if phys % frame_size != 0 {
         return None;
     }
+
     usize::try_from(phys / frame_size).ok()
 }
 

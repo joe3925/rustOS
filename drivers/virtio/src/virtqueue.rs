@@ -120,6 +120,17 @@ impl Virtqueue {
         self.used.base_va()
     }
 
+    #[inline]
+    pub fn used_idx_ptr(&self) -> *const AtomicU16 {
+        let used_base = self.used_va().as_u64() as *const u16;
+        unsafe { used_base.add(1) as *const AtomicU16 }
+    }
+
+    #[inline]
+    pub fn last_used_idx(&self) -> u16 {
+        self.last_used_idx.load(Ordering::Acquire)
+    }
+
     /// Enable the queue after all configuration (including MSI-X vector) is set.
     pub fn enable(&self, common_cfg: VirtAddr) {
         unsafe {
@@ -165,7 +176,7 @@ impl Virtqueue {
         }
     }
     /// Free a descriptor back to the free list.
-    fn free_desc(&mut self, idx: u16) {
+    pub(crate) fn free_desc(&mut self, idx: u16) {
         let desc = self.desc_ptr(idx);
         unsafe {
             (*desc).flags = 0;

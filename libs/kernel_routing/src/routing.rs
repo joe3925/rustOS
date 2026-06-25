@@ -114,7 +114,7 @@ trait IoSlotRequest: RequestKind + Sized {
     ) -> FfiFuture<DriverStep>;
 }
 
-impl<'data> IoSlotRequest for Read<'data> {
+impl<'io> IoSlotRequest for Read<'io> {
     type Handler = kernel_types::EvtIoRead;
 
     #[inline]
@@ -128,12 +128,11 @@ impl<'data> IoSlotRequest for Read<'data> {
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Self>,
     ) -> FfiFuture<DriverStep> {
-        let len = handle.read().body.len;
-        handler(dev, handle, len)
+        handler(dev, handle)
     }
 }
 
-impl<'data> IoSlotRequest for Write<'data> {
+impl<'io> IoSlotRequest for Write<'io> {
     type Handler = kernel_types::EvtIoWrite;
 
     #[inline]
@@ -147,11 +146,9 @@ impl<'data> IoSlotRequest for Write<'data> {
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Self>,
     ) -> FfiFuture<DriverStep> {
-        let len = handle.read().body.len;
-        handler(dev, handle, len)
+        handler(dev, handle)
     }
 }
-
 impl IoSlotRequest for Flush {
     type Handler = kernel_types::EvtIoFlush;
 
@@ -276,7 +273,7 @@ macro_rules! impl_routed_io {
     };
 }
 
-impl<'data> RoutedRequest for Read<'data> {
+impl<'io> RoutedRequest for Read<'io> {
     #[inline]
     fn invoke_at<'a, 'req>(
         dev: &'a Arc<DeviceObject>,
@@ -286,7 +283,7 @@ impl<'data> RoutedRequest for Read<'data> {
     }
 }
 
-impl<'data> RoutedRequest for Write<'data> {
+impl<'io> RoutedRequest for Write<'io> {
     #[inline]
     fn invoke_at<'a, 'req>(
         dev: &'a Arc<DeviceObject>,

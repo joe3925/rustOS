@@ -250,6 +250,27 @@ impl PELoader {
             pdb_path
         );
 
+        {
+            let path_str = self.path.to_string();
+            let debug_sections: Vec<crate::debug_metadata::DebugLoadedSection<'_>> = pe_info
+                .sections
+                .iter()
+                .map(|s| crate::debug_metadata::DebugLoadedSection {
+                    name: s.name.as_str(),
+                    runtime_addr: base + s.virtual_address as u64,
+                    size: s.virtual_size as u64,
+                })
+                .collect();
+
+            crate::debug_metadata::module_loaded(&crate::debug_metadata::DebugLoadedModule {
+                name: title.as_str(),
+                path: Some(path_str.as_str()),
+                preferred_image_base: preferred_base,
+                loaded_image_base: base,
+                sections: &debug_sections,
+            });
+        }
+
         let module = Module {
             title,
             image_path: self.path.clone(),

@@ -5,7 +5,12 @@ use spin::Mutex;
 
 pub(super) struct WritebackNotifier {
     epoch: AtomicU64,
-    waiters: Mutex<Vec<Waker>>,
+    waiters: Mutex<Vec<Option<WritebackWaiter>>>,
+}
+
+struct WritebackWaiter {
+    observed_epoch: u64,
+    waker: Waker,
 }
 
 impl WritebackNotifier {
@@ -28,23 +33,75 @@ impl WritebackNotifier {
             return false;
         }
 
-        if waiters.iter().all(|existing| !existing.will_wake(waker)) {
-            waiters.push(waker.clone());
+        let mut free_slot = None;
+
+        for index in 0..waiters.len() {
+            match &mut waiters[index] {
+                Some(existing) => {
+                    if existing.waker.will_wake(waker) {
+                        existing.observed_epoch = observed_epoch;
+                        existing.waker.clone_from(waker);
+                        return true;
+                    }
+                }
+                None => {
+                    if free_slot.is_none() {
+                        free_slot = Some(index);
+                    }
+                }
+            }
+        }
+
+        let waiter = WritebackWaiter {
+            observed_epoch,
+            waker: waker.clone(),
+        };
+
+        if let Some(index) = free_slot {
+            waiters[index] = Some(waiter);
+        } else {
+            waiters.push(Some(waiter));
         }
 
         true
     }
 
     pub(super) fn notify_all(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let notified_epoch = self.epoch.fetch_add(1, Ordering::AcqRel);
+        let mut cursor = 0;
 
-        let waiters = {
-            let mut waiters = self.waiters.lock();
-            core::mem::take(&mut *waiters)
-        };
+        loop {
+            let waker = {
+                let mut waiters = self.waiters.lock();
+                let mut found = None;
 
-        for waker in waiters {
-            waker.wake();
+                while cursor < waiters.len() {
+                    let should_wake = match &waiters[cursor] {
+                        Some(waiter) => waiter.observed_epoch <= notified_epoch,
+                        None => false,
+                    };
+
+                    if should_wake {
+                        found = Some(cursor);
+                        break;
+                    }
+
+                    cursor += 1;
+                }
+
+                match found {
+                    Some(index) => {
+                        cursor = index + 1;
+                        waiters[index].take().map(|waiter| waiter.waker)
+                    }
+                    None => None,
+                }
+            };
+
+            match waker {
+                Some(waker) => waker.wake(),
+                None => break,
+            }
         }
     }
 }

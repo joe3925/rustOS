@@ -15,7 +15,7 @@ use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
-use crate::{platform, println, vec};
+use crate::{platform, print, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -3478,7 +3478,7 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
-const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 256 * 1024 * 1024;
+const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 10 * 1024 * 1024;
 
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
@@ -3490,7 +3490,7 @@ const DISK_BENCH_SIZES: &[usize] = &[
     1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
-    // 64 * 1024 * 1024,
+    //64 * 1024 * 1024,
 ];
 
 #[inline(always)]
@@ -3671,11 +3671,37 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         let mut read_ops = 0u64;
         let mut read_ns = 0u128;
 
+        if !write_through {
+            let mut offset = 0u64;
+            let mut ops = 0u64;
+
+            while offset < bench_len {
+                let remaining = (bench_len - offset) as usize;
+                let len = core::cmp::min(size, remaining);
+                let tag = (ops ^ offset ^ 0xfeed_beef).to_le_bytes();
+                let tag_len = core::cmp::min(tag.len(), len);
+
+                buf[..tag_len].copy_from_slice(&tag[..tag_len]);
+
+                if let Err(e) = file.write_at(offset, &buf[..len]).await {
+                    println!(
+                        "[disk-bench] warm write failed size={} offset={}: {:?}",
+                        size, offset, e
+                    );
+                    let _ = file.close().await;
+                    return;
+                }
+
+                offset += len as u64;
+                ops += 1;
+            }
+        }
+
         for _ in 0..passes {
             let mut offset = 0u64;
             let mut ops = 0u64;
 
-            let start_ns = disk_bench_now_ns();
+            let timer = Stopwatch::start();
 
             while offset < bench_len {
                 let remaining = (bench_len - offset) as usize;
@@ -3698,21 +3724,24 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 ops += 1;
             }
 
+            write_bytes += offset;
+            write_ops += ops;
+            write_ns += timer.elapsed_nanos() as u128;
+
             if let Err(e) = file.flush().await {
-                println!("[disk-bench] write flush failed size={}: {:?}", size, e);
+                println!(
+                    "[disk-bench] post-write flush failed size={}: {:?}",
+                    size, e
+                );
                 let _ = file.close().await;
                 return;
             }
-
-            write_bytes += offset;
-            write_ops += ops;
-            write_ns += disk_bench_elapsed_ns(start_ns);
 
             let mut offset = 0u64;
             let mut ops = 0u64;
             let mut checksum = 0u64;
 
-            let start_ns = disk_bench_now_ns();
+            let timer = Stopwatch::start();
 
             while offset < bench_len {
                 let remaining = (bench_len - offset) as usize;
@@ -3736,7 +3765,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
 
             read_bytes += offset;
             read_ops += ops;
-            read_ns += disk_bench_elapsed_ns(start_ns);
+            read_ns += timer.elapsed_nanos() as u128;
         }
 
         let wr_ns_op = if write_ops == 0 {
@@ -3744,6 +3773,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         } else {
             write_ns / write_ops as u128
         };
+
         let rd_ns_op = if read_ops == 0 {
             0
         } else {

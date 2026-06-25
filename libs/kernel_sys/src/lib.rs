@@ -14,10 +14,10 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
-use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::{
-    DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
-    DmaPciDeviceIdentity, IoBuffer, PhysFramed, ToDevice,
+    DeviceMmuPlatformDeviceIdentity, DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError,
+    DmaMappedBuffer, DmaMappingStrategy, DmaPciDeviceIdentity,
 };
 use kernel_types::irq::{
     DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult, MsiMessage,
@@ -104,23 +104,15 @@ unsafe extern "C" {
         device: &Arc<DeviceObject>,
     ) -> Result<DmaDeviceHandle, DriverStatus>;
     pub fn kernel_dma_query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState>;
-    pub fn kernel_dma_map_buffer<'a>(
+    pub fn kernel_dma_map_buffer<'regions, 'frames>(
         device: &Arc<DeviceObject>,
-        buffer: kernel_types::dma::IoBufferRepr<'a>,
+        buffer: &DmaBufferView<'regions>,
         strategy: DmaMappingStrategy,
-    ) -> Result<
-        kernel_types::dma::IoBufferRepr<'a>,
-        (kernel_types::dma::IoBufferRepr<'a>, DmaMapError),
-    >;
-    pub fn kernel_dma_unmap_buffer<'a>(
-        buffer: kernel_types::dma::IoBufferRepr<'a>,
-    ) -> kernel_types::dma::IoBufferRepr<'a>;
-    pub fn kernel_dma_map_buffer_ref<'map, 'buffer>(
+    ) -> Result<DmaMappedBuffer, DmaMapError>;
+    pub fn kernel_dma_map_persistent_contiguous_backing(
         device: &Arc<DeviceObject>,
-        buffer: &'map kernel_types::dma::IoBufferRepr<'buffer>,
-        strategy: DmaMappingStrategy,
-    ) -> Result<kernel_types::dma::BorrowedDmaMapping<'map>, DmaMapError>;
-
+        backing: &IoBufferBacking<'_>,
+    ) -> Result<(), DmaMapError>;
     // Paging / VMM
     pub fn allocate_auto_kernel_range_mapped(
         size: u64,
@@ -234,7 +226,7 @@ unsafe extern "C" {
         init_pdo: DeviceInit,
     ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
-    pub fn InvalidateDeviceRelations(
+    pub fn pnp_invalidate_device_relations(
         device: &Arc<DeviceObject>,
         relation: DeviceRelationType,
     ) -> FfiFuture<DriverStatus>;

@@ -3,10 +3,13 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_GDB_PORT: u16 = 1234;
+const DEFAULT_META_PORT: u16 = 4322;
 const ACTIVE_PLATFORM: PlatformConfig = PlatformConfig {
     kernel_target_json: "x86_64-rustos-kernel.json",
     kernel_target_dir: "x86_64-rustos-kernel",
@@ -72,6 +75,10 @@ struct QemuOptions {
     dry_run: bool,
     console_serial: bool,
     gdb_port: u16,
+    /// Enable the COM2 LLDB metadata socket.
+    lldb_meta: bool,
+    /// TCP port for the COM2 LLDB metadata socket.
+    meta_port: u16,
 }
 
 impl Cli {
@@ -112,6 +119,8 @@ impl Cli {
                     dry_run: false,
                     console_serial: false,
                     gdb_port: DEFAULT_GDB_PORT,
+                    lldb_meta: false,
+                    meta_port: DEFAULT_META_PORT,
                 };
 
                 while let Some(arg) = args.next() {
@@ -129,6 +138,15 @@ impl Cli {
                             options.gdb_port = port
                                 .parse()
                                 .map_err(|_| format!("invalid gdb port `{port}`"))?;
+                        }
+                        "--lldb-meta" => options.lldb_meta = true,
+                        "--meta-port" => {
+                            let port = args
+                                .next()
+                                .ok_or_else(|| "--meta-port requires a port".to_string())?;
+                            options.meta_port = port
+                                .parse()
+                                .map_err(|_| format!("invalid meta port `{port}`"))?;
                         }
                         "-h" | "--help" => return Err(usage()),
                         other => {
@@ -177,7 +195,7 @@ fn usage() -> String {
         "  cargo run -p xtask",
         "  cargo run -p xtask -- --release",
         "  cargo run -p xtask -- build [--drivers] [--release]",
-        "  cargo run -p xtask -- qemu [--debug] [--detach] [--console-serial] [--no-build] [--dry-run] [--release] [--gdb-port PORT]",
+        "  cargo run -p xtask -- qemu [--debug] [--detach] [--console-serial] [--no-build] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
         "",
         "environment:",
         "  RUSTOS_QEMU       path to the active platform QEMU executable",
@@ -190,6 +208,12 @@ fn usage() -> String {
         "  RUSTOS_QEMU_MEMORY QEMU memory size, defaults to 8G",
         "  RUSTOS_QEMU_SMP   QEMU CPU count",
         "  RUSTOS_QEMU_SERIAL QEMU serial backend used unless --console-serial is passed",
+        "",
+        "serial ports:",
+        "  COM1 (0x3F8)  normal kernel log output (controlled by RUSTOS_QEMU_SERIAL)",
+        "  COM2 (0x2F8)  structured debugger metadata, enabled with --lldb-meta",
+        "                host TCP port defaults to 4322 (override with --meta-port)",
+        "                connect with: .zed/lldb/rustos_meta.py via rustos-meta-connect",
     ]
     .join("\n")
 }
@@ -223,7 +247,7 @@ fn run_qemu(root: &Path, options: QemuOptions) -> Result<(), String> {
     if options.detach {
         spawn_qemu_detached(root, &qemu, &args, options.debug, options.gdb_port)
     } else {
-        run_qemu_foreground(root, &qemu, &args)
+        run_qemu_foreground(root, &qemu, &args, options.console_serial)
     }
 }
 
@@ -687,11 +711,7 @@ fn qemu_args(
 ) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| "8G".to_string());
     let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
-    let serial = if options.console_serial {
-        "stdio".to_string()
-    } else {
-        env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "stdio".to_string())
-    };
+    let serial = qemu_serial_arg(root, options)?;
     let accel = qemu_accel(qemu, options);
     let iommu_device = qemu_iommu_device(&accel);
     let gdb = format!("tcp::{}", options.gdb_port);
@@ -739,8 +759,17 @@ fn qemu_args(
 
     args.extend(["-serial".into(), serial.into()]);
 
-    if options.console_serial {
-        args.extend(["-monitor".into(), "none".into()]);
+    if options.lldb_meta {
+        let meta_chardev = format!(
+            "socket,id=rustos_meta,host=127.0.0.1,port={},server=on,wait=off,nodelay=on",
+            options.meta_port
+        );
+        args.extend([
+            "-chardev".into(),
+            meta_chardev.into(),
+            "-serial".into(),
+            "chardev:rustos_meta".into(),
+        ]);
     }
 
     args.extend([
@@ -756,6 +785,20 @@ fn qemu_args(
     ]);
 
     Ok(args)
+}
+
+fn qemu_serial_log_path(root: &Path) -> PathBuf {
+    root.join("target").join("qemu-com1.log")
+}
+
+fn qemu_serial_arg(root: &Path, options: &QemuOptions) -> Result<String, String> {
+    if options.console_serial {
+        let path = qemu_serial_log_path(root);
+        let path = qemu_path_string(root, &path)?;
+        Ok(format!("file:{path}"))
+    } else {
+        Ok(env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "stdio".to_string()))
+    }
 }
 
 fn qemu_accel(qemu: &Path, options: &QemuOptions) -> String {
@@ -848,14 +891,108 @@ fn spawn_qemu_detached(
     Ok(())
 }
 
-fn run_qemu_foreground(root: &Path, qemu: &Path, args: &[OsString]) -> Result<(), String> {
-    let status = Command::new(qemu)
-        .args(args)
-        .current_dir(root)
-        .status()
-        .map_err(|err| format!("failed to launch QEMU {}: {err}", qemu.display()))?;
+fn run_qemu_foreground(
+    root: &Path,
+    qemu: &Path,
+    args: &[OsString],
+    console_serial: bool,
+) -> Result<(), String> {
+    if !console_serial {
+        let status = Command::new(qemu)
+            .args(args)
+            .current_dir(root)
+            .status()
+            .map_err(|err| format!("failed to launch QEMU {}: {err}", qemu.display()))?;
+
+        return check_status(status, "running QEMU");
+    }
+
+    let serial_log = qemu_serial_log_path(root);
+
+    if let Some(parent) = serial_log.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create serial log directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(&serial_log, [])
+        .map_err(|err| format!("failed to clear {}: {err}", serial_log.display()))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let tail_stop = Arc::clone(&stop);
+    let tail_path = serial_log.clone();
+    let tail = thread::spawn(move || tail_serial_file(&tail_path, &tail_stop));
+
+    let status_result = Command::new(qemu).args(args).current_dir(root).status();
+
+    stop.store(true, Ordering::Release);
+    let _ = tail.join();
+
+    let status =
+        status_result.map_err(|err| format!("failed to launch QEMU {}: {err}", qemu.display()))?;
 
     check_status(status, "running QEMU")
+}
+
+fn tail_serial_file(path: &Path, stop: &AtomicBool) {
+    use std::io::{Read, Seek, Write};
+
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 4096];
+
+    loop {
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+        };
+
+        if let Ok(metadata) = file.metadata() {
+            if metadata.len() < offset {
+                offset = metadata.len();
+            }
+        }
+
+        if file.seek(std::io::SeekFrom::Start(offset)).is_err() {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+
+            thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+
+        match file.read(&mut buffer) {
+            Ok(0) => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(read) => {
+                offset += read as u64;
+                let _ = std::io::stdout().write_all(&buffer[..read]);
+                let _ = std::io::stdout().flush();
+            }
+            Err(_) => {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
 }
 
 fn wait_for_qemu_to_settle(child: &mut Child) -> Result<(), String> {
