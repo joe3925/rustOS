@@ -1,5 +1,4 @@
-// TODO: there is a memory corruption race condition somewhere that needs to be fixed.
-// the race can be triggered by sending a request then awaiting it and so on for a while. It will occur at some point shows as a GPF.
+
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 #![no_main]

@@ -93,7 +93,7 @@ export! {
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
     pnp_create_devnode_over_pdo_with_function,
-    InvalidateDeviceRelations,
+    pnp_invalidate_device_relations,
 
     driver_get_name,
     driver_get_flags,

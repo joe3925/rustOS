@@ -526,7 +526,7 @@ pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(
 }
 
 #[no_mangle]
-pub extern "C" fn InvalidateDeviceRelations(
+pub extern "C" fn pnp_invalidate_device_relations(
     device: &Arc<DeviceObject>,
     relation: DeviceRelationType,
 ) -> FfiFuture<DriverStatus> {

@@ -227,7 +227,7 @@ unsafe extern "C" {
         init_pdo: DeviceInit,
     ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
-    pub fn InvalidateDeviceRelations(
+    pub fn pnp_invalidate_device_relations(
         device: &Arc<DeviceObject>,
         relation: DeviceRelationType,
     ) -> FfiFuture<DriverStatus>;
