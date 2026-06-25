@@ -1,9 +1,5 @@
-use alloc::sync::Arc;
 use kernel_api::util::random_number;
 use schnellru::{LruMap, Unlimited};
-
-use crate::cache_core::core::VolumeCache;
-use crate::cache_traits::{CacheConfig, CacheError, VolumeCacheBackend};
 
 pub trait CacheIndex<V>: Send {
     fn reserve_or_panic(&mut self, size: usize);
@@ -12,18 +8,10 @@ pub trait CacheIndex<V>: Send {
     fn peek(&self, key: &u64) -> Option<&V>;
     fn insert(&mut self, key: u64, value: V) -> bool;
     fn remove(&mut self, key: &u64) -> Option<V>;
-    fn pop_oldest(&mut self) -> Option<(u64, V)>;
     fn oldest_matching<FN>(&self, f: FN) -> Option<u64>
     where
         FN: FnMut(u64, &V) -> bool;
     fn for_each<FN>(&self, f: FN)
-    where
-        FN: FnMut(u64, &V);
-
-    /// Visit up to `limit` entries starting at logical position `start`.
-    /// Returns the number of entries walked (<= limit). Ordering follows the
-    /// underlying index iteration order.
-    fn for_each_chunk<FN>(&self, start: usize, limit: usize, f: FN) -> usize
     where
         FN: FnMut(u64, &V);
 }
@@ -96,11 +84,6 @@ where
     }
 
     #[inline]
-    fn pop_oldest(&mut self) -> Option<(u64, V)> {
-        self.inner.pop_oldest()
-    }
-
-    #[inline]
     fn oldest_matching<FN>(&self, mut f: FN) -> Option<u64>
     where
         FN: FnMut(u64, &V) -> bool,
@@ -122,25 +105,6 @@ where
             f(*k, v);
         }
     }
-
-    #[inline]
-    fn for_each_chunk<FN>(&self, start: usize, limit: usize, mut f: FN) -> usize
-    where
-        FN: FnMut(u64, &V),
-    {
-        let mut walked = 0usize;
-        for (idx, (k, v)) in self.inner.iter().enumerate() {
-            if idx < start {
-                continue;
-            }
-            if walked >= limit {
-                break;
-            }
-            walked += 1;
-            f(*k, v);
-        }
-        walked
-    }
 }
 
 impl<V> CacheIndexFactory<V> for DefaultIndexFactory
@@ -152,20 +116,5 @@ where
     #[inline]
     fn build(&self, _target_capacity: usize) -> Self::Index {
         DefaultIndex::new()
-    }
-}
-
-pub type DefaultVolumeCache<B, const BLOCK_SIZE: usize> =
-    VolumeCache<B, BLOCK_SIZE, DefaultIndexFactory>;
-
-impl<B, const BLOCK_SIZE: usize> DefaultVolumeCache<B, BLOCK_SIZE>
-where
-    B: VolumeCacheBackend,
-{
-    pub async fn new_default(
-        backend: Arc<B>,
-        cfg: CacheConfig,
-    ) -> Result<Self, CacheError<B::Error>> {
-        Self::new_with_index(backend, cfg, DefaultIndexFactory).await
     }
 }

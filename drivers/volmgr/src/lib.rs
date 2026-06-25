@@ -13,14 +13,13 @@ use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::async_ffi::FutureExt;
 use kernel_api::dma::dma::IoBufferBacking;
-use kernel_api::pnp::PnpMinorFunction::RegisterDmaBacking;
 use kernel_api::println;
 
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushOwner, DeviceRead, DeviceWrite,
@@ -227,7 +226,7 @@ impl VolumeCacheBackend for CacheBackend {
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
-                let mut r = req.write();
+                let r = req.write();
                 let mut current: *mut Read<'data> = &mut r.body;
                 let mut first_offset = 0u64;
                 let mut first_len = 0usize;
@@ -299,7 +298,7 @@ impl VolumeCacheBackend for CacheBackend {
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
-                let mut w = req.write();
+                let w = req.write();
                 let mut current: *mut Write<'data> = &mut w.body;
                 let mut first_offset = 0u64;
                 let mut first_len = 0usize;
@@ -365,73 +364,6 @@ impl VolumeCacheBackend for CacheBackend {
                 );
                 return Err(status);
             }
-            Ok(())
-        }
-        .into_ffi()
-    }
-
-    fn write_phys_framed<'a, 'buffer>(
-        &'a self,
-        lba: u64,
-        blocks: usize,
-        buffer: IoBuffer<'buffer, 'buffer, Described, ToDevice>,
-    ) -> FfiFuture<Result<(), Self::Error>> {
-        async move {
-            if unlikely(blocks == 0) {
-                cold_path();
-                return Ok(());
-            }
-
-            let Some(offset) = lba.checked_mul(BLOCK_SIZE as u64) else {
-                cold_path();
-                return Err(DriverStatus::InvalidParameter);
-            };
-
-            let mut total_len = 0usize;
-            let mut block_idx = 0usize;
-            while block_idx < blocks {
-                let Some(block_lba) = lba.checked_add(block_idx as u64) else {
-                    cold_path();
-                    return Err(DriverStatus::InvalidParameter);
-                };
-                let Some(block_len) = self.block_len(block_lba) else {
-                    cold_path();
-                    return Err(DriverStatus::InvalidParameter);
-                };
-                let Some(next_total_len) = total_len.checked_add(block_len) else {
-                    cold_path();
-                    return Err(DriverStatus::InvalidParameter);
-                };
-                total_len = next_total_len;
-                block_idx += 1;
-            }
-
-            if unlikely(buffer.len() < total_len) {
-                cold_path();
-                return Err(DriverStatus::InvalidParameter);
-            }
-
-            let mut req = RequestHandle::new(Write {
-                offset,
-                len: total_len,
-                no_buffer: false,
-                owner: 0,
-                buffer: Some(buffer),
-                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            });
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
-
-            if unlikely(status != DriverStatus::Success) {
-                cold_path();
-                println!(
-                    "volmgr: CacheBackend::write_phys_framed lower write failed at lba {} blocks {} len {}: {}",
-                    lba, blocks, total_len, status
-                );
-                return Err(status);
-            }
-
             Ok(())
         }
         .into_ffi()
@@ -751,7 +683,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         if vol_len != 0 {
             let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
             // TODO: set this based on system memory and maybe volume size
-            let mut cfg = CacheConfig::new(CACHE_CAPACITY_BYTES / BLOCK_SIZE, 50, 25);
+            let cfg = CacheConfig::new(CACHE_CAPACITY_BYTES / BLOCK_SIZE, 50, 25);
             match VolCache::new(backend, cfg).await {
                 Ok(cache) => {
                     pdx.cache.call_once(|| Arc::new(cache));
@@ -821,7 +753,7 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
     }
 
     {
-        let mut w = req.write();
+        let w = req.write();
         w.body.len = len;
     }
 
@@ -897,7 +829,7 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
     }
 
     {
-        let mut w = req.write();
+        let w = req.write();
         w.body.len = len;
     }
 
