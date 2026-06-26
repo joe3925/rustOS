@@ -120,7 +120,7 @@ pub const BENCH_PARAMS_VERSION_1: u32 = 1;
 
 pub const BENCH_FLAG_IRQ: u32 = 1 << 0; // allow irq waits
 pub const BENCH_FLAG_POLL: u32 = 1 << 1; // pure polling (no waits)
-pub const BENCH_FLAG_REQUEST: u32 = 1 << 2; // route through pnp_send_request + PDO read
+pub const BENCH_FLAG_REQUEST: u32 = 1 << 2; // route through request dispatch + PDO read
 
 pub const BENCH_SAMPLE_PROTO_SCHEMA_VERSION: u32 = 2;
 

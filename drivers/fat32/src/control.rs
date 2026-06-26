@@ -14,9 +14,9 @@ use kernel_api::{
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
         driver_set_evt_device_add, pnp_create_control_device_and_link,
-        pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
+        io, pnp, pnp_create_control_device_with_init,
     },
-    request::{DeviceControl, Pnp, RequestHandle, TraversalPolicy},
+    request::{DeviceControl, Pnp, RequestHandle},
     request_handler,
     runtime::spawn_detached,
     status::DriverStatus,
@@ -93,7 +93,7 @@ impl DeviceControlHandler for Fat32RootIo {
                     },
                 });
 
-                let st = pnp_send_request(volume_fdo.clone(), &mut query).await;
+                let st = pnp::send_down_stack(volume_fdo.clone(), &mut query).await;
 
                 let (sector_size, total_sectors) = {
                     let mut sector_size = None;
@@ -222,13 +222,10 @@ pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
             IOCTL_MOUNTMGR_REGISTER_FS,
             ctrl_link.into_bytes(),
         ));
-        binding.set_traversal_policy(TraversalPolicy::ForwardLower);
-        let _ioctl_status = pnp_ioctl_via_symlink(
-            GLOBAL_CTRL_LINK.to_string(),
-            IOCTL_MOUNTMGR_REGISTER_FS,
-            &mut binding,
-        )
-        .await;
+        binding.write().body.code = IOCTL_MOUNTMGR_REGISTER_FS;
+        if let Some(target) = io::resolve_target(GLOBAL_CTRL_LINK) {
+            let _ioctl_status = io::send_down_stack(target, &mut binding).await;
+        }
     });
 
     DriverStatus::Success

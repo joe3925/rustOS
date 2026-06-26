@@ -12,8 +12,7 @@ use kernel_api::request::{Pnp, Request, RequestData, RequestHandle};
 use kernel_api::status::{DriverStatus, PageMapError};
 
 use kernel_api::pnp::{
-    DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, ResourceKind,
-    pnp_forward_request_to_next_lower,
+    DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, ResourceKind, pnp,
 };
 
 use kernel_api::println;
@@ -644,7 +643,7 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
     };
 
     let mut handle = RequestHandle::new(Pnp { request: pnp });
-    let status = pnp_forward_request_to_next_lower(device.clone(), &mut handle).await;
+    let status = pnp::send_next_lower(device.clone(), &mut handle).await;
 
     if status != DriverStatus::Success {
         println!("[PCI] parent QueryResources failed; no ECAM");

@@ -25,7 +25,7 @@ use kernel_api::memory::{
 };
 use kernel_api::println;
 use kernel_api::request::Read;
-use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
+use kernel_api::request::{RequestHandle, Write};
 use kernel_api::runtime::spawn_detached;
 use spin::Mutex;
 
@@ -539,8 +539,6 @@ where
             next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
 
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
         let status = self.backend.write_request(&mut req).await;
         drop(req);
 
@@ -875,8 +873,6 @@ where
                 buffer: Some(io_buf),
                 next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             });
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
             self.backend
                 .read_request(&mut req)
                 .await
@@ -1055,8 +1051,6 @@ where
             buffer: Some(buffer),
             next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
-
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = self.backend.write_request(&mut req).await;
         drop(req);
@@ -1519,7 +1513,6 @@ where
         }
 
         if result.is_ok() {
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
             result = self
                 .backend
                 .write_request(&mut req)
@@ -2279,7 +2272,6 @@ where
                 w.body.len = len;
             }
 
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
             self.backend
                 .read_request(req)
                 .await
@@ -2307,7 +2299,6 @@ where
                     w.body.len = len;
                 }
 
-                req.set_traversal_policy(TraversalPolicy::ForwardLower);
                 self.backend
                     .read_request(req)
                     .await
@@ -2375,7 +2366,6 @@ where
                 w.body.len = len;
             }
 
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
             self.backend
                 .write_request(req)
                 .await
@@ -2403,7 +2393,6 @@ where
                     w.body.len = len;
                 }
 
-                req.set_traversal_policy(TraversalPolicy::ForwardLower);
                 self.backend
                     .write_request(req)
                     .await

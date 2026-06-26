@@ -1,4 +1,3 @@
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::future::Future;
 use core::pin::Pin;
@@ -10,7 +9,7 @@ use kernel_types::io::{DeviceOps, IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
 use kernel_types::request::{
     DeviceControl, Dummy, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Pnp, Read, RequestHandle,
-    RequestKind, TraversalPolicy, Write,
+    RequestKind, Write,
 };
 use kernel_types::status::DriverStatus;
 
@@ -71,38 +70,13 @@ macro_rules! println {
 }
 
 pub trait RoutedRequest: RequestKind + Sized {
-    #[inline]
-    fn validate_policy(_policy: TraversalPolicy) -> Result<(), DriverStatus> {
-        Ok(())
-    }
-
     fn invoke_at<'a, 'req>(
         dev: &'a Arc<DeviceObject>,
         handle: &'a mut RequestHandle<'req, Self>,
     ) -> impl Future<Output = Option<DriverStep>> + Send + 'a;
-
-    #[inline]
-    fn next_device(
-        dev: &Arc<DeviceObject>,
-        policy: TraversalPolicy,
-    ) -> Result<Arc<DeviceObject>, DriverStatus> {
-        match policy {
-            TraversalPolicy::ForwardLower => dev
-                .lower_device
-                .get()
-                .cloned()
-                .ok_or(DriverStatus::NotImplemented),
-            TraversalPolicy::ForwardUpper => dev
-                .upper_device
-                .get()
-                .and_then(|w| w.upgrade())
-                .ok_or(DriverStatus::NotImplemented),
-            TraversalPolicy::FailIfUnhandled => Err(DriverStatus::NotImplemented),
-        }
-    }
 }
 
-trait IoSlotRequest: RequestKind + Sized {
+pub trait IoRequest: RoutedRequest {
     type Handler: Copy;
 
     fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>>;
@@ -114,7 +88,7 @@ trait IoSlotRequest: RequestKind + Sized {
     ) -> FfiFuture<DriverStep>;
 }
 
-impl<'io> IoSlotRequest for Read<'io> {
+impl<'io> IoRequest for Read<'io> {
     type Handler = kernel_types::EvtIoRead;
 
     #[inline]
@@ -132,7 +106,7 @@ impl<'io> IoSlotRequest for Read<'io> {
     }
 }
 
-impl<'io> IoSlotRequest for Write<'io> {
+impl<'io> IoRequest for Write<'io> {
     type Handler = kernel_types::EvtIoWrite;
 
     #[inline]
@@ -149,7 +123,7 @@ impl<'io> IoSlotRequest for Write<'io> {
         handler(dev, handle)
     }
 }
-impl IoSlotRequest for Flush {
+impl IoRequest for Flush {
     type Handler = kernel_types::EvtIoFlush;
 
     #[inline]
@@ -167,7 +141,7 @@ impl IoSlotRequest for Flush {
     }
 }
 
-impl IoSlotRequest for FlushDirty {
+impl IoRequest for FlushDirty {
     type Handler = kernel_types::EvtIoFlushDirty;
 
     #[inline]
@@ -185,7 +159,7 @@ impl IoSlotRequest for FlushDirty {
     }
 }
 
-impl IoSlotRequest for FlushOwner {
+impl IoRequest for FlushOwner {
     type Handler = kernel_types::EvtIoFlushOwner;
 
     #[inline]
@@ -203,7 +177,7 @@ impl IoSlotRequest for FlushOwner {
     }
 }
 
-impl<'data> IoSlotRequest for DeviceControl<'data> {
+impl<'data> IoRequest for DeviceControl<'data> {
     type Handler = kernel_types::EvtIoDeviceControl;
 
     #[inline]
@@ -221,9 +195,12 @@ impl<'data> IoSlotRequest for DeviceControl<'data> {
     }
 }
 
-impl<'data, O> IoSlotRequest for Fs<'data, O>
+impl<'data, O> IoRequest for Fs<'data, O>
 where
-    O: FsOperation,
+    O: FsOperation + Send,
+    O::Handler: Sync,
+    for<'any> O::Params<'any>: Send,
+    O::Result: Send,
 {
     type Handler = O::Handler;
 
@@ -243,7 +220,7 @@ where
     }
 }
 
-async fn invoke_io_handler<K: IoSlotRequest>(
+async fn invoke_io_handler<K: IoRequest>(
     dev: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_, K>,
 ) -> Option<DriverStep> {
@@ -324,15 +301,6 @@ where
 }
 
 impl<'data> RoutedRequest for Pnp<'data> {
-    #[inline]
-    fn validate_policy(policy: TraversalPolicy) -> Result<(), DriverStatus> {
-        if policy == TraversalPolicy::ForwardLower {
-            Ok(())
-        } else {
-            Err(DriverStatus::InvalidParameter)
-        }
-    }
-
     fn invoke_at<'a, 'req>(
         dev: &'a Arc<DeviceObject>,
         handle: &'a mut RequestHandle<'req, Self>,
@@ -340,13 +308,6 @@ impl<'data> RoutedRequest for Pnp<'data> {
         async move { pnp_minor_dispatch(dev, handle).await }
     }
 
-    #[inline]
-    fn next_device(
-        dev: &Arc<DeviceObject>,
-        _policy: TraversalPolicy,
-    ) -> Result<Arc<DeviceObject>, DriverStatus> {
-        dev.lower_device.get().cloned().ok_or(DriverStatus::Success)
-    }
 }
 
 impl RoutedRequest for Dummy {
@@ -358,88 +319,13 @@ impl RoutedRequest for Dummy {
         async move { None }
     }
 
-    #[inline]
-    fn next_device(
-        _dev: &Arc<DeviceObject>,
-        _policy: TraversalPolicy,
-    ) -> Result<Arc<DeviceObject>, DriverStatus> {
-        Err(DriverStatus::Success)
-    }
 }
 
-/// Send a request to a target device.
-/// This is the main entry point for request routing.
-pub async fn send_request<K: RoutedRequest>(
-    target: IoTarget,
-    handle: &mut RequestHandle<'_, K>,
-) -> DriverStatus {
+fn prepare_request<K: RequestKind>(handle: &mut RequestHandle<'_, K>) {
     {
         let guard = handle.write();
         guard.status = DriverStatus::ContinueStep;
         guard.completed = false;
-    }
-
-    let policy = handle.read().traversal_policy;
-    call_device_handler(target, handle, policy).await
-}
-
-/// Forward a request to the next lower device in the stack.
-pub async fn send_request_to_next_lower<K: RoutedRequest>(
-    from: Arc<DeviceObject>,
-    handle: &mut RequestHandle<'_, K>,
-) -> DriverStatus {
-    let Some(target_dev) = from.lower_device.get() else {
-        return DriverStatus::NoSuchDevice;
-    };
-
-    send_request(target_dev.clone(), handle).await
-}
-
-/// Forward a request to the next upper device in the stack.
-pub async fn send_request_to_next_upper<K: RoutedRequest>(
-    from: Arc<DeviceObject>,
-    handle: &mut RequestHandle<'_, K>,
-) -> DriverStatus {
-    let Some(target_dev_weak) = from.upper_device.get() else {
-        return DriverStatus::NoSuchDevice;
-    };
-
-    let Some(up) = target_dev_weak.upgrade() else {
-        return DriverStatus::NoSuchDevice;
-    };
-
-    send_request(up, handle).await
-}
-
-/// Send a request via a symlink path.
-pub async fn send_request_via_symlink<K: RoutedRequest>(
-    link_path: String,
-    handle: &mut RequestHandle<'_, K>,
-) -> DriverStatus {
-    match resolve_path_to_device(&link_path) {
-        Some(tgt) => send_request(tgt, handle).await,
-        None => DriverStatus::NoSuchDevice,
-    }
-}
-
-/// Send an IOCTL request via a symlink path.
-pub async fn ioctl_via_symlink<'data>(
-    link_path: String,
-    control_code: u32,
-    handle: &mut RequestHandle<'_, DeviceControl<'data>>,
-) -> DriverStatus {
-    handle.write().body.code = control_code;
-    send_request_via_symlink(link_path, handle).await
-}
-
-/// Send a request to the top of a device stack.
-pub async fn send_request_to_stack_top<K: RoutedRequest>(
-    dev_node_weak: Weak<DevNode>,
-    handle: &mut RequestHandle<'_, K>,
-) -> DriverStatus {
-    match get_stack_top_from_weak(&dev_node_weak) {
-        Some(tgt) => send_request(tgt, handle).await,
-        None => DriverStatus::NoSuchDevice,
     }
 }
 
@@ -459,29 +345,203 @@ fn complete_with_status<K: RequestKind>(
     complete_request(handle)
 }
 
-async fn call_device_handler<K: RoutedRequest>(
+async fn call_one_device<K: RoutedRequest>(
+    dev: &Arc<DeviceObject>,
+    handle: &mut RequestHandle<'_, K>,
+) -> DriverStatus {
+    match K::invoke_at(dev, handle).await {
+        Some(DriverStep::Complete { status }) => complete_with_status(handle, status),
+        Some(DriverStep::Continue) | None => complete_with_status(handle, DriverStatus::NotImplemented),
+    }
+}
+
+async fn call_io_down_stack<K: IoRequest>(
     mut dev: Arc<DeviceObject>,
     handle: &mut RequestHandle<'_, K>,
-    policy: TraversalPolicy,
 ) -> DriverStatus {
-    if let Err(status) = K::validate_policy(policy) {
-        return complete_with_status(handle, status);
-    }
-
     loop {
         match K::invoke_at(&dev, handle).await {
             Some(DriverStep::Complete { status }) => {
                 return complete_with_status(handle, status);
             }
-            Some(DriverStep::Continue) | None => match K::next_device(&dev, policy) {
-                Ok(n) => {
+            Some(DriverStep::Continue) => {
+                return complete_with_status(handle, DriverStatus::NotImplemented);
+            }
+            None => match dev.lower_device.get().cloned() {
+                Some(n) => {
                     dev = n;
                 }
-                Err(status) => {
+                None => {
+                    return complete_with_status(handle, DriverStatus::NotImplemented);
+                }
+            },
+        }
+    }
+}
+
+async fn call_pnp_down_stack<'data>(
+    mut dev: Arc<DeviceObject>,
+    handle: &mut RequestHandle<'_, Pnp<'data>>,
+) -> DriverStatus {
+    loop {
+        match Pnp::invoke_at(&dev, handle).await {
+            Some(DriverStep::Complete { status }) => {
+                return complete_with_status(handle, status);
+            }
+            Some(DriverStep::Continue) | None => match dev.lower_device.get().cloned() {
+                Some(n) => {
+                    dev = n;
+                }
+                None => {
+                    let status = handle.read().body.request.minor_function.default_status_for_unhandled();
                     return complete_with_status(handle, status);
                 }
             },
         }
+    }
+}
+
+pub mod io {
+    use super::*;
+
+    /// Dispatches an I/O request to exactly `target`.
+    ///
+    /// The request does not traverse to lower or upper devices. If `target` has no handler for
+    /// the request kind, or the handler returns `Continue`, the request completes with
+    /// `NotImplemented`.
+    pub async fn send_to_device<K: IoRequest>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        prepare_request(handle);
+        call_one_device(&target, handle).await
+    }
+
+    /// Dispatches an I/O request downward through the current device stack starting at `target`.
+    ///
+    /// Each device is tried until a handler completes the request. Missing handlers move to the
+    /// next lower device in the same stack. The traversal never crosses into a parent or child
+    /// devnode. If the stack exists but no device handles the request, the request completes with
+    /// `NotImplemented`.
+    pub async fn send_down_stack<K: IoRequest>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        prepare_request(handle);
+        call_io_down_stack(target, handle).await
+    }
+
+    /// Dispatches an I/O request downward starting at `from.lower_device`.
+    ///
+    /// The traversal remains within the current device stack. If `from` has no lower device, the
+    /// request completes with `NoSuchDevice`. If lower devices exist but none handle the request,
+    /// it completes with `NotImplemented`.
+    pub async fn send_next_lower<K: IoRequest>(
+        from: Arc<DeviceObject>,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        let Some(target) = from.lower_device.get().cloned() else {
+            return complete_with_status(handle, DriverStatus::NoSuchDevice);
+        };
+
+        send_down_stack(target, handle).await
+    }
+
+    /// Dispatches an I/O request downward from the top device in `dev_node_weak`'s stack.
+    ///
+    /// The traversal remains within that single stack. If the devnode cannot be resolved to a
+    /// stack top or PDO, the request completes with `NoSuchDevice`. If a stack is found but no
+    /// device handles the request, it completes with `NotImplemented`.
+    pub async fn send_to_stack_top<K: IoRequest>(
+        dev_node_weak: Weak<DevNode>,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        match get_stack_top_from_weak(&dev_node_weak) {
+            Some(target) => send_down_stack(target, handle).await,
+            None => complete_with_status(handle, DriverStatus::NoSuchDevice),
+        }
+    }
+
+    /// Resolves `link_path` to a device object without dispatching a request.
+    ///
+    /// Callers must choose an explicit traversal helper after resolving the target, such as
+    /// `send_to_device` or `send_down_stack`.
+    pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
+        resolve_path_to_device(link_path)
+    }
+}
+
+pub mod pnp {
+    use super::*;
+
+    /// Dispatches a PnP request to exactly `target`.
+    ///
+    /// The request does not traverse to lower or upper devices. If `target` has no handler for the
+    /// PnP minor, the request completes with that minor's default unhandled status.
+    pub async fn send_to_device<'data>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        prepare_request(handle);
+        match Pnp::invoke_at(&target, handle).await {
+            Some(DriverStep::Complete { status }) => complete_with_status(handle, status),
+            Some(DriverStep::Continue) | None => {
+                let status = handle.read().body.request.minor_function.default_status_for_unhandled();
+                complete_with_status(handle, status)
+            }
+        }
+    }
+
+    /// Dispatches a PnP request downward through the current device stack starting at `target`.
+    ///
+    /// Missing handlers and `Continue` move to the next lower device in the same stack. The
+    /// traversal never crosses into parent or child devnodes. If the stack ends unhandled, the
+    /// request completes with the PnP minor's default unhandled status.
+    pub async fn send_down_stack<'data>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        prepare_request(handle);
+        call_pnp_down_stack(target, handle).await
+    }
+
+    /// Dispatches a PnP request downward starting at `from.lower_device`.
+    ///
+    /// The traversal remains within the current device stack. If `from` has no lower device, the
+    /// request completes with `NoSuchDevice`. If the lower stack ends unhandled, the request
+    /// completes with the PnP minor's default unhandled status.
+    pub async fn send_next_lower<'data>(
+        from: Arc<DeviceObject>,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        let Some(target) = from.lower_device.get().cloned() else {
+            return complete_with_status(handle, DriverStatus::NoSuchDevice);
+        };
+
+        send_down_stack(target, handle).await
+    }
+
+    /// Dispatches a PnP request downward from the top device in `dev_node_weak`'s stack.
+    ///
+    /// The traversal remains within that single stack. If the devnode cannot be resolved to a
+    /// stack top or PDO, the request completes with `NoSuchDevice`. If a stack is found but ends
+    /// unhandled, it completes with the PnP minor's default unhandled status.
+    pub async fn send_to_stack_top<'data>(
+        dev_node_weak: Weak<DevNode>,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        match get_stack_top_from_weak(&dev_node_weak) {
+            Some(target) => send_down_stack(target, handle).await,
+            None => complete_with_status(handle, DriverStatus::NoSuchDevice),
+        }
+    }
+
+    /// Resolves `link_path` to a device object without dispatching a request.
+    ///
+    /// Callers must choose an explicit traversal helper after resolving the target, such as
+    /// `send_to_device` or `send_down_stack`.
+    pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
+        resolve_path_to_device(link_path)
     }
 }
 

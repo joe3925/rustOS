@@ -13,10 +13,10 @@ use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
-use kernel_api::pnp::{DriverStep, pnp_send_request};
+use kernel_api::pnp::{DriverStep, io};
 use kernel_api::request::{
     FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, RequestHandle, TraversalPolicy,
+    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, RequestHandle,
 };
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
@@ -338,8 +338,7 @@ async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: boo
         owner,
         should_block,
     });
-    flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = pnp_send_request(volume_target, &mut flush_req).await;
+    let status = io::send_down_stack(volume_target, &mut flush_req).await;
     status
 }
 

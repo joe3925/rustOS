@@ -19,8 +19,8 @@ use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
     deallocate_kernel_range, unmap_range,
 };
-use kernel_api::pnp::pnp_send_request;
-use kernel_api::request::{Read, RequestHandle, TraversalPolicy};
+use kernel_api::pnp::io;
+use kernel_api::request::{Read, RequestHandle};
 use kernel_api::runtime::{cycle_counter, spawn};
 use kernel_api::status::DriverStatus;
 use spin::Mutex;
@@ -632,10 +632,8 @@ async fn bench_read_via_request(
             next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
 
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
         let start_cycles = cycle_counter();
-        let status = pnp_send_request(target, &mut req).await;
+        let status = io::send_down_stack(target, &mut req).await;
         let end_cycles = cycle_counter();
         let cycles = end_cycles.saturating_sub(start_cycles);
 

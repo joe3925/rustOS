@@ -62,7 +62,6 @@ use kernel_types::{
     irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, MsiMessage, MsiRequest},
     pci::PciConfigAddress,
     pnp::{DeviceIds, DeviceRelationType},
-    request::{DeviceControl, RequestHandle, RequestKind},
     runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
@@ -392,81 +391,6 @@ pub extern "C" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), 
 
 pub extern "C" fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget> {
     PNP_MANAGER.get_device_target(instance_path)
-}
-
-pub async fn pnp_forward_request_to_next_lower<'req, K>(
-    from: &Arc<DeviceObject>,
-    handle: &mut RequestHandle<'req, K>,
-) -> DriverStatus
-where
-    K: kernel_routing::RoutedRequest,
-{
-    PNP_MANAGER
-        .send_request_to_next_lower(from.clone(), handle)
-        .await
-}
-
-pub async fn pnp_forward_request_to_next_upper<'req, K>(
-    from: &Arc<DeviceObject>,
-    handle: &mut RequestHandle<'req, K>,
-) -> DriverStatus
-where
-    K: kernel_routing::RoutedRequest,
-{
-    PNP_MANAGER
-        .send_request_to_next_upper(from.clone(), handle)
-        .await
-}
-
-pub async fn pnp_send_request<'req, K>(
-    target: IoTarget,
-    handle: &mut RequestHandle<'req, K>,
-) -> DriverStatus
-where
-    K: kernel_routing::RoutedRequest,
-{
-    PNP_MANAGER.send_request(target, handle).await
-}
-
-pub fn pnp_complete_request<'req, K>(handle: &mut RequestHandle<'req, K>) -> DriverStatus
-where
-    K: RequestKind,
-{
-    PNP_MANAGER.complete_request(handle)
-}
-
-pub async fn pnp_send_request_via_symlink<'req, K>(
-    link_path: String,
-    handle: &mut RequestHandle<'req, K>,
-) -> DriverStatus
-where
-    K: kernel_routing::RoutedRequest,
-{
-    PNP_MANAGER
-        .send_request_via_symlink(link_path, handle)
-        .await
-}
-
-pub async fn pnp_ioctl_via_symlink<'req, 'data>(
-    link_path: String,
-    control_code: u32,
-    handle: &mut RequestHandle<'req, DeviceControl<'data>>,
-) -> DriverStatus {
-    PNP_MANAGER
-        .ioctl_via_symlink(link_path, control_code, handle)
-        .await
-}
-
-pub async fn pnp_send_request_to_stack_top<'req, K>(
-    dev_node_weak: alloc::sync::Weak<DevNode>,
-    handle: &mut RequestHandle<'req, K>,
-) -> DriverStatus
-where
-    K: kernel_routing::RoutedRequest,
-{
-    PNP_MANAGER
-        .send_request_to_stack_top(dev_node_weak, handle)
-        .await
 }
 
 pub extern "C" fn pnp_queue_dpc(func: DpcFn, arg: usize) {

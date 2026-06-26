@@ -10,16 +10,94 @@ use kernel_types::{ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload};
 
 pub use kernel_types::pnp::*;
 
-// Re-export routing functions from kernel_routing crate
-// These now compile per-driver, eliminating one FFI future boundary
-pub use kernel_routing::{
-    complete_request as pnp_complete_request, ioctl_via_symlink as pnp_ioctl_via_symlink,
-    send_request as pnp_send_request,
-    send_request_to_next_lower as pnp_forward_request_to_next_lower,
-    send_request_to_next_upper as pnp_forward_request_to_next_upper,
-    send_request_to_stack_top as pnp_send_request_to_stack_top,
-    send_request_via_symlink as pnp_send_request_via_symlink,
-};
+pub mod io {
+    use alloc::sync::{Arc, Weak};
+    use kernel_types::device::{DevNode, DeviceObject};
+    use kernel_types::io::IoTarget;
+    use kernel_types::request::RequestHandle;
+    use kernel_types::status::DriverStatus;
+    use kernel_routing::IoRequest;
+
+    pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
+        kernel_routing::io::resolve_target(link_path)
+    }
+
+    pub async fn send_to_device<K: IoRequest>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        kernel_routing::io::send_to_device(target, handle).await
+    }
+
+    pub async fn send_down_stack<K: IoRequest>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        kernel_routing::io::send_down_stack(target, handle).await
+    }
+
+    pub async fn send_next_lower<K: IoRequest>(
+        from: Arc<DeviceObject>,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        kernel_routing::io::send_next_lower(from, handle).await
+    }
+
+    pub async fn send_to_stack_top<K: IoRequest>(
+        dev_node_weak: Weak<DevNode>,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
+        kernel_routing::io::send_to_stack_top(dev_node_weak, handle).await
+    }
+
+}
+
+pub mod pnp {
+    use alloc::sync::{Arc, Weak};
+    use kernel_types::device::{DevNode, DeviceObject};
+    use kernel_types::io::IoTarget;
+    use kernel_types::request::{Pnp, RequestHandle};
+    use kernel_types::status::DriverStatus;
+
+    pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
+        kernel_routing::pnp::resolve_target(link_path)
+    }
+
+    pub async fn send_to_device<'data>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        kernel_routing::pnp::send_to_device(target, handle).await
+    }
+
+    pub async fn send_down_stack<'data>(
+        target: IoTarget,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        kernel_routing::pnp::send_down_stack(target, handle).await
+    }
+
+    pub async fn send_next_lower<'data>(
+        from: Arc<DeviceObject>,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        kernel_routing::pnp::send_next_lower(from, handle).await
+    }
+
+    pub async fn send_to_stack_top<'data>(
+        dev_node_weak: Weak<DevNode>,
+        handle: &mut RequestHandle<'_, Pnp<'data>>,
+    ) -> DriverStatus {
+        kernel_routing::pnp::send_to_stack_top(dev_node_weak, handle).await
+    }
+
+}
+
+pub fn complete_request<K: kernel_types::request::RequestKind>(
+    handle: &mut kernel_types::request::RequestHandle<'_, K>,
+) -> DriverStatus {
+    kernel_routing::complete_request(handle)
+}
 
 pub fn create_pdo(
     parent: &Arc<DevNode>,

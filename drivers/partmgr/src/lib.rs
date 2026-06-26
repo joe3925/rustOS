@@ -24,11 +24,10 @@ use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
-    pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
-    pnp_send_request_to_stack_top,
+    io, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{
-    DeviceControl, Flush, FlushDirty, Pnp, Read, RequestHandle, TraversalPolicy, Write,
+    DeviceControl, Flush, FlushDirty, Pnp, Read, RequestHandle, Write,
 };
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
@@ -248,9 +247,7 @@ impl DeviceRead for PartitionPdoIo {
             }
         }
 
-        request.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
 
         DriverStep::complete(status)
     }
@@ -306,9 +303,7 @@ impl DeviceWrite for PartitionPdoIo {
             }
         }
 
-        request.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
 
         DriverStep::complete(status)
     }
@@ -320,8 +315,7 @@ impl DeviceFlush for PartitionPdoIo {
         request: &'b mut RequestHandle<'req, Flush>,
     ) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
-        request.set_traversal_policy(TraversalPolicy::ForwardLower);
-        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
 
         DriverStep::complete(status)
     }
@@ -334,8 +328,7 @@ impl DeviceFlushDirty for PartitionPdoIo {
         request: &'b mut RequestHandle<'req, FlushDirty>,
     ) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
-        request.set_traversal_policy(TraversalPolicy::ForwardLower);
-        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
 
         DriverStep::complete(status)
     }
@@ -369,9 +362,7 @@ async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
         return DriverStep::complete(DriverStatus::NoSuchDevice);
     };
 
-    request.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-    let status = pnp_send_request_to_stack_top(parent.clone(), request).await;
+    let status = pnp::send_to_stack_top(parent.clone(), request).await;
 
     DriverStep::complete(status)
 }
@@ -386,8 +377,7 @@ pub async fn partmgr_start<'req, 'data, 'b>(
         IOCTL_DRIVE_IDENTIFY,
         RequestData::empty(),
     ));
-    parent_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut parent_req).await;
+    let status = io::send_next_lower(dev.clone(), &mut parent_req).await;
     if status != DriverStatus::Success {
         return DriverStep::complete(status);
     }
@@ -423,9 +413,7 @@ async fn read_from_lower_async(
         ),
         next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
-    child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;
+    let status = io::send_next_lower(dev.clone(), &mut child_req).await;
 
     drop(child_req);
     drop(io_buf);

@@ -23,9 +23,9 @@ use kernel_api::{
     },
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-        driver_set_evt_device_add, pnp_forward_request_to_next_lower,
+        driver_set_evt_device_add, io, pnp,
     },
-    request::{DeviceControl, Flush, Pnp, Read, RequestHandle, TraversalPolicy, Write},
+    request::{DeviceControl, Flush, Pnp, Read, RequestHandle, Write},
     request_handler,
     status::DriverStatus,
 };
@@ -172,8 +172,7 @@ impl DeviceRead for DiskIo {
             return DriverStep::complete(DriverStatus::Success);
         }
 
-        req.write().traversal_policy = TraversalPolicy::ForwardLower;
-        DriverStep::Continue
+        DriverStep::complete(io::send_next_lower(dev.clone(), req).await)
     }
 }
 
@@ -215,8 +214,7 @@ impl DeviceWrite for DiskIo {
             return DriverStep::complete(DriverStatus::Success);
         }
 
-        req.write().traversal_policy = TraversalPolicy::ForwardLower;
-        DriverStep::Continue
+        DriverStep::complete(io::send_next_lower(dev.clone(), req).await)
     }
 }
 impl DeviceFlush for DiskIo {
@@ -225,7 +223,7 @@ impl DeviceFlush for DiskIo {
         _dev: &Arc<DeviceObject>,
         _req: &'b mut RequestHandle<'req, Flush>,
     ) -> DriverStep {
-        DriverStep::Continue
+        DriverStep::complete(io::send_next_lower(_dev.clone(), _req).await)
     }
 }
 
@@ -249,7 +247,7 @@ impl DeviceControlHandler for DiskIo {
                     },
                 });
 
-                let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
+                let st = pnp::send_next_lower(dev.clone(), &mut ch).await;
                 if unlikely(st != DriverStatus::Success) {
                     cold_path();
                     return DriverStep::complete(st);
@@ -280,7 +278,7 @@ impl DeviceControlHandler for DiskIo {
                 req.write().body.set_data_t::<DiskInfo>(info);
                 DriverStep::complete(DriverStatus::Success)
             }
-            _ => DriverStep::Continue,
+            _ => DriverStep::complete(io::send_next_lower(dev.clone(), req).await),
         }
     }
 }
@@ -354,7 +352,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
             data_out: RequestData::empty(),
         },
     });
-    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
+    let st = pnp::send_next_lower(dev.clone(), &mut ch).await;
 
     if unlikely(st != DriverStatus::Success) {
         cold_path();

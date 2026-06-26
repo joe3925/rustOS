@@ -28,8 +28,7 @@ use kernel_api::{
     memory::{VirtAddr, unmap_mmio_region},
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-        driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
-        pnp_forward_request_to_next_lower,
+        driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
     },
     println,
     request::{DeviceControl, Pnp, RequestHandle},
@@ -106,7 +105,7 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
         },
     });
 
-    let st = pnp_forward_request_to_next_lower(device.clone(), &mut query_handle).await;
+    let st = pnp::send_next_lower(device.clone(), &mut query_handle).await;
 
     if st != DriverStatus::NoSuchDevice {
         let qst = st;

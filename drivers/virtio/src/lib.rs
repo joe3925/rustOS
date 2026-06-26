@@ -45,8 +45,7 @@ use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-    driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
-    pnp_forward_request_to_next_lower,
+    driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{DeviceControl, Pnp, RequestHandle, RequestKind};
 use kernel_api::runtime::{KernelStopwatch, cycle_counter, spawn_detached};
@@ -372,7 +371,7 @@ async fn setup_msix_via_pci(
     );
 
     let mut req = RequestHandle::new(DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup));
-    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut req).await;
+    let status = kernel_api::pnp::io::send_next_lower(dev.clone(), &mut req).await;
 
     if status == DriverStatus::Success {
         Ok(())
@@ -394,7 +393,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
             data_out: RequestData::empty(),
         },
     });
-    let qr_status = pnp_forward_request_to_next_lower(dev.clone(), &mut query_req).await;
+    let qr_status = pnp::send_next_lower(dev.clone(), &mut query_req).await;
     if qr_status != DriverStatus::Success {
         println!("virtio-blk: QueryResources failed: {:?}", qr_status);
         return complete_req(req, qr_status);

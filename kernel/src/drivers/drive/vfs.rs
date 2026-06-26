@@ -10,7 +10,7 @@ use kernel_types::fs::{Path, *};
 use kernel_types::io::IoTarget;
 use kernel_types::request::{
     Fs, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsOperation, FsPayload, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, RequestHandle, TraversalPolicy,
+    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, RequestHandle,
 };
 use kernel_types::status::{DriverStatus, FileStatus};
 
@@ -157,7 +157,7 @@ impl Vfs {
     ) -> Result<O::Result, DriverStatus>
     where
         O: FsOperation + 'data,
-        Fs<'data, O>: kernel_routing::RoutedRequest,
+        Fs<'data, O>: kernel_routing::IoRequest,
     {
         let mut request_handle = RequestHandle::new(Fs::<O> {
             payload: FsPayload {
@@ -166,15 +166,13 @@ impl Vfs {
                 _marker: PhantomData,
             },
         });
-        request_handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-
         let status = {
             if let Some(tgt) = target {
-                PNP_MANAGER.send_request(tgt, &mut request_handle).await
+                kernel_routing::io::send_down_stack(tgt, &mut request_handle).await
+            } else if let Some(tgt) = PNP_MANAGER.resolve_targetio_from_symlink_ref(volume_symlink) {
+                kernel_routing::io::send_down_stack(tgt, &mut request_handle).await
             } else {
-                PNP_MANAGER
-                    .send_request_via_symlink(volume_symlink.to_string(), &mut request_handle)
-                    .await
+                DriverStatus::NoSuchDevice
             }
         };
         if status != DriverStatus::Success {

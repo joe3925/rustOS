@@ -3,7 +3,7 @@ use core::mem::size_of;
 
 use crate::request::{
     BorrowedHandle, DeviceControl, RequestData, RequestDataError, RequestHandle, RequestPayload,
-    TraversalPolicy, type_name_stripped, type_tag,
+    type_name_stripped, type_tag,
 };
 
 #[repr(C)]
@@ -122,17 +122,7 @@ fn request_handle_owns_request_state_and_data_view() {
     assert!(handle.is_owned());
     assert!(!handle.is_stack());
     assert_eq!(handle.status(), crate::status::DriverStatus::ContinueStep);
-    assert_eq!(
-        handle.read().traversal_policy,
-        TraversalPolicy::FailIfUnhandled
-    );
     assert_eq!(handle.read().body.code, 0x100);
-
-    handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-    assert_eq!(
-        handle.read().traversal_policy,
-        TraversalPolicy::ForwardLower
-    );
 
     let view = handle.data().try_writable().unwrap();
     assert_eq!(view.view::<SmallPayload>().unwrap().flags, 3);

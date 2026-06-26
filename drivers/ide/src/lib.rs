@@ -35,8 +35,7 @@ use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-    ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
-    pnp_forward_request_to_next_lower,
+    ResourceKind, driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{DeviceControl, Pnp, Read, RequestHandle, RequestKind, Write};
 use kernel_api::request_handler;
@@ -652,7 +651,7 @@ async fn ide_pnp_start<'req, 'data, 'b>(
         },
     });
 
-    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child_handle).await;
+    let st = pnp::send_next_lower(dev.clone(), &mut child_handle).await;
 
     if st != DriverStatus::NoSuchDevice {
         let qst = child_handle.read().status.clone();

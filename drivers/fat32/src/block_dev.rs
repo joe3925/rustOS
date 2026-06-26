@@ -12,9 +12,9 @@ use kernel_api::{
         },
         io::IoTarget,
     },
-    pnp::pnp_send_request,
+    pnp::io,
     println,
-    request::{Read as ReadRequest, RequestHandle, TraversalPolicy, Write as WriteRequest},
+    request::{Read as ReadRequest, RequestHandle, Write as WriteRequest},
     status::DriverStatus,
 };
 
@@ -121,9 +121,7 @@ impl BlockDev {
             next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
 
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-        let status = pnp_send_request(volume, &mut req).await;
+        let status = io::send_down_stack(volume, &mut req).await;
 
         drop(req);
 
@@ -182,9 +180,7 @@ impl BlockDev {
             next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
         });
 
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-        let status = pnp_send_request(volume, &mut req).await;
+        let status = io::send_down_stack(volume, &mut req).await;
 
         drop(req);
 

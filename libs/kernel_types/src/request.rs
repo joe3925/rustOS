@@ -22,7 +22,6 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicBool;
 use core::{
     alloc::Layout,
     marker::PhantomData,
@@ -1038,14 +1037,6 @@ impl<'data> RequestData<'data> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum TraversalPolicy {
-    ForwardLower,
-    FailIfUnhandled,
-    ForwardUpper,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
 pub enum RequestMajor {
     Read,
     Write,
@@ -1478,15 +1469,6 @@ impl RequestKind for Dummy {
 }
 
 #[inline]
-fn default_policy_for<K: RequestKind>() -> TraversalPolicy {
-    if K::MAJOR == RequestMajor::Pnp {
-        TraversalPolicy::ForwardLower
-    } else {
-        TraversalPolicy::FailIfUnhandled
-    }
-}
-
-#[inline]
 fn request_data_view<'a, 'data>(data: &'a mut RequestData<'data>) -> RequestDataView<'a, 'data> {
     match data.mode {
         StorageMode::BorrowedReadOnly => RequestDataView::ReadOnly(RequestDataRef {
@@ -1520,7 +1502,6 @@ pub struct Request<K: RequestKind> {
     pub body: K,
     pub completed: bool,
     pub status: DriverStatus,
-    pub traversal_policy: TraversalPolicy,
     pub completion_routine: Option<CompletionRoutine<K>>,
     pub completion_context: usize,
     completion_is_chain: bool,
@@ -1530,27 +1511,15 @@ pub struct Request<K: RequestKind> {
 impl<K: RequestKind> Request<K> {
     #[inline]
     pub fn new(body: K) -> Self {
-        Self::with_policy(body, default_policy_for::<K>())
-    }
-
-    #[inline]
-    pub fn with_policy(body: K, policy: TraversalPolicy) -> Self {
         Self {
             body,
             completed: false,
             status: DriverStatus::ContinueStep,
-            traversal_policy: policy,
             completion_routine: None,
             completion_context: 0,
             completion_is_chain: false,
             completion_chain: None,
         }
-    }
-
-    #[inline]
-    pub fn set_traversal_policy(mut self, policy: TraversalPolicy) -> Self {
-        self.traversal_policy = policy;
-        self
     }
 
     pub fn add_completion(&mut self, func: CompletionRoutine<K>, ctx: usize) {
@@ -1622,12 +1591,11 @@ where
     /// Print all fields except the actual data payloads.
     pub fn print_meta(&self) -> alloc::string::String {
         alloc::format!(
-            "Request {{ major: {:?}, body: {:?}, completed: {}, status: {:?}, traversal_policy: {:?}, completion_routine: {:?}, completion_context: {:#x} }}",
+            "Request {{ major: {:?}, body: {:?}, completed: {}, status: {:?}, completion_routine: {:?}, completion_context: {:#x} }}",
             K::MAJOR,
             self.body,
             self.completed,
             self.status,
-            self.traversal_policy,
             self.completion_routine.map(|_| "Some(fn)"),
             self.completion_context,
         )
@@ -1661,7 +1629,6 @@ impl Request<Dummy> {
             body: Dummy,
             completed: true,
             status: DriverStatus::Success,
-            traversal_policy: TraversalPolicy::FailIfUnhandled,
             completion_routine: None,
             completion_context: 0,
             completion_is_chain: false,
@@ -1723,11 +1690,6 @@ impl<'req, K: RequestKind> RequestHandle<'req, K> {
     }
 
     #[inline]
-    pub fn with_policy(body: K, policy: TraversalPolicy) -> Self {
-        RequestHandle::Owned(Request::with_policy(body, policy))
-    }
-
-    #[inline]
     pub fn is_stack(&self) -> bool {
         matches!(self, Self::Stack(_))
     }
@@ -1758,11 +1720,6 @@ impl<'req, K: RequestKind> RequestHandle<'req, K> {
             RequestHandle::Stack(r) => r,
             RequestHandle::Owned(r) => r,
         }
-    }
-
-    #[inline]
-    pub fn set_traversal_policy(&mut self, policy: TraversalPolicy) {
-        self.write().traversal_policy = policy;
     }
 
     /// Returns a raw pointer to the inner Request. Only for use by BorrowedHandle within

@@ -35,11 +35,10 @@ use kernel_api::pnp::PnpVtable;
 use kernel_api::pnp::QueryIdType;
 use kernel_api::pnp::driver_set_evt_device_add;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
-use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
-use kernel_api::pnp::pnp_send_request;
+use kernel_api::pnp::{io, pnp};
 use kernel_api::request::{
-    Flush, FlushDirty, FlushOwner, Pnp, Read, RequestHandle, TraversalPolicy, Write,
+    Flush, FlushDirty, FlushOwner, Pnp, Read, RequestHandle, Write,
 };
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
@@ -203,9 +202,7 @@ impl VolumeCacheBackend for CacheBackend {
                 buffer: Some(buffer),
                 next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             });
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
+            let status = io::send_down_stack(self.target.clone(), &mut req).await;
 
             if unlikely(status != DriverStatus::Success) {
                 cold_path();
@@ -275,8 +272,7 @@ impl VolumeCacheBackend for CacheBackend {
                 (first_offset, first_len)
             };
 
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let status = pnp_send_request(self.target.clone(), req).await;
+            let status = io::send_down_stack(self.target.clone(), req).await;
             if unlikely(status != DriverStatus::Success) {
                 cold_path();
                 println!(
@@ -354,8 +350,7 @@ impl VolumeCacheBackend for CacheBackend {
                 (first_offset, first_len)
             };
 
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let status = pnp_send_request(self.target.clone(), req).await;
+            let status = io::send_down_stack(self.target.clone(), req).await;
             if unlikely(status != DriverStatus::Success) {
                 cold_path();
                 println!(
@@ -372,8 +367,7 @@ impl VolumeCacheBackend for CacheBackend {
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let mut req = RequestHandle::new(Flush { should_block: true });
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
+            let status = io::send_down_stack(self.target.clone(), &mut req).await;
             if unlikely(status != DriverStatus::Success && status != DriverStatus::NotImplemented) {
                 cold_path();
                 println!(
@@ -400,9 +394,7 @@ impl VolumeCacheBackend for CacheBackend {
                 },
             });
 
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
+            let status = pnp::send_down_stack(self.target.clone(), &mut req).await;
 
             if unlikely(status != DriverStatus::Success) {
                 cold_path();
@@ -551,7 +543,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
         },
     });
 
-    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut query_req).await;
+    let st = pnp::send_next_lower(dev.clone(), &mut query_req).await;
     if unlikely(st == DriverStatus::NoSuchDevice) {
         cold_path();
         return DriverStep::complete(DriverStatus::Success);

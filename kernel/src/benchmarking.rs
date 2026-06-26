@@ -41,7 +41,7 @@ use kernel_types::benchmark::{
 use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
-use kernel_types::request::{DeviceControl, RequestHandle, TraversalPolicy};
+use kernel_types::request::{DeviceControl, RequestHandle};
 use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::Message;
 use serde_json::{json, Value};
@@ -4180,8 +4180,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                     IOCTL_BLOCK_BENCH_SWEEP_BOTH,
                                     requested,
                                 ));
-                                warm.set_traversal_policy(TraversalPolicy::ForwardLower);
-                                let _ = PNP_MANAGER.send_request(target.clone(), &mut warm).await;
+                                let _ = kernel_routing::io::send_down_stack(target.clone(), &mut warm).await;
                                 trial += 1;
                                 continue;
                             }
@@ -4190,7 +4189,6 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                 IOCTL_BLOCK_BENCH_SWEEP_BOTH,
                                 requested,
                             ));
-                            req.set_traversal_policy(TraversalPolicy::ForwardLower);
                             println!(
                                 "[virtio-bench] Starting trial {} for run_id {} with params: flags=0x{:X} total_bytes={} request_size={} start_sector={} max_inflight={}",
                                 trial,
@@ -4201,7 +4199,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                 start_sector,
                                 max_inflight
                             );
-                            let st = PNP_MANAGER.send_request(target.clone(), &mut req).await;
+                            let st = kernel_routing::io::send_down_stack(target.clone(), &mut req).await;
                             println!(
                                 "[virtio-bench] Completed trial {} for run_id {} with status: {:?}",
                                 trial, run_id, st

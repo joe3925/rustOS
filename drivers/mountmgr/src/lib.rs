@@ -34,11 +34,10 @@ use kernel_api::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_control_device_and_link,
         pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
-        pnp_create_symlink, pnp_ioctl_via_symlink, pnp_load_service, pnp_remove_symlink,
-        pnp_send_request_via_symlink,
+        io, pnp, pnp_create_symlink, pnp_load_service, pnp_remove_symlink,
     },
     reg::{self, switch_to_vfs_async},
-    request::{DeviceControl, Fs, FsOpen, FsPayload, Pnp, Request, RequestHandle, TraversalPolicy},
+    request::{DeviceControl, Fs, FsOpen, FsPayload, Pnp, Request, RequestHandle},
     request_handler,
     runtime::spawn_detached,
     status::{Data, DriverStatus, RegError},
@@ -322,8 +321,7 @@ async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
             data_out: RequestData::empty(),
         },
     });
-    request.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = kernel_api::pnp::pnp_send_request(vol_target, &mut request).await;
+    let status = pnp::send_down_stack(vol_target, &mut request).await;
     if status != DriverStatus::Success {
         return None;
     }
@@ -415,13 +413,11 @@ async fn try_bind_filesystems_for_parent_fdo(
                 can_mount: false,
             },
         ));
-        identify_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-        let err = pnp_ioctl_via_symlink(
-            tag.clone(),
-            kernel_api::IOCTL_FS_IDENTIFY,
-            &mut identify_req,
-        )
-        .await;
+        identify_req.write().body.code = kernel_api::IOCTL_FS_IDENTIFY;
+        let Some(target) = io::resolve_target(&tag) else {
+            continue;
+        };
+        let err = io::send_down_stack(target, &mut identify_req).await;
         if err != DriverStatus::Success {
             continue;
         }
@@ -596,9 +592,10 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
             _marker: PhantomData,
         },
     });
-    req_inner.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-    let err = pnp_send_request_via_symlink(public_link.to_string(), &mut req_inner).await;
+    let Some(target) = io::resolve_target(public_link) else {
+        return false;
+    };
+    let err = io::send_down_stack(target, &mut req_inner).await;
 
     if err != DriverStatus::Success {
         return false;

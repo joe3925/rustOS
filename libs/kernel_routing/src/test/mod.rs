@@ -8,19 +8,19 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::device::{DeviceInit, DeviceObject};
-use kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
+use kernel_types::dma::{
+    IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+};
 use kernel_types::io::{DeviceOps, DeviceRead, DeviceWrite};
 use kernel_types::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
 };
 use kernel_types::request::{
-    Dummy, Pnp, Read, Request, RequestData, RequestHandle, TraversalPolicy, Write,
+    Dummy, Pnp, Read, Request, RequestData, RequestHandle, Write,
 };
 use kernel_types::status::DriverStatus;
 
-use crate::{
-    complete_request, send_request, send_request_to_next_lower, send_request_to_next_upper,
-};
+use crate::{complete_request, io, pnp};
 
 fn noop_waker() -> Waker {
     unsafe fn clone(_: *const ()) -> RawWaker {
@@ -60,13 +60,15 @@ fn device_with_pnp(vtable: PnpVtable) -> Arc<DeviceObject> {
 extern "C" fn read_handler(
     _dev: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_, Read<'_>>,
-    len: usize,
 ) -> FfiFuture<DriverStep> {
     async move {
-        let out = handle.write().body.buffer.as_inner_mut().as_mut_slice();
-        if out.len() >= 2 {
-            out[0] = len as u8;
-            out[1] = 0xAA;
+        let len = handle.read().body.len;
+        if let Some(buffer) = handle.write().body.buffer.as_mut() {
+            let out = buffer.try_as_mut_slice().unwrap();
+            if out.len() >= 2 {
+                out[0] = len as u8;
+                out[1] = 0xAA;
+            }
         }
         DriverStep::complete(DriverStatus::Success)
     }
@@ -76,7 +78,6 @@ extern "C" fn read_handler(
 extern "C" fn write_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Write<'_>>,
-    _len: usize,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }
@@ -84,7 +85,6 @@ extern "C" fn write_handler(
 extern "C" fn continue_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Read<'_>>,
-    _len: usize,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::Continue }.into_ffi()
 }
@@ -95,9 +95,8 @@ impl DeviceRead for TestRead {
     extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Read<'data>>,
-        len: usize,
     ) -> FfiFuture<DriverStep> {
-        read_handler(dev, handle, len)
+        read_handler(dev, handle)
     }
 }
 
@@ -107,9 +106,8 @@ impl DeviceRead for ContinueRead {
     extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Read<'data>>,
-        len: usize,
     ) -> FfiFuture<DriverStep> {
-        continue_handler(dev, handle, len)
+        continue_handler(dev, handle)
     }
 }
 
@@ -119,17 +117,9 @@ impl DeviceWrite for TestWrite {
     extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Write<'data>>,
-        len: usize,
     ) -> FfiFuture<DriverStep> {
-        write_handler(dev, handle, len)
+        write_handler(dev, handle)
     }
-}
-
-extern "C" fn not_implemented_pnp(
-    _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, Pnp<'_>>,
-) -> FfiFuture<DriverStep> {
-    async { DriverStep::complete(DriverStatus::NotImplemented) }.into_ffi()
 }
 
 static COMPLETION_SUM: AtomicUsize = AtomicUsize::new(0);
@@ -172,51 +162,55 @@ fn complete_request_runs_chained_completions_once() {
 }
 
 #[test]
-fn dummy_request_completes_without_requiring_a_handler() {
-    let dev = device_without_io();
-    let mut handle = RequestHandle::new(Dummy);
-
-    let status = block_on_ready(send_request(dev, &mut handle));
-
-    assert_eq!(status, DriverStatus::Success);
-    assert!(handle.read().completed);
-}
-
-#[test]
 fn read_request_invokes_matching_io_handler_and_updates_buffer() {
     let mut ops = DeviceOps::empty();
     ops.read.register::<TestRead>();
     let dev = device_with_ops(ops);
     let mut out = [0u8; 2];
-    let mut handle = RequestHandle::new(Read {
-        offset: 5,
-        len: 12,
-        no_buffer: false,
-        buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut out),
-        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-    });
+    let status = {
+        let out_len = out.len();
+        let backing = IoBufferBacking::new(
+            IoBufferBackingDesc::SliceMut(&mut out),
+            IoBufferBackingConfig::worst_case_for_len(out_len),
+        )
+        .unwrap();
+        let buffer = backing.create_from_device(0, out_len).unwrap();
+        let mut handle = RequestHandle::new(Read {
+            offset: 5,
+            len: 12,
+            no_buffer: false,
+            buffer: Some(buffer),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        });
 
-    let status = block_on_ready(send_request(dev, &mut handle));
+        block_on_ready(io::send_to_device(dev, &mut handle))
+    };
 
     assert_eq!(status, DriverStatus::Success);
     assert_eq!(out, [12, 0xAA]);
 }
 
 #[test]
-fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
+fn unhandled_io_is_not_implemented_or_explicitly_forwarded_lower() {
     let upper = device_without_io();
     let input = [0u8; 4];
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&input[..1]),
+        IoBufferBackingConfig::worst_case_for_len(1),
+    )
+    .unwrap();
+    let buffer = backing.create_to_device(0, 1).unwrap();
     let mut handle = RequestHandle::new(Write {
         offset: 0,
         len: 1,
         no_buffer: false,
         owner: 0,
-        buffer: IoBuffer::<Described, ToDevice>::from_slice(&input[..1]),
+        buffer: Some(buffer),
         next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
 
     assert_eq!(
-        block_on_ready(send_request(upper.clone(), &mut handle)),
+        block_on_ready(io::send_to_device(upper.clone(), &mut handle)),
         DriverStatus::NotImplemented
     );
 
@@ -225,49 +219,49 @@ fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
     let lower = device_with_ops(ops);
     DeviceObject::set_lower_upper(&upper, lower);
 
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&input),
+        IoBufferBackingConfig::worst_case_for_len(input.len()),
+    )
+    .unwrap();
+    let buffer = backing.create_to_device(0, input.len()).unwrap();
     let mut handle = RequestHandle::new(Write {
         offset: 0,
         len: 4,
         no_buffer: false,
         owner: 0,
-        buffer: IoBuffer::<Described, ToDevice>::from_slice(&input),
+        buffer: Some(buffer),
         next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
-    handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-
     assert_eq!(
-        block_on_ready(send_request_to_next_lower(upper, &mut handle)),
+        block_on_ready(io::send_next_lower(upper, &mut handle)),
         DriverStatus::Success
     );
 }
 
 #[test]
-fn next_upper_and_next_lower_report_missing_links() {
+fn next_lower_reports_missing_link() {
     let dev = device_without_io();
-    let mut handle = RequestHandle::new(Dummy);
-
-    assert_eq!(
-        block_on_ready(send_request_to_next_lower(dev.clone(), &mut handle)),
-        DriverStatus::NoSuchDevice
-    );
-    assert_eq!(
-        block_on_ready(send_request_to_next_upper(dev, &mut handle)),
-        DriverStatus::NoSuchDevice
-    );
-}
-
-#[test]
-fn pnp_not_implemented_lifecycle_handler_maps_to_default_success() {
-    let vtable = PnpVtable::new();
-    vtable.set(PnpMinorFunction::StartDevice, not_implemented_pnp);
-    let dev = device_with_pnp(vtable);
-    let mut handle = RequestHandle::new(Pnp {
-        request: pnp_request(PnpMinorFunction::StartDevice),
+    let input = [0u8; 1];
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&input),
+        IoBufferBackingConfig::worst_case_for_len(input.len()),
+    )
+    .unwrap();
+    let buffer = backing.create_to_device(0, input.len()).unwrap();
+    let mut handle = RequestHandle::new(Write {
+        offset: 0,
+        len: 1,
+        no_buffer: false,
+        owner: 0,
+        buffer: Some(buffer),
+        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
 
-    let status = block_on_ready(send_request(dev, &mut handle));
-
-    assert_eq!(status, DriverStatus::Success);
+    assert_eq!(
+        block_on_ready(io::send_next_lower(dev, &mut handle)),
+        DriverStatus::NoSuchDevice
+    );
 }
 
 #[test]
@@ -277,13 +271,13 @@ fn pnp_query_without_handler_continues_to_success_at_bottom_of_stack() {
         request: pnp_request(PnpMinorFunction::QueryId),
     });
 
-    let status = block_on_ready(send_request(dev, &mut handle));
+    let status = block_on_ready(pnp::send_down_stack(dev, &mut handle));
 
     assert_eq!(status, DriverStatus::Success);
 }
 
 #[test]
-fn continuing_handler_can_forward_to_lower_handler() {
+fn io_continue_completes_not_implemented_without_forwarding() {
     let mut upper_ops = DeviceOps::empty();
     upper_ops.read.register::<ContinueRead>();
     let upper = device_with_ops(upper_ops);
@@ -294,17 +288,24 @@ fn continuing_handler_can_forward_to_lower_handler() {
     DeviceObject::set_lower_upper(&upper, lower);
 
     let mut out = [0u8; 2];
-    let mut handle = RequestHandle::new(Read {
-        offset: 0,
-        len: 3,
-        no_buffer: false,
-        buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut out),
-        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-    });
-    handle.set_traversal_policy(TraversalPolicy::ForwardLower);
+    let status = {
+        let out_len = out.len();
+        let backing = IoBufferBacking::new(
+            IoBufferBackingDesc::SliceMut(&mut out),
+            IoBufferBackingConfig::worst_case_for_len(out_len),
+        )
+        .unwrap();
+        let buffer = backing.create_from_device(0, out_len).unwrap();
+        let mut handle = RequestHandle::new(Read {
+            offset: 0,
+            len: 3,
+            no_buffer: false,
+            buffer: Some(buffer),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        });
+        block_on_ready(io::send_down_stack(upper, &mut handle))
+    };
 
-    let status = block_on_ready(send_request(upper, &mut handle));
-
-    assert_eq!(status, DriverStatus::Success);
-    assert_eq!(out, [3, 0xAA]);
+    assert_eq!(status, DriverStatus::NotImplemented);
+    assert_eq!(out, [0, 0]);
 }
