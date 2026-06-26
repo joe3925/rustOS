@@ -18,7 +18,6 @@ use kernel_api::benchmark::{
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::dma::IoBuffer;
 use kernel_api::dma::dma::IoBufferAccess;
-use kernel_api::dma::dma::PhysFramed;
 use kernel_api::kernel_types::dma::{FromDevice, IoBufferDmaSegment, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
 use kernel_api::pnp::DriverStep;
@@ -281,7 +280,7 @@ fn largest_sector_aligned_prefix(bytes_before: usize, seg_len: usize) -> Option<
 }
 
 fn next_indirect_chunk_len<D>(
-    buffer: &IoBuffer<'_, '_, PhysFramed, D>,
+    buffer: &IoBuffer<'_, '_, D>,
     byte_offset: usize,
     remaining_len: usize,
 ) -> Result<usize, DriverStatus>

@@ -17,7 +17,7 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        dma::{Described, FromDevice, IoBuffer, ToDevice},
+        dma::{FromDevice, IoBuffer, ToDevice},
         io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo},
         request::RequestData,
     },
@@ -283,11 +283,11 @@ impl DeviceControlHandler for DiskIo {
     }
 }
 
-fn has_from_device_buffer(buffer: &IoBuffer<'_, '_, Described, FromDevice>, len: usize) -> bool {
+fn has_from_device_buffer(buffer: &IoBuffer<'_, '_, FromDevice>, len: usize) -> bool {
     buffer.len() >= len
 }
 
-fn has_to_device_buffer(buffer: &IoBuffer<'_, '_, Described, ToDevice>, len: usize) -> bool {
+fn has_to_device_buffer(buffer: &IoBuffer<'_, '_, ToDevice>, len: usize) -> bool {
     buffer.len() >= len
 }
 

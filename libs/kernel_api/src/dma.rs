@@ -6,7 +6,7 @@ pub use kernel_types::dma;
 use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::{
     DmaBufferView, DmaMapError, DmaMappedBuffer, DmaMappingStrategy, IoBuffer, IoBufferAccess,
-    IoBufferDmaSegment, IoBufferError, IoBufferPageFrame, MappableIoBufferState,
+    IoBufferDmaSegment, IoBufferError, IoBufferPageFrame,
 };
 use kernel_types::status::DriverStatus;
 
@@ -38,13 +38,12 @@ pub fn query_device_state(device: &Arc<DeviceObject>) -> Option<dma::DmaDeviceSt
     unsafe { kernel_sys::kernel_dma_query_device_state(device) }
 }
 
-pub fn map_buffer<'backing, 'data, S, A>(
+pub fn map_buffer<'backing, 'data, A>(
     device: &Arc<DeviceObject>,
-    buffer: IoBuffer<'backing, 'data, S, A>,
+    buffer: IoBuffer<'backing, 'data, A>,
     strategy: DmaMappingStrategy,
-) -> Result<IoBuffer<'backing, 'data, S, A>, (IoBuffer<'backing, 'data, S, A>, DmaMapError)>
+) -> Result<IoBuffer<'backing, 'data, A>, (IoBuffer<'backing, 'data, A>, DmaMapError)>
 where
-    S: MappableIoBufferState,
     A: IoBufferAccess,
 {
     let view = match describe_dma_buffer(&buffer) {
@@ -76,21 +75,19 @@ where
     }
 }
 
-pub fn try_unmap_buffer<'backing, 'data, S, A>(
-    buffer: IoBuffer<'backing, 'data, S, A>,
-) -> Result<IoBuffer<'backing, 'data, S, A>, (IoBuffer<'backing, 'data, S, A>, IoBufferError)>
+pub fn try_unmap_buffer<'backing, 'data, A>(
+    buffer: IoBuffer<'backing, 'data, A>,
+) -> Result<IoBuffer<'backing, 'data, A>, (IoBuffer<'backing, 'data, A>, IoBufferError)>
 where
-    S: MappableIoBufferState,
     A: IoBufferAccess,
 {
     buffer.remove_dma_mapping()
 }
 
-pub fn unmap_buffer<'backing, 'data, S, A>(
-    buffer: IoBuffer<'backing, 'data, S, A>,
-) -> IoBuffer<'backing, 'data, S, A>
+pub fn unmap_buffer<'backing, 'data, A>(
+    buffer: IoBuffer<'backing, 'data, A>,
+) -> IoBuffer<'backing, 'data, A>
 where
-    S: MappableIoBufferState,
     A: IoBufferAccess,
 {
     match try_unmap_buffer(buffer) {
@@ -99,13 +96,12 @@ where
     }
 }
 
-pub fn map_buffer_ref<'map, 'backing, 'data, S, A>(
+pub fn map_buffer_ref<'map, 'backing, 'data, A>(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBuffer<'backing, 'data, S, A>,
+    buffer: &'map IoBuffer<'backing, 'data, A>,
     strategy: DmaMappingStrategy,
 ) -> Result<BorrowedDmaMapping<'map>, DmaMapError>
 where
-    S: MappableIoBufferState,
     A: IoBufferAccess,
 {
     let view = describe_dma_buffer(buffer)?;
@@ -122,11 +118,10 @@ where
     })
 }
 
-fn describe_dma_buffer<'map, 'backing, 'data, S, A>(
-    buffer: &'map IoBuffer<'backing, 'data, S, A>,
+fn describe_dma_buffer<'map, 'backing, 'data, A>(
+    buffer: &'map IoBuffer<'backing, 'data, A>,
 ) -> Result<DmaBufferView<'map>, DmaMapError>
 where
-    S: MappableIoBufferState,
     A: IoBufferAccess,
 {
     if buffer.is_empty() {

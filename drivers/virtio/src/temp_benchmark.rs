@@ -13,7 +13,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-    IoBufferDmaSegments, PhysFramed,
+    IoBufferDmaSegments,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -97,7 +97,7 @@ struct BenchDmaBuffer {
     base_va: VirtAddr,
     alloc_bytes: usize,
     backing_addr: usize,
-    mapped: Option<IoBuffer<'static, 'static, DmaMapped<PhysFramed>, FromDevice>>,
+    mapped: Option<IoBuffer<'static, 'static, FromDevice>>,
 }
 
 impl BenchDmaBuffer {
@@ -134,20 +134,7 @@ impl BenchDmaBuffer {
         let backing_addr = Box::into_raw(Box::new(backing)) as usize;
         let backing_ref = unsafe { &*(backing_addr as *const IoBufferBacking<'static>) };
 
-        let described = match backing_ref.create_from_device(0, byte_len) {
-            Ok(buffer) => buffer,
-            Err(_) => {
-                unsafe {
-                    drop(Box::from_raw(backing_addr as *mut IoBufferBacking<'static>));
-                    unmap_range(base_va, alloc_bytes as u64);
-                }
-
-                deallocate_kernel_range(base_va, alloc_bytes as u64);
-                return Err(DriverStatus::InvalidParameter);
-            }
-        };
-
-        let phys_framed = match described.into_phys_framed() {
+        let buffer = match backing_ref.create_from_device(0, byte_len) {
             Ok(buffer) => buffer,
             Err(_) => {
                 unsafe {
@@ -162,12 +149,12 @@ impl BenchDmaBuffer {
 
         let mapped = match kernel_api::dma::map_buffer(
             parent,
-            phys_framed,
+            buffer,
             kernel_api::dma::dma::DmaMappingStrategy::SingleContiguous,
         ) {
             Ok(mapped) => mapped,
-            Err((phys_framed, _)) => {
-                drop(phys_framed);
+            Err((buffer, _)) => {
+                drop(buffer);
 
                 unsafe {
                     drop(Box::from_raw(backing_addr as *mut IoBufferBacking<'static>));

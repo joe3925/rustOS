@@ -16,7 +16,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+    FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
     ToDevice,
 };
 use kernel_api::memory::{
@@ -458,7 +458,7 @@ where
         page: &CachePage,
         block_off: usize,
         len: usize,
-    ) -> Result<IoBuffer<'a, 'a, Described, FromDevice>, CacheError<B::Error>> {
+    ) -> Result<IoBuffer<'a, 'a, FromDevice>, CacheError<B::Error>> {
         let start = Self::page_offset(page.slot)
             .checked_add(block_off)
             .ok_or(CacheError::OffsetOverflow)?;
@@ -475,7 +475,7 @@ where
         &'a self,
         page: &CachePage,
         len: usize,
-    ) -> Result<IoBuffer<'a, 'a, Described, FromDevice>, CacheError<B::Error>> {
+    ) -> Result<IoBuffer<'a, 'a, FromDevice>, CacheError<B::Error>> {
         self.create_cache_from_device_buffer_at(page, 0, len)
     }
 
@@ -484,7 +484,7 @@ where
         page: &CachePage,
         block_off: usize,
         len: usize,
-    ) -> Result<IoBuffer<'a, 'a, Described, ToDevice>, CacheError<B::Error>> {
+    ) -> Result<IoBuffer<'a, 'a, ToDevice>, CacheError<B::Error>> {
         let start = Self::page_offset(page.slot)
             .checked_add(block_off)
             .ok_or(CacheError::OffsetOverflow)?;
@@ -501,7 +501,7 @@ where
         &'a self,
         page: &CachePage,
         len: usize,
-    ) -> Result<IoBuffer<'a, 'a, Described, ToDevice>, CacheError<B::Error>> {
+    ) -> Result<IoBuffer<'a, 'a, ToDevice>, CacheError<B::Error>> {
         self.create_cache_to_device_buffer_at(page, 0, len)
     }
 

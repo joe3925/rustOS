@@ -1,6 +1,8 @@
 use crate::arch::{PageFlags, PagingPlatform, PhysAddr, PlatformInfo, TranslatedBlock, VirtAddr};
 use crate::port::PortAccess;
 use crate::status::{PageMapError, PageMapFailure};
+#[cfg(any(test, feature = "hosted-tests"))]
+use x86_64::structures::paging::PageSize;
 use x86_64::structures::paging::{PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
 pub struct Platform;

@@ -1,6 +1,6 @@
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::dma::dma::{IoBufferBacking, IoBufferError};
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
+use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::request::{Read, RequestHandle, Write};
 
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +100,7 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: IoBuffer<'buffer, 'buffer, Described, FromDevice>,
+        buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>>;
 
     fn write_request<'a, 'req, 'data>(

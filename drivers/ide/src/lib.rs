@@ -24,9 +24,7 @@ use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
-use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IoBuffer, IoBufferAccess, IoBufferState, ToDevice,
-};
+use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -91,12 +89,11 @@ struct PhysCursor {
 }
 
 impl PhysCursor {
-    fn from_buffer<'backing, 'data, State, Access>(
-        buffer: &IoBuffer<'backing, 'data, State, Access>,
+    fn from_buffer<'backing, 'data, Access>(
+        buffer: &IoBuffer<'backing, 'data, Access>,
         len: usize,
     ) -> Option<Self>
     where
-        State: IoBufferState,
         Access: IoBufferAccess,
     {
         if buffer.len() < len {
@@ -229,14 +226,14 @@ impl PhysCursor {
 }
 
 fn read_buffer_cursor<'backing, 'data>(
-    buffer: &IoBuffer<'backing, 'data, Described, FromDevice>,
+    buffer: &IoBuffer<'backing, 'data, FromDevice>,
     len: usize,
 ) -> Option<PhysCursor> {
     PhysCursor::from_buffer(buffer, len)
 }
 
 fn write_buffer_cursor<'backing, 'data>(
-    buffer: &IoBuffer<'backing, 'data, Described, ToDevice>,
+    buffer: &IoBuffer<'backing, 'data, ToDevice>,
     len: usize,
 ) -> Option<PhysCursor> {
     PhysCursor::from_buffer(buffer, len)

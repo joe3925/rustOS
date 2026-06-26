@@ -10,59 +10,20 @@ use core::slice;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use spin::{Mutex, RwLock};
 
-use crate::arch::{PagingPlatform, PhysAddr, Platform, VirtAddr};
+#[cfg(not(any(test, feature = "hosted-tests")))]
+use crate::arch::{PagingPlatform, Platform};
+use crate::arch::{PhysAddr, VirtAddr};
 use crate::device::DeviceObject;
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DmaDeviceHandle(pub u64);
+mod access;
+mod device;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DmaPciDeviceIdentity {
-    pub segment: u16,
-    pub bus: u8,
-    pub device: u8,
-    pub function: u8,
-    pub requester_id: u16,
-    pub flags: u32,
-    pub command: u16,
-    pub reserved: u16,
-    pub config_space_phys: u64,
-}
+pub use access::*;
+pub use device::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceMmuPlatformDeviceIdentity {
-    pub firmware_node: u64,
-    pub iommu_id_base: u32,
-    pub iommu_id_count: u32,
-    pub flags: u32,
-}
+mod types;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DmaDeviceState {
-    pub registered: u8,
-    pub activated: u8,
-    pub iommu_vendor: u8,
-    pub reserved0: u8,
-    pub remapper_index: u32,
-    pub active_mappings: u32,
-    pub reserved1: u32,
-    pub domain_id: u64,
-}
-
-pub const DMA_IOMMU_VENDOR_NONE: u8 = 0;
-pub const DMA_IOMMU_VENDOR_INTEL_DMAR: u8 = 1;
-pub const DMA_IOMMU_VENDOR_AMD_IVRS: u8 = 2;
-
-pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE: u32 = 1 << 0;
-pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED: u32 = 1 << 1;
-
-pub const IOBUFFER_INLINE_SEGMENT_CAPACITY: usize = 32;
-pub const IOBUFFER_DEFAULT_LEASE_CAPACITY: usize = 32;
-pub const IOBUFFER_DEFAULT_DMA_RECORD_CAPACITY: usize = 8;
-pub const IOBUFFER_WORST_CASE_LEASE_GRANULARITY: usize = 4096;
+pub use types::*;
 
 const LEASE_FREE: u8 = 0;
 const LEASE_ACTIVE: u8 = 1;
@@ -70,275 +31,7 @@ const LEASE_RELEASING: u8 = 2;
 const ACCESS_TO_DEVICE: u8 = 1;
 const ACCESS_FROM_DEVICE: u8 = 2;
 const ACCESS_BIDIRECTIONAL: u8 = 3;
-const STATE_DESCRIBED: u8 = 1;
-const STATE_PHYS_FRAMED: u8 = 2;
 const NO_DMA_RECORD: usize = usize::MAX;
-
-pub const fn iobuffer_worst_case_lease_count(byte_len: usize) -> usize {
-    if byte_len == 0 {
-        0
-    } else {
-        ((byte_len - 1) / IOBUFFER_WORST_CASE_LEASE_GRANULARITY) + 1
-    }
-}
-
-pub enum Described {}
-pub enum PhysFramed {}
-pub enum ToDevice {}
-pub enum FromDevice {}
-pub enum Bidirectional {}
-
-mod sealed {
-    pub trait IoBufferState {
-        const KIND: u8;
-    }
-    pub trait IoBufferAccess {}
-    pub trait WritableAccess {}
-    pub trait MappableState {}
-    pub trait VirtualBackedState {}
-}
-
-pub trait IoBufferState: sealed::IoBufferState {}
-impl<T: sealed::IoBufferState> IoBufferState for T {}
-
-pub trait IoBufferAccess: sealed::IoBufferAccess {}
-impl<T: sealed::IoBufferAccess> IoBufferAccess for T {}
-
-pub trait WritableIoBufferAccess: IoBufferAccess + sealed::WritableAccess {}
-impl<T: IoBufferAccess + sealed::WritableAccess> WritableIoBufferAccess for T {}
-
-pub trait MappableIoBufferState: IoBufferState + sealed::MappableState {}
-impl<T: IoBufferState + sealed::MappableState> MappableIoBufferState for T {}
-
-pub trait VirtualBackedIoBufferState: IoBufferState + sealed::VirtualBackedState {}
-impl<T: IoBufferState + sealed::VirtualBackedState> VirtualBackedIoBufferState for T {}
-
-impl sealed::IoBufferState for Described {
-    const KIND: u8 = STATE_DESCRIBED;
-}
-
-impl sealed::IoBufferState for PhysFramed {
-    const KIND: u8 = STATE_PHYS_FRAMED;
-}
-
-impl sealed::MappableState for Described {}
-impl sealed::MappableState for PhysFramed {}
-
-impl sealed::VirtualBackedState for Described {}
-
-impl sealed::IoBufferAccess for ToDevice {}
-impl sealed::IoBufferAccess for FromDevice {}
-impl sealed::IoBufferAccess for Bidirectional {}
-
-impl sealed::WritableAccess for FromDevice {}
-impl sealed::WritableAccess for Bidirectional {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaMappingStrategy {
-    SingleContiguous,
-    ContiguousChunks { chunk_size: usize },
-    FullIdentity,
-    ScatterGather,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaMapError {
-    NoIommu,
-    RemappingUnavailable,
-    UnalignedChunkSize {
-        buffer_len: usize,
-        chunk_size: usize,
-    },
-    ChunkSizeNotPageAligned {
-        chunk_size: usize,
-    },
-    PageCapacityExceeded {
-        required: usize,
-    },
-    SegmentCapacityExceeded {
-        required: usize,
-    },
-    InvalidSize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IoBufferPageFrame {
-    pub phys_addr: u64,
-    pub byte_len: u64,
-    pub cpu_addr: VirtAddr,
-}
-
-impl IoBufferPageFrame {
-    pub const fn new(phys_addr: u64, byte_len: u64, cpu_addr: VirtAddr) -> Self {
-        Self {
-            phys_addr,
-            byte_len,
-            cpu_addr,
-        }
-    }
-
-    pub fn cpu_address(&self) -> VirtAddr {
-        self.cpu_addr
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IoBufferDmaSegment {
-    pub dma_addr: u64,
-    pub byte_len: u32,
-    pub reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IoBufferExtent {
-    pub virtual_addr: Option<usize>,
-    pub frame_offset: usize,
-    pub byte_len: usize,
-    pub first_frame: usize,
-    pub frame_count: usize,
-}
-
-impl IoBufferExtent {
-    pub const fn new(
-        virtual_addr: Option<usize>,
-        frame_offset: usize,
-        byte_len: usize,
-        first_frame: usize,
-        frame_count: usize,
-    ) -> Self {
-        Self {
-            virtual_addr,
-            frame_offset,
-            byte_len,
-            first_frame,
-            frame_count,
-        }
-    }
-
-    pub fn virtual_address(&self) -> Option<usize> {
-        self.virtual_addr
-    }
-
-    pub fn frame_offset(&self) -> usize {
-        self.frame_offset
-    }
-
-    pub fn page_offset(&self) -> usize {
-        self.frame_offset
-    }
-
-    pub fn len(&self) -> usize {
-        self.byte_len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.byte_len == 0
-    }
-
-    pub fn frame_range(&self) -> core::ops::Range<usize> {
-        self.first_frame..self.first_frame + self.frame_count
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IoBufferError {
-    AllocationFailed,
-    PageCapacityExceeded {
-        required: usize,
-        capacity: usize,
-    },
-    ExtentCapacityExceeded {
-        required: usize,
-        capacity: usize,
-    },
-    SegmentCapacityExceeded {
-        required: usize,
-        capacity: usize,
-    },
-    LeaseCapacityExceeded {
-        capacity: usize,
-    },
-    DmaRecordCapacityExceeded {
-        capacity: usize,
-    },
-    LeaseConflict {
-        start: usize,
-        len: usize,
-    },
-    ActiveLeases,
-    InvalidLease,
-    InvalidBackingKind,
-    InvalidRange,
-    InvalidFrameSize {
-        byte_len: u64,
-    },
-    InvalidFrameAlignment {
-        phys_addr: u64,
-        byte_len: u64,
-    },
-    InvalidFrameLayout {
-        frame_offset: usize,
-        byte_len: usize,
-    },
-    InvalidExtentLayout {
-        extent_index: usize,
-    },
-    OverlappingMutableExtents {
-        first: usize,
-        second: usize,
-    },
-    LengthOverflow,
-    TranslationFailed {
-        virt_addr: usize,
-    },
-    DmaMappingNotFound,
-    DmaMappingAccessDenied,
-    DmaMappingRangeNotCovered,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IoBufferBackingConfig {
-    pub lease_capacity: usize,
-    pub dma_record_capacity: usize,
-}
-
-impl Default for IoBufferBackingConfig {
-    fn default() -> Self {
-        Self {
-            lease_capacity: IOBUFFER_DEFAULT_LEASE_CAPACITY,
-            dma_record_capacity: IOBUFFER_DEFAULT_DMA_RECORD_CAPACITY,
-        }
-    }
-}
-
-impl IoBufferBackingConfig {
-    pub const fn worst_case_for_len(byte_len: usize) -> Self {
-        Self {
-            lease_capacity: iobuffer_worst_case_lease_count(byte_len),
-            dma_record_capacity: IOBUFFER_DEFAULT_DMA_RECORD_CAPACITY,
-        }
-    }
-}
-
-pub enum IoBufferBackingDesc<'data> {
-    Slice(&'data [u8]),
-    SliceMut(&'data mut [u8]),
-    Segments(&'data [&'data [u8]]),
-    SegmentsMut(Vec<&'data mut [u8]>),
-    Frames {
-        frame_offset: usize,
-        byte_len: usize,
-        frames: &'data [IoBufferPageFrame],
-    },
-    PhysicalExtents {
-        frames: &'data [IoBufferPageFrame],
-        extents: &'data [IoBufferExtent],
-    },
-}
 
 #[derive(Clone, Copy)]
 enum BackingMemory<'data> {
@@ -593,7 +286,6 @@ struct LeaseSlot {
     start: AtomicUsize,
     len: AtomicUsize,
     access: AtomicU8,
-    desc_state: AtomicU8,
     dma_record: AtomicUsize,
 }
 
@@ -605,7 +297,6 @@ impl LeaseSlot {
             start: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
             access: AtomicU8::new(0),
-            desc_state: AtomicU8::new(0),
             dma_record: AtomicUsize::new(NO_DMA_RECORD),
         }
     }
@@ -617,7 +308,6 @@ impl LeaseSlot {
             start: AtomicUsize::new(slot.start.load(Ordering::Acquire)),
             len: AtomicUsize::new(slot.len.load(Ordering::Acquire)),
             access: AtomicU8::new(slot.access.load(Ordering::Acquire)),
-            desc_state: AtomicU8::new(slot.desc_state.load(Ordering::Acquire)),
             dma_record: AtomicUsize::new(slot.dma_record.load(Ordering::Acquire)),
         }
     }
@@ -632,7 +322,6 @@ impl LeaseSlot {
             start: self.start.load(Ordering::Acquire),
             len: self.len.load(Ordering::Acquire),
             access: self.access.load(Ordering::Acquire),
-            desc_state: self.desc_state.load(Ordering::Acquire),
             dma_record: self.dma_record.load(Ordering::Acquire),
         })
     }
@@ -642,7 +331,6 @@ impl LeaseSlot {
         start: usize,
         len: usize,
         access: u8,
-        desc_state: u8,
         dma_record: usize,
     ) -> Result<u32, IoBufferError> {
         self.state
@@ -658,7 +346,6 @@ impl LeaseSlot {
         self.start.store(start, Ordering::Relaxed);
         self.len.store(len, Ordering::Relaxed);
         self.access.store(access, Ordering::Relaxed);
-        self.desc_state.store(desc_state, Ordering::Relaxed);
         self.dma_record.store(dma_record, Ordering::Relaxed);
         self.state.store(LEASE_ACTIVE, Ordering::Release);
         Ok(generation)
@@ -686,7 +373,6 @@ impl LeaseSlot {
         self.start.store(0, Ordering::Relaxed);
         self.len.store(0, Ordering::Relaxed);
         self.access.store(0, Ordering::Relaxed);
-        self.desc_state.store(0, Ordering::Relaxed);
         let dma_record = self.dma_record.swap(NO_DMA_RECORD, Ordering::AcqRel);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.state.store(LEASE_FREE, Ordering::Release);
@@ -705,7 +391,6 @@ struct LeaseSnapshot {
     start: usize,
     len: usize,
     access: u8,
-    desc_state: u8,
     dma_record: usize,
 }
 
@@ -910,12 +595,12 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, Described, FromDevice>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, FromDevice>, IoBufferError>
     where
         'data: 'backing,
     {
         self.ensure_writable_virtual_backed()?;
-        let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE, STATE_DESCRIBED)?;
+        let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE)?;
         Ok(IoBuffer::new(self, handle))
     }
 
@@ -923,12 +608,12 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, Described, ToDevice>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, ToDevice>, IoBufferError>
     where
         'data: 'backing,
     {
         self.ensure_virtual_backed()?;
-        let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE, STATE_DESCRIBED)?;
+        let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE)?;
         Ok(IoBuffer::new(self, handle))
     }
 
@@ -936,12 +621,12 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, Described, Bidirectional>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, Bidirectional>, IoBufferError>
     where
         'data: 'backing,
     {
         self.ensure_writable_virtual_backed()?;
-        let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL, STATE_DESCRIBED)?;
+        let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL)?;
         Ok(IoBuffer::new(self, handle))
     }
 
@@ -949,12 +634,12 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, ToDevice>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, ToDevice>, IoBufferError>
     where
         'data: 'backing,
     {
         self.ensure_phys_backed()?;
-        let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE, STATE_PHYS_FRAMED)?;
+        let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE)?;
         Ok(IoBuffer::new(self, handle))
     }
 
@@ -962,12 +647,12 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, FromDevice>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, FromDevice>, IoBufferError>
     where
         'data: 'backing,
     {
         self.ensure_phys_backed()?;
-        let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE, STATE_PHYS_FRAMED)?;
+        let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE)?;
         Ok(IoBuffer::new(self, handle))
     }
 
@@ -975,19 +660,19 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, Bidirectional>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, Bidirectional>, IoBufferError>
     where
         'data: 'backing,
     {
         self.ensure_phys_backed()?;
-        let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL, STATE_PHYS_FRAMED)?;
+        let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL)?;
         Ok(IoBuffer::new(self, handle))
     }
     pub fn create_dma_to_device<'backing>(
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, ToDevice>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, ToDevice>, IoBufferError>
     where
         'data: 'backing,
     {
@@ -998,7 +683,6 @@ impl<'data> IoBufferBacking<'data> {
             offset,
             len,
             ACCESS_TO_DEVICE,
-            STATE_PHYS_FRAMED,
             record,
         ) {
             Ok(lease) => lease,
@@ -1015,7 +699,7 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, FromDevice>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, FromDevice>, IoBufferError>
     where
         'data: 'backing,
     {
@@ -1027,7 +711,6 @@ impl<'data> IoBufferBacking<'data> {
             offset,
             len,
             ACCESS_FROM_DEVICE,
-            STATE_PHYS_FRAMED,
             record,
         ) {
             Ok(lease) => lease,
@@ -1044,7 +727,7 @@ impl<'data> IoBufferBacking<'data> {
         &'backing self,
         offset: usize,
         len: usize,
-    ) -> Result<IoBuffer<'backing, 'backing, PhysFramed, Bidirectional>, IoBufferError>
+    ) -> Result<IoBuffer<'backing, 'backing, Bidirectional>, IoBufferError>
     where
         'data: 'backing,
     {
@@ -1056,7 +739,6 @@ impl<'data> IoBufferBacking<'data> {
             offset,
             len,
             ACCESS_BIDIRECTIONAL,
-            STATE_PHYS_FRAMED,
             record,
         ) {
             Ok(lease) => lease,
@@ -1073,7 +755,6 @@ impl<'data> IoBufferBacking<'data> {
         start: usize,
         len: usize,
         access: u8,
-        desc_state: u8,
     ) -> Result<LeaseHandle, IoBufferError> {
         self.validate_range(start, len)?;
 
@@ -1091,7 +772,7 @@ impl<'data> IoBufferBacking<'data> {
                 continue;
             }
 
-            match slot.activate(start, len, access, desc_state, dma_record) {
+            match slot.activate(start, len, access, dma_record) {
                 Ok(generation) => {
                     return Ok(LeaseHandle { index, generation });
                 }
@@ -1256,7 +937,6 @@ impl<'data> IoBufferBacking<'data> {
         start: usize,
         len: usize,
         access: u8,
-        desc_state: u8,
         record: usize,
     ) -> Result<LeaseHandle, IoBufferError> {
         self.validate_range(start, len)?;
@@ -1270,7 +950,7 @@ impl<'data> IoBufferBacking<'data> {
                 continue;
             }
 
-            let generation = match slot.activate(start, len, access, desc_state, record) {
+            let generation = match slot.activate(start, len, access, record) {
                 Ok(generation) => generation,
                 Err(err) => return Err(err),
             };
@@ -1313,7 +993,6 @@ impl<'data> IoBufferBacking<'data> {
                 right_start,
                 right_len,
                 snapshot.access,
-                snapshot.desc_state,
                 snapshot.dma_record,
             ) {
                 Ok(generation) => {
@@ -1353,26 +1032,6 @@ impl<'data> IoBufferBacking<'data> {
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
         validate_snapshot(slot, handle)
-    }
-
-    fn set_lease_state(
-        &self,
-        handle: LeaseHandle,
-        expected: u8,
-        new_state: u8,
-    ) -> Result<(), IoBufferError> {
-        let leases = self.leases.read();
-        let slot = leases
-            .get(handle.index)
-            .ok_or(IoBufferError::InvalidLease)?;
-        let snapshot = validate_snapshot(slot, handle)?;
-
-        if snapshot.desc_state != expected {
-            return Err(IoBufferError::InvalidLease);
-        }
-
-        slot.desc_state.store(new_state, Ordering::Release);
-        Ok(())
     }
 
     fn set_lease_dma_record(
@@ -1592,21 +1251,17 @@ impl<'data> Drop for IoBufferBacking<'data> {
 fn dma_access_allows(mapped: u8, requested: u8) -> bool {
     mapped == ACCESS_BIDIRECTIONAL || mapped == requested
 }
-pub struct IoBuffer<'backing, 'data, State: IoBufferState, Access: IoBufferAccess> {
+pub struct IoBuffer<'backing, 'data, Access: IoBufferAccess> {
     backing: &'backing IoBufferBacking<'data>,
     lease: LeaseHandle,
-    _state: PhantomData<fn() -> State>,
     _access: PhantomData<fn() -> Access>,
 }
 
-impl<'backing, 'data, State: IoBufferState, Access: IoBufferAccess>
-    IoBuffer<'backing, 'data, State, Access>
-{
+impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> {
     fn new(backing: &'backing IoBufferBacking<'data>, lease: LeaseHandle) -> Self {
         Self {
             backing,
             lease,
-            _state: PhantomData,
             _access: PhantomData,
         }
     }
@@ -1654,7 +1309,6 @@ impl<'backing, 'data, State: IoBufferState, Access: IoBufferAccess>
             start: 0,
             len: 0,
             access: 0,
-            desc_state: 0,
             dma_record: NO_DMA_RECORD,
         });
 
@@ -1671,9 +1325,7 @@ impl<'backing, 'data, State: IoBufferState, Access: IoBufferAccess>
     }
 }
 
-impl<'backing, 'data, State: VirtualBackedIoBufferState, Access: IoBufferAccess>
-    IoBuffer<'backing, 'data, State, Access>
-{
+impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> {
     pub fn try_as_slice(&self) -> Option<&[u8]> {
         let snapshot = self.snapshot().ok()?;
         match self.backing.memory {
@@ -1688,9 +1340,7 @@ impl<'backing, 'data, State: VirtualBackedIoBufferState, Access: IoBufferAccess>
     }
 }
 
-impl<'backing, 'data, State: VirtualBackedIoBufferState, Access: WritableIoBufferAccess>
-    IoBuffer<'backing, 'data, State, Access>
-{
+impl<'backing, 'data, Access: WritableIoBufferAccess> IoBuffer<'backing, 'data, Access> {
     pub fn try_as_mut_slice(&mut self) -> Option<&mut [u8]> {
         let snapshot = self.snapshot().ok()?;
         match self.backing.memory {
@@ -1702,24 +1352,7 @@ impl<'backing, 'data, State: VirtualBackedIoBufferState, Access: WritableIoBuffe
     }
 }
 
-impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Described, Access> {
-    pub fn into_phys_framed(
-        self,
-    ) -> Result<IoBuffer<'backing, 'data, PhysFramed, Access>, (Self, IoBufferError)> {
-        let this = ManuallyDrop::new(self);
-        let backing = this.backing;
-        let lease = this.lease;
-
-        match backing.set_lease_state(lease, STATE_DESCRIBED, STATE_PHYS_FRAMED) {
-            Ok(()) => Ok(IoBuffer::new(backing, lease)),
-            Err(err) => Err((ManuallyDrop::into_inner(this), err)),
-        }
-    }
-}
-
-impl<'backing, 'data, State: MappableIoBufferState, Access: IoBufferAccess>
-    IoBuffer<'backing, 'data, State, Access>
-{
+impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> {
     pub fn apply_dma_mapping(
         self,
         layout: IoBufferDmaMappingLayout,
@@ -1805,21 +1438,16 @@ impl<'backing, 'data, State: MappableIoBufferState, Access: IoBufferAccess>
     }
 }
 
-impl<'backing, 'data, State: IoBufferState, Access: IoBufferAccess> Drop
-    for IoBuffer<'backing, 'data, State, Access>
-{
+impl<'backing, 'data, Access: IoBufferAccess> Drop for IoBuffer<'backing, 'data, Access> {
     fn drop(&mut self) {
         self.backing.release_lease(self.lease);
     }
 }
 
-impl<'backing, 'data, State: IoBufferState, Access: IoBufferAccess> fmt::Debug
-    for IoBuffer<'backing, 'data, State, Access>
-{
+impl<'backing, 'data, Access: IoBufferAccess> fmt::Debug for IoBuffer<'backing, 'data, Access> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let snapshot = self.snapshot().ok();
         f.debug_struct("IoBuffer")
-            .field("state", &core::any::type_name::<State>())
             .field("access", &core::any::type_name::<Access>())
             .field("offset", &snapshot.map(|snapshot| snapshot.start))
             .field("len", &snapshot.map(|snapshot| snapshot.len))

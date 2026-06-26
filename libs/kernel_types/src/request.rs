@@ -1,7 +1,7 @@
 use crate::CompletionRoutine;
 use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
-use crate::dma::{Described, FromDevice, IoBuffer, ToDevice};
+use crate::dma::{FromDevice, IoBuffer, ToDevice};
 use crate::fs::{
     FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult,
     FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams,
@@ -1059,7 +1059,7 @@ pub struct Read<'io> {
     pub offset: u64,
     pub len: usize,
     pub no_buffer: bool,
-    pub buffer: Option<IoBuffer<'io, 'io, Described, FromDevice>>,
+    pub buffer: Option<IoBuffer<'io, 'io, FromDevice>>,
     pub next: AtomicPtr<Self>,
 }
 
@@ -1153,7 +1153,7 @@ pub struct Write<'io> {
     pub len: usize,
     pub no_buffer: bool,
     pub owner: u64,
-    pub buffer: Option<IoBuffer<'io, 'io, Described, ToDevice>>,
+    pub buffer: Option<IoBuffer<'io, 'io, ToDevice>>,
     pub next: AtomicPtr<Self>,
 }
 

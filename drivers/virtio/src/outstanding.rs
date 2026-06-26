@@ -6,7 +6,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::completion::CompletionToken;
-use kernel_api::dma::dma::{IoBuffer, IoBufferAccess, PhysFramed};
+use kernel_api::dma::dma::{IoBuffer, IoBufferAccess};
 
 pub(crate) const VIRTIO_QUEUE_BATCH_LIMIT: usize = 64;
 
@@ -20,7 +20,7 @@ where
 {
     pub(crate) sector: u64,
     pub(crate) len: usize,
-    pub(crate) mapped_buffer: IoBuffer<'data, 'data, PhysFramed, D>,
+    pub(crate) mapped_buffer: IoBuffer<'data, 'data, D>,
 }
 
 pub(crate) struct SubmittedCompletion<'completion> {

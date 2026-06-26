@@ -28,14 +28,13 @@ use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState}
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::dma::dma::IoBufferAccess;
-use kernel_api::dma::dma::PhysFramed;
 use kernel_api::dma::dma::ToDevice;
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::{Described, DmaMappingStrategy, IoBuffer, IoBufferState};
+use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::kernel_types::io::DmaBacking;
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
@@ -273,20 +272,16 @@ pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> Driver
 
 pub(crate) fn map_request_buffer<'buffer, D>(
     device: &Arc<DeviceObject>,
-    buffer: IoBuffer<'buffer, 'buffer, Described, D>,
-) -> Result<IoBuffer<'buffer, 'buffer, PhysFramed, D>, DriverStatus>
+    buffer: IoBuffer<'buffer, 'buffer, D>,
+) -> Result<IoBuffer<'buffer, 'buffer, D>, DriverStatus>
 where
     D: IoBufferAccess,
 {
-    let phys_framed = buffer
-        .into_phys_framed()
-        .map_err(|_| DriverStatus::InvalidParameter)?;
-
-    if phys_framed.is_dma_mapped() {
-        return Ok(phys_framed);
+    if buffer.is_dma_mapped() {
+        return Ok(buffer);
     }
 
-    kernel_api::dma::map_buffer(device, phys_framed, DmaMappingStrategy::SingleContiguous)
+    kernel_api::dma::map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
         .map_err(|_| DriverStatus::InsufficientResources)
 }
 

@@ -19,7 +19,7 @@ use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
+use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushOwner, DeviceRead, DeviceWrite,
@@ -151,7 +151,7 @@ impl VolumeCacheBackend for CacheBackend {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: IoBuffer<'buffer, 'buffer, Described, FromDevice>,
+        buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             if unlikely(blocks == 0) {

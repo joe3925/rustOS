@@ -15,7 +15,7 @@ use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::dma::dma::IoBufferBackingConfig;
 use kernel_api::dma::dma::{IoBufferBacking, IoBufferBackingDesc};
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
+use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceRead, DeviceWrite, DiskInfo, GptHeader, GptPartitionEntry,
     PartitionInfo,

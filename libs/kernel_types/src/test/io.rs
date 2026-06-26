@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::async_ffi::{FfiFuture, FutureExt};
 use crate::device::DeviceObject;
-use crate::dma::{Described, FromDevice, IoBuffer};
+use crate::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use crate::io::{
     DeviceControlHandler, DeviceFlush, DeviceOps, DeviceRead, DeviceWrite, TreiberStack,
 };
@@ -55,8 +55,8 @@ impl DeviceRead for TestRead {
     extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Read<'data>>,
-        len: usize,
     ) -> FfiFuture<DriverStep> {
+        let len = handle.read().body.len;
         read_handler(dev, handle, len)
     }
 }
@@ -67,8 +67,8 @@ impl DeviceWrite for TestWrite {
     extern "C" fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Write<'data>>,
-        len: usize,
     ) -> FfiFuture<DriverStep> {
+        let len = handle.read().body.len;
         write_handler(dev, handle, len)
     }
 }
@@ -129,11 +129,17 @@ fn device_ops_registers_typed_handlers() {
     assert!(ops.device_control.as_handler().is_some());
 
     let mut buffer = [0u8; 4];
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::SliceMut(&mut buffer),
+        IoBufferBackingConfig::default(),
+    )
+    .unwrap();
+    let io_buffer = backing.create_from_device(0, 4).unwrap();
     let handle = RequestHandle::new(Read {
         offset: 0,
         len: 4,
         no_buffer: false,
-        buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut buffer),
+        buffer: Some(io_buffer),
         next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
     });
     assert_eq!(handle.read().body.offset, 0);
