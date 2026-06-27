@@ -137,8 +137,8 @@ impl ContiguousDmaRegion {
                 }
             };
 
-            let segments = mapped.dma_segments();
-            let Some(segment) = segments.first() else {
+            let mut segments = mapped.dma_segments();
+            let Some(segment) = segments.next() else {
                 drop(mapped);
 
                 unsafe {
@@ -149,7 +149,7 @@ impl ContiguousDmaRegion {
                 return None;
             };
 
-            if segments.len() != 1 || segment.byte_len as usize != byte_len {
+            if segments.next().is_some() || segment.byte_len as usize != byte_len {
                 drop(mapped);
 
                 unsafe {

@@ -13,7 +13,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::dma::dma_base_page_size;
 use kernel_api::kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-    IoBufferDmaSegments,
+    IoBufferDmaSegmentIter,
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
@@ -174,7 +174,7 @@ impl BenchDmaBuffer {
         })
     }
 
-    fn dma_segments(&self) -> IoBufferDmaSegments<'_> {
+    fn dma_segments(&self) -> IoBufferDmaSegmentIter<'_> {
         self.mapped
             .as_ref()
             .expect("virtio benchmark DMA buffer used after destroy")

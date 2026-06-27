@@ -291,8 +291,7 @@ where
     let mut bytes = 0usize;
     let mut best = 0usize;
 
-    let dma_segments = buffer.dma_segments();
-    let segments = DmaSegmentByteWindow::new(dma_segments.iter(), byte_offset, remaining_len);
+    let segments = DmaSegmentByteWindow::new(buffer.dma_segments(), byte_offset, remaining_len);
 
     for seg in segments {
         if seg.byte_len == 0 {
@@ -511,9 +510,11 @@ where
                         }
                     };
 
-                let dma_segments = op.mapped_buffer.dma_segments();
-                let segments =
-                    DmaSegmentByteWindow::new(dma_segments.iter(), cursor.byte_offset, chunk_len);
+                let segments = DmaSegmentByteWindow::new(
+                    op.mapped_buffer.dma_segments(),
+                    cursor.byte_offset,
+                    chunk_len,
+                );
 
                 match qs
                     .arena

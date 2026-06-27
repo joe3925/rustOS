@@ -62,7 +62,7 @@ fn physical_iobuffer_validates_frame_layout_and_iterates_regions() {
     assert_eq!(regions.len(), 1);
     assert_eq!(regions[0].frame_offset(), 128);
     assert_eq!(regions[0].len(), 6000);
-    assert_eq!(regions[0].physical_frames().len(), 3);
+    assert_eq!(regions[0].page_frames().len(), 2);
 }
 
 #[test]
@@ -107,9 +107,9 @@ fn dma_mapping_contiguous_layout_unmaps_once() {
         .apply_dma_mapping(layout, device(), record_unmap, 7)
         .unwrap();
 
-    assert_eq!(mapped.dma_segments().len(), 1);
+    assert_eq!(mapped.dma_segments().count(), 1);
     assert_eq!(
-        mapped.dma_segments().first(),
+        mapped.dma_segments().next(),
         Some(IoBufferDmaSegment {
             dma_addr: 0x8000,
             byte_len: TEST_GRANULE as u32,
@@ -118,7 +118,7 @@ fn dma_mapping_contiguous_layout_unmaps_once() {
     );
 
     let unmapped = mapped.remove_dma_mapping().unwrap();
-    assert!(unmapped.dma_segments().is_empty());
+    assert!(unmapped.dma_segments().next().is_none());
     assert_eq!(UNMAP_COOKIE_SUM.load(Ordering::Acquire), before + 7);
 }
 
