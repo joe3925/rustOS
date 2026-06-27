@@ -3,12 +3,13 @@ use core::hint::{cold_path, likely, unlikely};
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use fatfs::{IoBase, IoKind, Read, Seek, SeekFrom, Write};
+use fatfs::{IoBase, IoKind, Read, ReadIoBuffer, Seek, SeekFrom, Write, WriteIoBuffer};
 use kernel_api::{
     kernel_types::{
         async_ffi::{FfiFuture, FutureExt},
         dma::{
-            IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, IoBufferBackingScratch,
+            FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+            IoBufferBackingScratch, ToDevice,
         },
         io::IoTarget,
     },
@@ -136,11 +137,33 @@ impl BlockDev {
         }
     }
 
+    async fn send_read_iobuffer<'buffer>(
+        &mut self,
+        offset: u64,
+        buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
+    ) -> Result<usize, DriverStatus> {
+        let len = buffer.len();
+        let mut req = RequestHandle::new(ReadRequest {
+            offset,
+            len,
+            no_buffer: false,
+            buffer: Some(buffer),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        });
+        let status = io::send_down_stack(self.volume.clone(), &mut req).await;
+        let completed = req.read().body.len;
+        if status == DriverStatus::Success {
+            Ok(completed)
+        } else {
+            Err(status)
+        }
+    }
+
     async fn send_write_immut(
         &mut self,
         offset: u64,
         src: &[u8],
-        kind: IoKind,
+        _kind: IoKind,
     ) -> Result<(), DriverStatus> {
         let no_buffer = false;
 
@@ -191,6 +214,29 @@ impl BlockDev {
         } else {
             cold_path();
             println!("Write Error: {:#?}", status);
+            Err(status)
+        }
+    }
+
+    async fn send_write_iobuffer<'buffer>(
+        &mut self,
+        offset: u64,
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+    ) -> Result<usize, DriverStatus> {
+        let len = buffer.len();
+        let mut req = RequestHandle::new(WriteRequest {
+            offset,
+            len,
+            no_buffer: false,
+            owner: self.current_owner.load(Ordering::Acquire),
+            buffer: Some(buffer),
+            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+        });
+        let status = io::send_down_stack(self.volume.clone(), &mut req).await;
+        let completed = req.read().body.len;
+        if status == DriverStatus::Success {
+            Ok(completed)
+        } else {
             Err(status)
         }
     }
@@ -260,6 +306,70 @@ impl Write for BlockDev {
 
     fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
         async move { Ok(()) }.into_ffi()
+    }
+}
+
+impl ReadIoBuffer for BlockDev {
+    fn read_iobuffer<'a, 'buffer>(
+        &'a mut self,
+        buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
+        kind: IoKind,
+    ) -> FfiFuture<Result<usize, Self::Error>> {
+        async move {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let cap_bytes = self.capacity_bytes();
+            if self.pos >= cap_bytes {
+                return Ok(0);
+            }
+            let len = min(buffer.len(), (cap_bytes - self.pos) as usize);
+            let buffer = if len == buffer.len() {
+                buffer
+            } else {
+                buffer.split_at(len).map_err(|_| ())?.0
+            };
+            let read = self
+                .send_read_iobuffer(self.pos, buffer)
+                .await
+                .map_err(|_| ())?;
+            self.pos += read as u64;
+            let _ = kind;
+            Ok(read)
+        }
+        .into_ffi()
+    }
+}
+
+impl WriteIoBuffer for BlockDev {
+    fn write_iobuffer<'a, 'buffer>(
+        &'a mut self,
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+        kind: IoKind,
+    ) -> FfiFuture<Result<usize, Self::Error>> {
+        async move {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            let cap_bytes = self.capacity_bytes();
+            if self.pos >= cap_bytes {
+                return Ok(0);
+            }
+            let len = min(buffer.len(), (cap_bytes - self.pos) as usize);
+            let buffer = if len == buffer.len() {
+                buffer
+            } else {
+                buffer.split_at(len).map_err(|_| ())?.0
+            };
+            let written = self
+                .send_write_iobuffer(self.pos, buffer)
+                .await
+                .map_err(|_| ())?;
+            self.pos += written as u64;
+            let _ = kind;
+            Ok(written)
+        }
+        .into_ffi()
     }
 }
 

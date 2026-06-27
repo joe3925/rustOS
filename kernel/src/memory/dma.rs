@@ -72,7 +72,7 @@ where
         return Err(DmaMapError::InvalidSize);
     }
 
-    let buffer = backing
+    let mut buffer = backing
         .create_phys_bidirectional(0, backing.len())
         .map_err(|_| DmaMapError::InvalidSize)?;
 

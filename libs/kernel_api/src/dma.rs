@@ -40,13 +40,13 @@ pub fn query_device_state(device: &Arc<DeviceObject>) -> Option<dma::DmaDeviceSt
 
 pub fn map_buffer<'backing, 'data, A>(
     device: &Arc<DeviceObject>,
-    buffer: IoBuffer<'backing, 'data, A>,
+    mut buffer: IoBuffer<'backing, 'data, A>,
     strategy: DmaMappingStrategy,
 ) -> Result<IoBuffer<'backing, 'data, A>, (IoBuffer<'backing, 'data, A>, DmaMapError)>
 where
     A: IoBufferAccess,
 {
-    let view = match describe_dma_buffer(&buffer) {
+    let view = match describe_dma_buffer(&mut buffer) {
         Ok(view) => view,
         Err(err) => return Err((buffer, err)),
     };
@@ -98,12 +98,13 @@ where
 
 pub fn map_buffer_ref<'map, 'backing, 'data, A>(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBuffer<'backing, 'data, A>,
+    buffer: &'map mut IoBuffer<'backing, 'data, A>,
     strategy: DmaMappingStrategy,
 ) -> Result<BorrowedDmaMapping<'map>, DmaMapError>
 where
     A: IoBufferAccess,
 {
+    let byte_len = buffer.len();
     let view = describe_dma_buffer(buffer)?;
     let mapped = unsafe { kernel_sys::kernel_dma_map_buffer(device, &view, strategy) }?;
 
@@ -112,19 +113,20 @@ where
         mapped_by: mapped.mapped_by,
         unmap: mapped.unmap,
         cookie: mapped.cookie,
-        byte_len: buffer.len(),
+        byte_len,
         view,
         _buffer: PhantomData,
     })
 }
 
 fn describe_dma_buffer<'map, 'backing, 'data, A>(
-    buffer: &'map IoBuffer<'backing, 'data, A>,
+    buffer: &'map mut IoBuffer<'backing, 'data, A>,
 ) -> Result<DmaBufferView<'map>, DmaMapError>
 where
     A: IoBufferAccess,
 {
-    if buffer.is_empty() {
+    let buffer_len = buffer.len();
+    if buffer_len == 0 {
         return Err(DmaMapError::InvalidSize);
     }
 
@@ -151,7 +153,7 @@ where
         region_count += 1;
     }
 
-    if region_count == 0 || described_len != buffer.len() {
+    if region_count == 0 || described_len != buffer_len {
         return Err(DmaMapError::InvalidSize);
     }
 

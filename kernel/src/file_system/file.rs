@@ -19,6 +19,9 @@ use core::time::Duration;
 use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::{
+    dma::{
+        FromDevice, IoBuffer, ToDevice,
+    },
     fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
 };
@@ -197,8 +200,23 @@ impl File {
             return Ok(0);
         }
 
+        let len = buf.len();
+        let buffer = unsafe { IoBuffer::from_virt_from_device(buf.as_mut_ptr() as usize, len) };
+
+        self.read_iobuffer_at(offset, buffer).await
+    }
+
+    pub async fn read_iobuffer_at<'buffer>(
+        &self,
+        offset: u64,
+        buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
+    ) -> Result<usize, FileStatus> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
         let (res, st) = file_provider::provider()
-            .read_at(self.fs_file_id, offset, buf)
+            .read_iobuffer_at(self.fs_file_id, offset, buffer)
             .await;
 
         if st != DriverStatus::Success {
@@ -211,8 +229,27 @@ impl File {
     }
 
     pub async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FileStatus> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let len = data.len();
+        let buffer = unsafe { IoBuffer::from_virt_to_device(data.as_ptr() as usize, len) };
+
+        self.write_iobuffer_at(offset, buffer).await
+    }
+
+    pub async fn write_iobuffer_at<'buffer>(
+        &mut self,
+        offset: u64,
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+    ) -> Result<usize, FileStatus> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
         let (wr, st) = file_provider::provider()
-            .write_at(self.fs_file_id, offset, data, self.write_through)
+            .write_iobuffer_at(self.fs_file_id, offset, buffer, self.write_through)
             .await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -311,8 +348,26 @@ impl File {
     /// Appends data to the end of the file atomically.
     /// Returns the number of bytes written and updates the cached file size.
     pub async fn append(&mut self, data: &[u8]) -> Result<usize, FileStatus> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let len = data.len();
+        let buffer = unsafe { IoBuffer::from_virt_to_device(data.as_ptr() as usize, len) };
+
+        self.append_iobuffer(buffer).await
+    }
+
+    pub async fn append_iobuffer<'buffer>(
+        &mut self,
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+    ) -> Result<usize, FileStatus> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
         let (res, st) = file_provider::provider()
-            .append(self.fs_file_id, data, self.write_through)
+            .append_iobuffer(self.fs_file_id, buffer, self.write_through)
             .await;
 
         if st != DriverStatus::Success {

@@ -169,7 +169,8 @@ impl Vfs {
         let status = {
             if let Some(tgt) = target {
                 kernel_routing::io::send_down_stack(tgt, &mut request_handle).await
-            } else if let Some(tgt) = PNP_MANAGER.resolve_targetio_from_symlink_ref(volume_symlink) {
+            } else if let Some(tgt) = PNP_MANAGER.resolve_targetio_from_symlink_ref(volume_symlink)
+            {
                 kernel_routing::io::send_down_stack(tgt, &mut request_handle).await
             } else {
                 DriverStatus::NoSuchDevice
@@ -452,6 +453,20 @@ impl Vfs {
     }
 
     pub async fn read<'a>(&self, mut p: FsReadParams<'a>) -> (FsReadResult, DriverStatus) {
+        if !p
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.is_cpu_accessible())
+        {
+            return (
+                FsReadResult {
+                    bytes_read: 0,
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::InvalidParameter,
+            );
+        }
+
         let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
             if let Some(h) = binding.get(&p.fs_file_id) {
@@ -492,6 +507,20 @@ impl Vfs {
     }
 
     pub async fn write<'a>(&self, mut p: FsWriteParams<'a>) -> (FsWriteResult, DriverStatus) {
+        if !p
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.is_cpu_accessible())
+        {
+            return (
+                FsWriteResult {
+                    written: 0,
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::InvalidParameter,
+            );
+        }
+
         let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
             if let Some(h) = binding.get(&p.fs_file_id) {
@@ -743,6 +772,21 @@ impl Vfs {
         }
     }
     pub async fn append<'a>(&self, mut p: FsAppendParams<'a>) -> (FsAppendResult, DriverStatus) {
+        if !p
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.is_cpu_accessible())
+        {
+            return (
+                FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::InvalidParameter,
+            );
+        }
+
         let (target, inner_id, symlink) = {
             let binding = self.handles.read().await;
             if let Some(h) = binding.get(&p.fs_file_id) {

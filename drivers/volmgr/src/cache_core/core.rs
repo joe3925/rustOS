@@ -17,11 +17,12 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_api::kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-    ToDevice,
+    IoBufferError, ToDevice,
 };
 use kernel_api::memory::{
-    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
-    deallocate_kernel_range, unmap_range,
+    PageTableFlags, PhysAddr, PhysicalMappingCache, VirtAddr,
+    allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range, map_physical_pages,
+    unmap_physical_pages, unmap_range,
 };
 use kernel_api::println;
 use kernel_api::request::Read;
@@ -2297,6 +2298,14 @@ where
                 {
                     let w = req.write();
                     w.body.len = len;
+                    let buffer = w
+                        .body
+                        .buffer
+                        .as_mut()
+                        .ok_or(CacheError::InvalidConfig)?;
+                    let _ = buffer
+                        .dma_buffer_view()
+                        .map_err(CacheError::InvalidIoBuffer)?;
                 }
 
                 self.backend
@@ -2308,26 +2317,34 @@ where
             }
         }
 
-        let dst_addr = {
-            let w = req.write();
-            let dst = match w
-                .body
-                .buffer
-                .as_mut()
-                .and_then(|buffer| buffer.try_as_mut_slice())
-            {
-                Some(dst) => dst,
-                None => {
-                    cold_path();
-                    return Err(CacheError::InvalidConfig);
-                }
-            };
+        let contiguous_dst = req
+            .write()
+            .body
+            .buffer
+            .as_mut()
+            .and_then(|buffer| buffer.try_as_mut_slice())
+            .map(|slice| slice.as_mut_ptr() as usize);
+        if let Some(dst) = contiguous_dst {
+            let dst = unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, len) };
+            return self.read_at(offset, dst).await;
+        }
 
-            dst.as_mut_ptr() as usize
-        };
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| CacheError::InsufficientResources)?;
+        bytes.resize(len, 0);
+        self.read_at(offset, &mut bytes).await?;
 
-        let dst = unsafe { core::slice::from_raw_parts_mut(dst_addr as *mut u8, len) };
-        self.read_at(offset, dst).await
+        let buffer = req
+            .write()
+            .body
+            .buffer
+            .as_mut()
+            .ok_or(CacheError::InvalidConfig)?;
+        buffer
+            .copy_from_slice(0, &bytes)
+            .map_err(CacheError::InvalidIoBuffer)
     }
 
     async fn write_request<'req, 'data>(
@@ -2391,6 +2408,14 @@ where
                 {
                     let w = req.write();
                     w.body.len = len;
+                    let buffer = w
+                        .body
+                        .buffer
+                        .as_mut()
+                        .ok_or(CacheError::InvalidConfig)?;
+                    let _ = buffer
+                        .dma_buffer_view()
+                        .map_err(CacheError::InvalidIoBuffer)?;
                 }
 
                 self.backend
@@ -2403,27 +2428,36 @@ where
             }
         }
 
-        let data_addr = {
-            let r = req.read();
-            let src = match r
-                .body
-                .buffer
-                .as_ref()
-                .and_then(|buffer| buffer.try_as_slice())
-            {
-                Some(src) => src,
-                None => {
-                    cold_path();
-                    return Err(CacheError::InvalidConfig);
-                }
-            };
+        let contiguous_src = req
+            .read()
+            .body
+            .buffer
+            .as_ref()
+            .and_then(|buffer| buffer.try_as_slice())
+            .map(|slice| slice.as_ptr() as usize);
+        if let Some(src) = contiguous_src {
+            let src = unsafe { core::slice::from_raw_parts(src as *const u8, len) };
+            VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, src, owner).await?;
+            VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
+            return Ok(());
+        }
 
-            src.as_ptr() as usize
-        };
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| CacheError::InsufficientResources)?;
+        bytes.resize(len, 0);
+        let buffer = req
+            .read()
+            .body
+            .buffer
+            .as_ref()
+            .ok_or(CacheError::InvalidConfig)?;
+        buffer
+            .copy_to_slice(0, &mut bytes)
+            .map_err(CacheError::InvalidIoBuffer)?;
 
-        let data = unsafe { core::slice::from_raw_parts(data_addr as *const u8, len) };
-
-        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, data, owner).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, &bytes, owner).await?;
         VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
         Ok(())
     }

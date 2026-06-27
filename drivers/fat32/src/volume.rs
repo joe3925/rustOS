@@ -7,7 +7,7 @@ use core::hint::{cold_path, likely, unlikely};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{
     CachedFileState, Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase,
-    LossyOemCpConverter, NullTimeProvider, Read, RenamedFileState, SeekFrom, Write,
+    LossyOemCpConverter, NullTimeProvider, RenamedFileState, SeekFrom, Write,
 };
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::async_types::AsyncMutex;
@@ -536,24 +536,26 @@ impl FileSystem for Fat32Fs {
             let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
-            let buf = &mut *params.buf;
 
-            let read_res: Result<usize, FileStatus> = {
-                let state = take_cached_file_state(&vdx, fs_file_id);
-                match state {
-                    Err(e) => Err(e),
-                    Ok(state) => {
-                        let mut file = state.into_file(&*fs);
-                        let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
-                            Err(map_fatfs_err(&e))
-                        } else {
-                            match file.read(buf, fatfs::IoKind::Data).await {
-                                Ok(n) => Ok(n),
-                                Err(e) => Err(map_fatfs_err(&e)),
-                            }
-                        };
-                        restore_cached_file(&vdx, fs_file_id, file);
-                        res
+            let read_res: Result<usize, FileStatus> = match params.buffer.take() {
+                None => Err(FileStatus::UnknownFail),
+                Some(buffer) => {
+                    let state = take_cached_file_state(&vdx, fs_file_id);
+                    match state {
+                        Err(e) => Err(e),
+                        Ok(state) => {
+                            let mut file = state.into_file(&*fs);
+                            let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
+                                Err(map_fatfs_err(&e))
+                            } else {
+                                match file.read_iobuffer(buffer, fatfs::IoKind::Data).await {
+                                    Ok(n) => Ok(n),
+                                    Err(e) => Err(map_fatfs_err(&e)),
+                                }
+                            };
+                            restore_cached_file(&vdx, fs_file_id, file);
+                            res
+                        }
                     }
                 }
             };
@@ -605,43 +607,45 @@ impl FileSystem for Fat32Fs {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.write().body.payload;
-            let params = &payload.params;
+            let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
             let write_through = params.write_through;
-            let data = params.data;
 
-            let write_res: Result<usize, FileStatus> = {
-                let state = take_cached_file_state(&vdx, fs_file_id);
-                match state {
-                    Err(e) => Err(e),
-                    Ok(state) => {
-                        let mut file = state.into_file(&*fs);
-                        let n = data.len();
-                        let seek_res = file.seek(SeekFrom::Start(offset)).await;
-                        let res = if let Err(e) = seek_res {
-                            Err(map_fatfs_err(&e))
-                        } else {
-                            let write_res = file.write_all(data, fatfs::IoKind::Data).await;
-                            match write_res {
-                                Ok(()) => Ok(n),
-                                Err(e) => Err(map_fatfs_err(&e)),
+            let write_res: Result<usize, FileStatus> = match params.buffer.take() {
+                None => Err(FileStatus::UnknownFail),
+                Some(buffer) => {
+                    let state = take_cached_file_state(&vdx, fs_file_id);
+                    match state {
+                        Err(e) => Err(e),
+                        Ok(state) => {
+                            let mut file = state.into_file(&*fs);
+                            let seek_res = file.seek(SeekFrom::Start(offset)).await;
+                            let res = if let Err(e) = seek_res {
+                                Err(map_fatfs_err(&e))
+                            } else {
+                                let write_res =
+                                    file.write_iobuffer(buffer, fatfs::IoKind::Data).await;
+                                match write_res {
+                                    Ok(n) => Ok(n),
+                                    Err(e) => Err(map_fatfs_err(&e)),
+                                }
+                            };
+                            let lower_flush = if write_through && res.is_ok() {
+                                LowerFlush::Blocking
+                            } else {
+                                LowerFlush::None
+                            };
+                            let flush_err = if write_through {
+                                flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
+                            } else {
+                                restore_cached_file(&vdx, fs_file_id, file);
+                                None
+                            };
+                            match flush_err {
+                                Some(e) => Err(e),
+                                None => res,
                             }
-                        };
-                        let lower_flush = if write_through && res.is_ok() {
-                            LowerFlush::Blocking
-                        } else {
-                            LowerFlush::None
-                        };
-                        let flush_err = if write_through {
-                            flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
-                        } else {
-                            restore_cached_file(&vdx, fs_file_id, file);
-                            None
-                        };
-                        match flush_err {
-                            Some(e) => Err(e),
-                            None => res,
                         }
                     }
                 }
@@ -696,7 +700,7 @@ impl FileSystem for Fat32Fs {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.write().body.payload;
-            let params = &payload.params;
+            let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let err = {
                 let is_dir = {
@@ -1020,52 +1024,56 @@ impl FileSystem for Fat32Fs {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.write().body.payload;
-            let params = &payload.params;
+            let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let write_through = params.write_through;
-            let data = params.data;
 
-            let append_res: Result<(usize, u64), FileStatus> = {
-                let start_off = {
-                    let handles = vdx.handles.lock();
-                    match handles.ctx(fs_file_id) {
-                        Ok(ctx) if ctx.is_dir => Err(FileStatus::AccessDenied),
-                        Ok(ctx) => Ok(ctx.size),
-                        Err(e) => Err(e),
-                    }
-                };
-                match start_off {
-                    Err(e) => Err(e),
-                    Ok(start_off) => {
-                        let state = take_cached_file_state(&vdx, fs_file_id);
-                        match state {
+            let append_res: Result<(usize, u64), FileStatus> = match params.buffer.take() {
+                None => Err(FileStatus::UnknownFail),
+                Some(buffer) => {
+                    let start_off = {
+                        let handles = vdx.handles.lock();
+                        match handles.ctx(fs_file_id) {
+                            Ok(ctx) if ctx.is_dir => Err(FileStatus::AccessDenied),
+                            Ok(ctx) => Ok(ctx.size),
                             Err(e) => Err(e),
-                            Ok(state) => {
-                                let mut file = state.into_file(&*fs);
-                                let res = match file.seek(SeekFrom::Start(start_off)).await {
-                                    Ok(_) => {
-                                        let n = data.len();
-                                        match file.write_all(data, fatfs::IoKind::Data).await {
-                                            Ok(()) => Ok((n, start_off + n as u64)),
-                                            Err(e) => Err(map_fatfs_err(&e)),
+                        }
+                    };
+                    match start_off {
+                        Err(e) => Err(e),
+                        Ok(start_off) => {
+                            let state = take_cached_file_state(&vdx, fs_file_id);
+                            match state {
+                                Err(e) => Err(e),
+                                Ok(state) => {
+                                    let mut file = state.into_file(&*fs);
+                                    let res = match file.seek(SeekFrom::Start(start_off)).await {
+                                        Ok(_) => {
+                                            match file
+                                                .write_iobuffer(buffer, fatfs::IoKind::Data)
+                                                .await
+                                            {
+                                                Ok(n) => Ok((n, start_off + n as u64)),
+                                                Err(e) => Err(map_fatfs_err(&e)),
+                                            }
                                         }
+                                        Err(e) => Err(map_fatfs_err(&e)),
+                                    };
+                                    let lower_flush = if write_through && res.is_ok() {
+                                        LowerFlush::Blocking
+                                    } else {
+                                        LowerFlush::None
+                                    };
+                                    let flush_err = if write_through {
+                                        flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
+                                    } else {
+                                        restore_cached_file(&vdx, fs_file_id, file);
+                                        None
+                                    };
+                                    match flush_err {
+                                        Some(e) => Err(e),
+                                        None => res,
                                     }
-                                    Err(e) => Err(map_fatfs_err(&e)),
-                                };
-                                let lower_flush = if write_through && res.is_ok() {
-                                    LowerFlush::Blocking
-                                } else {
-                                    LowerFlush::None
-                                };
-                                let flush_err = if write_through {
-                                    flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
-                                } else {
-                                    restore_cached_file(&vdx, fs_file_id, file);
-                                    None
-                                };
-                                match flush_err {
-                                    Some(e) => Err(e),
-                                    None => res,
                                 }
                             }
                         }

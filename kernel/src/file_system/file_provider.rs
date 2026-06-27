@@ -2,6 +2,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use spin::Lazy;
 
 use kernel_types::{
+    dma::{FromDevice, IoBuffer, ToDevice},
     fs::{Path, *},
     status::{DriverStatus, FileStatus},
 };
@@ -105,46 +106,71 @@ impl Provider {
         }
     }
 
-    pub async fn read_at(
+    pub async fn read_iobuffer_at<'buffer>(
         self,
         file_id: u64,
         offset: u64,
-        buf: &mut [u8],
+        mut buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
     ) -> (FsReadResult, DriverStatus) {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.read_at_sync(file_id, offset, buf))
-            }
+            Provider::Bootstrap => bootstrap(|| {
+                let mut bytes = alloc::vec![0; buffer.len()];
+                let (result, status) = BOOTSTRAP_PROVIDER.read_at_sync(file_id, offset, &mut bytes);
+                if result.error.is_none()
+                    && buffer
+                        .copy_from_slice(0, &bytes[..result.bytes_read])
+                        .is_err()
+                {
+                    return (
+                        FsReadResult {
+                            bytes_read: 0,
+                            error: Some(FileStatus::UnknownFail),
+                        },
+                        DriverStatus::InvalidParameter,
+                    );
+                }
+                (result, status)
+            }),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .read(FsReadParams {
                         fs_file_id: file_id,
                         offset,
-                        buf,
+                        buffer: Some(buffer),
                     })
                     .await
             }
         }
     }
 
-    pub async fn write_at(
+    pub async fn write_iobuffer_at<'buffer>(
         self,
         file_id: u64,
         offset: u64,
-        data: &[u8],
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         write_through: bool,
     ) -> (FsWriteResult, DriverStatus) {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.write_at_sync(file_id, offset, data))
-            }
+            Provider::Bootstrap => bootstrap(|| {
+                let mut bytes = alloc::vec![0; buffer.len()];
+                if buffer.copy_to_slice(0, &mut bytes).is_err() {
+                    return (
+                        FsWriteResult {
+                            written: 0,
+                            error: Some(FileStatus::UnknownFail),
+                        },
+                        DriverStatus::InvalidParameter,
+                    );
+                }
+                BOOTSTRAP_PROVIDER.write_at_sync(file_id, offset, &bytes)
+            }),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .write(FsWriteParams {
                         fs_file_id: file_id,
                         offset,
                         write_through,
-                        data,
+                        buffer: Some(buffer),
                     })
                     .await
             }
@@ -265,19 +291,32 @@ impl Provider {
         }
     }
 
-    pub async fn append(
+    pub async fn append_iobuffer<'buffer>(
         self,
         file_id: u64,
-        data: &[u8],
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         write_through: bool,
     ) -> (FsAppendResult, DriverStatus) {
         match self {
-            Provider::Bootstrap => bootstrap(|| BOOTSTRAP_PROVIDER.append_sync(file_id, data)),
+            Provider::Bootstrap => bootstrap(|| {
+                let mut bytes = alloc::vec![0; buffer.len()];
+                if buffer.copy_to_slice(0, &mut bytes).is_err() {
+                    return (
+                        FsAppendResult {
+                            written: 0,
+                            new_size: 0,
+                            error: Some(FileStatus::UnknownFail),
+                        },
+                        DriverStatus::InvalidParameter,
+                    );
+                }
+                BOOTSTRAP_PROVIDER.append_sync(file_id, &bytes)
+            }),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .append(FsAppendParams {
                         fs_file_id: file_id,
-                        data,
+                        buffer: Some(buffer),
                         write_through,
                     })
                     .await

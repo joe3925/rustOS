@@ -1,3 +1,4 @@
+use crate::dma::{FromDevice, IoBuffer, ToDevice};
 use crate::status::FileStatus;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -141,12 +142,8 @@ pub struct FsCloseResult {
 pub struct FsReadParams<'a> {
     pub fs_file_id: u64,
     pub offset: u64,
-    pub buf: &'a mut [u8],
+    pub buffer: Option<IoBuffer<'a, 'a, FromDevice>>,
 }
-
-// Safety: exclusive access is guaranteed by the &'a mut borrow while the BorrowedHandle
-// is alive; the driver only writes into buf during the awaited call, never concurrently.
-unsafe impl<'a> Sync for FsReadParams<'a> {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, kernel_macros::RequestPayload)]
@@ -161,7 +158,7 @@ pub struct FsWriteParams<'a> {
     pub fs_file_id: u64,
     pub offset: u64,
     pub write_through: bool,
-    pub data: &'a [u8],
+    pub buffer: Option<IoBuffer<'a, 'a, ToDevice>>,
 }
 
 #[repr(C)]
@@ -273,10 +270,10 @@ pub struct FsSetLenResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, kernel_macros::RequestPayload)]
+#[derive(Debug, kernel_macros::RequestPayload)]
 pub struct FsAppendParams<'a> {
     pub fs_file_id: u64,
-    pub data: &'a [u8],
+    pub buffer: Option<IoBuffer<'a, 'a, ToDevice>>,
     pub write_through: bool,
 }
 #[repr(C)]

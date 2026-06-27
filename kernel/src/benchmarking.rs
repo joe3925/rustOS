@@ -39,6 +39,7 @@ use kernel_types::benchmark::{
     BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
 };
 use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
+use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::{DeviceControl, RequestHandle};
@@ -3634,6 +3635,17 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
     let mut buf = vec![0u8; max_size];
 
     fill_disk_bench_pattern(&mut buf);
+    let io_backing = match IoBufferBacking::new(
+        IoBufferBackingDesc::SliceMut(&mut buf),
+        IoBufferBackingConfig::worst_case_for_len(max_size),
+    ) {
+        Ok(backing) => backing,
+        Err(e) => {
+            println!("[disk-bench] failed to create I/O backing: {:?}", e);
+            let _ = file.close().await;
+            return;
+        }
+    };
 
     let passes = core::cmp::max(
         1,
@@ -3681,9 +3693,29 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 let tag = (ops ^ offset ^ 0xfeed_beef).to_le_bytes();
                 let tag_len = core::cmp::min(tag.len(), len);
 
-                buf[..tag_len].copy_from_slice(&tag[..tag_len]);
+                let mut edit = match io_backing.create_bidirectional(0, len) {
+                    Ok(buffer) => buffer,
+                    Err(e) => {
+                        println!("[disk-bench] warm buffer lease failed: {:?}", e);
+                        let _ = file.close().await;
+                        return;
+                    }
+                };
+                edit.try_as_mut_slice()
+                    .expect("benchmark backing is contiguous")[..tag_len]
+                    .copy_from_slice(&tag[..tag_len]);
+                drop(edit);
 
-                if let Err(e) = file.write_at(offset, &buf[..len]).await {
+                let io_buffer = match io_backing.create_to_device(0, len) {
+                    Ok(buffer) => buffer,
+                    Err(e) => {
+                        println!("[disk-bench] warm write lease failed: {:?}", e);
+                        let _ = file.close().await;
+                        return;
+                    }
+                };
+
+                if let Err(e) = file.write_iobuffer_at(offset, io_buffer).await {
                     println!(
                         "[disk-bench] warm write failed size={} offset={}: {:?}",
                         size, offset, e
@@ -3709,9 +3741,29 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 let tag = (ops ^ offset).to_le_bytes();
                 let tag_len = core::cmp::min(tag.len(), len);
 
-                buf[..tag_len].copy_from_slice(&tag[..tag_len]);
+                let mut edit = match io_backing.create_bidirectional(0, len) {
+                    Ok(buffer) => buffer,
+                    Err(e) => {
+                        println!("[disk-bench] write buffer lease failed: {:?}", e);
+                        let _ = file.close().await;
+                        return;
+                    }
+                };
+                edit.try_as_mut_slice()
+                    .expect("benchmark backing is contiguous")[..tag_len]
+                    .copy_from_slice(&tag[..tag_len]);
+                drop(edit);
 
-                if let Err(e) = file.write_at(offset, &buf[..len]).await {
+                let io_buffer = match io_backing.create_to_device(0, len) {
+                    Ok(buffer) => buffer,
+                    Err(e) => {
+                        println!("[disk-bench] write lease failed: {:?}", e);
+                        let _ = file.close().await;
+                        return;
+                    }
+                };
+
+                if let Err(e) = file.write_iobuffer_at(offset, io_buffer).await {
                     println!(
                         "[disk-bench] write failed size={} offset={}: {:?}",
                         size, offset, e
@@ -3747,7 +3799,16 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 let remaining = (bench_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
 
-                if let Err(e) = file.read_at(offset, &mut buf[..len]).await {
+                let io_buffer = match io_backing.create_from_device(0, len) {
+                    Ok(buffer) => buffer,
+                    Err(e) => {
+                        println!("[disk-bench] read lease failed: {:?}", e);
+                        let _ = file.close().await;
+                        return;
+                    }
+                };
+
+                if let Err(e) = file.read_iobuffer_at(offset, io_buffer).await {
                     println!(
                         "[disk-bench] read failed size={} offset={}: {:?}",
                         size, offset, e
@@ -3756,7 +3817,14 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     return;
                 }
 
-                checksum ^= buf[0] as u64;
+                let inspect = io_backing
+                    .create_to_device(0, len)
+                    .expect("completed read released its benchmark lease");
+                checksum ^= inspect
+                    .try_as_slice()
+                    .expect("benchmark backing is contiguous")[0]
+                    as u64;
+                drop(inspect);
                 offset += len as u64;
                 ops += 1;
             }
@@ -4180,7 +4248,9 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                     IOCTL_BLOCK_BENCH_SWEEP_BOTH,
                                     requested,
                                 ));
-                                let _ = kernel_routing::io::send_down_stack(target.clone(), &mut warm).await;
+                                let _ =
+                                    kernel_routing::io::send_down_stack(target.clone(), &mut warm)
+                                        .await;
                                 trial += 1;
                                 continue;
                             }
@@ -4199,7 +4269,8 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                 start_sector,
                                 max_inflight
                             );
-                            let st = kernel_routing::io::send_down_stack(target.clone(), &mut req).await;
+                            let st =
+                                kernel_routing::io::send_down_stack(target.clone(), &mut req).await;
                             println!(
                                 "[virtio-bench] Completed trial {} for run_id {} with status: {:?}",
                                 trial, run_id, st

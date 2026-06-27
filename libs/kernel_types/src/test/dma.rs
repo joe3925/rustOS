@@ -152,3 +152,37 @@ fn dma_mapping_rejects_invalid_layout_without_unmapping() {
     );
     assert_eq!(UNMAP_COOKIE_SUM.load(Ordering::Acquire), before);
 }
+
+#[test]
+fn virtual_iobuffer_copies_without_physical_description() {
+    let mut bytes = [1u8, 2, 3, 4, 5, 6];
+    let mut buffer = unsafe {
+        IoBuffer::from_virt_bidirectional(bytes.as_mut_ptr() as usize, bytes.len())
+    };
+
+    assert!(buffer.backing().is_none());
+    assert_eq!(buffer.regions().count(), 0);
+
+    let mut copied = [0u8; 3];
+    buffer.copy_to_slice(2, &mut copied).unwrap();
+    assert_eq!(copied, [3, 4, 5]);
+
+    buffer.copy_from_slice(1, &[9, 8]).unwrap();
+    assert_eq!(bytes, [1, 9, 8, 4, 5, 6]);
+    assert_eq!(buffer.regions().count(), 0);
+}
+
+#[test]
+fn virtual_iobuffer_split_preserves_ranges() {
+    let mut bytes = [0u8; 8];
+    let buffer = unsafe {
+        IoBuffer::from_virt_bidirectional(bytes.as_mut_ptr() as usize, bytes.len())
+    };
+    let (mut left, mut right) = buffer.split_at(3).unwrap();
+
+    assert_eq!(left.len(), 3);
+    assert_eq!(right.len(), 5);
+    left.copy_from_slice(0, &[1, 2, 3]).unwrap();
+    right.copy_from_slice(0, &[4, 5, 6, 7, 8]).unwrap();
+    assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+}

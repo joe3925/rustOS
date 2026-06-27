@@ -11,7 +11,10 @@ pub const fn iobuffer_worst_case_lease_count(byte_len: usize) -> usize {
     if byte_len == 0 {
         0
     } else {
-        ((byte_len - 1) / IOBUFFER_WORST_CASE_LEASE_GRANULARITY) + 1
+        let chunks = ((byte_len - 1) / IOBUFFER_WORST_CASE_LEASE_GRANULARITY) + 1;
+        // A consumer that owns a buffer must be able to retain a remainder
+        // while forwarding a split prefix.
+        if chunks < 2 { 2 } else { chunks }
     }
 }
 

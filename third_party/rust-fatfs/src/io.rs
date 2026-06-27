@@ -13,6 +13,7 @@ pub trait IoBase: Send {
 ///
 /// It is based on the `std::io::Read` trait.
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::dma::{FromDevice, IoBuffer, ToDevice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoKind {
@@ -76,6 +77,24 @@ pub trait Write: IoBase {
 
     /// Flush this output stream, ensuring that all intermediately buffered contents reach their destination.
     fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>>;
+}
+
+/// Bulk data I/O that preserves an owned scatter/gather buffer through the
+/// storage stack. Filesystem metadata continues to use `Read` and `Write`.
+pub trait ReadIoBuffer: IoBase {
+    fn read_iobuffer<'a, 'buffer>(
+        &'a mut self,
+        buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
+        kind: IoKind,
+    ) -> FfiFuture<Result<usize, Self::Error>>;
+}
+
+pub trait WriteIoBuffer: IoBase {
+    fn write_iobuffer<'a, 'buffer>(
+        &'a mut self,
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+        kind: IoKind,
+    ) -> FfiFuture<Result<usize, Self::Error>>;
 }
 
 /// Enumeration of possible methods to seek within an I/O object.
