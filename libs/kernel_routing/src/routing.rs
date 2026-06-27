@@ -307,7 +307,6 @@ impl<'data> RoutedRequest for Pnp<'data> {
     ) -> impl Future<Output = Option<DriverStep>> + Send + 'a {
         async move { pnp_minor_dispatch(dev, handle).await }
     }
-
 }
 
 impl RoutedRequest for Dummy {
@@ -318,12 +317,11 @@ impl RoutedRequest for Dummy {
     ) -> impl Future<Output = Option<DriverStep>> + Send + 'a {
         async move { None }
     }
-
 }
 
 fn prepare_request<K: RequestKind>(handle: &mut RequestHandle<'_, K>) {
     {
-        let guard = handle.write();
+        let guard = handle.get_mut();
         guard.status = DriverStatus::ContinueStep;
         guard.completed = false;
     }
@@ -332,7 +330,7 @@ fn prepare_request<K: RequestKind>(handle: &mut RequestHandle<'_, K>) {
 /// Complete a request.
 #[inline]
 pub fn complete_request<K: RequestKind>(handle: &mut RequestHandle<'_, K>) -> DriverStatus {
-    let guard = handle.write();
+    let guard = handle.get_mut();
     guard.complete()
 }
 
@@ -341,7 +339,7 @@ fn complete_with_status<K: RequestKind>(
     handle: &mut RequestHandle<'_, K>,
     status: DriverStatus,
 ) -> DriverStatus {
-    handle.write().status = status;
+    handle.get_mut().status = status;
     complete_request(handle)
 }
 
@@ -351,7 +349,9 @@ async fn call_one_device<K: RoutedRequest>(
 ) -> DriverStatus {
     match K::invoke_at(dev, handle).await {
         Some(DriverStep::Complete { status }) => complete_with_status(handle, status),
-        Some(DriverStep::Continue) | None => complete_with_status(handle, DriverStatus::NotImplemented),
+        Some(DriverStep::Continue) | None => {
+            complete_with_status(handle, DriverStatus::NotImplemented)
+        }
     }
 }
 
@@ -393,7 +393,12 @@ async fn call_pnp_down_stack<'data>(
                     dev = n;
                 }
                 None => {
-                    let status = handle.read().body.request.minor_function.default_status_for_unhandled();
+                    let status = handle
+                        .get()
+                        .body
+                        .request
+                        .minor_function
+                        .default_status_for_unhandled();
                     return complete_with_status(handle, status);
                 }
             },
@@ -486,7 +491,12 @@ pub mod pnp {
         match Pnp::invoke_at(&target, handle).await {
             Some(DriverStep::Complete { status }) => complete_with_status(handle, status),
             Some(DriverStep::Continue) | None => {
-                let status = handle.read().body.request.minor_function.default_status_for_unhandled();
+                let status = handle
+                    .get()
+                    .body
+                    .request
+                    .minor_function
+                    .default_status_for_unhandled();
                 complete_with_status(handle, status)
             }
         }
@@ -549,7 +559,7 @@ async fn pnp_minor_dispatch<'data>(
     device: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_, Pnp<'data>>,
 ) -> Option<DriverStep> {
-    let minor = handle.read().body.request.minor_function;
+    let minor = handle.get().body.request.minor_function;
 
     if let Some(cb) = device.pnp_vtable.as_ref().and_then(|vt| vt.get(minor)) {
         let mut step = cb(device, handle).await;

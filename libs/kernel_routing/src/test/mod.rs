@@ -8,16 +8,12 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::device::{DeviceInit, DeviceObject};
-use kernel_types::dma::{
-    IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-};
+use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::io::{DeviceOps, DeviceRead, DeviceWrite};
 use kernel_types::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
 };
-use kernel_types::request::{
-    Dummy, Pnp, Read, Request, RequestData, RequestHandle, Write,
-};
+use kernel_types::request::{Dummy, Pnp, Read, Request, RequestData, RequestHandle, Write};
 use kernel_types::status::DriverStatus;
 
 use crate::{complete_request, io, pnp};
@@ -63,7 +59,7 @@ extern "C" fn read_handler(
 ) -> FfiFuture<DriverStep> {
     async move {
         let len = handle.read().body.len;
-        if let Some(buffer) = handle.write().body.buffer.as_mut() {
+        if let Some(buffer) = handle.get_mut().body.buffer.as_mut() {
             let out = buffer.try_as_mut_slice().unwrap();
             if out.len() >= 2 {
                 out[0] = len as u8;
@@ -149,9 +145,9 @@ fn complete_request_runs_chained_completions_once() {
     let before = COMPLETION_SUM.load(Ordering::Acquire);
     let mut handle = RequestHandle::new(Dummy);
 
-    handle.write().add_completion(completion_success, 10);
-    handle.write().add_completion(completion_timeout, 20);
-    handle.write().add_completion(completion_success, 5);
+    handle.get_mut().add_completion(completion_success, 10);
+    handle.get_mut().add_completion(completion_timeout, 20);
+    handle.get_mut().add_completion(completion_success, 5);
 
     assert_eq!(complete_request(&mut handle), DriverStatus::Success);
     assert_eq!(handle.status(), DriverStatus::Success);
@@ -175,13 +171,7 @@ fn read_request_invokes_matching_io_handler_and_updates_buffer() {
         )
         .unwrap();
         let buffer = backing.create_from_device(0, out_len).unwrap();
-        let mut handle = RequestHandle::new(Read {
-            offset: 5,
-            len: 12,
-            no_buffer: false,
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+        let mut handle = RequestHandle::new(Read::new(5, 12, false, Some(buffer)));
 
         block_on_ready(io::send_to_device(dev, &mut handle))
     };
@@ -200,14 +190,7 @@ fn unhandled_io_is_not_implemented_or_explicitly_forwarded_lower() {
     )
     .unwrap();
     let buffer = backing.create_to_device(0, 1).unwrap();
-    let mut handle = RequestHandle::new(Write {
-        offset: 0,
-        len: 1,
-        no_buffer: false,
-        owner: 0,
-        buffer: Some(buffer),
-        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-    });
+    let mut handle = RequestHandle::new(Write::new(0, 1, false, 0, Some(buffer)));
 
     assert_eq!(
         block_on_ready(io::send_to_device(upper.clone(), &mut handle)),
@@ -225,14 +208,7 @@ fn unhandled_io_is_not_implemented_or_explicitly_forwarded_lower() {
     )
     .unwrap();
     let buffer = backing.create_to_device(0, input.len()).unwrap();
-    let mut handle = RequestHandle::new(Write {
-        offset: 0,
-        len: 4,
-        no_buffer: false,
-        owner: 0,
-        buffer: Some(buffer),
-        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-    });
+    let mut handle = RequestHandle::new(Write::new(0, 4, false, 0, Some(buffer)));
     assert_eq!(
         block_on_ready(io::send_next_lower(upper, &mut handle)),
         DriverStatus::Success
@@ -249,14 +225,7 @@ fn next_lower_reports_missing_link() {
     )
     .unwrap();
     let buffer = backing.create_to_device(0, input.len()).unwrap();
-    let mut handle = RequestHandle::new(Write {
-        offset: 0,
-        len: 1,
-        no_buffer: false,
-        owner: 0,
-        buffer: Some(buffer),
-        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-    });
+    let mut handle = RequestHandle::new(Write::new(0, 1, false, 0, Some(buffer)));
 
     assert_eq!(
         block_on_ready(io::send_next_lower(dev, &mut handle)),
@@ -296,13 +265,7 @@ fn io_continue_completes_not_implemented_without_forwarding() {
         )
         .unwrap();
         let buffer = backing.create_from_device(0, out_len).unwrap();
-        let mut handle = RequestHandle::new(Read {
-            offset: 0,
-            len: 3,
-            no_buffer: false,
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+        let mut handle = RequestHandle::new(Read::new(0, 3, false, Some(buffer)));
         block_on_ready(io::send_down_stack(upper, &mut handle))
     };
 

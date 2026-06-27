@@ -105,7 +105,7 @@ pub async fn devicetree_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    if req.read().body.request.relation != DeviceRelationType::BusRelations {
+    if req.get().body.request.relation != DeviceRelationType::BusRelations {
         return DriverStep::Continue;
     }
 
@@ -215,10 +215,10 @@ pub async fn dt_pdo_query_id<'req, 'data, 'b>(
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
         return DriverStep::complete(DriverStatus::NoSuchDevice);
     };
-    let id_type = req.read().body.request.id_type;
+    let id_type = req.get().body.request.id_type;
 
     {
-        let w = req.write();
+        let w = req.get_mut();
         let pnp = &mut w.body.request;
         match id_type {
             QueryIdType::DeviceId => {
@@ -246,7 +246,7 @@ pub async fn dt_pdo_query_resources<'req, 'data, 'b>(
     };
 
     {
-        let w = req.write();
+        let w = req.get_mut();
         w.body.request.data_out = RequestData::from_t::<Vec<u8>>(ext.resources.clone());
         w.status = DriverStatus::Success;
     }
@@ -259,7 +259,7 @@ pub async fn dt_pdo_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    if req.read().body.request.relation != DeviceRelationType::BusRelations {
+    if req.get().body.request.relation != DeviceRelationType::BusRelations {
         return DriverStep::Continue;
     }
 

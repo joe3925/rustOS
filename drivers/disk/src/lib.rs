@@ -156,13 +156,13 @@ impl DeviceRead for DiskIo {
         }
 
         let (requests, bytes) = {
-            let body = &req.read().body;
+            let body = &req.get().body;
 
             match validate_disk_read_chain(body, bs) {
                 Ok(v) => v,
                 Err(st) => {
                     cold_path();
-                    req.write().status = st.clone();
+                    req.get_mut().status = st.clone();
                     return DriverStep::complete(st);
                 }
             }
@@ -198,13 +198,13 @@ impl DeviceWrite for DiskIo {
         }
 
         let (requests, bytes) = {
-            let body = &req.read().body;
+            let body = &req.get().body;
 
             match validate_disk_write_chain(body, bs) {
                 Ok(v) => v,
                 Err(st) => {
                     cold_path();
-                    req.write().status = st.clone();
+                    req.get_mut().status = st.clone();
                     return DriverStep::complete(st);
                 }
             }
@@ -233,7 +233,7 @@ impl DeviceControlHandler for DiskIo {
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
     ) -> DriverStep {
-        let code = req.read().body.code;
+        let code = req.get().body.code;
 
         match code {
             IOCTL_DRIVE_IDENTIFY => {
@@ -254,12 +254,12 @@ impl DeviceControlHandler for DiskIo {
                 }
 
                 let mut info_opt = {
-                    let wr = ch.write();
+                    let wr = ch.get_mut();
                     wr.body.request.data_out.take_exact::<DiskInfo>().ok()
                 };
                 if unlikely(info_opt.is_none()) {
                     info_opt = ch
-                        .read()
+                        .get()
                         .body
                         .request
                         .data_out_ref()
@@ -275,7 +275,7 @@ impl DeviceControlHandler for DiskIo {
                     }
                 };
 
-                req.write().body.set_data_t::<DiskInfo>(info);
+                req.get_mut().body.set_data_t::<DiskInfo>(info);
                 DriverStep::complete(DriverStatus::Success)
             }
             _ => DriverStep::complete(io::send_next_lower(dev.clone(), req).await),
@@ -358,18 +358,18 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         cold_path();
         return Err(st);
     }
-    if unlikely(ch.read().status != DriverStatus::Success) {
+    if unlikely(ch.get().status != DriverStatus::Success) {
         cold_path();
-        return Err(ch.read().status.clone());
+        return Err(ch.get().status.clone());
     }
 
     let mut di_opt = {
-        let req = ch.write();
+        let req = ch.get_mut();
         req.body.request.data_out.take_exact::<DiskInfo>().ok()
     };
 
     if unlikely(di_opt.is_none()) {
-        let req = ch.read();
+        let req = ch.get();
         di_opt = req
             .body
             .request

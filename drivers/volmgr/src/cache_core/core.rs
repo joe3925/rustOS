@@ -517,14 +517,7 @@ where
 
         let len = buffer.len();
 
-        let mut req = RequestHandle::new(Write {
-            offset,
-            len,
-            no_buffer: false,
-            owner,
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+        let mut req = RequestHandle::new(Write::new(offset, len, false, owner, Some(buffer)));
 
         let status = self.backend.write_request(&mut req).await;
         drop(req);
@@ -898,13 +891,7 @@ where
             }
 
             let io_buf = self.create_cache_from_device_buffer_at(page, block_off, len)?;
-            let mut req = RequestHandle::new(Read {
-                offset,
-                len,
-                no_buffer: false,
-                buffer: Some(io_buf),
-                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            });
+            let mut req = RequestHandle::new(Read::new(offset, len, false, Some(io_buf)));
             self.backend
                 .read_request(&mut req)
                 .await
@@ -1072,14 +1059,13 @@ where
     ) -> Result<(), CacheError<B::Error>> {
         let buffer = self.create_cache_to_device_buffer(page, BLOCK_SIZE)?;
 
-        let mut req = RequestHandle::new(Write {
-            offset: lba * BLOCK_SIZE as u64,
-            len: BLOCK_SIZE,
-            no_buffer: false,
+        let mut req = RequestHandle::new(Write::new(
+            lba * BLOCK_SIZE as u64,
+            BLOCK_SIZE,
+            false,
             owner,
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+            Some(buffer),
+        ));
 
         let status = self.backend.write_request(&mut req).await;
         drop(req);
@@ -1466,21 +1452,19 @@ where
         let first_buffer =
             self.create_cache_to_device_buffer_at(&first_page.page, first_block_off, first_len)?;
 
-        let mut req = RequestHandle::new(Write {
-            offset: first_offset,
-            len: first_len,
-            no_buffer: false,
-            owner: first_page.page.owner.load(Ordering::Acquire),
-            buffer: Some(first_buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+        let mut req = RequestHandle::new(Write::new(
+            first_offset,
+            first_len,
+            false,
+            first_page.page.owner.load(Ordering::Acquire),
+            Some(first_buffer),
+        ));
 
         let mut initialized = 0usize;
         let mut result = Ok(());
 
         {
-            let req_write = req.write();
-            let mut prev_write_ptr: *mut Write<'_> = &mut req_write.body;
+            let req_write = req.get_mut();
 
             let mut chain_idx = 1usize;
             while chain_idx < extents.len() {
@@ -1527,14 +1511,13 @@ where
                     }
                 };
 
-                let write = Write {
+                let write = Write::new(
                     offset,
-                    len: byte_len,
-                    no_buffer: false,
-                    owner: first_page.page.owner.load(Ordering::Acquire),
-                    buffer: Some(buffer),
-                    next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-                };
+                    byte_len,
+                    false,
+                    first_page.page.owner.load(Ordering::Acquire),
+                    Some(buffer),
+                );
 
                 let write_static: Write<'static> = unsafe { core::mem::transmute(write) };
 
@@ -1546,12 +1529,9 @@ where
                     as *mut Write<'static> as *mut Write<'_>;
 
                 unsafe {
-                    (*prev_write_ptr)
-                        .next
-                        .store(curr_write_ptr, Ordering::Release);
+                    req_write.body.append_next(curr_write_ptr);
                 }
 
-                prev_write_ptr = curr_write_ptr;
                 chain_idx += 1;
             }
         }
@@ -2296,7 +2276,7 @@ where
         self.check_open()?;
 
         let (offset, len_req, no_buffer, req_data_len) = {
-            let r = req.read();
+            let r = req.get();
             (
                 r.body.offset,
                 r.body.len,
@@ -2320,7 +2300,7 @@ where
 
         if no_buffer {
             {
-                let w = req.write();
+                let w = req.get_mut();
                 w.body.len = len;
             }
 
@@ -2346,7 +2326,7 @@ where
             }
 
             if !has_cached_page && self.free_pages.lock().is_empty() {
-                req.write().body.len = len;
+                req.get_mut().body.len = len;
 
                 self.backend
                     .read_request(req)
@@ -2358,7 +2338,7 @@ where
         }
 
         let contiguous_dst = req
-            .write()
+            .get_mut()
             .body
             .buffer
             .as_mut()
@@ -2377,7 +2357,7 @@ where
         self.read_at(offset, &mut bytes).await?;
 
         let buffer = req
-            .write()
+            .get_mut()
             .body
             .buffer
             .as_mut()
@@ -2394,7 +2374,7 @@ where
         self.check_open()?;
 
         let (offset, len_req, no_buffer, owner, req_data_len) = {
-            let r = req.read();
+            let r = req.get();
             (
                 r.body.offset,
                 r.body.len,
@@ -2419,7 +2399,7 @@ where
 
         if no_buffer {
             {
-                let w = req.write();
+                let w = req.get_mut();
                 w.body.len = len;
             }
 
@@ -2445,7 +2425,7 @@ where
             }
 
             if !has_cached_page && self.free_pages.lock().is_empty() {
-                req.write().body.len = len;
+                req.get_mut().body.len = len;
 
                 self.backend
                     .write_request(req)
@@ -2458,7 +2438,7 @@ where
         }
 
         let buffer = req
-            .write()
+            .get_mut()
             .body
             .buffer
             .take()

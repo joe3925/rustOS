@@ -5,10 +5,6 @@ pub extern crate alloc;
 
 pub use kernel_types::{async_ffi, device, request, status};
 
-pub use kernel_protocol::{
-    open_protocol_at_stack_top, open_protocol_to_next_lower, open_protocol_to_next_upper,
-    register_protocol, DriverProtocol, ProtocolHandle, ProtocolId, ProtocolVersion,
-};
 pub use kernel_routing;
 pub use kernel_types;
 

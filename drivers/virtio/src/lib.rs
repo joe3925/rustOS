@@ -395,7 +395,7 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
     }
 
     let resources = {
-        let r = query_req.read();
+        let r = query_req.get();
         let blob = r
             .body
             .request
@@ -959,7 +959,7 @@ async fn virtio_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    let relation = { req.read().body.request.relation };
+    let relation = { req.get().body.request.relation };
     if relation == DeviceRelationType::BusRelations {
         create_child_pdo(&dev);
         return complete_req(req, DriverStatus::Success);
@@ -1130,9 +1130,9 @@ pub async fn virtio_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    let ty = { req.read().body.request.id_type };
+    let ty = { req.get().body.request.id_type };
     let status = {
-        let w = req.write();
+        let w = req.get_mut();
         let p = &mut w.body.request;
         match ty {
             QueryIdType::HardwareIds | QueryIdType::CompatibleIds => {
@@ -1170,7 +1170,7 @@ pub async fn virtio_pdo_query_resources<'req, 'data, 'b>(
     };
 
     let status = {
-        let w = req.write();
+        let w = req.get_mut();
         let p = &mut w.body.request;
         let di = &cdx.disk_info;
         p.data_out = RequestData::from_t::<DiskInfo>(*di);
@@ -1195,7 +1195,7 @@ pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
     };
 
     let backing = {
-        let r = req.read();
+        let r = req.get();
 
         match r.body.request.data_out_ref().view::<DmaBacking<'data>>() {
             Some(payload) => payload.backing,

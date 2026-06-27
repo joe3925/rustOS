@@ -651,7 +651,7 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
     }
 
     let blob = handle
-        .read()
+        .get()
         .body
         .request
         .data_out_ref()

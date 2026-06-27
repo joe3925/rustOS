@@ -23,12 +23,10 @@ use kernel_api::kernel_types::io::{
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
-    DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
-    io, pnp, pnp_create_child_devnode_and_pdo_with_init,
+    DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add, io,
+    pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::request::{
-    DeviceControl, Flush, FlushDirty, Pnp, Read, RequestHandle, Write,
-};
+use kernel_api::request::{DeviceControl, Flush, FlushDirty, Pnp, Read, RequestHandle, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use spin::Once;
@@ -232,7 +230,7 @@ impl DeviceRead for PartitionPdoIo {
         };
 
         {
-            let body = &request.read().body;
+            let body = &request.get().body;
             if let Err(status) = validate_partition_read_chain(body, part_bytes, block_size) {
                 cold_path();
                 return DriverStep::complete(status);
@@ -240,7 +238,7 @@ impl DeviceRead for PartitionPdoIo {
         }
 
         {
-            let mut req = request.write();
+            let mut req = request.get_mut();
             if let Err(status) = translate_read_chain(&mut req.body, base) {
                 cold_path();
                 return DriverStep::complete(status);
@@ -288,7 +286,7 @@ impl DeviceWrite for PartitionPdoIo {
         };
 
         {
-            let body = &request.read().body;
+            let body = &request.get().body;
             if let Err(status) = validate_partition_write_chain(body, part_bytes, block_size) {
                 cold_path();
                 return DriverStep::complete(status);
@@ -296,7 +294,7 @@ impl DeviceWrite for PartitionPdoIo {
         }
 
         {
-            let mut req = request.write();
+            let mut req = request.get_mut();
             if let Err(status) = translate_write_chain(&mut req.body, base) {
                 cold_path();
                 return DriverStep::complete(status);
@@ -340,7 +338,7 @@ async fn partition_pdo_query_resources<'req, 'data, 'b>(
     request: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     {
-        let w = request.write();
+        let w = request.get_mut();
         let pnp = &mut w.body.request;
         let dx = ext::<PartDevExt>(&device);
         if let Some(pi) = dx.part.get() {
@@ -382,7 +380,7 @@ pub async fn partmgr_start<'req, 'data, 'b>(
         return DriverStep::complete(status);
     }
 
-    if let Some(data) = parent_req.write().data().read_only().view::<DiskInfo>() {
+    if let Some(data) = parent_req.get_mut().data().read_only().view::<DiskInfo>() {
         dx.disk_info.call_once(|| *data);
     } else {
         return DriverStep::complete(status);
@@ -402,17 +400,16 @@ async fn read_from_lower_async(
         IoBufferBackingConfig::default(),
     )
     .expect("io_buf creation for read_from_lower_async failed");
-    let mut child_req = RequestHandle::new(Read {
+    let mut child_req = RequestHandle::new(Read::new(
         offset,
         len,
-        no_buffer: false,
-        buffer: Some(
+        false,
+        Some(
             io_buf
                 .create_from_device(0, len)
                 .expect("io_buf creation for read_from_lower_async failed"),
         ),
-        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-    });
+    ));
     let status = io::send_next_lower(dev.clone(), &mut child_req).await;
 
     drop(child_req);
@@ -430,7 +427,7 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     request: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    let relation = { request.read().body.request.relation };
+    let relation = { request.get().body.request.relation };
     if relation != DeviceRelationType::BusRelations {
         return DriverStep::complete(DriverStatus::NotImplemented);
     }

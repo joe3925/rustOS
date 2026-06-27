@@ -206,18 +206,19 @@ impl<T> From<Poll<T>> for FfiPoll<T> {
 }
 unsafe impl Sync for FfiWakerVTable {}
 #[repr(C)]
-pub struct FfiWakerVTable {
-    pub clone: unsafe extern "C" fn(*const ()) -> FfiWaker,
-    pub wake: unsafe extern "C" fn(*const ()),
-    pub wake_by_ref: unsafe extern "C" fn(*const ()),
-    pub drop: unsafe extern "C" fn(*const ()),
+struct FfiWakerVTable {
+    clone: unsafe extern "C" fn(*const ()) -> FfiWaker,
+    wake: unsafe extern "C" fn(*const ()),
+    wake_by_ref: unsafe extern "C" fn(*const ()),
+    drop: unsafe extern "C" fn(*const ()),
 }
+
 unsafe impl Send for FfiWaker {}
 unsafe impl Sync for FfiWaker {}
 #[repr(C)]
 pub struct FfiWaker {
-    pub data: *const (),
-    pub vtable: &'static FfiWakerVTable,
+    data: *const (),
+    vtable: &'static FfiWakerVTable,
 }
 
 impl Clone for FfiWaker {
@@ -245,15 +246,19 @@ impl FfiWaker {
 
 #[repr(C)]
 pub struct FfiFuture<T> {
-    pub abi_version: u32,
-    pub data: Option<*mut ()>,
-    pub poll_fn: unsafe extern "C" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
-    pub drop_fn: unsafe extern "C" fn(*mut ()),
+    abi_version: u32,
+    data: Option<*mut ()>,
+    poll_fn: unsafe extern "C" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
+    drop_fn: unsafe extern "C" fn(*mut ()),
 }
 
 unsafe impl<T: Send> Send for FfiFuture<T> {}
 
 impl<T> FfiFuture<T> {
+    pub fn abi_version(&self) -> u32 {
+        self.abi_version
+    }
+
     pub fn is_null(&self) -> bool {
         self.data.is_none()
     }
@@ -555,20 +560,40 @@ unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
 
 #[repr(C)]
 pub struct BorrowingFfiFuture<'a, T> {
-    pub abi_version: u32,
-    pub data: *mut (),
-    pub poll_fn: unsafe extern "C" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
-    pub drop_fn: Option<unsafe extern "C" fn(*mut ())>,
+    abi_version: u32,
+    data: *mut (),
+    poll_fn: unsafe extern "C" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
+    drop_fn: Option<unsafe extern "C" fn(*mut ())>,
     _pd: PhantomData<&'a mut ()>,
 }
 
 impl<'a, T> BorrowingFfiFuture<'a, T> {
+    pub fn abi_version(&self) -> u32 {
+        self.abi_version
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.data.is_null()
+    }
+
     pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> {
-        unsafe { (self.poll_fn)(self.data, waker) }
+        if self.data.is_null() {
+            FfiPoll::pending()
+        } else {
+            unsafe { (self.poll_fn)(self.data, waker) }
+        }
     }
 
     pub fn from_owned_ffi<'b>(mut fut: FfiFuture<T>) -> BorrowingFfiFuture<'b, T> {
-        let data_ptr = fut.data.take().unwrap_or(ptr::null_mut());
+        let Some(data_ptr) = fut.data.take() else {
+            return BorrowingFfiFuture {
+                abi_version: fut.abi_version,
+                data: ptr::null_mut(),
+                poll_fn: null_borrowing_future_poll::<T>,
+                drop_fn: None,
+                _pd: PhantomData,
+            };
+        };
 
         BorrowingFfiFuture {
             abi_version: fut.abi_version,
@@ -598,9 +623,7 @@ where
     }
 }
 
-pub fn borrowing_ffi_future_from_pin<'a, F>(
-    fut: Pin<&'a mut F>,
-) -> BorrowingFfiFuture<'a, F::Output>
+fn borrowing_ffi_future_from_pin<'a, F>(fut: Pin<&'a mut F>) -> BorrowingFfiFuture<'a, F::Output>
 where
     F: Future,
 {
@@ -613,6 +636,13 @@ where
         drop_fn: None,
         _pd: PhantomData,
     }
+}
+
+unsafe extern "C" fn null_borrowing_future_poll<T>(
+    _data: *mut (),
+    _waker: *const FfiWaker,
+) -> FfiPoll<T> {
+    FfiPoll::pending()
 }
 
 unsafe extern "C" fn borrowing_future_poll<F>(
@@ -641,6 +671,11 @@ impl<'a, T> Future for BorrowingFfiFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         let this = unsafe { self.get_unchecked_mut() };
+
+        if this.data.is_null() {
+            return Poll::Pending;
+        }
+
         let ffi_waker = cx.waker().clone().into_ffi();
         let p = unsafe { (this.poll_fn)(this.data, &ffi_waker as *const FfiWaker) };
 

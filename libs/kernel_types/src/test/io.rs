@@ -135,13 +135,7 @@ fn device_ops_registers_typed_handlers() {
     )
     .unwrap();
     let io_buffer = backing.create_from_device(0, 4).unwrap();
-    let handle = RequestHandle::new(Read {
-        offset: 0,
-        len: 4,
-        no_buffer: false,
-        buffer: Some(io_buffer),
-        next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-    });
+    let handle = RequestHandle::new(Read::new(0, 4, false, Some(io_buffer)));
     assert_eq!(handle.read().body.offset, 0);
     assert_eq!(handle.read().body.len, 4);
 

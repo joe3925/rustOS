@@ -616,75 +616,14 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let mut cursor_addr = {
-        let mut guard = req.write();
-        (&mut guard.body as *mut Read<'data>) as usize
-    };
-
     let mut final_status = DriverStatus::Success;
     let mut pending = PendingOpBatch::new(&qs.read_ops);
 
-    loop {
-        if pending.is_full() {
-            let status =
-                submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read")
-                    .await;
-            pending.clear();
+    {
+        let request = req.get_mut();
 
-            if status != DriverStatus::Success {
-                final_status = status;
-                break;
-            }
-        }
-
-        if cursor_addr == 0 {
-            break;
-        }
-
-        let candidate = {
-            let _guard = req.write();
-            let read = unsafe { &mut *(cursor_addr as *mut Read<'data>) };
-            let next_addr = read.next.load(Ordering::Acquire) as usize;
-            let offset = read.offset;
-            let len = read.len;
-
-            if unlikely(len == 0) {
-                cursor_addr = next_addr;
-                None
-            } else {
-                match validate_common_block_io(offset, len) {
-                    Ok(()) => match read.buffer.as_ref() {
-                        Some(buffer) if buffer.len() >= len => Some((offset, len, next_addr)),
-                        Some(_) => {
-                            cold_path();
-                            final_status = DriverStatus::InvalidParameter;
-                            None
-                        }
-                        None => {
-                            cold_path();
-                            final_status = DriverStatus::InvalidParameter;
-                            None
-                        }
-                    },
-                    Err(status) => {
-                        final_status = status;
-                        None
-                    }
-                }
-            }
-        };
-
-        if final_status != DriverStatus::Success {
-            break;
-        }
-
-        let Some((offset, len, next_addr)) = candidate else {
-            continue;
-        };
-
-        let mut lease = match qs.read_ops.alloc() {
-            Some(lease) => lease,
-            None if !pending.is_empty() => {
+        for read in request.body.iter_mut() {
+            if pending.is_full() {
                 let status =
                     submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read")
                         .await;
@@ -694,43 +633,85 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                     final_status = status;
                     break;
                 }
+            }
 
+            let offset = read.offset;
+            let len = read.len;
+
+            if unlikely(len == 0) {
                 continue;
             }
-            None => wait_for_pending_op_slot(qs, &qs.read_ops).await,
-        };
 
-        let buffer = {
-            let _guard = req.write();
-            let read = unsafe { &mut *(cursor_addr as *mut Read<'data>) };
+            match validate_common_block_io(offset, len) {
+                Ok(()) => {}
+                Err(status) => {
+                    final_status = status;
+                    break;
+                }
+            }
 
-            match read.buffer.take() {
+            match read.buffer.as_ref() {
+                Some(buffer) if buffer.len() >= len => {}
+                Some(_) | None => {
+                    cold_path();
+                    final_status = DriverStatus::InvalidParameter;
+                    break;
+                }
+            }
+
+            let mut lease = match qs.read_ops.alloc() {
+                Some(lease) => lease,
+                None if !pending.is_empty() => {
+                    let status = submit_block_ops_to_queue(
+                        &inner,
+                        qs,
+                        VIRTIO_BLK_T_IN,
+                        &pending,
+                        false,
+                        "read",
+                    )
+                    .await;
+                    pending.clear();
+
+                    if status != DriverStatus::Success {
+                        final_status = status;
+                        break;
+                    }
+
+                    match qs.read_ops.alloc() {
+                        Some(lease) => lease,
+                        None => wait_for_pending_op_slot(qs, &qs.read_ops).await,
+                    }
+                }
+                None => wait_for_pending_op_slot(qs, &qs.read_ops).await,
+            };
+
+            let buffer = match read.buffer.take() {
                 Some(buffer) => buffer,
                 None => {
                     cold_path();
                     final_status = DriverStatus::InvalidParameter;
                     break;
                 }
-            }
-        };
+            };
 
-        let mapped_buffer = match map_request_buffer(&parent, buffer) {
-            Ok(buffer) => buffer,
-            Err(status) => {
-                cold_path();
-                final_status = status;
-                break;
-            }
-        };
+            let mapped_buffer = match map_request_buffer(&parent, buffer) {
+                Ok(buffer) => buffer,
+                Err(status) => {
+                    cold_path();
+                    final_status = status;
+                    break;
+                }
+            };
 
-        lease.write(PendingBlockOp {
-            sector: offset >> 9,
-            len,
-            mapped_buffer,
-        });
+            lease.write(PendingBlockOp {
+                sector: offset >> 9,
+                len,
+                mapped_buffer,
+            });
 
-        pending.push(lease);
-        cursor_addr = next_addr;
+            pending.push(lease);
+        }
     }
 
     if final_status == DriverStatus::Success && !pending.is_empty() {
@@ -740,7 +721,6 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
 
     complete_req(req, final_status)
 }
-
 #[inline(always)]
 pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
@@ -757,75 +737,14 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let mut cursor_addr = {
-        let mut guard = req.write();
-        (&mut guard.body as *mut Write<'data>) as usize
-    };
-
     let mut final_status = DriverStatus::Success;
     let mut pending = PendingOpBatch::new(&qs.write_ops);
 
-    loop {
-        if pending.is_full() {
-            let status =
-                submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_OUT, &pending, true, "write")
-                    .await;
-            pending.clear();
+    {
+        let request = req.get_mut();
 
-            if status != DriverStatus::Success {
-                final_status = status;
-                break;
-            }
-        }
-
-        if cursor_addr == 0 {
-            break;
-        }
-
-        let candidate = {
-            let _guard = req.write();
-            let write = unsafe { &mut *(cursor_addr as *mut Write<'data>) };
-            let next_addr = write.next.load(Ordering::Acquire) as usize;
-            let offset = write.offset;
-            let len = write.len;
-
-            if unlikely(len == 0) {
-                cursor_addr = next_addr;
-                None
-            } else {
-                match validate_common_block_io(offset, len) {
-                    Ok(()) => match write.buffer.as_ref() {
-                        Some(buffer) if buffer.len() >= len => Some((offset, len, next_addr)),
-                        Some(_) => {
-                            cold_path();
-                            final_status = DriverStatus::InvalidParameter;
-                            None
-                        }
-                        None => {
-                            cold_path();
-                            final_status = DriverStatus::InvalidParameter;
-                            None
-                        }
-                    },
-                    Err(status) => {
-                        final_status = status;
-                        None
-                    }
-                }
-            }
-        };
-
-        if final_status != DriverStatus::Success {
-            break;
-        }
-
-        let Some((offset, len, next_addr)) = candidate else {
-            continue;
-        };
-
-        let mut lease = match qs.write_ops.alloc() {
-            Some(lease) => lease,
-            None if !pending.is_empty() => {
+        for write in request.body.iter_mut() {
+            if pending.is_full() {
                 let status = submit_block_ops_to_queue(
                     &inner,
                     qs,
@@ -841,43 +760,85 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                     final_status = status;
                     break;
                 }
+            }
 
+            let offset = write.offset;
+            let len = write.len;
+
+            if unlikely(len == 0) {
                 continue;
             }
-            None => wait_for_pending_op_slot(qs, &qs.write_ops).await,
-        };
 
-        let buffer = {
-            let _guard = req.write();
-            let write = unsafe { &mut *(cursor_addr as *mut Write<'data>) };
+            match validate_common_block_io(offset, len) {
+                Ok(()) => {}
+                Err(status) => {
+                    final_status = status;
+                    break;
+                }
+            }
 
-            match write.buffer.take() {
+            match write.buffer.as_ref() {
+                Some(buffer) if buffer.len() >= len => {}
+                Some(_) | None => {
+                    cold_path();
+                    final_status = DriverStatus::InvalidParameter;
+                    break;
+                }
+            }
+
+            let mut lease = match qs.write_ops.alloc() {
+                Some(lease) => lease,
+                None if !pending.is_empty() => {
+                    let status = submit_block_ops_to_queue(
+                        &inner,
+                        qs,
+                        VIRTIO_BLK_T_OUT,
+                        &pending,
+                        true,
+                        "write",
+                    )
+                    .await;
+                    pending.clear();
+
+                    if status != DriverStatus::Success {
+                        final_status = status;
+                        break;
+                    }
+
+                    match qs.write_ops.alloc() {
+                        Some(lease) => lease,
+                        None => wait_for_pending_op_slot(qs, &qs.write_ops).await,
+                    }
+                }
+                None => wait_for_pending_op_slot(qs, &qs.write_ops).await,
+            };
+
+            let buffer = match write.buffer.take() {
                 Some(buffer) => buffer,
                 None => {
                     cold_path();
                     final_status = DriverStatus::InvalidParameter;
                     break;
                 }
-            }
-        };
+            };
 
-        let mapped_buffer = match map_request_buffer(&parent, buffer) {
-            Ok(buffer) => buffer,
-            Err(status) => {
-                cold_path();
-                final_status = status;
-                break;
-            }
-        };
+            let mapped_buffer = match map_request_buffer(&parent, buffer) {
+                Ok(buffer) => buffer,
+                Err(status) => {
+                    cold_path();
+                    final_status = status;
+                    break;
+                }
+            };
 
-        lease.write(PendingBlockOp {
-            sector: offset >> 9,
-            len,
-            mapped_buffer,
-        });
+            lease.write(PendingBlockOp {
+                sector: offset >> 9,
+                len,
+                mapped_buffer,
+            });
 
-        pending.push(lease);
-        cursor_addr = next_addr;
+            pending.push(lease);
+        }
     }
 
     if final_status == DriverStatus::Success && !pending.is_empty() {

@@ -56,7 +56,7 @@ pub async fn root_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    if req.read().body.request.relation != DeviceRelationType::BusRelations {
+    if req.get().body.request.relation != DeviceRelationType::BusRelations {
         return DriverStep::Continue;
     }
 

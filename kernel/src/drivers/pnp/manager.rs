@@ -823,7 +823,7 @@ impl PnpManager {
             });
 
             let ctx = Arc::into_raw(dn.clone()) as usize;
-            start_request.write().add_completion(Self::start_io, ctx);
+            start_request.get_mut().add_completion(Self::start_io, ctx);
 
             kernel_routing::pnp::send_down_stack(top_device, &mut start_request).await;
         } else {
@@ -858,7 +858,7 @@ impl PnpManager {
                 });
                 let ctx = Arc::into_raw(dev_node.clone()) as usize;
                 bus_enum_request
-                    .write()
+                    .get_mut()
                     .add_completion(Self::process_enumerated_children, ctx);
 
                 spawn_detached(async move {
@@ -983,7 +983,7 @@ impl PnpManager {
             request: pnp_payload,
         });
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
-        req.write()
+        req.get_mut()
             .add_completion(Self::process_enumerated_children, ctx);
 
         kernel_routing::pnp::send_down_stack(top, &mut req).await
@@ -1329,7 +1329,7 @@ impl PnpManager {
             request: pnp_payload,
         });
         let ctx = Arc::into_raw(dn.clone()) as usize;
-        start_request.write().add_completion(Self::start_io, ctx);
+        start_request.get_mut().add_completion(Self::start_io, ctx);
 
         kernel_routing::pnp::send_down_stack(top.clone(), &mut start_request).await;
 

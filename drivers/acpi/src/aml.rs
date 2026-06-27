@@ -932,7 +932,7 @@ pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
     }
 
     {
-        let w = req.write();
+        let w = req.get_mut();
         w.body.request.data_out = RequestData::from_t::<Vec<u8>>(blob);
         w.status = DriverStatus::Success;
     }
@@ -947,7 +947,7 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
-    let ty = { req.read().body.request.id_type };
+    let ty = { req.get().body.request.id_type };
 
     let ctx_lock = &pext.ctx;
     let mut guard = ctx_lock.write();
@@ -956,7 +956,7 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
 
     let mut status = DriverStatus::Success;
     {
-        let w = req.write();
+        let w = req.get_mut();
         let p = &mut w.body.request;
 
         match ty {

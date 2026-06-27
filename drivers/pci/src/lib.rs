@@ -48,7 +48,7 @@ impl DeviceControlHandler for PciPdoIo {
         dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
     ) -> DriverStep {
-        let code = req.read().body.code;
+        let code = req.get().body.code;
 
         match code {
             IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev.clone(), req).await,
@@ -114,7 +114,7 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
         }
 
         let blob = query_handle
-            .read()
+            .get()
             .body
             .request
             .data_out_ref()
@@ -157,7 +157,7 @@ pub async fn pci_bus_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    let relation = req.read().body.request.relation;
+    let relation = req.get().body.request.relation;
     if relation == DeviceRelationType::BusRelations {
         let st = enumerate_bus(&device).await;
         if st == DriverStatus::Success {
@@ -384,7 +384,7 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
 
     let mut status = DriverStatus::Success;
     {
-        let mut r = req.write();
+        let mut r = req.get_mut();
         let pnp = &mut r.body.request;
         match pnp.id_type {
             QueryIdType::HardwareIds => {
@@ -426,7 +426,7 @@ pub async fn pci_pdo_query_resources<'req, 'data, 'b>(
     };
 
     let status = {
-        let mut r = req.write();
+        let mut r = req.get_mut();
         r.body.request.data_out = RequestData::from_t::<Vec<u8>>(build_resources_blob(&ext));
         DriverStatus::Success
     };

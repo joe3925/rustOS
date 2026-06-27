@@ -149,7 +149,7 @@ impl<T> AsyncMutex<T> {
         self.unlock_and_wake_one();
     }
 
-    pub fn unlock_and_wake_one(&self) {
+    fn unlock_and_wake_one(&self) {
         let was_locked = self.locked.swap(false, Ordering::Release);
         debug_assert!(was_locked);
 
@@ -435,7 +435,7 @@ impl<T> AsyncRwLock<T> {
         self.write_unlock_and_wake_one();
     }
 
-    pub fn read_unlock_and_wake_one(&self) {
+    fn read_unlock_and_wake_one(&self) {
         let prev = self.state.fetch_sub(1, Ordering::Release);
         debug_assert!(prev > 0);
 
@@ -444,7 +444,7 @@ impl<T> AsyncRwLock<T> {
         }
     }
 
-    pub fn write_unlock_and_wake_one(&self) {
+    fn write_unlock_and_wake_one(&self) {
         let prev = self.state.swap(0, Ordering::Release);
         debug_assert!(prev == -1);
 

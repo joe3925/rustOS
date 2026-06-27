@@ -114,13 +114,7 @@ impl BlockDev {
             }
         };
 
-        let mut req = RequestHandle::new(ReadRequest {
-            offset,
-            len,
-            no_buffer: false,
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+        let mut req = RequestHandle::new(ReadRequest::new(offset, len, false, Some(buffer)));
 
         let status = io::send_down_stack(volume, &mut req).await;
 
@@ -143,15 +137,9 @@ impl BlockDev {
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
     ) -> Result<usize, DriverStatus> {
         let len = buffer.len();
-        let mut req = RequestHandle::new(ReadRequest {
-            offset,
-            len,
-            no_buffer: false,
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+        let mut req = RequestHandle::new(ReadRequest::new(offset, len, false, Some(buffer)));
         let status = io::send_down_stack(self.volume.clone(), &mut req).await;
-        let completed = req.read().body.len;
+        let completed = req.get().body.len;
         if status == DriverStatus::Success {
             Ok(completed)
         } else {
@@ -194,14 +182,13 @@ impl BlockDev {
             }
         };
 
-        let mut req = RequestHandle::new(WriteRequest {
+        let mut req = RequestHandle::new(WriteRequest::new(
             offset,
             len,
             no_buffer,
-            owner: self.current_owner.load(Ordering::Acquire),
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+            self.current_owner.load(Ordering::Acquire),
+            Some(buffer),
+        ));
 
         let status = io::send_down_stack(volume, &mut req).await;
 
@@ -224,16 +211,15 @@ impl BlockDev {
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
     ) -> Result<usize, DriverStatus> {
         let len = buffer.len();
-        let mut req = RequestHandle::new(WriteRequest {
+        let mut req = RequestHandle::new(WriteRequest::new(
             offset,
             len,
-            no_buffer: false,
-            owner: self.current_owner.load(Ordering::Acquire),
-            buffer: Some(buffer),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+            false,
+            self.current_owner.load(Ordering::Acquire),
+            Some(buffer),
+        ));
         let status = io::send_down_stack(self.volume.clone(), &mut req).await;
-        let completed = req.read().body.len;
+        let completed = req.get().body.len;
         if status == DriverStatus::Success {
             Ok(completed)
         } else {

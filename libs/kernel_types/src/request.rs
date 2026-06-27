@@ -17,6 +17,7 @@ use crate::{
     EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
     EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
 };
+use core::ptr::null;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use alloc::string::String;
@@ -1060,11 +1061,25 @@ pub struct Read<'io> {
     pub len: usize,
     pub no_buffer: bool,
     pub buffer: Option<IoBuffer<'io, 'io, FromDevice>>,
-    pub next: AtomicPtr<Self>,
+    next: AtomicPtr<Self>,
 }
-
 impl<'io> Read<'io> {
-    pub fn append_next(&self, next: *mut Self) {
+    pub fn new(
+        offset: u64,
+        len: usize,
+        no_buffer: bool,
+        buffer: Option<IoBuffer<'io, 'io, FromDevice>>,
+    ) -> Self {
+        Self {
+            offset,
+            len,
+            no_buffer,
+            buffer,
+            next: AtomicPtr::new(null_mut()),
+        }
+    }
+    // TODO: can be made safe by adding a chain lifetime param
+    pub unsafe fn append_next(&self, next: *mut Self) {
         let mut curr = self as *const Self as *mut Self;
 
         loop {
@@ -1154,11 +1169,27 @@ pub struct Write<'io> {
     pub no_buffer: bool,
     pub owner: u64,
     pub buffer: Option<IoBuffer<'io, 'io, ToDevice>>,
-    pub next: AtomicPtr<Self>,
+    next: AtomicPtr<Self>,
 }
 
 impl<'io> Write<'io> {
-    pub fn append_next(&self, next: *mut Self) {
+    pub fn new(
+        offset: u64,
+        len: usize,
+        no_buffer: bool,
+        owner: u64,
+        buffer: Option<IoBuffer<'io, 'io, ToDevice>>,
+    ) -> Self {
+        Self {
+            offset,
+            len,
+            no_buffer,
+            owner,
+            buffer,
+            next: AtomicPtr::new(null_mut()),
+        }
+    }
+    pub unsafe fn append_next(&self, next: *mut Self) {
         let mut curr = self as *const Self as *mut Self;
 
         loop {
@@ -1701,12 +1732,12 @@ impl<'req, K: RequestKind> RequestHandle<'req, K> {
 
     #[inline]
     pub fn status(&self) -> DriverStatus {
-        self.read().status.clone()
+        self.get().status.clone()
     }
 
     /// Acquire read access.
     #[inline]
-    pub fn read(&self) -> &Request<K> {
+    pub fn get(&self) -> &Request<K> {
         match self {
             RequestHandle::Stack(r) => r,
             RequestHandle::Owned(r) => r,
@@ -1715,7 +1746,7 @@ impl<'req, K: RequestKind> RequestHandle<'req, K> {
 
     /// Acquire write access.
     #[inline]
-    pub fn write(&mut self) -> &mut Request<K> {
+    pub fn get_mut(&mut self) -> &mut Request<K> {
         match self {
             RequestHandle::Stack(r) => r,
             RequestHandle::Owned(r) => r,
@@ -1738,7 +1769,7 @@ where
 {
     #[inline]
     pub fn data(&mut self) -> RequestDataView<'_, 'data> {
-        self.write().data()
+        self.get_mut().data()
     }
 }
 

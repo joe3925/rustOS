@@ -182,7 +182,7 @@ impl Vfs {
         }
 
         request_handle
-            .write()
+            .get_mut()
             .body
             .payload
             .result

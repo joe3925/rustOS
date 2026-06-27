@@ -89,7 +89,7 @@ pub async fn ps2_query_devrels<'req, 'data, 'b>(
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     use kernel_api::pnp::DeviceRelationType;
-    let relation = req.read().body.request.relation;
+    let relation = req.get().body.request.relation;
     if relation != DeviceRelationType::BusRelations {
         return DriverStep::complete(DriverStatus::NotImplemented);
     }
@@ -183,7 +183,7 @@ async fn ps2_child_query_id<'req, 'data, 'b>(
     };
 
     {
-        let r = req.write();
+        let r = req.get_mut();
         let p = &mut r.body.request;
 
         match p.id_type {

@@ -193,13 +193,10 @@ impl VolumeCacheBackend for CacheBackend {
                 return Err(DriverStatus::InvalidParameter);
             }
 
-            let mut req = RequestHandle::new(Read {
+            let mut req = RequestHandle::new( Read::new(
                 offset,
-                len: total_len,
-                no_buffer: false,
-                buffer: Some(buffer),
-                next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            });
+                 total_len,
+                 false,Some(buffer),));
             let status = io::send_down_stack(self.target.clone(), &mut req).await;
 
             if unlikely(status != DriverStatus::Success) {
@@ -221,61 +218,57 @@ impl VolumeCacheBackend for CacheBackend {
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
-                let r = req.write();
-                let mut current: *mut Read<'data> = &mut r.body;
+                let r = req.get_mut();
                 let mut first_offset = 0u64;
                 let mut first_len = 0usize;
                 let mut first = true;
+                    for body in &mut r.body.iter_mut() {
+                        let offset = body.offset;
+                        let len = body.len;
 
-                while !current.is_null() {
-                    let body = unsafe { &mut *current };
-                    let offset = body.offset;
-                    let len = body.len;
+                        let max_len = match self.request_len_from_offset(offset, len) {
+                            Some(max_len) => max_len,
+                            None => {
+                                cold_path();
+                                println!(
+                                    "volmgr: CacheBackend::read_request invalid read offset {} len {} for volume length {}",
+                                    offset,
+                                    len,
+                                    self.volume_bytes
+                                );
+                                return Err(DriverStatus::InvalidParameter);
+                            }
+                        };
 
-                    let max_len = match self.request_len_from_offset(offset, len) {
-                        Some(max_len) => max_len,
-                        None => {
+                        if unlikely(max_len == 0 || max_len != len) {
                             cold_path();
                             println!(
-                                "volmgr: CacheBackend::read_request invalid read offset {} len {} for volume length {}",
+                                "volmgr: CacheBackend::read_request read exceeds volume offset {} len {} max_len {} volume length {}",
                                 offset,
                                 len,
+                                max_len,
                                 self.volume_bytes
                             );
                             return Err(DriverStatus::InvalidParameter);
                         }
-                    };
 
-                    if unlikely(max_len == 0 || max_len != len) {
-                        cold_path();
-                        println!(
-                            "volmgr: CacheBackend::read_request read exceeds volume offset {} len {} max_len {} volume length {}",
-                            offset,
-                            len,
-                            max_len,
-                            self.volume_bytes
-                        );
-                        return Err(DriverStatus::InvalidParameter);
+                        if !body.no_buffer {
+                            let buffer = body
+                                .buffer
+                                .as_mut()
+                                .ok_or(DriverStatus::InvalidParameter)?;
+
+                            buffer
+                                .ensure_phys_described()
+                                .map_err(|_| DriverStatus::InsufficientResources)?;
+                        }
+
+                        if first {
+                            first_offset = offset;
+                            first_len = len;
+                            first = false;
+                        }
                     }
-
-                    if !body.no_buffer {
-                        let buffer = body
-                            .buffer
-                            .as_mut()
-                            .ok_or(DriverStatus::InvalidParameter)?;
-                        buffer
-                            .ensure_phys_described()
-                            .map_err(|_| DriverStatus::InsufficientResources)?;
-                    }
-
-                    if first {
-                        first_offset = offset;
-                        first_len = len;
-                        first = false;
-                    }
-
-                    current = body.next.load(core::sync::atomic::Ordering::Acquire);
-                }
 
                 (first_offset, first_len)
             };
@@ -302,14 +295,12 @@ impl VolumeCacheBackend for CacheBackend {
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
-                let w = req.write();
-                let mut current: *mut Write<'data> = &mut w.body;
+                let w = req.get_mut();
                 let mut first_offset = 0u64;
                 let mut first_len = 0usize;
                 let mut first = true;
 
-                while !current.is_null() {
-                    let body = unsafe { &mut *current };
+                for body in w.body.iter_mut() {
                     let offset = body.offset;
                     let len = body.len;
 
@@ -324,15 +315,6 @@ impl VolumeCacheBackend for CacheBackend {
                             return Err(DriverStatus::InvalidParameter);
                         }
                     };
-
-                    if unlikely(max_len == 0) {
-                        cold_path();
-                        println!(
-                            "volmgr: CacheBackend::write_request zero-length write after clamp at offset {} len {}",
-                            offset, len
-                        );
-                        return Err(DriverStatus::InvalidParameter);
-                    }
 
                     if unlikely(max_len == 0 || max_len != len) {
                         cold_path();
@@ -351,6 +333,7 @@ impl VolumeCacheBackend for CacheBackend {
                             .buffer
                             .as_mut()
                             .ok_or(DriverStatus::InvalidParameter)?;
+
                         buffer
                             .ensure_phys_described()
                             .map_err(|_| DriverStatus::InsufficientResources)?;
@@ -361,8 +344,6 @@ impl VolumeCacheBackend for CacheBackend {
                         first_len = max_len;
                         first = false;
                     }
-
-                    current = body.next.load(core::sync::atomic::Ordering::Acquire);
                 }
 
                 (first_offset, first_len)
@@ -377,6 +358,7 @@ impl VolumeCacheBackend for CacheBackend {
                 );
                 return Err(status);
             }
+
             Ok(())
         }
         .into_ffi()
@@ -576,7 +558,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
     }
 
     let dx = ext::<VolExt>(&dev);
-    let status = query_req.read().status.clone();
+    let status = query_req.get().status.clone();
     if unlikely(status != DriverStatus::Success) {
         cold_path();
         println!(
@@ -587,7 +569,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
     }
 
     let pi_opt: Option<PartitionInfo> = {
-        let req = query_req.write();
+        let req = query_req.get_mut();
         req.body.request.data_out.take_exact::<PartitionInfo>().ok()
     };
     if let Some(pi) = pi_opt {
@@ -723,7 +705,7 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
     };
 
     let (offset, len_req, no_buffer, req_data_len) = {
-        let r = req.read();
+        let r = req.get();
         (
             r.body.offset,
             r.body.len,
@@ -763,7 +745,7 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
     }
 
     {
-        let w = req.write();
+        let w = req.get_mut();
         w.body.len = len;
     }
 
@@ -799,7 +781,7 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
     };
 
     let (offset, len_req, no_buffer, req_data_len) = {
-        let r = req.read();
+        let r = req.get();
         (
             r.body.offset,
             r.body.len,
@@ -839,7 +821,7 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
     }
 
     {
-        let w = req.write();
+        let w = req.get_mut();
         w.body.len = len;
     }
 
@@ -864,21 +846,21 @@ async fn vol_pdo_flush_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Flush>,
 ) -> DriverStep {
-    vol_pdo_flush_common(dev, req.read().body.should_block, None).await
+    vol_pdo_flush_common(dev, req.get().body.should_block, None).await
 }
 
 async fn vol_pdo_flush_dirty_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, FlushDirty>,
 ) -> DriverStep {
-    vol_pdo_flush_common(dev, req.read().body.should_block, None).await
+    vol_pdo_flush_common(dev, req.get().body.should_block, None).await
 }
 
 async fn vol_pdo_flush_owner_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, FlushOwner>,
 ) -> DriverStep {
-    let body = req.read().body;
+    let body = req.get().body;
     vol_pdo_flush_common(dev, body.should_block, Some(body.owner)).await
 }
 
@@ -953,7 +935,7 @@ async fn vol_pdo_query_resources<'a, 'b>(
     req: &'b mut RequestHandle<'a, Pnp<'_>>,
 ) -> DriverStep {
     let status = {
-        let w = req.write();
+        let w = req.get_mut();
         if let Some(pi) = ext::<VolPdoExt>(&pdo).part.get() {
             w.body.request.data_out = RequestData::from_t(pi.clone());
         } else {

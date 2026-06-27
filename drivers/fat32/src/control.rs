@@ -13,8 +13,8 @@ use kernel_api::{
     },
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
-        driver_set_evt_device_add, pnp_create_control_device_and_link,
-        io, pnp, pnp_create_control_device_with_init,
+        driver_set_evt_device_add, io, pnp, pnp_create_control_device_and_link,
+        pnp_create_control_device_with_init,
     },
     request::{DeviceControl, Pnp, RequestHandle},
     request_handler,
@@ -61,12 +61,12 @@ impl DeviceControlHandler for Fat32RootIo {
         _dev: &Arc<DeviceObject>,
         req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
     ) -> DriverStep {
-        let code = req.read().body.code;
+        let code = req.get().body.code;
 
         match code {
             IOCTL_FS_IDENTIFY => {
                 let volume_fdo = {
-                    let r = req.write();
+                    let r = req.get_mut();
 
                     let volume_fdo = match r.data() {
                         RequestDataView::Writable(mut data) => data
@@ -100,7 +100,7 @@ impl DeviceControlHandler for Fat32RootIo {
                     let mut total_sectors = None;
 
                     if st == DriverStatus::Success {
-                        let q = query.write();
+                        let q = query.get_mut();
 
                         if let Some(pi) = q.body.request.data_out.take_exact::<PartitionInfo>().ok()
                         {
@@ -173,7 +173,7 @@ impl DeviceControlHandler for Fat32RootIo {
                 };
 
                 {
-                    let r = req.write();
+                    let r = req.get_mut();
                     let mut replacement = Some(FsIdentify {
                         mount_device,
                         can_mount,
@@ -222,7 +222,7 @@ pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
             IOCTL_MOUNTMGR_REGISTER_FS,
             ctrl_link.into_bytes(),
         ));
-        binding.write().body.code = IOCTL_MOUNTMGR_REGISTER_FS;
+        binding.get_mut().body.code = IOCTL_MOUNTMGR_REGISTER_FS;
         if let Some(target) = io::resolve_target(GLOBAL_CTRL_LINK) {
             let _ioctl_status = io::send_down_stack(target, &mut binding).await;
         }

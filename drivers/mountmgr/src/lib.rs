@@ -32,9 +32,9 @@ use kernel_api::{
     },
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-        driver_set_evt_device_add, pnp_create_control_device_and_link,
+        driver_set_evt_device_add, io, pnp, pnp_create_control_device_and_link,
         pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
-        io, pnp, pnp_create_symlink, pnp_load_service, pnp_remove_symlink,
+        pnp_create_symlink, pnp_load_service, pnp_remove_symlink,
     },
     reg::{self, switch_to_vfs_async},
     request::{DeviceControl, Fs, FsOpen, FsPayload, Pnp, Request, RequestHandle},
@@ -163,12 +163,12 @@ pub async fn volclass_ioctl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> DriverStep {
-    let code = req.read().body.code;
+    let code = req.get().body.code;
 
     match code {
         IOCTL_MOUNTMGR_UNMOUNT => {
             let target = {
-                let mut r = req.write();
+                let mut r = req.get_mut();
                 string_from_req(&mut r).unwrap_or_default()
             };
 
@@ -181,11 +181,11 @@ pub async fn volclass_ioctl<'req, 'data, 'b>(
                 }
                 dx.fs_attached.store(false, Ordering::Release);
             }
-            req.write().status = DriverStatus::Success;
+            req.get_mut().status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_QUERY => {
-            req.write().set_data(RequestData::from_t::<Vec<u8>>(
+            req.get_mut().set_data(RequestData::from_t::<Vec<u8>>(
                 build_status_blob(&dev).into_vec(),
             ));
             DriverStep::complete(DriverStatus::Success)
@@ -195,11 +195,11 @@ pub async fn volclass_ioctl<'req, 'data, 'b>(
             mount_if_unmounted(dev.clone()).await;
             // Enumerate all volumes and assign labels on-demand
             enumerate_and_assign_all_labels().await;
-            req.write().status = DriverStatus::Success;
+            req.get_mut().status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_LIST_FS => {
-            req.write()
+            req.get_mut()
                 .set_data(RequestData::from_t::<Vec<u8>>(list_fs_blob().into_vec()));
             DriverStep::complete(DriverStatus::Success)
         }
@@ -212,11 +212,11 @@ pub async fn volclass_ctrl_ioctl<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> DriverStep {
-    let code = req.read().body.code;
+    let code = req.get().body.code;
     match code {
         IOCTL_MOUNTMGR_REGISTER_FS => {
             let tag = {
-                let mut r = req.write();
+                let mut r = req.get_mut();
                 string_from_req(&mut r)
             };
             match tag {
@@ -328,7 +328,7 @@ async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
 
     // PartitionInfo is returned in the PnP payload data_out for QueryResources
     let pi = {
-        let req = request.read();
+        let req = request.get();
         let pnp = &req.body.request;
         if let Some(pi) = pnp
             .data_out_ref()
@@ -413,7 +413,7 @@ async fn try_bind_filesystems_for_parent_fdo(
                 can_mount: false,
             },
         ));
-        identify_req.write().body.code = kernel_api::IOCTL_FS_IDENTIFY;
+        identify_req.get_mut().body.code = kernel_api::IOCTL_FS_IDENTIFY;
         let Some(target) = io::resolve_target(&tag) else {
             continue;
         };
@@ -422,12 +422,12 @@ async fn try_bind_filesystems_for_parent_fdo(
             continue;
         }
 
-        if identify_req.read().status != DriverStatus::Success {
+        if identify_req.get().status != DriverStatus::Success {
             continue;
         }
 
         let (can_mount, function_fdo) = {
-            let req = identify_req.write();
+            let req = identify_req.get_mut();
             let Some(id) = req.data().read_only().view::<FsIdentify>() else {
                 continue;
             };
@@ -601,12 +601,12 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         return false;
     }
 
-    if req_inner.read().status != DriverStatus::Success {
+    if req_inner.get().status != DriverStatus::Success {
         return false;
     }
 
     req_inner
-        .read()
+        .get()
         .body
         .payload
         .result

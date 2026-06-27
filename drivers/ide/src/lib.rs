@@ -1,4 +1,3 @@
-
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 #![no_main]
@@ -375,7 +374,7 @@ impl DeviceRead for IdePdoIo {
         };
 
         let any = {
-            let r = req.read();
+            let r = req.get();
             match validate_ide_read_chain(&r.body) {
                 Ok(any) => any,
                 Err(status) => return complete_req(req, status),
@@ -395,7 +394,7 @@ impl DeviceRead for IdePdoIo {
 
         loop {
             let next = {
-                let r = req.read();
+                let r = req.get();
                 let mut out = Ok(None);
 
                 for (idx, read) in r.body.iter().enumerate() {
@@ -479,7 +478,7 @@ impl DeviceWrite for IdePdoIo {
         };
 
         let any = {
-            let r = req.read();
+            let r = req.get();
             match validate_ide_write_chain(&r.body) {
                 Ok(any) => any,
                 Err(status) => return complete_req(req, status),
@@ -499,7 +498,7 @@ impl DeviceWrite for IdePdoIo {
 
         loop {
             let next = {
-                let r = req.read();
+                let r = req.get();
                 let mut out = Ok(None);
 
                 for (idx, write) in r.body.iter().enumerate() {
@@ -582,7 +581,7 @@ impl DeviceControlHandler for IdePdoIo {
             Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
         };
 
-        let code = { req.read().body.code };
+        let code = { req.get().body.code };
 
         match code {
             IOCTL_BLOCK_FLUSH => {
@@ -651,12 +650,12 @@ async fn ide_pnp_start<'req, 'data, 'b>(
     let st = pnp::send_next_lower(dev.clone(), &mut child_handle).await;
 
     if st != DriverStatus::NoSuchDevice {
-        let qst = child_handle.read().status.clone();
+        let qst = child_handle.get().status.clone();
         if qst != DriverStatus::Success {
             return complete_req(req, qst);
         }
 
-        let binding = child_handle.read();
+        let binding = child_handle.get();
         let bars = {
             let data = binding
                 .body
@@ -724,7 +723,7 @@ async fn ide_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    let relation = { req.read().body.request.relation };
+    let relation = { req.get().body.request.relation };
 
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(dev);
@@ -1361,10 +1360,10 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
 ) -> DriverStep {
     use QueryIdType::*;
 
-    let ty = { req.read().body.request.id_type };
+    let ty = { req.get().body.request.id_type };
 
     {
-        let w = req.write();
+        let w = req.get_mut();
         let p = &mut w.body.request;
 
         match ty {
@@ -1407,7 +1406,7 @@ pub async fn ide_pdo_query_resources<'req, 'data, 'b>(
     };
 
     let status = {
-        let w = req.write();
+        let w = req.get_mut();
         let p = &mut w.body.request;
 
         match cdx.disk_info.as_ref() {
