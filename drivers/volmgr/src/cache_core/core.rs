@@ -16,13 +16,11 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_api::kernel_types::dma::{
-    FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-    IoBufferError, ToDevice,
+    FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, ToDevice,
 };
 use kernel_api::memory::{
-    PageTableFlags, PhysAddr, PhysicalMappingCache, VirtAddr,
-    allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range, map_physical_pages,
-    unmap_physical_pages, unmap_range,
+    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
+    deallocate_kernel_range, unmap_range,
 };
 use kernel_api::println;
 use kernel_api::request::Read;
@@ -506,34 +504,22 @@ where
         self.create_cache_to_device_buffer_at(page, 0, len)
     }
 
-    async fn write_slice_to_backend(
+    async fn write_buffer_to_backend<'buffer>(
         &self,
         offset: u64,
-        bytes: &[u8],
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
-        if unlikely(bytes.is_empty()) {
+        if unlikely(buffer.is_empty()) {
             cold_path();
             return Ok(());
         }
 
-        let backing = IoBufferBacking::new(
-            IoBufferBackingDesc::Slice(bytes),
-            IoBufferBackingConfig::worst_case_for_len(bytes.len()),
-        )
-        .map_err(|err| {
-            cold_path();
-            CacheError::InvalidIoBuffer(err)
-        })?;
-
-        let buffer = backing.create_to_device(0, bytes.len()).map_err(|err| {
-            cold_path();
-            CacheError::InvalidIoBuffer(err)
-        })?;
+        let len = buffer.len();
 
         let mut req = RequestHandle::new(Write {
             offset,
-            len: bytes.len(),
+            len,
             no_buffer: false,
             owner,
             buffer: Some(buffer),
@@ -545,6 +531,51 @@ where
 
         status.map_err(CacheError::Backend)?;
         Ok(())
+    }
+
+    fn take_to_device_buffer_range<'buffer>(
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+        offset: usize,
+        len: usize,
+    ) -> Result<
+        (
+            IoBuffer<'buffer, 'buffer, ToDevice>,
+            Option<IoBuffer<'buffer, 'buffer, ToDevice>>,
+        ),
+        CacheError<B::Error>,
+    > {
+        let end = offset.checked_add(len).ok_or(CacheError::OffsetOverflow)?;
+        if unlikely(end > buffer.len()) {
+            cold_path();
+            return Err(CacheError::InvalidConfig);
+        }
+
+        let range_and_tail = if offset == 0 {
+            buffer
+        } else {
+            match buffer.split_at(offset) {
+                Ok((prefix, range_and_tail)) => {
+                    drop(prefix);
+                    range_and_tail
+                }
+                Err((_buffer, err)) => {
+                    cold_path();
+                    return Err(CacheError::InvalidIoBuffer(err));
+                }
+            }
+        };
+
+        if len == range_and_tail.len() {
+            return Ok((range_and_tail, None));
+        }
+
+        match range_and_tail.split_at(len) {
+            Ok((range, tail)) => Ok((range, Some(tail))),
+            Err((_buffer, err)) => {
+                cold_path();
+                Err(CacheError::InvalidIoBuffer(err))
+            }
+        }
     }
 
     fn check_open(&self) -> Result<(), CacheError<B::Error>> {
@@ -985,9 +1016,6 @@ where
     async fn get_or_create_write_page(
         &self,
         lba: u64,
-        _block_off: usize,
-        _write_len: usize,
-        _src_for_full: &[u8],
     ) -> Result<WriteAcquire, CacheError<B::Error>> {
         if let Some(page) = self.try_get_page(lba).await {
             return Ok(WriteAcquire::Cached(page));
@@ -1060,20 +1088,6 @@ where
         Ok(())
     }
 
-    async fn write_direct_slice(
-        &self,
-        offset: u64,
-        bytes: &[u8],
-        owner: u64,
-    ) -> Result<(), CacheError<B::Error>> {
-        debug_assert_eq!((offset as usize) % BLOCK_SIZE, 0);
-        debug_assert_eq!(bytes.len() % BLOCK_SIZE, 0);
-
-        self.write_slice_to_backend(offset, bytes, owner).await?;
-
-        Ok(())
-    }
-
     fn take_direct_page(&self) -> Result<Arc<CachePage>, CacheError<B::Error>> {
         self.direct_page
             .lock()
@@ -1131,47 +1145,69 @@ where
         result
     }
 
-    async fn direct_write_at(
+    async fn direct_write_at<'buffer>(
         &self,
         offset: u64,
-        data: &[u8],
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+        len: usize,
         owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
-        if unlikely(data.is_empty()) {
+        if unlikely(len == 0) {
             cold_path();
             return Ok(());
+        }
+        if unlikely(buffer.len() < len) {
+            cold_path();
+            return Err(CacheError::InvalidConfig);
         }
 
         let page = self.take_direct_page()?;
         let mut result = Ok(());
-        let mut src_pos = 0usize;
+        let mut remaining = Some(buffer);
+        let mut buffer_offset = 0usize;
+        let mut written = 0usize;
         let mut cur_off = offset;
         let bs_u64 = Self::block_size_u64();
 
-        while src_pos < data.len() {
+        while written < len {
             let block_off = (cur_off % bs_u64) as usize;
 
             if block_off == 0 {
-                let remaining = data.len() - src_pos;
-                let direct_len = remaining - (remaining % BLOCK_SIZE);
+                let bytes_left = len - written;
+                let direct_len = bytes_left - (bytes_left % BLOCK_SIZE);
 
                 if direct_len != 0 {
+                    let source = remaining.take().expect("direct write buffer disappeared");
+                    let (direct_buffer, tail) = match Self::take_to_device_buffer_range(
+                        source,
+                        buffer_offset,
+                        direct_len,
+                    ) {
+                        Ok(parts) => parts,
+                        Err(err) => {
+                            result = Err(err);
+                            break;
+                        }
+                    };
+
                     if let Err(err) = self
-                        .write_direct_slice(cur_off, &data[src_pos..src_pos + direct_len], owner)
+                        .write_buffer_to_backend(cur_off, direct_buffer, owner)
                         .await
                     {
                         result = Err(err);
                         break;
                     }
 
-                    src_pos += direct_len;
+                    remaining = tail;
+                    buffer_offset = 0;
+                    written += direct_len;
                     cur_off += direct_len as u64;
                     continue;
                 }
             }
 
             let lba = cur_off / bs_u64;
-            let take = min(BLOCK_SIZE - block_off, data.len() - src_pos);
+            let take = min(BLOCK_SIZE - block_off, len - written);
 
             if block_off != 0 || take != BLOCK_SIZE {
                 if let Err(err) = self.read_block_into_direct_page(lba, &page).await {
@@ -1182,9 +1218,15 @@ where
 
             {
                 let _guard = page.data_lock.write();
-                unsafe {
-                    self.page_slice_mut(&page)[block_off..block_off + take]
-                        .copy_from_slice(&data[src_pos..src_pos + take]);
+                let destination =
+                    unsafe { &mut self.page_slice_mut(&page)[block_off..block_off + take] };
+                if let Err(err) = remaining
+                    .as_ref()
+                    .expect("direct write buffer disappeared")
+                    .copy_to_slice(buffer_offset, destination)
+                {
+                    result = Err(CacheError::InvalidIoBuffer(err));
+                    break;
                 }
             }
 
@@ -1193,7 +1235,8 @@ where
                 break;
             }
 
-            src_pos += take;
+            buffer_offset += take;
+            written += take;
             cur_off += take as u64;
         }
 
@@ -2024,17 +2067,16 @@ where
         Ok(())
     }
 
-    async fn direct_write_miss_span(
+    async fn direct_write_miss_len(
         cache: &Arc<Self>,
         offset: u64,
-        data: &[u8],
-        owner: u64,
+        remaining_len: usize,
     ) -> Result<usize, CacheError<B::Error>> {
         let bs_u64 = Self::block_size_u64();
         let mut len = 0usize;
         let mut cur_off = offset;
 
-        while len < data.len() {
+        while len < remaining_len {
             let lba = cur_off / bs_u64;
 
             if len != 0 && cache.try_get_page(lba).await.is_some() {
@@ -2042,43 +2084,46 @@ where
             }
 
             let block_off = (cur_off % bs_u64) as usize;
-            let take = min(BLOCK_SIZE - block_off, data.len() - len);
+            let take = min(BLOCK_SIZE - block_off, remaining_len - len);
             len += take;
             cur_off += take as u64;
         }
 
-        cache.direct_write_at(offset, &data[..len], owner).await?;
         Ok(len)
     }
 
-    async fn write_at_inner(
+    async fn write_at_inner<'buffer>(
         cache: &Arc<Self>,
         offset: u64,
-        data: &[u8],
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+        len: usize,
         owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
         cache.check_open()?;
-        let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, data.len())?;
+        let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, len)?;
 
-        if unlikely(data.is_empty()) {
+        if unlikely(len == 0) {
             cold_path();
             return Ok(());
         }
+        if unlikely(buffer.len() < len) {
+            cold_path();
+            return Err(CacheError::InvalidConfig);
+        }
 
-        let mut src_pos = 0usize;
+        let mut remaining = Some(buffer);
+        let mut buffer_offset = 0usize;
+        let mut written = 0usize;
         let mut cur_off = offset;
         let bs_u64 = VolumeCache::<B, BLOCK_SIZE, F>::block_size_u64();
         let mut no_free_flush_started = false;
 
-        while src_pos < data.len() {
+        while written < len {
             let lba = cur_off / bs_u64;
             let block_off = (cur_off % bs_u64) as usize;
-            let take = min(BLOCK_SIZE - block_off, data.len() - src_pos);
+            let take = min(BLOCK_SIZE - block_off, len - written);
 
-            let acquired = match cache
-                .get_or_create_write_page(lba, block_off, take, &data[src_pos..src_pos + take])
-                .await
-            {
+            let acquired = match cache.get_or_create_write_page(lba).await {
                 Ok(acquired) => acquired,
                 Err(CacheError::NoFreePages) if cache.cfg.direct_io_on_no_free_pages => {
                     cold_path();
@@ -2087,14 +2132,7 @@ where
                         Self::maybe_start_background_writeback(cache);
                         no_free_flush_started = true;
                     }
-
-                    let direct_len =
-                        Self::direct_write_miss_span(cache, cur_off, &data[src_pos..], owner)
-                            .await?;
-
-                    src_pos += direct_len;
-                    cur_off += direct_len as u64;
-                    continue;
+                    WriteAcquire::Direct
                 }
                 Err(err) => {
                     cold_path();
@@ -2120,10 +2158,14 @@ where
 
                     {
                         let _guard = page.data_lock.write();
-                        unsafe {
-                            cache.page_slice_mut(&page)[block_off..block_off + take]
-                                .copy_from_slice(&data[src_pos..src_pos + take]);
-                        }
+                        let destination = unsafe {
+                            &mut cache.page_slice_mut(&page)[block_off..block_off + take]
+                        };
+                        remaining
+                            .as_ref()
+                            .expect("write buffer disappeared")
+                            .copy_to_slice(buffer_offset, destination)
+                            .map_err(CacheError::InvalidIoBuffer)?;
                         cache.mark_cached_page_dirty_range(&page, owner, bits);
                     }
                 }
@@ -2131,16 +2173,25 @@ where
                     cold_path();
 
                     let direct_len =
-                        Self::direct_write_miss_span(cache, cur_off, &data[src_pos..], owner)
-                            .await?;
+                        Self::direct_write_miss_len(cache, cur_off, len - written).await?;
 
-                    src_pos += direct_len;
+                    let source = remaining.take().expect("write buffer disappeared");
+                    let (direct_buffer, tail) =
+                        Self::take_to_device_buffer_range(source, buffer_offset, direct_len)?;
+                    cache
+                        .direct_write_at(cur_off, direct_buffer, direct_len, owner)
+                        .await?;
+
+                    remaining = tail;
+                    buffer_offset = 0;
+                    written += direct_len;
                     cur_off += direct_len as u64;
                     continue;
                 }
             }
 
-            src_pos += take;
+            buffer_offset += take;
+            written += take;
             cur_off += take as u64;
         }
 
@@ -2295,18 +2346,7 @@ where
             }
 
             if !has_cached_page && self.free_pages.lock().is_empty() {
-                {
-                    let w = req.write();
-                    w.body.len = len;
-                    let buffer = w
-                        .body
-                        .buffer
-                        .as_mut()
-                        .ok_or(CacheError::InvalidConfig)?;
-                    let _ = buffer
-                        .dma_buffer_view()
-                        .map_err(CacheError::InvalidIoBuffer)?;
-                }
+                req.write().body.len = len;
 
                 self.backend
                     .read_request(req)
@@ -2405,18 +2445,7 @@ where
             }
 
             if !has_cached_page && self.free_pages.lock().is_empty() {
-                {
-                    let w = req.write();
-                    w.body.len = len;
-                    let buffer = w
-                        .body
-                        .buffer
-                        .as_mut()
-                        .ok_or(CacheError::InvalidConfig)?;
-                    let _ = buffer
-                        .dma_buffer_view()
-                        .map_err(CacheError::InvalidIoBuffer)?;
-                }
+                req.write().body.len = len;
 
                 self.backend
                     .write_request(req)
@@ -2428,36 +2457,14 @@ where
             }
         }
 
-        let contiguous_src = req
-            .read()
-            .body
-            .buffer
-            .as_ref()
-            .and_then(|buffer| buffer.try_as_slice())
-            .map(|slice| slice.as_ptr() as usize);
-        if let Some(src) = contiguous_src {
-            let src = unsafe { core::slice::from_raw_parts(src as *const u8, len) };
-            VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, src, owner).await?;
-            VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
-            return Ok(());
-        }
-
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| CacheError::InsufficientResources)?;
-        bytes.resize(len, 0);
         let buffer = req
-            .read()
+            .write()
             .body
             .buffer
-            .as_ref()
+            .take()
             .ok_or(CacheError::InvalidConfig)?;
-        buffer
-            .copy_to_slice(0, &mut bytes)
-            .map_err(CacheError::InvalidIoBuffer)?;
 
-        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, &bytes, owner).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, buffer, len, owner).await?;
         VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
         Ok(())
     }

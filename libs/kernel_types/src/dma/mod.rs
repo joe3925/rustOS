@@ -1434,8 +1434,18 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
         }
     }
 
-    pub fn dma_buffer_view(&mut self) -> Result<DmaBufferView<'_>, IoBufferError> {
+    /// Ensures that the buffer has the physical description required for device I/O.
+    /// Backing-based buffers are physically described when their backing is created.
+    pub fn ensure_phys_described(&mut self) -> Result<(), IoBufferError> {
         match &mut self.source {
+            IoBufferSource::Backing { .. } => Ok(()),
+            IoBufferSource::Virt(virt) => virt.ensure_phys_described().map(|_| ()),
+        }
+    }
+
+    /// Returns a side-effect-free DMA view of an already physically described buffer.
+    pub fn dma_buffer_view(&self) -> Result<DmaBufferView<'_>, IoBufferError> {
+        match &self.source {
             IoBufferSource::Backing { backing, .. } => Ok(DmaBufferView::from_iobuffer_parts(
                 self.len,
                 &backing.extents,
@@ -1444,7 +1454,10 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                 self.len,
             )),
             IoBufferSource::Virt(virt) => {
-                let phys = virt.ensure_phys_described()?;
+                let phys = virt
+                    .phys
+                    .as_ref()
+                    .ok_or(IoBufferError::PhysicalDescriptionMissing)?;
                 Ok(DmaBufferView::from_iobuffer_parts(
                     self.len,
                     &phys.extents,

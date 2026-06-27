@@ -156,9 +156,8 @@ fn dma_mapping_rejects_invalid_layout_without_unmapping() {
 #[test]
 fn virtual_iobuffer_copies_without_physical_description() {
     let mut bytes = [1u8, 2, 3, 4, 5, 6];
-    let mut buffer = unsafe {
-        IoBuffer::from_virt_bidirectional(bytes.as_mut_ptr() as usize, bytes.len())
-    };
+    let mut buffer =
+        unsafe { IoBuffer::from_virt_bidirectional(bytes.as_mut_ptr() as usize, bytes.len()) };
 
     assert!(buffer.backing().is_none());
     assert_eq!(buffer.regions().count(), 0);
@@ -173,11 +172,25 @@ fn virtual_iobuffer_copies_without_physical_description() {
 }
 
 #[test]
+fn virtual_iobuffer_requires_explicit_physical_description() {
+    let mut bytes = [0u8; 8];
+    let mut buffer =
+        unsafe { IoBuffer::from_virt_bidirectional(bytes.as_mut_ptr() as usize, bytes.len()) };
+
+    assert!(matches!(
+        buffer.dma_buffer_view(),
+        Err(IoBufferError::PhysicalDescriptionMissing)
+    ));
+
+    buffer.ensure_phys_described().unwrap();
+    assert_eq!(buffer.dma_buffer_view().unwrap().len(), bytes.len());
+}
+
+#[test]
 fn virtual_iobuffer_split_preserves_ranges() {
     let mut bytes = [0u8; 8];
-    let buffer = unsafe {
-        IoBuffer::from_virt_bidirectional(bytes.as_mut_ptr() as usize, bytes.len())
-    };
+    let buffer =
+        unsafe { IoBuffer::from_virt_bidirectional(bytes.as_mut_ptr() as usize, bytes.len()) };
     let (mut left, mut right) = buffer.split_at(3).unwrap();
 
     assert_eq!(left.len(), 3);

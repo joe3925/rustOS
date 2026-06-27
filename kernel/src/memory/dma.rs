@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use kernel_types::device::DeviceObject;
+use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaBufferView;
 use kernel_types::dma::DmaDeviceHandle;
@@ -22,7 +23,6 @@ use kernel_types::dma::DmaPciDeviceIdentity;
 use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::IoBufferDmaMappingLayout;
 use kernel_types::dma::IoBufferPageFrame;
-use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_types::status::DriverStatus;
 use spin::Mutex;
 use spin::Once;
@@ -72,7 +72,7 @@ where
         return Err(DmaMapError::InvalidSize);
     }
 
-    let mut buffer = backing
+    let buffer = backing
         .create_phys_bidirectional(0, backing.len())
         .map_err(|_| DmaMapError::InvalidSize)?;
 

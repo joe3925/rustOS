@@ -180,6 +180,7 @@ pub enum IoBufferError {
     TranslationFailed {
         virt_addr: usize,
     },
+    PhysicalDescriptionMissing,
     DmaMappingNotFound,
     DmaMappingAccessDenied,
     DmaMappingRangeNotCovered,

@@ -37,9 +37,7 @@ use kernel_api::pnp::driver_set_evt_device_add;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::{io, pnp};
-use kernel_api::request::{
-    Flush, FlushDirty, FlushOwner, Pnp, Read, RequestHandle, Write,
-};
+use kernel_api::request::{Flush, FlushDirty, FlushOwner, Pnp, Read, RequestHandle, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 
@@ -260,6 +258,16 @@ impl VolumeCacheBackend for CacheBackend {
                         return Err(DriverStatus::InvalidParameter);
                     }
 
+                    if !body.no_buffer {
+                        let buffer = body
+                            .buffer
+                            .as_mut()
+                            .ok_or(DriverStatus::InvalidParameter)?;
+                        buffer
+                            .ensure_phys_described()
+                            .map_err(|_| DriverStatus::InsufficientResources)?;
+                    }
+
                     if first {
                         first_offset = offset;
                         first_len = len;
@@ -336,6 +344,16 @@ impl VolumeCacheBackend for CacheBackend {
                             self.volume_bytes
                         );
                         return Err(DriverStatus::InvalidParameter);
+                    }
+
+                    if !body.no_buffer {
+                        let buffer = body
+                            .buffer
+                            .as_mut()
+                            .ok_or(DriverStatus::InvalidParameter)?;
+                        buffer
+                            .ensure_phys_described()
+                            .map_err(|_| DriverStatus::InsufficientResources)?;
                     }
 
                     if first {

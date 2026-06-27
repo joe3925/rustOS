@@ -46,7 +46,11 @@ pub fn map_buffer<'backing, 'data, A>(
 where
     A: IoBufferAccess,
 {
-    let view = match describe_dma_buffer(&mut buffer) {
+    if let Err(err) = buffer.ensure_phys_described() {
+        return Err((buffer, map_io_buffer_error(err)));
+    }
+
+    let view = match describe_dma_buffer(&buffer) {
         Ok(view) => view,
         Err(err) => return Err((buffer, err)),
     };
@@ -105,6 +109,9 @@ where
     A: IoBufferAccess,
 {
     let byte_len = buffer.len();
+    buffer
+        .ensure_phys_described()
+        .map_err(map_io_buffer_error)?;
     let view = describe_dma_buffer(buffer)?;
     let mapped = unsafe { kernel_sys::kernel_dma_map_buffer(device, &view, strategy) }?;
 
@@ -120,7 +127,7 @@ where
 }
 
 fn describe_dma_buffer<'map, 'backing, 'data, A>(
-    buffer: &'map mut IoBuffer<'backing, 'data, A>,
+    buffer: &'map IoBuffer<'backing, 'data, A>,
 ) -> Result<DmaBufferView<'map>, DmaMapError>
 where
     A: IoBufferAccess,
