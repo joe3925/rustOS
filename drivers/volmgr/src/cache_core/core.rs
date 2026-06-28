@@ -1424,7 +1424,7 @@ where
         &self,
         pages: &[PreparedFlushExtent],
         extents: &[PreparedRun],
-        writes: &mut [Option<kernel_api::request::Write<'static>>; MAX_WRITE_CHAIN],
+        writes: &mut [Option<Write<'static>>; MAX_WRITE_CHAIN],
     ) -> Result<(), CacheError<B::Error>> {
         if unlikely(extents.is_empty()) {
             cold_path();

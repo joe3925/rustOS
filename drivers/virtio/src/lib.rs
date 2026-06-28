@@ -14,6 +14,24 @@ mod outstanding;
 mod pci;
 //mod temp_benchmark;
 mod virtqueue;
+use kernel_api::device::open_protocol_to_next_lower;
+use kernel_api::device::publish_stack_protocol;
+use kernel_api::device::register_protocol;
+use kernel_api::dma::map_buffer;
+use kernel_api::dma::map_persistent_contiguous_backing;
+use kernel_api::irq::platform_cpu_ids;
+use kernel_api::kernel_types::pci::BarKind;
+
+use kernel_api::kernel_types::protocol::pci::PciProtocol;
+
+use kernel_api::memory::map_mmio_region;
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::RegisterDmaBacking;
+use kernel_api::pnp::RemoveDevice;
+use kernel_api::pnp::StartDevice;
+use kernel_api::pnp::io::send_next_lower;
 use alloc::{sync::Arc, vec, vec::Vec};
 use blk::{BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP};
 use core::cell::UnsafeCell;
@@ -279,7 +297,7 @@ where
         return Ok(buffer);
     }
 
-    kernel_api::dma::map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
+    map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
         .map_err(|_| DriverStatus::InsufficientResources)
 }
 
@@ -362,7 +380,7 @@ async fn setup_msix_via_pci(
     );
 
     let mut req = DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup);
-    let status = kernel_api::pnp::io::send_next_lower(dev.clone(), &mut req).await;
+    let status = send_next_lower(dev.clone(), &mut req).await;
 
     if status == DriverStatus::Success {
         Ok(())
@@ -374,7 +392,7 @@ async fn setup_msix_via_pci(
 async fn virtio_pnp_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     DriverStep::Continue
 }
@@ -383,10 +401,10 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
 async fn virtio_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::InitComplete,
+    req: &'b mut InitComplete,
 ) -> DriverStep {
-    let proto = match kernel_api::device::open_protocol_to_next_lower::<
-        kernel_api::kernel_types::protocol::pci::PciProtocol,
+    let proto = match open_protocol_to_next_lower::<
+        PciProtocol,
     >(dev)
     {
         Ok(p) => p,
@@ -401,12 +419,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     let mut mapped_bars = alloc::vec::Vec::new();
     for i in 0..6 {
         if let Some(bar) = (proto.get_bar)(&proto.provider(), i) {
-            if bar.kind == kernel_api::kernel_types::pci::BarKind::Mem32
-                || bar.kind == kernel_api::kernel_types::pci::BarKind::Mem64
+            if bar.kind == BarKind::Mem32
+                || bar.kind == BarKind::Mem64
             {
                 if bar.size > 0 {
-                    if let Ok(va) = kernel_api::memory::map_mmio_region(
-                        kernel_api::memory::PhysAddr::new(bar.base),
+                    if let Ok(va) = map_mmio_region(
+                        PhysAddr::new(bar.base),
                         bar.size,
                     ) {
                         mapped_bars.push((i as u32, va, bar.size));
@@ -438,7 +456,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         }
     };
 
-    let cfg_base = match kernel_api::memory::map_mmio_region(PhysAddr::new(cfg_phys), cfg_len) {
+    let cfg_base = match map_mmio_region(PhysAddr::new(cfg_phys), cfg_len) {
         Ok(va) => va,
         Err(_) => {
             println!("virtio-blk: failed to map PCI config space");
@@ -488,7 +506,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         }
     };
 
-    let cpu_ids = kernel_api::irq::platform_cpu_ids();
+    let cpu_ids = platform_cpu_ids();
     let cpu_count = cpu_ids.len().max(1);
     let target_queue_count = (init_result.num_queues as usize).min(cpu_count).max(1);
 
@@ -929,7 +947,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
 async fn virtio_pnp_remove<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::RemoveDevice,
+    req: &'b mut RemoveDevice,
 ) -> DriverStep {
     if let Ok(dx) = dev.try_devext::<DevExt>() {
         if let Some(inner) = dx.inner.get().cloned() {
@@ -970,7 +988,7 @@ async fn virtio_pnp_remove<'req, 'data, 'b>(
 async fn virtio_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     let relation = req.relation;
     if relation == DeviceRelationType::BusRelations {
@@ -1133,16 +1151,16 @@ pub(crate) const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 pub async fn virtio_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::StartDevice,
+    req: &'b mut StartDevice,
 ) -> DriverStep {
     if let Some(dn) = _dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
-            kernel_api::device::register_protocol::<kernel_api::kernel_types::protocol::disk::DiskInfoProtocol>(
+            register_protocol::<DiskInfoProtocol>(
                 _dev,
                 &VIRTIO_DISK_INFO_VTABLE,
             );
-            kernel_api::device::publish_stack_protocol::<
-                kernel_api::kernel_types::protocol::disk::DiskInfoProtocol,
+            publish_stack_protocol::<
+                DiskInfoProtocol,
             >(&dn);
         }
     }
@@ -1153,7 +1171,7 @@ pub async fn virtio_pdo_start<'req, 'data, 'b>(
 pub async fn virtio_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryId,
+    req: &'b mut QueryId,
 ) -> DriverStep {
     let status = {
         match req.id_type {
@@ -1185,7 +1203,7 @@ pub async fn virtio_pdo_query_id<'req, 'data, 'b>(
 pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::RegisterDmaBacking<'data>,
+    req: &'b mut RegisterDmaBacking<'data>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(cdx) => cdx,
@@ -1199,7 +1217,7 @@ pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
 
     let backing = req.backing;
 
-    let status = match kernel_api::dma::map_persistent_contiguous_backing(&parent, backing) {
+    let status = match map_persistent_contiguous_backing(&parent, backing) {
         Ok(()) => DriverStatus::Success,
         Err(_) => DriverStatus::InsufficientResources,
     };

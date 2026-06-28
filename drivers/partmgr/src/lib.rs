@@ -5,6 +5,10 @@
 #![feature(likely_unlikely)]
 extern crate alloc;
 
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::RegisterDmaBacking;
+use kernel_api::pnp::StartDevice;
 use alloc::sync::Weak;
 use alloc::{boxed::Box, string::String, sync::Arc, vec};
 use core::hint::{cold_path, likely, unlikely};
@@ -333,7 +337,7 @@ impl DeviceFlushDirty for PartitionPdoIo {
 async fn partmgr_pdo_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     if let Some(dn) = dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
@@ -348,7 +352,7 @@ async fn partmgr_pdo_start<'req, 'data, 'b>(
 pub async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    request: &'b mut kernel_api::pnp::RegisterDmaBacking<'data>,
+    request: &'b mut RegisterDmaBacking<'data>,
 ) -> DriverStep {
     let dx = ext::<PartDevExt>(&device);
 
@@ -365,7 +369,7 @@ pub async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
 pub async fn partmgr_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::InitComplete,
+    _req: &'b mut InitComplete,
 ) -> DriverStep {
     let dx = ext::<PartMgrExt>(&dev);
 
@@ -428,7 +432,7 @@ async fn read_from_lower_async(
 pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    request: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    request: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     let relation = request.relation;
     if relation != DeviceRelationType::BusRelations {

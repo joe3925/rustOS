@@ -4,6 +4,10 @@
 #![feature(const_trait_impl)]
 #![feature(likely_unlikely)]
 extern crate alloc;
+use kernel_api::device::open_protocol_to_next_lower;
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::RemoveDevice;
+use kernel_api::pnp::StartDevice;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
@@ -274,7 +278,7 @@ impl Default for DiskExt {
 async fn disk_pnp_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     let devnode = match dev.dev_node.get() {
         Some(dn) => match dn.upgrade() {
@@ -291,7 +295,7 @@ async fn disk_pnp_start<'req, 'data, 'b>(
 async fn disk_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::InitComplete,
+    _req: &'b mut InitComplete,
 ) -> DriverStep {
     if let Err(st) = query_props_sync(dev) {
         cold_path();
@@ -329,7 +333,7 @@ pub extern "C" fn disk_device_add(
 async fn disk_pnp_remove<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::RemoveDevice,
+    _req: &'b mut RemoveDevice,
 ) -> DriverStep {
     DriverStep::Continue
 }
@@ -340,7 +344,7 @@ fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
 }
 
 fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
-    let proto = match kernel_api::device::open_protocol_to_next_lower::<DiskInfoProtocol>(dev) {
+    let proto = match open_protocol_to_next_lower::<DiskInfoProtocol>(dev) {
         Ok(p) => p,
         Err(e) => {
             cold_path();

@@ -771,7 +771,6 @@ impl DevExtBox {
     }
 }
 
-
 impl<P: Protocol> ProtocolHandle<P> {
     #[inline]
     pub fn open_next_lower(&self) -> Result<ProtocolHandle<P>, DriverStatus> {

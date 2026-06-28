@@ -3,6 +3,13 @@
 
 extern crate alloc;
 
+
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::QueryResources;
+use kernel_api::pnp::ResourceSet;
+use kernel_api::pnp::StartDevice;
+use kernel_api::util::panic_common;
 use alloc::{
     format,
     string::{String, ToString},
@@ -31,7 +38,7 @@ static MOD_NAME: &str = env!("CARGO_PKG_NAME");
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    kernel_api::util::panic_common(MOD_NAME, info)
+    panic_common(MOD_NAME, info)
 }
 
 #[repr(C)]
@@ -45,7 +52,7 @@ pub struct DtPdoExt {
     tree: Arc<DeviceTree>,
     path: String,
     ids: DeviceIds,
-    resources: Vec<kernel_api::kernel_types::pnp::ResourceDescriptor>,
+    resources: Vec<ResourceDescriptor>,
 }
 
 #[unsafe(no_mangle)]
@@ -70,7 +77,7 @@ pub extern "C" fn devicetree_device_add(
 pub async fn devicetree_start<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     if has_lower_dt_pdo(device) {
         return DriverStep::complete(DriverStatus::Success);
@@ -101,7 +108,7 @@ pub async fn devicetree_start<'req, 'data, 'b>(
 pub async fn devicetree_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     if req.relation != DeviceRelationType::BusRelations {
         return DriverStep::Continue;
@@ -209,7 +216,7 @@ fn create_dt_child(
 pub async fn dt_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryId,
+    req: &'b mut QueryId,
 ) -> DriverStep {
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
         return DriverStep::complete(DriverStatus::NoSuchDevice);
@@ -232,13 +239,13 @@ pub async fn dt_pdo_query_id<'req, 'data, 'b>(
 pub async fn dt_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryResources,
+    req: &'b mut QueryResources,
 ) -> DriverStep {
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
         return DriverStep::complete(DriverStatus::NoSuchDevice);
     };
 
-    req.resources = kernel_api::pnp::ResourceSet::Descriptors(ext.resources.clone());
+    req.resources = ResourceSet::Descriptors(ext.resources.clone());
 
     DriverStep::complete(DriverStatus::Success)
 }
@@ -247,7 +254,7 @@ pub async fn dt_pdo_query_resources<'req, 'data, 'b>(
 pub async fn dt_pdo_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     if req.relation != DeviceRelationType::BusRelations {
         return DriverStep::Continue;
@@ -274,7 +281,7 @@ pub async fn dt_pdo_query_devrels<'req, 'data, 'b>(
 pub async fn dt_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }
@@ -375,7 +382,7 @@ fn sanitize_instance_component(s: &str) -> String {
     out
 }
 
-fn resources_for_node(parent: &Node, node: &Node) -> Vec<kernel_api::kernel_types::pnp::ResourceDescriptor> {
+fn resources_for_node(parent: &Node, node: &Node) -> Vec<ResourceDescriptor> {
     let mut entries = Vec::<ResourceDescriptor>::new();
     append_reg_entries(&mut entries, parent, node);
     append_interrupt_entries(&mut entries, node);

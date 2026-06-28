@@ -7,6 +7,10 @@ extern crate alloc;
 mod dev_ext;
 mod msix;
 
+use kernel_api::device::publish_stack_protocol;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::StartDevice;
 use alloc::{sync::Arc, vec::Vec};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -132,7 +136,7 @@ pub extern "C" fn bus_driver_device_add(
 pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     let mut query_handle = QueryResources {
         resources: ResourceSet::default(),
@@ -185,7 +189,7 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
 pub async fn pci_bus_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     let relation = req.relation;
     if relation == DeviceRelationType::BusRelations {
@@ -403,7 +407,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
 pub async fn pci_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryId,
+    req: &'b mut QueryId,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
@@ -439,12 +443,12 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
 pub async fn pci_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     if let Some(dn) = _dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
             _dev.register_protocol::<PciProtocol>(&PCI_PROTO_VTABLE);
-            kernel_api::device::publish_stack_protocol::<PciProtocol>(&dn);
+            publish_stack_protocol::<PciProtocol>(&dn);
         }
     }
     DriverStep::complete(DriverStatus::Success)
@@ -454,7 +458,7 @@ pub async fn pci_pdo_start<'req, 'data, 'b>(
 pub async fn pci_pdo_query_devrels<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    _req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

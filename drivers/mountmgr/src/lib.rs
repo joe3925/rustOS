@@ -4,6 +4,7 @@
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
 extern crate alloc;
+use kernel_api::pnp::StartDevice;
 use alloc::vec;
 use alloc::vec::Vec;
 use alloc::{
@@ -155,7 +156,7 @@ impl DeviceControlHandler for VolclassCtrlIo {
 pub async fn volclass_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);

@@ -5,6 +5,9 @@
 #![feature(const_trait_impl)]
 extern crate alloc;
 
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::StartDevice;
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     panic::PanicInfo,
@@ -69,7 +72,7 @@ pub extern "C" fn ps2_device_add(
 pub async fn ps2_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     if let Ok(ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
@@ -87,7 +90,7 @@ pub async fn ps2_start<'req, 'data, 'b>(
 pub async fn ps2_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     use kernel_api::pnp::DeviceRelationType;
     let relation = req.relation;
@@ -177,7 +180,7 @@ fn make_child_pdo(
 async fn ps2_child_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryId,
+    req: &'b mut QueryId,
 ) -> DriverStep {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
@@ -231,7 +234,7 @@ async fn ps2_child_query_id<'req, 'data, 'b>(
 async fn ps2_child_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use kernel_api::util::panic_common;
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -23,7 +24,7 @@ static MOD_NAME: &str = env!("CARGO_PKG_NAME");
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    kernel_api::util::panic_common(MOD_NAME, info)
+    panic_common(MOD_NAME, info)
 }
 
 #[unsafe(no_mangle)]

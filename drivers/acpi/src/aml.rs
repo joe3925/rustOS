@@ -1,3 +1,7 @@
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::QueryResources;
+use kernel_api::pnp::ResourceSet;
+use kernel_api::pnp::StartDevice;
 use crate::alloc::format;
 use crate::pdo::AcpiPdoExt;
 use alloc::{
@@ -913,7 +917,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryResources,
+    req: &'b mut QueryResources,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
@@ -931,7 +935,7 @@ pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
         append_prt_list(&mut blob, &pext.prt);
     }
 
-    req.resources = kernel_api::pnp::ResourceSet::Encoded(blob);
+    req.resources = ResourceSet::Encoded(blob);
 
     DriverStep::complete(DriverStatus::Success)
 }
@@ -940,7 +944,7 @@ pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
 pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryId,
+    req: &'b mut QueryId,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
@@ -984,7 +988,7 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
 pub async fn acpi_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

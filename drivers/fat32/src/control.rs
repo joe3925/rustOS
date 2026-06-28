@@ -1,3 +1,5 @@
+use kernel_api::device::open_public_protocol;
+use kernel_api::kernel_types::protocol::volmgr::VolmgrProtocol;
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::FsOptions;
@@ -84,8 +86,8 @@ impl DeviceControlHandler for Fat32RootIo {
 
                     if let Some(devnode) = volume_fdo.dev_node.get() {
                         if let Some(dn) = devnode.upgrade() {
-                            if let Ok(proto) = kernel_api::device::open_public_protocol::<
-                                kernel_api::kernel_types::protocol::volmgr::VolmgrProtocol,
+                            if let Ok(proto) = open_public_protocol::<
+                                VolmgrProtocol,
                             >(&dn)
                             {
                                 if let Ok(pi) = (proto.partition_info)(&proto.provider()) {

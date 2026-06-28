@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 extern crate alloc;
+use kernel_api::pnp::StartDevice;
 use core::panic::PanicInfo;
 
 use alloc::sync::Arc;
@@ -38,7 +39,7 @@ pub extern "C" fn bus_driver_device_add(
 pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     _device: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
     DriverStep::complete(DriverStatus::Success)

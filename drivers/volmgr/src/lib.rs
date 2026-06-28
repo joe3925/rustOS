@@ -6,6 +6,11 @@
 #![allow(async_fn_in_trait)]
 
 extern crate alloc;
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::QueryDeviceRelations;
+
+use kernel_api::pnp::RemoveDevice;
+use kernel_api::pnp::StartDevice;
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::hint::{cold_path, unlikely};
 use core::panic::PanicInfo;
@@ -511,7 +516,7 @@ pub extern "C" fn vol_device_add(
 pub async fn vol_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::InitComplete,
+    _req: &'b mut InitComplete,
 ) -> DriverStep {
     let devnode = dev.dev_node.get().unwrap().upgrade().unwrap();
     let proto = match open_public_protocol::<PartitionInfoProtocol>(&devnode) {
@@ -539,7 +544,7 @@ pub async fn vol_init_complete<'req, 'data, 'b>(
 pub async fn vol_enumerate_devices<'a, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    _req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     let dx = ext::<VolExt>(&device);
 
@@ -872,7 +877,7 @@ async fn vol_pdo_flush_common(
 async fn vol_pdo_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     if let Some(dn) = dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
@@ -887,7 +892,7 @@ async fn vol_pdo_start<'req, 'data, 'b>(
 pub async fn vol_pdo_remove_device<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::RemoveDevice,
+    _req: &'b mut RemoveDevice,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
@@ -904,7 +909,7 @@ pub async fn vol_pdo_remove_device<'req, 'data, 'b>(
 async fn vol_pdo_register_dma_backing<'req, 'data, 'b>(
     _pdo: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::RegisterDmaBacking<'data>,
+    _req: &'b mut RegisterDmaBacking<'data>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

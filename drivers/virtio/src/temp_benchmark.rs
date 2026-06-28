@@ -1,3 +1,5 @@
+use kernel_api::dma::dma::DmaMappingStrategy;
+use kernel_api::dma::map_buffer;
 use crate::blk::{SubmitRequestError, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::completion::CompletionToken;
 use crate::dev_ext::{DevExtInner, QueueState};
@@ -147,10 +149,10 @@ impl BenchDmaBuffer {
             }
         };
 
-        let mapped = match kernel_api::dma::map_buffer(
+        let mapped = match map_buffer(
             parent,
             buffer,
-            kernel_api::dma::dma::DmaMappingStrategy::SingleContiguous,
+            DmaMappingStrategy::SingleContiguous,
         ) {
             Ok(mapped) => mapped,
             Err((buffer, _)) => {

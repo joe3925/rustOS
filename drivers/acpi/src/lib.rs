@@ -6,6 +6,8 @@ extern crate alloc;
 mod aml;
 mod dev_ext;
 mod pdo;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::StartDevice;
 use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
@@ -58,7 +60,7 @@ pub extern "C" fn bus_driver_device_add(
 pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut StartDevice,
 ) -> DriverStep {
     let (dsdt, ssdts) = {
         let acpi_tables = get_acpi_tables();
@@ -147,7 +149,7 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 pub async fn enumerate_bus<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    _req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 

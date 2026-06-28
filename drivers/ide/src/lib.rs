@@ -8,6 +8,15 @@ extern crate alloc;
 
 mod dev_ext;
 
+
+
+use kernel_api::kernel_types::pci::BarKind;
+use kernel_api::kernel_types::protocol::pci::PciProtocol;
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::QueryResources;
+use kernel_api::pnp::StartDevice;
 use alloc::sync::Weak;
 use alloc::vec;
 use alloc::{
@@ -633,11 +642,11 @@ pub extern "C" fn ide_device_add(
 async fn ide_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::InitComplete,
+    req: &'b mut InitComplete,
 ) -> DriverStep {
-    let proto = kernel_api::device::open_protocol_to_next_lower::<kernel_api::kernel_types::protocol::pci::PciProtocol>(dev).ok();
+    let proto = open_protocol_to_next_lower::<PciProtocol>(dev).ok();
 
-    if proto.is_some() || pnp::send_next_lower(dev.clone(), &mut kernel_api::pnp::QueryResources { resources: ResourceSet::default() }).await != DriverStatus::NoSuchDevice {
+    if proto.is_some() || pnp::send_next_lower(dev.clone(), &mut QueryResources { resources: ResourceSet::default() }).await != DriverStatus::NoSuchDevice {
         let bars = parse_ide_bars(proto.as_ref());
 
         let dx = dev.try_devext::<DevExt>().expect("ide: FDO DevExt missing");
@@ -694,7 +703,7 @@ async fn ide_init_complete<'req, 'data, 'b>(
 async fn ide_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
+    req: &'b mut QueryDeviceRelations,
 ) -> DriverStep {
     let relation = req.relation;
 
@@ -827,13 +836,13 @@ struct IdeBars {
 }
 
 
-fn parse_ide_bars(proto: Option<&kernel_api::device::ProtocolHandle<kernel_api::kernel_types::protocol::pci::PciProtocol>>) -> IdeBars {
+fn parse_ide_bars(proto: Option<&ProtocolHandle<PciProtocol>>) -> IdeBars {
     let mut bars = IdeBars::default();
 
     if let Some(proto) = proto {
         for i in 0..6 {
             if let Some(b) = (proto.get_bar)(&proto.provider(), i) {
-                if b.kind != kernel_api::kernel_types::pci::BarKind::Io {
+                if b.kind != BarKind::Io {
                     continue;
                 }
                 match i {
@@ -1290,7 +1299,7 @@ fn wait_drq_poll_brief(ports: &mut Ports) -> bool {
 pub async fn ide_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryId,
+    req: &'b mut QueryId,
 ) -> DriverStep {
     use QueryIdType::*;
 
@@ -1326,7 +1335,7 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
 pub async fn ide_pdo_start<'req, 'data, 'b>(
     _pdo: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::StartDevice,
+    req: &'b mut StartDevice,
 ) -> DriverStep {
     if let Some(dn) = _pdo.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
