@@ -290,10 +290,10 @@ pub extern "C" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    dev_init.ops.read.register::<DiskIo>();
-    dev_init.ops.write.register::<DiskIo>();
-    dev_init.ops.device_control.register::<DiskIo>();
-    dev_init.ops.flush.register::<DiskIo>();
+    dev_init.ops.register_read::<DiskIo>();
+    dev_init.ops.register_write::<DiskIo>();
+    dev_init.ops.register_device_control::<DiskIo>();
+    dev_init.ops.register_flush::<DiskIo>();
 
     let mut pnp_vt = PnpOps::new();
     pnp_vt.remove_device.set(disk_pnp_remove);

@@ -665,282 +665,252 @@ pub trait DeviceControlHandler {
     ) -> FfiFuture<DriverStep>;
 }
 
-pub trait FileSystem {
-    const OPEN_DEPTH: u32 = 0;
-    const CLOSE_DEPTH: u32 = 0;
-    const READ_DEPTH: u32 = 0;
-    const WRITE_DEPTH: u32 = 0;
-    const FLUSH_DEPTH: u32 = 1;
-    const SEEK_DEPTH: u32 = 0;
-    const CREATE_DEPTH: u32 = 0;
-    const RENAME_DEPTH: u32 = 0;
-    const READ_DIR_DEPTH: u32 = 0;
-    const GET_INFO_DEPTH: u32 = 0;
-    const SET_LEN_DEPTH: u32 = 0;
-    const APPEND_DEPTH: u32 = 0;
-    const ZERO_RANGE_DEPTH: u32 = 0;
-
-    extern "C" fn open<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsOpen>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn close<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsClose>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn read<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsRead>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn write<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsWrite>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn flush<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsFlush>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn seek<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsSeek>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn create<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsCreate>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn rename<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsRename>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn read_dir<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsReadDir>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn get_info<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsGetInfo>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn set_len<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsSetLen>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn append<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsAppend>,
-    ) -> FfiFuture<DriverStep>;
-
-    extern "C" fn zero_range<'a, 'data>(
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut FsRequest<'data, FsZeroRange>,
-    ) -> FfiFuture<DriverStep>;
+#[repr(C)]
+#[derive(Debug)]
+pub struct HandlerSlot<T> {
+    handler: Option<IoHandler<T>>,
 }
 
-macro_rules! define_device_slot {
-    ($slot:ident, $handler:ty, $trait:path) => {
-        #[repr(C)]
-        #[derive(Debug)]
-        pub struct $slot {
-            handler: Option<IoHandler<$handler>>,
+impl<T> HandlerSlot<T> {
+    #[inline]
+    pub const fn empty() -> Self {
+        Self { handler: None }
+    }
+
+    #[inline]
+    pub fn as_handler(&self) -> Option<&IoHandler<T>> {
+        self.handler.as_ref()
+    }
+
+    #[inline]
+    pub fn set(&mut self, handler: T) {
+        self.set_with_depth(handler, 0);
+    }
+
+    #[inline]
+    pub fn set_with_depth(&mut self, handler: T, depth: u32) {
+        self.handler = Some(IoHandler::new(handler, depth));
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.handler = None;
+    }
+}
+
+macro_rules! define_fs_io_operations {
+    (
+        $(
+            $field:ident {
+                op: $op:ident,
+                params: $params:ty,
+                result: $result:ty,
+                handler: $handler:ty,
+                method: $method:ident,
+                depth: $depth:ident = $default_depth:expr
+            }
+        ),+ $(,)?
+    ) => {
+        pub trait FileSystem {
+            $(
+                const $depth: u32 = $default_depth;
+
+                extern "C" fn $method<'a, 'data>(
+                    dev: &'a Arc<DeviceObject>,
+                    req: &'a mut FsRequest<'data, $op>,
+                ) -> FfiFuture<DriverStep>;
+            )+
         }
 
-        impl $slot {
+        #[repr(C)]
+        #[derive(Debug)]
+        pub struct FsOps {
+            $(pub $field: HandlerSlot<$handler>,)+
+        }
+
+        impl FsOps {
+            pub const fn empty() -> Self {
+                Self {
+                    $($field: HandlerSlot::empty(),)+
+                }
+            }
+        }
+
+        impl Default for FsOps {
+            fn default() -> Self {
+                Self::empty()
+            }
+        }
+
+        #[repr(C)]
+        #[derive(Debug)]
+        pub struct FsSlot {
+            ops: Option<FsOps>,
+        }
+
+        impl FsSlot {
             #[inline]
             pub const fn empty() -> Self {
-                Self { handler: None }
+                Self { ops: None }
             }
 
             #[inline]
-            pub fn as_handler(&self) -> Option<&IoHandler<$handler>> {
-                self.handler.as_ref()
+            pub fn as_ops(&self) -> Option<&FsOps> {
+                self.ops.as_ref()
             }
 
             #[inline]
             pub fn register<T>(&mut self)
             where
+                T: FileSystem + 'static,
+            {
+                let mut ops = FsOps::empty();
+                $(ops.$field.set_with_depth(T::$method, T::$depth);)+
+                self.ops = Some(ops);
+            }
+
+            #[inline]
+            pub fn clear(&mut self) {
+                self.ops = None;
+            }
+        }
+
+        impl Default for FsSlot {
+            fn default() -> Self {
+                Self::empty()
+            }
+        }
+    };
+}
+
+crate::for_each_fs_operation!(define_fs_io_operations);
+
+macro_rules! define_device_ops {
+    (
+        $(
+            $field:ident {
+                op: $op:ident,
+                slot: $slot:ident,
+                handler: $handler:ty,
+                trait: $trait:path
+            }
+        ),+ $(,)?
+    ) => {
+        $(
+            pub enum $op {}
+            pub type $slot = HandlerSlot<$handler>;
+        )+
+
+        #[derive(Debug)]
+        #[repr(C)]
+        pub struct DeviceOps {
+            $(pub $field: $slot,)+
+            pub fs: FsSlot,
+        }
+
+        pub trait DeviceOpRegistration<Op, T> {
+            fn register_op(&mut self);
+        }
+
+        pub trait DeviceOpHandlerRegistration<Op, H> {
+            fn set_op_handler(&mut self, handler: H, depth: u32);
+        }
+
+        impl DeviceOps {
+            pub const fn empty() -> Self {
+                Self {
+                    $($field: HandlerSlot::empty(),)+
+                    fs: FsSlot::empty(),
+                }
+            }
+
+            #[inline]
+            pub fn register<Op, T>(&mut self)
+            where
+                Self: DeviceOpRegistration<Op, T>,
+            {
+                <Self as DeviceOpRegistration<Op, T>>::register_op(self);
+            }
+
+            #[inline]
+            pub fn set_handler<Op, H>(&mut self, handler: H)
+            where
+                Self: DeviceOpHandlerRegistration<Op, H>,
+            {
+                <Self as DeviceOpHandlerRegistration<Op, H>>::set_op_handler(self, handler, 0);
+            }
+
+            #[inline]
+            pub fn set_handler_with_depth<Op, H>(&mut self, handler: H, depth: u32)
+            where
+                Self: DeviceOpHandlerRegistration<Op, H>,
+            {
+                <Self as DeviceOpHandlerRegistration<Op, H>>::set_op_handler(self, handler, depth);
+            }
+        }
+
+        impl Default for DeviceOps {
+            fn default() -> Self {
+                Self::empty()
+            }
+        }
+
+        $(
+            impl<T> DeviceOpRegistration<$op, T> for DeviceOps
+            where
                 T: $trait + 'static,
             {
-                self.handler = Some(IoHandler::new(T::handler, T::DEPTH));
+                #[inline]
+                fn register_op(&mut self) {
+                    self.$field.set_with_depth(T::handler, T::DEPTH);
+                }
             }
 
-            #[inline]
-            pub fn clear(&mut self) {
-                self.handler = None;
+            impl DeviceOpHandlerRegistration<$op, $handler> for DeviceOps {
+                #[inline]
+                fn set_op_handler(&mut self, handler: $handler, depth: u32) {
+                    self.$field.set_with_depth(handler, depth);
+                }
             }
-        }
+        )+
     };
 }
 
-macro_rules! define_fs_slot {
-    ($slot:ident, $handler:ty) => {
-        #[repr(C)]
-        #[derive(Debug)]
-        pub struct $slot {
-            handler: Option<IoHandler<$handler>>,
-        }
-
-        impl $slot {
-            #[inline]
-            pub const fn empty() -> Self {
-                Self { handler: None }
-            }
-
-            #[inline]
-            pub fn as_handler(&self) -> Option<&IoHandler<$handler>> {
-                self.handler.as_ref()
-            }
-
-            #[inline]
-            fn set(&mut self, handler: $handler, depth: u32) {
-                self.handler = Some(IoHandler::new(handler, depth));
-            }
-
-            #[inline]
-            pub fn clear(&mut self) {
-                self.handler = None;
-            }
-        }
-    };
-}
-
-define_device_slot!(ReadSlot, EvtIoRead, DeviceRead);
-define_device_slot!(WriteSlot, EvtIoWrite, DeviceWrite);
-define_device_slot!(FlushSlot, EvtIoFlush, DeviceFlush);
-define_device_slot!(FlushDirtySlot, EvtIoFlushDirty, DeviceFlushDirty);
-define_device_slot!(FlushOwnerSlot, EvtIoFlushOwner, DeviceFlushOwner);
-define_device_slot!(DeviceControlSlot, EvtIoDeviceControl, DeviceControlHandler);
-
-define_fs_slot!(FsOpenSlot, EvtFsOpen);
-define_fs_slot!(FsCloseSlot, EvtFsClose);
-define_fs_slot!(FsReadSlot, EvtFsRead);
-define_fs_slot!(FsWriteSlot, EvtFsWrite);
-define_fs_slot!(FsFlushSlot, EvtFsFlush);
-define_fs_slot!(FsSeekSlot, EvtFsSeek);
-define_fs_slot!(FsCreateSlot, EvtFsCreate);
-define_fs_slot!(FsRenameSlot, EvtFsRename);
-define_fs_slot!(FsReadDirSlot, EvtFsReadDir);
-define_fs_slot!(FsGetInfoSlot, EvtFsGetInfo);
-define_fs_slot!(FsSetLenSlot, EvtFsSetLen);
-define_fs_slot!(FsAppendSlot, EvtFsAppend);
-define_fs_slot!(FsZeroRangeSlot, EvtFsZeroRange);
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct FsOps {
-    pub open: FsOpenSlot,
-    pub close: FsCloseSlot,
-    pub read: FsReadSlot,
-    pub write: FsWriteSlot,
-    pub flush: FsFlushSlot,
-    pub seek: FsSeekSlot,
-    pub create: FsCreateSlot,
-    pub rename: FsRenameSlot,
-    pub read_dir: FsReadDirSlot,
-    pub get_info: FsGetInfoSlot,
-    pub set_len: FsSetLenSlot,
-    pub append: FsAppendSlot,
-    pub zero_range: FsZeroRangeSlot,
-}
-
-impl FsOps {
-    pub const fn empty() -> Self {
-        Self {
-            open: FsOpenSlot::empty(),
-            close: FsCloseSlot::empty(),
-            read: FsReadSlot::empty(),
-            write: FsWriteSlot::empty(),
-            flush: FsFlushSlot::empty(),
-            seek: FsSeekSlot::empty(),
-            create: FsCreateSlot::empty(),
-            rename: FsRenameSlot::empty(),
-            read_dir: FsReadDirSlot::empty(),
-            get_info: FsGetInfoSlot::empty(),
-            set_len: FsSetLenSlot::empty(),
-            append: FsAppendSlot::empty(),
-            zero_range: FsZeroRangeSlot::empty(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct FsSlot {
-    ops: Option<FsOps>,
-}
-
-impl FsSlot {
-    #[inline]
-    pub const fn empty() -> Self {
-        Self { ops: None }
-    }
-
-    #[inline]
-    pub fn as_ops(&self) -> Option<&FsOps> {
-        self.ops.as_ref()
-    }
-
-    #[inline]
-    pub fn register<T>(&mut self)
-    where
-        T: FileSystem + 'static,
-    {
-        let mut ops = FsOps::empty();
-
-        ops.open.set(T::open, T::OPEN_DEPTH);
-        ops.close.set(T::close, T::CLOSE_DEPTH);
-        ops.read.set(T::read, T::READ_DEPTH);
-        ops.write.set(T::write, T::WRITE_DEPTH);
-        ops.flush.set(T::flush, T::FLUSH_DEPTH);
-        ops.seek.set(T::seek, T::SEEK_DEPTH);
-        ops.create.set(T::create, T::CREATE_DEPTH);
-        ops.rename.set(T::rename, T::RENAME_DEPTH);
-        ops.read_dir.set(T::read_dir, T::READ_DIR_DEPTH);
-        ops.get_info.set(T::get_info, T::GET_INFO_DEPTH);
-        ops.set_len.set(T::set_len, T::SET_LEN_DEPTH);
-        ops.append.set(T::append, T::APPEND_DEPTH);
-        ops.zero_range.set(T::zero_range, T::ZERO_RANGE_DEPTH);
-
-        self.ops = Some(ops);
-    }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.ops = None;
-    }
-}
-
-#[derive(Debug)]
-#[repr(C)]
-pub struct DeviceOps {
-    pub read: ReadSlot,
-    pub write: WriteSlot,
-    pub flush: FlushSlot,
-    pub flush_dirty: FlushDirtySlot,
-    pub flush_owner: FlushOwnerSlot,
-    pub device_control: DeviceControlSlot,
-    pub fs: FsSlot,
-}
-
-impl DeviceOps {
-    pub const fn empty() -> Self {
-        Self {
-            read: ReadSlot::empty(),
-            write: WriteSlot::empty(),
-            flush: FlushSlot::empty(),
-            flush_dirty: FlushDirtySlot::empty(),
-            flush_owner: FlushOwnerSlot::empty(),
-            device_control: DeviceControlSlot::empty(),
-            fs: FsSlot::empty(),
-        }
+define_device_ops! {
+    read {
+        op: DeviceReadOp,
+        slot: ReadSlot,
+        handler: EvtIoRead,
+        trait: DeviceRead
+    },
+    write {
+        op: DeviceWriteOp,
+        slot: WriteSlot,
+        handler: EvtIoWrite,
+        trait: DeviceWrite
+    },
+    flush {
+        op: DeviceFlushOp,
+        slot: FlushSlot,
+        handler: EvtIoFlush,
+        trait: DeviceFlush
+    },
+    flush_dirty {
+        op: DeviceFlushDirtyOp,
+        slot: FlushDirtySlot,
+        handler: EvtIoFlushDirty,
+        trait: DeviceFlushDirty
+    },
+    flush_owner {
+        op: DeviceFlushOwnerOp,
+        slot: FlushOwnerSlot,
+        handler: EvtIoFlushOwner,
+        trait: DeviceFlushOwner
+    },
+    device_control {
+        op: DeviceControlOp,
+        slot: DeviceControlSlot,
+        handler: EvtIoDeviceControl,
+        trait: DeviceControlHandler
     }
 }

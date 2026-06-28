@@ -1,7 +1,7 @@
 use crate::device::DevNode;
 use crate::dma::IoBufferBacking;
-use crate::io::IoHandler;
 use crate::io::{DiskInfo, PartitionInfo};
+use crate::io::{HandlerSlot, IoHandler};
 use crate::status::DriverStatus;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -13,6 +13,7 @@ pub struct DeviceIds {
     pub hardware: Vec<String>,
     pub compatible: Vec<String>,
 }
+
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriverStep {
@@ -26,6 +27,7 @@ impl DriverStep {
         DriverStep::Complete { status }
     }
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DeviceRelationType {
@@ -45,35 +47,91 @@ pub enum QueryIdType {
     InstanceId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum PnpOp {
-    StartDevice,
-    QueryDeviceRelations,
-    QueryId,
+macro_rules! define_pnp_ops {
+    (
+        $(
+            $field:ident {
+                op: $op:ident,
+                slot: $slot:ident,
+                handler: $handler:ty,
+                variant: $variant:ident,
+                default: $default:expr
+            }
+        ),+ $(,)?
+    ) => {
+        $(
+            pub enum $op {}
+            pub type $slot = PnpSlot<$handler>;
+        )+
 
-    RegisterDmaBacking,
-    QueryResources,
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u32)]
+        pub enum PnpOp {
+            $($variant,)+
+        }
 
-    SurpriseRemoval,
-    RemoveDevice,
-    StopDevice,
-}
-
-impl PnpOp {
-    pub fn default_status_for_unhandled(self) -> DriverStatus {
-        match self {
-            Self::StartDevice
-            | Self::QueryDeviceRelations
-            | Self::SurpriseRemoval
-            | Self::RemoveDevice
-            | Self::StopDevice => DriverStatus::Success,
-
-            Self::QueryId | Self::QueryResources | Self::RegisterDmaBacking => {
-                DriverStatus::NotImplemented
+        impl PnpOp {
+            #[inline]
+            pub fn default_status_for_unhandled(self) -> DriverStatus {
+                match self {
+                    $(Self::$variant => $default,)+
+                }
             }
         }
-    }
+
+        #[repr(C)]
+        #[derive(Debug)]
+        pub struct PnpOps {
+            $(pub $field: $slot,)+
+        }
+
+        pub trait PnpOpHandlerRegistration<Op, H> {
+            fn set_pnp_op_handler(&mut self, handler: H, depth: u32);
+        }
+
+        impl PnpOps {
+            pub const fn new() -> Self {
+                Self {
+                    $($field: PnpSlot::empty(),)+
+                }
+            }
+
+            #[inline]
+            pub fn register<Op, H>(&mut self, handler: H)
+            where
+                Self: PnpOpHandlerRegistration<Op, H>,
+            {
+                <Self as PnpOpHandlerRegistration<Op, H>>::set_pnp_op_handler(self, handler, 0);
+            }
+
+            #[inline]
+            pub fn register_with_depth<Op, H>(&mut self, handler: H, depth: u32)
+            where
+                Self: PnpOpHandlerRegistration<Op, H>,
+            {
+                <Self as PnpOpHandlerRegistration<Op, H>>::set_pnp_op_handler(
+                    self,
+                    handler,
+                    depth,
+                );
+            }
+        }
+
+        impl Default for PnpOps {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        $(
+            impl PnpOpHandlerRegistration<$op, $handler> for PnpOps {
+                #[inline]
+                fn set_pnp_op_handler(&mut self, handler: $handler, depth: u32) {
+                    self.$field.set_with_depth(handler, depth);
+                }
+            }
+        )+
+    };
 }
 
 #[repr(C)]
@@ -133,6 +191,68 @@ pub struct RemoveDevice;
 #[derive(Debug, Default)]
 pub struct StopDevice;
 
+pub type PnpHandler<T> = IoHandler<T>;
+pub type PnpSlot<T> = HandlerSlot<T>;
+
+define_pnp_ops! {
+    start_device {
+        op: PnpStartDeviceOp,
+        slot: StartDeviceSlot,
+        handler: crate::EvtPnpStartDevice,
+        variant: StartDevice,
+        default: DriverStatus::Success
+    },
+    query_device_relations {
+        op: PnpQueryDeviceRelationsOp,
+        slot: QueryDeviceRelationsSlot,
+        handler: crate::EvtPnpQueryDeviceRelations,
+        variant: QueryDeviceRelations,
+        default: DriverStatus::Success
+    },
+    query_id {
+        op: PnpQueryIdOp,
+        slot: QueryIdSlot,
+        handler: crate::EvtPnpQueryId,
+        variant: QueryId,
+        default: DriverStatus::NotImplemented
+    },
+    register_dma_backing {
+        op: PnpRegisterDmaBackingOp,
+        slot: RegisterDmaBackingSlot,
+        handler: crate::EvtPnpRegisterDmaBacking,
+        variant: RegisterDmaBacking,
+        default: DriverStatus::NotImplemented
+    },
+    query_resources {
+        op: PnpQueryResourcesOp,
+        slot: QueryResourcesSlot,
+        handler: crate::EvtPnpQueryResources,
+        variant: QueryResources,
+        default: DriverStatus::NotImplemented
+    },
+    surprise_removal {
+        op: PnpSurpriseRemovalOp,
+        slot: SurpriseRemovalSlot,
+        handler: crate::EvtPnpSurpriseRemoval,
+        variant: SurpriseRemoval,
+        default: DriverStatus::Success
+    },
+    remove_device {
+        op: PnpRemoveDeviceOp,
+        slot: RemoveDeviceSlot,
+        handler: crate::EvtPnpRemoveDevice,
+        variant: RemoveDevice,
+        default: DriverStatus::Success
+    },
+    stop_device {
+        op: PnpStopDeviceOp,
+        slot: StopDeviceSlot,
+        handler: crate::EvtPnpStopDevice,
+        variant: StopDevice,
+        default: DriverStatus::Success
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ResourceKind {
@@ -170,69 +290,6 @@ impl ResourceDescriptor {
             start: irq,
             length: 0,
         }
-    }
-}
-
-pub type PnpHandler<T> = IoHandler<T>;
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct PnpSlot<T> {
-    handler: Option<PnpHandler<T>>,
-}
-
-impl<T> PnpSlot<T> {
-    pub const fn empty() -> Self {
-        Self { handler: None }
-    }
-
-    #[inline]
-    pub fn as_handler(&self) -> Option<&PnpHandler<T>> {
-        self.handler.as_ref()
-    }
-
-    #[inline]
-    pub fn set(&mut self, handler: T) {
-        self.handler = Some(PnpHandler::new(handler, 0));
-    }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.handler = None;
-    }
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct PnpOps {
-    pub start_device: PnpSlot<crate::EvtPnpStartDevice>,
-    pub query_device_relations: PnpSlot<crate::EvtPnpQueryDeviceRelations>,
-    pub query_id: PnpSlot<crate::EvtPnpQueryId>,
-    pub register_dma_backing: PnpSlot<crate::EvtPnpRegisterDmaBacking>,
-    pub query_resources: PnpSlot<crate::EvtPnpQueryResources>,
-    pub surprise_removal: PnpSlot<crate::EvtPnpSurpriseRemoval>,
-    pub remove_device: PnpSlot<crate::EvtPnpRemoveDevice>,
-    pub stop_device: PnpSlot<crate::EvtPnpStopDevice>,
-}
-
-impl PnpOps {
-    pub const fn new() -> Self {
-        Self {
-            start_device: PnpSlot::empty(),
-            query_device_relations: PnpSlot::empty(),
-            query_id: PnpSlot::empty(),
-            register_dma_backing: PnpSlot::empty(),
-            query_resources: PnpSlot::empty(),
-            surprise_removal: PnpSlot::empty(),
-            remove_device: PnpSlot::empty(),
-            stop_device: PnpSlot::empty(),
-        }
-    }
-}
-
-impl Default for PnpOps {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

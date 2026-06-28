@@ -26,6 +26,118 @@ use core::{
     ptr::null_mut,
 };
 
+#[macro_export]
+macro_rules! for_each_fs_operation {
+    ($m:ident) => {
+        $m! {
+            open {
+                op: FsOpen,
+                params: FsOpenParams,
+                result: FsOpenResult,
+                handler: EvtFsOpen,
+                method: open,
+                depth: OPEN_DEPTH = 0
+            },
+            close {
+                op: FsClose,
+                params: FsCloseParams,
+                result: FsCloseResult,
+                handler: EvtFsClose,
+                method: close,
+                depth: CLOSE_DEPTH = 0
+            },
+            read {
+                op: FsRead,
+                params: FsReadParams<'data>,
+                result: FsReadResult,
+                handler: EvtFsRead,
+                method: read,
+                depth: READ_DEPTH = 0
+            },
+            write {
+                op: FsWrite,
+                params: FsWriteParams<'data>,
+                result: FsWriteResult,
+                handler: EvtFsWrite,
+                method: write,
+                depth: WRITE_DEPTH = 0
+            },
+            flush {
+                op: FsFlush,
+                params: FsFlushParams,
+                result: FsFlushResult,
+                handler: EvtFsFlush,
+                method: flush,
+                depth: FLUSH_DEPTH = 1
+            },
+            seek {
+                op: FsSeek,
+                params: FsSeekParams,
+                result: FsSeekResult,
+                handler: EvtFsSeek,
+                method: seek,
+                depth: SEEK_DEPTH = 0
+            },
+            create {
+                op: FsCreate,
+                params: FsCreateParams,
+                result: FsCreateResult,
+                handler: EvtFsCreate,
+                method: create,
+                depth: CREATE_DEPTH = 0
+            },
+            rename {
+                op: FsRename,
+                params: FsRenameParams,
+                result: FsRenameResult,
+                handler: EvtFsRename,
+                method: rename,
+                depth: RENAME_DEPTH = 0
+            },
+            read_dir {
+                op: FsReadDir,
+                params: FsListDirParams,
+                result: FsListDirResult,
+                handler: EvtFsReadDir,
+                method: read_dir,
+                depth: READ_DIR_DEPTH = 0
+            },
+            get_info {
+                op: FsGetInfo,
+                params: FsGetInfoParams,
+                result: FsGetInfoResult,
+                handler: EvtFsGetInfo,
+                method: get_info,
+                depth: GET_INFO_DEPTH = 0
+            },
+            set_len {
+                op: FsSetLen,
+                params: FsSetLenParams,
+                result: FsSetLenResult,
+                handler: EvtFsSetLen,
+                method: set_len,
+                depth: SET_LEN_DEPTH = 0
+            },
+            append {
+                op: FsAppend,
+                params: FsAppendParams<'data>,
+                result: FsAppendResult,
+                handler: EvtFsAppend,
+                method: append,
+                depth: APPEND_DEPTH = 0
+            },
+            zero_range {
+                op: FsZeroRange,
+                params: FsZeroRangeParams,
+                result: FsZeroRangeResult,
+                handler: EvtFsZeroRange,
+                method: zero_range,
+                depth: ZERO_RANGE_DEPTH = 0
+            }
+        }
+    };
+}
+
 /// Maximum size for inline storage (bytes)
 const INLINE_THRESHOLD: usize = 512;
 
@@ -1116,33 +1228,60 @@ impl<'data> DeviceControl<'data> {
     }
 }
 
-pub struct FsOpen;
-pub struct FsClose;
-pub struct FsRead;
-pub struct FsWrite;
-pub struct FsFlush;
-pub struct FsSeek;
-pub struct FsCreate;
-pub struct FsRename;
-pub struct FsReadDir;
-pub struct FsGetInfo;
-pub struct FsSetLen;
-pub struct FsAppend;
-pub struct FsZeroRange;
+macro_rules! define_fs_request_operations {
+    (
+        $(
+            $field:ident {
+                op: $op:ident,
+                params: $params:ty,
+                result: $result:ty,
+                handler: $handler:ty,
+                method: $method:ident,
+                depth: $depth:ident = $default_depth:expr
+            }
+        ),+ $(,)?
+    ) => {
+        $(pub struct $op;)+
 
-pub trait FsOperation: Sized {
-    type Params<'data>;
-    type Result;
-    type Handler: Copy;
+        pub trait FsOperation: Sized {
+            type Params<'data>;
+            type Result;
+            type Handler: Copy;
 
-    fn handler(ops: &FsOps) -> Option<&IoHandler<Self::Handler>>;
+            fn handler(ops: &FsOps) -> Option<&IoHandler<Self::Handler>>;
 
-    fn call<'a, 'data>(
-        handler: Self::Handler,
-        dev: &'a Arc<DeviceObject>,
-        req: &'a mut Fs<'data, Self>,
-    ) -> FfiFuture<DriverStep>;
+            fn call<'a, 'data>(
+                handler: Self::Handler,
+                dev: &'a Arc<DeviceObject>,
+                req: &'a mut Fs<'data, Self>,
+            ) -> FfiFuture<DriverStep>;
+        }
+
+        $(
+            impl FsOperation for $op {
+                type Params<'data> = $params;
+                type Result = $result;
+                type Handler = $handler;
+
+                #[inline]
+                fn handler(ops: &FsOps) -> Option<&IoHandler<Self::Handler>> {
+                    ops.$field.as_handler()
+                }
+
+                #[inline]
+                fn call<'a, 'data>(
+                    handler: Self::Handler,
+                    dev: &'a Arc<DeviceObject>,
+                    req: &'a mut Fs<'data, Self>,
+                ) -> FfiFuture<DriverStep> {
+                    handler(dev, req)
+                }
+            }
+        )+
+    };
 }
+
+crate::for_each_fs_operation!(define_fs_request_operations);
 
 #[repr(C)]
 pub struct FsPayload<'data, O: FsOperation> {
@@ -1155,89 +1294,3 @@ pub struct FsPayload<'data, O: FsOperation> {
 pub struct Fs<'data, O: FsOperation> {
     pub payload: FsPayload<'data, O>,
 }
-
-macro_rules! impl_fs_operation {
-    ($op:ty, $params:ty, $result:ty, $handler:ty, $slot:ident) => {
-        impl FsOperation for $op {
-            type Params<'data> = $params;
-            type Result = $result;
-            type Handler = $handler;
-
-            #[inline]
-            fn handler(ops: &FsOps) -> Option<&IoHandler<Self::Handler>> {
-                ops.$slot.as_handler()
-            }
-
-            #[inline]
-            fn call<'a, 'data>(
-                handler: Self::Handler,
-                dev: &'a Arc<DeviceObject>,
-                req: &'a mut Fs<'data, Self>,
-            ) -> FfiFuture<DriverStep> {
-                handler(dev, req)
-            }
-        }
-    };
-}
-
-impl_fs_operation!(FsOpen, FsOpenParams, FsOpenResult, EvtFsOpen, open);
-impl_fs_operation!(FsClose, FsCloseParams, FsCloseResult, EvtFsClose, close);
-impl_fs_operation!(FsRead, FsReadParams<'data>, FsReadResult, EvtFsRead, read);
-impl_fs_operation!(
-    FsWrite,
-    FsWriteParams<'data>,
-    FsWriteResult,
-    EvtFsWrite,
-    write
-);
-impl_fs_operation!(FsFlush, FsFlushParams, FsFlushResult, EvtFsFlush, flush);
-impl_fs_operation!(FsSeek, FsSeekParams, FsSeekResult, EvtFsSeek, seek);
-impl_fs_operation!(
-    FsCreate,
-    FsCreateParams,
-    FsCreateResult,
-    EvtFsCreate,
-    create
-);
-impl_fs_operation!(
-    FsRename,
-    FsRenameParams,
-    FsRenameResult,
-    EvtFsRename,
-    rename
-);
-impl_fs_operation!(
-    FsReadDir,
-    FsListDirParams,
-    FsListDirResult,
-    EvtFsReadDir,
-    read_dir
-);
-impl_fs_operation!(
-    FsGetInfo,
-    FsGetInfoParams,
-    FsGetInfoResult,
-    EvtFsGetInfo,
-    get_info
-);
-impl_fs_operation!(
-    FsSetLen,
-    FsSetLenParams,
-    FsSetLenResult,
-    EvtFsSetLen,
-    set_len
-);
-impl_fs_operation!(
-    FsAppend,
-    FsAppendParams<'data>,
-    FsAppendResult,
-    EvtFsAppend,
-    append
-);
-impl_fs_operation!(
-    FsZeroRange,
-    FsZeroRangeParams,
-    FsZeroRangeResult,
-    EvtFsZeroRange,
-    zero_range
-);

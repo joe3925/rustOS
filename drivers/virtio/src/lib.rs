@@ -35,7 +35,9 @@ use kernel_api::irq::{
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
 use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
-use kernel_api::kernel_types::io::DiskInfo;
+use kernel_api::kernel_types::io::{
+    DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
+};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -986,10 +988,10 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     };
 
     let mut child_init = DeviceInit::with_pnp(Some(pnp_vt));
-    child_init.ops.read.register::<VirtioPdoIo>();
-    child_init.ops.write.register::<VirtioPdoIo>();
-    child_init.ops.device_control.register::<VirtioPdoIo>();
-    child_init.ops.flush.register::<VirtioPdoIo>();
+    child_init.ops.register::<DeviceReadOp, VirtioPdoIo>();
+    child_init.ops.register::<DeviceWriteOp, VirtioPdoIo>();
+    child_init.ops.register::<DeviceControlOp, VirtioPdoIo>();
+    child_init.ops.register::<DeviceFlushOp, VirtioPdoIo>();
     child_init.set_dev_ext_from(ChildExt {
         parent_device: Arc::downgrade(parent),
         disk_info,
