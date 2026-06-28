@@ -593,7 +593,6 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         );
     };
     let task = Task::new_user_mode(
-        // TODO: check this
         unsafe { *(entry as *const extern "C" fn(usize)) },
         0,
         stack_size,

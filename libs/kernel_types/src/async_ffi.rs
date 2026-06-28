@@ -398,18 +398,18 @@ static RUST_WAKER_BOX_VTABLE: FfiWakerVTable = FfiWakerVTable {
     drop: rust_waker_box_drop,
 };
 
-fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
+fn ffi_waker_from_waker(mut w: Waker) -> FfiWaker {
     #[cfg(feature = "async-ffi-slab")]
     {
-        if let Some(p) = WAKER_TO_FFI_POOL.try_alloc(RustWakerBox {
+        match WAKER_TO_FFI_POOL.try_alloc(RustWakerBox {
             refs: AtomicUsize::new(1),
-            // TODO: it is possible to get rid of this clone
-            waker: w.clone(),
+            waker: w,
         }) {
-            return FfiWaker {
+            Ok(p) => return FfiWaker {
                 data: p.as_ptr() as *const (),
                 vtable: &RUST_WAKER_BOX_VTABLE,
-            };
+            },
+            Err(err) => w = err.waker,
         }
     }
 
@@ -490,7 +490,7 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
 
     #[cfg(feature = "async-ffi-slab")]
     {
-        if let Some(p) = FFI_TO_WAKER_POOL.try_alloc(FfiWakerBox {
+        if let Ok(p) = FFI_TO_WAKER_POOL.try_alloc(FfiWakerBox {
             refs: AtomicUsize::new(1),
             waker: w.clone(),
         }) {

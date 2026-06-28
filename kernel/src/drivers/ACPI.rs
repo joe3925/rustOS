@@ -8,20 +8,7 @@ use core::ptr::NonNull;
 
 use kernel_types::arch::{PhysAddr, VirtAddr};
 
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct Xsdp {
-    pub signature: [u8; 8],
-    pub checksum: u8,
-    pub oem_id: [u8; 6],
-    pub revision: u8,
-    pub rsdt_address: u32, // todo: prob remove this
 
-    pub length: u32,
-    pub xsdt_address: u64,
-    pub extended_checksum: u8,
-    pub reserved: [u8; 3],
-}
 unsafe impl Send for AcpiFirmware {}
 unsafe impl Sync for AcpiFirmware {}
 pub struct AcpiFirmware {

@@ -155,19 +155,22 @@ impl<T, const N: usize, const W: usize> StaticObjectPool<T, N, W> {
     }
 
     #[inline(always)]
-    pub fn try_alloc(&self, value: T) -> Option<NonNull<T>> {
+    pub fn try_alloc(&self, value: T) -> Result<NonNull<T>, T> {
         if mem::size_of::<T>() == 0 {
-            return None;
+            return Err(value);
         }
 
-        let idx = self.alloc.alloc()?;
+        let idx = match self.alloc.alloc() {
+            Some(idx) => idx,
+            None => return Err(value),
+        };
 
         unsafe {
             let slot = (*self.slots.get()).as_mut_ptr().add(idx);
             let ptr = slot as *mut T;
 
             ptr::write(ptr, value);
-            Some(NonNull::new_unchecked(ptr))
+            Ok(NonNull::new_unchecked(ptr))
         }
     }
 

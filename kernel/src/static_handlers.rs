@@ -75,8 +75,7 @@ pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, na
 }
 
 pub unsafe extern "C" fn park_self_and_yield() {
-    // TODO:
-    todo!()
+    SCHEDULER.park_current();
 }
 pub extern "C" fn get_current_platform_cpu_id() -> usize {
     crate::platform::current_logical_id()

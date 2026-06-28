@@ -16,7 +16,6 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
-// TODO: without interrupts usage in mimalloc is temporary. Heaps need to be fragmented for interrupts, panics, and normal execution before merging to main
 cfg_if::cfg_if! {
     if #[cfg(feature = "allocator-mimalloc")] {
         use crate::memory::heap::mimalloc;
