@@ -17,7 +17,7 @@ use core::{
     panic::PanicInfo,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use kernel_api::kernel_types::io::VolmgrProtocol;
+use kernel_api::kernel_types::protocol::volmgr::VolmgrProtocol;
 use kernel_api::println;
 use spin::{Once, RwLock};
 
@@ -27,7 +27,7 @@ use kernel_api::{
     device::open_public_protocol,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOpenParams, notify_label_published, notify_label_unpublished},
-    kernel_types::io::PartitionInfoProtocol,
+    kernel_types::protocol::disk::PartitionInfoProtocol,
     kernel_types::{
         fs::{OpenFlags, Path},
         io::{DeviceControlHandler, DeviceControlOp, FsIdentify},

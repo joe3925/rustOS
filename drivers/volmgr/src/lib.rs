@@ -21,7 +21,9 @@ use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::IoTarget;
-use kernel_api::kernel_types::io::{PartitionInfo, PartitionInfoProtocol, VolmgrProtocol, VolmgrProtocolVTable};
+use kernel_api::kernel_types::io::PartitionInfo;
+use kernel_api::kernel_types::protocol::disk::PartitionInfoProtocol;
+use kernel_api::kernel_types::protocol::volmgr::{VolmgrProtocol, VolmgrProtocolVTable};
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceFlushOwner, DeviceFlushOwnerOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
 };

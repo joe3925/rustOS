@@ -19,8 +19,11 @@ use kernel_api::dma::dma::{IoBufferBacking, IoBufferBackingDesc};
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceRead, DeviceReadOp,
-    DeviceWrite, DeviceWriteOp, DiskInfo, DiskInfoProtocol, DiskInfoProtocolVTable, GptHeader,
-    GptPartitionEntry, PartitionInfo, PartitionInfoProtocol, PartitionInfoProtocolVTable,
+    DeviceWrite, DeviceWriteOp, DiskInfo, GptHeader,
+    GptPartitionEntry, PartitionInfo,
+};
+use kernel_api::kernel_types::protocol::disk::{
+    DiskInfoProtocol, DiskInfoProtocolVTable, PartitionInfoProtocol, PartitionInfoProtocolVTable,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::IoctlData;

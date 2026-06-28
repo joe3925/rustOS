@@ -250,7 +250,7 @@ fn has_to_device_buffer(buffer: &IoBuffer<'_, '_, ToDevice>, len: usize) -> bool
     buffer.len() >= len
 }
 
-use kernel_api::kernel_types::io::{DiskInfoProtocol, DiskInfoProtocolVTable};
+use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::device::open_public_protocol;
 use spin::RwLock;
 

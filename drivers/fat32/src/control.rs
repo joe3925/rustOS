@@ -85,7 +85,7 @@ impl DeviceControlHandler for Fat32RootIo {
                     if let Some(devnode) = volume_fdo.dev_node.get() {
                         if let Some(dn) = devnode.upgrade() {
                             if let Ok(proto) = kernel_api::device::open_public_protocol::<
-                                kernel_api::kernel_types::io::VolmgrProtocol,
+                                kernel_api::kernel_types::protocol::volmgr::VolmgrProtocol,
                             >(&dn)
                             {
                                 if let Ok(pi) = (proto.partition_info)(&proto.provider()) {

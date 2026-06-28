@@ -36,9 +36,9 @@ use kernel_api::irq::{
 };
 use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::{
-    DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, DiskInfoProtocol,
-    DiskInfoProtocolVTable, ReadSlot,
+    DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
 };
+use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -386,7 +386,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     req: &'b mut kernel_api::pnp::InitComplete,
 ) -> DriverStep {
     let proto = match kernel_api::device::open_protocol_to_next_lower::<
-        kernel_api::kernel_types::pci::PciProtocol,
+        kernel_api::kernel_types::protocol::pci::PciProtocol,
     >(dev)
     {
         Ok(p) => p,
@@ -1137,12 +1137,12 @@ pub async fn virtio_pdo_start<'req, 'data, 'b>(
 ) -> DriverStep {
     if let Some(dn) = _dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
-            kernel_api::device::register_protocol::<kernel_api::kernel_types::io::DiskInfoProtocol>(
+            kernel_api::device::register_protocol::<kernel_api::kernel_types::protocol::disk::DiskInfoProtocol>(
                 _dev,
                 &VIRTIO_DISK_INFO_VTABLE,
             );
             kernel_api::device::publish_stack_protocol::<
-                kernel_api::kernel_types::io::DiskInfoProtocol,
+                kernel_api::kernel_types::protocol::disk::DiskInfoProtocol,
             >(&dn);
         }
     }

@@ -29,6 +29,7 @@ pub mod object_manager;
 pub mod pci;
 pub mod pnp;
 pub mod port;
+pub mod protocol;
 pub mod request;
 pub mod runtime;
 pub mod status;

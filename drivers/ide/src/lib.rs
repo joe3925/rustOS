@@ -26,8 +26,9 @@ use kernel_api::irq::{
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
 use kernel_api::kernel_types::io::{
     DeviceControlHandler, DeviceControlOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
-    DiskInfo, DiskInfoProtocol, DiskInfoProtocolVTable,
+    DiskInfo,
 };
+use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::port::Port;
@@ -634,7 +635,7 @@ async fn ide_init_complete<'req, 'data, 'b>(
     _op: PnpOp,
     req: &'b mut kernel_api::pnp::InitComplete,
 ) -> DriverStep {
-    let proto = kernel_api::device::open_protocol_to_next_lower::<kernel_api::kernel_types::pci::PciProtocol>(dev).ok();
+    let proto = kernel_api::device::open_protocol_to_next_lower::<kernel_api::kernel_types::protocol::pci::PciProtocol>(dev).ok();
 
     if proto.is_some() || pnp::send_next_lower(dev.clone(), &mut kernel_api::pnp::QueryResources { resources: ResourceSet::default() }).await != DriverStatus::NoSuchDevice {
         let bars = parse_ide_bars(proto.as_ref());
@@ -826,7 +827,7 @@ struct IdeBars {
 }
 
 
-fn parse_ide_bars(proto: Option<&kernel_api::device::ProtocolHandle<kernel_api::kernel_types::pci::PciProtocol>>) -> IdeBars {
+fn parse_ide_bars(proto: Option<&kernel_api::device::ProtocolHandle<kernel_api::kernel_types::protocol::pci::PciProtocol>>) -> IdeBars {
     let mut bars = IdeBars::default();
 
     if let Some(proto) = proto {

@@ -40,7 +40,8 @@ use spin::Once;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
-use kernel_api::kernel_types::pci::{PciProtocol, PciProtocolVTable, Bar, MsixInfo};
+use kernel_api::kernel_types::pci::{Bar, MsixInfo};
+use kernel_api::kernel_types::protocol::pci::{PciProtocol, PciProtocolVTable};
 
 extern "C" fn pci_proto_get_bar(dev: &Arc<DeviceObject>, index: u8) -> Option<Bar> {
     let ext = dev.try_devext::<PciPdoExt>().ok()?;
