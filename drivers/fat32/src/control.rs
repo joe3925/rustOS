@@ -7,7 +7,7 @@ use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         async_types::AsyncMutex,
-        io::{DeviceControlHandler, FsIdentify, PartitionInfo},
+        io::{DeviceControlHandler, DeviceControlOp, FsIdentify, PartitionInfo},
         request::IoctlData,
     },
     pnp::{
@@ -193,7 +193,7 @@ pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, fs_device_add);
     init_logger();
     let mut init = DeviceInit::new();
-    init.ops.device_control.register::<Fat32RootIo>();
+    init.ops.register::<DeviceControlOp, Fat32RootIo>();
     let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
     let ctrl_name = "\\Device\\fat32.fs".to_string();
     let _ctrl = pnp_create_control_device_and_link(ctrl_name, init, ctrl_link.clone());

@@ -23,7 +23,7 @@ use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::{
-    DeviceFlush, DeviceFlushDirty, DeviceFlushOwner, DeviceRead, DeviceWrite,
+    DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceFlushOwner, DeviceFlushOwnerOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::pnp::DeviceRelationType;
@@ -608,11 +608,11 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     pnp_ops.remove_device.set(vol_pdo_remove_device);
 
     let mut init = DeviceInit::with_pnp(Some(pnp_ops));
-    init.ops.read.register::<VolPdoIo>();
-    init.ops.write.register::<VolPdoIo>();
-    init.ops.flush.register::<VolPdoIo>();
-    init.ops.flush_dirty.register::<VolPdoIo>();
-    init.ops.flush_owner.register::<VolPdoIo>();
+    init.ops.register::<DeviceReadOp, VolPdoIo>();
+    init.ops.register::<DeviceWriteOp, VolPdoIo>();
+    init.ops.register::<DeviceFlushOp, VolPdoIo>();
+    init.ops.register::<DeviceFlushDirtyOp, VolPdoIo>();
+    init.ops.register::<DeviceFlushOwnerOp, VolPdoIo>();
     init.set_dev_ext_default::<VolPdoExt>();
 
     let (_dn, pdo) = pnp_create_child_devnode_and_pdo_with_init(

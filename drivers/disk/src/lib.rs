@@ -18,7 +18,7 @@ use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         dma::{FromDevice, IoBuffer, ToDevice},
-        io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo},
+        io::{DeviceControlHandler, DeviceControlOp, DeviceFlush, DeviceFlushOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp, DiskInfo},
         request::IoctlData,
     },
     pnp::{
@@ -290,10 +290,10 @@ pub extern "C" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    dev_init.ops.register_read::<DiskIo>();
-    dev_init.ops.register_write::<DiskIo>();
-    dev_init.ops.register_device_control::<DiskIo>();
-    dev_init.ops.register_flush::<DiskIo>();
+    dev_init.ops.register::<DeviceReadOp, DiskIo>();
+    dev_init.ops.register::<DeviceWriteOp, DiskIo>();
+    dev_init.ops.register::<DeviceControlOp, DiskIo>();
+    dev_init.ops.register::<DeviceFlushOp, DiskIo>();
 
     let mut pnp_vt = PnpOps::new();
     pnp_vt.remove_device.set(disk_pnp_remove);

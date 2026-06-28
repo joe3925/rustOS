@@ -26,7 +26,7 @@ use kernel_api::{
     fs::{FsOpenParams, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
-        io::{DeviceControlHandler, FsIdentify},
+        io::{DeviceControlHandler, DeviceControlOp, FsIdentify},
         pnp::DeviceIds,
         request::IoctlData,
     },
@@ -98,7 +98,7 @@ pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, volclass_device_add);
 
     let mut init = DeviceInit::new();
-    init.ops.device_control.register::<VolclassCtrlIo>();
+    init.ops.register::<DeviceControlOp, VolclassCtrlIo>();
     let _ctrl = pnp_create_control_device_and_link(
         "\\Device\\volclass.ctrl".to_string(),
         init,
@@ -115,7 +115,7 @@ pub extern "C" fn volclass_device_add(
     let mut pnp_ops = PnpOps::new();
     pnp_ops.start_device.set(volclass_start);
 
-    dev_init.ops.device_control.register::<VolclassIo>();
+    dev_init.ops.register::<DeviceControlOp, VolclassIo>();
 
     dev_init.set_dev_ext_default::<VolFdoExt>();
     dev_init.pnp_ops = Some(pnp_ops);

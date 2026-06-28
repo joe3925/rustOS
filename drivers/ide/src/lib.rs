@@ -24,7 +24,7 @@ use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
-use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite, DiskInfo};
+use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceControlOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp, DiskInfo};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::port::Port;
@@ -783,9 +783,9 @@ fn create_child_pdo(
 
     let mut child_init = DeviceInit::with_pnp(Some(pvt));
 
-    child_init.ops.read.register::<IdePdoIo>();
-    child_init.ops.write.register::<IdePdoIo>();
-    child_init.ops.device_control.register::<IdePdoIo>();
+    child_init.ops.register::<DeviceReadOp, IdePdoIo>();
+    child_init.ops.register::<DeviceWriteOp, IdePdoIo>();
+    child_init.ops.register::<DeviceControlOp, IdePdoIo>();
 
     child_init.set_dev_ext_from(ChildExt {
         parent_device: Arc::downgrade(parent),

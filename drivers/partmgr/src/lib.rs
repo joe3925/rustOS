@@ -17,7 +17,7 @@ use kernel_api::dma::dma::IoBufferBackingConfig;
 use kernel_api::dma::dma::{IoBufferBacking, IoBufferBackingDesc};
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
-    DeviceFlush, DeviceFlushDirty, DeviceRead, DeviceWrite, DiskInfo, GptHeader, GptPartitionEntry,
+    DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp, DiskInfo, GptHeader, GptPartitionEntry,
     PartitionInfo,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -518,10 +518,10 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
         }
 
         let mut child_init = DeviceInit::new();
-        child_init.ops.read.register::<PartitionPdoIo>();
-        child_init.ops.write.register::<PartitionPdoIo>();
-        child_init.ops.flush.register::<PartitionPdoIo>();
-        child_init.ops.flush_dirty.register::<PartitionPdoIo>();
+        child_init.ops.register::<DeviceReadOp, PartitionPdoIo>();
+        child_init.ops.register::<DeviceWriteOp, PartitionPdoIo>();
+        child_init.ops.register::<DeviceFlushOp, PartitionPdoIo>();
+        child_init.ops.register::<DeviceFlushDirtyOp, PartitionPdoIo>();
 
         let mut vt = PnpOps::new();
         vt.query_resources.set(partition_pdo_query_resources);

@@ -24,7 +24,7 @@ use kernel_api::{
     IOCTL_PCI_SETUP_MSIX,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
-    kernel_types::{io::DeviceControlHandler, pnp::DeviceIds},
+    kernel_types::{io::{DeviceControlHandler, DeviceControlOp}, pnp::DeviceIds},
     memory::{VirtAddr, unmap_mmio_region},
     pnp::{
         DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceSet,
@@ -316,7 +316,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     vt.query_device_relations.set(pci_pdo_query_devrels);
 
     let mut child_init = DeviceInit::with_pnp(Some(vt));
-    child_init.ops.device_control.register::<PciPdoIo>();
+    child_init.ops.register::<DeviceControlOp, PciPdoIo>();
     child_init.set_dev_ext_from(*p);
 
     let name = name_for(p);
