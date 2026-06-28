@@ -87,7 +87,10 @@ impl RangeTracker {
         }
     }
 
-    pub fn dealloc(&self, base: u64, size: u64) {
+    /// # Safety
+    /// The exact range must currently be allocated by this tracker and must be
+    /// returned exactly once after all users have released it.
+    pub unsafe fn dealloc(&self, base: u64, size: u64) {
         let Some(aligned_size) = self.align_size(size) else {
             return;
         };

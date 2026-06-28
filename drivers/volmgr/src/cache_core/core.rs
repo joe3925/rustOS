@@ -265,7 +265,7 @@ where
                         unmap_range(cache_base, cache_bytes as u64);
                     }
 
-                    deallocate_kernel_range(cache_base, cache_bytes as u64);
+                    unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
                     return Err(CacheError::InvalidIoBuffer(e));
                 }
             };
@@ -278,7 +278,7 @@ where
                     unmap_range(cache_base, cache_bytes as u64);
                 }
 
-                deallocate_kernel_range(cache_base, cache_bytes as u64);
+                unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
                 return Err(CacheError::Backend(e));
             }
         }
@@ -295,7 +295,7 @@ where
                 unmap_range(cache_base, cache_bytes as u64);
             }
 
-            deallocate_kernel_range(cache_base, cache_bytes as u64);
+            unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
             return Err(CacheError::InsufficientResources);
         }
 
@@ -316,7 +316,7 @@ where
                 unmap_range(cache_base, cache_bytes as u64);
             }
 
-            deallocate_kernel_range(cache_base, cache_bytes as u64);
+            unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
             return Err(CacheError::InsufficientResources);
         }
 
@@ -340,7 +340,7 @@ where
                     unmap_range(cache_base, cache_bytes as u64);
                 }
 
-                deallocate_kernel_range(cache_base, cache_bytes as u64);
+                unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
                 return Err(CacheError::InsufficientResources);
             }
         };
@@ -2256,7 +2256,7 @@ where
                 unmap_range(self.cache_base, self.cache_bytes as u64);
             }
 
-            deallocate_kernel_range(self.cache_base, self.cache_bytes as u64);
+            unsafe { deallocate_kernel_range(self.cache_base, self.cache_bytes as u64) };
             self.cache_bytes = 0;
         }
     }

@@ -1,4 +1,5 @@
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -29,7 +30,10 @@ impl<P: Platform, T> SleepMutex<P, T> {
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
-            Some(SleepMutexGuard { mutex: self })
+            Some(SleepMutexGuard {
+                mutex: self,
+                _borrow: PhantomData,
+            })
         } else {
             None
         }
@@ -68,6 +72,7 @@ impl<P: Platform, T> SleepMutex<P, T> {
 
 pub struct SleepMutexGuard<'a, P: Platform, T> {
     mutex: &'a SleepMutex<P, T>,
+    _borrow: PhantomData<&'a mut T>,
 }
 
 impl<'a, P: Platform, T> SleepMutexGuard<'a, P, T> {

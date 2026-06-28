@@ -99,7 +99,7 @@ pub extern "C" fn kernel_alloc(layout: Layout) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_free(ptr: *mut u8, layout: Layout) {
+pub unsafe extern "C" fn kernel_free(ptr: *mut u8, layout: Layout) {
     unsafe {
         GlobalAlloc::dealloc(&crate::memory::heap::ALLOCATOR, ptr, layout);
     };
@@ -409,16 +409,14 @@ pub extern "C" fn driver_set_evt_device_add(
     driver: &Arc<DriverObject>,
     callback: EvtDriverDeviceAdd,
 ) {
-    let driver_mut = unsafe { &mut *(Arc::as_ptr(driver) as *mut DriverObject) };
-    driver_mut.evt_device_add = Some(callback);
+    *driver.evt_device_add.write() = Some(callback);
 }
 
 pub extern "C" fn driver_set_evt_driver_unload(
     driver: &Arc<DriverObject>,
     callback: EvtDriverUnload,
 ) {
-    let driver_mut = unsafe { &mut *(Arc::as_ptr(driver) as *mut DriverObject) };
-    driver_mut.evt_driver_unload = Some(callback);
+    *driver.evt_driver_unload.write() = Some(callback);
 }
 
 pub extern "C" fn get_rsdp() -> u64 {
@@ -775,13 +773,13 @@ pub extern "C" fn allocate_kernel_range_mapped(
 }
 
 #[no_mangle]
-pub extern "C" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
-    crate::memory::paging::deallocate_kernel_range(addr, size)
+pub unsafe extern "C" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
+    unsafe { crate::memory::paging::deallocate_kernel_range(addr, size) }
 }
 
 #[no_mangle]
-pub extern "C" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
-    crate::memory::paging::unmap_range(virtual_addr, size)
+pub unsafe extern "C" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
+    unsafe { crate::memory::paging::unmap_range(virtual_addr, size) }
 }
 
 #[no_mangle]
@@ -803,8 +801,11 @@ pub extern "C" fn map_physical_pages(
 }
 
 #[no_mangle]
-pub extern "C" fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
-    crate::memory::paging::unmap_physical_pages(base, size)
+pub unsafe extern "C" fn unmap_physical_pages(
+    base: VirtAddr,
+    size: u64,
+) -> Result<(), PageMapError> {
+    unsafe { crate::memory::paging::unmap_physical_pages(base, size) }
 }
 
 #[no_mangle]

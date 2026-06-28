@@ -67,7 +67,7 @@ pub struct DeviceInitResult {
 
 /// Negotiate features and read device configuration.
 /// Returns DeviceInitResult with capacity and multiqueue information.
-pub fn init_device(
+pub(crate) unsafe fn init_device(
     common_cfg: VirtAddr,
     device_cfg: VirtAddr,
 ) -> Result<DeviceInitResult, &'static str> {
@@ -199,7 +199,7 @@ pub fn init_device(
 }
 
 /// Set the DRIVER_OK status bit, completing device initialization.
-pub fn set_driver_ok(common_cfg: VirtAddr) {
+pub(crate) unsafe fn set_driver_ok(common_cfg: VirtAddr) {
     unsafe {
         pci::common_write_u8(
             common_cfg,
@@ -213,7 +213,7 @@ pub fn set_driver_ok(common_cfg: VirtAddr) {
 }
 
 /// Reset the device by writing 0 to device_status.
-pub fn reset_device(common_cfg: VirtAddr) {
+pub(crate) unsafe fn reset_device(common_cfg: VirtAddr) {
     unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, 0) };
 }
 
@@ -343,7 +343,7 @@ impl BlkIoSlots {
             desc_count += 1;
 
             let total_table_len = (desc_count * core::mem::size_of::<VirtqDesc>()) as u32;
-            vq.push_allocated_indirect(head, indirect_phys, total_table_len);
+            unsafe { vq.push_allocated_indirect(head, indirect_phys, total_table_len) };
         }
 
         Ok(head)

@@ -113,20 +113,53 @@ pub struct FdtHeader {
 #[derive(Debug)]
 #[repr(C)]
 pub struct MemoryRegions {
-    pub ptr: *mut MemoryRegion,
-    pub len: usize,
+    ptr: *mut MemoryRegion,
+    len: usize,
+}
+
+impl MemoryRegions {
+    /// # Safety
+    ///
+    /// `ptr` must reference `len` initialized `MemoryRegion` values for the
+    /// entire lifetime of this handoff object and must be exclusively borrowed
+    /// whenever the returned value is mutably dereferenced.
+    pub const unsafe fn from_raw_parts(ptr: *mut MemoryRegion, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    pub const fn as_ptr(&self) -> *const MemoryRegion {
+        self.ptr.cast_const()
+    }
+
+    pub const fn as_mut_ptr(&mut self) -> *mut MemoryRegion {
+        self.ptr
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl ops::Deref for MemoryRegions {
     type Target = [MemoryRegion];
 
     fn deref(&self) -> &Self::Target {
+        if self.len == 0 {
+            return &[];
+        }
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
 impl ops::DerefMut for MemoryRegions {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        if self.len == 0 {
+            return &mut [];
+        }
         unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
@@ -206,11 +239,14 @@ impl<T> From<Optional<T>> for Option<T> {
 #[derive(Debug)]
 #[repr(C)]
 pub struct FrameBuffer {
-    pub buffer_start: u64,
-    pub info: FrameBufferInfo,
+    buffer_start: u64,
+    info: FrameBufferInfo,
 }
 
 impl FrameBuffer {
+    /// # Safety
+    /// `buffer_start` must identify an exclusively owned writable framebuffer
+    /// of at least `info.byte_len` bytes for every borrow produced from it.
     pub const unsafe fn new(buffer_start: u64, info: FrameBufferInfo) -> Self {
         Self { buffer_start, info }
     }
@@ -223,8 +259,22 @@ impl FrameBuffer {
         unsafe { slice::from_raw_parts_mut(self.buffer_start as *mut u8, self.info.byte_len) }
     }
 
+    /// Consumes the descriptor and returns a mutable slice with caller-chosen
+    /// lifetime.
+    ///
+    /// # Safety
+    /// The framebuffer allocation must remain live and exclusively borrowed
+    /// for the full returned lifetime.
+    pub unsafe fn into_buffer_mut<'a>(self) -> &'a mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.buffer_start as *mut u8, self.info.byte_len) }
+    }
+
     pub const fn info(&self) -> FrameBufferInfo {
         self.info
+    }
+
+    pub const fn buffer_start(&self) -> u64 {
+        self.buffer_start
     }
 }
 
@@ -255,8 +305,8 @@ pub enum PixelFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct KernelSymbolString {
-    pub ptr: *const u8,
-    pub len: usize,
+    ptr: *const u8,
+    len: usize,
 }
 
 impl KernelSymbolString {
@@ -265,6 +315,26 @@ impl KernelSymbolString {
             ptr: core::ptr::null(),
             len: 0,
         }
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must reference `len` bytes of valid UTF-8 that remain alive for
+    /// every borrow produced from this value.
+    pub const unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    pub const fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn as_str(&self) -> &str {
@@ -297,11 +367,31 @@ impl KernelSymbol {
 #[derive(Debug)]
 #[repr(C)]
 pub struct KernelSymbols {
-    pub ptr: *const KernelSymbol,
-    pub len: usize,
+    ptr: *const KernelSymbol,
+    len: usize,
 }
 
 impl KernelSymbols {
+    /// # Safety
+    ///
+    /// `ptr` must reference `len` initialized `KernelSymbol` values that remain
+    /// alive for every borrow produced from this value.
+    pub const unsafe fn from_raw_parts(ptr: *const KernelSymbol, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    pub const fn as_ptr(&self) -> *const KernelSymbol {
+        self.ptr
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn as_slice(&self) -> &[KernelSymbol] {
         if self.len == 0 {
             return &[];
@@ -328,12 +418,35 @@ pub struct KernelTextSection {
 #[derive(Debug)]
 #[repr(C)]
 pub struct KernelSections {
-    pub ptr: *const KernelSection,
-    pub len: usize,
+    ptr: *const KernelSection,
+    len: usize,
 }
 
 impl KernelSections {
+    /// # Safety
+    ///
+    /// `ptr` must reference `len` initialized `KernelSection` values that
+    /// remain alive for every borrow produced from this value.
+    pub const unsafe fn from_raw_parts(ptr: *const KernelSection, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    pub const fn as_ptr(&self) -> *const KernelSection {
+        self.ptr
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn as_slice(&self) -> &[KernelSection] {
+        if self.len == 0 {
+            return &[];
+        }
         unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 }

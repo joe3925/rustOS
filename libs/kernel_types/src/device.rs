@@ -76,25 +76,18 @@ impl DriverRuntime {
     }
 }
 
-#[repr(C)]
-pub struct DriverConfig {
-    driver: *const DriverObject,
+pub struct DriverConfig<'a> {
+    driver: &'a DriverObject,
 }
 
-impl DriverConfig {
+impl DriverConfig<'_> {
     pub fn on_device_add(&mut self, cb: EvtDriverDeviceAdd) -> &mut Self {
-        unsafe {
-            (*(self.driver as *mut DriverObject)).evt_device_add = Some(cb);
-        }
-
+        *self.driver.evt_device_add.write() = Some(cb);
         self
     }
 
     pub fn on_unload(&mut self, cb: EvtDriverUnload) -> &mut Self {
-        unsafe {
-            (*(self.driver as *mut DriverObject)).evt_driver_unload = Some(cb);
-        }
-
+        *self.driver.evt_driver_unload.write() = Some(cb);
         self
     }
 }
@@ -105,8 +98,8 @@ pub struct DriverObject {
     pub runtime: Arc<DriverRuntime>,
     pub driver_name: String,
     pub flags: u32,
-    pub evt_device_add: Option<EvtDriverDeviceAdd>,
-    pub evt_driver_unload: Option<EvtDriverUnload>,
+    pub evt_device_add: RwLock<Option<EvtDriverDeviceAdd>>,
+    pub evt_driver_unload: RwLock<Option<EvtDriverUnload>>,
 }
 
 impl DriverObject {
@@ -115,15 +108,13 @@ impl DriverObject {
             runtime,
             driver_name,
             flags: 0,
-            evt_device_add: None,
-            evt_driver_unload: None,
+            evt_device_add: RwLock::new(None),
+            evt_driver_unload: RwLock::new(None),
         })
     }
 
     pub fn configure<F: FnOnce(&mut DriverConfig)>(this: &Arc<Self>, f: F) {
-        let mut cfg = DriverConfig {
-            driver: Arc::as_ptr(this),
-        };
+        let mut cfg = DriverConfig { driver: this };
 
         f(&mut cfg);
     }

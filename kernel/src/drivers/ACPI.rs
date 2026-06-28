@@ -80,9 +80,11 @@ impl AcpiHandler for ACPIImpl {
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        let _ = unmap_physical_pages(
-            VirtAddr::new(region.virtual_start().as_ptr() as u64).into(),
-            region.region_length() as u64,
-        );
+        let _ = unsafe {
+            unmap_physical_pages(
+                VirtAddr::new(region.virtual_start().as_ptr() as u64).into(),
+                region.region_length() as u64,
+            )
+        };
     }
 }

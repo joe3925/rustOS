@@ -78,7 +78,7 @@ pub async fn pci_setup_msix<'req, 'data>(
     let message = match irq_compose_msi_message(&msi_request) {
         Some(message) => message,
         None => {
-            let _ = unmap_mmio_region(table_va, table_region_size);
+            let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
             return DriverStep::complete(DriverStatus::NotImplemented);
         }
     };
@@ -107,7 +107,7 @@ pub async fn pci_setup_msix<'req, 'data>(
     let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
         Ok(va) => va,
         Err(_) => {
-            let _ = unmap_mmio_region(table_va, table_region_size);
+            let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
             return DriverStep::complete(DriverStatus::InsufficientResources);
         }
     };
@@ -126,8 +126,8 @@ pub async fn pci_setup_msix<'req, 'data>(
     unsafe { cfg_write16(cfg_va, msg_ctrl_offset, new_msg_ctrl) };
     let _msg_ctrl_after = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
 
-    let _ = unmap_mmio_region(cfg_va, 4096);
-    let _ = unmap_mmio_region(table_va, table_region_size);
+    let _ = unsafe { unmap_mmio_region(cfg_va, 4096) };
+    let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
 
     DriverStep::complete(DriverStatus::Success)
 }

@@ -34,7 +34,7 @@ pub struct QueueState {
     pub read_ops: PendingOpPool<FromDevice>,
     pub write_ops: PendingOpPool<ToDevice>,
     pub submitted_completions: SubmittedCompletionPool,
-    pub used_idx: *const AtomicU16,
+    pub(crate) used_idx: *const AtomicU16,
     pub last_drained_used_idx: AtomicU16,
 }
 

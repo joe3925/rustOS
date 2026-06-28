@@ -115,7 +115,7 @@ impl PhysCursor {
                     break;
                 }
 
-                let frame_len = usize::try_from(frame.byte_len).ok()?;
+                let frame_len = usize::try_from(frame.len()).ok()?;
 
                 if frame_offset >= frame_len {
                     frame_offset -= frame_len;

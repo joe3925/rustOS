@@ -77,15 +77,18 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
     let map_start = VirtAddr::new(stack_top.as_u64() - map_bytes);
 
     if let Err(err) = unsafe { map_range(map_start, map_bytes, flags, false) } {
-        unmap_range(region_base, reserve_total);
+        unsafe { unmap_range(region_base, reserve_total) };
         return Err(err);
     }
 
     Ok(stack_top)
 }
 
-pub fn deallocate_kernel_stack(stack_top: VirtAddr) {
+/// # Safety
+/// `stack_top` must identify a live kernel stack allocation that is no longer
+/// executing or referenced and has not already been deallocated.
+pub unsafe fn deallocate_kernel_stack(stack_top: VirtAddr) {
     let reserve_total = kernel_stack_reservation_bytes();
     let region_base = VirtAddr::new(stack_top.as_u64() - reserve_total);
-    unmap_range(region_base, reserve_total);
+    unsafe { unmap_range(region_base, reserve_total) };
 }

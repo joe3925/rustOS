@@ -11,7 +11,6 @@ use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use kernel_types::device::DeviceObject;
-use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaBufferView;
 use kernel_types::dma::DmaDeviceHandle;
@@ -23,6 +22,7 @@ use kernel_types::dma::DmaPciDeviceIdentity;
 use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::IoBufferDmaMappingLayout;
 use kernel_types::dma::IoBufferPageFrame;
+use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_types::status::DriverStatus;
 use spin::Mutex;
 use spin::Once;
@@ -481,18 +481,18 @@ fn frames_cover_buffer(
         return false;
     };
 
-    if frame_offset >= first.byte_len as usize {
+    if frame_offset >= first.len() as usize {
         return false;
     }
 
-    let mut available = (first.byte_len as usize).saturating_sub(frame_offset);
+    let mut available = (first.len() as usize).saturating_sub(frame_offset);
 
     for frame in &frames[1..] {
         if available >= buffer_len {
             return true;
         }
 
-        available = available.saturating_add(frame.byte_len as usize);
+        available = available.saturating_add(frame.len() as usize);
     }
 
     available >= buffer_len
@@ -564,12 +564,12 @@ where
             return Ok(());
         }
 
-        if offset >= frame.byte_len {
+        if offset >= frame.len() {
             return Err(DmaMapError::InvalidSize);
         }
 
-        let start = frame.phys_addr + offset;
-        let bytes = remaining.min((frame.byte_len - offset) as usize);
+        let start = frame.physical_address() + offset;
+        let bytes = remaining.min((frame.len() - offset) as usize);
         let device_page_size_u64 = device_page_size as u64;
         let page_base = align_down_u64(start, device_page_size_u64);
         let page_end = align_up_u64(start + bytes as u64, device_page_size_u64)?;

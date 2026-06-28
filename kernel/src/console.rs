@@ -1,4 +1,4 @@
-use crate::util::boot_info;
+use crate::util::take_framebuffer;
 use core::fmt;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -145,15 +145,13 @@ pub struct Screen {
 
 impl Screen {
     pub fn clear_framebuffer() {
-        let boot = boot_info();
-        if let Some(fb) = boot.framebuffer.as_mut() {
-            fb.buffer_mut().fill(0);
+        if let Some(mut console) = CONSOLE.try_lock() {
+            console.screen.buffer_start.fill(0);
         }
     }
 
     pub fn new() -> Option<Self> {
-        let boot = boot_info();
-        let fb = boot.framebuffer.as_mut()?;
+        let mut fb = take_framebuffer()?;
         let info = fb.info();
 
         let mut red_offset = 0usize;
@@ -191,6 +189,9 @@ impl Screen {
         let stride = info.stride as usize;
         let bpp = info.bytes_per_pixel as usize;
 
+        let buffer_start = unsafe { fb.into_buffer_mut() };
+        buffer_start.fill(0);
+
         Some(Self {
             width,
             height,
@@ -198,7 +199,7 @@ impl Screen {
             bytes_per_pixel: bpp,
             total_size: info.byte_len as usize,
             pixel_format: info.pixel_format,
-            buffer_start: fb.buffer_mut(),
+            buffer_start,
             red_offset,
             green_offset,
             blue_offset,

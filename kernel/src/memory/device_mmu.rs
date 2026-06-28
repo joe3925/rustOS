@@ -216,7 +216,7 @@ impl DeviceMmuDomain {
         }
         drop(cache);
 
-        self.iova_tracker.dealloc(base, size);
+        unsafe { self.iova_tracker.dealloc(base, size) };
     }
 }
 

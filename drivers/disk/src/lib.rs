@@ -387,7 +387,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
                 if blob.len() < size_of::<DiskInfo>() {
                     return None;
                 }
-                Some(unsafe { *(blob.as_ptr() as *const DiskInfo) })
+                Some(unsafe { core::ptr::read_unaligned(blob.as_ptr().cast::<DiskInfo>()) })
             });
     }
 

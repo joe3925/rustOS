@@ -126,7 +126,11 @@ impl KernelFrameAllocator {
     }
 
     /// Frees a mapping frame range allocated by `allocate_mapping_frame`.
-    pub fn free_mapping_frame(base: PhysAddr, size: MappingSize) {
+    ///
+    /// # Safety
+    /// The frame range must be owned by the caller, no longer mapped or
+    /// referenced, and freed exactly once.
+    pub unsafe fn free_mapping_frame(base: PhysAddr, size: MappingSize) {
         if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
             free_mapping_frame_runtime(runtime, base, size);
             return;
@@ -136,7 +140,11 @@ impl KernelFrameAllocator {
     }
 
     /// Releases an already-reserved mapping frame range back to the allocator.
-    pub fn release_reserved_mapping_frame(base: PhysAddr, size: MappingSize) {
+    ///
+    /// # Safety
+    /// The frame range must be reserved, owned by the caller, unused, and
+    /// released exactly once.
+    pub unsafe fn release_reserved_mapping_frame(base: PhysAddr, size: MappingSize) {
         if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
             release_reserved_mapping_frame_runtime(runtime, base, size);
             return;
@@ -164,12 +172,14 @@ impl PageTableFrameAllocator for KernelPageTableFrameAllocator {
     }
 
     fn free_page_table_frame(&mut self, phys: PhysAddr) {
-        KernelFrameAllocator::free_mapping_frame(
-            phys,
-            MappingSize {
-                bytes: cached_frame_size(),
-            },
-        );
+        unsafe {
+            KernelFrameAllocator::free_mapping_frame(
+                phys,
+                MappingSize {
+                    bytes: cached_frame_size(),
+                },
+            )
+        };
     }
 }
 
@@ -336,7 +346,7 @@ fn allocate_base_frame_runtime(runtime: &RuntimeFrameBitmap) -> Option<PhysAddr>
     let frame_size = cached_frame_size();
 
     let Some(phys) = checked_frame_phys(frame, frame_size) else {
-        runtime.free_frame(frame);
+        unsafe { runtime.free_frame(frame) };
         return None;
     };
 
@@ -354,7 +364,7 @@ fn allocate_contiguous_frames_aligned_runtime(
     let frame_size = cached_frame_size();
 
     let Some(phys) = checked_frame_phys(start, frame_size) else {
-        runtime.free_contiguous_frames(start, frame_count);
+        unsafe { runtime.free_contiguous_frames(start, frame_count) };
         return None;
     };
 
@@ -386,7 +396,7 @@ fn free_mapping_frame_runtime(runtime: &RuntimeFrameBitmap, base: PhysAddr, size
         return;
     }
 
-    runtime.free_contiguous_frames(base_idx, len);
+    unsafe { runtime.free_contiguous_frames(base_idx, len) };
 
     USED_MEMORY_BYTES.fetch_sub(
         len.saturating_mul(cached_frame_size() as usize),
@@ -432,7 +442,7 @@ fn release_reserved_mapping_frame_runtime(
         }
     }
 
-    runtime.free_contiguous_frames(base_idx, len);
+    unsafe { runtime.free_contiguous_frames(base_idx, len) };
 }
 
 fn allocate_base_frame_boot() -> Option<PhysAddr> {

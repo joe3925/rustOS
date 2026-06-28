@@ -290,7 +290,7 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
         let prt_copy = prt_arc.clone();
 
         joins.push(spawn_blocking(move || {
-            let mut devices = scan_ecam_bus_mapped(&seg_copy, bus, bus_base);
+            let mut devices = unsafe { scan_ecam_bus_mapped(&seg_copy, bus, bus_base) };
 
             if !prt_copy.is_empty() {
                 for p in devices.iter_mut() {
@@ -308,7 +308,7 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
     }
 
     for m in unmaps {
-        let _ = unmap_mmio_region(m.base, m.size);
+        let _ = unsafe { unmap_mmio_region(m.base, m.size) };
     }
     DriverStatus::Success
 }

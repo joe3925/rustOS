@@ -30,7 +30,7 @@ pub unsafe fn map_leaf<A: PageTableFrameAllocator>(
         .recursive_index
         .into_option()
         .ok_or(PageMapError::NoMemoryMap())?;
-    let mut mapper = init_mapper(recursive_index);
+    let mut mapper = unsafe { init_mapper(recursive_index) };
     let mut table_allocator = X86PageTableFrameAllocator { inner: allocator };
     let flags = page_flags_to_x86(flags, cache) | PageTableFlags::PRESENT;
     let virt = X86VirtAddr::new(virt.as_u64());
@@ -86,7 +86,7 @@ pub unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
         .recursive_index
         .into_option()
         .ok_or(PageMapError::NoMemoryMap())?;
-    let mut mapper = init_mapper(recursive_index);
+    let mut mapper = unsafe { init_mapper(recursive_index) };
     let virt = X86VirtAddr::new(virt.as_u64());
 
     match size.bytes {
@@ -207,15 +207,15 @@ where
             let phys = frame.start_address();
             let abi = PhysAddr::new(phys.as_u64());
             match disposition {
-                UnmapFrameDisposition::FreeMappedFrame => {
+                UnmapFrameDisposition::FreeMappedFrame => unsafe {
                     KernelFrameAllocator::free_mapping_frame(abi, MappingSize { bytes: S::SIZE })
-                }
-                UnmapFrameDisposition::ReleaseReservedFrame => {
+                },
+                UnmapFrameDisposition::ReleaseReservedFrame => unsafe {
                     KernelFrameAllocator::release_reserved_mapping_frame(
                         abi,
                         MappingSize { bytes: S::SIZE },
                     )
-                }
+                },
                 UnmapFrameDisposition::KeepFrame => {}
             }
             Ok(Some(abi))

@@ -221,7 +221,7 @@ impl ContiguousDmaRegion {
             unmap_range(self.base_va, self.alloc_bytes as u64);
         }
 
-        deallocate_kernel_range(self.base_va, self.alloc_bytes as u64);
+        unsafe { deallocate_kernel_range(self.base_va, self.alloc_bytes as u64) };
 
         self.base_va = VirtAddr::new(0);
         self.alloc_bytes = 0;

@@ -640,7 +640,7 @@ impl PnpManager {
             return None;
         }
 
-        let Some(cb) = drv.evt_device_add else {
+        let Some(cb) = *drv.evt_device_add.read() else {
             return None;
         };
 

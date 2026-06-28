@@ -6,8 +6,8 @@ use kernel_types::runtime::BlockOnThreadState;
 pub type KernelTls = <ActivePlatform as TaskPlatform>::KernelTls;
 
 #[inline(always)]
-pub fn activate(thread_pointer: u64) {
-    platform::activate_kernel_tls(thread_pointer);
+pub(crate) unsafe fn activate(thread_pointer: u64) {
+    unsafe { platform::activate_kernel_tls(thread_pointer) };
 }
 
 #[inline(always)]

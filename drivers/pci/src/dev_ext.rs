@@ -165,7 +165,7 @@ fn function_base(bus_base: VirtAddr, dev: u8, func: u8) -> VirtAddr {
 
 #[inline]
 unsafe fn unmap_cfg_page(va: VirtAddr, size: u64) {
-    let _ = unmap_mmio_region(va, size);
+    let _ = unsafe { unmap_mmio_region(va, size) };
 }
 
 #[inline]
@@ -384,7 +384,11 @@ fn probe_function_mapped(
     })
 }
 
-pub fn scan_ecam_bus_mapped(seg: &McfgSegment, bus: u8, bus_base: VirtAddr) -> Vec<PciPdoExt> {
+pub(crate) unsafe fn scan_ecam_bus_mapped(
+    seg: &McfgSegment,
+    bus: u8,
+    bus_base: VirtAddr,
+) -> Vec<PciPdoExt> {
     let mut out = Vec::new();
 
     for dev in 0u8..32 {
@@ -410,7 +414,7 @@ pub fn scan_ecam_bus_mapped(seg: &McfgSegment, bus: u8, bus_base: VirtAddr) -> V
 
 pub fn scan_ecam_bus(seg: &McfgSegment, bus: u8) -> Result<Vec<PciPdoExt>, PageMapError> {
     let (bus_base, sz) = map_ecam_bus(seg, bus)?;
-    let out = scan_ecam_bus_mapped(seg, bus, bus_base);
+    let out = unsafe { scan_ecam_bus_mapped(seg, bus, bus_base) };
     unsafe { unmap_cfg_page(bus_base, sz) };
     Ok(out)
 }

@@ -23,7 +23,10 @@ use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
-use crate::{println, ActiveBootInfo, BOOT_INFO, BOOT_INFO_INITIALIZED};
+use crate::{
+    println, ActiveBootInfo, BOOT_FRAMEBUFFER, BOOT_FRAMEBUFFER_AVAILABLE, BOOT_FRAMEBUFFER_TAKEN,
+    BOOT_INFO, BOOT_INFO_INITIALIZED,
+};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -33,6 +36,7 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use kernel_abi::FrameBuffer;
 use kernel_executor::global_async::GlobalAsyncExecutor;
 use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_types::arch::VirtAddr;
@@ -334,12 +338,29 @@ pub extern "C" fn random_number() -> u64 {
     rng.next_u64()
 }
 
-pub fn boot_info() -> &'static mut ActiveBootInfo {
+pub fn boot_info() -> &'static ActiveBootInfo {
     if !BOOT_INFO_INITIALIZED.load(Ordering::Acquire) {
         panic!("BOOT_INFO not initialized");
     }
 
-    unsafe { &mut BOOT_INFO }
+    unsafe { &*core::ptr::addr_of!(BOOT_INFO) }
+}
+
+pub(crate) fn take_framebuffer() -> Option<FrameBuffer> {
+    if !BOOT_INFO_INITIALIZED.load(Ordering::Acquire)
+        || !BOOT_FRAMEBUFFER_AVAILABLE.load(Ordering::Acquire)
+        || BOOT_FRAMEBUFFER_TAKEN.swap(true, Ordering::AcqRel)
+    {
+        return None;
+    }
+
+    unsafe {
+        Some(
+            core::ptr::addr_of_mut!(BOOT_FRAMEBUFFER)
+                .read()
+                .assume_init(),
+        )
+    }
 }
 
 fn reclaim_kernel_stub() {

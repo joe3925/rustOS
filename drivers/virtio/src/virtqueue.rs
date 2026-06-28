@@ -52,7 +52,11 @@ fn align_up(v: u64, align: u64) -> u64 {
 impl Virtqueue {
     /// Allocate and initialise a split virtqueue.
     /// Writes the physical addresses into the device via common_cfg.
-    pub fn new(queue_idx: u16, common_cfg: VirtAddr, device: &Arc<DeviceObject>) -> Option<Self> {
+    pub(crate) unsafe fn new(
+        queue_idx: u16,
+        common_cfg: VirtAddr,
+        device: &Arc<DeviceObject>,
+    ) -> Option<Self> {
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, queue_idx) };
 
         let max_size = unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_SIZE) };
@@ -132,7 +136,7 @@ impl Virtqueue {
     }
 
     /// Enable the queue after all configuration (including MSI-X vector) is set.
-    pub fn enable(&self, common_cfg: VirtAddr) {
+    pub(crate) unsafe fn enable(&self, common_cfg: VirtAddr) {
         unsafe {
             pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, self.idx);
             pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_ENABLE, 1);
@@ -153,7 +157,12 @@ impl Virtqueue {
         Some(idx)
     }
 
-    pub fn push_allocated_indirect(&mut self, head: u16, table_addr: u64, table_len: u32) {
+    pub(crate) unsafe fn push_allocated_indirect(
+        &mut self,
+        head: u16,
+        table_addr: u64,
+        table_len: u32,
+    ) {
         let desc = self.desc_ptr(head);
         unsafe {
             (*desc).addr = table_addr;
@@ -192,7 +201,7 @@ impl Virtqueue {
 
     /// Push a chain of buffers into the virtqueue.
     /// Returns the head descriptor index of the chain.
-    pub fn push_chain(&mut self, bufs: &[(PhysAddr, u32, u16)]) -> Option<u16> {
+    pub(crate) unsafe fn push_chain(&mut self, bufs: &[(PhysAddr, u32, u16)]) -> Option<u16> {
         if unlikely(bufs.is_empty() || bufs.len() as u16 > self.num_free) {
             cold_path();
             return None;
@@ -239,7 +248,11 @@ impl Virtqueue {
 
     /// Push a single indirect descriptor table into the virtqueue.
     /// Returns the head descriptor index.
-    pub fn push_indirect(&mut self, table_phys: PhysAddr, table_len: u32) -> Option<u16> {
+    pub(crate) unsafe fn push_indirect(
+        &mut self,
+        table_phys: PhysAddr,
+        table_len: u32,
+    ) -> Option<u16> {
         let head = self.alloc_desc()?;
         let desc = self.desc_ptr(head);
         unsafe {
@@ -266,7 +279,7 @@ impl Virtqueue {
     }
 
     /// Write to the device's notify register to kick the queue.
-    pub fn notify(&self, notify_base: VirtAddr, notify_off_multiplier: u32) {
+    pub(crate) unsafe fn notify(&self, notify_base: VirtAddr, notify_off_multiplier: u32) {
         let offset = self.queue_notify_off as u64 * notify_off_multiplier as u64;
         let addr = (notify_base.as_u64() + offset) as *mut u16;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);

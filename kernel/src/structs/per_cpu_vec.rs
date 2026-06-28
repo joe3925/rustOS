@@ -5,8 +5,8 @@ use crate::platform;
 
 /// Per-CPU storage backed by a Vec.
 ///
-/// Safe because `.get()` uses the current platform CPU id so each CPU only accesses its own slot.
-/// No locks needed for per-CPU access after initialization.
+/// Access is unsafe because callers must prevent CPU migration and must ensure
+/// initialization or resizing cannot race outstanding references.
 pub struct PerCpuVec<T> {
     data: UnsafeCell<Vec<T>>,
 }
@@ -22,7 +22,9 @@ impl<T> PerCpuVec<T> {
     }
 
     /// Initialize storage for n CPUs. Must be called before any get() calls.
-    pub fn init(&self, n: usize, f: impl Fn() -> T) {
+    /// # Safety
+    /// No references into this storage may exist while it is initialized.
+    pub unsafe fn init(&self, n: usize, f: impl Fn() -> T) {
         let v = unsafe { &mut *self.data.get() };
         v.clear();
         for _ in 0..n {
@@ -32,27 +34,38 @@ impl<T> PerCpuVec<T> {
 
     /// Get reference to current CPU's slot.
     #[inline]
-    pub fn get(&self) -> &T {
+    /// # Safety
+    /// Storage must be initialized and the caller must remain on the current
+    /// CPU for the lifetime of the returned reference.
+    pub unsafe fn get(&self) -> &T {
         let id = platform::current_cpu_id();
         unsafe { &(&*self.data.get())[id] }
     }
 
     /// Get mutable reference to current CPU's slot
     #[inline]
-    pub fn get_mut(&self) -> &mut T {
+    /// # Safety
+    /// In addition to `get`'s requirements, this CPU's slot must not already be
+    /// borrowed.
+    pub unsafe fn get_mut(&self) -> &mut T {
         let id = platform::current_cpu_id();
         unsafe { &mut (&mut *self.data.get())[id] }
     }
 
     /// Get by explicit platform CPU ID.
     #[inline]
-    pub fn get_by_id(&self, id: usize) -> &T {
+    /// # Safety
+    /// The selected CPU slot must be initialized and cannot be mutated for the
+    /// lifetime of the returned reference.
+    pub unsafe fn get_by_id(&self, id: usize) -> &T {
         unsafe { &(&*self.data.get())[id] }
     }
 
     /// Get mutable reference by explicit ID
     #[inline]
-    pub fn get_mut_by_id(&self, id: usize) -> &mut T {
+    /// # Safety
+    /// The caller must have exclusive access to the selected CPU slot.
+    pub unsafe fn get_mut_by_id(&self, id: usize) -> &mut T {
         unsafe { &mut (&mut *self.data.get())[id] }
     }
 
@@ -63,7 +76,10 @@ impl<T> PerCpuVec<T> {
 
     /// Set value at explicit ID, growing the vec if necessary.
     /// Useful for cases where IDs may not be sequential or pre-initialized.
-    pub fn set_by_id(&self, id: usize, value: T, default: impl Fn() -> T) {
+    /// # Safety
+    /// No references into this storage may exist if this operation can replace
+    /// an element or reallocate the backing vector.
+    pub unsafe fn set_by_id(&self, id: usize, value: T, default: impl Fn() -> T) {
         let v = unsafe { &mut *self.data.get() };
         if id >= v.len() {
             v.resize_with(id + 1, default);

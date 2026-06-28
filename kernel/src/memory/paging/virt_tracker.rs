@@ -64,9 +64,12 @@ pub fn allocate_kernel_range(base: u64, size: u64) -> Result<VirtAddr, RangeAllo
     Ok(addr.into())
 }
 
-pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
+/// # Safety
+/// The range must currently be allocated in the kernel range tracker and must
+/// be released exactly once after all uses have ended.
+pub unsafe fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     debug_assert_eq!(addr.as_u64() % base_page_size(), 0);
     if let Some(aligned_size) = align_up_to_base_page(size) {
-        KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), aligned_size);
+        unsafe { KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), aligned_size) };
     }
 }

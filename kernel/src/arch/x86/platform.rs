@@ -576,7 +576,7 @@ impl TaskPlatform for X86Platform {
             *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
         }
 
-        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
+        let selectors = unsafe { gdt.selectors_per_cpu.get_by_id(platform_cpu_id) };
         state.cs = selectors.user_code_selector.0 as u64 | 3;
         state.ss = selectors.user_data_selector.0 as u64 | 3;
         state
@@ -599,7 +599,7 @@ impl TaskPlatform for X86Platform {
             *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
         }
 
-        let selectors = gdt.selectors_per_cpu.get_by_id(platform_cpu_id);
+        let selectors = unsafe { gdt.selectors_per_cpu.get_by_id(platform_cpu_id) };
         state.cs = selectors.kernel_code_selector.0 as u64;
         state.ss = selectors.kernel_data_selector.0 as u64;
         state
@@ -630,8 +630,8 @@ impl TaskPlatform for X86Platform {
         tls.thread_pointer()
     }
 
-    fn activate_kernel_tls(thread_pointer: u64) {
-        super::scheduling::tls::activate(thread_pointer);
+    unsafe fn activate_kernel_tls(thread_pointer: u64) {
+        unsafe { super::scheduling::tls::activate(thread_pointer) };
     }
 
     fn ensure_current_thread_runtime_initialized() {

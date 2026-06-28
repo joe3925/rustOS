@@ -24,7 +24,7 @@ pub fn allocate_auto_kernel_range_mapped(
     let addr = allocate_auto_kernel_range(aligned_size).ok_or(PageMapError::NoMemory())?;
 
     if let Err(err) = unsafe { map_range(addr, aligned_size, flags, false) } {
-        deallocate_kernel_range(addr, aligned_size);
+        unsafe { deallocate_kernel_range(addr, aligned_size) };
         return Err(err);
     }
 
@@ -61,13 +61,15 @@ pub fn allocate_auto_kernel_range_mapped_contiguous(
             LocalTlbFlush::Flush,
         )
     } {
-        KernelFrameAllocator::release_reserved_mapping_frame(
-            phys_base,
-            MappingSize {
-                bytes: aligned_size,
-            },
-        );
-        deallocate_kernel_range(addr, aligned_size);
+        unsafe {
+            KernelFrameAllocator::release_reserved_mapping_frame(
+                phys_base,
+                MappingSize {
+                    bytes: aligned_size,
+                },
+            );
+            deallocate_kernel_range(addr, aligned_size);
+        }
         return Err(err);
     }
 
@@ -83,7 +85,7 @@ pub fn allocate_kernel_range_mapped(
     let addr = allocate_kernel_range(base, aligned_size).map_err(|_| PageMapError::NoMemory())?;
 
     if let Err(err) = unsafe { map_range(addr, aligned_size, flags, false) } {
-        deallocate_kernel_range(addr, aligned_size);
+        unsafe { deallocate_kernel_range(addr, aligned_size) };
         return Err(err);
     }
 
@@ -300,8 +302,11 @@ pub unsafe fn map_allocated_range(
     }
 }
 
-pub fn unmap_range(addr: VirtAddr, size: u64) {
-    deallocate_kernel_range(addr, size);
+/// # Safety
+/// `addr..addr + size` must be a live kernel mapping owned by the caller and
+/// no references into it may survive this call.
+pub unsafe fn unmap_range(addr: VirtAddr, size: u64) {
+    unsafe { deallocate_kernel_range(addr, size) };
     unsafe {
         unmap_range_with_disposition(addr, size, UnmapFrameDisposition::FreeMappedFrame);
     }

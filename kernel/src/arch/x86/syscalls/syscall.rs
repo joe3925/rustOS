@@ -15,7 +15,7 @@ pub fn syscall_init() {
     unsafe { Efer::update(|e| e.set(EferFlags::SYSTEM_CALL_EXTENSIONS, true)) };
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
     let id = get_current_logical_id() as usize;
-    let selectors = gdt.selectors_per_cpu.get_by_id(id);
+    let selectors = unsafe { gdt.selectors_per_cpu.get_by_id(id) };
     let kernel_cs = selectors.kernel_code_selector;
     let kernel_ss = selectors.kernel_data_selector;
     let user_cs = selectors.user_code_selector;

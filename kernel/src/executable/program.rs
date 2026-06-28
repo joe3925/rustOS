@@ -331,7 +331,7 @@ impl Program {
 
         let _guard = self.page_table_lock.lock();
 
-        self.tracker.dealloc(start, size);
+        unsafe { self.tracker.dealloc(start, size) };
 
         let old_address_space_root = crate::memory::paging::current_address_space_root();
 

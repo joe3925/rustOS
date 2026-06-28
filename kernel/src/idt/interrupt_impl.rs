@@ -130,7 +130,7 @@ impl IrqHandleOps for IrqHandleInner {
                 continue;
             };
 
-            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::closed()) {
+            if let Some(waker) = unsafe { slot.complete_claimed(ticket, IrqWaitResult::closed()) } {
                 waker.wake_by_ref();
             }
         }
@@ -154,7 +154,9 @@ impl IrqHandleOps for IrqHandleInner {
                 continue;
             };
 
-            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) {
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
                 waker.wake_by_ref();
             }
 
@@ -197,7 +199,9 @@ impl IrqHandleOps for IrqHandleInner {
                 continue;
             };
 
-            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) {
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
                 waker.wake_by_ref();
             }
 
@@ -230,7 +234,9 @@ impl IrqHandleOps for IrqHandleInner {
                 continue;
             };
 
-            if let Some(waker) = slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) {
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
                 waker.wake_by_ref();
             }
 
@@ -346,8 +352,10 @@ fn poll_slot(handle: &IrqHandleInner, slot_index: usize, cx: &Context<'_>) -> Po
         _ => return Poll::Ready(IrqWaitResult::rescue()),
     }
 
-    slot.set_preparing();
-    slot.set_waker_exclusive(cx.waker());
+    unsafe {
+        slot.set_preparing();
+        slot.set_waker_exclusive(cx.waker());
+    }
 
     if handle.is_closed() {
         slot.cancel();
@@ -361,7 +369,7 @@ fn poll_slot(handle: &IrqHandleInner, slot_index: usize, cx: &Context<'_>) -> Po
 
     let phase_before = handle.signal_phase.load(Ordering::Acquire);
     let ticket = next_waiter_ticket(handle);
-    slot.publish(ticket);
+    unsafe { slot.publish(ticket) };
     let phase_after = handle.signal_phase.load(Ordering::Acquire);
 
     if phase_before != phase_after

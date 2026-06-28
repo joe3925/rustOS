@@ -500,13 +500,19 @@ impl WaiterSlot {
     }
 
     #[inline]
-    pub fn set_preparing(&self) {
+    /// # Safety
+    /// The caller must exclusively own this slot and ensure no signaler is
+    /// concurrently accessing its result or waker storage.
+    pub unsafe fn set_preparing(&self) {
         self.word
             .store(waiter_word(WAITER_PREPARING, 0), Ordering::Release);
     }
 
     #[inline]
-    pub fn publish(&self, ticket: usize) {
+    /// # Safety
+    /// The caller must have exclusively initialized this slot's waker and the
+    /// nonzero ticket must identify the registered wait operation.
+    pub unsafe fn publish(&self, ticket: usize) {
         self.word
             .store(waiter_word(WAITER_WAITING, ticket), Ordering::Release);
     }
@@ -555,7 +561,10 @@ impl WaiterSlot {
     }
 
     #[inline]
-    pub fn complete_claimed(&self, ticket: usize, result: IrqWaitResult) -> Option<Waker> {
+    /// # Safety
+    /// The caller must have transitioned this exact ticket from WAITING to
+    /// CLAIMED and must be the only signaler completing it.
+    pub unsafe fn complete_claimed(&self, ticket: usize, result: IrqWaitResult) -> Option<Waker> {
         unsafe {
             (*self.result.get()).write(result);
         }
@@ -566,7 +575,7 @@ impl WaiterSlot {
             .store(waiter_word(WAITER_SIGNALED, ticket), Ordering::Release);
 
         if self.abandoned.swap(false, Ordering::AcqRel) {
-            self.cleanup_signaled(ticket);
+            unsafe { self.cleanup_signaled(ticket) };
             return None;
         }
 
@@ -574,7 +583,7 @@ impl WaiterSlot {
     }
 
     #[inline]
-    pub fn cleanup_signaled(&self, ticket: usize) {
+    unsafe fn cleanup_signaled(&self, ticket: usize) {
         if self
             .word
             .compare_exchange(
@@ -637,14 +646,16 @@ impl WaiterSlot {
     }
 
     #[inline]
-    pub fn set_waker_exclusive(&self, waker: &Waker) {
+    /// # Safety
+    /// The caller must exclusively own a PREPARING slot.
+    pub unsafe fn set_waker_exclusive(&self, waker: &Waker) {
         unsafe {
             *self.waker.get() = Some(waker.clone());
         }
     }
 
     #[inline]
-    pub fn clear_waker_exclusive(&self) {
+    unsafe fn clear_waker_exclusive(&self) {
         unsafe {
             let _ = (*self.waker.get()).take();
         }
@@ -659,7 +670,7 @@ impl WaiterSlot {
                 WAITER_FREE => return,
 
                 WAITER_PREPARING => {
-                    self.clear_waker_exclusive();
+                    unsafe { self.clear_waker_exclusive() };
                     self.word
                         .store(waiter_word(WAITER_FREE, 0), Ordering::Release);
                     return;
@@ -679,7 +690,7 @@ impl WaiterSlot {
                         continue;
                     }
 
-                    self.clear_waker_exclusive();
+                    unsafe { self.clear_waker_exclusive() };
                     self.word
                         .store(waiter_word(WAITER_FREE, 0), Ordering::Release);
                     return;
@@ -691,7 +702,7 @@ impl WaiterSlot {
                     let after = self.word.load(Ordering::Acquire);
 
                     if waiter_state(after) == WAITER_SIGNALED {
-                        self.cleanup_signaled(waiter_ticket(after));
+                        unsafe { self.cleanup_signaled(waiter_ticket(after)) };
                     }
 
                     return;
@@ -699,7 +710,7 @@ impl WaiterSlot {
 
                 WAITER_SIGNALED => {
                     self.abandoned.store(true, Ordering::Release);
-                    self.cleanup_signaled(waiter_ticket(word));
+                    unsafe { self.cleanup_signaled(waiter_ticket(word)) };
                     return;
                 }
 

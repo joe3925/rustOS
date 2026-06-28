@@ -266,7 +266,7 @@ impl TaskSlab {
     }
 
     #[inline]
-    pub fn get_slot(
+    pub(crate) fn get_slot(
         &self,
         shard_idx: usize,
         local_idx: usize,
@@ -275,11 +275,16 @@ impl TaskSlab {
         Self::get_slot_in(&self.shards, shard_idx, local_idx, expected_gen)
     }
 
-    pub fn increment_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) -> bool {
+    pub(crate) fn increment_ref(
+        &self,
+        shard_idx: usize,
+        local_idx: usize,
+        expected_gen: u32,
+    ) -> bool {
         Self::increment_ref_in(&self.shards, shard_idx, local_idx, expected_gen)
     }
 
-    pub fn decrement_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
+    pub(crate) fn decrement_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
         Self::decrement_ref_in(&self.shards, shard_idx, local_idx, expected_gen);
     }
 
@@ -301,7 +306,7 @@ impl TaskSlab {
     }
 
     #[inline]
-    pub fn get_joinable_slot(
+    pub(crate) fn get_joinable_slot(
         &self,
         shard_idx: usize,
         local_idx: usize,
@@ -310,7 +315,7 @@ impl TaskSlab {
         Self::get_slot_in(&self.joinable_shards, shard_idx, local_idx, expected_gen)
     }
 
-    pub fn increment_joinable_ref(
+    pub(crate) fn increment_joinable_ref(
         &self,
         shard_idx: usize,
         local_idx: usize,
@@ -319,7 +324,12 @@ impl TaskSlab {
         Self::increment_ref_in(&self.joinable_shards, shard_idx, local_idx, expected_gen)
     }
 
-    pub fn decrement_joinable_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
+    pub(crate) fn decrement_joinable_ref(
+        &self,
+        shard_idx: usize,
+        local_idx: usize,
+        expected_gen: u32,
+    ) {
         Self::decrement_ref_in(&self.joinable_shards, shard_idx, local_idx, expected_gen);
     }
 
@@ -390,9 +400,9 @@ impl<'a> SlotHandle<'a> {
 
 pub struct JoinableSlotHandle<'a> {
     slab: &'a TaskSlab,
-    pub shard_idx: u8,
-    pub local_idx: u16,
-    pub generation: u32,
+    shard_idx: u8,
+    local_idx: u16,
+    generation: u32,
 }
 
 impl<'a> JoinableSlotHandle<'a> {
@@ -401,8 +411,11 @@ impl<'a> JoinableSlotHandle<'a> {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let shard = &self.slab.joinable_shards[self.shard_idx as usize];
-        if let Some(slot) = shard.get_slot(self.local_idx as usize) {
+        if let Some(slot) = self.slab.get_joinable_slot(
+            self.shard_idx as usize,
+            self.local_idx as usize,
+            self.generation,
+        ) {
             unsafe { slot.init_joinable(future) };
 
             self.slab.increment_joinable_ref(

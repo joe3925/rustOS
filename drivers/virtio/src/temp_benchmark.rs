@@ -126,7 +126,7 @@ impl BenchDmaBuffer {
                     unmap_range(base_va, alloc_bytes as u64);
                 }
 
-                deallocate_kernel_range(base_va, alloc_bytes as u64);
+                unsafe { deallocate_kernel_range(base_va, alloc_bytes as u64) };
                 return Err(DriverStatus::InsufficientResources);
             }
         };
@@ -142,7 +142,7 @@ impl BenchDmaBuffer {
                     unmap_range(base_va, alloc_bytes as u64);
                 }
 
-                deallocate_kernel_range(base_va, alloc_bytes as u64);
+                unsafe { deallocate_kernel_range(base_va, alloc_bytes as u64) };
                 return Err(DriverStatus::InvalidParameter);
             }
         };
@@ -161,7 +161,7 @@ impl BenchDmaBuffer {
                     unmap_range(base_va, alloc_bytes as u64);
                 }
 
-                deallocate_kernel_range(base_va, alloc_bytes as u64);
+                unsafe { deallocate_kernel_range(base_va, alloc_bytes as u64) };
                 return Err(DriverStatus::InsufficientResources);
             }
         };
@@ -202,7 +202,7 @@ impl BenchDmaBuffer {
             unmap_range(self.base_va, self.alloc_bytes as u64);
         }
 
-        deallocate_kernel_range(self.base_va, self.alloc_bytes as u64);
+        unsafe { deallocate_kernel_range(self.base_va, self.alloc_bytes as u64) };
 
         self.base_va = VirtAddr::new(0);
         self.alloc_bytes = 0;
@@ -282,7 +282,7 @@ fn submit_bench_read<'a>(
                 true
             }
             Err(SubmitRequestError::QueueFull) => {
-                vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                unsafe { vq.notify(inner.notify_base, inner.notify_off_multiplier) };
                 false
             }
             Err(SubmitRequestError::TooManyDataSegments) => {

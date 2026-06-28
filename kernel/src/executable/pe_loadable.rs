@@ -207,7 +207,7 @@ impl PELoader {
 
         if need_reloc {
             if preferred_reserved {
-                program.tracker.dealloc(preferred_base, image_size);
+                unsafe { program.tracker.dealloc(preferred_base, image_size) };
             }
 
             let new_base = self.allocate_relocation_base_for_size(&program.tracker, image_size)?;

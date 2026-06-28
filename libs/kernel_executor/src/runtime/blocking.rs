@@ -166,7 +166,7 @@ pub struct BlockingJoin<R> {
 }
 
 impl<R> BlockingJoin<R> {
-    pub fn new(ptr: *const SharedTaskHeader<R>, drop_fn: fn(*const SharedTaskHeader<R>)) -> Self {
+    fn new(ptr: *const SharedTaskHeader<R>, drop_fn: fn(*const SharedTaskHeader<R>)) -> Self {
         Self { ptr, drop_fn }
     }
 }
@@ -207,7 +207,7 @@ impl<R: Send + 'static> Future for BlockingJoin<R> {
     }
 }
 
-pub extern "C" fn blocking_trampoline<F, R>(ctx: usize)
+extern "C" fn blocking_trampoline<F, R>(ctx: usize)
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -342,7 +342,7 @@ mod tests {
 mod loom_tests {
     use super::*;
     use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use crate::sync::{Arc, exhaustive_model};
+    use crate::sync::{exhaustive_model, Arc};
     use core::mem::ManuallyDrop;
     use core::task::{RawWaker, RawWakerVTable, Waker};
 

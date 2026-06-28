@@ -21,7 +21,7 @@ fn device() -> Arc<DeviceObject> {
 }
 
 fn frame(phys_addr: u64) -> IoBufferPageFrame {
-    IoBufferPageFrame::new(phys_addr, TEST_FRAME_SIZE, crate::arch::VirtAddr::new(0))
+    unsafe { IoBufferPageFrame::new(phys_addr, TEST_FRAME_SIZE, crate::arch::VirtAddr::new(0)) }
 }
 
 fn backing_from_frames<'a>(

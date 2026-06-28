@@ -17,13 +17,21 @@ pub fn kernel_cr3() -> PhysFrame<Size4KiB> {
     PhysFrame::containing_address(x86_64::PhysAddr::new(KERNEL_CR3_U64.load(Ordering::SeqCst)))
 }
 
-pub fn init_mapper(recursive_index: u16) -> RecursivePageTable<'static> {
+/// # Safety
+/// `recursive_index` must describe the active recursive page-table mapping and
+/// the caller must prevent concurrent mutable page-table access.
+pub(super) unsafe fn init_mapper(recursive_index: u16) -> RecursivePageTable<'static> {
     let recursive_index = PageTableIndex::new(recursive_index);
-    let level_4_table = get_level4_page_table(recursive_index);
+    let level_4_table = unsafe { get_level4_page_table(recursive_index) };
     unsafe { RecursivePageTable::new_unchecked(level_4_table, recursive_index) }
 }
 
-pub fn get_level4_page_table(recursive_index: PageTableIndex) -> &'static mut PageTable {
+/// # Safety
+/// The recursive mapping must be active and the caller must hold exclusive
+/// access to the level-four table for the returned borrow.
+pub(super) unsafe fn get_level4_page_table(
+    recursive_index: PageTableIndex,
+) -> &'static mut PageTable {
     let virt_addr = recursive_level_4_table_addr(u64::from(recursive_index) as u16);
     unsafe { &mut *virt_addr.as_mut_ptr() }
 }

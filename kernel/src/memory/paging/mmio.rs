@@ -63,14 +63,17 @@ pub fn map_physical_pages_aligned(
             LocalTlbFlush::Flush,
         )
     } {
-        deallocate_kernel_range(virtual_addr, total_size);
+        unsafe { deallocate_kernel_range(virtual_addr, total_size) };
         return Err(err);
     }
 
     Ok(VirtAddr::new(virtual_addr.as_u64() + off))
 }
 
-pub fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+/// # Safety
+/// The range must be an MMIO mapping owned by the caller and must not be used
+/// after this call.
+pub unsafe fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
     if size == 0 {
@@ -85,7 +88,7 @@ pub fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapErro
     unsafe {
         unmap_range_keep_frames_unchecked(start, total);
     }
-    deallocate_kernel_range(start, total);
+    unsafe { deallocate_kernel_range(start, total) };
 
     Ok(())
 }

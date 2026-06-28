@@ -312,23 +312,23 @@ fn build_handoff(
 
     unsafe {
         let parts = BootInfoParts {
-            memory_regions: MemoryRegions {
-                ptr: addr_of_mut!(ABI_MEMORY_REGIONS).cast::<MemoryRegion>(),
-                len: memory_region_count,
-            },
-            kernel_imports: KernelSymbols {
-                ptr: addr_of_mut!(ABI_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
-                len: kernel_import_count,
-            },
-            kernel_exports: KernelSymbols {
-                ptr: addr_of_mut!(ABI_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
-                len: kernel_export_count,
-            },
+            memory_regions: MemoryRegions::from_raw_parts(
+                addr_of_mut!(ABI_MEMORY_REGIONS).cast::<MemoryRegion>(),
+                memory_region_count,
+            ),
+            kernel_imports: KernelSymbols::from_raw_parts(
+                addr_of_mut!(ABI_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
+                kernel_import_count,
+            ),
+            kernel_exports: KernelSymbols::from_raw_parts(
+                addr_of_mut!(ABI_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
+                kernel_export_count,
+            ),
             kernel_text,
-            kernel_sections: KernelSections {
-                ptr: addr_of_mut!(ABI_KERNEL_SECTIONS).cast::<KernelSection>(),
-                len: section_count,
-            },
+            kernel_sections: KernelSections::from_raw_parts(
+                addr_of_mut!(ABI_KERNEL_SECTIONS).cast::<KernelSection>(),
+                section_count,
+            ),
             loaded_kernel: loaded,
             tls_directory,
         };
@@ -542,10 +542,10 @@ fn store_kernel_symbol_string(value: &str) -> Result<KernelSymbolString, &'stati
         copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         ABI_KERNEL_SYMBOL_STRING_LEN = end;
 
-        Ok(KernelSymbolString {
-            ptr: dst.cast_const(),
-            len: bytes.len(),
-        })
+        Ok(KernelSymbolString::from_raw_parts(
+            dst.cast_const(),
+            bytes.len(),
+        ))
     }
 }
 

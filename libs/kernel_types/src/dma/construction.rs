@@ -156,13 +156,15 @@ where
             .try_reserve_exact(1)
             .map_err(|_| IoBufferError::AllocationFailed)?;
 
-        extents.push(IoBufferExtent::new(
-            Some(virt_addr),
-            frame_offset,
-            len,
-            first_frame,
-            frame_count,
-        ));
+        extents.push(unsafe {
+            IoBufferExtent::new(
+                Some(virt_addr),
+                frame_offset,
+                len,
+                first_frame,
+                frame_count,
+            )
+        });
 
         byte_len = byte_len
             .checked_add(len)
@@ -198,13 +200,15 @@ fn build_physical_backing_into(
         .try_reserve_exact(source_frames.len())
         .map_err(|_| IoBufferError::AllocationFailed)?;
 
-    extents.push(IoBufferExtent::new(
-        virtual_addr,
-        frame_offset,
-        byte_len,
-        0,
-        source_frames.len(),
-    ));
+    extents.push(unsafe {
+        IoBufferExtent::new(
+            virtual_addr,
+            frame_offset,
+            byte_len,
+            0,
+            source_frames.len(),
+        )
+    });
 
     frames.extend_from_slice(source_frames);
 
@@ -273,11 +277,13 @@ fn describe_virtual_buffer_to_frames(
             .try_reserve_exact(1)
             .map_err(|_| IoBufferError::AllocationFailed)?;
 
-        frames.push(IoBufferPageFrame::new(
-            translated.phys_addr,
-            translated.byte_len,
-            VirtAddr::new(current_base_va as u64),
-        ));
+        frames.push(unsafe {
+            IoBufferPageFrame::new(
+                translated.phys_addr,
+                translated.byte_len,
+                VirtAddr::new(current_base_va as u64),
+            )
+        });
 
         frame_count += 1;
         let bytes = (byte_len - consumed).min(frame_len - offset);

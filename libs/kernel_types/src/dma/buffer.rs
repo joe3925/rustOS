@@ -43,13 +43,15 @@ impl VirtIoBuffer {
             extents
                 .try_reserve_exact(1)
                 .map_err(|_| IoBufferError::AllocationFailed)?;
-            extents.push(IoBufferExtent::new(
-                Some(self.virt_base),
-                frame_offset,
-                self.len,
-                first_frame,
-                frame_count,
-            ));
+            extents.push(unsafe {
+                IoBufferExtent::new(
+                    Some(self.virt_base),
+                    frame_offset,
+                    self.len,
+                    first_frame,
+                    frame_count,
+                )
+            });
             self.phys = Some(VirtPhys { extents, frames });
         }
         Ok(self
@@ -66,13 +68,15 @@ fn crop_virt_phys(phys: &VirtPhys, start: usize, len: usize) -> VirtPhys {
     for region in IoBufferRegionIter::new(&phys.extents, &phys.frames, start, len) {
         let first_frame = frames.len();
         frames.extend_from_slice(region.page_frames());
-        extents.push(IoBufferExtent::new(
-            region.virtual_address(),
-            region.frame_offset(),
-            region.len(),
-            first_frame,
-            region.page_frames().len(),
-        ));
+        extents.push(unsafe {
+            IoBufferExtent::new(
+                region.virtual_address(),
+                region.frame_offset(),
+                region.len(),
+                first_frame,
+                region.page_frames().len(),
+            )
+        });
     }
 
     VirtPhys { extents, frames }

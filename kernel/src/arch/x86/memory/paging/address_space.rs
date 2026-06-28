@@ -53,7 +53,7 @@ pub fn create_user_root<A: PageTableFrameAllocator>(
         .recursive_index
         .into_option()
         .ok_or(PageMapError::NoMemoryMap())?;
-    let kernel_pml4 = get_level4_page_table(PageTableIndex::new(recursive_index));
+    let kernel_pml4 = unsafe { get_level4_page_table(PageTableIndex::new(recursive_index)) };
     let new_table: &mut PageTable = unsafe { &mut *(root_virt.as_mut_ptr()) };
     new_table.zero();
 
@@ -61,7 +61,9 @@ pub fn create_user_root<A: PageTableFrameAllocator>(
         new_table[idx] = kernel_pml4[idx].clone();
     }
 
-    let _ = crate::memory::paging::unmap_physical_pages(root_virt, size_of::<PageTable>() as u64);
+    let _ = unsafe {
+        crate::memory::paging::unmap_physical_pages(root_virt, size_of::<PageTable>() as u64)
+    };
 
     Ok(PhysFrame::containing_address(PhysAddr::new(
         root_phys.as_u64(),

@@ -225,7 +225,10 @@ impl RuntimeFrameBitmap {
     }
 
     /// Frees one physical frame using only atomic bitmap operations.
-    pub fn free_frame(&self, frame: usize) {
+    ///
+    /// # Safety
+    /// `frame` must be allocated, unused, and freed exactly once.
+    pub unsafe fn free_frame(&self, frame: usize) {
         debug_assert!(frame < self.frames);
 
         if frame >= self.frames {
@@ -256,7 +259,7 @@ impl RuntimeFrameBitmap {
                 }
                 None => {
                     for frame in &out[..allocated] {
-                        self.free_frame(*frame);
+                        unsafe { self.free_frame(*frame) };
                     }
 
                     return None;
@@ -268,9 +271,13 @@ impl RuntimeFrameBitmap {
     }
 
     /// Frees a list of non-contiguous physical frames.
-    pub fn free_frames(&self, frames: &[usize]) {
+    ///
+    /// # Safety
+    /// Every frame must be allocated, unused, unique in `frames`, and freed
+    /// exactly once.
+    pub unsafe fn free_frames(&self, frames: &[usize]) {
         for frame in frames {
-            self.free_frame(*frame);
+            unsafe { self.free_frame(*frame) };
         }
     }
 
@@ -350,7 +357,10 @@ impl RuntimeFrameBitmap {
     }
 
     /// Frees a physically contiguous range of frames.
-    pub fn free_contiguous_frames(&self, start: usize, count: usize) {
+    /// # Safety
+    /// The complete range must be allocated contiguously, unused, and freed
+    /// exactly once.
+    pub unsafe fn free_contiguous_frames(&self, start: usize, count: usize) {
         let Some(end) = start.checked_add(count) else {
             return;
         };

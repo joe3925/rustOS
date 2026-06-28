@@ -1,4 +1,5 @@
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicIsize, Ordering};
 
@@ -12,10 +13,12 @@ pub(crate) struct SendCell<T> {
 
 pub(crate) struct SendRef<'a, T> {
     cell: &'a SendCell<T>,
+    _borrow: PhantomData<&'a T>,
 }
 
 pub(crate) struct SendRefMut<'a, T> {
     cell: &'a SendCell<T>,
+    _borrow: PhantomData<&'a mut T>,
 }
 
 unsafe impl<T: Send> Send for SendCell<T> {}
@@ -36,7 +39,10 @@ impl<T> SendCell<T> {
             .compare_exchange(UNUSED, 1, Ordering::Acquire, Ordering::Relaxed)
             .expect("SendCell already borrowed");
 
-        SendRef { cell: self }
+        SendRef {
+            cell: self,
+            _borrow: PhantomData,
+        }
     }
 
     pub(crate) fn borrow_mut(&self) -> SendRefMut<'_, T> {
@@ -44,7 +50,10 @@ impl<T> SendCell<T> {
             .compare_exchange(UNUSED, WRITING, Ordering::Acquire, Ordering::Relaxed)
             .expect("SendCell already borrowed");
 
-        SendRefMut { cell: self }
+        SendRefMut {
+            cell: self,
+            _borrow: PhantomData,
+        }
     }
 }
 

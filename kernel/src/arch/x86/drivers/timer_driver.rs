@@ -35,7 +35,7 @@ pub struct TimerDebug {
     pub did_sched: bool,
 }
 #[no_mangle]
-pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
+pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -52,9 +52,9 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     bench_submit_interrupt_sample_current_core(unsafe { &*state });
 
     let sw = Stopwatch::start();
-    SCHEDULER.on_timer_tick(state, cpu_id);
+    unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };
     let dt = sw.elapsed_nanos() as usize;
-    TIMER_TIME_SCHED.get().fetch_add(dt, Ordering::Relaxed);
+    unsafe { TIMER_TIME_SCHED.get() }.fetch_add(dt, Ordering::Relaxed);
 }
 
 pub fn set_num_cores(n: usize) {
@@ -62,9 +62,11 @@ pub fn set_num_cores(n: usize) {
     NUM_CORES.store(n, Ordering::Relaxed);
     ROT_TICKET.0.store(0, Ordering::Relaxed);
 
-    TIMER_TIME_SCHED.init(n, || AtomicUsize::new(0));
-    PER_CORE_SWITCHES.init(n, || AtomicUsize::new(0));
-    APIC_TICKS_PER_NS.init(n, || AtomicU64::new(0));
+    unsafe {
+        TIMER_TIME_SCHED.init(n, || AtomicUsize::new(0));
+        PER_CORE_SWITCHES.init(n, || AtomicUsize::new(0));
+        APIC_TICKS_PER_NS.init(n, || AtomicU64::new(0));
+    }
 }
 
 #[unsafe(naked)]

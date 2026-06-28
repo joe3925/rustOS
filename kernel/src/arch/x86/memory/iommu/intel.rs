@@ -520,7 +520,7 @@ fn find_parent_bridge(ecam_base: u64, start_bus: u8, target_bus: u8) -> Option<P
         };
 
         let candidate = scan_bus_for_parent_bridge(bus_va.into(), target_bus);
-        let _ = unmap_physical_pages(bus_va, 1 << 20);
+        let _ = unsafe { unmap_physical_pages(bus_va, 1 << 20) };
 
         if let Some(parent) = candidate {
             if found.is_some() {

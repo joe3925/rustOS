@@ -130,7 +130,7 @@ async fn submit_virtio_no_data_request(
                 }
                 Err(SubmitRequestError::QueueFull) => {
                     cold_path();
-                    vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                    unsafe { vq.notify(inner.notify_base, inner.notify_off_multiplier) };
                     false
                 }
                 Err(SubmitRequestError::TooManyDataSegments) => {
@@ -374,7 +374,7 @@ impl PendingBlockCursor {
 
 #[inline]
 fn notify_queue(inner: &DevExtInner, vq: &crate::virtqueue::Virtqueue) {
-    vq.notify(inner.notify_base, inner.notify_off_multiplier);
+    unsafe { vq.notify(inner.notify_base, inner.notify_off_multiplier) };
 }
 
 async fn yield_once() {

@@ -89,7 +89,10 @@ impl fmt::Debug for KernelTls {
 }
 
 #[inline(always)]
-pub fn activate(tls_array_pointer: u64) {
+/// # Safety
+/// The TLS allocation identified by `tls_array_pointer` must remain live until
+/// another TLS pointer is activated on this CPU.
+pub(crate) unsafe fn activate(tls_array_pointer: u64) {
     unsafe {
         asm!(
             "mov qword ptr gs:[{off}], {tls}",

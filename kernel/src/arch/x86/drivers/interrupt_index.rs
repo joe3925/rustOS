@@ -90,7 +90,7 @@ fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 }
 
 fn unmap_range(addr: VirtAddr, size: u64) {
-    crate::memory::paging::unmap_range(addr.into(), size);
+    unsafe { crate::memory::paging::unmap_range(addr.into(), size) };
 }
 
 extern "C" {
@@ -368,7 +368,10 @@ fn rdmsr(msr: u32) -> u64 {
 }
 
 #[inline(always)]
-pub fn set_gs_bases(percpu: *const PerCpu) {
+/// # Safety
+/// `percpu` must be a stable, initialized per-CPU allocation that remains live
+/// while either GS base can reference it.
+pub(crate) unsafe fn set_gs_bases(percpu: *const PerCpu) {
     let p = percpu as u64;
 
     wrmsr(IA32_GS_BASE, p);
@@ -572,7 +575,7 @@ pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
         (((dec as u128) << 32) / elapsed_ns) as u64
     };
 
-    APIC_TICKS_PER_NS.get().store(q32, Ordering::Relaxed);
+    unsafe { APIC_TICKS_PER_NS.get() }.store(q32, Ordering::Relaxed);
 
     wr(APICOffset::Ticr, saved_ticr);
     wr(APICOffset::LvtT, saved_lvt);
@@ -582,7 +585,7 @@ pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
 
 #[inline]
 pub fn apic_ticr_for_ns(ns: u64) -> u32 {
-    let fp = APIC_TICKS_PER_NS.get().load(Ordering::Relaxed);
+    let fp = unsafe { APIC_TICKS_PER_NS.get() }.load(Ordering::Relaxed);
 
     if fp == 0 || ns == 0 {
         return 0;
@@ -1058,7 +1061,7 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
         (*(ptr as *mut PerCpu)).cpu_id = lapic_id as u64;
         (*(ptr as *mut PerCpu)).tls_array_pointer = 0;
     }
-    set_gs_bases(ptr);
+    unsafe { set_gs_bases(ptr) };
     kernel_types::irq::set_irq_context_query(current_is_in_interrupt);
     kernel_types::irq::set_irq_interrupt_control(
         irq_interrupts_enabled,

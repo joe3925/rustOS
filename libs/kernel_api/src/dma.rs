@@ -497,8 +497,8 @@ fn next_identity_segment_limited(
         return None;
     }
 
-    while *frame_index < frames.len() && *frame_offset >= frames[*frame_index].byte_len as usize {
-        *frame_offset -= frames[*frame_index].byte_len as usize;
+    while *frame_index < frames.len() && *frame_offset >= frames[*frame_index].len() as usize {
+        *frame_offset -= frames[*frame_index].len() as usize;
         *frame_index += 1;
     }
 
@@ -508,8 +508,8 @@ fn next_identity_segment_limited(
 
     let first = frames[*frame_index];
     let start_offset = *frame_offset;
-    let dma_addr = first.phys_addr.checked_add(start_offset as u64)?;
-    let first_available = first.byte_len as usize - start_offset;
+    let dma_addr = first.physical_address().checked_add(start_offset as u64)?;
+    let first_available = first.len() as usize - start_offset;
     let mut byte_len = (*remaining).min(first_available).min(u32::MAX as usize);
 
     *remaining -= byte_len;
@@ -525,11 +525,11 @@ fn next_identity_segment_limited(
         let next = frames[*frame_index];
         let expected = dma_addr.checked_add(byte_len as u64)?;
 
-        if next.phys_addr != expected {
+        if next.physical_address() != expected {
             break;
         }
 
-        let add_len = (*remaining).min(next.byte_len as usize);
+        let add_len = (*remaining).min(next.len() as usize);
         let merged_len = byte_len.checked_add(add_len)?;
 
         if merged_len > u32::MAX as usize {

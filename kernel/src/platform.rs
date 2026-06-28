@@ -190,7 +190,7 @@ pub trait TaskPlatform: CpuPlatform {
 
     fn new_kernel_tls() -> Option<Self::KernelTls>;
     fn kernel_tls_thread_pointer(tls: &Self::KernelTls) -> u64;
-    fn activate_kernel_tls(thread_pointer: u64);
+    unsafe fn activate_kernel_tls(thread_pointer: u64);
     fn ensure_current_thread_runtime_initialized();
     fn current_block_on_thread_state() -> Arc<BlockOnThreadState>;
     fn request_task_yield();
@@ -453,8 +453,8 @@ pub fn kernel_tls_thread_pointer(tls: &<ActivePlatform as TaskPlatform>::KernelT
     <ActivePlatform as TaskPlatform>::kernel_tls_thread_pointer(tls)
 }
 
-pub fn activate_kernel_tls(thread_pointer: u64) {
-    <ActivePlatform as TaskPlatform>::activate_kernel_tls(thread_pointer);
+pub unsafe fn activate_kernel_tls(thread_pointer: u64) {
+    unsafe { <ActivePlatform as TaskPlatform>::activate_kernel_tls(thread_pointer) };
 }
 
 pub fn ensure_current_thread_runtime_initialized() {

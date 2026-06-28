@@ -288,7 +288,7 @@ impl TaskRef {
 
         self.guard_page.store(0, Ordering::Release);
         self.stack_size.store(0, Ordering::Release);
-        deallocate_kernel_stack(VirtAddr::new(stack_top));
+        unsafe { deallocate_kernel_stack(VirtAddr::new(stack_top)) };
     }
 }
 
@@ -463,7 +463,10 @@ impl Task {
         })
     }
 
-    pub fn update_from_context(&mut self, context: *mut State) {
+    /// # Safety
+    /// `context` must point to a live, aligned interrupt state owned by the
+    /// current scheduling operation.
+    pub unsafe fn update_from_context(&mut self, context: *mut State) {
         self.context = unsafe { *context };
     }
 

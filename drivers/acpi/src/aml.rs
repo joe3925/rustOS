@@ -67,7 +67,7 @@ unsafe fn map_phys_window(paddr: usize, bytes: usize) -> (VirtAddr, usize, usize
 
 #[inline]
 unsafe fn unmap_phys_window(va: VirtAddr, size: usize) {
-    let _ = unmap_mmio_region(va, size as u64);
+    let _ = unsafe { unmap_mmio_region(va, size as u64) };
 }
 
 #[inline]

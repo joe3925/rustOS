@@ -111,15 +111,18 @@ pub enum DmaMapError {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoBufferPageFrame {
-    pub phys_addr: u64,
-    pub byte_len: u64,
-    pub cpu_addr: VirtAddr,
+    pub(super) phys_addr: u64,
+    pub(super) byte_len: u64,
+    pub(super) cpu_addr: VirtAddr,
 }
 
 impl IoBufferPageFrame {
-    pub const fn new(phys_addr: u64, byte_len: u64, cpu_addr: VirtAddr) -> Self {
+    /// # Safety
+    /// `cpu_addr`, when nonzero, must map this physical frame for at least
+    /// `byte_len` bytes and remain valid while the descriptor is in use.
+    pub const unsafe fn new(phys_addr: u64, byte_len: u64, cpu_addr: VirtAddr) -> Self {
         Self {
             phys_addr,
             byte_len,
@@ -129,6 +132,18 @@ impl IoBufferPageFrame {
 
     pub fn cpu_address(&self) -> VirtAddr {
         self.cpu_addr
+    }
+
+    pub const fn physical_address(&self) -> u64 {
+        self.phys_addr
+    }
+
+    pub const fn len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.byte_len == 0
     }
 }
 
@@ -141,17 +156,20 @@ pub struct IoBufferDmaSegment {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoBufferExtent {
-    pub virtual_addr: Option<usize>,
-    pub frame_offset: usize,
-    pub byte_len: usize,
-    pub first_frame: usize,
-    pub frame_count: usize,
+    pub(super) virtual_addr: Option<usize>,
+    pub(super) frame_offset: usize,
+    pub(super) byte_len: usize,
+    pub(super) first_frame: usize,
+    pub(super) frame_count: usize,
 }
 
 impl IoBufferExtent {
-    pub const fn new(
+    /// # Safety
+    /// The virtual address, frame range, and offsets must describe the same
+    /// live backing memory without creating overlapping mutable extents.
+    pub const unsafe fn new(
         virtual_addr: Option<usize>,
         frame_offset: usize,
         byte_len: usize,

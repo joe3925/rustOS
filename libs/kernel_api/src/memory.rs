@@ -30,7 +30,10 @@ pub fn map_physical_pages(
     unsafe { kernel_sys::map_physical_pages(phys, size, cache) }
 }
 
-pub fn unmap_physical_pages(virt: VirtAddr, size: u64) -> Result<(), PageMapError> {
+/// # Safety
+/// The range must be a live physical mapping owned by the caller and no users
+/// may retain it after this call.
+pub unsafe fn unmap_physical_pages(virt: VirtAddr, size: u64) -> Result<(), PageMapError> {
     unsafe { kernel_sys::unmap_physical_pages(virt, size) }
 }
 
@@ -38,10 +41,16 @@ pub fn map_mmio_region(base: PhysAddr, size: u64) -> Result<VirtAddr, PageMapErr
     map_physical_pages(base, size, PhysicalMappingCache::Uncached)
 }
 
-pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
-    unmap_physical_pages(base, size)
+/// # Safety
+/// The range must be a live MMIO mapping owned by the caller and no users may
+/// retain it after this call.
+pub unsafe fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+    unsafe { unmap_physical_pages(base, size) }
 }
 
+/// # Safety
+/// The range must be a live mapping owned by the caller and no references may
+/// survive this call.
 pub unsafe fn unmap_range(addr: VirtAddr, size: u64) {
     unsafe {
         kernel_sys::unmap_range(addr, size);
@@ -70,7 +79,10 @@ pub fn allocate_kernel_range_mapped(
     unsafe { kernel_sys::allocate_kernel_range_mapped(base, size, flags) }
 }
 
-pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
+/// # Safety
+/// The range must be owned by the caller, no longer mapped or referenced, and
+/// returned exactly once.
+pub unsafe fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     unsafe { kernel_sys::deallocate_kernel_range(addr, size) }
 }
 

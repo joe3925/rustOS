@@ -380,7 +380,10 @@ impl Scheduler {
     }
 
     #[inline(always)]
-    pub fn on_timer_tick(&self, state: *mut State, cpu_id: usize) -> Option<TaskHandle> {
+    /// # Safety
+    /// `state` must be the live interrupt frame for `cpu_id` and remain valid
+    /// for the duration of this scheduling operation.
+    pub unsafe fn on_timer_tick(&self, state: *mut State, cpu_id: usize) -> Option<TaskHandle> {
         if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return None;
         }
@@ -401,7 +404,7 @@ impl Scheduler {
                     return None;
                 };
 
-                guard.update_from_context(state);
+                unsafe { guard.update_from_context(state) };
 
                 if !Arc::ptr_eq(cur, &core.idle_task) {
                     prev_task = Some(cur.clone());
@@ -628,7 +631,9 @@ impl Scheduler {
             0
         };
 
-        tls::activate(thread_pointer);
+        // SAFETY: kernel tasks retain their KernelTls allocation in TaskInner
+        // for as long as this thread pointer can be scheduled.
+        unsafe { tls::activate(thread_pointer) };
     }
 
     pub fn maybe_balance(&self) {
@@ -669,7 +674,10 @@ impl Scheduler {
     }
 
     #[inline(always)]
-    pub fn on_ipi(&self, state: *mut State, cpu_id: usize) {
+    /// # Safety
+    /// `state` must be the live IPI frame for `cpu_id` and remain valid for the
+    /// duration of this scheduling operation.
+    pub unsafe fn on_ipi(&self, state: *mut State, cpu_id: usize) {
         if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return;
         }
@@ -712,7 +720,7 @@ impl Scheduler {
 }
 
 #[no_mangle]
-pub extern "C" fn ipi_handler_c(state: *mut State) {
+pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -727,11 +735,11 @@ pub extern "C" fn ipi_handler_c(state: *mut State) {
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = platform::current_cpu_id();
 
-    SCHEDULER.on_ipi(state, cpu_id);
+    unsafe { SCHEDULER.on_ipi(state, cpu_id) };
 }
 
 #[no_mangle]
-pub extern "C" fn yield_handler_c(state: *mut State) {
+pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -745,7 +753,7 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
     //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = platform::current_cpu_id();
 
-    SCHEDULER.on_timer_tick(state, cpu_id);
+    unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };
 }
 
 #[no_mangle]

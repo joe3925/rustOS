@@ -149,7 +149,7 @@ struct VirtioPciCap {
 ///
 /// For virtio-pci modern devices, the capabilities are found in PCI config space
 /// starting at the capability pointer (offset 0x34). Each capability is a linked list entry.
-pub fn parse_virtio_caps(
+pub(crate) unsafe fn parse_virtio_caps(
     cfg_base: VirtAddr,
     mapped_bars: &[(u32, VirtAddr, u64)],
 ) -> Option<VirtioPciCaps> {
