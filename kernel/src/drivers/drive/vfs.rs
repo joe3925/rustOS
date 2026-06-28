@@ -10,7 +10,7 @@ use kernel_types::fs::{Path, *};
 use kernel_types::io::IoTarget;
 use kernel_types::request::{
     Fs, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsOperation, FsPayload, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, RequestHandle,
+    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
 };
 use kernel_types::status::{DriverStatus, FileStatus};
 
@@ -159,13 +159,13 @@ impl Vfs {
         O: FsOperation + 'data,
         Fs<'data, O>: kernel_routing::IoRequest,
     {
-        let mut request_handle = RequestHandle::new(Fs::<O> {
+        let mut request_handle = Fs::<O> {
             payload: FsPayload {
                 params,
                 result: None,
                 _marker: PhantomData,
             },
-        });
+        };
         let status = {
             if let Some(tgt) = target {
                 kernel_routing::io::send_down_stack(tgt, &mut request_handle).await
@@ -182,8 +182,6 @@ impl Vfs {
         }
 
         request_handle
-            .get_mut()
-            .body
             .payload
             .result
             .take()

@@ -7,12 +7,12 @@ use crate::io::{
     DeviceControlHandler, DeviceFlush, DeviceOps, DeviceRead, DeviceWrite, TreiberStack,
 };
 use crate::pnp::DriverStep;
-use crate::request::{DeviceControl, Flush, Read, RequestData, RequestHandle, Write};
+use crate::request::{DeviceControl, Flush, IoctlData, Read, Write};
 use crate::status::DriverStatus;
 
 extern "C" fn read_handler(
     _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, Read<'_>>,
+    _request: &mut Read<'_>,
     len: usize,
 ) -> FfiFuture<DriverStep> {
     async move {
@@ -27,7 +27,7 @@ extern "C" fn read_handler(
 
 extern "C" fn write_handler(
     _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, Write<'_>>,
+    _request: &mut Write<'_>,
     _len: usize,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::Continue }.into_ffi()
@@ -35,14 +35,14 @@ extern "C" fn write_handler(
 
 extern "C" fn device_control_handler(
     _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, DeviceControl<'_>>,
+    _request: &mut DeviceControl<'_>,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }
 
 extern "C" fn flush_handler(
     _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, Flush>,
+    _request: &mut Flush,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }
@@ -52,46 +52,46 @@ struct TestRead;
 impl DeviceRead for TestRead {
     const DEPTH: u32 = 1;
 
-    extern "C" fn handler<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        handle: &'b mut RequestHandle<'req, Read<'data>>,
+    extern "C" fn handler<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        request: &'a mut Read<'data>,
     ) -> FfiFuture<DriverStep> {
-        let len = handle.read().body.len;
-        read_handler(dev, handle, len)
+        let len = request.len;
+        read_handler(dev, request, len)
     }
 }
 
 struct TestWrite;
 
 impl DeviceWrite for TestWrite {
-    extern "C" fn handler<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        handle: &'b mut RequestHandle<'req, Write<'data>>,
+    extern "C" fn handler<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        request: &'a mut Write<'data>,
     ) -> FfiFuture<DriverStep> {
-        let len = handle.read().body.len;
-        write_handler(dev, handle, len)
+        let len = request.len;
+        write_handler(dev, request, len)
     }
 }
 
 struct TestFlush;
 
 impl DeviceFlush for TestFlush {
-    extern "C" fn handler<'req, 'b>(
-        dev: &Arc<DeviceObject>,
-        handle: &'b mut RequestHandle<'req, Flush>,
+    extern "C" fn handler<'a>(
+        dev: &'a Arc<DeviceObject>,
+        request: &'a mut Flush,
     ) -> FfiFuture<DriverStep> {
-        flush_handler(dev, handle)
+        flush_handler(dev, request)
     }
 }
 
 struct TestDeviceControl;
 
 impl DeviceControlHandler for TestDeviceControl {
-    extern "C" fn handler<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        handle: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    extern "C" fn handler<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        request: &'a mut DeviceControl<'data>,
     ) -> FfiFuture<DriverStep> {
-        device_control_handler(dev, handle)
+        device_control_handler(dev, request)
     }
 }
 
@@ -135,10 +135,10 @@ fn device_ops_registers_typed_handlers() {
     )
     .unwrap();
     let io_buffer = backing.create_from_device(0, 4).unwrap();
-    let handle = RequestHandle::new(Read::new(0, 4, false, Some(io_buffer)));
-    assert_eq!(handle.read().body.offset, 0);
-    assert_eq!(handle.read().body.len, 4);
+    let request = Read::new(0, 4, false, Some(io_buffer));
+    assert_eq!(request.offset, 0);
+    assert_eq!(request.len, 4);
 
-    let dc = RequestHandle::new(DeviceControl::new(0xCAFE, RequestData::empty()));
-    assert_eq!(dc.read().body.code, 0xCAFE);
+    let dc = DeviceControl::new(0xCAFE, IoctlData::empty());
+    assert_eq!(dc.code, 0xCAFE);
 }

@@ -19,13 +19,12 @@ use kernel_api::{
     kernel_types::{
         dma::{FromDevice, IoBuffer, ToDevice},
         io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo},
-        request::RequestData,
+        request::IoctlData,
     },
     pnp::{
-        DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-        driver_set_evt_device_add, io, pnp,
+        DriverStep, PnpOp, PnpOps, QueryResources, ResourceSet, driver_set_evt_device_add, io, pnp,
     },
-    request::{DeviceControl, Flush, Pnp, Read, RequestHandle, Write},
+    request::{DeviceControl, Flush, Read, Write},
     request_handler,
     status::DriverStatus,
 };
@@ -138,7 +137,7 @@ impl DeviceRead for DiskIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'data>>,
+        req: &'b mut Read<'data>,
     ) -> DriverStep {
         let dx = disk_ext(&dev);
 
@@ -156,13 +155,12 @@ impl DeviceRead for DiskIo {
         }
 
         let (requests, bytes) = {
-            let body = &req.get().body;
+            let body = &req;
 
             match validate_disk_read_chain(body, bs) {
                 Ok(v) => v,
                 Err(st) => {
                     cold_path();
-                    req.get_mut().status = st.clone();
                     return DriverStep::complete(st);
                 }
             }
@@ -180,7 +178,7 @@ impl DeviceWrite for DiskIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'data>>,
+        req: &'b mut Write<'data>,
     ) -> DriverStep {
         let dx = disk_ext(&dev);
 
@@ -198,13 +196,12 @@ impl DeviceWrite for DiskIo {
         }
 
         let (requests, bytes) = {
-            let body = &req.get().body;
+            let body = &req;
 
             match validate_disk_write_chain(body, bs) {
                 Ok(v) => v,
                 Err(st) => {
                     cold_path();
-                    req.get_mut().status = st.clone();
                     return DriverStep::complete(st);
                 }
             }
@@ -219,10 +216,7 @@ impl DeviceWrite for DiskIo {
 }
 impl DeviceFlush for DiskIo {
     #[request_handler]
-    async fn handler<'req, 'b>(
-        _dev: &Arc<DeviceObject>,
-        _req: &'b mut RequestHandle<'req, Flush>,
-    ) -> DriverStep {
+    async fn handler<'req, 'b>(_dev: &Arc<DeviceObject>, _req: &'b mut Flush) -> DriverStep {
         DriverStep::complete(io::send_next_lower(_dev.clone(), _req).await)
     }
 }
@@ -231,21 +225,15 @@ impl DeviceControlHandler for DiskIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+        req: &'b mut DeviceControl<'data>,
     ) -> DriverStep {
-        let code = req.get().body.code;
+        let code = req.code;
 
         match code {
             IOCTL_DRIVE_IDENTIFY => {
-                let mut ch = RequestHandle::new(Pnp {
-                    request: PnpRequest {
-                        minor_function: PnpMinorFunction::QueryResources,
-                        relation: DeviceRelationType::TargetDeviceRelation,
-                        id_type: QueryIdType::CompatibleIds,
-                        ids_out: Vec::new(),
-                        data_out: RequestData::empty(),
-                    },
-                });
+                let mut ch = QueryResources {
+                    resources: ResourceSet::default(),
+                };
 
                 let st = pnp::send_next_lower(dev.clone(), &mut ch).await;
                 if unlikely(st != DriverStatus::Success) {
@@ -253,29 +241,15 @@ impl DeviceControlHandler for DiskIo {
                     return DriverStep::complete(st);
                 }
 
-                let mut info_opt = {
-                    let wr = ch.get_mut();
-                    wr.body.request.data_out.take_exact::<DiskInfo>().ok()
-                };
-                if unlikely(info_opt.is_none()) {
-                    info_opt = ch
-                        .get()
-                        .body
-                        .request
-                        .data_out_ref()
-                        .view::<DiskInfo>()
-                        .copied();
-                }
-
-                let info = match info_opt {
-                    Some(di) => di,
-                    None => {
+                let info = match ch.resources {
+                    ResourceSet::Disk(di) => di,
+                    _ => {
                         cold_path();
                         return DriverStep::complete(DriverStatus::Unsuccessful);
                     }
                 };
 
-                req.get_mut().body.set_data_t::<DiskInfo>(info);
+                req.set_data_t::<DiskInfo>(info);
                 DriverStep::complete(DriverStatus::Success)
             }
             _ => DriverStep::complete(io::send_next_lower(dev.clone(), req).await),
@@ -321,9 +295,9 @@ pub extern "C" fn disk_device_add(
     dev_init.ops.device_control.register::<DiskIo>();
     dev_init.ops.flush.register::<DiskIo>();
 
-    let pnp_vt = PnpVtable::new();
-    pnp_vt.set(PnpMinorFunction::RemoveDevice, disk_pnp_remove);
-    dev_init.pnp_vtable = Some(pnp_vt);
+    let mut pnp_vt = PnpOps::new();
+    pnp_vt.remove_device.set(disk_pnp_remove);
+    dev_init.pnp_ops = Some(pnp_vt);
 
     dev_init.set_dev_ext_default::<DiskExt>();
     DriverStep::complete(DriverStatus::Success)
@@ -332,7 +306,8 @@ pub extern "C" fn disk_device_add(
 #[request_handler]
 async fn disk_pnp_remove<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::RemoveDevice,
 ) -> DriverStep {
     DriverStep::Continue
 }
@@ -343,57 +318,21 @@ fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
 }
 
 async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
-    let mut ch = RequestHandle::new(Pnp {
-        request: PnpRequest {
-            minor_function: PnpMinorFunction::QueryResources,
-            relation: DeviceRelationType::TargetDeviceRelation,
-            id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
-        },
-    });
+    let mut ch = QueryResources {
+        resources: ResourceSet::default(),
+    };
     let st = pnp::send_next_lower(dev.clone(), &mut ch).await;
 
     if unlikely(st != DriverStatus::Success) {
         cold_path();
         return Err(st);
     }
-    if unlikely(ch.get().status != DriverStatus::Success) {
-        cold_path();
-        return Err(ch.get().status.clone());
-    }
-
-    let mut di_opt = {
-        let req = ch.get_mut();
-        req.body.request.data_out.take_exact::<DiskInfo>().ok()
-    };
-
-    if unlikely(di_opt.is_none()) {
-        let req = ch.get();
-        di_opt = req
-            .body
-            .request
-            .data_out_ref()
-            .view::<DiskInfo>()
-            .copied()
-            .or_else(|| {
-                let blob = req
-                    .body
-                    .request
-                    .data_out_ref()
-                    .view::<Vec<u8>>()
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                if blob.len() < size_of::<DiskInfo>() {
-                    return None;
-                }
-                Some(unsafe { core::ptr::read_unaligned(blob.as_ptr().cast::<DiskInfo>()) })
-            });
-    }
-
-    let di = match di_opt {
-        Some(di) => di,
-        None => {
+    let di = match ch.resources {
+        ResourceSet::Disk(di) => di,
+        ResourceSet::Encoded(blob) if blob.len() >= size_of::<DiskInfo>() => unsafe {
+            core::ptr::read_unaligned(blob.as_ptr().cast::<DiskInfo>())
+        },
+        _ => {
             cold_path();
             return Err(DriverStatus::Unsuccessful);
         }

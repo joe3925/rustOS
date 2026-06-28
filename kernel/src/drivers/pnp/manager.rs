@@ -20,9 +20,8 @@ use kernel_types::device::{
 use kernel_types::fs::Path;
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{
-    BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
+    BootType, DeviceIds, DeviceRelationType, DriverStep, QueryDeviceRelations, StartDevice,
 };
-use kernel_types::request::{Pnp, Request, RequestData, RequestHandle};
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
@@ -811,33 +810,18 @@ impl PnpManager {
             );
             let _ = OBJECT_MANAGER.link(alloc::format!("{}\\Top", base), &top_obj);
 
-            let pnp_payload = PnpRequest {
-                minor_function: PnpMinorFunction::StartDevice,
-                relation: DeviceRelationType::TargetDeviceRelation,
-                id_type: QueryIdType::CompatibleIds,
-                ids_out: Vec::new(),
-                data_out: RequestData::empty(),
+            let mut start_request = StartDevice {
+                resources: Vec::new(),
             };
-            let mut start_request = RequestHandle::new(Pnp {
-                request: pnp_payload,
-            });
-
-            let ctx = Arc::into_raw(dn.clone()) as usize;
-            start_request.get_mut().add_completion(Self::start_io, ctx);
-
-            kernel_routing::pnp::send_down_stack(top_device, &mut start_request).await;
+            let status = kernel_routing::pnp::send_down_stack(top_device, &mut start_request).await;
+            Self::finish_start(dn.clone(), status).await;
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
     }
 
-    pub extern "C" fn start_io(req: &mut Request<Pnp<'_>>, context: usize) -> DriverStatus {
-        if context == 0 {
-            return DriverStatus::InvalidParameter;
-        }
-        let dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
-
-        if req.status == DriverStatus::Success {
+    async fn finish_start(dev_node: Arc<DevNode>, status: DriverStatus) {
+        if status == DriverStatus::Success {
             dev_node.set_state(DevNodeState::Started);
 
             if let Some(top_device) = dev_node
@@ -846,47 +830,22 @@ impl PnpManager {
                 .as_ref()
                 .and_then(|s| s.get_top_device_object())
             {
-                let pnp_payload = PnpRequest {
-                    minor_function: PnpMinorFunction::QueryDeviceRelations,
+                let mut bus_enum_request = QueryDeviceRelations {
                     relation: DeviceRelationType::BusRelations,
-                    id_type: QueryIdType::CompatibleIds,
-                    ids_out: Vec::new(),
-                    data_out: RequestData::empty(),
+                    devices: Vec::new(),
                 };
-                let mut bus_enum_request = RequestHandle::new(Pnp {
-                    request: pnp_payload,
-                });
-                let ctx = Arc::into_raw(dev_node.clone()) as usize;
-                bus_enum_request
-                    .get_mut()
-                    .add_completion(Self::process_enumerated_children, ctx);
-
-                spawn_detached(async move {
-                    let mut handle = bus_enum_request;
-                    let _ = &kernel_routing::pnp::send_down_stack(top_device, &mut handle).await;
-                });
+                let status =
+                    kernel_routing::pnp::send_down_stack(top_device, &mut bus_enum_request).await;
+                Self::process_enumerated_children(&dev_node, status);
             }
         } else {
             dev_node.set_state(DevNodeState::Stopped);
         }
-
-        DriverStatus::Success
     }
 
-    pub extern "C" fn process_enumerated_children(
-        req: &mut Request<Pnp<'_>>,
-        context: usize,
-    ) -> DriverStatus {
-        if context == 0 {
-            return DriverStatus::InvalidParameter;
-        }
-        let parent_dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
-
-        if req.status == DriverStatus::NotImplemented {
-            return DriverStatus::NotImplemented;
-        }
-        if req.status != DriverStatus::Success {
-            return req.status.clone();
+    fn process_enumerated_children(parent_dev_node: &Arc<DevNode>, status: DriverStatus) {
+        if status != DriverStatus::Success {
+            return;
         }
 
         let children_to_start: Vec<Arc<DevNode>> = parent_dev_node
@@ -908,7 +867,6 @@ impl PnpManager {
                 }
             });
         }
-        DriverStatus::Success
     }
 
     async fn ensure_loaded(
@@ -971,22 +929,13 @@ impl PnpManager {
             return DriverStatus::NoSuchDevice;
         };
 
-        let pnp_payload = PnpRequest {
-            minor_function: PnpMinorFunction::QueryDeviceRelations,
+        let mut req = QueryDeviceRelations {
             relation,
-            id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
+            devices: Vec::new(),
         };
-
-        let mut req = RequestHandle::new(Pnp {
-            request: pnp_payload,
-        });
-        let ctx = Arc::into_raw(dev_node.clone()) as usize;
-        req.get_mut()
-            .add_completion(Self::process_enumerated_children, ctx);
-
-        kernel_routing::pnp::send_down_stack(top, &mut req).await
+        let status = kernel_routing::pnp::send_down_stack(top, &mut req).await;
+        Self::process_enumerated_children(dev_node, status.clone());
+        status
     }
 
     pub fn create_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
@@ -1318,22 +1267,11 @@ impl PnpManager {
         );
         let _ = OBJECT_MANAGER.link(alloc::format!("{}\\Top", base), &top_obj);
 
-        let pnp_payload = PnpRequest {
-            minor_function: PnpMinorFunction::StartDevice,
-            relation: DeviceRelationType::TargetDeviceRelation,
-            id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
+        let mut start_request = StartDevice {
+            resources: Vec::new(),
         };
-        let mut start_request = RequestHandle::new(Pnp {
-            request: pnp_payload,
-        });
-        let ctx = Arc::into_raw(dn.clone()) as usize;
-        start_request.get_mut().add_completion(Self::start_io, ctx);
-
-        kernel_routing::pnp::send_down_stack(top.clone(), &mut start_request).await;
-
-        dn.set_state(DevNodeState::Started);
+        let status = kernel_routing::pnp::send_down_stack(top.clone(), &mut start_request).await;
+        Self::finish_start(dn.clone(), status).await;
 
         Ok((dn, top))
     }
@@ -1343,7 +1281,7 @@ impl PnpManager {
         name: String,
         mut init: DeviceInit,
     ) -> (Arc<DeviceObject>, String) {
-        init.pnp_vtable = None;
+        init.pnp_ops = None;
 
         let dev = DeviceObject::new(init);
 

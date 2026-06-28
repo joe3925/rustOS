@@ -2,13 +2,13 @@ use alloc::sync::Arc;
 
 use crate::async_ffi::{FfiFuture, FutureExt};
 use crate::device::DeviceObject;
-use crate::pnp::{BootType, DriverStep, PnpMinorFunction, PnpVtable};
-use crate::request::{Pnp, RequestHandle};
+use crate::pnp::{BootType, DriverStep, PnpOp, PnpOps, StartDevice};
 use crate::status::DriverStatus;
 
 extern "C" fn start_device_handler(
     _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, Pnp<'_>>,
+    _op: PnpOp,
+    _request: &mut StartDevice,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }
@@ -26,29 +26,29 @@ fn boot_type_parses_kernel_driver_start_modes() {
 #[test]
 fn pnp_minor_defaults_distinguish_optional_queries_from_lifecycle_ops() {
     assert_eq!(
-        PnpMinorFunction::StartDevice.default_status_for_unhandled(),
+        PnpOp::StartDevice.default_status_for_unhandled(),
         DriverStatus::Success
     );
     assert_eq!(
-        PnpMinorFunction::RemoveDevice.default_status_for_unhandled(),
+        PnpOp::RemoveDevice.default_status_for_unhandled(),
         DriverStatus::Success
     );
     assert_eq!(
-        PnpMinorFunction::QueryId.default_status_for_unhandled(),
+        PnpOp::QueryId.default_status_for_unhandled(),
         DriverStatus::NotImplemented
     );
     assert_eq!(
-        PnpMinorFunction::QueryResources.default_status_for_unhandled(),
+        PnpOp::QueryResources.default_status_for_unhandled(),
         DriverStatus::NotImplemented
     );
 }
 
 #[test]
-fn pnp_vtable_installs_handlers_by_minor_function() {
-    let vtable = PnpVtable::new();
+fn pnp_ops_installs_handlers_by_minor_function() {
+    let mut ops = PnpOps::new();
 
-    assert!(vtable.get(PnpMinorFunction::StartDevice).is_none());
-    vtable.set(PnpMinorFunction::StartDevice, start_device_handler);
-    assert!(vtable.get(PnpMinorFunction::StartDevice).is_some());
-    assert!(vtable.get(PnpMinorFunction::StopDevice).is_none());
+    assert!(ops.start_device.as_handler().is_none());
+    ops.start_device.set(start_device_handler);
+    assert!(ops.start_device.as_handler().is_some());
+    assert!(ops.stop_device.as_handler().is_none());
 }

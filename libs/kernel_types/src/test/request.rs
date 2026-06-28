@@ -2,8 +2,7 @@ use alloc::{string::String, vec, vec::Vec};
 use core::mem::size_of;
 
 use crate::request::{
-    BorrowedHandle, DeviceControl, RequestData, RequestDataError, RequestHandle, RequestPayload,
-    type_name_stripped, type_tag,
+    DeviceControl, IoctlData, IoctlDataError, RequestPayload, type_name_stripped, type_tag,
 };
 
 #[repr(C)]
@@ -25,7 +24,7 @@ fn request_data_stores_small_payloads_inline_and_moves_them_out_once() {
         id: 0xAABB_CCDD,
         flags: 0x55AA,
     };
-    let mut data = RequestData::from_t(payload);
+    let mut data = IoctlData::from_t(payload);
 
     assert_eq!(data.len(), size_of::<SmallPayload>());
     assert_eq!(data.get_type_tag(), Some(SmallPayload::RUNTIME_TAG));
@@ -42,14 +41,14 @@ fn request_data_stores_small_payloads_inline_and_moves_them_out_once() {
     );
     assert_eq!(
         data.take_exact::<SmallPayload>(),
-        Err(RequestDataError::Missing)
+        Err(IoctlDataError::Missing)
     );
 }
 
 #[test]
 fn request_data_stores_large_payloads_on_heap_and_drops_cleanly() {
     let payload = LargePayload { words: [9; 80] };
-    let mut data = RequestData::from_t(payload);
+    let mut data = IoctlData::from_t(payload);
 
     assert_eq!(data.len(), size_of::<LargePayload>());
     assert_eq!(data.view::<LargePayload>().unwrap().words[79], 9);
@@ -57,21 +56,18 @@ fn request_data_stores_large_payloads_on_heap_and_drops_cleanly() {
     let moved = data.require::<LargePayload>().unwrap();
     assert_eq!(moved.words[0], 9);
     assert_eq!(moved.words[79], 9);
-    assert_eq!(
-        data.require::<LargePayload>(),
-        Err(RequestDataError::Missing)
-    );
+    assert_eq!(data.require::<LargePayload>(), Err(IoctlDataError::Missing));
 }
 
 #[test]
 fn request_data_vec_payload_round_trips_without_aliasing() {
-    let mut data = RequestData::from_t(vec![1u8, 2, 3, 4]);
+    let mut data = IoctlData::from_t(vec![1u8, 2, 3, 4]);
 
     assert_eq!(data.view::<Vec<u8>>().unwrap().as_slice(), &[1, 2, 3, 4]);
     assert!(!data.can_take_exact::<SmallPayload>());
     assert_eq!(
         data.take_exact::<SmallPayload>(),
-        Err(RequestDataError::WrongType)
+        Err(IoctlDataError::WrongType)
     );
 
     let mut owned = data.take_exact::<Vec<u8>>().unwrap();
@@ -80,52 +76,12 @@ fn request_data_vec_payload_round_trips_without_aliasing() {
 }
 
 #[test]
-fn borrowed_read_only_slice_cannot_be_mutated_or_consumed() {
-    let bytes = [4u8, 5, 6, 7];
-    let mut handle = RequestHandle::new(DeviceControl::new(0, RequestData::empty()));
+fn device_control_owns_mutable_ioctl_data() {
+    let mut request = DeviceControl::new_t(0x100, SmallPayload { id: 7, flags: 3 });
 
-    {
-        let mut borrowed = BorrowedHandle::<_, [u8]>::read_only(&mut handle, &bytes);
-        let view = borrowed.handle().data().read_only();
-        assert_eq!(view.view::<[u8]>().unwrap(), &[4, 5, 6, 7]);
-        assert!(!view.can_take_exact::<Vec<u8>>());
-    }
-
-    assert!(handle.data().read_only().view::<[u8]>().is_none());
-}
-
-#[test]
-fn borrowed_writable_slice_exposes_mut_view_and_is_cleared_on_drop() {
-    let mut bytes = [1u8, 2, 3];
-    let mut handle = RequestHandle::new(DeviceControl::new(0, RequestData::empty()));
-
-    {
-        let mut borrowed = BorrowedHandle::<_, [u8]>::writable(&mut handle, &mut bytes);
-        let mut view = borrowed.handle().data().try_writable().unwrap();
-        let slice = view.view_mut::<[u8]>().unwrap();
-        slice[1] = 9;
-        assert_eq!(view.read_only().view::<[u8]>().unwrap(), &[1, 9, 3]);
-    }
-
-    assert!(handle.data().read_only().view::<[u8]>().is_none());
-    drop(handle);
-    assert_eq!(bytes, [1, 9, 3]);
-}
-
-#[test]
-fn request_handle_owns_request_state_and_data_view() {
-    let mut handle = RequestHandle::new(DeviceControl::new_t(
-        0x100,
-        SmallPayload { id: 7, flags: 3 },
-    ));
-
-    assert!(handle.is_owned());
-    assert!(!handle.is_stack());
-    assert_eq!(handle.status(), crate::status::DriverStatus::ContinueStep);
-    assert_eq!(handle.read().body.code, 0x100);
-
-    let view = handle.data().try_writable().unwrap();
-    assert_eq!(view.view::<SmallPayload>().unwrap().flags, 3);
+    assert_eq!(request.code, 0x100);
+    request.data.view_mut::<SmallPayload>().unwrap().flags = 9;
+    assert_eq!(request.data.view::<SmallPayload>().unwrap().flags, 9);
 }
 
 #[test]

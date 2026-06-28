@@ -24,14 +24,14 @@ use kernel_api::{
     IOCTL_PCI_SETUP_MSIX,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
-    kernel_types::{io::DeviceControlHandler, pnp::DeviceIds, request::RequestData},
+    kernel_types::{io::DeviceControlHandler, pnp::DeviceIds},
     memory::{VirtAddr, unmap_mmio_region},
     pnp::{
-        DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
+        DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceSet,
         driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
     },
     println,
-    request::{DeviceControl, Pnp, RequestHandle},
+    request::DeviceControl,
     request_handler,
     runtime::spawn_blocking,
     status::DriverStatus,
@@ -46,9 +46,9 @@ impl DeviceControlHandler for PciPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+        req: &'b mut DeviceControl<'data>,
     ) -> DriverStep {
-        let code = req.get().body.code;
+        let code = req.code;
 
         match code {
             IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev.clone(), req).await,
@@ -74,13 +74,10 @@ pub extern "C" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let mut vt = PnpVtable::new();
-    vt.set(PnpMinorFunction::StartDevice, pci_bus_pnp_start);
-    vt.set(
-        PnpMinorFunction::QueryDeviceRelations,
-        pci_bus_pnp_query_devrels,
-    );
-    dev_init.pnp_vtable = Some(vt);
+    let mut vt = PnpOps::new();
+    vt.start_device.set(pci_bus_pnp_start);
+    vt.query_device_relations.set(pci_bus_pnp_query_devrels);
+    dev_init.pnp_ops = Some(vt);
 
     dev_init.set_dev_ext_from(DevExt {
         segments: Once::new(),
@@ -93,17 +90,12 @@ pub extern "C" fn bus_driver_device_add(
 #[request_handler]
 pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
-    let mut query_handle = RequestHandle::new(Pnp {
-        request: PnpRequest {
-            minor_function: PnpMinorFunction::QueryResources,
-            relation: DeviceRelationType::TargetDeviceRelation,
-            id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
-        },
-    });
+    let mut query_handle = QueryResources {
+        resources: ResourceSet::default(),
+    };
 
     let st = pnp::send_next_lower(device.clone(), &mut query_handle).await;
 
@@ -113,14 +105,10 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
             return DriverStep::complete(qst);
         }
 
-        let blob = query_handle
-            .get()
-            .body
-            .request
-            .data_out_ref()
-            .view::<Vec<u8>>()
-            .cloned()
-            .unwrap_or_default();
+        let blob = match query_handle.resources {
+            ResourceSet::Encoded(blob) => blob,
+            _ => Vec::new(),
+        };
         let segs = parse_ecam_segments_from_blob(&blob);
 
         if segs.is_empty() {
@@ -155,9 +143,10 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
 #[request_handler]
 pub async fn pci_bus_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
-    let relation = req.get().body.request.relation;
+    let relation = req.relation;
     if relation == DeviceRelationType::BusRelations {
         let st = enumerate_bus(&device).await;
         if st == DriverStatus::Success {
@@ -320,14 +309,11 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
         compatible,
     };
 
-    let mut vt = PnpVtable::new();
-    vt.set(PnpMinorFunction::QueryId, pci_pdo_query_id);
-    vt.set(PnpMinorFunction::QueryResources, pci_pdo_query_resources);
-    vt.set(PnpMinorFunction::StartDevice, pci_pdo_start);
-    vt.set(
-        PnpMinorFunction::QueryDeviceRelations,
-        pci_pdo_query_devrels,
-    );
+    let mut vt = PnpOps::new();
+    vt.query_id.set(pci_pdo_query_id);
+    vt.query_resources.set(pci_pdo_query_resources);
+    vt.start_device.set(pci_pdo_start);
+    vt.query_device_relations.set(pci_pdo_query_devrels);
 
     let mut child_init = DeviceInit::with_pnp(Some(vt));
     child_init.ops.device_control.register::<PciPdoIo>();
@@ -375,41 +361,34 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
 #[request_handler]
 pub async fn pci_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryId,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
         Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let mut status = DriverStatus::Success;
-    {
-        let mut r = req.get_mut();
-        let pnp = &mut r.body.request;
-        match pnp.id_type {
-            QueryIdType::HardwareIds => {
-                let (hw, _cmp, _) = hwids_for(&ext);
-                pnp.ids_out.extend(hw);
-                r.status = DriverStatus::Success;
+    let status = DriverStatus::Success;
+    match req.id_type {
+        QueryIdType::HardwareIds => {
+            let (hw, _cmp, _) = hwids_for(&ext);
+            req.ids.extend(hw);
+        }
+        QueryIdType::CompatibleIds => {
+            let (_hw, cmp, _) = hwids_for(&ext);
+            req.ids.extend(cmp);
+        }
+        QueryIdType::DeviceId => {
+            let (hw, _, _) = hwids_for(&ext);
+            if let Some(primary) = hw.first() {
+                req.ids.push(primary.clone());
+            } else {
+                return DriverStep::complete(DriverStatus::NoSuchDevice);
             }
-            QueryIdType::CompatibleIds => {
-                let (_hw, cmp, _) = hwids_for(&ext);
-                pnp.ids_out.extend(cmp);
-                r.status = DriverStatus::Success;
-            }
-            QueryIdType::DeviceId => {
-                let (hw, _, _) = hwids_for(&ext);
-                if let Some(primary) = hw.first() {
-                    pnp.ids_out.push(primary.clone());
-                    r.status = DriverStatus::Success;
-                } else {
-                    r.status = DriverStatus::NoSuchDevice;
-                }
-            }
-            QueryIdType::InstanceId => {
-                pnp.ids_out.push(instance_path_for(&ext));
-                r.status = DriverStatus::Success;
-            }
+        }
+        QueryIdType::InstanceId => {
+            req.ids.push(instance_path_for(&ext));
         }
     }
     DriverStep::complete(status)
@@ -418,18 +397,16 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
 #[request_handler]
 pub async fn pci_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryResources,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
         Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let status = {
-        let mut r = req.get_mut();
-        r.body.request.data_out = RequestData::from_t::<Vec<u8>>(build_resources_blob(&ext));
-        DriverStatus::Success
-    };
+    req.resources = ResourceSet::Encoded(build_resources_blob(&ext));
+    let status = DriverStatus::Success;
 
     DriverStep::complete(status)
 }
@@ -437,7 +414,8 @@ pub async fn pci_pdo_query_resources<'req, 'data, 'b>(
 #[request_handler]
 pub async fn pci_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }
@@ -445,7 +423,8 @@ pub async fn pci_pdo_start<'req, 'data, 'b>(
 #[request_handler]
 pub async fn pci_pdo_query_devrels<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

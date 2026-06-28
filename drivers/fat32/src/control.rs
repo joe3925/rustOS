@@ -1,7 +1,6 @@
 use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::FsOptions;
-use kernel_api::request::RequestDataView;
 
 use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS,
@@ -9,14 +8,13 @@ use kernel_api::{
     kernel_types::{
         async_types::AsyncMutex,
         io::{DeviceControlHandler, FsIdentify, PartitionInfo},
-        request::RequestData,
+        request::IoctlData,
     },
     pnp::{
-        DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
-        driver_set_evt_device_add, io, pnp, pnp_create_control_device_and_link,
-        pnp_create_control_device_with_init,
+        DriverStep, QueryResources, ResourceSet, driver_set_evt_device_add, io, pnp,
+        pnp_create_control_device_and_link, pnp_create_control_device_with_init,
     },
-    request::{DeviceControl, Pnp, RequestHandle},
+    request::DeviceControl,
     request_handler,
     runtime::spawn_detached,
     status::DriverStatus,
@@ -59,39 +57,30 @@ impl DeviceControlHandler for Fat32RootIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         _dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+        req: &'b mut DeviceControl<'data>,
     ) -> DriverStep {
-        let code = req.get().body.code;
+        let code = req.code;
 
         match code {
             IOCTL_FS_IDENTIFY => {
                 let volume_fdo = {
-                    let r = req.get_mut();
+                    let r = &mut *req;
 
-                    let volume_fdo = match r.data() {
-                        RequestDataView::Writable(mut data) => data
-                            .view_mut::<FsIdentify>()
-                            .map(|id| id.volume_fdo.clone()),
-                        RequestDataView::ReadOnly(_) => None,
-                    };
+                    let volume_fdo = r
+                        .data
+                        .view_mut::<FsIdentify>()
+                        .map(|id| id.volume_fdo.clone());
 
                     let Some(volume_fdo) = volume_fdo else {
-                        r.status = DriverStatus::InvalidParameter;
                         return DriverStep::complete(DriverStatus::InvalidParameter);
                     };
 
                     volume_fdo
                 };
 
-                let mut query = RequestHandle::new(Pnp {
-                    request: PnpRequest {
-                        minor_function: PnpMinorFunction::QueryResources,
-                        relation: DeviceRelationType::TargetDeviceRelation,
-                        id_type: QueryIdType::DeviceId,
-                        ids_out: Vec::new(),
-                        data_out: RequestData::empty(),
-                    },
-                });
+                let mut query = QueryResources {
+                    resources: ResourceSet::default(),
+                };
 
                 let st = pnp::send_down_stack(volume_fdo.clone(), &mut query).await;
 
@@ -100,10 +89,7 @@ impl DeviceControlHandler for Fat32RootIo {
                     let mut total_sectors = None;
 
                     if st == DriverStatus::Success {
-                        let q = query.get_mut();
-
-                        if let Some(pi) = q.body.request.data_out.take_exact::<PartitionInfo>().ok()
-                        {
+                        if let ResourceSet::Partition(pi) = query.resources {
                             sector_size = Some(if pi.disk.logical_block_size != 0 {
                                 pi.disk.logical_block_size as u16
                             } else {
@@ -173,31 +159,26 @@ impl DeviceControlHandler for Fat32RootIo {
                 };
 
                 {
-                    let r = req.get_mut();
+                    let r = &mut *req;
                     let mut replacement = Some(FsIdentify {
                         mount_device,
                         can_mount,
                         volume_fdo,
                     });
-                    let replace_payload = match r.data() {
-                        RequestDataView::Writable(mut data) => {
-                            if let Some(id) = data.view_mut::<FsIdentify>() {
-                                let value = replacement.take().unwrap();
-                                id.mount_device = value.mount_device;
-                                id.can_mount = can_mount;
-                                false
-                            } else {
-                                true
-                            }
+                    let replace_payload = {
+                        if let Some(id) = r.data.view_mut::<FsIdentify>() {
+                            let value = replacement.take().unwrap();
+                            id.mount_device = value.mount_device;
+                            id.can_mount = can_mount;
+                            false
+                        } else {
+                            true
                         }
-                        RequestDataView::ReadOnly(_) => true,
                     };
 
                     if replace_payload {
                         r.set_data_t(replacement.unwrap());
                     }
-
-                    r.status = DriverStatus::Success;
                 }
 
                 DriverStep::complete(DriverStatus::Success)
@@ -218,11 +199,8 @@ pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let _ctrl = pnp_create_control_device_and_link(ctrl_name, init, ctrl_link.clone());
 
     spawn_detached(async move {
-        let mut binding = RequestHandle::new(DeviceControl::new_t(
-            IOCTL_MOUNTMGR_REGISTER_FS,
-            ctrl_link.into_bytes(),
-        ));
-        binding.get_mut().body.code = IOCTL_MOUNTMGR_REGISTER_FS;
+        let mut binding = DeviceControl::new_t(IOCTL_MOUNTMGR_REGISTER_FS, ctrl_link.into_bytes());
+        binding.code = IOCTL_MOUNTMGR_REGISTER_FS;
         if let Some(target) = io::resolve_target(GLOBAL_CTRL_LINK) {
             let _ioctl_status = io::send_down_stack(target, &mut binding).await;
         }

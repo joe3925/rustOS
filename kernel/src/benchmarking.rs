@@ -42,7 +42,7 @@ use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAM
 use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
-use kernel_types::request::{DeviceControl, RequestHandle};
+use kernel_types::request::DeviceControl;
 use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::Message;
 use serde_json::{json, Value};
@@ -4244,10 +4244,8 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                             );
 
                             if matrix.discard_first_per_combo && trial == 0 {
-                                let mut warm = RequestHandle::new(DeviceControl::new_t(
-                                    IOCTL_BLOCK_BENCH_SWEEP_BOTH,
-                                    requested,
-                                ));
+                                let mut warm =
+                                    DeviceControl::new_t(IOCTL_BLOCK_BENCH_SWEEP_BOTH, requested);
                                 let _ =
                                     kernel_routing::io::send_down_stack(target.clone(), &mut warm)
                                         .await;
@@ -4255,10 +4253,8 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                 continue;
                             }
 
-                            let mut req = RequestHandle::new(DeviceControl::new_t(
-                                IOCTL_BLOCK_BENCH_SWEEP_BOTH,
-                                requested,
-                            ));
+                            let mut req =
+                                DeviceControl::new_t(IOCTL_BLOCK_BENCH_SWEEP_BOTH, requested);
                             println!(
                                 "[virtio-bench] Starting trial {} for run_id {} with params: flags=0x{:X} total_bytes={} request_size={} start_sector={} max_inflight={}",
                                 trial,
@@ -4286,8 +4282,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                             }
 
                             let both = {
-                                let data = req.data().read_only();
-                                match data.view::<BenchSweepBothResult>() {
+                                match req.data.view::<BenchSweepBothResult>() {
                                     Some(r) => *r,
                                     None => {
                                         println!(

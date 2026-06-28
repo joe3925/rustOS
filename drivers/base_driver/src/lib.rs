@@ -6,10 +6,8 @@ use core::panic::PanicInfo;
 use alloc::sync::Arc;
 use kernel_api::{
     device::{DeviceInit, DeviceObject, DriverObject},
-    pnp::{DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add},
-    println,
-    request::{Pnp, RequestHandle},
-    request_handler,
+    pnp::{DriverStep, PnpOp, PnpOps, driver_set_evt_device_add},
+    println, request_handler,
     status::DriverStatus,
 };
 
@@ -29,17 +27,18 @@ pub extern "C" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStep {
-    let mut pnp_vtable = PnpVtable::new();
+    let mut pnp_ops = PnpOps::new();
     println!("BaseBusDriver: EvtDeviceAdd called.\n");
-    pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
-    dev_init_ptr.pnp_vtable = Some(pnp_vtable);
+    pnp_ops.start_device.set(bus_driver_prepare_hardware);
+    dev_init_ptr.pnp_ops = Some(pnp_ops);
     DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
 pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     _device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
     DriverStep::complete(DriverStatus::Success)

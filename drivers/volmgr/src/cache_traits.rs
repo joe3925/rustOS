@@ -1,7 +1,7 @@
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::dma::dma::{IoBufferBacking, IoBufferError};
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
-use kernel_api::request::{Read, RequestHandle, Write};
+use kernel_api::request::{Read, Write};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
@@ -93,7 +93,7 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
 
     fn read_request<'a, 'req, 'data>(
         &'a self,
-        req: &'a mut RequestHandle<'req, Read<'data>>,
+        req: &'a mut Read<'data>,
     ) -> FfiFuture<Result<(), Self::Error>>;
 
     fn read_phys_framed<'a, 'buffer>(
@@ -105,7 +105,7 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
 
     fn write_request<'a, 'req, 'data>(
         &'a self,
-        req: &'a mut RequestHandle<'req, Write<'data>>,
+        req: &'a mut Write<'data>,
     ) -> FfiFuture<Result<(), Self::Error>>;
 
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
@@ -116,15 +116,9 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
 pub trait VolumeCacheOps {
     type Error;
 
-    async fn read_request<'req, 'data>(
-        &self,
-        req: &mut RequestHandle<'req, Read<'data>>,
-    ) -> Result<(), Self::Error>;
+    async fn read_request<'req, 'data>(&self, req: &mut Read<'data>) -> Result<(), Self::Error>;
 
-    async fn write_request<'req, 'data>(
-        &self,
-        req: &mut RequestHandle<'req, Write<'data>>,
-    ) -> Result<(), Self::Error>;
+    async fn write_request<'req, 'data>(&self, req: &mut Write<'data>) -> Result<(), Self::Error>;
 
     async fn flush(&self) -> Result<(), Self::Error>;
     async fn flush_owner(&self, owner: u64) -> Result<(), Self::Error>;

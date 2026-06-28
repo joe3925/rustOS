@@ -21,12 +21,12 @@ use kernel_api::kernel_types::io::{
     PartitionInfo,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::kernel_types::request::RequestData;
+use kernel_api::kernel_types::request::IoctlData;
 use kernel_api::pnp::{
-    DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add, io,
-    pnp, pnp_create_child_devnode_and_pdo_with_init,
+    DeviceRelationType, DriverStep, PnpOp, PnpOps, driver_set_evt_device_add, io, pnp,
+    pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::request::{DeviceControl, Flush, FlushDirty, Pnp, Read, RequestHandle, Write};
+use kernel_api::request::{DeviceControl, Flush, FlushDirty, Read, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use spin::Once;
@@ -53,13 +53,10 @@ pub extern "C" fn partmgr_device_add(
 ) -> DriverStep {
     init.set_dev_ext_default::<PartMgrExt>();
 
-    let pnp = PnpVtable::new();
-    pnp.set(PnpMinorFunction::StartDevice, partmgr_start);
-    pnp.set(
-        PnpMinorFunction::QueryDeviceRelations,
-        partmgr_pnp_query_devrels,
-    );
-    init.pnp_vtable = Some(pnp);
+    let mut pnp = PnpOps::new();
+    pnp.start_device.set(partmgr_start);
+    pnp.query_device_relations.set(partmgr_pnp_query_devrels);
+    init.pnp_ops = Some(pnp);
 
     DriverStep::complete(DriverStatus::Success)
 }
@@ -199,7 +196,7 @@ impl DeviceRead for PartitionPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         device: &Arc<DeviceObject>,
-        request: &'b mut RequestHandle<'req, Read<'data>>,
+        request: &'b mut Read<'data>,
     ) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
         let start_lba = *dx.start_lba.get().unwrap();
@@ -230,7 +227,7 @@ impl DeviceRead for PartitionPdoIo {
         };
 
         {
-            let body = &request.get().body;
+            let body = &request;
             if let Err(status) = validate_partition_read_chain(body, part_bytes, block_size) {
                 cold_path();
                 return DriverStep::complete(status);
@@ -238,8 +235,7 @@ impl DeviceRead for PartitionPdoIo {
         }
 
         {
-            let mut req = request.get_mut();
-            if let Err(status) = translate_read_chain(&mut req.body, base) {
+            if let Err(status) = translate_read_chain(request, base) {
                 cold_path();
                 return DriverStep::complete(status);
             }
@@ -255,7 +251,7 @@ impl DeviceWrite for PartitionPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         device: &Arc<DeviceObject>,
-        request: &'b mut RequestHandle<'req, Write<'data>>,
+        request: &'b mut Write<'data>,
     ) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
         let start_lba = *dx.start_lba.get().unwrap();
@@ -286,7 +282,7 @@ impl DeviceWrite for PartitionPdoIo {
         };
 
         {
-            let body = &request.get().body;
+            let body = &request;
             if let Err(status) = validate_partition_write_chain(body, part_bytes, block_size) {
                 cold_path();
                 return DriverStep::complete(status);
@@ -294,8 +290,7 @@ impl DeviceWrite for PartitionPdoIo {
         }
 
         {
-            let mut req = request.get_mut();
-            if let Err(status) = translate_write_chain(&mut req.body, base) {
+            if let Err(status) = translate_write_chain(request, base) {
                 cold_path();
                 return DriverStep::complete(status);
             }
@@ -308,10 +303,7 @@ impl DeviceWrite for PartitionPdoIo {
 }
 impl DeviceFlush for PartitionPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(
-        device: &Arc<DeviceObject>,
-        request: &'b mut RequestHandle<'req, Flush>,
-    ) -> DriverStep {
+    async fn handler<'req, 'b>(device: &Arc<DeviceObject>, request: &'b mut Flush) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
         let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
 
@@ -323,7 +315,7 @@ impl DeviceFlushDirty for PartitionPdoIo {
     #[request_handler]
     async fn handler<'req, 'b>(
         device: &Arc<DeviceObject>,
-        request: &'b mut RequestHandle<'req, FlushDirty>,
+        request: &'b mut FlushDirty,
     ) -> DriverStep {
         let dx = ext::<PartDevExt>(&device);
         let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
@@ -335,15 +327,12 @@ impl DeviceFlushDirty for PartitionPdoIo {
 #[request_handler]
 async fn partition_pdo_query_resources<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    request: &'b mut kernel_api::pnp::QueryResources,
 ) -> DriverStep {
-    {
-        let w = request.get_mut();
-        let pnp = &mut w.body.request;
-        let dx = ext::<PartDevExt>(&device);
-        if let Some(pi) = dx.part.get() {
-            pnp.data_out = RequestData::from_t((*pi).clone());
-        }
+    let dx = ext::<PartDevExt>(&device);
+    if let Some(pi) = dx.part.get() {
+        request.resources = kernel_api::pnp::ResourceSet::Partition((*pi).clone());
     }
 
     DriverStep::complete(DriverStatus::Success)
@@ -351,7 +340,8 @@ async fn partition_pdo_query_resources<'req, 'data, 'b>(
 #[request_handler]
 async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    request: &'b mut kernel_api::pnp::RegisterDmaBacking<'data>,
 ) -> DriverStep {
     let dx = ext::<PartDevExt>(&device);
 
@@ -367,20 +357,18 @@ async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
 #[request_handler]
 pub async fn partmgr_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     let dx = ext::<PartMgrExt>(&dev);
 
-    let mut parent_req = RequestHandle::new(DeviceControl::new(
-        IOCTL_DRIVE_IDENTIFY,
-        RequestData::empty(),
-    ));
+    let mut parent_req = DeviceControl::new(IOCTL_DRIVE_IDENTIFY, IoctlData::empty());
     let status = io::send_next_lower(dev.clone(), &mut parent_req).await;
     if status != DriverStatus::Success {
         return DriverStep::complete(status);
     }
 
-    if let Some(data) = parent_req.get_mut().data().read_only().view::<DiskInfo>() {
+    if let Some(data) = parent_req.data.view::<DiskInfo>() {
         dx.disk_info.call_once(|| *data);
     } else {
         return DriverStep::complete(status);
@@ -400,7 +388,7 @@ async fn read_from_lower_async(
         IoBufferBackingConfig::default(),
     )
     .expect("io_buf creation for read_from_lower_async failed");
-    let mut child_req = RequestHandle::new(Read::new(
+    let mut child_req = Read::new(
         offset,
         len,
         false,
@@ -409,7 +397,7 @@ async fn read_from_lower_async(
                 .create_from_device(0, len)
                 .expect("io_buf creation for read_from_lower_async failed"),
         ),
-    ));
+    );
     let status = io::send_next_lower(dev.clone(), &mut child_req).await;
 
     drop(child_req);
@@ -425,9 +413,10 @@ async fn read_from_lower_async(
 #[request_handler]
 pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    request: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
-    let relation = { request.get().body.request.relation };
+    let relation = request.relation;
     if relation != DeviceRelationType::BusRelations {
         return DriverStep::complete(DriverStatus::NotImplemented);
     }
@@ -534,16 +523,11 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
         child_init.ops.flush.register::<PartitionPdoIo>();
         child_init.ops.flush_dirty.register::<PartitionPdoIo>();
 
-        let vt = PnpVtable::new();
-        vt.set(
-            PnpMinorFunction::QueryResources,
-            partition_pdo_query_resources,
-        );
-        vt.set(
-            PnpMinorFunction::RegisterDmaBacking,
-            partition_pdo_register_dma_backing,
-        );
-        child_init.pnp_vtable = Some(vt);
+        let mut vt = PnpOps::new();
+        vt.query_resources.set(partition_pdo_query_resources);
+        vt.register_dma_backing
+            .set(partition_pdo_register_dma_backing);
+        child_init.pnp_ops = Some(vt);
         child_init.set_dev_ext_default::<PartDevExt>();
 
         let name = alloc::format!("Partition{}", idx);

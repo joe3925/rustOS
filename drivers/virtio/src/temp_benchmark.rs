@@ -20,7 +20,7 @@ use kernel_api::memory::{
     deallocate_kernel_range, unmap_range,
 };
 use kernel_api::pnp::io;
-use kernel_api::request::{Read, RequestHandle};
+use kernel_api::request::Read;
 use kernel_api::runtime::{cycle_counter, spawn};
 use kernel_api::status::DriverStatus;
 use spin::Mutex;
@@ -611,13 +611,7 @@ async fn bench_read_via_request(
             }
         };
 
-        let mut req = RequestHandle::new(Read {
-            offset,
-            len,
-            no_buffer: false,
-            buffer: Some(io_buf),
-            next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-        });
+        let mut req = Read::new(offset, len, false, Some(io_buf));
 
         let start_cycles = cycle_counter();
         let status = io::send_down_stack(target, &mut req).await;

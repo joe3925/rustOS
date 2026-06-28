@@ -16,7 +16,7 @@ use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, io};
 use kernel_api::request::{
     FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, RequestHandle,
+    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
 };
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
@@ -334,10 +334,10 @@ async fn flush_cached_file(
 pub struct Fat32Fs;
 
 async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
-    let mut flush_req = RequestHandle::new(FlushOwner {
+    let mut flush_req = FlushOwner {
         owner,
         should_block,
-    });
+    };
     let status = io::send_down_stack(volume_target, &mut flush_req).await;
     status
 }
@@ -401,7 +401,7 @@ impl FileSystem for Fat32Fs {
     #[request_handler]
     async fn open<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsOpen>>,
+        req: &'b mut FsRequest<'data, FsOpen>,
     ) -> DriverStep {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
@@ -409,7 +409,7 @@ impl FileSystem for Fat32Fs {
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let mut fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let _ = (params.flags, params.write_through);
             let result_value = {
@@ -471,23 +471,22 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn close<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsClose>>,
+        req: &'b mut FsRequest<'data, FsClose>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let removed_ctx = { vdx.handles.lock().remove(fs_file_id) };
@@ -516,23 +515,22 @@ impl FileSystem for Fat32Fs {
             true,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn read<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRead>>,
+        req: &'b mut FsRequest<'data, FsRead>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
@@ -590,23 +588,22 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn write<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsWrite>>,
+        req: &'b mut FsRequest<'data, FsWrite>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
@@ -683,23 +680,22 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn flush<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsFlush>>,
+        req: &'b mut FsRequest<'data, FsFlush>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let err = {
@@ -731,21 +727,20 @@ impl FileSystem for Fat32Fs {
             true,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn seek<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSeek>>,
+        req: &'b mut FsRequest<'data, FsSeek>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (_, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
-            let params = &req.get().body.payload.params;
+            let params = &req.payload.params;
             let (fs_file_id, origin, offset) = (params.fs_file_id, params.origin, params.offset);
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let result = {
@@ -773,7 +768,7 @@ impl FileSystem for Fat32Fs {
                     error: Some(e),
                 },
             };
-            req.get_mut().body.payload.result = Some(res);
+            req.payload.result = Some(res);
             DriverStatus::Success
         };
         finish_fs_request(
@@ -784,14 +779,13 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn create<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsCreate>>,
+        req: &'b mut FsRequest<'data, FsCreate>,
     ) -> DriverStep {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
@@ -799,7 +793,7 @@ impl FileSystem for Fat32Fs {
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let mut fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let err = {
                 match create_entry(&mut *fs, &params.path, params.dir).await {
@@ -819,14 +813,13 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn rename<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRename>>,
+        req: &'b mut FsRequest<'data, FsRename>,
     ) -> DriverStep {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
@@ -834,7 +827,7 @@ impl FileSystem for Fat32Fs {
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let mut fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let err = {
                 match rename_entry(&mut *fs, &params.src, &params.dst).await {
@@ -859,21 +852,20 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn read_dir<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsReadDir>>,
+        req: &'b mut FsRequest<'data, FsReadDir>,
     ) -> DriverStep {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let mut fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let res = {
                 match list_names(&mut *fs, &params.path).await {
@@ -898,22 +890,21 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn get_info<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsGetInfo>>,
+        req: &'b mut FsRequest<'data, FsGetInfo>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (_, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let info_res = {
@@ -949,23 +940,22 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn set_len<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSetLen>>,
+        req: &'b mut FsRequest<'data, FsSetLen>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let new_size = params.new_size;
@@ -1007,23 +997,22 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn append<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsAppend>>,
+        req: &'b mut FsRequest<'data, FsAppend>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let write_through = params.write_through;
@@ -1112,23 +1101,22 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 
     #[request_handler]
     async fn zero_range<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsZeroRange>>,
+        req: &'b mut FsRequest<'data, FsZeroRange>,
     ) -> DriverStep {
-        let owner = req.get().body.payload.params.fs_file_id;
+        let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         let status = {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
-            let payload = &mut req.get_mut().body.payload;
+            let payload = &mut req.payload;
             let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
@@ -1180,7 +1168,6 @@ impl FileSystem for Fat32Fs {
             false,
         )
         .await;
-        req.get_mut().status = status.clone();
         DriverStep::complete(status)
     }
 }

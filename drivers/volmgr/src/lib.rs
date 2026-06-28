@@ -20,24 +20,22 @@ use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
+use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushOwner, DeviceRead, DeviceWrite,
 };
-use kernel_api::kernel_types::io::{DmaBacking, IoTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::DeviceRelationType;
 use kernel_api::pnp::DriverStep;
-use kernel_api::pnp::PnpMinorFunction;
-use kernel_api::pnp::PnpRequest;
-use kernel_api::pnp::PnpVtable;
-use kernel_api::pnp::QueryIdType;
+use kernel_api::pnp::PnpOp;
+use kernel_api::pnp::PnpOps;
 use kernel_api::pnp::driver_set_evt_device_add;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_get_device_target;
+use kernel_api::pnp::{QueryResources, RegisterDmaBacking, ResourceSet};
 use kernel_api::pnp::{io, pnp};
-use kernel_api::request::{Flush, FlushDirty, FlushOwner, Pnp, Read, RequestHandle, Write};
+use kernel_api::request::{Flush, FlushDirty, FlushOwner, Read, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 
@@ -60,7 +58,7 @@ impl DeviceRead for VolPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'data>>,
+        req: &'b mut Read<'data>,
     ) -> DriverStep {
         vol_pdo_read_impl(dev, req).await
     }
@@ -70,7 +68,7 @@ impl DeviceWrite for VolPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'data>>,
+        req: &'b mut Write<'data>,
     ) -> DriverStep {
         vol_pdo_write_impl(dev, req).await
     }
@@ -78,30 +76,21 @@ impl DeviceWrite for VolPdoIo {
 
 impl DeviceFlush for VolPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Flush>,
-    ) -> DriverStep {
+    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut Flush) -> DriverStep {
         vol_pdo_flush_impl(dev, req).await
     }
 }
 
 impl DeviceFlushDirty for VolPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FlushDirty>,
-    ) -> DriverStep {
+    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut FlushDirty) -> DriverStep {
         vol_pdo_flush_dirty_impl(dev, req).await
     }
 }
 
 impl DeviceFlushOwner for VolPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FlushOwner>,
-    ) -> DriverStep {
+    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut FlushOwner) -> DriverStep {
         vol_pdo_flush_owner_impl(dev, req).await
     }
 }
@@ -193,10 +182,10 @@ impl VolumeCacheBackend for CacheBackend {
                 return Err(DriverStatus::InvalidParameter);
             }
 
-            let mut req = RequestHandle::new( Read::new(
+            let mut req =  Read::new(
                 offset,
                  total_len,
-                 false,Some(buffer),));
+                 false,Some(buffer),);
             let status = io::send_down_stack(self.target.clone(), &mut req).await;
 
             if unlikely(status != DriverStatus::Success) {
@@ -214,15 +203,15 @@ impl VolumeCacheBackend for CacheBackend {
     }
     fn read_request<'a, 'req, 'data>(
         &'a self,
-        req: &'a mut RequestHandle<'req, Read<'data>>,
+        req: &'a mut Read<'data>,
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
-                let r = req.get_mut();
+                let r = &mut *req;
                 let mut first_offset = 0u64;
                 let mut first_len = 0usize;
                 let mut first = true;
-                    for body in &mut r.body.iter_mut() {
+                    for body in &mut r.iter_mut() {
                         let offset = body.offset;
                         let len = body.len;
 
@@ -291,16 +280,16 @@ impl VolumeCacheBackend for CacheBackend {
     }
     fn write_request<'a, 'req, 'data>(
         &'a self,
-        req: &'a mut RequestHandle<'req, Write<'data>>,
+        req: &'a mut Write<'data>,
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
-                let w = req.get_mut();
+                let w = &mut *req;
                 let mut first_offset = 0u64;
                 let mut first_len = 0usize;
                 let mut first = true;
 
-                for body in w.body.iter_mut() {
+                for body in w.iter_mut() {
                     let offset = body.offset;
                     let len = body.len;
 
@@ -366,7 +355,7 @@ impl VolumeCacheBackend for CacheBackend {
 
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>> {
         async move {
-            let mut req = RequestHandle::new(Flush { should_block: true });
+            let mut req = Flush { should_block: true };
             let status = io::send_down_stack(self.target.clone(), &mut req).await;
             if unlikely(status != DriverStatus::Success && status != DriverStatus::NotImplemented) {
                 cold_path();
@@ -382,17 +371,7 @@ impl VolumeCacheBackend for CacheBackend {
     }
     fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> FfiFuture<Result<(), Self::Error>> {
         async move {
-            let payload = DmaBacking { backing: &*backing };
-
-            let mut req = RequestHandle::new(Pnp {
-                request: PnpRequest {
-                    minor_function: PnpMinorFunction::RegisterDmaBacking,
-                    relation: DeviceRelationType::TargetDeviceRelation,
-                    id_type: QueryIdType::CompatibleIds,
-                    ids_out: Vec::new(),
-                    data_out: RequestData::from_t(payload),
-                },
-            });
+            let mut req = RegisterDmaBacking { backing: &*backing };
 
             let status = pnp::send_down_stack(self.target.clone(), &mut req).await;
 
@@ -516,32 +495,24 @@ pub extern "C" fn vol_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let pnp_vtable = PnpVtable::new();
-    pnp_vtable.set(PnpMinorFunction::StartDevice, vol_prepare_hardware);
-    pnp_vtable.set(
-        PnpMinorFunction::QueryDeviceRelations,
-        vol_enumerate_devices,
-    );
+    let mut pnp_ops = PnpOps::new();
+    pnp_ops.start_device.set(vol_prepare_hardware);
+    pnp_ops.query_device_relations.set(vol_enumerate_devices);
 
     dev_init.set_dev_ext_default::<VolExt>();
-    dev_init.pnp_vtable = Some(pnp_vtable);
+    dev_init.pnp_ops = Some(pnp_ops);
     DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
 pub async fn vol_prepare_hardware<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, Pnp<'_>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
-    let mut query_req = RequestHandle::new(Pnp {
-        request: PnpRequest {
-            minor_function: PnpMinorFunction::QueryResources,
-            relation: DeviceRelationType::TargetDeviceRelation,
-            id_type: QueryIdType::DeviceId,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
-        },
-    });
+    let mut query_req = QueryResources {
+        resources: ResourceSet::default(),
+    };
 
     let st = pnp::send_next_lower(dev.clone(), &mut query_req).await;
     if unlikely(st == DriverStatus::NoSuchDevice) {
@@ -558,19 +529,9 @@ pub async fn vol_prepare_hardware<'a, 'b>(
     }
 
     let dx = ext::<VolExt>(&dev);
-    let status = query_req.get().status.clone();
-    if unlikely(status != DriverStatus::Success) {
-        cold_path();
-        println!(
-            "volmgr: vol_prepare_hardware lower QueryResources completed with: {}",
-            status
-        );
-        return DriverStep::complete(status);
-    }
-
-    let pi_opt: Option<PartitionInfo> = {
-        let req = query_req.get_mut();
-        req.body.request.data_out.take_exact::<PartitionInfo>().ok()
+    let pi_opt = match query_req.resources {
+        ResourceSet::Partition(pi) => Some(pi),
+        _ => None,
     };
     if let Some(pi) = pi_opt {
         dx.part.call_once(|| pi);
@@ -582,7 +543,8 @@ pub async fn vol_prepare_hardware<'a, 'b>(
 #[request_handler]
 pub async fn vol_enumerate_devices<'a, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, Pnp<'_>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
     let dx = ext::<VolExt>(&device);
 
@@ -641,11 +603,11 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         compatible: vec!["STOR\\Volume".into()],
     };
 
-    let pnp_vtable = PnpVtable::new();
-    pnp_vtable.set(PnpMinorFunction::QueryResources, vol_pdo_query_resources);
-    pnp_vtable.set(PnpMinorFunction::RemoveDevice, vol_pdo_remove_device);
+    let mut pnp_ops = PnpOps::new();
+    pnp_ops.query_resources.set(vol_pdo_query_resources);
+    pnp_ops.remove_device.set(vol_pdo_remove_device);
 
-    let mut init = DeviceInit::with_pnp(Some(pnp_vtable));
+    let mut init = DeviceInit::with_pnp(Some(pnp_ops));
     init.ops.read.register::<VolPdoIo>();
     init.ops.write.register::<VolPdoIo>();
     init.ops.flush.register::<VolPdoIo>();
@@ -692,7 +654,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
 
 async fn vol_pdo_read_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Read<'data>>,
+    req: &'b mut Read<'data>,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
@@ -705,12 +667,12 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
     };
 
     let (offset, len_req, no_buffer, req_data_len) = {
-        let r = req.get();
+        let r = &*req;
         (
-            r.body.offset,
-            r.body.len,
-            r.body.no_buffer,
-            r.body.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+            r.offset,
+            r.len,
+            r.no_buffer,
+            r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
         )
     };
 
@@ -745,8 +707,8 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
     }
 
     {
-        let w = req.get_mut();
-        w.body.len = len;
+        let w = &mut *req;
+        w.len = len;
     }
 
     let cache = match dx.cache.get() {
@@ -768,7 +730,7 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
 
 async fn vol_pdo_write_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Write<'data>>,
+    req: &'b mut Write<'data>,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
@@ -781,12 +743,12 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
     };
 
     let (offset, len_req, no_buffer, req_data_len) = {
-        let r = req.get();
+        let r = &*req;
         (
-            r.body.offset,
-            r.body.len,
-            r.body.no_buffer,
-            r.body.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+            r.offset,
+            r.len,
+            r.no_buffer,
+            r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
         )
     };
 
@@ -821,8 +783,8 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
     }
 
     {
-        let w = req.get_mut();
-        w.body.len = len;
+        let w = &mut *req;
+        w.len = len;
     }
 
     let cache = match dx.cache.get() {
@@ -842,25 +804,22 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
     }
 }
 
-async fn vol_pdo_flush_impl<'req, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Flush>,
-) -> DriverStep {
-    vol_pdo_flush_common(dev, req.get().body.should_block, None).await
+async fn vol_pdo_flush_impl<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut Flush) -> DriverStep {
+    vol_pdo_flush_common(dev, req.should_block, None).await
 }
 
 async fn vol_pdo_flush_dirty_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, FlushDirty>,
+    req: &'b mut FlushDirty,
 ) -> DriverStep {
-    vol_pdo_flush_common(dev, req.get().body.should_block, None).await
+    vol_pdo_flush_common(dev, req.should_block, None).await
 }
 
 async fn vol_pdo_flush_owner_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, FlushOwner>,
+    req: &'b mut FlushOwner,
 ) -> DriverStep {
-    let body = req.get().body;
+    let body = req;
     vol_pdo_flush_common(dev, body.should_block, Some(body.owner)).await
 }
 
@@ -916,7 +875,8 @@ async fn vol_pdo_flush_common(
 #[request_handler]
 pub async fn vol_pdo_remove_device<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, Pnp<'_>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::RemoveDevice,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
@@ -932,17 +892,13 @@ pub async fn vol_pdo_remove_device<'a, 'b>(
 #[request_handler]
 async fn vol_pdo_query_resources<'a, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, Pnp<'_>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryResources,
 ) -> DriverStep {
-    let status = {
-        let w = req.get_mut();
-        if let Some(pi) = ext::<VolPdoExt>(&pdo).part.get() {
-            w.body.request.data_out = RequestData::from_t(pi.clone());
-        } else {
-            w.body.request.data_out = RequestData::empty();
-        }
-        DriverStatus::Success
-    };
+    if let Some(pi) = ext::<VolPdoExt>(&pdo).part.get() {
+        req.resources = ResourceSet::Partition(pi.clone());
+    }
+    let status = DriverStatus::Success;
 
     DriverStep::complete(status)
 }

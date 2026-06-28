@@ -28,13 +28,12 @@ use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceRead, DeviceWrite
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::port::Port;
-use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::{
-    DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
-    ResourceKind, driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
+    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceKind,
+    ResourceSet, driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::request::{DeviceControl, Pnp, Read, RequestHandle, RequestKind, Write};
+use kernel_api::request::{DeviceControl, Read, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
@@ -63,14 +62,11 @@ const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 10000;
 
-fn complete_req<K: RequestKind>(
-    _req: &mut RequestHandle<'_, K>,
-    status: DriverStatus,
-) -> DriverStep {
+fn complete_req<K>(_req: &mut K, status: DriverStatus) -> DriverStep {
     DriverStep::complete(status)
 }
 
-fn continue_req<K: RequestKind>(_req: &mut RequestHandle<'_, K>) -> DriverStep {
+fn continue_req<K>(_req: &mut K) -> DriverStep {
     DriverStep::Continue
 }
 
@@ -352,7 +348,7 @@ impl DeviceRead for IdePdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'data>>,
+        req: &'b mut Read<'data>,
     ) -> DriverStep {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
@@ -374,8 +370,8 @@ impl DeviceRead for IdePdoIo {
         };
 
         let any = {
-            let r = req.get();
-            match validate_ide_read_chain(&r.body) {
+            let r = &*req;
+            match validate_ide_read_chain(&r) {
                 Ok(any) => any,
                 Err(status) => return complete_req(req, status),
             }
@@ -394,10 +390,10 @@ impl DeviceRead for IdePdoIo {
 
         loop {
             let next = {
-                let r = req.get();
+                let r = &*req;
                 let mut out = Ok(None);
 
-                for (idx, read) in r.body.iter().enumerate() {
+                for (idx, read) in r.iter().enumerate() {
                     if idx < chain_index {
                         continue;
                     }
@@ -456,7 +452,7 @@ impl DeviceWrite for IdePdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'data>>,
+        req: &'b mut Write<'data>,
     ) -> DriverStep {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
@@ -478,8 +474,8 @@ impl DeviceWrite for IdePdoIo {
         };
 
         let any = {
-            let r = req.get();
-            match validate_ide_write_chain(&r.body) {
+            let r = &*req;
+            match validate_ide_write_chain(&r) {
                 Ok(any) => any,
                 Err(status) => return complete_req(req, status),
             }
@@ -498,10 +494,10 @@ impl DeviceWrite for IdePdoIo {
 
         loop {
             let next = {
-                let r = req.get();
+                let r = &*req;
                 let mut out = Ok(None);
 
-                for (idx, write) in r.body.iter().enumerate() {
+                for (idx, write) in r.iter().enumerate() {
                     if idx < chain_index {
                         continue;
                     }
@@ -560,7 +556,7 @@ impl DeviceControlHandler for IdePdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+        req: &'b mut DeviceControl<'data>,
     ) -> DriverStep {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
@@ -581,7 +577,7 @@ impl DeviceControlHandler for IdePdoIo {
             Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
         };
 
-        let code = { req.get().body.code };
+        let code = { req.code };
 
         match code {
             IOCTL_BLOCK_FLUSH => {
@@ -616,13 +612,10 @@ pub extern "C" fn ide_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let mut vt = PnpVtable::new();
+    let mut vt = PnpOps::new();
 
-    vt.set(PnpMinorFunction::StartDevice, ide_pnp_start);
-    vt.set(
-        PnpMinorFunction::QueryDeviceRelations,
-        ide_pnp_query_devrels,
-    );
+    vt.start_device.set(ide_pnp_start);
+    vt.query_device_relations.set(ide_pnp_query_devrels);
 
     let init = DeviceInit::with_pnp(Some(vt));
     *dev_init = init;
@@ -635,35 +628,21 @@ pub extern "C" fn ide_device_add(
 #[request_handler]
 async fn ide_pnp_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
-    let mut child_handle = RequestHandle::new(Pnp {
-        request: PnpRequest {
-            minor_function: PnpMinorFunction::QueryResources,
-            relation: DeviceRelationType::TargetDeviceRelation,
-            id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
-        },
-    });
+    let mut child_handle = QueryResources {
+        resources: ResourceSet::default(),
+    };
 
     let st = pnp::send_next_lower(dev.clone(), &mut child_handle).await;
 
     if st != DriverStatus::NoSuchDevice {
-        let qst = child_handle.get().status.clone();
-        if qst != DriverStatus::Success {
-            return complete_req(req, qst);
-        }
-
-        let binding = child_handle.get();
         let bars = {
-            let data = binding
-                .body
-                .request
-                .data_out_ref()
-                .view::<Vec<u8>>()
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
+            let data = match &child_handle.resources {
+                ResourceSet::Encoded(data) => data.as_slice(),
+                _ => &[],
+            };
 
             parse_ide_bars(data)
         };
@@ -721,9 +700,10 @@ async fn ide_pnp_start<'req, 'data, 'b>(
 #[request_handler]
 async fn ide_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
-    let relation = { req.get().body.request.relation };
+    let relation = req.relation;
 
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(dev);
@@ -796,10 +776,10 @@ fn create_child_pdo(
         compatible,
     };
 
-    let mut pvt = PnpVtable::new();
-    pvt.set(PnpMinorFunction::QueryId, ide_pdo_query_id);
-    pvt.set(PnpMinorFunction::QueryResources, ide_pdo_query_resources);
-    pvt.set(PnpMinorFunction::StartDevice, ide_pdo_start);
+    let mut pvt = PnpOps::new();
+    pvt.query_id.set(ide_pdo_query_id);
+    pvt.query_resources.set(ide_pdo_query_resources);
+    pvt.start_device.set(ide_pdo_start);
 
     let mut child_init = DeviceInit::with_pnp(Some(pvt));
 
@@ -1356,39 +1336,33 @@ fn wait_drq_poll_brief(ports: &mut Ports) -> bool {
 #[request_handler]
 pub async fn ide_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryId,
 ) -> DriverStep {
     use QueryIdType::*;
 
-    let ty = { req.get().body.request.id_type };
-
-    {
-        let w = req.get_mut();
-        let p = &mut w.body.request;
-
-        match ty {
-            HardwareIds => {
-                p.ids_out.push("IDE\\Disk".into());
-                p.ids_out.push("GenDisk".into());
-            }
-            CompatibleIds => {
-                p.ids_out.push("IDE\\Disk".into());
-                p.ids_out.push("GenDisk".into());
-            }
-            DeviceId => {
-                p.ids_out.push("IDE\\Disk".into());
-            }
-            InstanceId => {
-                p.ids_out.push(
-                    pdo.dev_node
-                        .get()
-                        .unwrap()
-                        .upgrade()
-                        .unwrap()
-                        .instance_path
-                        .clone(),
-                );
-            }
+    match req.id_type {
+        HardwareIds => {
+            req.ids.push("IDE\\Disk".into());
+            req.ids.push("GenDisk".into());
+        }
+        CompatibleIds => {
+            req.ids.push("IDE\\Disk".into());
+            req.ids.push("GenDisk".into());
+        }
+        DeviceId => {
+            req.ids.push("IDE\\Disk".into());
+        }
+        InstanceId => {
+            req.ids.push(
+                pdo.dev_node
+                    .get()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .instance_path
+                    .clone(),
+            );
         }
     }
 
@@ -1398,24 +1372,20 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
 #[request_handler]
 pub async fn ide_pdo_query_resources<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryResources,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
         Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
-    let status = {
-        let w = req.get_mut();
-        let p = &mut w.body.request;
-
-        match cdx.disk_info.as_ref() {
-            Some(di) => {
-                p.data_out = RequestData::from_t::<DiskInfo>(*di);
-                DriverStatus::Success
-            }
-            None => DriverStatus::DeviceNotReady,
+    let status = match cdx.disk_info.as_ref() {
+        Some(di) => {
+            req.resources = ResourceSet::Disk(*di);
+            DriverStatus::Success
         }
+        None => DriverStatus::DeviceNotReady,
     };
 
     complete_req(req, status)
@@ -1424,7 +1394,8 @@ pub async fn ide_pdo_query_resources<'req, 'data, 'b>(
 #[request_handler]
 pub async fn ide_pdo_start<'req, 'data, 'b>(
     _pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
 }

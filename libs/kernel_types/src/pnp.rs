@@ -1,10 +1,11 @@
-use crate::PnpMinorCallback;
-use crate::request::RequestData;
+use crate::device::DevNode;
+use crate::dma::IoBufferBacking;
+use crate::io::IoHandler;
+use crate::io::{DiskInfo, PartitionInfo};
 use crate::status::DriverStatus;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use array_init::array_init;
-use spin::Once;
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -46,7 +47,7 @@ pub enum QueryIdType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum PnpMinorFunction {
+pub enum PnpOp {
     StartDevice,
     QueryDeviceRelations,
     QueryId,
@@ -59,8 +60,8 @@ pub enum PnpMinorFunction {
     StopDevice,
 }
 
-impl PnpMinorFunction {
-    pub fn default_status_for_unhandled(&self) -> DriverStatus {
+impl PnpOp {
+    pub fn default_status_for_unhandled(self) -> DriverStatus {
         match self {
             Self::StartDevice
             | Self::QueryDeviceRelations
@@ -77,58 +78,60 @@ impl PnpMinorFunction {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct PnpVtable {
-    pub handlers: [Once<PnpMinorCallback>; PNP_MINOR_COUNT],
-}
-
-const PNP_MINOR_COUNT: usize = core::mem::variant_count::<PnpMinorFunction>();
-
-impl PnpVtable {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            handlers: array_init(|_| Once::new()),
-        }
-    }
-
-    #[inline]
-    pub fn set(&self, m: PnpMinorFunction, cb: PnpMinorCallback) {
-        let i = m as usize;
-        if i < self.handlers.len() {
-            let _ = self.handlers[i].call_once(|| cb);
-        }
-    }
-
-    #[inline]
-    pub fn get(&self, m: PnpMinorFunction) -> Option<PnpMinorCallback> {
-        let i = m as usize;
-        self.handlers.get(i).and_then(|h| h.get().copied())
-    }
+pub struct StartDevice {
+    pub resources: Vec<ResourceDescriptor>,
 }
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct PnpRequest<'data> {
-    pub minor_function: PnpMinorFunction,
+pub struct QueryDeviceRelations {
     pub relation: DeviceRelationType,
-    pub id_type: QueryIdType,
-    pub ids_out: Vec<String>,
-    pub data_out: RequestData<'data>,
+    pub devices: Vec<Arc<DevNode>>,
 }
 
-impl<'data> PnpRequest<'data> {
-    /// Print metadata without the actual data payload
-    pub fn print_meta(&self) -> alloc::string::String {
-        alloc::format!(
-            "PnpRequest {{ minor_function: {:?}, relation: {:?}, id_type: {:?}, ids_out: {:?}, data_out: {} }}",
-            self.minor_function,
-            self.relation,
-            self.id_type,
-            self.ids_out,
-            self.data_out.print_meta()
-        )
+#[repr(C)]
+#[derive(Debug)]
+pub struct QueryId {
+    pub id_type: QueryIdType,
+    pub ids: Vec<String>,
+}
+
+#[repr(C)]
+pub struct RegisterDmaBacking<'data> {
+    pub backing: &'data IoBufferBacking<'data>,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct QueryResources {
+    pub resources: ResourceSet,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResourceSet {
+    Descriptors(Vec<ResourceDescriptor>),
+    Encoded(Vec<u8>),
+    Disk(DiskInfo),
+    Partition(PartitionInfo),
+}
+
+impl Default for ResourceSet {
+    fn default() -> Self {
+        Self::Descriptors(Vec::new())
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct SurpriseRemoval;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct RemoveDevice;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct StopDevice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -167,6 +170,69 @@ impl ResourceDescriptor {
             start: irq,
             length: 0,
         }
+    }
+}
+
+pub type PnpHandler<T> = IoHandler<T>;
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct PnpSlot<T> {
+    handler: Option<PnpHandler<T>>,
+}
+
+impl<T> PnpSlot<T> {
+    pub const fn empty() -> Self {
+        Self { handler: None }
+    }
+
+    #[inline]
+    pub fn as_handler(&self) -> Option<&PnpHandler<T>> {
+        self.handler.as_ref()
+    }
+
+    #[inline]
+    pub fn set(&mut self, handler: T) {
+        self.handler = Some(PnpHandler::new(handler, 0));
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.handler = None;
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct PnpOps {
+    pub start_device: PnpSlot<crate::EvtPnpStartDevice>,
+    pub query_device_relations: PnpSlot<crate::EvtPnpQueryDeviceRelations>,
+    pub query_id: PnpSlot<crate::EvtPnpQueryId>,
+    pub register_dma_backing: PnpSlot<crate::EvtPnpRegisterDmaBacking>,
+    pub query_resources: PnpSlot<crate::EvtPnpQueryResources>,
+    pub surprise_removal: PnpSlot<crate::EvtPnpSurpriseRemoval>,
+    pub remove_device: PnpSlot<crate::EvtPnpRemoveDevice>,
+    pub stop_device: PnpSlot<crate::EvtPnpStopDevice>,
+}
+
+impl PnpOps {
+    pub const fn new() -> Self {
+        Self {
+            start_device: PnpSlot::empty(),
+            query_device_relations: PnpSlot::empty(),
+            query_id: PnpSlot::empty(),
+            register_dma_backing: PnpSlot::empty(),
+            query_resources: PnpSlot::empty(),
+            surprise_removal: PnpSlot::empty(),
+            remove_device: PnpSlot::empty(),
+            stop_device: PnpSlot::empty(),
+        }
+    }
+}
+
+impl Default for PnpOps {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -2,18 +2,14 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::pci::{EcamSegment, PciConfigAddress};
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pci::{pci_read_config_u32, pci_write_config_u32};
-use kernel_api::request::{Pnp, Request, RequestData, RequestHandle};
+use kernel_api::pnp::{QueryResources, ResourceSet};
 use kernel_api::status::{DriverStatus, PageMapError};
 
-use kernel_api::pnp::{
-    DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, ResourceKind, pnp,
-};
+use kernel_api::pnp::{ResourceKind, pnp};
 
 use kernel_api::println;
 use spin::{Once, RwLock};
@@ -99,12 +95,6 @@ pub struct PciPdoExt {
     pub bars: [Bar; 6],
 
     pub msix: Option<MsixInfo>,
-}
-
-#[repr(C)]
-pub struct PrepareHardwareCtx<'a> {
-    pub(crate) original_device: Arc<DeviceObject>,
-    pub(crate) original_request: Arc<RwLock<Request<Pnp<'a>>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -555,28 +545,6 @@ pub fn name_for(p: &PciPdoExt) -> alloc::string::String {
     alloc::format!("PCI_{}_{}_{}", p.bus, p.dev, p.func)
 }
 
-struct WaitCtx {
-    done: AtomicBool,
-    status: UnsafeCell<DriverStatus>,
-    blob: UnsafeCell<Vec<u8>>,
-}
-
-extern "C" fn on_complete(req: &mut Request<Pnp<'_>>, ctx: usize) -> DriverStatus {
-    let w = unsafe { &*(ctx as *const WaitCtx) };
-    let mut out = Vec::new();
-    if let Some(v) = req.body.request.data_out_ref().view::<Vec<u8>>() {
-        out.extend_from_slice(v);
-    }
-    unsafe {
-        *w.status.get() = req.status.clone();
-    }
-    unsafe {
-        *w.blob.get() = out;
-    }
-    w.done.store(true, Ordering::Release);
-    DriverStatus::Success
-}
-
 pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
     let mut segs = Vec::new();
     let mut i = 0usize;
@@ -638,15 +606,9 @@ pub fn parse_prt_from_blob(blob: &[u8]) -> Vec<PrtEntry> {
 }
 
 pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment> {
-    let pnp = PnpRequest {
-        minor_function: PnpMinorFunction::QueryResources,
-        relation: DeviceRelationType::TargetDeviceRelation,
-        id_type: QueryIdType::CompatibleIds,
-        ids_out: alloc::vec::Vec::new(),
-        data_out: RequestData::empty(),
+    let mut handle = QueryResources {
+        resources: ResourceSet::default(),
     };
-
-    let mut handle = RequestHandle::new(Pnp { request: pnp });
     let status = pnp::send_next_lower(device.clone(), &mut handle).await;
 
     if status != DriverStatus::Success {
@@ -654,14 +616,10 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
         return alloc::vec::Vec::new();
     }
 
-    let blob = handle
-        .get()
-        .body
-        .request
-        .data_out_ref()
-        .view::<Vec<u8>>()
-        .cloned()
-        .unwrap_or_default();
+    let blob = match handle.resources {
+        ResourceSet::Encoded(blob) => blob,
+        _ => Vec::new(),
+    };
 
     let segs: Vec<McfgSegment> = parse_ecam_segments_from_blob(&blob);
     if segs.is_empty() {

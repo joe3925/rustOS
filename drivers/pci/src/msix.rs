@@ -8,7 +8,7 @@ use kernel_api::kernel_types::irq::{
 };
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
-use kernel_api::request::{DeviceControl, RequestHandle};
+use kernel_api::request::DeviceControl;
 use kernel_api::status::DriverStatus;
 
 use crate::dev_ext::{BarKind, PciPdoExt};
@@ -30,7 +30,7 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 /// Program MSI-X table and enable MSI-X capability.
 pub async fn pci_setup_msix<'req, 'data>(
     dev: Arc<DeviceObject>,
-    req: &mut RequestHandle<'req, DeviceControl<'data>>,
+    req: &mut DeviceControl<'data>,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(e) => e,
@@ -42,10 +42,7 @@ pub async fn pci_setup_msix<'req, 'data>(
         None => return DriverStep::complete(DriverStatus::NotImplemented),
     };
 
-    let msi_request = match {
-        let data = req.data().read_only();
-        data.view::<MsiRequest>().copied()
-    } {
+    let msi_request = match { req.data.view::<MsiRequest>().copied() } {
         Some(request) => request,
         None => return DriverStep::complete(DriverStatus::InvalidParameter),
     };

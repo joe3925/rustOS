@@ -211,7 +211,7 @@ impl CompletionQueue {
         self.completion_permits.fetch_add(1, Ordering::Release);
     }
 
-    fn complete_request(
+    fn complete_entry(
         &self,
         request_id: RequestId,
         opcode: IoOpcode,
@@ -274,7 +274,7 @@ impl Future for IoRequestDriverFuture {
         {
             Ok(CompleteTransition::Normal) => {}
             Ok(CompleteTransition::Cancelled) => {
-                this.queue.complete_request(
+                this.queue.complete_entry(
                     this.request_id,
                     this.opcode,
                     this.user_token,
@@ -288,7 +288,7 @@ impl Future for IoRequestDriverFuture {
         match this.inner.as_mut().poll(cx) {
             Poll::Ready(output) => {
                 this.queue
-                    .complete_request(this.request_id, this.opcode, this.user_token, output);
+                    .complete_entry(this.request_id, this.opcode, this.user_token, output);
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,

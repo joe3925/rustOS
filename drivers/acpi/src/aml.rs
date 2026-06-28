@@ -14,16 +14,15 @@ use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::pci::EcamSegment;
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::kernel_types::request::RequestData;
+use kernel_api::kernel_types::request::IoctlData;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
-use kernel_api::pnp::PnpMinorFunction;
-use kernel_api::pnp::PnpVtable;
+use kernel_api::pnp::PnpOp;
+use kernel_api::pnp::PnpOps;
 use kernel_api::pnp::QueryIdType;
 use kernel_api::pnp::ResourceKind;
 use kernel_api::pnp::get_acpi_tables;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
-use kernel_api::request::{Pnp, RequestHandle};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 pub const PAGE_SIZE: usize = 4096;
@@ -336,10 +335,10 @@ pub fn create_pnp_bus_from_acpi(
         dev_name.as_string()
     };
 
-    let mut vt = PnpVtable::new();
-    vt.set(PnpMinorFunction::QueryResources, acpi_pdo_query_resources);
-    vt.set(PnpMinorFunction::QueryId, acpi_pdo_query_id);
-    vt.set(PnpMinorFunction::StartDevice, acpi_pdo_start);
+    let mut vt = PnpOps::new();
+    vt.query_resources.set(acpi_pdo_query_resources);
+    vt.query_id.set(acpi_pdo_query_id);
+    vt.start_device.set(acpi_pdo_start);
 
     let mut init = DeviceInit::with_pnp(Some(vt));
     let mut ext = AcpiPdoExt {
@@ -913,7 +912,8 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 #[request_handler]
 pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryResources,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
@@ -931,11 +931,7 @@ pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
         append_prt_list(&mut blob, &pext.prt);
     }
 
-    {
-        let w = req.get_mut();
-        w.body.request.data_out = RequestData::from_t::<Vec<u8>>(blob);
-        w.status = DriverStatus::Success;
-    }
+    req.resources = kernel_api::pnp::ResourceSet::Encoded(blob);
 
     DriverStep::complete(DriverStatus::Success)
 }
@@ -943,11 +939,12 @@ pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
 #[request_handler]
 pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryId,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
-    let ty = { req.get().body.request.id_type };
+    let ty = req.id_type;
 
     let ctx_lock = &pext.ctx;
     let mut guard = ctx_lock.write();
@@ -955,36 +952,29 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
     drop(guard);
 
     let mut status = DriverStatus::Success;
-    {
-        let w = req.get_mut();
-        let p = &mut w.body.request;
-
-        match ty {
-            QueryIdType::HardwareIds => {
-                if let Some(h) = hid_opt {
-                    p.ids_out.push(h);
-                }
-            }
-            QueryIdType::CompatibleIds => {
-                p.ids_out.append(&mut cids);
-            }
-            QueryIdType::DeviceId => {
-                if let Some(h) = hid_opt {
-                    p.ids_out.push(h);
-                } else {
-                    status = DriverStatus::NoSuchDevice;
-                }
-            }
-            QueryIdType::InstanceId => {
-                if let Some(dn) = dev.dev_node.get().unwrap().upgrade() {
-                    p.ids_out.push(dn.instance_path.clone());
-                } else {
-                    status = DriverStatus::NoSuchDevice;
-                }
+    match ty {
+        QueryIdType::HardwareIds => {
+            if let Some(h) = hid_opt {
+                req.ids.push(h);
             }
         }
-
-        w.status = status.clone();
+        QueryIdType::CompatibleIds => {
+            req.ids.append(&mut cids);
+        }
+        QueryIdType::DeviceId => {
+            if let Some(h) = hid_opt {
+                req.ids.push(h);
+            } else {
+                status = DriverStatus::NoSuchDevice;
+            }
+        }
+        QueryIdType::InstanceId => {
+            if let Some(dn) = dev.dev_node.get().unwrap().upgrade() {
+                req.ids.push(dn.instance_path.clone());
+            } else {
+                status = DriverStatus::NoSuchDevice;
+            }
+        }
     }
 
     DriverStep::complete(status)
@@ -993,7 +983,8 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
 #[request_handler]
 pub async fn acpi_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

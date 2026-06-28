@@ -15,7 +15,7 @@ use kernel_api::{
     },
     pnp::io,
     println,
-    request::{Read as ReadRequest, RequestHandle, Write as WriteRequest},
+    request::{Read as ReadRequest, Write as WriteRequest},
     status::DriverStatus,
 };
 
@@ -114,7 +114,7 @@ impl BlockDev {
             }
         };
 
-        let mut req = RequestHandle::new(ReadRequest::new(offset, len, false, Some(buffer)));
+        let mut req = ReadRequest::new(offset, len, false, Some(buffer));
 
         let status = io::send_down_stack(volume, &mut req).await;
 
@@ -137,9 +137,9 @@ impl BlockDev {
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
     ) -> Result<usize, DriverStatus> {
         let len = buffer.len();
-        let mut req = RequestHandle::new(ReadRequest::new(offset, len, false, Some(buffer)));
+        let mut req = ReadRequest::new(offset, len, false, Some(buffer));
         let status = io::send_down_stack(self.volume.clone(), &mut req).await;
-        let completed = req.get().body.len;
+        let completed = req.len;
         if status == DriverStatus::Success {
             Ok(completed)
         } else {
@@ -182,13 +182,13 @@ impl BlockDev {
             }
         };
 
-        let mut req = RequestHandle::new(WriteRequest::new(
+        let mut req = WriteRequest::new(
             offset,
             len,
             no_buffer,
             self.current_owner.load(Ordering::Acquire),
             Some(buffer),
-        ));
+        );
 
         let status = io::send_down_stack(volume, &mut req).await;
 
@@ -211,15 +211,15 @@ impl BlockDev {
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
     ) -> Result<usize, DriverStatus> {
         let len = buffer.len();
-        let mut req = RequestHandle::new(WriteRequest::new(
+        let mut req = WriteRequest::new(
             offset,
             len,
             false,
             self.current_owner.load(Ordering::Acquire),
             Some(buffer),
-        ));
+        );
         let status = io::send_down_stack(self.volume.clone(), &mut req).await;
-        let completed = req.get().body.len;
+        let completed = req.len;
         if status == DriverStatus::Success {
             Ok(completed)
         } else {

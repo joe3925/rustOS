@@ -15,10 +15,9 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::pnp::DeviceIds,
     pnp::{
-        DriverStep, PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
+        DriverStep, PnpOp, PnpOps, QueryIdType, driver_set_evt_device_add,
         pnp_create_child_devnode_and_pdo_with_init,
     },
-    request::{Pnp, RequestHandle},
     request_handler,
     status::DriverStatus,
 };
@@ -53,11 +52,11 @@ pub extern "C" fn ps2_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let pnp = PnpVtable::new();
-    pnp.set(PnpMinorFunction::StartDevice, ps2_start);
-    pnp.set(PnpMinorFunction::QueryDeviceRelations, ps2_query_devrels);
+    let mut pnp = PnpOps::new();
+    pnp.start_device.set(ps2_start);
+    pnp.query_device_relations.set(ps2_query_devrels);
 
-    dev_init.pnp_vtable = Some(pnp);
+    dev_init.pnp_ops = Some(pnp);
     dev_init.set_dev_ext_from(DevExt {
         probed: AtomicBool::new(false),
         have_kbd: AtomicBool::new(false),
@@ -69,7 +68,8 @@ pub extern "C" fn ps2_device_add(
 #[request_handler]
 pub async fn ps2_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     if let Ok(ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
@@ -86,10 +86,11 @@ pub async fn ps2_start<'req, 'data, 'b>(
 #[request_handler]
 pub async fn ps2_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
     use kernel_api::pnp::DeviceRelationType;
-    let relation = req.get().body.request.relation;
+    let relation = req.relation;
     if relation != DeviceRelationType::BusRelations {
         return DriverStep::complete(DriverStatus::NotImplemented);
     }
@@ -155,9 +156,9 @@ fn make_child_pdo(
         compatible: compat.iter().map(|s| (*s).into()).collect(),
     };
 
-    let vt = PnpVtable::new();
-    vt.set(PnpMinorFunction::QueryId, ps2_child_query_id);
-    vt.set(PnpMinorFunction::StartDevice, ps2_child_start);
+    let mut vt = PnpOps::new();
+    vt.query_id.set(ps2_child_query_id);
+    vt.start_device.set(ps2_child_start);
 
     let mut child_init = DeviceInit::with_pnp(Some(vt));
     child_init.set_dev_ext_from(Ps2ChildExt { is_kbd });
@@ -175,56 +176,52 @@ fn make_child_pdo(
 #[request_handler]
 async fn ps2_child_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryId,
 ) -> DriverStep {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
         Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    {
-        let r = req.get_mut();
-        let p = &mut r.body.request;
-
-        match p.id_type {
-            QueryIdType::HardwareIds => {
+    match req.id_type {
+        QueryIdType::HardwareIds => {
+            if is_kbd {
+                req.ids.push("PS2\\Keyboard".into());
+                req.ids.push("ACPI\\PNP0303".into());
+            } else {
+                req.ids.push("PS2\\Mouse".into());
+                req.ids.push("ACPI\\PNP0F13".into());
+            }
+        }
+        QueryIdType::CompatibleIds => {
+            if is_kbd {
+                req.ids.push("INPUT\\Keyboard".into());
+                req.ids.push("INPUT\\GenericKbd".into());
+            } else {
+                req.ids.push("INPUT\\Pointer".into());
+                req.ids.push("INPUT\\GenericMouse".into());
+            }
+        }
+        QueryIdType::DeviceId => {
+            req.ids.push(
                 if is_kbd {
-                    p.ids_out.push("PS2\\Keyboard".into());
-                    p.ids_out.push("ACPI\\PNP0303".into());
+                    "PS2\\Keyboard"
                 } else {
-                    p.ids_out.push("PS2\\Mouse".into());
-                    p.ids_out.push("ACPI\\PNP0F13".into());
+                    "PS2\\Mouse"
                 }
-            }
-            QueryIdType::CompatibleIds => {
+                .into(),
+            );
+        }
+        QueryIdType::InstanceId => {
+            req.ids.push(
                 if is_kbd {
-                    p.ids_out.push("INPUT\\Keyboard".into());
-                    p.ids_out.push("INPUT\\GenericKbd".into());
+                    "\\I8042\\Kbd0"
                 } else {
-                    p.ids_out.push("INPUT\\Pointer".into());
-                    p.ids_out.push("INPUT\\GenericMouse".into());
+                    "\\I8042\\Mouse0"
                 }
-            }
-            QueryIdType::DeviceId => {
-                p.ids_out.push(
-                    if is_kbd {
-                        "PS2\\Keyboard"
-                    } else {
-                        "PS2\\Mouse"
-                    }
-                    .into(),
-                );
-            }
-            QueryIdType::InstanceId => {
-                p.ids_out.push(
-                    if is_kbd {
-                        "\\I8042\\Kbd0"
-                    } else {
-                        "\\I8042\\Mouse0"
-                    }
-                    .into(),
-                );
-            }
+                .into(),
+            );
         }
     }
     DriverStep::complete(DriverStatus::Success)
@@ -233,7 +230,8 @@ async fn ps2_child_query_id<'req, 'data, 'b>(
 #[request_handler]
 async fn ps2_child_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

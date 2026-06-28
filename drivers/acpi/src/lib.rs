@@ -14,10 +14,9 @@ use kernel_api::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::memory::{PhysAddr, map_mmio_region};
 use kernel_api::pnp::{
-    DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
+    DriverStep, PnpOp, PnpOps, driver_set_evt_device_add, get_acpi_tables,
     pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::request::{Pnp, RequestHandle};
 use kernel_api::runtime::spawn_blocking;
 use kernel_api::status::DriverStatus;
 use kernel_api::{println, request_handler};
@@ -45,12 +44,12 @@ pub extern "C" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStep {
-    let mut pnp_vtable = PnpVtable::new();
-    pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
-    pnp_vtable.set(PnpMinorFunction::QueryDeviceRelations, enumerate_bus);
+    let mut pnp_ops = PnpOps::new();
+    pnp_ops.start_device.set(bus_driver_prepare_hardware);
+    pnp_ops.query_device_relations.set(enumerate_bus);
 
     dev_init_ptr.set_dev_ext_default::<DevExt>();
-    dev_init_ptr.pnp_vtable = Some(pnp_vtable);
+    dev_init_ptr.pnp_ops = Some(pnp_ops);
 
     DriverStep::complete(DriverStatus::Success)
 }
@@ -58,7 +57,8 @@ pub extern "C" fn bus_driver_device_add(
 #[request_handler]
 pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     let (dsdt, ssdts) = {
         let acpi_tables = get_acpi_tables();
@@ -146,7 +146,8 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 #[request_handler]
 pub async fn enumerate_bus<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
@@ -194,7 +195,7 @@ fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
         compatible: alloc::vec![],
     };
 
-    let child_init = DeviceInit::with_pnp(Some(PnpVtable::new()));
+    let child_init = DeviceInit::with_pnp(Some(PnpOps::new()));
 
     let name = "\\Device\\ACPI_I8042".to_string();
     let instance = "ACPI\\I8042\\0".to_string();

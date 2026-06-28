@@ -24,7 +24,7 @@ use kernel_api::memory::{
 };
 use kernel_api::println;
 use kernel_api::request::Read;
-use kernel_api::request::{RequestHandle, Write};
+use kernel_api::request::Write;
 use kernel_api::runtime::spawn_detached;
 use spin::Mutex;
 
@@ -517,7 +517,7 @@ where
 
         let len = buffer.len();
 
-        let mut req = RequestHandle::new(Write::new(offset, len, false, owner, Some(buffer)));
+        let mut req = Write::new(offset, len, false, owner, Some(buffer));
 
         let status = self.backend.write_request(&mut req).await;
         drop(req);
@@ -891,7 +891,7 @@ where
             }
 
             let io_buf = self.create_cache_from_device_buffer_at(page, block_off, len)?;
-            let mut req = RequestHandle::new(Read::new(offset, len, false, Some(io_buf)));
+            let mut req = Read::new(offset, len, false, Some(io_buf));
             self.backend
                 .read_request(&mut req)
                 .await
@@ -1059,13 +1059,13 @@ where
     ) -> Result<(), CacheError<B::Error>> {
         let buffer = self.create_cache_to_device_buffer(page, BLOCK_SIZE)?;
 
-        let mut req = RequestHandle::new(Write::new(
+        let mut req = Write::new(
             lba * BLOCK_SIZE as u64,
             BLOCK_SIZE,
             false,
             owner,
             Some(buffer),
-        ));
+        );
 
         let status = self.backend.write_request(&mut req).await;
         drop(req);
@@ -1452,19 +1452,19 @@ where
         let first_buffer =
             self.create_cache_to_device_buffer_at(&first_page.page, first_block_off, first_len)?;
 
-        let mut req = RequestHandle::new(Write::new(
+        let mut req = Write::new(
             first_offset,
             first_len,
             false,
             first_page.page.owner.load(Ordering::Acquire),
             Some(first_buffer),
-        ));
+        );
 
         let mut initialized = 0usize;
         let mut result = Ok(());
 
         {
-            let req_write = req.get_mut();
+            let req_write = &req;
 
             let mut chain_idx = 1usize;
             while chain_idx < extents.len() {
@@ -1529,7 +1529,7 @@ where
                     as *mut Write<'static> as *mut Write<'_>;
 
                 unsafe {
-                    req_write.body.append_next(curr_write_ptr);
+                    req_write.append_next(curr_write_ptr);
                 }
 
                 chain_idx += 1;
@@ -2269,19 +2269,16 @@ where
     F: CacheIndexFactory<Arc<CachePage>>,
 {
     type Error = CacheError<B::Error>;
-    async fn read_request<'req, 'data>(
-        &self,
-        req: &mut RequestHandle<'req, Read<'data>>,
-    ) -> Result<(), Self::Error> {
+    async fn read_request<'req, 'data>(&self, req: &mut Read<'data>) -> Result<(), Self::Error> {
         self.check_open()?;
 
         let (offset, len_req, no_buffer, req_data_len) = {
-            let r = req.get();
+            let r = &*req;
             (
-                r.body.offset,
-                r.body.len,
-                r.body.no_buffer,
-                r.body.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+                r.offset,
+                r.len,
+                r.no_buffer,
+                r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
             )
         };
 
@@ -2300,8 +2297,8 @@ where
 
         if no_buffer {
             {
-                let w = req.get_mut();
-                w.body.len = len;
+                let w = &mut *req;
+                w.len = len;
             }
 
             self.backend
@@ -2326,7 +2323,7 @@ where
             }
 
             if !has_cached_page && self.free_pages.lock().is_empty() {
-                req.get_mut().body.len = len;
+                req.len = len;
 
                 self.backend
                     .read_request(req)
@@ -2338,8 +2335,6 @@ where
         }
 
         let contiguous_dst = req
-            .get_mut()
-            .body
             .buffer
             .as_mut()
             .and_then(|buffer| buffer.try_as_mut_slice())
@@ -2356,31 +2351,23 @@ where
         bytes.resize(len, 0);
         self.read_at(offset, &mut bytes).await?;
 
-        let buffer = req
-            .get_mut()
-            .body
-            .buffer
-            .as_mut()
-            .ok_or(CacheError::InvalidConfig)?;
+        let buffer = req.buffer.as_mut().ok_or(CacheError::InvalidConfig)?;
         buffer
             .copy_from_slice(0, &bytes)
             .map_err(CacheError::InvalidIoBuffer)
     }
 
-    async fn write_request<'req, 'data>(
-        &self,
-        req: &mut RequestHandle<'req, Write<'data>>,
-    ) -> Result<(), Self::Error> {
+    async fn write_request<'req, 'data>(&self, req: &mut Write<'data>) -> Result<(), Self::Error> {
         self.check_open()?;
 
         let (offset, len_req, no_buffer, owner, req_data_len) = {
-            let r = req.get();
+            let r = &*req;
             (
-                r.body.offset,
-                r.body.len,
-                r.body.no_buffer,
-                r.body.owner,
-                r.body.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+                r.offset,
+                r.len,
+                r.no_buffer,
+                r.owner,
+                r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
             )
         };
 
@@ -2399,8 +2386,8 @@ where
 
         if no_buffer {
             {
-                let w = req.get_mut();
-                w.body.len = len;
+                let w = &mut *req;
+                w.len = len;
             }
 
             self.backend
@@ -2425,7 +2412,7 @@ where
             }
 
             if !has_cached_page && self.free_pages.lock().is_empty() {
-                req.get_mut().body.len = len;
+                req.len = len;
 
                 self.backend
                     .write_request(req)
@@ -2437,12 +2424,7 @@ where
             }
         }
 
-        let buffer = req
-            .get_mut()
-            .body
-            .buffer
-            .take()
-            .ok_or(CacheError::InvalidConfig)?;
+        let buffer = req.buffer.take().ok_or(CacheError::InvalidConfig)?;
 
         VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, buffer, len, owner).await?;
         VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);

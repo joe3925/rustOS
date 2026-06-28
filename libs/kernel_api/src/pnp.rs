@@ -12,91 +12,70 @@ pub use kernel_types::pnp::*;
 
 pub mod io {
     use alloc::sync::{Arc, Weak};
+    use kernel_routing::IoRequest;
     use kernel_types::device::{DevNode, DeviceObject};
     use kernel_types::io::IoTarget;
-    use kernel_types::request::RequestHandle;
     use kernel_types::status::DriverStatus;
-    use kernel_routing::IoRequest;
 
     pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
         kernel_routing::io::resolve_target(link_path)
     }
 
-    pub async fn send_to_device<K: IoRequest>(
-        target: IoTarget,
-        handle: &mut RequestHandle<'_, K>,
-    ) -> DriverStatus {
-        kernel_routing::io::send_to_device(target, handle).await
+    pub async fn send_to_device<K: IoRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+        kernel_routing::io::send_to_device(target, req).await
     }
 
-    pub async fn send_down_stack<K: IoRequest>(
-        target: IoTarget,
-        handle: &mut RequestHandle<'_, K>,
-    ) -> DriverStatus {
-        kernel_routing::io::send_down_stack(target, handle).await
+    pub async fn send_down_stack<K: IoRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+        kernel_routing::io::send_down_stack(target, req).await
     }
 
     pub async fn send_next_lower<K: IoRequest>(
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'_, K>,
+        req: &mut K,
     ) -> DriverStatus {
-        kernel_routing::io::send_next_lower(from, handle).await
+        kernel_routing::io::send_next_lower(from, req).await
     }
 
     pub async fn send_to_stack_top<K: IoRequest>(
         dev_node_weak: Weak<DevNode>,
-        handle: &mut RequestHandle<'_, K>,
+        req: &mut K,
     ) -> DriverStatus {
-        kernel_routing::io::send_to_stack_top(dev_node_weak, handle).await
+        kernel_routing::io::send_to_stack_top(dev_node_weak, req).await
     }
-
 }
 
 pub mod pnp {
     use alloc::sync::{Arc, Weak};
+    use kernel_routing::PnpRequest;
     use kernel_types::device::{DevNode, DeviceObject};
     use kernel_types::io::IoTarget;
-    use kernel_types::request::{Pnp, RequestHandle};
     use kernel_types::status::DriverStatus;
 
     pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
         kernel_routing::pnp::resolve_target(link_path)
     }
 
-    pub async fn send_to_device<'data>(
-        target: IoTarget,
-        handle: &mut RequestHandle<'_, Pnp<'data>>,
-    ) -> DriverStatus {
-        kernel_routing::pnp::send_to_device(target, handle).await
+    pub async fn send_to_device<K: PnpRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+        kernel_routing::pnp::send_to_device(target, req).await
     }
 
-    pub async fn send_down_stack<'data>(
-        target: IoTarget,
-        handle: &mut RequestHandle<'_, Pnp<'data>>,
-    ) -> DriverStatus {
-        kernel_routing::pnp::send_down_stack(target, handle).await
+    pub async fn send_down_stack<K: PnpRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+        kernel_routing::pnp::send_down_stack(target, req).await
     }
 
-    pub async fn send_next_lower<'data>(
+    pub async fn send_next_lower<K: PnpRequest>(
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'_, Pnp<'data>>,
+        req: &mut K,
     ) -> DriverStatus {
-        kernel_routing::pnp::send_next_lower(from, handle).await
+        kernel_routing::pnp::send_next_lower(from, req).await
     }
 
-    pub async fn send_to_stack_top<'data>(
+    pub async fn send_to_stack_top<K: PnpRequest>(
         dev_node_weak: Weak<DevNode>,
-        handle: &mut RequestHandle<'_, Pnp<'data>>,
+        req: &mut K,
     ) -> DriverStatus {
-        kernel_routing::pnp::send_to_stack_top(dev_node_weak, handle).await
+        kernel_routing::pnp::send_to_stack_top(dev_node_weak, req).await
     }
-
-}
-
-pub fn complete_request<K: kernel_types::request::RequestKind>(
-    handle: &mut kernel_types::request::RequestHandle<'_, K>,
-) -> DriverStatus {
-    kernel_routing::complete_request(handle)
 }
 
 pub fn create_pdo(

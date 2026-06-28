@@ -1,12 +1,11 @@
 use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
-use crate::dma::IoBufferBacking;
 use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate,
     FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite,
-    FsZeroRange, Read, RequestHandle, Write,
+    FsZeroRange, Read, Write,
 };
 use crate::{
     EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
@@ -615,54 +614,54 @@ impl<T> IoHandler<T> {
 pub trait DeviceRead {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'io, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'io>>,
+    extern "C" fn handler<'a, 'io>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut Read<'io>,
     ) -> FfiFuture<DriverStep>;
 }
 
 pub trait DeviceWrite {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'io, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'io>>,
+    extern "C" fn handler<'a, 'io>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut Write<'io>,
     ) -> FfiFuture<DriverStep>;
 }
 
 pub trait DeviceFlush {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Flush>,
+    extern "C" fn handler<'a>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut Flush,
     ) -> FfiFuture<DriverStep>;
 }
 
 pub trait DeviceFlushDirty {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FlushDirty>,
+    extern "C" fn handler<'a>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FlushDirty,
     ) -> FfiFuture<DriverStep>;
 }
 
 pub trait DeviceFlushOwner {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FlushOwner>,
+    extern "C" fn handler<'a>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FlushOwner,
     ) -> FfiFuture<DriverStep>;
 }
 
 pub trait DeviceControlHandler {
     const DEPTH: u32 = 0;
 
-    extern "C" fn handler<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    extern "C" fn handler<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut DeviceControl<'data>,
     ) -> FfiFuture<DriverStep>;
 }
 
@@ -681,69 +680,69 @@ pub trait FileSystem {
     const APPEND_DEPTH: u32 = 0;
     const ZERO_RANGE_DEPTH: u32 = 0;
 
-    extern "C" fn open<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsOpen>>,
+    extern "C" fn open<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsOpen>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn close<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsClose>>,
+    extern "C" fn close<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsClose>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn read<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRead>>,
+    extern "C" fn read<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsRead>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn write<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsWrite>>,
+    extern "C" fn write<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsWrite>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn flush<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsFlush>>,
+    extern "C" fn flush<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsFlush>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn seek<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSeek>>,
+    extern "C" fn seek<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsSeek>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn create<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsCreate>>,
+    extern "C" fn create<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsCreate>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn rename<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRename>>,
+    extern "C" fn rename<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsRename>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn read_dir<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsReadDir>>,
+    extern "C" fn read_dir<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsReadDir>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn get_info<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsGetInfo>>,
+    extern "C" fn get_info<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsGetInfo>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn set_len<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSetLen>>,
+    extern "C" fn set_len<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsSetLen>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn append<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsAppend>>,
+    extern "C" fn append<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsAppend>,
     ) -> FfiFuture<DriverStep>;
 
-    extern "C" fn zero_range<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, FsRequest<'data, FsZeroRange>>,
+    extern "C" fn zero_range<'a, 'data>(
+        dev: &'a Arc<DeviceObject>,
+        req: &'a mut FsRequest<'data, FsZeroRange>,
     ) -> FfiFuture<DriverStep>;
 }
 
@@ -944,9 +943,4 @@ impl DeviceOps {
             fs: FsSlot::empty(),
         }
     }
-}
-#[repr(C)]
-#[derive(kernel_macros::RequestPayload)]
-pub struct DmaBacking<'data> {
-    pub backing: &'data IoBufferBacking<'data>,
 }

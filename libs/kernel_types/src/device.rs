@@ -1,8 +1,8 @@
-use crate::DriverStatus;
 use crate::fs::Path;
 use crate::io::DeviceOps;
 use crate::memory::Module;
-use crate::pnp::{BootType, DeviceIds, PnpVtable};
+use crate::pnp::{BootType, DeviceIds, PnpOps};
+use crate::status::DriverStatus;
 use crate::{EvtDriverDeviceAdd, EvtDriverUnload};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -467,7 +467,7 @@ pub struct DeviceObject {
     pub upper_device: Once<Weak<DeviceObject>>,
     dev_ext: DevExtBox,
     pub ops: DeviceOps,
-    pub pnp_vtable: Option<PnpVtable>,
+    pub pnp_ops: Option<PnpOps>,
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
@@ -485,7 +485,7 @@ impl DeviceObject {
             upper_device: Once::new(),
             dev_ext,
             ops: init.ops,
-            pnp_vtable: init.pnp_vtable,
+            pnp_ops: init.pnp_ops,
             dispatch_tickets: AtomicU32::new(0),
             dev_node: Once::new(),
             in_queue: AtomicBool::new(false),
@@ -607,7 +607,7 @@ impl DeviceObject {
 #[derive(Debug)]
 pub struct DeviceInit {
     pub ops: DeviceOps,
-    pub pnp_vtable: Option<PnpVtable>,
+    pub pnp_ops: Option<PnpOps>,
     pub(crate) dev_ext_type: Option<TypeId>,
     pub(crate) dev_ext_size: usize,
     pub(crate) dev_ext_ready: Option<DevExtBox>,
@@ -617,16 +617,16 @@ impl DeviceInit {
     pub fn new() -> Self {
         Self {
             ops: DeviceOps::empty(),
-            pnp_vtable: None,
+            pnp_ops: None,
             dev_ext_type: None,
             dev_ext_size: 0,
             dev_ext_ready: None,
         }
     }
 
-    pub fn with_pnp(pnp_vtable: Option<PnpVtable>) -> Self {
+    pub fn with_pnp(pnp_ops: Option<PnpOps>) -> Self {
         let mut init = Self::new();
-        init.pnp_vtable = pnp_vtable;
+        init.pnp_ops = pnp_ops;
         init
     }
 

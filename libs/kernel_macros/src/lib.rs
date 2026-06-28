@@ -423,7 +423,7 @@ fn request_into_case_items(
             unsafe extern "C" fn request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
-                out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
+                out: *mut ::kernel_types::request::IoctlData<'__request_payload_data>,
             ) -> bool;
         }
 
@@ -440,7 +440,7 @@ fn request_into_case_items(
             default unsafe extern "C" fn request_payload_into_case(
                 _target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
-                _out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
+                _out: *mut ::kernel_types::request::IoctlData<'__request_payload_data>,
             ) -> bool {
                 false
             }
@@ -464,7 +464,7 @@ fn request_into_case_items(
             unsafe extern "C" fn request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
-                out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
+                out: *mut ::kernel_types::request::IoctlData<'__request_payload_data>,
             ) -> bool {
                 if target_tag
                     != <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::RUNTIME_TAG
@@ -475,7 +475,7 @@ fn request_into_case_items(
                 let source = unsafe { ::core::ptr::read(parts.data as *const #source) };
                 let target = <#source as ::core::convert::Into<#target>>::into(source);
                 unsafe {
-                    ::core::ptr::write(out, ::kernel_types::request::RequestData::from_t(target));
+                    ::core::ptr::write(out, ::kernel_types::request::IoctlData::from_t(target));
                 }
                 true
             }
@@ -696,7 +696,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             unsafe extern "C" fn into_request_data(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
-                out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
+                out: *mut ::kernel_types::request::IoctlData<'__request_payload_data>,
             ) -> bool {
                 #(
                     if unsafe {
@@ -808,44 +808,13 @@ pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Check if a type is `&mut RequestHandle`
-fn type_is_mut_ref_request_handle(ty: &Type) -> bool {
+fn type_is_mut_ref(ty: &Type) -> bool {
     match ty {
-        Type::Reference(r) => r.mutability.is_some() && type_is_request_handle_path(&r.elem),
-        Type::Paren(p) => type_is_mut_ref_request_handle(&p.elem),
-        Type::Group(g) => type_is_mut_ref_request_handle(&g.elem),
+        Type::Reference(r) => r.mutability.is_some(),
+        Type::Paren(p) => type_is_mut_ref(&p.elem),
+        Type::Group(g) => type_is_mut_ref(&g.elem),
         _ => false,
     }
-}
-
-/// Check if a type path is RequestHandle
-fn type_is_request_handle_path(ty: &Type) -> bool {
-    match ty {
-        Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident == "RequestHandle")
-            .unwrap_or(false),
-        Type::Paren(p) => type_is_request_handle_path(&p.elem),
-        Type::Group(g) => type_is_request_handle_path(&g.elem),
-        _ => false,
-    }
-}
-
-/// Find the RequestHandle parameter and return its identifier
-fn find_request_handle_param(sig: &syn::Signature) -> Option<syn::Ident> {
-    for arg in sig.inputs.iter() {
-        let FnArg::Typed(pat_ty) = arg else { continue };
-        let Pat::Ident(pat_ident) = &*pat_ty.pat else {
-            continue;
-        };
-
-        if type_is_mut_ref_request_handle(&pat_ty.ty) {
-            return Some(pat_ident.ident.clone());
-        }
-    }
-    None
 }
 
 fn validate_function(sig: &syn::Signature) -> syn::Result<()> {
@@ -870,12 +839,13 @@ fn validate_function(sig: &syn::Signature) -> syn::Result<()> {
         ));
     }
 
-    // Check that there's at least one &mut RequestHandle parameter
-    let has_request_handle = find_request_handle_param(sig).is_some();
-    if !has_request_handle {
+    if !sig.inputs.iter().any(|arg| match arg {
+        FnArg::Typed(pat_ty) => type_is_mut_ref(&pat_ty.ty),
+        FnArg::Receiver(_) => false,
+    }) {
         return Err(syn::Error::new_spanned(
             sig,
-            "#[request_handler] requires a &mut RequestHandle parameter",
+            "#[request_handler] requires a mutable typed request parameter",
         ));
     }
 
@@ -888,25 +858,17 @@ fn validate_function(sig: &syn::Signature) -> syn::Result<()> {
                 ));
             }
             FnArg::Typed(pat_ty) => {
-                // Allow &mut RequestHandle
-                if type_is_mut_ref_request_handle(&pat_ty.ty) {
+                if type_is_mut_ref(&pat_ty.ty) {
                     continue;
                 }
 
-                // Allow shared refs to Arc<_>; disallow other reference types
                 if let Type::Reference(ty_ref) = &*pat_ty.ty {
-                    if type_is_request_handle_path(&ty_ref.elem) {
-                        return Err(syn::Error::new_spanned(
-                            ty_ref,
-                            "#[request_handler] RequestHandle must be passed as &mut RequestHandle",
-                        ));
-                    }
                     if type_is_arc(&ty_ref.elem) {
                         continue;
                     }
                     return Err(syn::Error::new_spanned(
                         ty_ref,
-                        "#[request_handler] handler parameters must be owned types; only &Arc<T> references are allowed",
+                        "#[request_handler] only permits &Arc<T>, &mut TypedRequest, and owned parameters",
                     ));
                 }
 

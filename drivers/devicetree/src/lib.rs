@@ -17,11 +17,10 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{fdt::FdtHeader, pnp::DeviceIds},
     pnp::{
-        DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, QueryIdType,
-        ResourceDescriptor, driver_set_evt_device_add, encode_resource_descriptors,
-        get_device_tree_blob, pnp_create_child_devnode_and_pdo_with_init,
+        DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, ResourceDescriptor,
+        driver_set_evt_device_add, encode_resource_descriptors, get_device_tree_blob,
+        pnp_create_child_devnode_and_pdo_with_init,
     },
-    request::{Pnp, RequestData, RequestHandle},
     request_handler,
     status::DriverStatus,
 };
@@ -59,21 +58,19 @@ pub extern "C" fn devicetree_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let pnp = PnpVtable::new();
-    pnp.set(PnpMinorFunction::StartDevice, devicetree_start);
-    pnp.set(
-        PnpMinorFunction::QueryDeviceRelations,
-        devicetree_query_devrels,
-    );
+    let mut pnp = PnpOps::new();
+    pnp.start_device.set(devicetree_start);
+    pnp.query_device_relations.set(devicetree_query_devrels);
     dev_init.set_dev_ext_default::<DevTreeExt>();
-    dev_init.pnp_vtable = Some(pnp);
+    dev_init.pnp_ops = Some(pnp);
     DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
 pub async fn devicetree_start<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     if has_lower_dt_pdo(device) {
         return DriverStep::complete(DriverStatus::Success);
@@ -103,9 +100,10 @@ pub async fn devicetree_start<'req, 'data, 'b>(
 #[request_handler]
 pub async fn devicetree_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
-    if req.get().body.request.relation != DeviceRelationType::BusRelations {
+    if req.relation != DeviceRelationType::BusRelations {
         return DriverStep::Continue;
     }
 
@@ -183,11 +181,11 @@ fn create_dt_child(
     let ids = ids_for_node(node);
     let resources = resources_for_node(parent_node, node);
 
-    let pnp = PnpVtable::new();
-    pnp.set(PnpMinorFunction::QueryId, dt_pdo_query_id);
-    pnp.set(PnpMinorFunction::QueryResources, dt_pdo_query_resources);
-    pnp.set(PnpMinorFunction::QueryDeviceRelations, dt_pdo_query_devrels);
-    pnp.set(PnpMinorFunction::StartDevice, dt_pdo_start);
+    let mut pnp = PnpOps::new();
+    pnp.query_id.set(dt_pdo_query_id);
+    pnp.query_resources.set(dt_pdo_query_resources);
+    pnp.query_device_relations.set(dt_pdo_query_devrels);
+    pnp.start_device.set(dt_pdo_start);
 
     let mut init = DeviceInit::with_pnp(Some(pnp));
     init.set_dev_ext_from(DtPdoExt {
@@ -210,27 +208,21 @@ fn create_dt_child(
 #[request_handler]
 pub async fn dt_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryId,
 ) -> DriverStep {
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
         return DriverStep::complete(DriverStatus::NoSuchDevice);
     };
-    let id_type = req.get().body.request.id_type;
-
-    {
-        let w = req.get_mut();
-        let pnp = &mut w.body.request;
-        match id_type {
-            QueryIdType::DeviceId => {
-                if let Some(id) = ext.ids.hardware.first() {
-                    pnp.ids_out.push(id.clone());
-                }
+    match req.id_type {
+        QueryIdType::DeviceId => {
+            if let Some(id) = ext.ids.hardware.first() {
+                req.ids.push(id.clone());
             }
-            QueryIdType::HardwareIds => pnp.ids_out.extend(ext.ids.hardware.iter().cloned()),
-            QueryIdType::CompatibleIds => pnp.ids_out.extend(ext.ids.compatible.iter().cloned()),
-            QueryIdType::InstanceId => pnp.ids_out.push(ext.path.clone()),
         }
-        w.status = DriverStatus::Success;
+        QueryIdType::HardwareIds => req.ids.extend(ext.ids.hardware.iter().cloned()),
+        QueryIdType::CompatibleIds => req.ids.extend(ext.ids.compatible.iter().cloned()),
+        QueryIdType::InstanceId => req.ids.push(ext.path.clone()),
     }
 
     DriverStep::complete(DriverStatus::Success)
@@ -239,17 +231,14 @@ pub async fn dt_pdo_query_id<'req, 'data, 'b>(
 #[request_handler]
 pub async fn dt_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryResources,
 ) -> DriverStep {
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
         return DriverStep::complete(DriverStatus::NoSuchDevice);
     };
 
-    {
-        let w = req.get_mut();
-        w.body.request.data_out = RequestData::from_t::<Vec<u8>>(ext.resources.clone());
-        w.status = DriverStatus::Success;
-    }
+    req.resources = kernel_api::pnp::ResourceSet::Encoded(ext.resources.clone());
 
     DriverStep::complete(DriverStatus::Success)
 }
@@ -257,9 +246,10 @@ pub async fn dt_pdo_query_resources<'req, 'data, 'b>(
 #[request_handler]
 pub async fn dt_pdo_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
-    if req.get().body.request.relation != DeviceRelationType::BusRelations {
+    if req.relation != DeviceRelationType::BusRelations {
         return DriverStep::Continue;
     }
 
@@ -283,7 +273,8 @@ pub async fn dt_pdo_query_devrels<'req, 'data, 'b>(
 #[request_handler]
 pub async fn dt_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

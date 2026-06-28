@@ -36,17 +36,15 @@ use kernel_api::irq::{
 };
 use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::DiskInfo;
-use kernel_api::kernel_types::io::DmaBacking;
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
 use kernel_api::pnp::{
-    DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
+    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceSet,
     driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::request::{DeviceControl, Pnp, RequestHandle, RequestKind};
+use kernel_api::request::DeviceControl;
 use kernel_api::runtime::{KernelStopwatch, cycle_counter, spawn_detached};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::panic_common;
@@ -238,14 +236,11 @@ where
 }
 // Request helpers
 #[inline(always)]
-pub(crate) fn complete_req<K: RequestKind>(
-    _req: &mut RequestHandle<'_, K>,
-    status: DriverStatus,
-) -> DriverStep {
+pub(crate) fn complete_req<K>(_req: &mut K, status: DriverStatus) -> DriverStep {
     DriverStep::complete(status)
 }
 #[inline(always)]
-fn continue_req<K: RequestKind>(_req: &mut RequestHandle<'_, K>) -> DriverStep {
+fn continue_req<K>(_req: &mut K) -> DriverStep {
     DriverStep::Continue
 }
 
@@ -301,13 +296,10 @@ pub extern "C" fn virtio_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let mut pnp_vt = PnpVtable::new();
-    pnp_vt.set(PnpMinorFunction::StartDevice, virtio_pnp_start);
-    pnp_vt.set(PnpMinorFunction::RemoveDevice, virtio_pnp_remove);
-    pnp_vt.set(
-        PnpMinorFunction::QueryDeviceRelations,
-        virtio_pnp_query_devrels,
-    );
+    let mut pnp_vt = PnpOps::new();
+    pnp_vt.start_device.set(virtio_pnp_start);
+    pnp_vt.remove_device.set(virtio_pnp_remove);
+    pnp_vt.query_device_relations.set(virtio_pnp_query_devrels);
 
     let init = DeviceInit::with_pnp(Some(pnp_vt));
     *dev_init = init;
@@ -365,7 +357,7 @@ async fn setup_msix_via_pci(
         table_index,
     );
 
-    let mut req = RequestHandle::new(DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup));
+    let mut req = DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup);
     let status = kernel_api::pnp::io::send_next_lower(dev.clone(), &mut req).await;
 
     if status == DriverStatus::Success {
@@ -377,17 +369,12 @@ async fn setup_msix_via_pci(
 #[request_handler]
 async fn virtio_pnp_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
-    let mut query_req = RequestHandle::new(Pnp {
-        request: PnpRequest {
-            minor_function: PnpMinorFunction::QueryResources,
-            relation: DeviceRelationType::TargetDeviceRelation,
-            id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
-        },
-    });
+    let mut query_req = QueryResources {
+        resources: ResourceSet::default(),
+    };
     let qr_status = pnp::send_next_lower(dev.clone(), &mut query_req).await;
     if qr_status != DriverStatus::Success {
         println!("virtio-blk: QueryResources failed: {:?}", qr_status);
@@ -395,14 +382,10 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
     }
 
     let resources = {
-        let r = query_req.get();
-        let blob = r
-            .body
-            .request
-            .data_out_ref()
-            .view::<Vec<u8>>()
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
+        let blob = match &query_req.resources {
+            ResourceSet::Encoded(blob) => blob.as_slice(),
+            _ => &[],
+        };
         pci::parse_resources(blob)
     };
     let msix_cap = pci::find_msix_capability(&resources);
@@ -917,7 +900,8 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
 #[request_handler]
 async fn virtio_pnp_remove<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::RemoveDevice,
 ) -> DriverStep {
     if let Ok(dx) = dev.try_devext::<DevExt>() {
         if let Some(inner) = dx.inner.get().cloned() {
@@ -957,9 +941,10 @@ async fn virtio_pnp_remove<'req, 'data, 'b>(
 #[request_handler]
 async fn virtio_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryDeviceRelations,
 ) -> DriverStep {
-    let relation = { req.get().body.request.relation };
+    let relation = req.relation;
     if relation == DeviceRelationType::BusRelations {
         create_child_pdo(&dev);
         return complete_req(req, DriverStatus::Success);
@@ -982,14 +967,13 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
         compatible: vec!["VirtIO\\Disk".into(), "GenDisk".into()],
     };
 
-    let mut pnp_vt = PnpVtable::new();
-    pnp_vt.set(PnpMinorFunction::QueryId, virtio_pdo_query_id);
-    pnp_vt.set(PnpMinorFunction::QueryResources, virtio_pdo_query_resources);
-    pnp_vt.set(PnpMinorFunction::StartDevice, virtio_pdo_start);
-    pnp_vt.set(
-        PnpMinorFunction::RegisterDmaBacking,
-        virtio_pdo_register_dma_backing,
-    );
+    let mut pnp_vt = PnpOps::new();
+    pnp_vt.query_id.set(virtio_pdo_query_id);
+    pnp_vt.query_resources.set(virtio_pdo_query_resources);
+    pnp_vt.start_device.set(virtio_pdo_start);
+    pnp_vt
+        .register_dma_backing
+        .set(virtio_pdo_register_dma_backing);
     let capacity = dx.inner.get().map(|i| i.capacity).unwrap_or(0);
     let total_bytes = capacity * 512;
 
@@ -1120,7 +1104,8 @@ pub(crate) const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 #[request_handler]
 pub async fn virtio_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
 }
@@ -1128,22 +1113,20 @@ pub async fn virtio_pdo_start<'req, 'data, 'b>(
 #[request_handler]
 pub async fn virtio_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryId,
 ) -> DriverStep {
-    let ty = { req.get().body.request.id_type };
     let status = {
-        let w = req.get_mut();
-        let p = &mut w.body.request;
-        match ty {
+        match req.id_type {
             QueryIdType::HardwareIds | QueryIdType::CompatibleIds => {
-                p.ids_out.push("VirtIO\\Disk".into());
-                p.ids_out.push("GenDisk".into());
+                req.ids.push("VirtIO\\Disk".into());
+                req.ids.push("GenDisk".into());
             }
             QueryIdType::DeviceId => {
-                p.ids_out.push("VirtIO\\Disk".into());
+                req.ids.push("VirtIO\\Disk".into());
             }
             QueryIdType::InstanceId => {
-                p.ids_out.push(
+                req.ids.push(
                     pdo.dev_node
                         .get()
                         .unwrap()
@@ -1162,27 +1145,24 @@ pub async fn virtio_pdo_query_id<'req, 'data, 'b>(
 #[request_handler]
 pub async fn virtio_pdo_query_resources<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::QueryResources,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
         Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
-    let status = {
-        let w = req.get_mut();
-        let p = &mut w.body.request;
-        let di = &cdx.disk_info;
-        p.data_out = RequestData::from_t::<DiskInfo>(*di);
-        DriverStatus::Success
-    };
+    req.resources = ResourceSet::Disk(cdx.disk_info);
+    let status = DriverStatus::Success;
 
     complete_req(req, status)
 }
 #[request_handler]
 pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Pnp<'data>>,
+    _op: PnpOp,
+    req: &'b mut kernel_api::pnp::RegisterDmaBacking<'data>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(cdx) => cdx,
@@ -1194,14 +1174,7 @@ pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
         None => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
-    let backing = {
-        let r = req.get();
-
-        match r.body.request.data_out_ref().view::<DmaBacking<'data>>() {
-            Some(payload) => payload.backing,
-            None => return complete_req(req, DriverStatus::InvalidParameter),
-        }
-    };
+    let backing = req.backing;
 
     let status = match kernel_api::dma::map_persistent_contiguous_backing(&parent, backing) {
         Ok(()) => DriverStatus::Success,

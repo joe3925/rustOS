@@ -43,103 +43,128 @@ pub use request::{RequestPayload, RequestPayloadInto};
 use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
+use crate::pnp::{
+    PnpOp, QueryDeviceRelations, QueryId, QueryResources, RegisterDmaBacking, RemoveDevice,
+    StartDevice, StopDevice, SurpriseRemoval,
+};
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsAppend, FsClose, FsCreate, FsFlush,
-    FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, Pnp,
-    Read, Request, RequestHandle, RequestKind, Write,
+    FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, Read,
+    Write,
 };
-use crate::status::DriverStatus;
 pub type EvtDriverDeviceAdd =
     extern "C" fn(driver: &Arc<device::DriverObject>, init: &mut device::DeviceInit) -> DriverStep;
 pub type EvtDriverUnload =
     extern "C" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
-pub type EvtIoRead = for<'req, 'io, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Read<'io>>,
+pub type EvtIoRead =
+    for<'a, 'io> extern "C" fn(&'a Arc<DeviceObject>, &'a mut Read<'io>) -> FfiFuture<DriverStep>;
+
+pub type EvtIoWrite =
+    for<'a, 'io> extern "C" fn(&'a Arc<DeviceObject>, &'a mut Write<'io>) -> FfiFuture<DriverStep>;
+pub type EvtIoDeviceControl = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut DeviceControl<'data>,
+) -> FfiFuture<DriverStep>;
+pub type EvtIoFlush =
+    for<'a> extern "C" fn(&'a Arc<DeviceObject>, &'a mut Flush) -> FfiFuture<DriverStep>;
+pub type EvtIoFlushDirty =
+    for<'a> extern "C" fn(&'a Arc<DeviceObject>, &'a mut FlushDirty) -> FfiFuture<DriverStep>;
+pub type EvtIoFlushOwner =
+    for<'a> extern "C" fn(&'a Arc<DeviceObject>, &'a mut FlushOwner) -> FfiFuture<DriverStep>;
+
+pub type EvtFsOpen = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsOpen>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsClose = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsClose>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsRead = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsRead>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsWrite = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsWrite>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsFlush = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsFlush>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsSeek = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsSeek>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsCreate = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsCreate>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsRename = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsRename>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsReadDir = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsReadDir>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsGetInfo = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsGetInfo>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsSetLen = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsSetLen>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsAppend = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsAppend>,
+) -> FfiFuture<DriverStep>;
+pub type EvtFsZeroRange = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    &'a mut Fs<'data, FsZeroRange>,
 ) -> FfiFuture<DriverStep>;
 
-pub type EvtIoWrite = for<'req, 'io, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Write<'io>>,
+pub type EvtPnpStartDevice = for<'a> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut StartDevice,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoDeviceControl = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, DeviceControl<'data>>,
+pub type EvtPnpQueryDeviceRelations = for<'a> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut QueryDeviceRelations,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlush = for<'req, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Flush>,
+pub type EvtPnpQueryId =
+    for<'a> extern "C" fn(&'a Arc<DeviceObject>, PnpOp, &'a mut QueryId) -> FfiFuture<DriverStep>;
+pub type EvtPnpRegisterDmaBacking = for<'a, 'data> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut RegisterDmaBacking<'data>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlushDirty = for<'req, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, FlushDirty>,
+pub type EvtPnpQueryResources = for<'a> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut QueryResources,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlushOwner = for<'req, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, FlushOwner>,
+pub type EvtPnpSurpriseRemoval = for<'a> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut SurpriseRemoval,
 ) -> FfiFuture<DriverStep>;
-
-pub type EvtFsOpen = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsOpen>>,
+pub type EvtPnpRemoveDevice = for<'a> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut RemoveDevice,
 ) -> FfiFuture<DriverStep>;
-pub type EvtFsClose = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsClose>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsRead = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsRead>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsWrite = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsWrite>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsFlush = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsFlush>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsSeek = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsSeek>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsCreate = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsCreate>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsRename = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsRename>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsReadDir = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsReadDir>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsGetInfo = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsGetInfo>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsSetLen = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsSetLen>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsAppend = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsAppend>>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsZeroRange = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Fs<'data, FsZeroRange>>,
+pub type EvtPnpStopDevice = for<'a> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut StopDevice,
 ) -> FfiFuture<DriverStep>;
 
 pub type ClassAddCallback = extern "C" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
-pub type CompletionRoutine<K: RequestKind> =
-    extern "C" fn(request: &mut Request<K>, context: usize) -> DriverStatus;
-pub type PnpMinorCallback = for<'req, 'data, 'b> extern "C" fn(
-    &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, Pnp<'data>>,
-) -> FfiFuture<DriverStep>;
 pub type DpcFn = extern "C" fn(usize);
 
 #[unsafe(export_name = "_fltused")]

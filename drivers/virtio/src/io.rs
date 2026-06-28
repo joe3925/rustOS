@@ -21,7 +21,7 @@ use kernel_api::dma::dma::IoBufferAccess;
 use kernel_api::kernel_types::dma::{FromDevice, IoBufferDmaSegment, ToDevice};
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
 use kernel_api::pnp::DriverStep;
-use kernel_api::request::{DeviceControl, Flush, Read, RequestHandle, Write};
+use kernel_api::request::{DeviceControl, Flush, Read, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 
@@ -37,7 +37,7 @@ impl DeviceRead for VirtioPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Read<'data>>,
+        req: &'b mut Read<'data>,
     ) -> DriverStep {
         virtio_pdo_read_impl(pdo, req).await
     }
@@ -47,7 +47,7 @@ impl DeviceWrite for VirtioPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Write<'data>>,
+        req: &'b mut Write<'data>,
     ) -> DriverStep {
         virtio_pdo_write_impl(pdo, req).await
     }
@@ -55,10 +55,7 @@ impl DeviceWrite for VirtioPdoIo {
 
 impl DeviceFlush for VirtioPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(
-        pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, Flush>,
-    ) -> DriverStep {
+    async fn handler<'req, 'b>(pdo: &Arc<DeviceObject>, req: &'b mut Flush) -> DriverStep {
         virtio_pdo_flush_impl(pdo, req).await
     }
 }
@@ -67,7 +64,7 @@ impl DeviceControlHandler for VirtioPdoIo {
     #[request_handler]
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
-        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+        req: &'b mut DeviceControl<'data>,
     ) -> DriverStep {
         DriverStep::complete(DriverStatus::NotImplemented)
         //virtio_pdo_ioctl_impl(pdo, req).await
@@ -603,7 +600,7 @@ fn validate_common_block_io(offset: u64, len: usize) -> Result<(), DriverStatus>
 #[inline(always)]
 pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Read<'data>>,
+    req: &'b mut Read<'data>,
 ) -> DriverStep {
     let (parent, inner) = match get_parent_inner(pdo) {
         Ok(v) => v,
@@ -620,9 +617,9 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     let mut pending = PendingOpBatch::new(&qs.read_ops);
 
     {
-        let request = req.get_mut();
+        let request = &mut *req;
 
-        for read in request.body.iter_mut() {
+        for read in request.iter_mut() {
             if pending.is_full() {
                 let status =
                     submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read")
@@ -724,7 +721,7 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
 #[inline(always)]
 pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Write<'data>>,
+    req: &'b mut Write<'data>,
 ) -> DriverStep {
     let (parent, inner) = match get_parent_inner(pdo) {
         Ok(v) => v,
@@ -741,9 +738,9 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     let mut pending = PendingOpBatch::new(&qs.write_ops);
 
     {
-        let request = req.get_mut();
+        let request = &mut *req;
 
-        for write in request.body.iter_mut() {
+        for write in request.iter_mut() {
             if pending.is_full() {
                 let status = submit_block_ops_to_queue(
                     &inner,
@@ -851,7 +848,7 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
 #[inline(always)]
 pub(crate) async fn virtio_pdo_flush_impl<'req, 'b>(
     _pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Flush>,
+    req: &'b mut Flush,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
 }
@@ -859,7 +856,7 @@ pub(crate) async fn virtio_pdo_flush_impl<'req, 'b>(
 // #[inline(always)]
 // pub(crate) async fn virtio_pdo_ioctl_impl<'req, 'data, 'b>(
 //     pdo: &Arc<DeviceObject>,
-//     req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+//     req: &'b mut DeviceControl<'data>,
 // ) -> DriverStep {
 //     let code = req.read().body.code;
 
