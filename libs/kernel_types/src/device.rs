@@ -128,12 +128,21 @@ pub struct StackLayer {
 }
 
 #[repr(C)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicProtocol {
+    pub id: ProtocolId,
+    pub major: u16,
+}
+
+#[repr(C)]
 #[derive(Debug)]
 pub struct DeviceStack {
     pub pdo_bus_service: Option<String>,
     pub lower: Vec<StackLayer>,
     pub function: Option<StackLayer>,
     pub upper: Vec<StackLayer>,
+    pub public_protocols: Vec<PublicProtocol>,
 }
 
 impl Default for DeviceStack {
@@ -149,7 +158,29 @@ impl DeviceStack {
             lower: Vec::new(),
             function: None,
             upper: Vec::new(),
+            public_protocols: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn has_public_protocol<P: Protocol>(&self) -> bool {
+        self.public_protocols
+            .iter()
+            .any(|p| p.id == P::ID && p.major == P::VERSION.major)
+    }
+
+    #[inline]
+    pub fn publish_protocol<P: Protocol>(&mut self) -> bool {
+        if self.has_public_protocol::<P>() {
+            return false;
+        }
+
+        self.public_protocols.push(PublicProtocol {
+            id: P::ID,
+            major: P::VERSION.major,
+        });
+
+        true
     }
 
     pub fn get_top_device_object(&self) -> Option<Arc<DeviceObject>> {
@@ -216,7 +247,7 @@ impl ProtocolVersion {
 }
 
 /// Safety: for a given `ID` and major version, `VTable` must always be the same ABI layout.
-pub unsafe trait DeviceProtocol: 'static {
+pub unsafe trait Protocol: 'static {
     const ID: ProtocolId;
     const VERSION: ProtocolVersion;
 
@@ -247,7 +278,7 @@ unsafe impl Send for ErasedProtocolVtable {}
 unsafe impl Sync for ErasedProtocolVtable {}
 
 #[derive(Debug, Clone, Copy)]
-struct DeviceProtocolEntry {
+struct ProtocolEntry {
     id: ProtocolId,
     version: ProtocolVersion,
     vtable: ErasedProtocolVtable,
@@ -256,14 +287,14 @@ struct DeviceProtocolEntry {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct DeviceProtocolRef<P: DeviceProtocol> {
+pub struct ProtocolRef<P: Protocol> {
     vtable: &'static P::VTable,
     version: ProtocolVersion,
     generation: u64,
     _protocol: PhantomData<P>,
 }
 
-impl<P: DeviceProtocol> DeviceProtocolRef<P> {
+impl<P: Protocol> ProtocolRef<P> {
     #[inline]
     pub fn vtable(&self) -> &'static P::VTable {
         self.vtable
@@ -290,7 +321,7 @@ impl<P: DeviceProtocol> DeviceProtocolRef<P> {
     }
 }
 
-impl<P: DeviceProtocol> Deref for DeviceProtocolRef<P> {
+impl<P: Protocol> Deref for ProtocolRef<P> {
     type Target = P::VTable;
 
     #[inline]
@@ -299,7 +330,7 @@ impl<P: DeviceProtocol> Deref for DeviceProtocolRef<P> {
     }
 }
 
-pub struct ProtocolHandle<P: DeviceProtocol> {
+pub struct ProtocolHandle<P: Protocol> {
     provider: Arc<DeviceObject>,
     vtable: &'static P::VTable,
     version: ProtocolVersion,
@@ -309,7 +340,7 @@ pub struct ProtocolHandle<P: DeviceProtocol> {
     _protocol: PhantomData<P>,
 }
 
-impl<P: DeviceProtocol> ProtocolHandle<P> {
+impl<P: Protocol> ProtocolHandle<P> {
     #[inline]
     pub fn provider(&self) -> &Arc<DeviceObject> {
         &self.provider
@@ -358,7 +389,7 @@ impl<P: DeviceProtocol> ProtocolHandle<P> {
     }
 }
 
-impl<P: DeviceProtocol> Deref for ProtocolHandle<P> {
+impl<P: Protocol> Deref for ProtocolHandle<P> {
     type Target = P::VTable;
 
     #[inline]
@@ -367,7 +398,7 @@ impl<P: DeviceProtocol> Deref for ProtocolHandle<P> {
     }
 }
 
-pub fn register_protocol<P: DeviceProtocol>(
+pub fn register_protocol<P: Protocol>(
     device: &Arc<DeviceObject>,
     vtable: &'static P::VTable,
 ) -> DriverStatus {
@@ -382,7 +413,7 @@ pub fn register_protocol<P: DeviceProtocol>(
     }
 }
 
-pub fn open_protocol_to_next_lower<P: DeviceProtocol>(
+pub fn open_protocol_to_next_lower<P: Protocol>(
     device: &Arc<DeviceObject>,
 ) -> Result<ProtocolHandle<P>, DriverStatus> {
     let mut current = device.lower_device.get().cloned();
@@ -398,7 +429,7 @@ pub fn open_protocol_to_next_lower<P: DeviceProtocol>(
     Err(DriverStatus::NotImplemented)
 }
 
-pub fn open_protocol_at_stack_top<P: DeviceProtocol>(
+pub fn open_protocol_at_stack_top<P: Protocol>(
     node: &Arc<DevNode>,
 ) -> Result<ProtocolHandle<P>, DriverStatus> {
     let top = {
@@ -424,7 +455,7 @@ pub fn open_protocol_at_stack_top<P: DeviceProtocol>(
     Err(DriverStatus::NotImplemented)
 }
 
-pub fn open_protocol_to_next_upper<P: DeviceProtocol>(
+pub fn open_protocol_to_next_upper<P: Protocol>(
     device: &Arc<DeviceObject>,
 ) -> Result<ProtocolHandle<P>, DriverStatus> {
     let mut current = device.upper_device.get().and_then(Weak::upgrade);
@@ -440,7 +471,7 @@ pub fn open_protocol_to_next_upper<P: DeviceProtocol>(
     Err(DriverStatus::NotImplemented)
 }
 
-fn try_open_protocol_on_device<P: DeviceProtocol>(
+fn try_open_protocol_on_device<P: Protocol>(
     device: &Arc<DeviceObject>,
 ) -> Option<ProtocolHandle<P>> {
     if device.is_removed() {
@@ -471,7 +502,7 @@ pub struct DeviceObject {
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
-    protocols: RwLock<Vec<DeviceProtocolEntry>>,
+    protocols: RwLock<Vec<ProtocolEntry>>,
     protocol_generation: AtomicU64,
     generation: AtomicU64,
 }
@@ -556,7 +587,7 @@ impl DeviceObject {
 
     pub fn register_protocol<P>(&self, vtable: &'static P::VTable) -> bool
     where
-        P: DeviceProtocol,
+        P: Protocol,
     {
         let mut protocols = self.protocols.write();
 
@@ -569,7 +600,7 @@ impl DeviceObject {
 
         let generation = self.bump_protocol_generation();
 
-        protocols.push(DeviceProtocolEntry {
+        protocols.push(ProtocolEntry {
             id: P::ID,
             version: P::VERSION,
             vtable: ErasedProtocolVtable::from_static(vtable),
@@ -579,9 +610,9 @@ impl DeviceObject {
         true
     }
 
-    pub fn find_protocol<P>(&self, min_version_minor: u16) -> Option<DeviceProtocolRef<P>>
+    pub fn find_protocol<P>(&self, min_version_minor: u16) -> Option<ProtocolRef<P>>
     where
-        P: DeviceProtocol,
+        P: Protocol,
     {
         let required = ProtocolVersion::new(P::VERSION.major, min_version_minor);
 
@@ -593,7 +624,7 @@ impl DeviceObject {
             .map(|entry| {
                 let vtable = unsafe { entry.vtable.as_static::<P::VTable>() };
 
-                DeviceProtocolRef {
+                ProtocolRef {
                     vtable,
                     version: entry.version,
                     generation: entry.generation,
@@ -738,4 +769,32 @@ impl DevExtBox {
             None => ptr::null(),
         }
     }
+}
+
+
+impl<P: Protocol> ProtocolHandle<P> {
+    #[inline]
+    pub fn open_next_lower(&self) -> Result<ProtocolHandle<P>, DriverStatus> {
+        open_protocol_to_next_lower::<P>(&self.provider)
+    }
+}
+
+pub fn publish_stack_protocol<P: Protocol>(node: &Arc<DevNode>) -> DriverStatus {
+    let mut stack = node.stack.write();
+
+    let Some(stack) = stack.as_mut() else {
+        return DriverStatus::NoSuchDevice;
+    };
+
+    if stack.publish_protocol::<P>() {
+        DriverStatus::Success
+    } else {
+        DriverStatus::InvalidParameter
+    }
+}
+
+pub fn open_public_protocol<P: Protocol>(
+    node: &Arc<DevNode>,
+) -> Result<ProtocolHandle<P>, DriverStatus> {
+    open_protocol_at_stack_top::<P>(node)
 }

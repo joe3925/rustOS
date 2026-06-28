@@ -15,7 +15,7 @@ use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
 use kernel_api::dma::dma::DmaPciDeviceIdentity;
 
 use dev_ext::{
-    DevExt, McfgSegment, PciPdoExt, PrtEntry, build_resources_blob, ecam_bus_base_from_segment,
+    DevExt, McfgSegment, PciPdoExt, PrtEntry, ecam_bus_base_from_segment,
     hwids_for, instance_path_for, load_segments_from_parent, map_ecam_bus, map_ecam_segment_range,
     name_for, parse_ecam_segments_from_blob, parse_prt_from_blob, scan_ecam_bus_mapped,
 };
@@ -39,6 +39,46 @@ use kernel_api::{
 use spin::Once;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+
+use kernel_api::kernel_types::pci::{PciProtocol, PciProtocolVTable, Bar, MsixInfo};
+
+extern "C" fn pci_proto_get_bar(dev: &Arc<DeviceObject>, index: u8) -> Option<Bar> {
+    let ext = dev.try_devext::<PciPdoExt>().ok()?;
+    if index >= 6 { return None; }
+    Some(ext.bars[index as usize])
+}
+
+extern "C" fn pci_proto_get_config_space_phys(dev: &Arc<DeviceObject>) -> Option<(u64, u64)> {
+    let ext = dev.try_devext::<PciPdoExt>().ok()?;
+    Some((ext.cfg_phys, 4096))
+}
+
+extern "C" fn pci_proto_get_gsi(dev: &Arc<DeviceObject>) -> Option<u16> {
+    let ext = dev.try_devext::<PciPdoExt>().ok()?;
+    ext.irq_gsi
+}
+
+extern "C" fn pci_proto_get_interrupt_line(dev: &Arc<DeviceObject>) -> Option<u8> {
+    let ext = dev.try_devext::<PciPdoExt>().ok()?;
+    if ext.irq_line == 0 || ext.irq_line == 0xFF {
+        None
+    } else {
+        Some(ext.irq_line)
+    }
+}
+
+extern "C" fn pci_proto_get_msix(dev: &Arc<DeviceObject>) -> Option<MsixInfo> {
+    let ext = dev.try_devext::<PciPdoExt>().ok()?;
+    ext.msix
+}
+
+static PCI_PROTO_VTABLE: PciProtocolVTable = PciProtocolVTable {
+    get_bar: pci_proto_get_bar,
+    get_config_space_phys: pci_proto_get_config_space_phys,
+    get_gsi: pci_proto_get_gsi,
+    get_interrupt_line: pci_proto_get_interrupt_line,
+    get_msix: pci_proto_get_msix,
+};
 
 struct PciPdoIo;
 
@@ -311,7 +351,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
 
     let mut vt = PnpOps::new();
     vt.query_id.set(pci_pdo_query_id);
-    vt.query_resources.set(pci_pdo_query_resources);
+
     vt.start_device.set(pci_pdo_start);
     vt.query_device_relations.set(pci_pdo_query_devrels);
 
@@ -395,28 +435,17 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
 }
 
 #[request_handler]
-pub async fn pci_pdo_query_resources<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryResources,
-) -> DriverStep {
-    let ext = match dev.try_devext::<PciPdoExt>() {
-        Ok(g) => g,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
-
-    req.resources = ResourceSet::Encoded(build_resources_blob(&ext));
-    let status = DriverStatus::Success;
-
-    DriverStep::complete(status)
-}
-
-#[request_handler]
 pub async fn pci_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
+    if let Some(dn) = _dev.dev_node.get() {
+        if let Some(dn) = dn.upgrade() {
+            _dev.register_protocol::<PciProtocol>(&PCI_PROTO_VTABLE);
+            kernel_api::device::publish_stack_protocol::<PciProtocol>(&dn);
+        }
+    }
     DriverStep::complete(DriverStatus::Success)
 }
 

@@ -45,7 +45,7 @@ pub struct DtPdoExt {
     tree: Arc<DeviceTree>,
     path: String,
     ids: DeviceIds,
-    resources: Vec<u8>,
+    resources: Vec<kernel_api::kernel_types::pnp::ResourceDescriptor>,
 }
 
 #[unsafe(no_mangle)]
@@ -238,7 +238,7 @@ pub async fn dt_pdo_query_resources<'req, 'data, 'b>(
         return DriverStep::complete(DriverStatus::NoSuchDevice);
     };
 
-    req.resources = kernel_api::pnp::ResourceSet::Encoded(ext.resources.clone());
+    req.resources = kernel_api::pnp::ResourceSet::Descriptors(ext.resources.clone());
 
     DriverStep::complete(DriverStatus::Success)
 }
@@ -375,11 +375,11 @@ fn sanitize_instance_component(s: &str) -> String {
     out
 }
 
-fn resources_for_node(parent: &Node, node: &Node) -> Vec<u8> {
+fn resources_for_node(parent: &Node, node: &Node) -> Vec<kernel_api::kernel_types::pnp::ResourceDescriptor> {
     let mut entries = Vec::<ResourceDescriptor>::new();
     append_reg_entries(&mut entries, parent, node);
     append_interrupt_entries(&mut entries, node);
-    encode_resource_descriptors(&entries)
+    entries
 }
 
 fn append_reg_entries(entries: &mut Vec<ResourceDescriptor>, parent: &Node, node: &Node) {

@@ -11,8 +11,8 @@ use kernel_api::{
         request::IoctlData,
     },
     pnp::{
-        DriverStep, QueryResources, ResourceSet, driver_set_evt_device_add, io, pnp,
-        pnp_create_control_device_and_link, pnp_create_control_device_with_init,
+        DriverStep, driver_set_evt_device_add, io, pnp, pnp_create_control_device_and_link,
+        pnp_create_control_device_with_init,
     },
     request::DeviceControl,
     request_handler,
@@ -78,27 +78,27 @@ impl DeviceControlHandler for Fat32RootIo {
                     volume_fdo
                 };
 
-                let mut query = QueryResources {
-                    resources: ResourceSet::default(),
-                };
-
-                let st = pnp::send_down_stack(volume_fdo.clone(), &mut query).await;
-
                 let (sector_size, total_sectors) = {
                     let mut sector_size = None;
                     let mut total_sectors = None;
 
-                    if st == DriverStatus::Success {
-                        if let ResourceSet::Partition(pi) = query.resources {
-                            sector_size = Some(if pi.disk.logical_block_size != 0 {
-                                pi.disk.logical_block_size as u16
-                            } else {
-                                512
-                            });
-
-                            total_sectors = pi.gpt_entry.map(|ent| {
-                                ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
-                            });
+                    if let Some(devnode) = volume_fdo.dev_node.get() {
+                        if let Some(dn) = devnode.upgrade() {
+                            if let Ok(proto) = kernel_api::device::open_public_protocol::<
+                                kernel_api::kernel_types::io::VolmgrProtocol,
+                            >(&dn)
+                            {
+                                if let Ok(pi) = (proto.partition_info)(&proto.provider()) {
+                                    sector_size = Some(if pi.disk.logical_block_size != 0 {
+                                        pi.disk.logical_block_size as u16
+                                    } else {
+                                        512
+                                    });
+                                    total_sectors = pi.gpt_entry.map(|ent| {
+                                        ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
+                                    });
+                                }
+                            }
                         }
                     }
 

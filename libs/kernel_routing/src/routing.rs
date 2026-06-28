@@ -8,7 +8,7 @@ use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::io::{DeviceOps, IoHandler, IoTarget};
 use kernel_types::pnp::{
     DriverStep, PnpHandler, PnpOp, PnpOps, QueryDeviceRelations, QueryId, QueryResources,
-    RegisterDmaBacking, RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
+    InitComplete, RegisterDmaBacking, RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
 };
 use kernel_types::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Read, Write,
@@ -312,6 +312,12 @@ macro_rules! impl_pnp_request {
     };
 }
 
+impl_pnp_request!(
+    InitComplete,
+    PnpOp::InitComplete,
+    kernel_types::EvtPnpInitComplete,
+    init_complete
+);
 impl_pnp_request!(
     StartDevice,
     PnpOp::StartDevice,

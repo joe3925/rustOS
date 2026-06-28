@@ -45,7 +45,7 @@ use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
 use crate::pnp::{
     PnpOp, QueryDeviceRelations, QueryId, QueryResources, RegisterDmaBacking, RemoveDevice,
-    StartDevice, StopDevice, SurpriseRemoval,
+    InitComplete, StartDevice, StopDevice, SurpriseRemoval,
 };
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsAppend, FsClose, FsCreate, FsFlush,
@@ -126,6 +126,11 @@ pub type EvtFsZeroRange = for<'a, 'data> extern "C" fn(
     &'a mut Fs<'data, FsZeroRange>,
 ) -> FfiFuture<DriverStep>;
 
+pub type EvtPnpInitComplete = for<'a> extern "C" fn(
+    &'a Arc<DeviceObject>,
+    PnpOp,
+    &'a mut InitComplete,
+) -> FfiFuture<DriverStep>;
 pub type EvtPnpStartDevice = for<'a> extern "C" fn(
     &'a Arc<DeviceObject>,
     PnpOp,

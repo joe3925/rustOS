@@ -1,6 +1,5 @@
 use crate::device::DevNode;
 use crate::dma::IoBufferBacking;
-use crate::io::{DiskInfo, PartitionInfo};
 use crate::io::{HandlerSlot, IoHandler};
 use crate::status::DriverStatus;
 use alloc::string::String;
@@ -169,8 +168,6 @@ pub struct QueryResources {
 pub enum ResourceSet {
     Descriptors(Vec<ResourceDescriptor>),
     Encoded(Vec<u8>),
-    Disk(DiskInfo),
-    Partition(PartitionInfo),
 }
 
 impl Default for ResourceSet {
@@ -178,6 +175,10 @@ impl Default for ResourceSet {
         Self::Descriptors(Vec::new())
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct InitComplete;
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -200,6 +201,13 @@ define_pnp_ops! {
         slot: StartDeviceSlot,
         handler: crate::EvtPnpStartDevice,
         variant: StartDevice,
+        default: DriverStatus::Success
+    },
+    init_complete {
+        op: PnpInitCompleteOp,
+        slot: InitCompleteSlot,
+        handler: crate::EvtPnpInitComplete,
+        variant: InitComplete,
         default: DriverStatus::Success
     },
     query_device_relations {

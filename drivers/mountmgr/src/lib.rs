@@ -17,13 +17,17 @@ use core::{
     panic::PanicInfo,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use kernel_api::kernel_types::io::VolmgrProtocol;
+use kernel_api::println;
 use spin::{Once, RwLock};
 
 use kernel_api::{
     GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY,
     IOCTL_MOUNTMGR_REGISTER_FS, IOCTL_MOUNTMGR_RESYNC, IOCTL_MOUNTMGR_UNMOUNT,
+    device::open_public_protocol,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOpenParams, notify_label_published, notify_label_unpublished},
+    kernel_types::io::PartitionInfoProtocol,
     kernel_types::{
         fs::{OpenFlags, Path},
         io::{DeviceControlHandler, DeviceControlOp, FsIdentify},
@@ -31,7 +35,7 @@ use kernel_api::{
         request::IoctlData,
     },
     pnp::{
-        DriverStep, PnpOp, PnpOps, QueryResources, ResourceSet, driver_set_evt_device_add, io, pnp,
+        DriverStep, PnpOp, PnpOps, driver_set_evt_device_add, io, pnp,
         pnp_create_control_device_and_link, pnp_create_device_symlink_top,
         pnp_create_devnode_over_pdo_with_function, pnp_create_symlink, pnp_load_service,
         pnp_remove_symlink,
@@ -310,18 +314,9 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
 /// Returns None if the volume lacks a valid GPT GUID.
 async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
     let vol_target = parent_fdo.clone();
-    let mut request = QueryResources {
-        resources: ResourceSet::default(),
-    };
-    let status = pnp::send_down_stack(vol_target, &mut request).await;
-    if status != DriverStatus::Success {
-        return None;
-    }
-
-    let pi = match request.resources {
-        ResourceSet::Partition(pi) => pi,
-        _ => return None,
-    };
+    let devnode = parent_fdo.dev_node.get().unwrap().upgrade().unwrap();
+    let proto = open_public_protocol::<VolmgrProtocol>(&devnode).ok()?;
+    let pi = (proto.partition_info)(&proto.provider()).ok()?;
     let ge = pi.gpt_entry?;
     let guid = ge.unique_partition_guid;
 
@@ -352,7 +347,10 @@ async fn try_bind_filesystems_for_parent_fdo(
 
     let parent_dn = match parent_fdo.dev_node.get().unwrap().upgrade() {
         Some(x) => x,
-        None => return false,
+        None => {
+            println!("weak upgrade failed");
+            return false;
+        }
     };
 
     // Compute and store stable_id if not already set

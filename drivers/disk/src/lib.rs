@@ -22,7 +22,7 @@ use kernel_api::{
         request::IoctlData,
     },
     pnp::{
-        DriverStep, PnpOp, PnpOps, QueryResources, ResourceSet, driver_set_evt_device_add, io, pnp,
+        DriverStep, PnpOp, PnpOps, QueryResources, driver_set_evt_device_add, io, pnp,
     },
     request::{DeviceControl, Flush, Read, Write},
     request_handler,
@@ -141,13 +141,6 @@ impl DeviceRead for DiskIo {
     ) -> DriverStep {
         let dx = disk_ext(&dev);
 
-        if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
-            if let Err(st) = query_props_sync(&dev).await {
-                cold_path();
-                return DriverStep::complete(st);
-            }
-        }
-
         let bs = dx.block_size.load(Ordering::Acquire) as u64;
         if unlikely(bs == 0) {
             cold_path();
@@ -181,13 +174,6 @@ impl DeviceWrite for DiskIo {
         req: &'b mut Write<'data>,
     ) -> DriverStep {
         let dx = disk_ext(&dev);
-
-        if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
-            if let Err(st) = query_props_sync(&dev).await {
-                cold_path();
-                return DriverStep::complete(st);
-            }
-        }
 
         let bs = dx.block_size.load(Ordering::Acquire) as u64;
         if unlikely(bs == 0) {
@@ -231,19 +217,18 @@ impl DeviceControlHandler for DiskIo {
 
         match code {
             IOCTL_DRIVE_IDENTIFY => {
-                let mut ch = QueryResources {
-                    resources: ResourceSet::default(),
-                };
-
-                let st = pnp::send_next_lower(dev.clone(), &mut ch).await;
-                if unlikely(st != DriverStatus::Success) {
-                    cold_path();
-                    return DriverStep::complete(st);
-                }
-
-                let info = match ch.resources {
-                    ResourceSet::Disk(di) => di,
-                    _ => {
+                let devnode = dev.dev_node.get().unwrap().upgrade().unwrap();
+                let info = match open_public_protocol::<DiskInfoProtocol>(&devnode) {
+                    Ok(proto) => {
+                        match (proto.query)(&proto.provider()) {
+                            Ok(di) => di,
+                            Err(_) => {
+                                cold_path();
+                                return DriverStep::complete(DriverStatus::Unsuccessful);
+                            }
+                        }
+                    }
+                    Err(_) => {
                         cold_path();
                         return DriverStep::complete(DriverStatus::Unsuccessful);
                     }
@@ -265,10 +250,14 @@ fn has_to_device_buffer(buffer: &IoBuffer<'_, '_, ToDevice>, len: usize) -> bool
     buffer.len() >= len
 }
 
-#[repr(C)]
+use kernel_api::kernel_types::io::{DiskInfoProtocol, DiskInfoProtocolVTable};
+use kernel_api::device::open_public_protocol;
+use spin::RwLock;
+
 struct DiskExt {
     block_size: AtomicU32,
     props_ready: AtomicBool,
+    info: RwLock<Option<DiskInfo>>,
 }
 
 impl Default for DiskExt {
@@ -276,8 +265,39 @@ impl Default for DiskExt {
         Self {
             block_size: AtomicU32::new(0),
             props_ready: AtomicBool::new(false),
+            info: RwLock::new(None),
         }
     }
+}
+
+#[request_handler]
+async fn disk_pnp_start<'req, 'data, 'b>(
+    dev: &Arc<DeviceObject>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
+) -> DriverStep {
+    let devnode = match dev.dev_node.get() {
+        Some(dn) => match dn.upgrade() {
+            Some(dn) => dn,
+            None => return DriverStep::complete(DriverStatus::Unsuccessful),
+        },
+        None => return DriverStep::complete(DriverStatus::Unsuccessful),
+    };
+
+    DriverStep::Continue
+}
+
+#[request_handler]
+async fn disk_init_complete<'req, 'data, 'b>(
+    dev: &Arc<DeviceObject>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::InitComplete,
+) -> DriverStep {
+    if let Err(st) = query_props_sync(dev) {
+        cold_path();
+        return DriverStep::complete(st);
+    }
+    DriverStep::Continue
 }
 
 #[unsafe(no_mangle)]
@@ -296,6 +316,8 @@ pub extern "C" fn disk_device_add(
     dev_init.ops.register::<DeviceFlushOp, DiskIo>();
 
     let mut pnp_vt = PnpOps::new();
+    pnp_vt.start_device.set(disk_pnp_start);
+    pnp_vt.init_complete.set(disk_init_complete);
     pnp_vt.remove_device.set(disk_pnp_remove);
     dev_init.pnp_ops = Some(pnp_vt);
 
@@ -317,31 +339,23 @@ fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
     dev.try_devext::<DiskExt>().expect("disk dev ext missing")
 }
 
-async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
-    let mut ch = QueryResources {
-        resources: ResourceSet::default(),
-    };
-    let st = pnp::send_next_lower(dev.clone(), &mut ch).await;
-
-    if unlikely(st != DriverStatus::Success) {
-        cold_path();
-        return Err(st);
-    }
-    let di = match ch.resources {
-        ResourceSet::Disk(di) => di,
-        ResourceSet::Encoded(blob) if blob.len() >= size_of::<DiskInfo>() => unsafe {
-            core::ptr::read_unaligned(blob.as_ptr().cast::<DiskInfo>())
-        },
-        _ => {
+fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
+    let proto = match kernel_api::device::open_protocol_to_next_lower::<DiskInfoProtocol>(dev) {
+        Ok(p) => p,
+        Err(e) => {
             cold_path();
-            return Err(DriverStatus::Unsuccessful);
+            return Err(e);
         }
     };
+    let di = (proto.query)(&proto.provider())?;
 
     let dx = disk_ext(dev);
+    *dx.info.write() = Some(di.clone());
     dx.block_size
         .store(di.logical_block_size.max(1), Ordering::Release);
     dx.props_ready.store(true, Ordering::Release);
 
     Ok(())
 }
+
+

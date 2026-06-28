@@ -20,7 +20,7 @@ use kernel_types::device::{
 use kernel_types::fs::Path;
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{
-    BootType, DeviceIds, DeviceRelationType, DriverStep, QueryDeviceRelations, StartDevice,
+    BootType, DeviceIds, DeviceRelationType, DriverStep, QueryDeviceRelations, StartDevice, InitComplete,
 };
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
@@ -813,7 +813,11 @@ impl PnpManager {
             let mut start_request = StartDevice {
                 resources: Vec::new(),
             };
-            let status = kernel_routing::pnp::send_down_stack(top_device, &mut start_request).await;
+            let mut status = kernel_routing::pnp::send_down_stack(top_device.clone(), &mut start_request).await;
+            if status == DriverStatus::Success {
+                let mut init_request = InitComplete;
+                status = kernel_routing::pnp::send_down_stack(top_device, &mut init_request).await;
+            }
             Self::finish_start(dn.clone(), status).await;
         } else {
             dn.set_state(DevNodeState::Faulted);
@@ -1270,7 +1274,11 @@ impl PnpManager {
         let mut start_request = StartDevice {
             resources: Vec::new(),
         };
-        let status = kernel_routing::pnp::send_down_stack(top.clone(), &mut start_request).await;
+        let mut status = kernel_routing::pnp::send_down_stack(top.clone(), &mut start_request).await;
+        if status == DriverStatus::Success {
+            let mut init_request = InitComplete;
+            status = kernel_routing::pnp::send_down_stack(top.clone(), &mut init_request).await;
+        }
         Self::finish_start(dn.clone(), status).await;
 
         Ok((dn, top))

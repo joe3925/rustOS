@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region};
-use kernel_api::pnp::ResourceKind;
+use kernel_api::pnp::{ResourceKind, ResourceDescriptor};
 
 /// Volatile reads/writes that remain defined on unaligned PCI/virtio registers.
 #[repr(C, packed)]
@@ -35,92 +35,12 @@ pub struct PciResource {
     pub length: u64,
 }
 
-/// Parse the RSRC blob returned by QueryResources into individual resource entries.
-pub fn parse_resources(blob: &[u8]) -> Vec<PciResource> {
-    let mut out = Vec::new();
-    if blob.len() < 12 || &blob[0..4] != b"RSRC" {
-        return out;
-    }
-    let mut off = 12usize;
-    while off + 24 <= blob.len() {
-        let kind = u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
-        let index =
-            u32::from_le_bytes([blob[off + 4], blob[off + 5], blob[off + 6], blob[off + 7]]);
-        let start = u64::from_le_bytes([
-            blob[off + 8],
-            blob[off + 9],
-            blob[off + 10],
-            blob[off + 11],
-            blob[off + 12],
-            blob[off + 13],
-            blob[off + 14],
-            blob[off + 15],
-        ]);
-        let length = u64::from_le_bytes([
-            blob[off + 16],
-            blob[off + 17],
-            blob[off + 18],
-            blob[off + 19],
-            blob[off + 20],
-            blob[off + 21],
-            blob[off + 22],
-            blob[off + 23],
-        ]);
-        off += 24;
-        out.push(PciResource {
-            kind,
-            index,
-            start,
-            length,
-        });
-    }
-    out
-}
+
 
 /// Find the PCI configuration space physical address from the resource blob.
-pub fn find_config_space(resources: &[PciResource]) -> Option<(u64, u64)> {
-    for r in resources {
-        if r.kind == ResourceKind::ConfigSpace as u32 {
-            return Some((r.start, r.length));
-        }
-    }
-    None
-}
 
-/// Find a GSI from the resource blob (preferred over interrupt line resources).
-pub fn find_gsi(resources: &[PciResource]) -> Option<u16> {
-    for r in resources {
-        if r.kind == ResourceKind::Gsi as u32 {
-            return Some(r.start as u16);
-        }
-    }
-    None
-}
 
-/// Find the IRQ line from the resource blob.
-pub fn find_interrupt_line(resources: &[PciResource]) -> Option<u8> {
-    for r in resources {
-        if r.kind == ResourceKind::Interrupt as u32 {
-            return Some(r.start as u8);
-        }
-    }
-    None
-}
 
-/// Map all memory BARs from the resource list.
-/// Returns (bar_index, virt_addr, size) tuples. The caller must track these for cleanup.
-pub fn map_memory_bars(resources: &[PciResource]) -> Vec<(u32, VirtAddr, u64)> {
-    let mut mapped = Vec::new();
-    for r in resources {
-        if r.kind == ResourceKind::Memory as u32
-            && r.length > 0
-            && let Ok(va) = map_mmio_region(PhysAddr::new(r.start), r.length)
-        {
-            mapped.push((r.index, va, r.length));
-        }
-    }
-    mapped
-}
 
 /// Virtio PCI capability structure layout (from PCI config space).
 /// cfg_type values:
@@ -263,39 +183,4 @@ pub const COMMON_QUEUE_DEVICE: usize = 0x30;
 pub const COMMON_MSIX_CONFIG: usize = 0x10;
 pub const COMMON_QUEUE_MSIX_VECTOR: usize = 0x1A;
 
-/// MSI-X capability information parsed from PCI resources.
-#[derive(Clone, Copy, Debug)]
-pub struct MsixCapInfo {
-    pub cap_offset: u16,
-    pub table_bar: u8,
-    pub table_offset: u32,
-    pub table_size: u16,
-    pub pba_bar: u8,
-    pub pba_offset: u32,
-}
 
-/// Find MSI-X capability information from the resource blob.
-/// The PCI driver encodes MSI-X info in a packed format:
-/// - start: cap_offset(16) | table_bar(8) | reserved(8) | table_offset(32)
-/// - length: table_size(16) | pba_bar(8) | reserved(8) | pba_offset(32)
-pub fn find_msix_capability(resources: &[PciResource]) -> Option<MsixCapInfo> {
-    for r in resources {
-        if r.kind == ResourceKind::MsixCapability as u32 {
-            let cap_offset = (r.start & 0xFFFF) as u16;
-            let table_bar = ((r.start >> 16) & 0xFF) as u8;
-            let table_offset = ((r.start >> 32) & 0xFFFF_FFFF) as u32;
-            let table_size = (r.length & 0xFFFF) as u16;
-            let pba_bar = ((r.length >> 16) & 0xFF) as u8;
-            let pba_offset = ((r.length >> 32) & 0xFFFF_FFFF) as u32;
-            return Some(MsixCapInfo {
-                cap_offset,
-                table_bar,
-                table_offset,
-                table_size,
-                pba_bar,
-                pba_offset,
-            });
-        }
-    }
-    None
-}

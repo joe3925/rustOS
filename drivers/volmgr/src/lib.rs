@@ -21,7 +21,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::IoTarget;
-use kernel_api::kernel_types::io::PartitionInfo;
+use kernel_api::kernel_types::io::{PartitionInfo, PartitionInfoProtocol, VolmgrProtocol, VolmgrProtocolVTable};
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceFlushOwner, DeviceFlushOwnerOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
 };
@@ -33,7 +33,8 @@ use kernel_api::pnp::PnpOps;
 use kernel_api::pnp::driver_set_evt_device_add;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_get_device_target;
-use kernel_api::pnp::{QueryResources, RegisterDmaBacking, ResourceSet};
+use kernel_api::device::{register_protocol, publish_stack_protocol, open_public_protocol};
+use kernel_api::pnp::{RegisterDmaBacking};
 use kernel_api::pnp::{io, pnp};
 use kernel_api::request::{Flush, FlushDirty, FlushOwner, Read, Write};
 use kernel_api::request_handler;
@@ -496,7 +497,7 @@ pub extern "C" fn vol_device_add(
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp_ops = PnpOps::new();
-    pnp_ops.start_device.set(vol_prepare_hardware);
+    pnp_ops.init_complete.set(vol_init_complete);
     pnp_ops.query_device_relations.set(vol_enumerate_devices);
 
     dev_init.set_dev_ext_default::<VolExt>();
@@ -505,37 +506,29 @@ pub extern "C" fn vol_device_add(
 }
 
 #[request_handler]
-pub async fn vol_prepare_hardware<'a, 'b>(
+pub async fn vol_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut kernel_api::pnp::InitComplete,
 ) -> DriverStep {
-    let mut query_req = QueryResources {
-        resources: ResourceSet::default(),
+    let devnode = dev.dev_node.get().unwrap().upgrade().unwrap();
+    let proto = match open_public_protocol::<PartitionInfoProtocol>(&devnode) {
+        Ok(p) => p,
+        Err(e) => {
+            cold_path();
+            return DriverStep::complete(e);
+        }
     };
-
-    let st = pnp::send_next_lower(dev.clone(), &mut query_req).await;
-    if unlikely(st == DriverStatus::NoSuchDevice) {
-        cold_path();
-        return DriverStep::complete(DriverStatus::Success);
-    }
-    if unlikely(st != DriverStatus::Success) {
-        cold_path();
-        println!(
-            "volmgr: vol_prepare_hardware lower QueryResources dispatch failed: {}",
-            st
-        );
-        return DriverStep::complete(st);
-    }
+    let pi = match (proto.query)(&proto.provider()) {
+        Ok(pi) => pi,
+        Err(e) => {
+            cold_path();
+            return DriverStep::complete(e);
+        }
+    };
 
     let dx = ext::<VolExt>(&dev);
-    let pi_opt = match query_req.resources {
-        ResourceSet::Partition(pi) => Some(pi),
-        _ => None,
-    };
-    if let Some(pi) = pi_opt {
-        dx.part.call_once(|| pi);
-    }
+    dx.part.call_once(|| pi);
 
     DriverStep::Continue
 }
@@ -604,8 +597,9 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     };
 
     let mut pnp_ops = PnpOps::new();
-    pnp_ops.query_resources.set(vol_pdo_query_resources);
+    pnp_ops.start_device.set(vol_pdo_start);
     pnp_ops.remove_device.set(vol_pdo_remove_device);
+    pnp_ops.register_dma_backing.set(vol_pdo_register_dma_backing);
 
     let mut init = DeviceInit::with_pnp(Some(pnp_ops));
     init.ops.register::<DeviceReadOp, VolPdoIo>();
@@ -615,12 +609,12 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     init.ops.register::<DeviceFlushOwnerOp, VolPdoIo>();
     init.set_dev_ext_default::<VolPdoExt>();
 
-    let (_dn, pdo) = pnp_create_child_devnode_and_pdo_with_init(
+    let (dn_child, pdo) = pnp_create_child_devnode_and_pdo_with_init(
         &parent_dn,
         name,
         inst,
         ids,
-        Some("volume".into()),
+        Some("Volume".into()),
         init,
     );
 
@@ -873,7 +867,22 @@ async fn vol_pdo_flush_common(
 }
 
 #[request_handler]
-pub async fn vol_pdo_remove_device<'a, 'b>(
+async fn vol_pdo_start<'req, 'data, 'b>(
+    dev: &Arc<DeviceObject>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
+) -> DriverStep {
+    if let Some(dn) = dev.dev_node.get() {
+        if let Some(dn) = dn.upgrade() {
+            register_protocol::<VolmgrProtocol>(dev, &VOLMGR_INFO_VTABLE);
+            publish_stack_protocol::<VolmgrProtocol>(&dn);
+        }
+    }
+    DriverStep::Continue
+}
+
+#[request_handler]
+pub async fn vol_pdo_remove_device<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut kernel_api::pnp::RemoveDevice,
@@ -886,19 +895,26 @@ pub async fn vol_pdo_remove_device<'a, 'b>(
         }
     }
 
-    DriverStep::Continue
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-async fn vol_pdo_query_resources<'a, 'b>(
-    pdo: &Arc<DeviceObject>,
+async fn vol_pdo_register_dma_backing<'req, 'data, 'b>(
+    _pdo: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryResources,
+    _req: &'b mut kernel_api::pnp::RegisterDmaBacking<'data>,
 ) -> DriverStep {
-    if let Some(pi) = ext::<VolPdoExt>(&pdo).part.get() {
-        req.resources = ResourceSet::Partition(pi.clone());
-    }
-    let status = DriverStatus::Success;
-
-    DriverStep::complete(status)
+    DriverStep::complete(DriverStatus::Success)
 }
+
+extern "C" fn vol_partition_info(device: &Arc<DeviceObject>) -> Result<PartitionInfo, DriverStatus> {
+    let dx = ext::<VolPdoExt>(device);
+    if let Some(pi) = dx.part.get() {
+        Ok(pi.clone())
+    } else {
+        Err(DriverStatus::Unsuccessful)
+    }
+}
+const VOLMGR_INFO_VTABLE: VolmgrProtocolVTable = VolmgrProtocolVTable {
+    partition_info: vol_partition_info,
+};

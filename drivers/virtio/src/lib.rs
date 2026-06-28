@@ -36,14 +36,15 @@ use kernel_api::irq::{
 };
 use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::{
-    DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
+    DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, DiskInfoProtocol,
+    DiskInfoProtocolVTable, ReadSlot,
 };
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
 use kernel_api::pnp::{
-    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceSet,
+    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources,
     driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::DeviceControl;
@@ -300,6 +301,7 @@ pub extern "C" fn virtio_device_add(
 ) -> DriverStep {
     let mut pnp_vt = PnpOps::new();
     pnp_vt.start_device.set(virtio_pnp_start);
+    pnp_vt.init_complete.set(virtio_init_complete);
     pnp_vt.remove_device.set(virtio_pnp_remove);
     pnp_vt.query_device_relations.set(virtio_pnp_query_devrels);
 
@@ -370,35 +372,59 @@ async fn setup_msix_via_pci(
 }
 #[request_handler]
 async fn virtio_pnp_start<'req, 'data, 'b>(
+    _dev: &Arc<DeviceObject>,
+    _op: PnpOp,
+    _req: &'b mut kernel_api::pnp::StartDevice,
+) -> DriverStep {
+    DriverStep::Continue
+}
+
+#[request_handler]
+async fn virtio_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::StartDevice,
+    req: &'b mut kernel_api::pnp::InitComplete,
 ) -> DriverStep {
-    let mut query_req = QueryResources {
-        resources: ResourceSet::default(),
+    let proto = match kernel_api::device::open_protocol_to_next_lower::<
+        kernel_api::kernel_types::pci::PciProtocol,
+    >(dev)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            println!("virtio-blk: no PCI protocol on parent");
+            return complete_req(req, e);
+        }
     };
-    let qr_status = pnp::send_next_lower(dev.clone(), &mut query_req).await;
-    if qr_status != DriverStatus::Success {
-        println!("virtio-blk: QueryResources failed: {:?}", qr_status);
-        return complete_req(req, qr_status);
+
+    let msix_cap = (proto.get_msix)(&proto.provider());
+
+    let mut mapped_bars = alloc::vec::Vec::new();
+    for i in 0..6 {
+        if let Some(bar) = (proto.get_bar)(&proto.provider(), i) {
+            if bar.kind == kernel_api::kernel_types::pci::BarKind::Mem32
+                || bar.kind == kernel_api::kernel_types::pci::BarKind::Mem64
+            {
+                if bar.size > 0 {
+                    if let Ok(va) = kernel_api::memory::map_mmio_region(
+                        kernel_api::memory::PhysAddr::new(bar.base),
+                        bar.size,
+                    ) {
+                        mapped_bars.push((i as u32, va, bar.size));
+                    }
+                }
+            }
+        }
     }
 
-    let resources = {
-        let blob = match &query_req.resources {
-            ResourceSet::Encoded(blob) => blob.as_slice(),
-            _ => &[],
-        };
-        pci::parse_resources(blob)
-    };
-    let msix_cap = pci::find_msix_capability(&resources);
-
-    let mapped_bars = pci::map_memory_bars(&resources);
     if mapped_bars.is_empty() {
         println!("virtio-blk: no memory BARs found");
         return complete_req(req, virtio_device_error("virtio-blk: no memory BARs found"));
     }
 
-    let (cfg_phys, cfg_len) = match pci::find_config_space(&resources) {
+    let gsi = (proto.get_gsi)(&proto.provider());
+    let int_line = (proto.get_interrupt_line)(&proto.provider());
+
+    let (cfg_phys, cfg_len) = match (proto.get_config_space_phys)(&proto.provider()) {
         Some(v) => v,
         None => {
             println!("virtio-blk: no PCI config space resource");
@@ -580,13 +606,13 @@ async fn virtio_pnp_start<'req, 'data, 'b>(
     virtqueues.truncate(final_queue_count);
 
     let line_irq_handle: Option<IrqHandle> = if !use_msix {
-        if let Some(gsi) = pci::find_gsi(&resources) {
-            if gsi < 64 {
-                irq_register_isr_gsi(gsi as u8, virtio_isr, caps.isr_cfg.as_u64() as usize)
+        if let Some(g) = gsi {
+            if g < 64 {
+                irq_register_isr_gsi(g as u8, virtio_isr, caps.isr_cfg.as_u64() as usize)
             } else {
                 None
             }
-        } else if let Some(line) = pci::find_interrupt_line(&resources) {
+        } else if let Some(line) = int_line {
             if line < 16 {
                 let vector = PIC_BASE_VECTOR + line;
                 irq_register_isr(vector, virtio_isr, caps.isr_cfg.as_u64() as usize)
@@ -971,7 +997,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
 
     let mut pnp_vt = PnpOps::new();
     pnp_vt.query_id.set(virtio_pdo_query_id);
-    pnp_vt.query_resources.set(virtio_pdo_query_resources);
+
     pnp_vt.start_device.set(virtio_pdo_start);
     pnp_vt
         .register_dma_backing
@@ -998,7 +1024,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     });
 
     let parent_dn = parent.dev_node.get().unwrap().upgrade().unwrap();
-    let _ = pnp_create_child_devnode_and_pdo_with_init(
+    let (devnode, pdo) = pnp_create_child_devnode_and_pdo_with_init(
         &parent_dn,
         "VirtIO_Disk_0".into(),
         "VirtIO\\Disk_0".into(),
@@ -1109,6 +1135,17 @@ pub async fn virtio_pdo_start<'req, 'data, 'b>(
     _op: PnpOp,
     req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
+    if let Some(dn) = _dev.dev_node.get() {
+        if let Some(dn) = dn.upgrade() {
+            kernel_api::device::register_protocol::<kernel_api::kernel_types::io::DiskInfoProtocol>(
+                _dev,
+                &VIRTIO_DISK_INFO_VTABLE,
+            );
+            kernel_api::device::publish_stack_protocol::<
+                kernel_api::kernel_types::io::DiskInfoProtocol,
+            >(&dn);
+        }
+    }
     complete_req(req, DriverStatus::Success)
 }
 
@@ -1145,22 +1182,6 @@ pub async fn virtio_pdo_query_id<'req, 'data, 'b>(
 }
 
 #[request_handler]
-pub async fn virtio_pdo_query_resources<'req, 'data, 'b>(
-    pdo: &Arc<DeviceObject>,
-    _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryResources,
-) -> DriverStep {
-    let cdx = match pdo.try_devext::<ChildExt>() {
-        Ok(x) => x,
-        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
-    };
-
-    req.resources = ResourceSet::Disk(cdx.disk_info);
-    let status = DriverStatus::Success;
-
-    complete_req(req, status)
-}
-#[request_handler]
 pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     _op: PnpOp,
@@ -1185,3 +1206,13 @@ pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
 
     complete_req(req, status)
 }
+
+extern "C" fn virtio_disk_info(device: &Arc<DeviceObject>) -> Result<DiskInfo, DriverStatus> {
+    let ext = device
+        .try_devext::<ChildExt>()
+        .map_err(|_| DriverStatus::NoSuchDevice)?;
+    Ok(ext.disk_info)
+}
+const VIRTIO_DISK_INFO_VTABLE: DiskInfoProtocolVTable = DiskInfoProtocolVTable {
+    query: virtio_disk_info,
+};

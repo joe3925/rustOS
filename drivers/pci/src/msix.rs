@@ -11,7 +11,8 @@ use kernel_api::pnp::DriverStep;
 use kernel_api::request::DeviceControl;
 use kernel_api::status::DriverStatus;
 
-use crate::dev_ext::{BarKind, PciPdoExt};
+use crate::dev_ext::PciPdoExt;
+use kernel_api::kernel_types::pci::BarKind;
 
 /// Read 16-bit value from config space.
 #[inline]

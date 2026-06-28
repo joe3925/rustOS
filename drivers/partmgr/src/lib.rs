@@ -13,12 +13,14 @@ use core::panic::PanicInfo;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_api::device::{open_public_protocol, publish_stack_protocol, register_protocol};
 use kernel_api::dma::dma::IoBufferBackingConfig;
 use kernel_api::dma::dma::{IoBufferBacking, IoBufferBackingDesc};
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
-    DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp, DiskInfo, GptHeader, GptPartitionEntry,
-    PartitionInfo,
+    DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceRead, DeviceReadOp,
+    DeviceWrite, DeviceWriteOp, DiskInfo, DiskInfoProtocol, DiskInfoProtocolVTable, GptHeader,
+    GptPartitionEntry, PartitionInfo, PartitionInfoProtocol, PartitionInfoProtocolVTable,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::IoctlData;
@@ -27,8 +29,8 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{DeviceControl, Flush, FlushDirty, Read, Write};
-use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
+use kernel_api::{println, request_handler};
 use spin::Once;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
@@ -54,7 +56,7 @@ pub extern "C" fn partmgr_device_add(
     init.set_dev_ext_default::<PartMgrExt>();
 
     let mut pnp = PnpOps::new();
-    pnp.start_device.set(partmgr_start);
+    pnp.init_complete.set(partmgr_init_complete);
     pnp.query_device_relations.set(partmgr_pnp_query_devrels);
     init.pnp_ops = Some(pnp);
 
@@ -325,20 +327,22 @@ impl DeviceFlushDirty for PartitionPdoIo {
 }
 
 #[request_handler]
-async fn partition_pdo_query_resources<'req, 'data, 'b>(
-    device: &Arc<DeviceObject>,
+async fn partmgr_pdo_start<'req, 'data, 'b>(
+    dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    request: &'b mut kernel_api::pnp::QueryResources,
+    _req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
-    let dx = ext::<PartDevExt>(&device);
-    if let Some(pi) = dx.part.get() {
-        request.resources = kernel_api::pnp::ResourceSet::Partition((*pi).clone());
+    if let Some(dn) = dev.dev_node.get() {
+        if let Some(dn) = dn.upgrade() {
+            register_protocol::<PartitionInfoProtocol>(dev, &PARTITION_INFO_VTABLE);
+            publish_stack_protocol::<PartitionInfoProtocol>(&dn);
+        }
     }
-
-    DriverStep::complete(DriverStatus::Success)
+    DriverStep::Continue
 }
+
 #[request_handler]
-async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
+pub async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     request: &'b mut kernel_api::pnp::RegisterDmaBacking<'data>,
@@ -355,24 +359,31 @@ async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
     DriverStep::complete(status)
 }
 #[request_handler]
-pub async fn partmgr_start<'req, 'data, 'b>(
+pub async fn partmgr_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    _req: &'b mut kernel_api::pnp::StartDevice,
+    _req: &'b mut kernel_api::pnp::InitComplete,
 ) -> DriverStep {
     let dx = ext::<PartMgrExt>(&dev);
 
-    let mut parent_req = DeviceControl::new(IOCTL_DRIVE_IDENTIFY, IoctlData::empty());
-    let status = io::send_next_lower(dev.clone(), &mut parent_req).await;
-    if status != DriverStatus::Success {
-        return DriverStep::complete(status);
-    }
+    let devnode = dev.dev_node.get().unwrap().upgrade().unwrap();
+    let proto = match open_public_protocol::<DiskInfoProtocol>(&devnode) {
+        Ok(p) => p,
+        Err(e) => {
+            cold_path();
+            return DriverStep::complete(e);
+        }
+    };
 
-    if let Some(data) = parent_req.data.view::<DiskInfo>() {
-        dx.disk_info.call_once(|| *data);
-    } else {
-        return DriverStep::complete(status);
-    }
+    let di = match (proto.query)(&proto.provider()) {
+        Ok(di) => di,
+        Err(e) => {
+            cold_path();
+            return DriverStep::complete(e);
+        }
+    };
+
+    dx.disk_info.call_once(|| di);
 
     DriverStep::Continue
 }
@@ -521,13 +532,16 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
         child_init.ops.register::<DeviceReadOp, PartitionPdoIo>();
         child_init.ops.register::<DeviceWriteOp, PartitionPdoIo>();
         child_init.ops.register::<DeviceFlushOp, PartitionPdoIo>();
-        child_init.ops.register::<DeviceFlushDirtyOp, PartitionPdoIo>();
+        child_init
+            .ops
+            .register::<DeviceFlushDirtyOp, PartitionPdoIo>();
 
-        let mut vt = PnpOps::new();
-        vt.query_resources.set(partition_pdo_query_resources);
-        vt.register_dma_backing
+        let mut pnp_vt = PnpOps::new();
+        pnp_vt.start_device.set(partmgr_pdo_start);
+        pnp_vt
+            .register_dma_backing
             .set(partition_pdo_register_dma_backing);
-        child_init.pnp_ops = Some(vt);
+        child_init.pnp_ops = Some(pnp_vt);
         child_init.set_dev_ext_default::<PartDevExt>();
 
         let name = alloc::format!("Partition{}", idx);
@@ -537,7 +551,7 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
             compatible: vec!["STOR\\Partition".into()],
         };
 
-        let (_dn_child, pdo) = pnp_create_child_devnode_and_pdo_with_init(
+        let (dn_child, pdo) = pnp_create_child_devnode_and_pdo_with_init(
             &parent_dn,
             name,
             inst,
@@ -549,18 +563,8 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
         let pext = ext::<PartDevExt>(&pdo);
         pext.start_lba.call_once(|| e.first_lba);
         pext.end_lba.call_once(|| e.last_lba);
-        pext.block_size.call_once(|| sec_sz_u32.max(1));
-        pext.parent.call_once(|| {
-            pdo.dev_node
-                .get()
-                .unwrap()
-                .upgrade()
-                .unwrap()
-                .parent
-                .get()
-                .unwrap()
-                .clone()
-        });
+        pext.block_size.call_once(|| di.logical_block_size.max(1));
+        pext.parent.call_once(|| Arc::downgrade(&parent_dn));
 
         let part_pi = PartitionInfo {
             disk: *di,
@@ -594,3 +598,17 @@ fn guid_to_string(g: &[u8; 16]) -> String {
         g[15]
     )
 }
+
+extern "C" fn part_partition_info(
+    device: &Arc<DeviceObject>,
+) -> Result<PartitionInfo, DriverStatus> {
+    let dx = ext::<PartDevExt>(device);
+    if let Some(pi) = dx.part.get() {
+        Ok(pi.clone())
+    } else {
+        Err(DriverStatus::Unsuccessful)
+    }
+}
+const PARTITION_INFO_VTABLE: PartitionInfoProtocolVTable = PartitionInfoProtocolVTable {
+    query: part_partition_info,
+};

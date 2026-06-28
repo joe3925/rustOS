@@ -18,19 +18,22 @@ use alloc::{
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
-use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::device::{open_protocol_to_next_lower, ProtocolHandle, register_protocol, DeviceInit, DeviceObject, DriverObject, publish_stack_protocol};
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
-use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceControlOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp, DiskInfo};
+use kernel_api::kernel_types::io::{
+    DeviceControlHandler, DeviceControlOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
+    DiskInfo, DiskInfoProtocol, DiskInfoProtocolVTable,
+};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::port::Port;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::{
-    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceKind,
+    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, ResourceKind,
     ResourceSet, driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{DeviceControl, Read, Write};
@@ -614,7 +617,7 @@ pub extern "C" fn ide_device_add(
 ) -> DriverStep {
     let mut vt = PnpOps::new();
 
-    vt.start_device.set(ide_pnp_start);
+    vt.init_complete.set(ide_init_complete);
     vt.query_device_relations.set(ide_pnp_query_devrels);
 
     let init = DeviceInit::with_pnp(Some(vt));
@@ -626,26 +629,15 @@ pub extern "C" fn ide_device_add(
 }
 
 #[request_handler]
-async fn ide_pnp_start<'req, 'data, 'b>(
+async fn ide_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
-    req: &'b mut kernel_api::pnp::StartDevice,
+    req: &'b mut kernel_api::pnp::InitComplete,
 ) -> DriverStep {
-    let mut child_handle = QueryResources {
-        resources: ResourceSet::default(),
-    };
+    let proto = kernel_api::device::open_protocol_to_next_lower::<kernel_api::kernel_types::pci::PciProtocol>(dev).ok();
 
-    let st = pnp::send_next_lower(dev.clone(), &mut child_handle).await;
-
-    if st != DriverStatus::NoSuchDevice {
-        let bars = {
-            let data = match &child_handle.resources {
-                ResourceSet::Encoded(data) => data.as_slice(),
-                _ => &[],
-            };
-
-            parse_ide_bars(data)
-        };
+    if proto.is_some() || pnp::send_next_lower(dev.clone(), &mut kernel_api::pnp::QueryResources { resources: ResourceSet::default() }).await != DriverStatus::NoSuchDevice {
+        let bars = parse_ide_bars(proto.as_ref());
 
         let dx = dev.try_devext::<DevExt>().expect("ide: FDO DevExt missing");
 
@@ -778,7 +770,6 @@ fn create_child_pdo(
 
     let mut pvt = PnpOps::new();
     pvt.query_id.set(ide_pdo_query_id);
-    pvt.query_resources.set(ide_pdo_query_resources);
     pvt.start_device.set(ide_pdo_start);
 
     let mut child_init = DeviceInit::with_pnp(Some(pvt));
@@ -807,9 +798,22 @@ fn create_child_pdo(
     let short_name = alloc::format!("IDE_Disk_{}_{}", channel, drive);
     let instance = alloc::format!("IDE\\DRV_{:02}", drive);
 
-    let (_dn, _pdo) = pnp_create_child_devnode_and_pdo_with_init(
+    let (_dn, pdo) = pnp_create_child_devnode_and_pdo_with_init(
         &parent_dn, short_name, instance, ids, class, child_init,
     );
+}
+
+const DISK_INFO_VTABLE: DiskInfoProtocolVTable = DiskInfoProtocolVTable {
+    query: ide_disk_info,
+};
+
+extern "C" fn ide_disk_info(device: &Arc<DeviceObject>) -> Result<DiskInfo, DriverStatus> {
+    let cdx = device.try_devext::<ChildExt>().map_err(|_| DriverStatus::NoSuchDevice)?;
+    if let Some(di) = cdx.disk_info {
+        Ok(di)
+    } else {
+        Err(DriverStatus::Unsuccessful)
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -821,93 +825,41 @@ struct IdeBars {
     irq_line: Option<u8>,
 }
 
-fn parse_ide_bars(blob: &[u8]) -> IdeBars {
+
+fn parse_ide_bars(proto: Option<&kernel_api::device::ProtocolHandle<kernel_api::kernel_types::pci::PciProtocol>>) -> IdeBars {
     let mut bars = IdeBars::default();
 
-    if blob.len() < 12 || &blob[0..4] != b"RSRC" {
-        bars.cmd = 0x1F0;
-        bars.ctl = 0x3F4;
-        bars.irq_line = Some(14);
-        return bars;
-    }
-
-    let mut off = 12usize;
-
-    while off + 24 <= blob.len() {
-        let kind = u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
-        let index =
-            u32::from_le_bytes([blob[off + 4], blob[off + 5], blob[off + 6], blob[off + 7]]);
-        let start = u64::from_le_bytes([
-            blob[off + 8],
-            blob[off + 9],
-            blob[off + 10],
-            blob[off + 11],
-            blob[off + 12],
-            blob[off + 13],
-            blob[off + 14],
-            blob[off + 15],
-        ]);
-        let len = u64::from_le_bytes([
-            blob[off + 16],
-            blob[off + 17],
-            blob[off + 18],
-            blob[off + 19],
-            blob[off + 20],
-            blob[off + 21],
-            blob[off + 22],
-            blob[off + 23],
-        ]);
-
-        off += 24;
-
-        if kind == ResourceKind::Gsi as u32 {
-            bars.gsi = Some(start as u32);
-            continue;
-        }
-
-        if kind == ResourceKind::Interrupt as u32 {
-            bars.irq_line = Some(start as u8);
-            continue;
-        }
-
-        if kind != ResourceKind::Port as u32 {
-            continue;
-        }
-
-        match index {
-            0 => bars.cmd = start as u16,
-            1 => bars.ctl = start as u16,
-            4 => bars.bm = start as u16,
-            _ => {
-                let l = len as u16;
-
-                if bars.cmd == 0 && (l == 8 || l == 16) {
-                    bars.cmd = start as u16;
-                } else if bars.ctl == 0 && (l == 4 || l == 2) {
-                    bars.ctl = start as u16;
-                } else if bars.bm == 0 && (l == 0x10 || l == 0x08) {
-                    bars.bm = start as u16;
+    if let Some(proto) = proto {
+        for i in 0..6 {
+            if let Some(b) = (proto.get_bar)(&proto.provider(), i) {
+                if b.kind != kernel_api::kernel_types::pci::BarKind::Io {
+                    continue;
+                }
+                match i {
+                    0 => bars.cmd = b.base as u16,
+                    1 => bars.ctl = b.base as u16,
+                    4 => bars.bm = b.base as u16,
+                    _ => {
+                        if bars.cmd == 0 && (b.size == 8 || b.size == 16) {
+                            bars.cmd = b.base as u16;
+                        } else if bars.ctl == 0 && (b.size == 4 || b.size == 2) {
+                            bars.ctl = b.base as u16;
+                        } else if bars.bm == 0 && (b.size == 0x10 || b.size == 0x08) {
+                            bars.bm = b.base as u16;
+                        }
+                    }
                 }
             }
         }
+        bars.irq_line = (proto.get_interrupt_line)(&proto.provider());
+        bars.gsi = (proto.get_gsi)(&proto.provider()).map(|x| x as u32);
     }
 
     if bars.cmd == 0 {
         bars.cmd = 0x1F0;
+        bars.ctl = 0x3F4;
+        bars.irq_line = Some(14);
     }
-
-    if bars.ctl == 0 {
-        bars.ctl = match bars.cmd {
-            0x1F0 => 0x3F4,
-            0x170 => 0x374,
-            v => v.wrapping_add(2),
-        };
-    }
-
-    if bars.gsi.is_none() && bars.irq_line.is_none() {
-        bars.irq_line = Some(if bars.cmd == 0x170 { 15 } else { 14 });
-    }
-
     bars
 }
 
@@ -1370,32 +1322,16 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
 }
 
 #[request_handler]
-pub async fn ide_pdo_query_resources<'req, 'data, 'b>(
-    pdo: &Arc<DeviceObject>,
-    _op: PnpOp,
-    req: &'b mut kernel_api::pnp::QueryResources,
-) -> DriverStep {
-    let cdx = match pdo.try_devext::<ChildExt>() {
-        Ok(x) => x,
-        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
-    };
-
-    let status = match cdx.disk_info.as_ref() {
-        Some(di) => {
-            req.resources = ResourceSet::Disk(*di);
-            DriverStatus::Success
-        }
-        None => DriverStatus::DeviceNotReady,
-    };
-
-    complete_req(req, status)
-}
-
-#[request_handler]
 pub async fn ide_pdo_start<'req, 'data, 'b>(
     _pdo: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut kernel_api::pnp::StartDevice,
 ) -> DriverStep {
+    if let Some(dn) = _pdo.dev_node.get() {
+        if let Some(dn) = dn.upgrade() {
+            register_protocol::<DiskInfoProtocol>(_pdo, &DISK_INFO_VTABLE);
+            publish_stack_protocol::<DiskInfoProtocol>(&dn);
+        }
+    }
     complete_req(req, DriverStatus::Success)
 }

@@ -60,3 +60,76 @@ impl PciConfigAddress {
         self.offset & !3
     }
 }
+
+use alloc::vec::Vec;
+use alloc::sync::Arc;
+use crate::device::{Protocol, ProtocolId, ProtocolVersion, DeviceObject};
+use crate::status::DriverStatus;
+
+#[derive(Clone, Copy, Debug)]
+pub struct PrtEntry {
+    pub device: u8,
+    pub pin: u8,
+    pub gsi: u16,
+}
+
+#[repr(C)]
+pub struct AcpiPciProtocolVTable {
+    pub get_ecam_segments: extern "C" fn(&Arc<DeviceObject>) -> Result<Vec<EcamSegment>, DriverStatus>,
+    pub get_prt_entries: extern "C" fn(&Arc<DeviceObject>) -> Result<Vec<PrtEntry>, DriverStatus>,
+}
+
+pub enum AcpiPciProtocol {}
+unsafe impl Protocol for AcpiPciProtocol {
+    const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000005);
+    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+    type VTable = AcpiPciProtocolVTable;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarKind { None, Io, Mem32, Mem64 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct Bar {
+    pub kind: BarKind,
+    pub base: u64,
+    pub size: u64,
+    pub prefetch: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsixInfo {
+    pub cap_offset: u16,
+    pub table_bar: u8,
+    pub table_offset: u32,
+    pub table_size: u16,
+    pub pba_bar: u8,
+    pub pba_offset: u32,
+}
+
+#[repr(C)]
+pub struct PciProtocolVTable {
+    pub get_bar: extern "C" fn(&Arc<DeviceObject>, u8) -> Option<Bar>,
+    pub get_config_space_phys: extern "C" fn(&Arc<DeviceObject>) -> Option<(u64, u64)>,
+    pub get_gsi: extern "C" fn(&Arc<DeviceObject>) -> Option<u16>,
+    pub get_interrupt_line: extern "C" fn(&Arc<DeviceObject>) -> Option<u8>,
+    pub get_msix: extern "C" fn(&Arc<DeviceObject>) -> Option<MsixInfo>,
+}
+
+pub enum PciProtocol {}
+unsafe impl Protocol for PciProtocol {
+    const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000006);
+    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+    type VTable = PciProtocolVTable;
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Bar {
+            kind: BarKind::None,
+            base: 0,
+            size: 0,
+            prefetch: false,
+        }
+    }
+}

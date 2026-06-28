@@ -2,6 +2,7 @@ use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
 use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
+use crate::status::DriverStatus;
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate,
     FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite,
@@ -913,4 +914,48 @@ define_device_ops! {
         handler: EvtIoDeviceControl,
         trait: DeviceControlHandler
     }
+}
+
+use crate::device::{Protocol, ProtocolId, ProtocolVersion};
+
+#[repr(C)]
+pub struct DiskInfoProtocolVTable {
+    pub query: extern "C" fn(&Arc<DeviceObject>) -> Result<DiskInfo, DriverStatus>,
+}
+
+pub enum DiskInfoProtocol {}
+
+unsafe impl Protocol for DiskInfoProtocol {
+    const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000001);
+    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+
+    type VTable = DiskInfoProtocolVTable;
+}
+
+#[repr(C)]
+pub struct PartitionInfoProtocolVTable {
+    pub query: extern "C" fn(&Arc<DeviceObject>) -> Result<PartitionInfo, DriverStatus>,
+}
+
+pub enum PartitionInfoProtocol {}
+
+unsafe impl Protocol for PartitionInfoProtocol {
+    const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000002);
+    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+
+    type VTable = PartitionInfoProtocolVTable;
+}
+
+#[repr(C)]
+pub struct VolmgrProtocolVTable {
+    pub partition_info: extern "C" fn(&Arc<DeviceObject>) -> Result<PartitionInfo, DriverStatus>,
+}
+
+pub enum VolmgrProtocol {}
+
+unsafe impl Protocol for VolmgrProtocol {
+    const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000003);
+    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+
+    type VTable = VolmgrProtocolVTable;
 }

@@ -3,13 +3,13 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_api::device::DeviceObject;
-use kernel_api::kernel_types::pci::{EcamSegment, PciConfigAddress};
+use kernel_api::kernel_types::pci::{EcamSegment, PciConfigAddress, Bar, BarKind, MsixInfo};
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pci::{pci_read_config_u32, pci_write_config_u32};
 use kernel_api::pnp::{QueryResources, ResourceSet};
 use kernel_api::status::{DriverStatus, PageMapError};
 
-use kernel_api::pnp::{ResourceKind, pnp};
+use kernel_api::pnp::pnp;
 
 use kernel_api::println;
 use spin::{Once, RwLock};
@@ -29,42 +29,13 @@ pub struct DevExt {
     pub prt: Once<Vec<PrtEntry>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BarKind {
-    None,
-    Io,
-    Mem32,
-    Mem64,
-}
 
-#[derive(Clone, Copy, Debug)]
-pub struct Bar {
-    pub kind: BarKind,
-    pub base: u64,
-    pub size: u64,
-    pub prefetch: bool,
-}
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MsixInfo {
-    pub cap_offset: u16,
-    pub table_bar: u8,
-    pub table_offset: u32,
-    pub table_size: u16,
-    pub pba_bar: u8,
-    pub pba_offset: u32,
-}
 
-impl Default for Bar {
-    fn default() -> Self {
-        Bar {
-            kind: BarKind::None,
-            base: 0,
-            size: 0,
-            prefetch: false,
-        }
-    }
-}
+
+
+
+
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -421,55 +392,7 @@ pub fn header_type(seg: &McfgSegment, bus: u8, dev: u8) -> Option<u8> {
     Some(ht)
 }
 
-pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
-    let mut items: alloc::vec::Vec<(u32, u32, u64, u64)> = alloc::vec::Vec::new();
 
-    for (i, b) in p.bars.iter().enumerate() {
-        match b.kind {
-            BarKind::None => {}
-            BarKind::Io => {
-                items.push((ResourceKind::Port as u32, i as u32, b.base, b.size));
-            }
-            BarKind::Mem32 | BarKind::Mem64 => {
-                items.push((ResourceKind::Memory as u32, i as u32, b.base, b.size));
-            }
-        }
-    }
-
-    if p.irq_pin != 0 {
-        if let Some(gsi) = p.irq_gsi {
-            let prt_pin = (p.irq_pin - 1) as u32;
-            items.push((ResourceKind::Gsi as u32, prt_pin, gsi as u64, 0));
-        } else {
-            let flags = (p.irq_pin as u32) & 0xFF;
-            items.push((ResourceKind::Interrupt as u32, flags, p.irq_line as u64, 0));
-        }
-    }
-
-    items.push((ResourceKind::ConfigSpace as u32, 0, p.cfg_phys, 4096));
-
-    if let Some(ref msix) = p.msix {
-        let start = (msix.cap_offset as u64)
-            | ((msix.table_bar as u64) << 16)
-            | ((msix.table_offset as u64) << 32);
-        let length = (msix.table_size as u64)
-            | ((msix.pba_bar as u64) << 16)
-            | ((msix.pba_offset as u64) << 32);
-        items.push((ResourceKind::MsixCapability as u32, 0, start, length));
-    }
-
-    let mut out = alloc::vec::Vec::with_capacity(12 + items.len() * 24);
-    out.extend_from_slice(b"RSRC");
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-    for (k, idx, s, l) in items {
-        out.extend_from_slice(&k.to_le_bytes());
-        out.extend_from_slice(&idx.to_le_bytes());
-        out.extend_from_slice(&s.to_le_bytes());
-        out.extend_from_slice(&l.to_le_bytes());
-    }
-    out
-}
 
 #[inline]
 pub fn hwids_for(
