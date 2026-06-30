@@ -8,7 +8,8 @@ use kernel_types::{
 };
 
 use crate::{
-    drivers::drive::vfs::Vfs, file_system::bootstrap_filesystem::BootstrapProvider, util::BOOTSET,
+    drivers::drive::vfs::Vfs, file_system::bootstrap_filesystem::BootstrapProvider,
+    util::take_boot_packages,
 };
 
 #[repr(u8)]
@@ -19,8 +20,12 @@ pub enum ProviderKind {
 }
 
 pub static BOOTSTRAP_PROVIDER: Lazy<BootstrapProvider> =
-    Lazy::new(|| BootstrapProvider::new(BOOTSET));
+    Lazy::new(|| BootstrapProvider::new(take_boot_packages()));
 pub static VFS_PROVIDER: Lazy<Vfs> = Lazy::new(Vfs::new);
+
+pub fn initialize_bootstrap_provider() {
+    let _ = &*BOOTSTRAP_PROVIDER;
+}
 
 static CURRENT_PROVIDER: AtomicU8 = AtomicU8::new(ProviderKind::Bootstrap as u8);
 

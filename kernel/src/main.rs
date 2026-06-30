@@ -152,6 +152,7 @@ unsafe fn copy_boot_info(src: &ActiveBootInfo) {
         kernel_entry: src.kernel_entry,
         kernel_text: src.kernel_text,
         kernel_sections,
+        boot_packages: src.boot_packages,
         stub_base: src.stub_base,
         stub_size: src.stub_size,
     };

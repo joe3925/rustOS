@@ -1,13 +1,14 @@
 extern crate rand_xoshiro;
 
 use crate::benchmarking::BenchWindow;
-use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file_provider::{install_file_provider, ProviderKind};
+use crate::file_system::file_provider::{
+    initialize_bootstrap_provider, install_file_provider, ProviderKind,
+};
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
@@ -52,20 +53,6 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub static BOOTSET: &[BootPkg] = boot_packages![
-    "root",
-    "devicetree",
-    "acpi",
-    "pci",
-    "ide",
-    "disk",
-    "partmgr",
-    "volmgr",
-    "mountmgr",
-    "fat32",
-    "i8042",
-    "virtio"
-];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
 
@@ -121,6 +108,7 @@ pub unsafe fn init() {
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
+        initialize_bootstrap_provider();
         {
             let boot = boot_info();
             crate::profiling::unwind::register_kernel_pe_unwind_module(
@@ -421,54 +409,98 @@ pub fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
     buffer
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct BootPkg {
-    pub name: &'static str,
-    pub toml: &'static [u8],
-    pub image: &'static [u8],
+    pub name: alloc::string::String,
+    pub toml: Vec<u8>,
+    pub image: Vec<u8>,
 }
 
-#[macro_export]
-macro_rules! boot_packages {
-    ($($name:literal),+ $(,)?) => {{
-        &[
-            $(
-                {
-                    #[cfg(debug_assertions)]
-                    const IMAGE: &[u8] = include_bytes!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../drivers/target/",
-                        $crate::platform_driver_target_dir!(),
-                        "/debug/",
-                        $name,
-                        ".dll"
-                    ));
-                    #[cfg(not(debug_assertions))]
-                    const IMAGE: &[u8] = include_bytes!(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../drivers/target/",
-                        $crate::platform_driver_target_dir!(),
-                        "/release/",
-                        $name,
-                        ".dll"
-                    ));
+pub fn take_boot_packages() -> Vec<BootPkg> {
+    use alloc::collections::BTreeSet;
+    use alloc::string::String;
+    use core::mem::size_of;
+    use kernel_abi::MAX_BOOT_PACKAGES;
 
-                    $crate::util::BootPkg {
-                        name: $name,
-                        toml: include_bytes!(concat!(
-                            env!("CARGO_MANIFEST_DIR"),
-                            "/../drivers/",
-                            $name,
-                            "/src/",
-                            $name,
-                            ".toml"
-                        )),
-                        image: IMAGE,
-                    }
-                },
-            )+
-        ] as &[ $crate::util::BootPkg ]
-    }};
+    let boot = boot_info();
+    let packages = &boot.boot_packages;
+    if packages.len() > MAX_BOOT_PACKAGES {
+        panic!("boot info contains too many boot packages");
+    }
+    validate_stub_slice(
+        packages.as_ptr() as usize,
+        packages
+            .len()
+            .saturating_mul(size_of::<kernel_abi::BootPackage>()),
+        boot.stub_base,
+        boot.stub_size,
+        "boot package table",
+    );
+    let descriptors = unsafe { packages.as_slice() };
+    let mut names = BTreeSet::new();
+    let mut owned = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let name_bytes = copy_stub_bytes(&descriptor.name, boot.stub_base, boot.stub_size, "name");
+        let name = String::from_utf8(name_bytes).expect("boot package name is not UTF-8");
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+            || name.contains("..")
+        {
+            panic!("invalid boot package name `{name}`");
+        }
+        if !names.insert(name.clone()) {
+            panic!("duplicate boot package `{name}` in boot info");
+        }
+        let toml = copy_stub_bytes(
+            &descriptor.configuration,
+            boot.stub_base,
+            boot.stub_size,
+            "configuration",
+        );
+        let image = copy_stub_bytes(&descriptor.image, boot.stub_base, boot.stub_size, "image");
+        if toml.is_empty() || image.is_empty() {
+            panic!("boot package `{name}` contains an empty artifact");
+        }
+        owned.push(BootPkg { name, toml, image });
+    }
+    owned
+}
+
+fn copy_stub_bytes(
+    bytes: &kernel_abi::BootByteSlice,
+    stub_base: u64,
+    stub_size: u64,
+    what: &str,
+) -> Vec<u8> {
+    validate_stub_slice(
+        bytes.as_ptr() as usize,
+        bytes.len(),
+        stub_base,
+        stub_size,
+        what,
+    );
+    unsafe { bytes.as_slice().to_vec() }
+}
+
+fn validate_stub_slice(ptr: usize, len: usize, stub_base: u64, stub_size: u64, what: &str) {
+    if len == 0 {
+        return;
+    }
+    if ptr == 0 {
+        panic!("boot package {what} has a null pointer");
+    }
+    let start = ptr as u64;
+    let end = start
+        .checked_add(len as u64)
+        .expect("boot package range overflow");
+    let stub_end = stub_base
+        .checked_add(stub_size)
+        .expect("kernel stub range overflow");
+    if start < stub_base || end > stub_end {
+        panic!("boot package {what} lies outside kernel stub memory");
+    }
 }
 unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) {
     (

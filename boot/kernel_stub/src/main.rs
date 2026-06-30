@@ -16,8 +16,8 @@ use goblin::pe::optional_header::MAGIC_64;
 use goblin::pe::section_table::{SectionTable, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 use goblin::pe::PE;
 use kernel_abi::{
-    BootInfo, KernelSection, KernelSections, KernelSymbol, KernelSymbolString, KernelSymbols,
-    KernelTextSection, MemoryRegion, MemoryRegionKind, MemoryRegions, Optional,
+    BootInfo, BootPackages, KernelSection, KernelSections, KernelSymbol, KernelSymbolString,
+    KernelSymbols, KernelTextSection, MemoryRegion, MemoryRegionKind, MemoryRegions, Optional,
     MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
     MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES,
 };
@@ -29,6 +29,7 @@ use platform::{
 type ActiveBootInfo = BootInfo<<ActivePlatform as Platform>::BootArchInfo>;
 
 const KERNEL_PE: &[u8] = include_bytes!(env!("KERNEL_PE_PATH"));
+include!(concat!(env!("OUT_DIR"), "/boot_packages.rs"));
 const STUB_HEAP_SIZE: usize = 2 * 1024 * 1024;
 const MAX_ALLOCATED_RANGES: usize = 128;
 
@@ -329,6 +330,7 @@ fn build_handoff(
                 addr_of_mut!(ABI_KERNEL_SECTIONS).cast::<KernelSection>(),
                 section_count,
             ),
+            boot_packages: BootPackages::from_static(EMBEDDED_BOOT_PACKAGES),
             loaded_kernel: loaded,
             tls_directory,
         };

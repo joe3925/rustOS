@@ -4,35 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(), Box<dyn Error>> {
-    let contents = fs::read_to_string(exports_path)?;
-
-    let start = contents
-        .find('{')
-        .ok_or("Missing opening `{` in export! macro")?;
-    let end = contents
-        .rfind('}')
-        .ok_or("Missing closing `}` in export! macro")?;
-    let export_body = &contents[start + 1..end];
-
-    let mut lines = Vec::new();
-    lines.push("LIBRARY kernel".to_string());
-    lines.push("EXPORTS".to_string());
-
-    for line in export_body.lines() {
-        let trimmed = line.trim().trim_end_matches(',');
-        if !trimmed.is_empty() {
-            lines.push(format!("    {}", trimmed));
-        }
-    }
-
-    fs::write(def_out_path, lines.join("\n"))?;
-    Ok(())
-}
-
 struct KernelTarget {
-    machine: &'static str,
-    dlltool_machine: &'static str,
     mimalloc: Option<MimallocTarget>,
 }
 
@@ -44,8 +16,6 @@ struct MimallocTarget {
 fn kernel_target(target: &str) -> Result<KernelTarget, Box<dyn Error>> {
     if target.contains("x86_64") {
         return Ok(KernelTarget {
-            machine: "X64",
-            dlltool_machine: "i386:x86-64",
             mimalloc: Some(MimallocTarget {
                 clang_target: "x86_64-pc-windows-msvc",
                 flags: &["-mno-red-zone", "-mcmodel=large"],
@@ -54,91 +24,10 @@ fn kernel_target(target: &str) -> Result<KernelTarget, Box<dyn Error>> {
     }
 
     if target.contains("aarch64") {
-        return Ok(KernelTarget {
-            machine: "ARM64",
-            dlltool_machine: "arm64",
-            mimalloc: None,
-        });
+        return Ok(KernelTarget { mimalloc: None });
     }
 
     Err(format!("unsupported kernel target architecture: {target}").into())
-}
-
-fn generate_import_library(
-    target: &str,
-    def_path: &PathBuf,
-    lib_out: &PathBuf,
-) -> Result<(), Box<dyn Error>> {
-    let attempts = if target.contains("gnu") {
-        vec![ImportLibTool::LlvmDlltool]
-    } else {
-        vec![ImportLibTool::LlvmLib, ImportLibTool::LldLink]
-    };
-    let mut errors = Vec::new();
-
-    for tool in attempts {
-        match tool.run(target, def_path, lib_out) {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => errors.push(format!("{} exited with {status}", tool.name())),
-            Err(err) => errors.push(format!("{} failed to start: {err}", tool.name())),
-        }
-    }
-
-    Err(format!(
-        "failed to generate kernel import library: {}",
-        errors.join("; ")
-    )
-    .into())
-}
-
-#[derive(Clone, Copy)]
-enum ImportLibTool {
-    LlvmDlltool,
-    LlvmLib,
-    LldLink,
-}
-
-impl ImportLibTool {
-    fn name(self) -> &'static str {
-        match self {
-            Self::LlvmDlltool => "llvm-dlltool",
-            Self::LlvmLib => "llvm-lib",
-            Self::LldLink => "lld-link",
-        }
-    }
-
-    fn run(
-        self,
-        target: &str,
-        def_path: &PathBuf,
-        lib_out: &PathBuf,
-    ) -> Result<std::process::ExitStatus, Box<dyn Error>> {
-        let target = kernel_target(target)?;
-
-        match self {
-            Self::LlvmDlltool => Ok(tool_command(self.name())
-                .arg("-d")
-                .arg(def_path)
-                .arg("-l")
-                .arg(lib_out)
-                .arg("-m")
-                .arg(target.dlltool_machine)
-                .status()?),
-            Self::LlvmLib => Ok(tool_command(self.name())
-                .arg("/NOLOGO")
-                .arg(format!("/DEF:{}", def_path.display()))
-                .arg(format!("/MACHINE:{}", target.machine))
-                .arg(format!("/OUT:{}", lib_out.display()))
-                .status()?),
-            Self::LldLink => Ok(tool_command(self.name())
-                .arg("/lib")
-                .arg("/NOLOGO")
-                .arg(format!("/DEF:{}", def_path.display()))
-                .arg(format!("/MACHINE:{}", target.machine))
-                .arg(format!("/OUT:{}", lib_out.display()))
-                .status()?),
-        }
-    }
 }
 
 fn compile_mimalloc(
@@ -273,28 +162,6 @@ fn main() {
     if env::var_os("CARGO_FEATURE_ALLOCATOR_MIMALLOC").is_some() {
         compile_mimalloc(&manifest_dir, &target, &out_dir).expect("Failed to compile mimalloc");
     }
-
-    let exports_path = manifest_dir.join("src").join("exports.rs");
-    println!("cargo:rerun-if-changed={}", exports_path.display());
-
-    let def_path = out_dir.join("kernel.def");
-    generate_def_file(&exports_path, &def_path).expect("Failed to generate .def file");
-
-    let lib_out = out_dir.join("kernel.lib");
-    generate_import_library(&target, &def_path, &lib_out).expect("Failed to generate kernel.lib");
-
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            out_dir
-                .ancestors()
-                .nth(5) // .../target/<profile>/build/<pkg>/out -> target is 4 up
-                .expect("unexpected OUT_DIR layout")
-                .to_path_buf()
-        });
-
-    let shared_lib = target_dir.join("kernel.lib");
-    fs::copy(&lib_out, &shared_lib).expect("Failed to copy kernel.lib to target/");
 
     println!("cargo:rerun-if-changed=build.rs");
 }

@@ -1,0 +1,102 @@
+schema = 1
+id = "x86_64-q35"
+
+[kernel]
+manifest = "../kernel/Cargo.toml"
+package = "kernel"
+binary = "kernel"
+target = "../x86_64-rustos-kernel.json"
+import_library_machine = "X64"
+
+[drivers]
+target = "../drivers/x86_64-rustos-driver.json"
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/root/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/devicetree/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/acpi/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/pci/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/ide/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/disk/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/partmgr/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/volmgr/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/mountmgr/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/fat32/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/i8042/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/virtio/Cargo.toml" }
+
+[stub]
+manifest = "../boot/kernel_stub/Cargo.toml"
+package = "kernel_stub"
+binary = "kernel_stub"
+target = "x86_64-unknown-none"
+rustflags = "-C link-args=--image-base=0xFFFF880000000000 -C link-arg=-no-pie -C relocation-model=static -C code-model=large"
+
+[bootloader]
+provider = "local"
+firmware = "uefi"
+output = "boot.img"
+
+[runner]
+provider = "qemu"
+executable = "qemu-system-x86_64"
+executable_fallbacks = [
+    "C:/Program Files/qemu/qemu-system-x86_64w.exe",
+    "C:/Program Files/qemu/qemu-system-x86_64.exe",
+    "C:/Program Files (x86)/qemu/qemu-system-x86_64w.exe",
+    "C:/Program Files (x86)/qemu/qemu-system-x86_64.exe",
+    "/opt/homebrew/bin/qemu-system-x86_64",
+    "/usr/local/bin/qemu-system-x86_64",
+    "/opt/local/bin/qemu-system-x86_64",
+    "/usr/bin/qemu-system-x86_64",
+]
+firmware_candidates = [
+    "../qemu/OVMF_X64.fd",
+    "../qemu/OVMF_CODE.fd",
+    "../qemu/edk2-x86_64-code.fd",
+    "C:/Program Files/qemu/OVMF_X64.fd",
+    "C:/Program Files/qemu/edk2-x86_64-code.fd",
+    "C:/Program Files (x86)/qemu/OVMF_X64.fd",
+    "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
+    "/usr/local/share/qemu/edk2-x86_64-code.fd",
+    "/opt/local/share/qemu/edk2-x86_64-code.fd",
+    "/usr/share/qemu/edk2-x86_64-code.fd",
+    "/usr/share/OVMF/OVMF_CODE.fd",
+    "/usr/share/OVMF/OVMF_CODE_4M.fd",
+    "/usr/share/ovmf/OVMF.fd",
+    "/usr/share/edk2/x64/OVMF_CODE.fd",
+    "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
+]
+firmware_files_from_qemu = [
+    "edk2-x86_64-code.fd",
+    "edk2-x86_64-secure-code.fd",
+    "OVMF_X64.fd",
+    "OVMF_CODE.fd",
+]
+machine = "q35"
+cpu = "qemu64,+apic,+acpi"
+default_memory = "8G"
+iommu = "amd-iommu,dma-remap=on,dma-translation=on"
+iommu_whpx = "intel-iommu,intremap=off"

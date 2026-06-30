@@ -326,6 +326,7 @@ impl BootloaderPlatform for X86Platform {
             kernel_entry: parts.loaded_kernel.entry,
             kernel_text: parts.kernel_text,
             kernel_sections: parts.kernel_sections,
+            boot_packages: parts.boot_packages,
             stub_base: stub_image_base(),
             stub_size: stub_image_size(bootloader_info),
         })

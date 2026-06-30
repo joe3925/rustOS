@@ -915,5 +915,3 @@ define_device_ops! {
         trait: DeviceControlHandler
     }
 }
-
-

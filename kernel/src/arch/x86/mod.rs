@@ -1,13 +1,13 @@
 pub mod cpu;
+pub(crate) mod debug_meta;
 pub mod exception_handlers;
 pub mod gdt;
 pub mod idt;
 pub(crate) mod machine;
 pub mod memory;
 pub mod platform;
-pub(crate) mod serial;
 pub(crate) mod scheduling;
-pub(crate) mod debug_meta;
+pub(crate) mod serial;
 
 pub mod drivers {
     pub(crate) mod interrupt_index;
@@ -75,10 +75,3 @@ pub mod paging {
 pub type PlatformImpl = platform::X86Platform;
 
 pub const MAX_CPUS: usize = 256;
-
-#[macro_export]
-macro_rules! platform_driver_target_dir {
-    () => {
-        "x86_64-rustos-driver"
-    };
-}

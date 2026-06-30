@@ -5,13 +5,14 @@ use core::{fmt::Debug, ops, slice};
 pub mod arch;
 
 pub const RUSTOS_BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_5045;
-pub const RUSTOS_BOOT_INFO_VERSION: u32 = 7;
+pub const RUSTOS_BOOT_INFO_VERSION: u32 = 8;
 
 pub const MAX_BOOT_MEMORY_REGIONS: usize = 256;
 pub const MAX_KERNEL_SECTIONS: usize = 96;
 pub const MAX_KERNEL_IMPORT_SYMBOLS: usize = 512;
 pub const MAX_KERNEL_EXPORT_SYMBOLS: usize = 1024;
 pub const MAX_KERNEL_SYMBOL_STRING_BYTES: usize = 128 * 1024;
+pub const MAX_BOOT_PACKAGES: usize = 256;
 
 pub trait BootArchInfo: Copy + Debug {
     const EMPTY: Self;
@@ -50,6 +51,7 @@ pub struct BootInfo<A: BootArchInfo = EmptyArchInfo> {
     pub kernel_entry: u64,
     pub kernel_text: Optional<KernelTextSection>,
     pub kernel_sections: KernelSections,
+    pub boot_packages: BootPackages,
     pub stub_base: u64,
     pub stub_size: u64,
 }
@@ -89,9 +91,111 @@ impl<A: BootArchInfo> BootInfo<A> {
                 ptr: core::ptr::null(),
                 len: 0,
             },
+            boot_packages: BootPackages::empty(),
             stub_base: 0,
             stub_size: 0,
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootByteSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+// `BootByteSlice` is immutable handoff metadata. Its constructors only expose
+// shared byte ranges, and consumers must validate the range before reading it.
+unsafe impl Sync for BootByteSlice {}
+
+impl BootByteSlice {
+    pub const fn from_static(bytes: &'static [u8]) -> Self {
+        Self {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    pub const fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// # Safety
+    /// The descriptor must point to `len` readable bytes.
+    pub unsafe fn as_slice<'a>(&self) -> &'a [u8] {
+        slice::from_raw_parts(self.ptr, self.len)
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootPackage {
+    pub name: BootByteSlice,
+    pub configuration: BootByteSlice,
+    pub image: BootByteSlice,
+}
+
+impl BootPackage {
+    pub const fn from_static(
+        name: &'static [u8],
+        configuration: &'static [u8],
+        image: &'static [u8],
+    ) -> Self {
+        Self {
+            name: BootByteSlice::from_static(name),
+            configuration: BootByteSlice::from_static(configuration),
+            image: BootByteSlice::from_static(image),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootPackages {
+    ptr: *const BootPackage,
+    len: usize,
+}
+
+impl BootPackages {
+    pub const fn empty() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
+
+    pub const fn from_static(packages: &'static [BootPackage]) -> Self {
+        Self {
+            ptr: packages.as_ptr(),
+            len: packages.len(),
+        }
+    }
+
+    pub const fn as_ptr(&self) -> *const BootPackage {
+        self.ptr
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// # Safety
+    /// The descriptor must point to `len` initialized `BootPackage` values.
+    pub unsafe fn as_slice<'a>(&self) -> &'a [BootPackage] {
+        slice::from_raw_parts(self.ptr, self.len)
     }
 }
 

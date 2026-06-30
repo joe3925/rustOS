@@ -11,6 +11,9 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 test = false
 
+[package.metadata.rustos-driver]
+configuration = "src/partmgr.toml"
+
 [profile.dev]
 panic = "abort"
 codegen-units = 1

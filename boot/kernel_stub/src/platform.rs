@@ -1,7 +1,7 @@
 use goblin::pe::tls::ImageTlsDirectory;
 use kernel_abi::{
-    BootArchInfo as KernelBootArchInfo, BootInfo, KernelSections, KernelSymbols, KernelTextSection,
-    MemoryRegionKind, MemoryRegions, Optional,
+    BootArchInfo as KernelBootArchInfo, BootInfo, BootPackages, KernelSections, KernelSymbols,
+    KernelTextSection, MemoryRegionKind, MemoryRegions, Optional,
 };
 
 pub type ActivePlatform = crate::arch::PlatformImpl;
@@ -45,6 +45,7 @@ pub struct BootInfoParts<TlsDirectory> {
     pub kernel_exports: KernelSymbols,
     pub kernel_sections: KernelSections,
     pub kernel_text: Optional<KernelTextSection>,
+    pub boot_packages: BootPackages,
     pub loaded_kernel: LoadedKernel,
     pub tls_directory: Optional<TlsDirectory>,
 }

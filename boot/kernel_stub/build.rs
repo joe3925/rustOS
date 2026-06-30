@@ -1,7 +1,21 @@
+use serde::Deserialize;
 use std::{
     env, fs,
     path::{Path, PathBuf},
 };
+
+#[derive(Deserialize)]
+struct PackageManifest {
+    schema: u32,
+    packages: Vec<PackageEntry>,
+}
+
+#[derive(Deserialize)]
+struct PackageEntry {
+    name: String,
+    configuration: PathBuf,
+    binary: PathBuf,
+}
 
 #[derive(Clone, Copy)]
 struct KernelPeTarget {
@@ -27,7 +41,7 @@ fn kernel_pe_target() -> KernelPeTarget {
 fn main() {
     let kernel_pe = kernel_pe_path();
     validate_kernel_pe(&kernel_pe, kernel_pe_target());
-    publish_stable_kernel_artifacts(&kernel_pe);
+    generate_boot_packages();
 
     println!("cargo:rerun-if-changed={}", kernel_pe.display());
     println!("cargo:rustc-env=KERNEL_PE_PATH={}", kernel_pe.display());
@@ -49,53 +63,66 @@ fn kernel_pe_path() -> PathBuf {
     panic!("KERNEL_PE_PATH is not set; build through `cargo run -p xtask` so the PE kernel is built first")
 }
 
-fn publish_stable_kernel_artifacts(kernel_pe: &Path) {
-    let stable_kernel_pe = stable_target_path("kernel.exe");
-    copy_artifact(kernel_pe, &stable_kernel_pe, "kernel PE");
+fn generate_boot_packages() {
+    println!("cargo:rerun-if-env-changed=RUSTOS_BOOT_PACKAGES_MANIFEST");
+    let manifest_path = env::var_os("RUSTOS_BOOT_PACKAGES_MANIFEST")
+        .map(PathBuf::from)
+        .expect("RUSTOS_BOOT_PACKAGES_MANIFEST is not set; build through xtask");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    let source = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
+    let manifest: PackageManifest = toml::from_str(&source)
+        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", manifest_path.display()));
+    assert_eq!(
+        manifest.schema, 1,
+        "unsupported boot package manifest schema"
+    );
 
-    let kernel_pdb = kernel_pe.with_extension("pdb");
-    if kernel_pdb.is_file() {
-        copy_artifact(
-            &kernel_pdb,
-            &stable_kernel_pe.with_extension("pdb"),
-            "kernel PDB",
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let package_dir = out_dir.join("boot_packages");
+    fs::create_dir_all(&package_dir).expect("failed to create boot package output directory");
+    let mut generated =
+        String::from("pub static EMBEDDED_BOOT_PACKAGES: &[kernel_abi::BootPackage] = &[\n");
+    for (index, package) in manifest.packages.iter().enumerate() {
+        assert!(
+            !package.name.is_empty(),
+            "boot package name cannot be empty"
         );
-        println!("cargo:rerun-if-changed={}", kernel_pdb.display());
+        assert!(
+            package
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+            "boot package name contains unsupported characters: {}",
+            package.name
+        );
+        assert!(
+            package.configuration.is_file(),
+            "missing boot package configuration: {}",
+            package.configuration.display()
+        );
+        assert!(
+            package.binary.is_file(),
+            "missing boot package binary: {}",
+            package.binary.display()
+        );
+        println!("cargo:rerun-if-changed={}", package.configuration.display());
+        println!("cargo:rerun-if-changed={}", package.binary.display());
+        fs::copy(
+            &package.configuration,
+            package_dir.join(format!("{index}.toml")),
+        )
+        .expect("failed to stage boot package configuration");
+        fs::copy(&package.binary, package_dir.join(format!("{index}.dll")))
+            .expect("failed to stage boot package binary");
+        generated.push_str(&format!(
+            "kernel_abi::BootPackage::from_static(b{:?}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/boot_packages/{index}.toml\")), include_bytes!(concat!(env!(\"OUT_DIR\"), \"/boot_packages/{index}.dll\"))),\n",
+            package.name
+        ));
     }
-}
-
-fn stable_target_path(file_name: &str) -> PathBuf {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("kernel_stub should live under boot/ in the workspace root");
-    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-
-    workspace_root.join("target").join(profile).join(file_name)
-}
-
-fn copy_artifact(source: &Path, destination: &Path, what: &str) {
-    let destination_dir = destination.parent().unwrap_or_else(|| {
-        panic!(
-            "stable {what} path has no parent: {}",
-            destination.display()
-        )
-    });
-
-    fs::create_dir_all(destination_dir).unwrap_or_else(|err| {
-        panic!(
-            "failed to create stable {what} directory {}: {err}",
-            destination_dir.display()
-        )
-    });
-    fs::copy(source, destination).unwrap_or_else(|err| {
-        panic!(
-            "failed to copy {what} from {} to {}: {err}",
-            source.display(),
-            destination.display()
-        )
-    });
+    generated.push_str("];\n");
+    fs::write(out_dir.join("boot_packages.rs"), generated)
+        .expect("failed to generate boot package descriptors");
 }
 
 fn validate_kernel_pe(path: &PathBuf, target: KernelPeTarget) {

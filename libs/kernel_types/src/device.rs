@@ -455,22 +455,6 @@ pub fn open_protocol_at_stack_top<P: Protocol>(
     Err(DriverStatus::NotImplemented)
 }
 
-pub fn open_protocol_to_next_upper<P: Protocol>(
-    device: &Arc<DeviceObject>,
-) -> Result<ProtocolHandle<P>, DriverStatus> {
-    let mut current = device.upper_device.get().and_then(Weak::upgrade);
-
-    while let Some(dev) = current {
-        if let Some(handle) = try_open_protocol_on_device::<P>(&dev) {
-            return Ok(handle);
-        }
-
-        current = dev.upper_device.get().and_then(Weak::upgrade);
-    }
-
-    Err(DriverStatus::NotImplemented)
-}
-
 fn try_open_protocol_on_device<P: Protocol>(
     device: &Arc<DeviceObject>,
 ) -> Option<ProtocolHandle<P>> {

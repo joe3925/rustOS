@@ -48,19 +48,19 @@ fn leaf_of(path: &str) -> &str {
     path.rsplit_once('/').map(|(_, b)| b).unwrap_or(path)
 }
 
-enum DataRef<'a> {
-    Static(&'a [u8]),
+enum DataRef {
+    Boot(Vec<u8>),
     Ram(Vec<u8>),
     Alias(String),
 }
 
-struct Node<'a> {
+struct Node {
     is_dir: bool,
-    data: Option<DataRef<'a>>,
+    data: Option<DataRef>,
     children: BTreeMap<String, String>,
 }
 
-impl<'a> Node<'a> {
+impl Node {
     fn dir() -> Self {
         Self {
             is_dir: true,
@@ -68,43 +68,43 @@ impl<'a> Node<'a> {
             children: BTreeMap::new(),
         }
     }
-    fn file(data: DataRef<'a>) -> Self {
+    fn file(data: DataRef) -> Self {
         Self {
             is_dir: false,
             data: Some(data),
             children: BTreeMap::new(),
         }
     }
-    fn size(&self, fs: &BootstrapProvider<'a>, path: &str) -> u64 {
+    fn size(&self, fs: &BootstrapProvider, path: &str) -> u64 {
         if self.is_dir {
             return 0;
         }
         match self.data.as_ref().unwrap() {
-            DataRef::Static(b) => b.len() as u64,
+            DataRef::Boot(b) => b.len() as u64,
             DataRef::Ram(v) => v.len() as u64,
             DataRef::Alias(t) => fs.size_of(t) as u64,
         }
     }
 }
 
-pub struct BootstrapProvider<'a> {
-    nodes: RwLock<BTreeMap<String, Node<'a>>>,
+pub struct BootstrapProvider {
+    nodes: RwLock<BTreeMap<String, Node>>,
     next_id: AtomicU64,
     handles: RwLock<BTreeMap<u64, String>>,
 }
 
-impl<'a> BootstrapProvider<'a> {
-    pub fn new(boot: &'a [BootPkg]) -> Self {
+impl BootstrapProvider {
+    pub fn new(boot: Vec<BootPkg>) -> Self {
         let prov = Self {
             nodes: RwLock::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
             handles: RwLock::new(BTreeMap::new()),
         };
-        prov.init_tree(boot);
+        prov.init_tree(&boot);
         prov
     }
 
-    fn init_tree(&self, boot: &'a [BootPkg]) {
+    fn init_tree(&self, boot: &[BootPkg]) {
         let mut n = self.nodes.write();
 
         for d in [
@@ -157,8 +157,8 @@ impl<'a> BootstrapProvider<'a> {
             let toml_src = norm_upcase(&alloc::format!("{}/{}", ddir, toml_name));
             let dll_src = norm_upcase(&alloc::format!("{}/{}", ddir, dll_name));
 
-            n.insert(toml_src.clone(), Node::file(DataRef::Static(bp.toml)));
-            n.insert(dll_src.clone(), Node::file(DataRef::Static(bp.image)));
+            n.insert(toml_src.clone(), Node::file(DataRef::Boot(bp.toml.clone())));
+            n.insert(dll_src.clone(), Node::file(DataRef::Boot(bp.image.clone())));
 
             n.get_mut(&ddir)
                 .unwrap()
@@ -204,7 +204,7 @@ impl<'a> BootstrapProvider<'a> {
                     0
                 } else {
                     match n.data.as_ref().unwrap() {
-                        DataRef::Static(b) => b.len(),
+                        DataRef::Boot(b) => b.len(),
                         DataRef::Ram(v) => v.len(),
                         DataRef::Alias(t) => self.size_of(t),
                     }
@@ -269,7 +269,7 @@ impl<'a> BootstrapProvider<'a> {
             }
 
             match node.data.as_ref().unwrap() {
-                DataRef::Static(b) => break b.to_vec(),
+                DataRef::Boot(b) => break b.clone(),
                 DataRef::Ram(v) => break v.clone(),
                 DataRef::Alias(t) => {
                     cur = t.clone();
@@ -300,7 +300,7 @@ impl<'a> BootstrapProvider<'a> {
                 v[offset as usize..offset as usize + data.len()].copy_from_slice(data);
                 Ok(data.len() as u32)
             }
-            DataRef::Static(_) => Err(FileStatus::UnknownFail),
+            DataRef::Boot(_) => Err(FileStatus::UnknownFail),
             DataRef::Alias(_t) => Ok(data.len() as u32),
         }
     }
@@ -360,7 +360,7 @@ impl<'a> BootstrapProvider<'a> {
     }
 }
 
-impl<'a> BootstrapProvider<'a> {
+impl BootstrapProvider {
     pub(crate) fn open_path_sync(
         &self,
         path: &str,
@@ -836,7 +836,7 @@ impl<'a> BootstrapProvider<'a> {
                 v.resize(new_size as usize, 0);
                 (FsSetLenResult { error: None }, DriverStatus::Success)
             }
-            Some(DataRef::Static(_)) => (
+            Some(DataRef::Boot(_)) => (
                 FsSetLenResult {
                     error: Some(FileStatus::AccessDenied),
                 },
@@ -911,7 +911,7 @@ impl<'a> BootstrapProvider<'a> {
                     DriverStatus::Success,
                 )
             }
-            Some(DataRef::Static(_)) => (
+            Some(DataRef::Boot(_)) => (
                 FsAppendResult {
                     written: 0,
                     new_size: 0,
@@ -999,7 +999,7 @@ impl<'a> BootstrapProvider<'a> {
                 }
                 (FsZeroRangeResult { error: None }, DriverStatus::Success)
             }
-            Some(DataRef::Static(_)) => (
+            Some(DataRef::Boot(_)) => (
                 FsZeroRangeResult {
                     error: Some(FileStatus::AccessDenied),
                 },
