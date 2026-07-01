@@ -1,31 +1,13 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use alloc::{string::String, vec::Vec};
 use kernel_types::fs::{OpenFlags, Path};
-use kernel_types::pnp::BootType;
-use kernel_types::status::{Data, DriverError, FileStatus, LoadError, RegError};
+use kernel_types::pnp::{BootType, DriverRole};
+use kernel_types::status::{Data, DriverError, FileStatus, RegError};
 use toml::de::{DeInteger, DeTable};
 use toml::Spanned;
 
 use crate::alloc::string::ToString;
 use crate::{file_system::file::File, registry::reg};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverRole {
-    Function,
-    Filter,
-    Base,
-}
-
-impl DriverRole {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "function" | "" => Some(Self::Function),
-            "filter" => Some(Self::Filter),
-            "base" => Some(Self::Base),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterPosition {
@@ -108,11 +90,22 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
     let role = if has_filter_tbl {
         DriverRole::Filter
     } else {
-        match explicit_role {
-            Some("base") => DriverRole::Base,
-            _ => DriverRole::Function,
-        }
+        explicit_role
+            .and_then(DriverRole::from_str)
+            .ok_or(FileStatus::BadPath)?
     };
+
+    let valid_start_role = matches!(
+        (start, role),
+        (BootType::Boot, DriverRole::Service)
+            | (
+                BootType::Demand | BootType::Disabled,
+                DriverRole::Function | DriverRole::Filter
+            )
+    );
+    if !valid_start_role {
+        return Err(FileStatus::BadPath);
+    }
 
     let hwids = tbl
         .get("hwids")
@@ -387,9 +380,9 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
     reg::set_value(&key_path, "Start", Data::U32(driver.start.as_u32())).await?;
 
     let role_u32 = match driver.role {
-        DriverRole::Function => 0,
-        DriverRole::Filter => 1,
-        DriverRole::Base => 2,
+        DriverRole::Service => 0,
+        DriverRole::Function => 1,
+        DriverRole::Filter => 2,
     };
     reg::set_value(&key_path, "Role", Data::U32(role_u32)).await?;
 
@@ -454,7 +447,7 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
             reg_add_filter_index(&f.target, f.position, f.order, driver_name).await?;
         }
 
-        DriverRole::Base => {}
+        DriverRole::Service => {}
     }
 
     for rw in driver.reg_writes.iter() {

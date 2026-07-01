@@ -45,8 +45,8 @@ use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
 use crate::pnp::{
-    PnpOp, QueryDeviceRelations, QueryId, QueryResources, RegisterDmaBacking, RemoveDevice,
-    InitComplete, StartDevice, StopDevice, SurpriseRemoval,
+    InitComplete, PnpOp, QueryDeviceRelations, QueryId, QueryResources, RegisterDmaBacking,
+    RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
 };
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsAppend, FsClose, FsCreate, FsFlush,
@@ -55,6 +55,10 @@ use crate::request::{
 };
 pub type EvtDriverDeviceAdd =
     extern "C" fn(driver: &Arc<device::DriverObject>, init: &mut device::DeviceInit) -> DriverStep;
+pub type EvtDriverProbeDevice = extern "C" fn(
+    driver: &Arc<device::DriverObject>,
+    context: &pnp::ProbeContext,
+) -> FfiFuture<pnp::ProbeOutcome>;
 pub type EvtDriverUnload =
     extern "C" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
@@ -170,7 +174,8 @@ pub type EvtPnpStopDevice = for<'a> extern "C" fn(
     &'a mut StopDevice,
 ) -> FfiFuture<DriverStep>;
 
-pub type ClassAddCallback = extern "C" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
+pub type ClassEventCallback =
+    extern "C" fn(node: Arc<DevNode>, event: pnp::DeviceEvent, listener_dev: &Arc<DeviceObject>);
 pub type DpcFn = extern "C" fn(usize);
 
 #[unsafe(export_name = "_fltused")]

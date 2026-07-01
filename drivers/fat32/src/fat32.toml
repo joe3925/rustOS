@@ -1,11 +1,5 @@
 image = "fat32.dll"
 start = "demand"
 role = "function"
-hwids = []
-
-[[registry]]
-path = "SYSTEM/CurrentControlSet/MountMgr/Filesystems/fat32"
-[registry.values]
-Service = "fat32"
-ControlLink = "\\GLOBAL\\FileSystems\\fat32"
-Order = 100
+class = "Volume"
+hwids = ["STOR\\Volume\\GPT", "STOR\\Volume"]

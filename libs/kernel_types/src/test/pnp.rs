@@ -16,7 +16,7 @@ extern "C" fn start_device_handler(
 #[test]
 fn boot_type_parses_kernel_driver_start_modes() {
     assert_eq!(BootType::from_str("boot"), Some(BootType::Boot));
-    assert_eq!(BootType::from_str("system"), Some(BootType::System));
+    assert_eq!(BootType::from_str("system"), None);
     assert_eq!(BootType::from_str("demand"), Some(BootType::Demand));
     assert_eq!(BootType::from_str("disabled"), Some(BootType::Disabled));
     assert_eq!(BootType::from_str("manual"), None);

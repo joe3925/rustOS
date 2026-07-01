@@ -1,4 +1,4 @@
 image = "root.dll"
-start = "boot"
-role = "base"
+start = "demand"
+role = "function"
 hwids = ["ROOT\\root"]

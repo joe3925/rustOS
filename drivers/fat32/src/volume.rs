@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::{cold_path, likely, unlikely};
+use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{
     CachedFileState, Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase,
@@ -27,7 +28,7 @@ use kernel_api::{
     },
     println, request_handler,
 };
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 use crate::block_dev::{flush_owner, flush_owner_blocking};
 use crate::control::ext_mut;
@@ -49,6 +50,10 @@ static ZERO_CHUNK: [u8; SET_LEN_ZERO_CHUNK] = [0u8; SET_LEN_ZERO_CHUNK];
 
 #[repr(C)]
 pub struct VolCtrlDevExt {
+    mounted: Once<MountedFat32>,
+}
+
+pub struct MountedFat32 {
     pub fs: Arc<AsyncMutex<Fs>>,
     pub(crate) handles: Mutex<FileHandleTable>,
     pub(crate) volume_target: IoTarget,
@@ -56,6 +61,30 @@ pub struct VolCtrlDevExt {
     pub pending_flush_owner: Arc<AtomicU64>,
     pub pending_flush_block: Arc<AtomicBool>,
     pub current_owner: Arc<AtomicU64>,
+}
+
+impl Default for VolCtrlDevExt {
+    fn default() -> Self {
+        Self { mounted: Once::new() }
+    }
+}
+
+impl VolCtrlDevExt {
+    pub fn mount(&self, mounted: MountedFat32) -> Result<(), MountedFat32> {
+        if self.mounted.get().is_some() {
+            return Err(mounted);
+        }
+        self.mounted.call_once(|| mounted);
+        Ok(())
+    }
+}
+
+impl Deref for VolCtrlDevExt {
+    type Target = MountedFat32;
+
+    fn deref(&self) -> &Self::Target {
+        self.mounted.get().expect("FAT32 device used before StartDevice completed")
+    }
 }
 
 pub struct FileCtx {

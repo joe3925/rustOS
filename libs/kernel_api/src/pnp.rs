@@ -6,7 +6,7 @@ use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fdt::FdtHeader;
 use kernel_types::io::IoTarget;
 use kernel_types::status::{DriverError, DriverStatus};
-use kernel_types::{ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload};
+use kernel_types::{ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload};
 
 pub use kernel_types::pnp::*;
 
@@ -155,42 +155,18 @@ pub fn pnp_remove_symlink(link_path: String) -> DriverStatus {
 
 pub fn pnp_add_class_listener(
     class: String,
-    callback: ClassAddCallback,
+    callback: ClassEventCallback,
     dev_obj: &Arc<DeviceObject>,
 ) {
     unsafe { kernel_sys::pnp_add_class_listener(class, callback, dev_obj) }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn pnp_create_devnode_over_pdo_with_function(
-    parent_dn: &Arc<DevNode>,
-    instance_path: String,
-    ids: DeviceIds,
-    class: Option<String>,
-    function_service: &str,
-    function_fdo: &Arc<DeviceObject>,
-    init_pdo: DeviceInit,
-) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError> {
-    unsafe {
-        kernel_sys::pnp_create_devnode_over_pdo_with_function(
-            parent_dn,
-            instance_path,
-            ids,
-            class,
-            function_service,
-            function_fdo,
-            init_pdo,
-        )
-        .await
-    }
-}
-
-pub async fn pnp_load_service(name: String) -> Option<Arc<DriverObject>> {
-    unsafe { kernel_sys::pnp_load_service(name).await }
-}
-
 pub fn driver_set_evt_device_add(driver: &Arc<DriverObject>, callback: EvtDriverDeviceAdd) {
     unsafe { kernel_sys::driver_set_evt_device_add(driver, callback) }
+}
+
+pub fn driver_set_evt_probe_device(driver: &Arc<DriverObject>, callback: EvtDriverProbeDevice) {
+    unsafe { kernel_sys::driver_set_evt_probe_device(driver, callback) }
 }
 
 pub fn driver_set_evt_driver_unload(driver: &Arc<DriverObject>, callback: EvtDriverUnload) {

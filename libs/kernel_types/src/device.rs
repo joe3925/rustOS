@@ -1,9 +1,9 @@
 use crate::fs::Path;
 use crate::io::DeviceOps;
 use crate::memory::Module;
-use crate::pnp::{BootType, DeviceIds, PnpOps};
+use crate::pnp::{BootType, DeviceIds, DriverRole, PnpOps};
 use crate::status::DriverStatus;
-use crate::{EvtDriverDeviceAdd, EvtDriverUnload};
+use crate::{EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -37,6 +37,7 @@ pub struct DriverPackage {
     pub image_path: Path,
     pub toml_path: String,
     pub start: BootType,
+    pub role: DriverRole,
     pub hwids: Vec<String>,
 }
 
@@ -86,6 +87,11 @@ impl DriverConfig<'_> {
         self
     }
 
+    pub fn on_probe_device(&mut self, cb: EvtDriverProbeDevice) -> &mut Self {
+        *self.driver.evt_probe_device.write() = Some(cb);
+        self
+    }
+
     pub fn on_unload(&mut self, cb: EvtDriverUnload) -> &mut Self {
         *self.driver.evt_driver_unload.write() = Some(cb);
         self
@@ -99,6 +105,7 @@ pub struct DriverObject {
     pub driver_name: String,
     pub flags: u32,
     pub evt_device_add: RwLock<Option<EvtDriverDeviceAdd>>,
+    pub evt_probe_device: RwLock<Option<EvtDriverProbeDevice>>,
     pub evt_driver_unload: RwLock<Option<EvtDriverUnload>>,
 }
 
@@ -109,6 +116,7 @@ impl DriverObject {
             driver_name,
             flags: 0,
             evt_device_add: RwLock::new(None),
+            evt_probe_device: RwLock::new(None),
             evt_driver_unload: RwLock::new(None),
         })
     }
@@ -416,14 +424,14 @@ pub fn register_protocol<P: Protocol>(
 pub fn open_protocol_to_next_lower<P: Protocol>(
     device: &Arc<DeviceObject>,
 ) -> Result<ProtocolHandle<P>, DriverStatus> {
-    let mut current = device.lower_device.get().cloned();
+    let mut current = device.lower_device.read().clone();
 
     while let Some(dev) = current {
         if let Some(handle) = try_open_protocol_on_device::<P>(&dev) {
             return Ok(handle);
         }
 
-        current = dev.lower_device.get().cloned();
+        current = dev.lower_device.read().clone();
     }
 
     Err(DriverStatus::NotImplemented)
@@ -449,7 +457,7 @@ pub fn open_protocol_at_stack_top<P: Protocol>(
             return Ok(handle);
         }
 
-        current = dev.lower_device.get().cloned();
+        current = dev.lower_device.read().clone();
     }
 
     Err(DriverStatus::NotImplemented)
@@ -478,14 +486,15 @@ fn try_open_protocol_on_device<P: Protocol>(
 #[derive(Debug)]
 #[repr(C)]
 pub struct DeviceObject {
-    pub lower_device: Once<Arc<DeviceObject>>,
-    pub upper_device: Once<Weak<DeviceObject>>,
+    pub lower_device: RwLock<Option<Arc<DeviceObject>>>,
+    pub upper_device: RwLock<Option<Weak<DeviceObject>>>,
     dev_ext: DevExtBox,
     pub ops: DeviceOps,
     pub pnp_ops: Option<PnpOps>,
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
+    started: AtomicBool,
     protocols: RwLock<Vec<ProtocolEntry>>,
     protocol_generation: AtomicU64,
     generation: AtomicU64,
@@ -496,14 +505,15 @@ impl DeviceObject {
         let dev_ext = init.dev_ext_ready.take().unwrap_or_else(DevExtBox::none);
 
         Arc::new(Self {
-            lower_device: Once::new(),
-            upper_device: Once::new(),
+            lower_device: RwLock::new(None),
+            upper_device: RwLock::new(None),
             dev_ext,
             ops: init.ops,
             pnp_ops: init.pnp_ops,
             dispatch_tickets: AtomicU32::new(0),
             dev_node: Once::new(),
             in_queue: AtomicBool::new(false),
+            started: AtomicBool::new(false),
             protocols: RwLock::new(Vec::new()),
             protocol_generation: AtomicU64::new(1),
             generation: AtomicU64::new(1),
@@ -533,8 +543,22 @@ impl DeviceObject {
     }
 
     pub fn set_lower_upper(this: &Arc<Self>, lower: Arc<DeviceObject>) {
-        this.lower_device.call_once(|| lower.clone());
-        lower.upper_device.call_once(|| Arc::downgrade(this));
+        *this.lower_device.write() = Some(lower.clone());
+        *lower.upper_device.write() = Some(Arc::downgrade(this));
+    }
+
+    pub fn detach(this: &Arc<Self>) {
+        if let Some(lower) = this.lower_device.write().take() {
+            let mut upper = lower.upper_device.write();
+            if upper
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|candidate| Arc::ptr_eq(&candidate, this))
+            {
+                *upper = None;
+            }
+        }
+        *this.upper_device.write() = None;
     }
 
     pub fn attach_devnode(&self, dn: &Arc<DevNode>) {
@@ -567,6 +591,16 @@ impl DeviceObject {
                     DevNodeState::SurpriseRemoved | DevNodeState::Deleted
                 )
             })
+    }
+
+    #[inline]
+    pub fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_started(&self, started: bool) {
+        self.started.store(started, Ordering::Release);
     }
 
     pub fn register_protocol<P>(&self, vtable: &'static P::VTable) -> bool

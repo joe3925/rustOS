@@ -2,12 +2,12 @@ use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
 use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
-use crate::status::DriverStatus;
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate,
     FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite,
     FsZeroRange, Read, Write,
 };
+use crate::status::DriverStatus;
 use crate::{
     EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
     EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
@@ -555,14 +555,6 @@ pub struct PartitionInfo {
     pub disk: DiskInfo,
     pub gpt_header: Option<GptHeader>,
     pub gpt_entry: Option<GptPartitionEntry>,
-}
-
-#[repr(C)]
-#[derive(kernel_macros::RequestPayload)]
-pub struct FsIdentify {
-    pub volume_fdo: IoTarget,
-    pub mount_device: Option<Arc<DeviceObject>>,
-    pub can_mount: bool,
 }
 
 #[repr(C)]

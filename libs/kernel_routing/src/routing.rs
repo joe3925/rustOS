@@ -7,8 +7,8 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::io::{DeviceOps, IoHandler, IoTarget};
 use kernel_types::pnp::{
-    DriverStep, PnpHandler, PnpOp, PnpOps, QueryDeviceRelations, QueryId, QueryResources,
-    InitComplete, RegisterDmaBacking, RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
+    DriverStep, InitComplete, PnpHandler, PnpOp, PnpOps, QueryDeviceRelations, QueryId,
+    QueryResources, RegisterDmaBacking, RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
 };
 use kernel_types::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Read, Write,
@@ -381,10 +381,13 @@ async fn call_down_stack<K: RoutedOperation>(
     loop {
         match K::invoke_at(&dev, req).await {
             Some(DriverStep::Complete { status }) => return status,
-            Some(DriverStep::Continue) | None => match dev.lower_device.get().cloned() {
-                Some(lower) => dev = lower,
-                None => return K::default_unhandled_status(req),
-            },
+            Some(DriverStep::Continue) | None => {
+                let lower = dev.lower_device.read().clone();
+                match lower {
+                    Some(lower) => dev = lower,
+                    None => return K::default_unhandled_status(req),
+                }
+            }
         }
     }
 }
@@ -406,7 +409,7 @@ macro_rules! routing_api {
                 from: Arc<DeviceObject>,
                 req: &mut K,
             ) -> DriverStatus {
-                let Some(target) = from.lower_device.get().cloned() else {
+                let Some(target) = from.lower_device.read().clone() else {
                     return DriverStatus::NoSuchDevice;
                 };
                 call_down_stack(target, req).await

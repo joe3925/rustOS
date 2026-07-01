@@ -1,6 +1,6 @@
 use crate::device::DevNode;
 use crate::dma::IoBufferBacking;
-use crate::io::{HandlerSlot, IoHandler};
+use crate::io::{HandlerSlot, IoHandler, IoTarget};
 use crate::status::DriverStatus;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -319,16 +319,14 @@ pub fn encode_resource_descriptors(resources: &[ResourceDescriptor]) -> Vec<u8> 
 #[repr(u32)]
 pub enum BootType {
     Boot = 0,
-    System = 1,
-    Demand = 2,
-    Disabled = 3,
+    Demand = 1,
+    Disabled = 2,
 }
 
 impl BootType {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "boot" => Some(BootType::Boot),
-            "system" => Some(BootType::System),
             "demand" => Some(BootType::Demand),
             "disabled" => Some(BootType::Disabled),
             _ => None,
@@ -338,4 +336,49 @@ impl BootType {
     pub fn as_u32(self) -> u32 {
         self as u32
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DriverRole {
+    Service = 0,
+    Function = 1,
+    Filter = 2,
+}
+
+impl DriverRole {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "service" => Some(Self::Service),
+            "function" => Some(Self::Function),
+            "filter" => Some(Self::Filter),
+            _ => None,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone)]
+pub struct ProbeContext {
+    pub devnode: Arc<DevNode>,
+    pub lower_target: IoTarget,
+    pub generation: u64,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    Match,
+    NoMatch,
+    Error(DriverStatus),
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceEvent {
+    Created,
+    Started,
+    Stopped,
+    Removed,
+    Failed,
 }

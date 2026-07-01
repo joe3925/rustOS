@@ -189,6 +189,8 @@ pub enum DriverError {
     NoParent,
     Registry(RegError),
     LoadErr(LoadError),
+    ProbeFailed(DriverStatus),
+    DriverEntryFailed,
 }
 
 impl From<FileStatus> for DriverError {

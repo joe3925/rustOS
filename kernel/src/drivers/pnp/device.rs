@@ -30,9 +30,9 @@ impl DevNodeExt for DevNode {
             name: "ROOT".into(),
             parent: Once::new(),
             children: RwLock::new(Vec::new()),
-            instance_path: "ROOT".into(),
+            instance_path: "ROOT\\0".into(),
             ids: DeviceIds {
-                hardware: Vec::new(),
+                hardware: alloc::vec!["ROOT\\root".into()],
                 compatible: Vec::new(),
             },
             class: None,

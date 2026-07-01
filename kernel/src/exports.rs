@@ -87,16 +87,15 @@ export! {
     pnp_replace_symlink,
     pnp_create_device_symlink_top,
     pnp_remove_symlink,
-    pnp_load_service,
     pnp_add_class_listener,
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
-    pnp_create_devnode_over_pdo_with_function,
     pnp_invalidate_device_relations,
 
     driver_get_name,
     driver_get_flags,
     driver_set_evt_device_add,
+    driver_set_evt_probe_device,
     driver_set_evt_driver_unload,
     random_number,
 

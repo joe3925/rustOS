@@ -10,7 +10,7 @@ use crate::device::{
 };
 use crate::fs::Path;
 use crate::memory::Module;
-use crate::pnp::BootType;
+use crate::pnp::{BootType, DriverRole};
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TestExt {
@@ -24,6 +24,7 @@ fn runtime(name: &str) -> Arc<DriverRuntime> {
             image_path: Path::from_string("C:/drivers/test.dll"),
             toml_path: String::from("C:/drivers/test.toml"),
             start: BootType::Demand,
+            role: DriverRole::Function,
             hwids: Vec::new(),
         }),
         module: Arc::new(RwLock::new(Module {
@@ -83,9 +84,18 @@ fn device_object_links_lower_and_upper_devices_once() {
 
     DeviceObject::set_lower_upper(&upper, lower.clone());
 
-    assert!(Arc::ptr_eq(upper.lower_device.get().unwrap(), &lower));
     assert!(Arc::ptr_eq(
-        &lower.upper_device.get().unwrap().upgrade().unwrap(),
+        upper.lower_device.read().as_ref().unwrap(),
+        &lower
+    ));
+    assert!(Arc::ptr_eq(
+        &lower
+            .upper_device
+            .read()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap(),
         &upper
     ));
 }

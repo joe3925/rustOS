@@ -5,6 +5,7 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use kernel_types::device::DriverPackage;
 use kernel_types::fs::Path;
 use kernel_types::pnp::BootType;
+use kernel_types::pnp::DriverRole;
 use kernel_types::status::{Data, RegError};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchClass {
@@ -32,32 +33,44 @@ impl HwIndex {
             by_driver: BTreeMap::new(),
         }
     }
-    pub fn match_best<'a>(&'a self, ids: &[&str]) -> Option<&'a DriverBinding> {
+    pub fn matching(&self, ids: &[&str], role: DriverRole) -> Vec<DriverBinding> {
+        let mut by_service = BTreeMap::<String, DriverBinding>::new();
         for id in ids {
             let key = canonicalize_id(id);
-            if let Some(cands) = self.by_id.get(&key) {
-                if let Some(best) = cands.first() {
-                    return Some(best);
+            let Some(candidates) = self.by_id.get(&key) else {
+                continue;
+            };
+            for candidate in candidates {
+                if candidate.pkg.role != role || candidate.pkg.start == BootType::Disabled {
+                    continue;
+                }
+                let entry = by_service
+                    .entry(candidate.pkg.name.clone())
+                    .or_insert_with(|| candidate.clone());
+                if candidate.score > entry.score {
+                    *entry = candidate.clone();
                 }
             }
         }
-        None
+
+        let mut matches: Vec<_> = by_service.into_values().collect();
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.pkg.name.cmp(&right.pkg.name))
+        });
+        matches
     }
 }
 
-pub fn rank(kind: MatchClass, start: BootType) -> u32 {
+pub fn rank(kind: MatchClass) -> u32 {
     let k = match kind {
         MatchClass::Exact => 3,
         MatchClass::Compatible => 2,
         MatchClass::Class => 1,
     };
-    let s = match start {
-        BootType::Boot => 4,
-        BootType::System => 3,
-        BootType::Demand => 2,
-        BootType::Disabled => 0,
-    };
-    (k * 100) + s as u32
+    k * 100
 }
 pub fn canonicalize_id(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -116,9 +129,8 @@ pub async fn build_hw_index() -> Result<HwIndex, RegError> {
         let start = match get_value(&kpath, "Start").await {
             Some(Data::U32(v)) => match v {
                 0 => BootType::Boot,
-                1 => BootType::System,
-                2 => BootType::Demand,
-                3 => BootType::Disabled,
+                1 => BootType::Demand,
+                2 => BootType::Disabled,
                 _ => BootType::Disabled,
             },
             _ => BootType::Demand,
@@ -133,6 +145,7 @@ pub async fn build_hw_index() -> Result<HwIndex, RegError> {
             image_path: image,
             toml_path,
             start,
+            role: dt.role,
             hwids: dt.hwids,
         });
 
@@ -140,7 +153,7 @@ pub async fn build_hw_index() -> Result<HwIndex, RegError> {
         for raw in &pkg.hwids {
             let id = canonicalize_id(raw);
             let kind = classify_id(&id);
-            let sc = rank(kind, pkg.start);
+            let sc = rank(kind);
             idx.by_id.entry(id).or_default().push(DriverBinding {
                 pkg: pkg.clone(),
                 kind,

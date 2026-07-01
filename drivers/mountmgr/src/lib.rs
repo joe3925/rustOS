@@ -1,821 +1,367 @@
 #![no_std]
 #![no_main]
-#![allow(static_mut_refs)]
-#![feature(const_option_ops)]
-#![feature(const_trait_impl)]
+
 extern crate alloc;
-use kernel_api::pnp::StartDevice;
-use alloc::vec;
-use alloc::vec::Vec;
+
 use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     sync::Arc,
+    vec::Vec,
 };
-use core::{marker::PhantomData, ptr::addr_of};
 use core::{
+    marker::PhantomData,
     panic::PanicInfo,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
-use kernel_api::kernel_types::protocol::volmgr::VolmgrProtocol;
-use kernel_api::println;
-use spin::{Once, RwLock};
-
 use kernel_api::{
-    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY,
-    IOCTL_MOUNTMGR_REGISTER_FS, IOCTL_MOUNTMGR_RESYNC, IOCTL_MOUNTMGR_UNMOUNT,
-    device::open_public_protocol,
-    device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    fs::{FsOpenParams, notify_label_published, notify_label_unpublished},
-    kernel_types::protocol::disk::PartitionInfoProtocol,
+    device::{open_public_protocol, DevNode, DeviceInit, DeviceObject, DriverObject},
+    fs::{notify_label_published, notify_label_unpublished, FsOpenParams},
     kernel_types::{
         fs::{OpenFlags, Path},
-        io::{DeviceControlHandler, DeviceControlOp, FsIdentify},
-        pnp::DeviceIds,
+        io::{DeviceControlHandler, DeviceControlOp},
+        pnp::DeviceEvent,
+        protocol::volmgr::VolmgrProtocol,
         request::IoctlData,
     },
     pnp::{
-        DriverStep, PnpOp, PnpOps, driver_set_evt_device_add, io, pnp,
-        pnp_create_control_device_and_link, pnp_create_device_symlink_top,
-        pnp_create_devnode_over_pdo_with_function, pnp_create_symlink, pnp_load_service,
-        pnp_remove_symlink,
+        io, pnp_add_class_listener, pnp_create_control_device_and_link,
+        pnp_create_device_symlink_top, pnp_create_symlink, pnp_remove_symlink, DriverStep,
     },
     reg::{self, switch_to_vfs_async},
     request::{DeviceControl, Fs, FsOpen, FsPayload},
     request_handler,
     runtime::spawn_detached,
     status::{Data, DriverStatus, RegError},
+    util::panic_common,
+    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY, IOCTL_MOUNTMGR_RESYNC,
+    IOCTL_MOUNTMGR_UNMOUNT,
 };
+use spin::RwLock;
 
-#[inline]
-fn make_volume_link_name(id: u32) -> String {
-    alloc::format!("{}\\{:04}", GLOBAL_VOLUMES_BASE, id)
-}
-
-#[derive(Clone, Debug)]
-struct FsReg {
-    svc: String,
-    tag: String,
-    ord: u32,
-}
-
-static FS_REGISTRY: RwLock<Vec<FsReg>> = RwLock::new(Vec::new());
-static FS_REGISTERED: RwLock<Vec<String>> = RwLock::new(Vec::new());
-static VFS_ACTIVE: AtomicBool = AtomicBool::new(false);
-static VOLUMES: RwLock<Vec<Arc<DeviceObject>>> = RwLock::new(Vec::new());
-const MP_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/MountPoints";
-const DL_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/DriveLetters";
-
-#[repr(C)]
-#[derive(Default)]
-struct VolFdoExt {
-    inst_path: Once<String>,
-    public_link: Once<String>,
-    fs_link: Once<String>,
-    fs_attached: AtomicBool,
-    vid: Once<u32>,
-    /// Stable identifier derived from GPT partition GUID (e.g., "GPT.XXXX...")
-    /// None if the volume lacks a valid GPT GUID.
-    stable_id: Once<Option<String>>,
-    /// Assigned drive label (e.g., "C:") - only set after successful assignment
-    assigned_label: RwLock<Option<String>>,
-}
-
-#[inline]
-fn ext<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
-    dev.try_devext().expect("Failed to get mountmgr dev ext")
-}
-
-static NEXT_VOL_ID: AtomicU32 = AtomicU32::new(1);
-
-static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+const MOD_NAME: &str = env!("CARGO_PKG_NAME");
+const DRIVE_LETTERS_KEY: &str = "SYSTEM/CurrentControlSet/MountMgr/DriveLetters";
+const HINTS_KEY: &str = "SYSTEM/CurrentControlSet/MountMgr/FilesystemHints";
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::util::panic_common;
     panic_common(MOD_NAME, info)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    driver_set_evt_device_add(driver, volclass_device_add);
-
-    let mut init = DeviceInit::new();
-    init.ops.register::<DeviceControlOp, VolclassCtrlIo>();
-    let _ctrl = pnp_create_control_device_and_link(
-        "\\Device\\volclass.ctrl".to_string(),
-        init,
-        GLOBAL_CTRL_LINK.to_string(),
-    );
-
-    DriverStatus::Success
+#[derive(Clone)]
+struct MountedVolume {
+    instance_path: String,
+    stable_id: String,
+    stable_link: String,
+    filesystem_service: String,
+    assigned_label: Option<String>,
 }
 
-pub extern "C" fn volclass_device_add(
-    _driver: &Arc<DriverObject>,
-    dev_init: &mut DeviceInit,
-) -> DriverStep {
-    let mut pnp_ops = PnpOps::new();
-    pnp_ops.start_device.set(volclass_start);
+static MOUNTED: RwLock<BTreeMap<String, MountedVolume>> = RwLock::new(BTreeMap::new());
+static PUBLISHED_LABELS: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
+static VFS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    dev_init.ops.register::<DeviceControlOp, VolclassIo>();
+struct MountMgrControl;
 
-    dev_init.set_dev_ext_default::<VolFdoExt>();
-    dev_init.pnp_ops = Some(pnp_ops);
-
-    DriverStep::complete(DriverStatus::Success)
-}
-
-struct VolclassIo;
-
-impl DeviceControlHandler for VolclassIo {
+impl DeviceControlHandler for MountMgrControl {
     #[request_handler]
-    async fn handler<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut DeviceControl<'data>,
+    async fn handler(
+        _device: &Arc<DeviceObject>,
+        request: &mut DeviceControl<'_>,
     ) -> DriverStep {
-        volclass_ioctl(dev, req).await
-    }
-}
-
-struct VolclassCtrlIo;
-
-impl DeviceControlHandler for VolclassCtrlIo {
-    #[request_handler]
-    async fn handler<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut DeviceControl<'data>,
-    ) -> DriverStep {
-        volclass_ctrl_ioctl(dev, req).await
-    }
-}
-
-#[request_handler]
-pub async fn volclass_start<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    _op: PnpOp,
-    _req: &'b mut StartDevice,
-) -> DriverStep {
-    let _ = refresh_fs_registry_from_registry().await;
-    init_volume_dx(&dev);
-    spawn_detached(mount_if_unmounted(dev.clone()));
-    DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn volclass_ioctl<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut DeviceControl<'data>,
-) -> DriverStep {
-    let code = req.code;
-
-    match code {
-        IOCTL_MOUNTMGR_UNMOUNT => {
-            let target = {
-                let mut r = &mut *req;
-                string_from_req(&mut r).unwrap_or_default()
-            };
-
-            if !target.is_empty() {
-                let _ = pnp_remove_symlink(target);
-            } else {
-                let dx = ext::<VolFdoExt>(&dev);
-                if let Some(pl) = dx.public_link.get() {
-                    let _ = pnp_remove_symlink(pl.clone());
-                }
-                dx.fs_attached.store(false, Ordering::Release);
+        match request.code {
+            IOCTL_MOUNTMGR_QUERY => {
+                request.set_data(IoctlData::from_t::<Vec<u8>>(status_blob()));
+                DriverStep::complete(DriverStatus::Success)
             }
-            DriverStep::complete(DriverStatus::Success)
-        }
-        IOCTL_MOUNTMGR_QUERY => {
-            req.set_data(IoctlData::from_t::<Vec<u8>>(
-                build_status_blob(&dev).into_vec(),
-            ));
-            DriverStep::complete(DriverStatus::Success)
-        }
-        IOCTL_MOUNTMGR_RESYNC => {
-            let _ = refresh_fs_registry_from_registry().await;
-            mount_if_unmounted(dev.clone()).await;
-            // Enumerate all volumes and assign labels on-demand
-            enumerate_and_assign_all_labels().await;
-            DriverStep::complete(DriverStatus::Success)
-        }
-        IOCTL_MOUNTMGR_LIST_FS => {
-            req.set_data(IoctlData::from_t::<Vec<u8>>(list_fs_blob().into_vec()));
-            DriverStep::complete(DriverStatus::Success)
-        }
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
-    }
-}
-
-#[request_handler]
-pub async fn volclass_ctrl_ioctl<'req, 'data, 'b>(
-    _dev: &Arc<DeviceObject>,
-    req: &'b mut DeviceControl<'data>,
-) -> DriverStep {
-    let code = req.code;
-    match code {
-        IOCTL_MOUNTMGR_REGISTER_FS => {
-            let tag = {
-                let mut r = &mut *req;
-                string_from_req(&mut r)
-            };
-            match tag {
-                Some(t) if !t.is_empty() => {
-                    let mut wr = FS_REGISTERED.write();
-                    if !wr.iter().any(|s| s == &t) {
-                        wr.push(t);
-                    }
-                    drop(wr);
-                    let _registry = refresh_fs_registry_from_registry().await;
-
-                    spawn_detached(rescan_all_volumes());
-
-                    DriverStep::complete(DriverStatus::Success)
-                }
-                _ => DriverStep::complete(DriverStatus::InvalidParameter),
+            IOCTL_MOUNTMGR_LIST_FS => {
+                request.set_data(IoctlData::from_t::<Vec<u8>>(filesystem_blob()));
+                DriverStep::complete(DriverStatus::Success)
             }
-        }
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
-    }
-}
-
-fn init_volume_dx(dev: &Arc<DeviceObject>) {
-    let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
-    let inst = dev
-        .dev_node
-        .get()
-        .unwrap()
-        .upgrade()
-        .unwrap()
-        .instance_path
-        .clone();
-
-    let dx = ext::<VolFdoExt>(dev);
-    dx.inst_path.call_once(|| inst);
-    dx.public_link.call_once(|| make_volume_link_name(vid));
-    dx.vid.call_once(|| vid);
-
-    let mut v = VOLUMES.write();
-    if !v.iter().any(|d| Arc::ptr_eq(d, dev)) {
-        v.push(dev.clone());
-    }
-}
-
-async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
-    {
-        let dx = ext::<VolFdoExt>(&dev);
-        if dx
-            .fs_attached
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-    }
-
-    let dx = ext::<VolFdoExt>(&dev);
-    let public = dx.public_link.get().cloned().unwrap_or_default();
-    if public.is_empty() {
-        dx.fs_attached.store(false, Ordering::Release);
-        return;
-    }
-    if try_bind_filesystems_for_parent_fdo(&dev, &public).await {
-        let link = dx.fs_link.get().cloned().unwrap_or_else(|| public.clone());
-        let inst = dx.inst_path.get().cloned().unwrap_or_default();
-        // Get stable_id - must exist after successful bind
-        let stable_id = dx.stable_id.get().cloned().flatten().unwrap_or_default();
-        start_boot_probe_async(&link, &inst, &stable_id);
-
-        // If the system is already running on VFS, assign a drive label immediately.
-        if VFS_ACTIVE.load(Ordering::Acquire) && dx.assigned_label.read().is_none() {
-            let published_label = if !stable_id.is_empty() {
-                PUBLISHED_LABELS
-                    .read()
-                    .iter()
-                    .find_map(|(lbl, sid)| (sid == &stable_id).then(|| lbl.clone()))
-            } else {
-                None
-            };
-
-            if let Some(lbl) = published_label {
-                *dx.assigned_label.write() = Some(lbl);
-            } else {
-                let _ = assign_label_on_demand(&dev).await;
+            IOCTL_MOUNTMGR_RESYNC => {
+                assign_all_labels().await;
+                DriverStep::complete(DriverStatus::Success)
             }
-        }
-    } else {
-        dx.fs_attached.store(false, Ordering::Release);
-    }
-}
-
-/// Compute stable identifier from GPT partition GUID.
-/// Returns None if the volume lacks a valid GPT GUID.
-async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
-    let vol_target = parent_fdo.clone();
-    let devnode = parent_fdo.dev_node.get().unwrap().upgrade().unwrap();
-    let proto = open_public_protocol::<VolmgrProtocol>(&devnode).ok()?;
-    let pi = (proto.partition_info)(&proto.provider()).ok()?;
-    let ge = pi.gpt_entry?;
-    let guid = ge.unique_partition_guid;
-
-    // Check for all-zero GUID
-    if guid.iter().all(|&b| b == 0) {
-        return None;
-    }
-
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut id = String::new();
-    id.push_str("GPT.");
-    for &b in &guid {
-        id.push(HEX[(b >> 4) as usize] as char);
-        id.push(HEX[(b & 0xF) as usize] as char);
-    }
-
-    Some(id)
-}
-
-async fn try_bind_filesystems_for_parent_fdo(
-    parent_fdo: &Arc<DeviceObject>,
-    public_link: &str,
-) -> bool {
-    let _ = refresh_fs_registry_from_registry().await;
-
-    let dx_vol = ext::<VolFdoExt>(parent_fdo);
-    let vid = dx_vol.vid.get().copied().unwrap_or(0);
-
-    let parent_dn = match parent_fdo.dev_node.get().unwrap().upgrade() {
-        Some(x) => x,
-        None => {
-            println!("weak upgrade failed");
-            return false;
-        }
-    };
-
-    // Compute and store stable_id if not already set
-    let stable_id = match dx_vol.stable_id.get() {
-        Some(id) => id.clone(),
-        None => {
-            let id = compute_stable_id(parent_fdo).await;
-            dx_vol.stable_id.call_once(|| id.clone());
-            id
-        }
-    };
-
-    // Require valid stable_id for mounting
-    let stable_id = match stable_id {
-        Some(id) => id,
-        None => {
-            return false;
-        }
-    };
-
-    let stable_link = alloc::format!("\\GLOBAL\\Volumes\\{}", stable_id);
-
-    let inst_suffix = alloc::format!("FSINST.{:04X}", vid);
-    let parent_inst = parent_dn.instance_path.clone();
-    let fs_inst = alloc::format!("{}\\{}", parent_inst, inst_suffix);
-
-    let ids = DeviceIds {
-        hardware: alloc::vec![alloc::format!("VIRT\\FSINST#{}", inst_suffix)],
-        compatible: Vec::new(),
-    };
-    let class = Some("FileSystem".to_string());
-
-    let tags = FS_REGISTERED.read().clone();
-
-    for tag in tags {
-        let mut identify_req = DeviceControl::new_t(
-            kernel_api::IOCTL_FS_IDENTIFY,
-            FsIdentify {
-                volume_fdo: parent_fdo.clone(),
-                mount_device: None,
-                can_mount: false,
-            },
-        );
-        identify_req.code = kernel_api::IOCTL_FS_IDENTIFY;
-        let Some(target) = io::resolve_target(&tag) else {
-            continue;
-        };
-        let err = io::send_down_stack(target, &mut identify_req).await;
-        if err != DriverStatus::Success {
-            continue;
-        }
-
-        let (can_mount, function_fdo) = {
-            let req = identify_req;
-            let Some(id) = req.data.view::<FsIdentify>() else {
-                continue;
-            };
-            (id.can_mount, id.mount_device.clone())
-        };
-        if !can_mount {
-            continue;
-        }
-        let Some(function_fdo) = function_fdo else {
-            continue;
-        };
-
-        let svc = match svc_for_tag(&tag) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let created = pnp_create_devnode_over_pdo_with_function(
-            &parent_dn,
-            fs_inst.clone(),
-            ids.clone(),
-            class.clone(),
-            &svc,
-            &function_fdo.clone(),
-            DeviceInit::new(),
-        )
-        .await;
-
-        match created {
-            Ok((dn, _top)) => {
-                let primary_link = public_link.to_string();
-                let compat_link = alloc::format!("\\GLOBAL\\Mounts\\{:04}", vid);
-                let _ =
-                    pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone());
-                let _ =
-                    pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone());
-                let _ =
-                    pnp_create_device_symlink_top(dn.instance_path.clone(), stable_link.clone());
-
-                let dx = ext::<VolFdoExt>(parent_fdo);
-                dx.fs_link.call_once(|| stable_link);
-                return true;
-            }
-            Err(_e) => {}
+            IOCTL_MOUNTMGR_UNMOUNT => DriverStep::complete(DriverStatus::NotImplemented),
+            _ => DriverStep::complete(DriverStatus::NotImplemented),
         }
     }
-
-    false
-}
-fn svc_for_tag(tag: &str) -> Option<String> {
-    FS_REGISTRY
-        .read()
-        .iter()
-        .find(|r| r.tag == tag)
-        .map(|r| r.svc.clone())
 }
 
-fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
-    let dx = ext::<VolFdoExt>(dev);
-    let claimed = if dx.fs_attached.load(Ordering::Acquire) {
-        1
-    } else {
-        0
-    };
-    let link = dx
-        .fs_link
-        .get()
-        .cloned()
-        .or_else(|| dx.public_link.get().cloned())
-        .unwrap_or_default();
-    let s = alloc::format!("claimed={};public={}", claimed, link);
-    s.into_bytes().into_boxed_slice()
-}
-
-fn string_from_req<'data>(req: &mut DeviceControl<'data>) -> Option<String> {
-    core::str::from_utf8(
-        req.data
-            .view::<Vec<u8>>()
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]),
-    )
-    .ok()
-    .map(|s| s.trim_matches(core::char::from_u32(0).unwrap()).to_string())
-}
-
-fn list_fs_blob() -> Box<[u8]> {
-    let s = {
-        let rd = FS_REGISTRY.read();
-        let mut out = String::new();
-        for (i, r) in rd.iter().enumerate() {
-            if i != 0 {
-                out.push('\n');
-            }
-            out.push_str(&r.tag);
-        }
-        out
-    };
-    s.into_bytes().into_boxed_slice()
-}
-
-async fn refresh_fs_registry_from_registry() -> usize {
-    use alloc::collections::{BTreeMap, BTreeSet};
-
-    const ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/Filesystems";
-
-    let mut by_tag: BTreeMap<String, FsReg> = BTreeMap::new();
-    if let Ok(keys) = reg::list_keys(ROOT).await {
-        for sub in keys {
-            let svc = match reg::get_value(&sub, "Service").await {
-                Some(Data::Str(s)) if !s.is_empty() => s,
-                _ => continue,
-            };
-            let tag = match reg::get_value(&sub, "ControlLink").await {
-                Some(Data::Str(s)) if !s.is_empty() => s,
-                _ => continue,
-            };
-            let ord = match reg::get_value(&sub, "Order").await {
-                Some(Data::U32(v)) => v,
-                _ => 100,
-            };
-            by_tag.entry(tag.clone()).or_insert(FsReg { svc, tag, ord });
-        }
-    }
-
-    let mut fresh: Vec<FsReg> = by_tag.into_values().collect();
-    fresh.sort_by(|a, b| a.ord.cmp(&b.ord).then_with(|| a.tag.cmp(&b.tag)));
-
-    let mut guard = FS_REGISTRY.write();
-
-    let old_svcs: BTreeSet<String> = guard.iter().map(|r| r.svc.clone()).collect();
-    let mut new_svcs = Vec::new();
-
-    for r in &fresh {
-        if !old_svcs.contains(&r.svc) {
-            new_svcs.push(r.svc.clone());
-        }
-    }
-
-    *guard = fresh;
-
-    drop(guard);
-
-    for s in new_svcs {
-        let _ = pnp_load_service(s).await;
-    }
-
-    let guard = FS_REGISTRY.read();
-    guard.len()
-}
-
-async fn fs_check_open(public_link: &str, path: &str) -> bool {
-    let params = FsOpenParams {
-        flags: OpenFlags::Open.into(),
-        write_through: false,
-        path: Path::from_string(path),
-    };
-    let mut req_inner = Fs::<FsOpen> {
-        payload: FsPayload {
-            params,
-            result: None,
-            _marker: PhantomData,
-        },
-    };
-    let Some(target) = io::resolve_target(public_link) else {
-        return false;
-    };
-    let err = io::send_down_stack(target, &mut req_inner).await;
-
-    if err != DriverStatus::Success {
-        return false;
-    }
-
-    req_inner
-        .payload
-        .result
-        .as_ref()
-        .is_some_and(|res| res.error.is_none())
-}
-
-fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {
-    let link = public_link.to_string();
-    let inst = inst_path.to_string();
-    let sid = stable_id.to_string();
-
+extern "C" fn volume_event(
+    node: Arc<DevNode>,
+    event: DeviceEvent,
+    _listener: &Arc<DeviceObject>,
+) {
     spawn_detached(async move {
-        if !VFS_ACTIVE.load(Ordering::Acquire) {
-            let mod_ok = fs_check_open(&link, "system/mod").await;
-            let inf_ok = fs_check_open(&link, "system/toml").await;
-            let reg_dir_ok = fs_check_open(&link, "system/registry").await;
-            if mod_ok && inf_ok && reg_dir_ok {
-                let _ = attempt_boot_bind(&inst, &link, &sid).await;
-            }
+        match event {
+            DeviceEvent::Started => handle_started(node).await,
+            DeviceEvent::Stopped | DeviceEvent::Removed => handle_removed(&node.instance_path),
+            DeviceEvent::Created | DeviceEvent::Failed => {}
         }
     });
 }
 
-async fn attempt_boot_bind(
-    _dev_inst_path: &str,
-    fs_mount_link: &str,
-    stable_id: &str,
-) -> Result<(), RegError> {
+#[unsafe(no_mangle)]
+pub extern "C" fn DriverEntry(_driver: &Arc<DriverObject>) -> DriverStatus {
+    let mut init = DeviceInit::new();
+    init.ops.register::<DeviceControlOp, MountMgrControl>();
+    let control = pnp_create_control_device_and_link(
+        "mountmgr".to_string(),
+        init,
+        GLOBAL_CTRL_LINK.to_string(),
+    );
+    pnp_add_class_listener("Volume".to_string(), volume_event, &control);
+    DriverStatus::Success
+}
+
+async fn handle_started(node: Arc<DevNode>) {
+    if MOUNTED.read().contains_key(&node.instance_path) {
+        return;
+    }
+    let protocol = match open_public_protocol::<VolmgrProtocol>(&node) {
+        Ok(protocol) => protocol,
+        Err(_) => return,
+    };
+    let info = match (protocol.partition_info)(protocol.provider()) {
+        Ok(info) => info,
+        Err(_) => return,
+    };
+    let Some(entry) = info.gpt_entry else {
+        return;
+    };
+    if entry.unique_partition_guid.iter().all(|byte| *byte == 0) {
+        return;
+    }
+
+    let stable_id = guid_id(&entry.unique_partition_guid);
+    let stable_link = alloc::format!("\\GLOBAL\\Volumes\\{stable_id}");
+    let service = node
+        .stack
+        .read()
+        .as_ref()
+        .and_then(|stack| stack.function.as_ref())
+        .map(|layer| layer.driver.driver_name.clone())
+        .unwrap_or_default();
+    if service.is_empty() {
+        return;
+    }
+
+    let _ = pnp_create_device_symlink_top(node.instance_path.clone(), stable_link.clone());
+    let mounted = MountedVolume {
+        instance_path: node.instance_path.clone(),
+        stable_id: stable_id.clone(),
+        stable_link: stable_link.clone(),
+        filesystem_service: service.clone(),
+        assigned_label: None,
+    };
+    MOUNTED.write().insert(node.instance_path.clone(), mounted);
+    write_filesystem_hint(&stable_id, &service).await;
+
     if VFS_ACTIVE.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
-    // Boot path: assign C: only, write registry only on first-boot/change
-    if stable_id.is_empty() {
-        return Err(RegError::KeyNotFound);
-    }
-
-    assign_boot_drive_letter(b'C', stable_id, fs_mount_link).await?;
-
-    match unsafe { switch_to_vfs_async().await } {
-        Ok(()) => {
-            VFS_ACTIVE.store(true, Ordering::Release);
-            // Now that the VFS provider is active, trigger a resync so all volumes
-            // get mounted and labeled without waiting for an external RESYNC request.
-            rescan_all_volumes().await;
-            Ok(())
-        }
-        Err(e) => {
-            panic!("VFS transition failed {:#?}", e);
-        }
+        let _ = assign_label(&node.instance_path, false).await;
+    } else {
+        start_boot_probe(node.instance_path.clone(), stable_id, stable_link);
     }
 }
 
-/// Tracking structure for currently published labels at runtime.
-/// Maps label (e.g., "C:") to stable_id of the volume holding it.
-static PUBLISHED_LABELS: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
+fn handle_removed(instance_path: &str) {
+    let Some(volume) = MOUNTED.write().remove(instance_path) else {
+        return;
+    };
+    if let Some(label) = volume.assigned_label {
+        unpublish_label(&label);
+    }
+    let _ = pnp_remove_symlink(volume.stable_link);
+}
 
-/// Read preferred label for a stable_id from registry.
-/// Returns None if no preference exists.
+fn guid_id(guid: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut id = String::from("GPT.");
+    for byte in guid {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    id
+}
+
+async fn write_filesystem_hint(stable_id: &str, service: &str) {
+    let _ = reg::create_key(HINTS_KEY).await;
+    let key = alloc::format!("{HINTS_KEY}/{stable_id}");
+    let _ = reg::create_key(&key).await;
+    let _ = reg::set_value(&key, "Service", Data::Str(service.to_string())).await;
+}
+
+fn start_boot_probe(instance_path: String, stable_id: String, stable_link: String) {
+    spawn_detached(async move {
+        let has_boot_tree = fs_check_open(&stable_link, "system/mod").await
+            && fs_check_open(&stable_link, "system/toml").await
+            && fs_check_open(&stable_link, "system/registry").await;
+        if !has_boot_tree || VFS_ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        if assign_specific_label('C', &instance_path, &stable_id, &stable_link)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match unsafe { switch_to_vfs_async().await } {
+            Ok(()) => {
+                VFS_ACTIVE.store(true, Ordering::Release);
+                assign_all_labels().await;
+            }
+            Err(error) => panic!("VFS transition failed: {error:?}"),
+        }
+    });
+}
+
+async fn fs_check_open(volume_link: &str, path: &str) -> bool {
+    let mut request = Fs::<FsOpen> {
+        payload: FsPayload {
+            params: FsOpenParams {
+                flags: OpenFlags::Open.into(),
+                write_through: false,
+                path: Path::from_string(path),
+            },
+            result: None,
+            _marker: PhantomData,
+        },
+    };
+    let Some(target) = io::resolve_target(volume_link) else {
+        return false;
+    };
+    io::send_down_stack(target, &mut request).await == DriverStatus::Success
+        && request
+            .payload
+            .result
+            .as_ref()
+            .is_some_and(|result| result.error.is_none())
+}
+
+async fn assign_all_labels() {
+    let instances: Vec<_> = MOUNTED.read().keys().cloned().collect();
+    for instance in instances {
+        let _ = assign_label(&instance, false).await;
+    }
+}
+
+async fn assign_label(instance_path: &str, allow_c: bool) -> Option<String> {
+    let volume = MOUNTED.read().get(instance_path).cloned()?;
+    if volume.assigned_label.is_some() {
+        return volume.assigned_label;
+    }
+    let preferred = read_preferred_label(&volume.stable_id).await;
+    let label = match preferred {
+        Some(label) if !is_label_published(&label) => label,
+        _ => {
+            let label = find_free_label(allow_c)?;
+            let _ = write_preferred_label(&volume.stable_id, &label).await;
+            label
+        }
+    };
+    publish_label(&label, &volume.stable_id, &volume.stable_link);
+    if let Some(current) = MOUNTED.write().get_mut(instance_path) {
+        current.assigned_label = Some(label.clone());
+    }
+    Some(label)
+}
+
+async fn assign_specific_label(
+    letter: char,
+    instance_path: &str,
+    stable_id: &str,
+    stable_link: &str,
+) -> Result<(), RegError> {
+    let label = alloc::format!("{}:", letter.to_ascii_uppercase());
+    write_preferred_label(stable_id, &label).await?;
+    publish_label(&label, stable_id, stable_link);
+    if let Some(volume) = MOUNTED.write().get_mut(instance_path) {
+        volume.assigned_label = Some(label);
+    }
+    Ok(())
+}
+
 async fn read_preferred_label(stable_id: &str) -> Option<String> {
-    reg::get_value(DL_ROOT, stable_id)
+    reg::get_value(DRIVE_LETTERS_KEY, stable_id)
         .await
-        .and_then(|d| match d {
-            Data::Str(s) if !s.is_empty() => Some(s),
+        .and_then(|value| match value {
+            Data::Str(label) if !label.is_empty() => Some(label),
             _ => None,
         })
 }
 
-/// Write preferred label for a stable_id to registry.
 async fn write_preferred_label(stable_id: &str, label: &str) -> Result<(), RegError> {
-    let _ = reg::create_key(DL_ROOT).await;
-    reg::set_value(DL_ROOT, stable_id, Data::Str(label.to_string())).await
+    let _ = reg::create_key(DRIVE_LETTERS_KEY).await;
+    reg::set_value(
+        DRIVE_LETTERS_KEY,
+        stable_id,
+        Data::Str(label.to_string()),
+    )
+    .await
 }
 
-/// Publish a drive letter symlink pointing to the volume's stable mount symlink.
-/// Updates the PUBLISHED_LABELS map.
-fn publish_label(label: &str, stable_id: &str, fs_mount_link: &str) {
-    let ch = label.chars().next().unwrap_or('?');
-    let link_nocolon = alloc::format!("\\GLOBAL\\StorageDevices\\{}", ch);
-    let link_colon = alloc::format!("\\GLOBAL\\StorageDevices\\{}:", ch);
-
-    pnp_remove_symlink(link_nocolon.clone());
-    pnp_remove_symlink(link_colon.clone());
-
-    pnp_create_symlink(link_nocolon, fs_mount_link.to_string());
-    pnp_create_symlink(link_colon, fs_mount_link.to_string());
-
-    PUBLISHED_LABELS
-        .write()
-        .insert(label.to_string(), stable_id.to_string());
-
-    notify_label_published(label, fs_mount_link);
-}
-
-/// Unpublish a drive letter symlink.
-fn unpublish_label(label: &str) {
-    let ch = label.chars().next().unwrap_or('?');
-    let link_nocolon = alloc::format!("\\GLOBAL\\StorageDevices\\{}", ch);
-    let link_colon = alloc::format!("\\GLOBAL\\StorageDevices\\{}:", ch);
-
-    pnp_remove_symlink(link_nocolon);
-    pnp_remove_symlink(link_colon);
-
-    PUBLISHED_LABELS.write().remove(label);
-
-    notify_label_unpublished(label);
-}
-
-/// Check if a label is currently published.
-fn is_label_published(label: &str) -> bool {
-    PUBLISHED_LABELS.read().contains_key(label)
-}
-
-/// Find the first free label starting from D: (or C: if allow_c is true).
 fn find_free_label(allow_c: bool) -> Option<String> {
-    let published = PUBLISHED_LABELS.read();
-    let start = if allow_c { b'C' } else { b'D' };
-    for ch in start..=b'Z' {
-        let label = alloc::format!("{}:", ch as char);
-        if !published.contains_key(&label) {
+    let labels = PUBLISHED_LABELS.read();
+    for letter in if allow_c { b'C' } else { b'D' }..=b'Z' {
+        let label = alloc::format!("{}:", letter as char);
+        if !labels.contains_key(&label) {
             return Some(label);
         }
     }
     None
 }
 
-/// Assign a specific drive letter to a volume (boot path for C:).
-/// Only writes to registry if this is first assignment or the mapping changed.
-async fn assign_boot_drive_letter(
-    letter: u8,
-    stable_id: &str,
-    fs_mount_link: &str,
-) -> Result<(), RegError> {
-    let ch = (letter as char).to_ascii_uppercase();
-    if !('A'..='Z').contains(&ch) {
-        return Ok(());
-    }
-
-    let label = alloc::format!("{}:", ch);
-
-    // Check if we need to write to registry
-    let current_pref = read_preferred_label(stable_id).await;
-    if current_pref.as_ref() != Some(&label) {
-        // First boot or mapping changed - write registry
-        write_preferred_label(stable_id, &label).await?;
-    }
-
-    // Publish the runtime symlink
-    publish_label(&label, stable_id, fs_mount_link);
-
-    Ok(())
+fn is_label_published(label: &str) -> bool {
+    PUBLISHED_LABELS.read().contains_key(label)
 }
 
-/// On-demand label assignment for a volume.
-/// Uses Policy A: existing mapping wins (newcomers get new labels).
-async fn assign_label_on_demand(dev: &Arc<DeviceObject>) -> Option<String> {
-    let dx = ext::<VolFdoExt>(dev);
+fn publish_label(label: &str, stable_id: &str, stable_link: &str) {
+    let letter = label.chars().next().unwrap_or('?');
+    let plain = alloc::format!("\\GLOBAL\\StorageDevices\\{letter}");
+    let colon = alloc::format!("\\GLOBAL\\StorageDevices\\{letter}:");
+    let _ = pnp_remove_symlink(plain.clone());
+    let _ = pnp_remove_symlink(colon.clone());
+    let _ = pnp_create_symlink(plain, stable_link.to_string());
+    let _ = pnp_create_symlink(colon, stable_link.to_string());
+    PUBLISHED_LABELS
+        .write()
+        .insert(label.to_string(), stable_id.to_string());
+    notify_label_published(label, stable_link);
+}
 
-    // Get stable_id - required for assignment
-    let stable_id = match dx.stable_id.get() {
-        Some(Some(id)) => id.clone(),
-        _ => return None,
-    };
+fn unpublish_label(label: &str) {
+    let letter = label.chars().next().unwrap_or('?');
+    let _ = pnp_remove_symlink(alloc::format!("\\GLOBAL\\StorageDevices\\{letter}"));
+    let _ = pnp_remove_symlink(alloc::format!("\\GLOBAL\\StorageDevices\\{letter}:"));
+    PUBLISHED_LABELS.write().remove(label);
+    notify_label_unpublished(label);
+}
 
-    // Get fs_link for the volume
-    let fs_link = match dx.fs_link.get() {
-        Some(link) => link.clone(),
-        None => match dx.public_link.get() {
-            Some(link) => link.clone(),
-            None => return None,
-        },
-    };
-
-    // Check if already assigned
-    if let Some(existing) = dx.assigned_label.read().clone() {
-        return Some(existing);
-    }
-
-    // Check registry for preferred label (single read)
-    let preferred = read_preferred_label(&stable_id).await;
-
-    let label = if let Some(pref) = preferred {
-        // Has preference - check if free
-        if is_label_published(&pref) {
-            // Conflict - Policy A: existing wins, we get a new label
-            match find_free_label(false) {
-                Some(new_label) => {
-                    // Don't persist conflict resolution to avoid future fights
-                    new_label
-                }
-                None => return None, // No free labels
-            }
-        } else {
-            pref
+fn status_blob() -> Vec<u8> {
+    let mounted = MOUNTED.read();
+    let mut output = String::new();
+    for volume in mounted.values() {
+        if !output.is_empty() {
+            output.push('\n');
         }
-    } else {
-        // No preference - find a free label and persist it
-        match find_free_label(false) {
-            Some(new_label) => {
-                // Persist new assignment
-                let _ = write_preferred_label(&stable_id, &new_label).await;
-                new_label
-            }
-            None => return None,
-        }
-    };
-
-    // Publish the symlink
-    publish_label(&label, &stable_id, &fs_link);
-
-    // Store assignment in device extension
-    *dx.assigned_label.write() = Some(label.clone());
-
-    Some(label)
-}
-
-async fn rescan_all_volumes() {
-    let vols = VOLUMES.read().clone();
-    for dev in vols {
-        mount_if_unmounted(dev.clone()).await;
+        output.push_str(&alloc::format!(
+            "{};{};{};{}",
+            volume.instance_path,
+            volume.stable_id,
+            volume.filesystem_service,
+            volume.assigned_label.as_deref().unwrap_or("")
+        ));
     }
+    output.into_bytes()
 }
 
-/// Enumerate all volumes and assign labels on-demand.
-/// Called during RESYNC or when VFS needs to refresh labels.
-async fn enumerate_and_assign_all_labels() {
-    let vols = VOLUMES.read().clone();
-    for dev in vols {
-        let dx = ext::<VolFdoExt>(&dev);
-        // Only process mounted volumes
-        if dx.fs_attached.load(Ordering::Acquire) {
-            let _ = assign_label_on_demand(&dev).await;
-        }
-    }
-}
-
-fn dev_name_for(label: u8) -> String {
-    let c = (label as char).to_ascii_uppercase();
-    alloc::format!("StorageDevices\\{}:", c)
+fn filesystem_blob() -> Vec<u8> {
+    let services: BTreeSet<_> = MOUNTED
+        .read()
+        .values()
+        .map(|volume| volume.filesystem_service.clone())
+        .collect();
+    services.into_iter().collect::<Vec<_>>().join("\n").into_bytes()
 }

@@ -36,7 +36,9 @@ use kernel_types::pnp::{DeviceIds, DeviceRelationType};
 use kernel_types::status::{
     Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError, TaskError,
 };
-use kernel_types::{ClassAddCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverUnload};
+use kernel_types::{
+    ClassEventCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
+};
 
 #[link(name = "kernel")]
 unsafe extern "C" {
@@ -169,6 +171,7 @@ unsafe extern "C" {
     pub fn driver_get_name(driver: &Arc<DriverObject>) -> String;
     pub fn driver_get_flags(driver: &Arc<DriverObject>) -> u32;
     pub fn driver_set_evt_device_add(driver: &Arc<DriverObject>, callback: EvtDriverDeviceAdd);
+    pub fn driver_set_evt_probe_device(driver: &Arc<DriverObject>, callback: EvtDriverProbeDevice);
     pub fn driver_set_evt_driver_unload(driver: &Arc<DriverObject>, callback: EvtDriverUnload);
 
     pub fn pnp_create_pdo(
@@ -199,8 +202,6 @@ unsafe extern "C" {
     ) -> Result<(), kernel_types::object_manager::OmError>;
     pub fn pnp_remove_symlink(link_path: String) -> DriverStatus;
 
-    pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
-
     pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit)
     -> Arc<DeviceObject>;
 
@@ -212,19 +213,9 @@ unsafe extern "C" {
 
     pub fn pnp_add_class_listener(
         class: String,
-        callback: ClassAddCallback,
+        callback: ClassEventCallback,
         dev_obj: &Arc<DeviceObject>,
     );
-
-    pub fn pnp_create_devnode_over_pdo_with_function(
-        parent_dn: &Arc<DevNode>,
-        instance_path: String,
-        ids: DeviceIds,
-        class: Option<String>,
-        function_service: &str,
-        function_fdo: &Arc<DeviceObject>,
-        init_pdo: DeviceInit,
-    ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
     pub fn pnp_invalidate_device_relations(
         device: &Arc<DeviceObject>,

@@ -64,7 +64,7 @@ use kernel_types::{
     pnp::{DeviceIds, DeviceRelationType},
     runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
-    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
+    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
 
@@ -411,6 +411,13 @@ pub extern "C" fn driver_set_evt_device_add(
     *driver.evt_device_add.write() = Some(callback);
 }
 
+pub extern "C" fn driver_set_evt_probe_device(
+    driver: &Arc<DriverObject>,
+    callback: EvtDriverProbeDevice,
+) {
+    *driver.evt_probe_device.write() = Some(callback);
+}
+
 pub extern "C" fn driver_set_evt_driver_unload(
     driver: &Arc<DriverObject>,
     callback: EvtDriverUnload,
@@ -492,11 +499,6 @@ pub extern "C" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
     }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>> {
-    async move { PNP_MANAGER.load_service(&name).await }.into_ffi()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn pnp_create_control_device_with_init(
     name: String,
     init: DeviceInit,
@@ -517,40 +519,10 @@ pub extern "C" fn pnp_create_control_device_and_link(
 #[unsafe(no_mangle)]
 pub extern "C" fn pnp_add_class_listener(
     class: String,
-    callback: ClassAddCallback,
+    callback: ClassEventCallback,
     dev_obj: &Arc<DeviceObject>,
 ) {
     PNP_MANAGER.add_class_listener(class, dev_obj.clone(), callback);
-}
-
-#[no_mangle]
-pub extern "C" fn pnp_create_devnode_over_pdo_with_function(
-    parent_dn: &Arc<DevNode>,
-    instance_path: String,
-    ids: DeviceIds,
-    class: Option<String>,
-    function_service: &str,
-    function_fdo: &Arc<DeviceObject>,
-    init_pdo: DeviceInit,
-) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>> {
-    let parent_dn = parent_dn.clone();
-    let function_service = function_service.to_string();
-    let function_fdo = function_fdo.clone();
-
-    async move {
-        PNP_MANAGER
-            .create_devnode_over_pdo_with_function(
-                parent_dn,
-                instance_path,
-                ids,
-                class,
-                function_service.as_str(),
-                function_fdo,
-                init_pdo,
-            )
-            .await
-    }
-    .into_ffi()
 }
 
 static BLOCKING_INIT: Once = Once::new();

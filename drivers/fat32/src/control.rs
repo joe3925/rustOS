@@ -1,219 +1,202 @@
-use kernel_api::device::open_public_protocol;
-use kernel_api::kernel_types::protocol::volmgr::VolmgrProtocol;
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64};
-use fatfs::FsOptions;
 
+use fatfs::{Error, FileSystem, FsOptions, IoKind, Read};
 use kernel_api::{
-    GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS,
-    device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
+    device::{
+        open_protocol_to_next_lower, open_public_protocol, DevExtRef, DeviceInit, DeviceObject,
+        DriverObject, ProtocolHandle,
+    },
     kernel_types::{
+        async_ffi::{FfiFuture, FutureExt},
         async_types::AsyncMutex,
-        io::{DeviceControlHandler, DeviceControlOp, FsIdentify, PartitionInfo},
-        request::IoctlData,
+        pnp::{ProbeContext, ProbeOutcome},
+        protocol::volmgr::VolmgrProtocol,
     },
     pnp::{
-        DriverStep, driver_set_evt_device_add, io, pnp, pnp_create_control_device_and_link,
-        pnp_create_control_device_with_init,
+        driver_set_evt_device_add, driver_set_evt_probe_device, DriverStep, PnpOp, PnpOps,
+        RemoveDevice, StartDevice,
     },
-    request::DeviceControl,
     request_handler,
-    runtime::spawn_detached,
     status::DriverStatus,
 };
-
-use crate::block_dev::BlockDev;
-use crate::volume::{
-    FILE_HANDLE_CAPACITY, Fat32Fs, FileHandleTable, METADATA_OWNER_ID, VolCtrlDevExt,
-};
-use log::{Metadata, Record};
 use spin::Mutex;
 
-struct KernelLogger;
-
-impl log::Log for KernelLogger {
-    fn enabled(&self, _metadata: &Metadata) -> bool {
-        false
-    }
-
-    fn log(&self, _record: &Record) {}
-
-    fn flush(&self) {}
-}
-
-static LOGGER: KernelLogger = KernelLogger;
-
-fn init_logger() {
-    let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Off);
-}
+use crate::{
+    block_dev::{flush, BlockDev},
+    volume::{
+        Fat32Fs, FileHandleTable, MountedFat32, VolCtrlDevExt, FILE_HANDLE_CAPACITY,
+        METADATA_OWNER_ID,
+    },
+};
 
 #[inline]
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
-    dev.try_devext().expect("Failed to get fat32 dev ext")
+    dev.try_devext().expect("failed to get FAT32 device extension")
 }
 
-pub struct Fat32RootIo;
+fn volume_geometry(
+    protocol: &ProtocolHandle<VolmgrProtocol>,
+) -> Result<(u16, u64), DriverStatus> {
+    let info = (protocol.partition_info)(protocol.provider())?;
+    let entry = info.gpt_entry.ok_or(DriverStatus::InvalidParameter)?;
+    let sector_size = if info.disk.logical_block_size == 0 {
+        512
+    } else {
+        u16::try_from(info.disk.logical_block_size).map_err(|_| DriverStatus::InvalidParameter)?
+    };
+    let sectors = entry
+        .last_lba
+        .checked_sub(entry.first_lba)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(DriverStatus::InvalidParameter)?;
+    Ok((sector_size, sectors))
+}
 
-impl DeviceControlHandler for Fat32RootIo {
-    #[request_handler]
-    async fn handler<'req, 'data, 'b>(
-        _dev: &Arc<DeviceObject>,
-        req: &'b mut DeviceControl<'data>,
-    ) -> DriverStep {
-        let code = req.code;
-
-        match code {
-            IOCTL_FS_IDENTIFY => {
-                let volume_fdo = {
-                    let r = &mut *req;
-
-                    let volume_fdo = r
-                        .data
-                        .view_mut::<FsIdentify>()
-                        .map(|id| id.volume_fdo.clone());
-
-                    let Some(volume_fdo) = volume_fdo else {
-                        return DriverStep::complete(DriverStatus::InvalidParameter);
-                    };
-
-                    volume_fdo
-                };
-
-                let (sector_size, total_sectors) = {
-                    let mut sector_size = None;
-                    let mut total_sectors = None;
-
-                    if let Some(devnode) = volume_fdo.dev_node.get() {
-                        if let Some(dn) = devnode.upgrade() {
-                            if let Ok(proto) = open_public_protocol::<
-                                VolmgrProtocol,
-                            >(&dn)
-                            {
-                                if let Ok(pi) = (proto.partition_info)(&proto.provider()) {
-                                    sector_size = Some(if pi.disk.logical_block_size != 0 {
-                                        pi.disk.logical_block_size as u16
-                                    } else {
-                                        512
-                                    });
-                                    total_sectors = pi.gpt_entry.map(|ent| {
-                                        ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    (sector_size, total_sectors)
-                };
-
-                let (can_mount, mount_device) = match (sector_size, total_sectors) {
-                    (Some(sector_size), Some(total_sectors)) => {
-                        let options = FsOptions::new().update_accessed_date(false).strict(false);
-                        let target_clone = volume_fdo.clone();
-                        let should_flush = Arc::new(AtomicBool::new(false));
-                        let should_flush_blk = should_flush.clone();
-                        let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
-                        let current_owner_blk = current_owner.clone();
-
-                        let result = fatfs::FileSystem::new(
-                            BlockDev::new(
-                                target_clone,
-                                sector_size,
-                                total_sectors,
-                                should_flush_blk,
-                                current_owner_blk,
-                            ),
-                            options,
-                        )
-                        .await;
-
-                        match result {
-                            Ok(fs) => {
-                                let ext = VolCtrlDevExt {
-                                    fs: Arc::new(AsyncMutex::new(fs)),
-                                    handles: Mutex::new(FileHandleTable::with_capacity(
-                                        FILE_HANDLE_CAPACITY,
-                                    )),
-                                    volume_target: volume_fdo.clone(),
-                                    should_flush,
-                                    pending_flush_owner: Arc::new(AtomicU64::new(0)),
-                                    pending_flush_block: Arc::new(AtomicBool::new(false)),
-                                    current_owner,
-                                };
-
-                                let mut init = DeviceInit::new();
-                                init.ops.fs.register::<Fat32Fs>();
-                                init.set_dev_ext_from(ext);
-
-                                let vol_name = alloc::format!(
-                                    "\\Device\\fat32.vol.{:p}",
-                                    Arc::as_ptr(&volume_fdo)
-                                );
-                                let vol_ctrl = pnp_create_control_device_with_init(vol_name, init);
-
-                                (true, Some(vol_ctrl))
-                            }
-                            Err(_e) => (false, None),
-                        }
-                    }
-                    _ => (false, None),
-                };
-
-                {
-                    let r = &mut *req;
-                    let mut replacement = Some(FsIdentify {
-                        mount_device,
-                        can_mount,
-                        volume_fdo,
-                    });
-                    let replace_payload = {
-                        if let Some(id) = r.data.view_mut::<FsIdentify>() {
-                            let value = replacement.take().unwrap();
-                            id.mount_device = value.mount_device;
-                            id.can_mount = can_mount;
-                            false
-                        } else {
-                            true
-                        }
-                    };
-
-                    if replace_payload {
-                        r.set_data_t(replacement.unwrap());
-                    }
-                }
-
-                DriverStep::complete(DriverStatus::Success)
-            }
-            _ => DriverStep::complete(DriverStatus::NotImplemented),
+extern "C" fn fat32_probe(
+    _driver: &Arc<DriverObject>,
+    context: &ProbeContext,
+) -> FfiFuture<ProbeOutcome> {
+    let context = context.clone();
+    async move {
+        let protocol = match open_public_protocol::<VolmgrProtocol>(&context.devnode) {
+            Ok(protocol) => protocol,
+            Err(status) => return ProbeOutcome::Error(status),
+        };
+        let (sector_size, sectors) = match volume_geometry(&protocol) {
+            Ok(geometry) => geometry,
+            Err(status) => return ProbeOutcome::Error(status),
+        };
+        let should_flush = Arc::new(AtomicBool::new(false));
+        let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
+        let mut probe_block = BlockDev::new(
+            context.lower_target.clone(),
+            sector_size,
+            sectors,
+            should_flush.clone(),
+            current_owner.clone(),
+        );
+        let mut boot_sector = [0_u8; 512];
+        if probe_block
+            .read_exact(&mut boot_sector, IoKind::Metadata)
+            .await
+            .is_err()
+        {
+            return ProbeOutcome::Error(DriverStatus::Unsuccessful);
+        }
+        let fat32_signature = boot_sector[510..512] == [0x55, 0xaa]
+            && boot_sector[17..19] == [0, 0]
+            && boot_sector[22..24] == [0, 0]
+            && u32::from_le_bytes([
+                boot_sector[36],
+                boot_sector[37],
+                boot_sector[38],
+                boot_sector[39],
+            ]) != 0;
+        if !fat32_signature {
+            return ProbeOutcome::NoMatch;
+        }
+        let block = BlockDev::new(
+            context.lower_target,
+            sector_size,
+            sectors,
+            should_flush,
+            current_owner,
+        );
+        match FileSystem::new(
+            block,
+            FsOptions::new().update_accessed_date(false).strict(false),
+        )
+        .await
+        {
+            Ok(_) => ProbeOutcome::Match,
+            Err(Error::Io(_)) => ProbeOutcome::Error(DriverStatus::Unsuccessful),
+            Err(_) => ProbeOutcome::Error(DriverStatus::Unsuccessful),
         }
     }
+    .into_ffi()
+}
+
+pub extern "C" fn fat32_device_add(
+    _driver: &Arc<DriverObject>,
+    init: &mut DeviceInit,
+) -> DriverStep {
+    let mut pnp = PnpOps::new();
+    pnp.start_device.set(fat32_start);
+    pnp.remove_device.set(fat32_remove);
+    init.pnp_ops = Some(pnp);
+    init.ops.fs.register::<Fat32Fs>();
+    init.set_dev_ext_default::<VolCtrlDevExt>();
+    DriverStep::complete(DriverStatus::Success)
+}
+
+#[request_handler]
+async fn fat32_start(
+    device: &Arc<DeviceObject>,
+    _op: PnpOp,
+    _request: &mut StartDevice,
+) -> DriverStep {
+    let protocol = match open_protocol_to_next_lower::<VolmgrProtocol>(device) {
+        Ok(protocol) => protocol,
+        Err(status) => return DriverStep::complete(status),
+    };
+    let (sector_size, sectors) = match volume_geometry(&protocol) {
+        Ok(geometry) => geometry,
+        Err(status) => return DriverStep::complete(status),
+    };
+    let Some(volume_target) = device.lower_device.read().clone() else {
+        return DriverStep::complete(DriverStatus::NoSuchDevice);
+    };
+
+    let should_flush = Arc::new(AtomicBool::new(false));
+    let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
+    let block = BlockDev::new(
+        volume_target.clone(),
+        sector_size,
+        sectors,
+        should_flush.clone(),
+        current_owner.clone(),
+    );
+    let filesystem = match FileSystem::new(
+        block,
+        FsOptions::new().update_accessed_date(false).strict(false),
+    )
+    .await
+    {
+        Ok(filesystem) => filesystem,
+        Err(_) => return DriverStep::complete(DriverStatus::Unsuccessful),
+    };
+
+    let mounted = MountedFat32 {
+        fs: Arc::new(AsyncMutex::new(filesystem)),
+        handles: Mutex::new(FileHandleTable::with_capacity(FILE_HANDLE_CAPACITY)),
+        volume_target,
+        should_flush,
+        pending_flush_owner: Arc::new(AtomicU64::new(0)),
+        pending_flush_block: Arc::new(AtomicBool::new(false)),
+        current_owner,
+    };
+    if ext_mut::<VolCtrlDevExt>(device).mount(mounted).is_err() {
+        return DriverStep::complete(DriverStatus::InvalidParameter);
+    }
+    DriverStep::complete(DriverStatus::Success)
+}
+
+#[request_handler]
+async fn fat32_remove(
+    device: &Arc<DeviceObject>,
+    _op: PnpOp,
+    _request: &mut RemoveDevice,
+) -> DriverStep {
+    if device.is_started() {
+        flush(&ext_mut::<VolCtrlDevExt>(device));
+    }
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    driver_set_evt_device_add(driver, fs_device_add);
-    init_logger();
-    let mut init = DeviceInit::new();
-    init.ops.register::<DeviceControlOp, Fat32RootIo>();
-    let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
-    let ctrl_name = "\\Device\\fat32.fs".to_string();
-    let _ctrl = pnp_create_control_device_and_link(ctrl_name, init, ctrl_link.clone());
-
-    spawn_detached(async move {
-        let mut binding = DeviceControl::new_t(IOCTL_MOUNTMGR_REGISTER_FS, ctrl_link.into_bytes());
-        binding.code = IOCTL_MOUNTMGR_REGISTER_FS;
-        if let Some(target) = io::resolve_target(GLOBAL_CTRL_LINK) {
-            let _ioctl_status = io::send_down_stack(target, &mut binding).await;
-        }
-    });
-
+    driver_set_evt_probe_device(driver, fat32_probe);
+    driver_set_evt_device_add(driver, fat32_device_add);
     DriverStatus::Success
-}
-
-pub extern "C" fn fs_device_add(
-    _driver: &Arc<DriverObject>,
-    _dev_init: &mut DeviceInit,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
 }

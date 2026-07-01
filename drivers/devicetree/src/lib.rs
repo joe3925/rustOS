@@ -136,7 +136,8 @@ pub async fn devicetree_query_devrels<'req, 'data, 'b>(
 fn has_lower_dt_pdo(device: &Arc<DeviceObject>) -> bool {
     device
         .lower_device
-        .get()
+        .read()
+        .as_ref()
         .and_then(|lower| lower.try_devext::<DtPdoExt>().ok())
         .is_some()
 }
@@ -148,7 +149,8 @@ fn enumeration_context(device: &Arc<DeviceObject>) -> Option<(Arc<DeviceTree>, S
         }
     }
 
-    let lower = device.lower_device.get()?;
+    let lower = device.lower_device.read();
+    let lower = lower.as_ref()?;
     let pdo = lower.try_devext::<DtPdoExt>().ok()?;
     Some((pdo.tree.clone(), pdo.path.clone()))
 }
