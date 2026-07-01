@@ -1,3 +1,0 @@
-[submodule "third_party/aarch64-bootloader"]
-	path = third_party/aarch64-bootloader
-	url = https://github.com/joe3925/aarch64-bootloader
