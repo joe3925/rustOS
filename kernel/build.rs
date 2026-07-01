@@ -35,7 +35,10 @@ fn compile_mimalloc(
     target: &str,
     out_dir: &PathBuf,
 ) -> Result<(), Box<dyn Error>> {
-    let mimalloc_dir = manifest_dir.join("vendor").join("mimalloc-v2");
+    let workspace_dir = manifest_dir
+        .parent()
+        .ok_or("kernel manifest directory has no parent")?;
+    let mimalloc_dir = workspace_dir.join("third_party").join("mimalloc-v2");
     let shim_include_dir = manifest_dir.join("c").join("include");
     let include_dir = mimalloc_dir.join("include");
     let src_dir = mimalloc_dir.join("src");

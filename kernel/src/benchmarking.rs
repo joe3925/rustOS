@@ -2612,18 +2612,19 @@ pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Resul
 }
 
 pub fn used_memory() -> usize {
-    #[cfg(feature = "allocator-mimalloc")]
-    {
-        let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
-            + crate::memory::heap::MIMALLOC_OS_HEAP_SIZE as usize;
-        let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
-        let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
-            .load(core::sync::atomic::Ordering::Relaxed);
-        used_non_arena + used_arena
-    }
-    #[cfg(feature = "allocator-buddy")]
-    {
-        crate::memory::heap::HEAP_SIZE as usize - crate::memory::heap::ALLOCATOR.free_memory()
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "allocator-mimalloc")] {
+            let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
+                + crate::memory::heap::MIMALLOC_OS_HEAP_SIZE as usize;
+            let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
+            let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
+                .load(core::sync::atomic::Ordering::Relaxed);
+            used_non_arena + used_arena
+        } else if #[cfg(feature = "allocator-buddy")] {
+            crate::memory::heap::HEAP_SIZE as usize - crate::memory::heap::ALLOCATOR.free_memory()
+        } else {
+            0
+        }
     }
 }
 
