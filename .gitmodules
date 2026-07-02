@@ -1,3 +1,6 @@
 [submodule "third_party/aarch64-bootloader"]
 	path = third_party/aarch64-bootloader
 	url = https://github.com/joe3925/aarch64-bootloader.git
+[submodule "third_party/aarch64-vmsa"]
+	path = third_party/aarch64-vmsa
+	url = https://github.com/joe3925/aarch64-vmsa.git
