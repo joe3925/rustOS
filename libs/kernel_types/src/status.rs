@@ -1,11 +1,14 @@
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
 use bincode::{Decode, Encode};
 use core::convert::Infallible;
 use core::fmt;
 use core::ops::{ControlFlow, FromResidual, Residual, Try};
 
+use crate::dma::IoBufferError;
+
 #[repr(i32)]
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, Eq, Copy)]
 pub enum DriverStatus {
     Success = 0x0000_0000,
     PendingStep = 0x0000_0103,
@@ -17,7 +20,7 @@ pub enum DriverStatus {
     NoSuchFile = 0xC000_000Fu32 as i32,
     DeviceNotReady = 0xC000_00A3u32 as i32,
     Unsuccessful = 0xC000_0001u32 as i32,
-    DeviceError { message: String } = 0xC000_002Fu32 as i32,
+    DeviceError { message: &'static str } = 0xC000_002Fu32 as i32,
     Timeout = 0xC000_001Fu32 as i32,
 }
 
@@ -34,13 +37,6 @@ impl DriverStatus {
     pub const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
     pub const STATUS_DEVICE_ERROR: i32 = 0xC000_002Fu32 as i32;
     pub const STATUS_TIMEOUT: i32 = 0xC000_001Fu32 as i32;
-
-    #[inline]
-    pub fn device_error(message: impl Into<String>) -> Self {
-        Self::DeviceError {
-            message: message.into(),
-        }
-    }
 
     #[inline]
     pub fn code(&self) -> i32 {
@@ -124,7 +120,9 @@ impl From<i32> for DriverStatus {
             Self::STATUS_NO_SUCH_FILE => Self::NoSuchFile,
             Self::STATUS_DEVICE_NOT_READY => Self::DeviceNotReady,
             Self::STATUS_UNSUCCESSFUL => Self::Unsuccessful,
-            Self::STATUS_DEVICE_ERROR => Self::device_error("Device error"),
+            Self::STATUS_DEVICE_ERROR => Self::DeviceError {
+                message: "Device Error",
+            },
             Self::STATUS_TIMEOUT => Self::Timeout,
             _ => Self::Unsuccessful,
         }
@@ -247,6 +245,10 @@ pub enum FileStatus {
     FileAlreadyExist,
     PathNotFound,
     UnknownFail,
+    NoBuffer,
+    BufferError(IoBufferError),
+    FileSystemError,
+    DriverError(DriverStatus),
     NotFat,
     DriveNotFound,
     IncompatibleFlags,
@@ -257,23 +259,37 @@ pub enum FileStatus {
     NoSpace,
     FileTooLarge,
 }
-
+impl From<DriverStatus> for FileStatus {
+    fn from(failure: DriverStatus) -> Self {
+        FileStatus::DriverError(failure)
+    }
+}
 impl FileStatus {
-    pub fn to_str(&self) -> &str {
+    pub fn to_str(&self) -> String {
         match self {
-            FileStatus::Success => "Success",
-            FileStatus::FileAlreadyExist => "File already exists",
-            FileStatus::PathNotFound => "Path not found",
-            FileStatus::UnknownFail => "The operation failed for an unknown reason",
-            FileStatus::NotFat => "The partition is unformatted or not supported",
-            FileStatus::DriveNotFound => "The drive specified doesn't exist",
-            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
-            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt",
-            FileStatus::InternalError => "Internal error",
-            FileStatus::BadPath => "Invalid path",
-            FileStatus::AccessDenied => "Insufficient permissions to access the current file",
-            FileStatus::NoSpace => "Insufficient space on drive to write the requested data",
-            FileStatus::FileTooLarge => "The op would cause the file to exceed the max file size",
+            FileStatus::Success => "Success".into(),
+            FileStatus::FileAlreadyExist => "File already exists".into(),
+            FileStatus::PathNotFound => "Path not found".into(),
+            FileStatus::UnknownFail => "The operation failed for an unknown reason".into(),
+            FileStatus::NoBuffer => {
+                "The file system recived the request but there was no buffer passed with it".into()
+            }
+            FileStatus::BufferError(e) => format!("{e:#?}"),
+            FileStatus::DriverError(e) => format!("{e:#?}"),
+            FileStatus::FileSystemError => "The file system encountered an internal error".into(),
+            FileStatus::NotFat => "The partition is unformatted or not supported".into(),
+            FileStatus::DriveNotFound => "The drive specified doesn't exist".into(),
+            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create".into(),
+            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt".into(),
+            FileStatus::InternalError => "Internal error".into(),
+            FileStatus::BadPath => "Invalid path".into(),
+            FileStatus::AccessDenied => {
+                "Insufficient permissions to access the current file".into()
+            }
+            FileStatus::NoSpace => "Insufficient space on drive to write the requested data".into(),
+            FileStatus::FileTooLarge => {
+                "The op would cause the file to exceed the max file size".into()
+            }
         }
     }
 }
@@ -282,7 +298,7 @@ impl PartialEq for FileStatus {
         self.to_str() == other.to_str()
     }
 }
-
+// TODO: move this to a better place
 #[derive(Debug)]
 #[repr(C)]
 pub enum RegError {
@@ -300,13 +316,18 @@ impl From<FileStatus> for RegError {
         RegError::FileIO { status }
     }
 }
-#[derive(Debug, Clone, Encode, Decode, PartialEq)]
-#[repr(u32)]
+#[derive(Clone, PartialEq, prost::Oneof)]
 pub enum Data {
+    #[prost(uint32, tag = "1")]
     U32(u32),
+    #[prost(uint64, tag = "2")]
     U64(u64),
+    #[prost(sint32, tag = "3")]
     I32(i32),
+    #[prost(sint64, tag = "4")]
     I64(i64),
+    #[prost(bool, tag = "5")]
     Bool(bool),
+    #[prost(string, tag = "6")]
     Str(String),
 }

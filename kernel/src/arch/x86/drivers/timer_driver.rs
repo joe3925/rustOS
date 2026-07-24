@@ -5,7 +5,7 @@ use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 
 use super::super::idt::NestedInterruptEnableGuard;
 use super::interrupt_index::{
-    current_cpu_id, current_is_in_interrupt_atomic, send_eoi_timer, APIC_TICKS_PER_NS,
+    APIC_TICKS_PER_NS, current_cpu_id, current_is_in_interrupt_atomic, send_eoi_timer,
 };
 use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
 use crate::scheduling::state::State;
@@ -34,7 +34,7 @@ pub struct TimerDebug {
     pub claimed: bool,
     pub did_sched: bool,
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;

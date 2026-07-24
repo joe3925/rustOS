@@ -1,15 +1,15 @@
+use crate::println;
 use core::sync::atomic::{AtomicU8, Ordering};
-use spin::Lazy;
-
 use kernel_types::{
     dma::{FromDevice, IoBuffer, ToDevice},
     fs::{Path, *},
     status::{DriverStatus, FileStatus},
 };
+use spin::Lazy;
 
 use crate::{
     drivers::drive::vfs::Vfs, file_system::bootstrap_filesystem::BootstrapProvider,
-    util::take_boot_packages,
+    static_handlers::print, util::take_boot_packages,
 };
 
 #[repr(u8)]
@@ -122,14 +122,12 @@ impl Provider {
                 let mut bytes = alloc::vec![0; buffer.len()];
                 let (result, status) = BOOTSTRAP_PROVIDER.read_at_sync(file_id, offset, &mut bytes);
                 if result.error.is_none()
-                    && buffer
-                        .copy_from_slice(0, &bytes[..result.bytes_read])
-                        .is_err()
+                    && let Err(e) = buffer.copy_from_slice(0, &bytes[..result.bytes_read])
                 {
                     return (
                         FsReadResult {
                             bytes_read: 0,
-                            error: Some(FileStatus::UnknownFail),
+                            error: Some(FileStatus::BufferError(e)),
                         },
                         DriverStatus::InvalidParameter,
                     );
@@ -158,11 +156,11 @@ impl Provider {
         match self {
             Provider::Bootstrap => bootstrap(|| {
                 let mut bytes = alloc::vec![0; buffer.len()];
-                if buffer.copy_to_slice(0, &mut bytes).is_err() {
+                if let Err(e) = buffer.copy_to_slice(0, &mut bytes) {
                     return (
                         FsWriteResult {
                             written: 0,
-                            error: Some(FileStatus::UnknownFail),
+                            error: Some(FileStatus::BufferError(e)),
                         },
                         DriverStatus::InvalidParameter,
                     );
@@ -243,12 +241,17 @@ impl Provider {
             Provider::Bootstrap => {
                 bootstrap(|| BOOTSTRAP_PROVIDER.remove_dir_path_sync(&path.to_string()))
             }
-            Provider::Vfs => (
-                FsCreateResult {
-                    error: Some(FileStatus::UnknownFail),
-                },
-                DriverStatus::Success,
-            ),
+            Provider::Vfs => {
+                // TODO: add a vfs remove dir path path
+                todo!("");
+
+                (
+                    FsCreateResult {
+                        error: Some(FileStatus::UnknownFail),
+                    },
+                    DriverStatus::Success,
+                )
+            }
         }
     }
 
@@ -273,12 +276,16 @@ impl Provider {
             Provider::Bootstrap => {
                 bootstrap(|| BOOTSTRAP_PROVIDER.delete_path_sync(&path.to_string()))
             }
-            Provider::Vfs => (
-                FsCreateResult {
-                    error: Some(FileStatus::UnknownFail),
-                },
-                DriverStatus::Success,
-            ),
+            Provider::Vfs => {
+                // TODO: add a vfs delete path
+                todo!("");
+                (
+                    FsCreateResult {
+                        error: Some(FileStatus::UnknownFail),
+                    },
+                    DriverStatus::Success,
+                )
+            }
         }
     }
 
@@ -305,12 +312,12 @@ impl Provider {
         match self {
             Provider::Bootstrap => bootstrap(|| {
                 let mut bytes = alloc::vec![0; buffer.len()];
-                if buffer.copy_to_slice(0, &mut bytes).is_err() {
+                if let Err(e) = buffer.copy_to_slice(0, &mut bytes) {
                     return (
                         FsAppendResult {
                             written: 0,
                             new_size: 0,
-                            error: Some(FileStatus::UnknownFail),
+                            error: Some(FileStatus::BufferError(e)),
                         },
                         DriverStatus::InvalidParameter,
                     );

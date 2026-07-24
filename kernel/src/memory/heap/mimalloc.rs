@@ -1,6 +1,6 @@
 use crate::memory::heap::{
-    mimalloc_arena_size, mimalloc_heap_end, MIMALLOC_ARENA_START, MIMALLOC_HEAP_START,
-    MIMALLOC_OS_HEAP_SIZE,
+    MIMALLOC_ARENA_START, MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE, mimalloc_arena_size,
+    mimalloc_heap_end,
 };
 use crate::memory::paging::{
     align_up_to_base_page, base_page_size, map_fresh_kernel_range_no_flush, unmap_range_unchecked,
@@ -574,7 +574,7 @@ pub fn init_mimalloc_diagnostics() {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
     let start_cycles = mimalloc_stats_start();
 
@@ -678,7 +678,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -> bool {
     if addr.is_null() || size == 0 {
         return true;
@@ -766,7 +766,7 @@ fn mimalloc_record_commit_cycles(start: u64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void {
     let ptr = platform::with_interrupts_disabled(|| {
         MIMALLOC_OS_ALLOCATOR
@@ -786,7 +786,7 @@ pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *m
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
     if !addr.is_null() {
         platform::with_interrupts_disabled(|| {
@@ -795,7 +795,7 @@ pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
     let bytes = boot_info()
         .memory_regions
@@ -808,7 +808,7 @@ pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
     (bytes / 1024).min(usize::MAX as u128) as usize
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rustos_mi_clock_now() -> u64 {
     let cycles = platform::cycle_counter();
     let hz = platform::cycle_counter_frequency_hz();
@@ -819,7 +819,7 @@ pub extern "C" fn rustos_mi_clock_now() -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> bool {
     if buf.is_null() {
         return false;
@@ -836,10 +836,10 @@ pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> b
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rustos_mi_thread_yield() {
     if platform::interrupts_enabled() {
         platform::enable_interrupts_and_halt();

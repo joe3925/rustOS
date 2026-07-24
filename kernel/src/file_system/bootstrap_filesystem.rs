@@ -6,7 +6,7 @@ use alloc::{
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::util::BootPkg;
+use crate::{println, util::BootPkg};
 use kernel_types::{
     fs::*,
     status::{DriverStatus, FileStatus},
@@ -300,7 +300,12 @@ impl BootstrapProvider {
                 v[offset as usize..offset as usize + data.len()].copy_from_slice(data);
                 Ok(data.len() as u32)
             }
-            DataRef::Boot(_) => Err(FileStatus::UnknownFail),
+
+            DataRef::Boot(_) => {
+                println!("DataRef::Boot(_)");
+
+                Err(FileStatus::UnknownFail)
+            }
             DataRef::Alias(_t) => Ok(data.len() as u32),
         }
     }
@@ -656,6 +661,7 @@ impl BootstrapProvider {
     }
 
     pub(crate) fn remove_dir_path_sync(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
+        println!("remove_dir_path_sync");
         (
             FsCreateResult {
                 error: Some(FileStatus::UnknownFail),
@@ -848,12 +854,15 @@ impl BootstrapProvider {
                 },
                 DriverStatus::Success,
             ),
-            None => (
-                FsSetLenResult {
-                    error: Some(FileStatus::UnknownFail),
-                },
-                DriverStatus::Success,
-            ),
+            None => {
+                println!("set_len_sync: node not found");
+                (
+                    FsSetLenResult {
+                        error: Some(FileStatus::UnknownFail),
+                    },
+                    DriverStatus::Success,
+                )
+            }
         }
     }
 
@@ -927,14 +936,17 @@ impl BootstrapProvider {
                 },
                 DriverStatus::Success,
             ),
-            None => (
-                FsAppendResult {
-                    written: 0,
-                    new_size: 0,
-                    error: Some(FileStatus::UnknownFail),
-                },
-                DriverStatus::Success,
-            ),
+            None => {
+                println!("append_sync: node not found");
+                (
+                    FsAppendResult {
+                        written: 0,
+                        new_size: 0,
+                        error: Some(FileStatus::UnknownFail),
+                    },
+                    DriverStatus::Success,
+                )
+            }
         }
     }
 
@@ -1011,12 +1023,15 @@ impl BootstrapProvider {
                 },
                 DriverStatus::Success,
             ),
-            None => (
-                FsZeroRangeResult {
-                    error: Some(FileStatus::UnknownFail),
-                },
-                DriverStatus::Success,
-            ),
+            None => {
+                println!("zero_range_sync: node not found");
+                (
+                    FsZeroRangeResult {
+                        error: Some(FileStatus::UnknownFail),
+                    },
+                    DriverStatus::Success,
+                )
+            }
         }
     }
 }

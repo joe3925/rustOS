@@ -592,7 +592,9 @@ impl IoRequestTable {
 }
 
 fn file_status(status: FileStatus) -> u64 {
-    IO_STATUS_FILE_ERROR_BASE | status as u64
+    todo!("fix this");
+    // TODO: fix this IMPORTANT
+    IO_STATUS_FILE_ERROR_BASE | 0 //(status as u64)
 }
 
 #[inline(always)]

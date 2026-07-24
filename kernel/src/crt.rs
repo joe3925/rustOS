@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 use core::ptr;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static mut _tls_index: u32 = 0;
 
 #[repr(C)]
@@ -22,30 +22,30 @@ struct TlsCallback(*const c_void);
 unsafe impl Sync for TlsCallback {}
 
 #[used]
-#[no_mangle]
+#[unsafe(no_mangle)]
 // Rust emits COFF TLS data into .tls$; exact .tls sorts before it and becomes
 // the base used by the compiler's SECREL32 TLS offsets.
-#[link_section = ".tls"]
+#[unsafe(link_section = ".tls")]
 static mut _tls_start: usize = 0;
 
 #[used]
-#[no_mangle]
-#[link_section = ".tls$ZZZ"]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".tls$ZZZ")]
 static mut _tls_end: usize = 0;
 
 #[used]
-#[no_mangle]
-#[link_section = ".CRT$XLA"]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".CRT$XLA")]
 static __xl_a: TlsCallback = TlsCallback(ptr::null());
 
 #[used]
-#[no_mangle]
-#[link_section = ".CRT$XLZ"]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".CRT$XLZ")]
 static __xl_z: TlsCallback = TlsCallback(ptr::null());
 
 #[used]
-#[no_mangle]
-#[link_section = ".rdata$T"]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".rdata$T")]
 static _tls_used: ImageTlsDirectory64 = ImageTlsDirectory64 {
     start_address_of_raw_data: ptr::addr_of!(_tls_start).cast(),
     end_address_of_raw_data: ptr::addr_of!(_tls_end).cast(),
@@ -55,7 +55,7 @@ static _tls_used: ImageTlsDirectory64 = ImageTlsDirectory64 {
     characteristics: 0,
 };
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn strlen(string: *const u8) -> usize {
     let mut len = 0;
 

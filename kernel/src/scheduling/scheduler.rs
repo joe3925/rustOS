@@ -719,7 +719,7 @@ impl Scheduler {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
@@ -738,7 +738,7 @@ pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
     unsafe { SCHEDULER.on_ipi(state, cpu_id) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
@@ -756,7 +756,7 @@ pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
     unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ipi_eoi_only() {
     platform::end_interrupt(platform::scheduler_ipi_vector());
 }

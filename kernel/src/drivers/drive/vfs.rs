@@ -226,7 +226,7 @@ impl Vfs {
                         fs_file_id: 0,
                         is_dir: false,
                         size: 0,
-                        error: Some(FileStatus::UnknownFail),
+                        error: Some(st.into()),
                     },
                     st,
                 ),
@@ -252,7 +252,7 @@ impl Vfs {
                                 fs_file_id: 0,
                                 is_dir: false,
                                 size: 0,
-                                error: Some(FileStatus::UnknownFail),
+                                error: Some(st.into()),
                             },
                             st,
                         );
@@ -341,7 +341,7 @@ impl Vfs {
                                     fs_file_id: 0,
                                     is_dir: false,
                                     size: 0,
-                                    error: Some(FileStatus::UnknownFail),
+                                    error: Some(st.into()),
                                 },
                                 st,
                             );
@@ -443,7 +443,7 @@ impl Vfs {
             }
             Err(st) => (
                 FsCloseResult {
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -459,7 +459,7 @@ impl Vfs {
             return (
                 FsReadResult {
                     bytes_read: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(FileStatus::NoBuffer),
                 },
                 DriverStatus::InvalidParameter,
             );
@@ -497,7 +497,7 @@ impl Vfs {
             Err(st) => (
                 FsReadResult {
                     bytes_read: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -513,7 +513,7 @@ impl Vfs {
             return (
                 FsWriteResult {
                     written: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(FileStatus::NoBuffer),
                 },
                 DriverStatus::InvalidParameter,
             );
@@ -551,7 +551,7 @@ impl Vfs {
             Err(st) => (
                 FsWriteResult {
                     written: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -591,7 +591,7 @@ impl Vfs {
             Err(st) => (
                 FsSeekResult {
                     pos: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -619,7 +619,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsFlushResult {
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -653,7 +653,7 @@ impl Vfs {
                     size: 0,
                     is_dir: false,
                     attrs: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -673,7 +673,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsCreateResult {
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -692,7 +692,7 @@ impl Vfs {
         if src_symlink != dst_symlink {
             return (
                 FsRenameResult {
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(FileStatus::NoBuffer),
                 },
                 DriverStatus::Success,
             );
@@ -706,7 +706,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsRenameResult {
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -735,7 +735,7 @@ impl Vfs {
             Err(st) => (
                 FsListDirResult {
                     names: None,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -763,7 +763,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsSetLenResult {
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -779,7 +779,7 @@ impl Vfs {
                 FsAppendResult {
                     written: 0,
                     new_size: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(FileStatus::NoBuffer),
                 },
                 DriverStatus::InvalidParameter,
             );
@@ -811,7 +811,7 @@ impl Vfs {
                 FsAppendResult {
                     written: 0,
                     new_size: 0,
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(st.into()),
                 },
                 st,
             ),
@@ -839,7 +839,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsZeroRangeResult {
-                    error: Some(FileStatus::UnknownFail),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),

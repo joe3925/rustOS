@@ -4,10 +4,10 @@ use crate::benchmarking::BenchWindow;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::executable::program::{Program, PROGRAM_MANAGER};
+use crate::executable::program::{PROGRAM_MANAGER, Program};
 use crate::exports::EXPORTS;
 use crate::file_system::file_provider::{
-    initialize_bootstrap_provider, install_file_provider, ProviderKind,
+    ProviderKind, initialize_bootstrap_provider, install_file_provider,
 };
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
@@ -16,7 +16,7 @@ use crate::memory::heap::{heap_capacity_bytes, init_heap};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::memory::paging::{
-    boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked, KernelFrameAllocator,
+    KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked,
 };
 use crate::platform::{current_cpu_id, cycle_counter};
 use crate::scheduling::runtime::runtime::init_executor_platform;
@@ -25,8 +25,8 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::{
-    println, ActiveBootInfo, BOOT_FRAMEBUFFER, BOOT_FRAMEBUFFER_AVAILABLE, BOOT_FRAMEBUFFER_TAKEN,
-    BOOT_INFO, BOOT_INFO_INITIALIZED,
+    ActiveBootInfo, BOOT_FRAMEBUFFER, BOOT_FRAMEBUFFER_AVAILABLE, BOOT_FRAMEBUFFER_TAKEN,
+    BOOT_INFO, BOOT_INFO_INITIALIZED, println,
 };
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -181,6 +181,9 @@ pub extern "C" fn kernel_main(ctx: usize) {
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
+        crate::registry::init()
+            .await
+            .expect("Failed to init registry");
         let _ = install_prepacked_drivers().await;
         // BOOT_WINDOW.start();
         let _ = PNP_MANAGER.init_from_registry().await;
@@ -194,7 +197,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
 fn halt_loop() -> ! {
     crate::platform::halt()
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
         halt_loop()
@@ -283,13 +286,13 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(unconditional_recursion)]
 pub extern "C" fn trigger_stack_overflow() {
     trigger_stack_overflow();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn trigger_triple_fault() -> ! {
     crate::platform::disable_interrupts();

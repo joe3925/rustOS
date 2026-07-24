@@ -146,7 +146,7 @@ pub struct FsReadParams<'a> {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, kernel_macros::RequestPayload)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsReadResult {
     pub bytes_read: usize,
     pub error: Option<FileStatus>,
@@ -277,7 +277,7 @@ pub struct FsAppendParams<'a> {
     pub write_through: bool,
 }
 #[repr(C)]
-#[derive(Debug, Clone, Copy, kernel_macros::RequestPayload)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsAppendResult {
     pub written: usize,
     pub new_size: u64,

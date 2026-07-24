@@ -5,8 +5,8 @@ use crate::benchmarking::bench_runtime_executor_async;
 use crate::benchmarking::used_memory;
 use crate::benchmarking::yield_once;
 
-use crate::benchmarking::bench_c_drive_io;
 use crate::benchmarking::BenchWindow;
+use crate::benchmarking::bench_c_drive_io;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::static_handlers::print;
 use crate::util::trigger_triple_fault;
@@ -19,20 +19,18 @@ use core::time::Duration;
 use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::{
-    dma::{
-        FromDevice, IoBuffer, ToDevice,
-    },
+    dma::{FromDevice, IoBuffer, ToDevice},
     fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
 };
 use rand_core::block;
 
 use crate::file_system::file_provider::provider;
-use kernel_executor::runtime::runtime::{spawn, JoinAll};
+use kernel_executor::runtime::runtime::{JoinAll, spawn};
 
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
-    file_system::file_provider::{self, install_file_provider, ProviderKind},
+    file_system::file_provider::{self, ProviderKind, install_file_provider},
     memory::paging::used_bytes,
     platform::wait_duration,
     println,
@@ -113,7 +111,7 @@ impl File {
             .open_path(path, flags, write_through)
             .await;
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         if let Some(e) = res.error {
             return Err(e);
@@ -130,7 +128,7 @@ impl File {
     pub async fn delete(&mut self) -> Result<(), FileStatus> {
         let (r, st) = file_provider::provider().delete_path(&self.path).await;
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match r.error {
             None => Ok(()),
@@ -141,7 +139,7 @@ impl File {
     pub async fn list_dir(path: &Path) -> Result<Vec<String>, FileStatus> {
         let (r, st) = file_provider::provider().list_dir_path(path).await;
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match &r.names {
             Some(names) => Ok(names.clone()),
@@ -152,7 +150,7 @@ impl File {
     pub async fn remove_dir(path: &Path) -> Result<(), FileStatus> {
         let (r, st) = file_provider::provider().remove_dir_path(path).await;
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match r.error {
             None => Ok(()),
@@ -179,7 +177,7 @@ impl File {
 
             let (r, st) = file_provider::provider().make_dir_path(&cur_path).await;
             if st != DriverStatus::Success {
-                return Err(FileStatus::UnknownFail);
+                return Err(FileStatus::DriverError(st));
             }
 
             if let Some(e) = r.error {
@@ -220,7 +218,7 @@ impl File {
             .await;
 
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match res.error {
             None => Ok(res.bytes_read),
@@ -252,7 +250,7 @@ impl File {
             .write_iobuffer_at(self.fs_file_id, offset, buffer, self.write_through)
             .await;
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match wr.error {
             None => {
@@ -270,7 +268,7 @@ impl File {
     pub async fn move_no_copy(&self, dst: &Path) -> Result<(), FileStatus> {
         let (r, st) = file_provider::provider().rename_path(&self.path, dst).await;
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match r.error {
             None => Ok(()),
@@ -287,7 +285,7 @@ impl File {
             .await;
 
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         if let Some(e) = res.error {
             return Err(e);
@@ -301,7 +299,7 @@ impl File {
             .await;
 
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match res.error {
             None => Ok(()),
@@ -318,7 +316,7 @@ impl File {
         let (res, st) = file_provider::provider().close_handle(id).await;
 
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match res.error {
             None => Ok(()),
@@ -336,7 +334,7 @@ impl File {
             .await;
 
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         if let Some(e) = res.error {
             return Err(e);
@@ -371,7 +369,7 @@ impl File {
             .await;
 
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         if let Some(e) = res.error {
             return Err(e);
@@ -389,7 +387,7 @@ impl File {
             .await;
 
         if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::DriverError(st));
         }
         match res.error {
             None => Ok(()),
