@@ -10,6 +10,7 @@
           "third_party/rust-fatfs/Cargo.toml",
           "third_party/aarch64-bootloader/bootloader/Cargo.toml",
           "third_party/aarch64-bootloader/bootloader-api/Cargo.toml",
+          "third_party/aarch64-vmsa/Cargo.toml",
           "libs/kernel_macros/Cargo.toml",
           "Cargo.toml",
         ],
