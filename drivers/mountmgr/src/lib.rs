@@ -15,18 +15,20 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use kernel_api::{
-    device::{open_public_protocol, DevNode, DeviceInit, DeviceObject, DriverObject},
-    fs::{notify_label_published, notify_label_unpublished, FsOpenParams},
+    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY, IOCTL_MOUNTMGR_RESYNC,
+    IOCTL_MOUNTMGR_UNMOUNT,
+    device::{DevNode, DeviceInit, DeviceObject, DriverObject, open_public_protocol},
+    fs::{FsOpenParams, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
         io::{DeviceControlHandler, DeviceControlOp},
         pnp::DeviceEvent,
-        protocol::volmgr::VolmgrProtocol,
+        protocol::volmgr::VolumeProtocol,
         request::IoctlData,
     },
     pnp::{
-        io, pnp_add_class_listener, pnp_create_control_device_and_link,
-        pnp_create_device_symlink_top, pnp_create_symlink, pnp_remove_symlink, DriverStep,
+        DriverStep, io, pnp_add_class_listener, pnp_create_control_device_and_link,
+        pnp_create_device_symlink_top, pnp_create_symlink, pnp_remove_symlink,
     },
     reg::{self, switch_to_vfs_async},
     request::{DeviceControl, Fs, FsOpen, FsPayload},
@@ -34,8 +36,6 @@ use kernel_api::{
     runtime::spawn_detached,
     status::{Data, DriverStatus, RegError},
     util::panic_common,
-    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY, IOCTL_MOUNTMGR_RESYNC,
-    IOCTL_MOUNTMGR_UNMOUNT,
 };
 use spin::RwLock;
 
@@ -66,10 +66,7 @@ struct MountMgrControl;
 
 impl DeviceControlHandler for MountMgrControl {
     #[request_handler]
-    async fn handler(
-        _device: &Arc<DeviceObject>,
-        request: &mut DeviceControl<'_>,
-    ) -> DriverStep {
+    async fn handler(_device: &Arc<DeviceObject>, request: &mut DeviceControl<'_>) -> DriverStep {
         match request.code {
             IOCTL_MOUNTMGR_QUERY => {
                 request.set_data(IoctlData::from_t::<Vec<u8>>(status_blob()));
@@ -89,11 +86,7 @@ impl DeviceControlHandler for MountMgrControl {
     }
 }
 
-extern "C" fn volume_event(
-    node: Arc<DevNode>,
-    event: DeviceEvent,
-    _listener: &Arc<DeviceObject>,
-) {
+extern "C" fn volume_event(node: Arc<DevNode>, event: DeviceEvent, _listener: &Arc<DeviceObject>) {
     spawn_detached(async move {
         match event {
             DeviceEvent::Started => handle_started(node).await,
@@ -120,7 +113,7 @@ async fn handle_started(node: Arc<DevNode>) {
     if MOUNTED.read().contains_key(&node.instance_path) {
         return;
     }
-    let protocol = match open_public_protocol::<VolmgrProtocol>(&node) {
+    let protocol = match open_public_protocol::<VolumeProtocol>(&node) {
         Ok(protocol) => protocol,
         Err(_) => return,
     };
@@ -294,12 +287,7 @@ async fn read_preferred_label(stable_id: &str) -> Option<String> {
 
 async fn write_preferred_label(stable_id: &str, label: &str) -> Result<(), RegError> {
     let _ = reg::create_key(DRIVE_LETTERS_KEY).await;
-    reg::set_value(
-        DRIVE_LETTERS_KEY,
-        stable_id,
-        Data::Str(label.to_string()),
-    )
-    .await
+    reg::set_value(DRIVE_LETTERS_KEY, stable_id, Data::Str(label.to_string())).await
 }
 
 fn find_free_label(allow_c: bool) -> Option<String> {
@@ -363,5 +351,9 @@ fn filesystem_blob() -> Vec<u8> {
         .values()
         .map(|volume| volume.filesystem_service.clone())
         .collect();
-    services.into_iter().collect::<Vec<_>>().join("\n").into_bytes()
+    services
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
 }

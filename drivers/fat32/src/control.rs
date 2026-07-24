@@ -4,18 +4,18 @@ use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::{Error, FileSystem, FsOptions, IoKind, Read};
 use kernel_api::{
     device::{
-        open_protocol_to_next_lower, open_public_protocol, DevExtRef, DeviceInit, DeviceObject,
-        DriverObject, ProtocolHandle,
+        DevExtRef, DeviceInit, DeviceObject, DriverObject, ProtocolHandle,
+        open_protocol_to_next_lower, open_public_protocol,
     },
     kernel_types::{
         async_ffi::{FfiFuture, FutureExt},
         async_types::AsyncMutex,
         pnp::{ProbeContext, ProbeOutcome},
-        protocol::volmgr::VolmgrProtocol,
+        protocol::volmgr::VolumeProtocol,
     },
     pnp::{
-        driver_set_evt_device_add, driver_set_evt_probe_device, DriverStep, PnpOp, PnpOps,
-        RemoveDevice, StartDevice,
+        DriverStep, PnpOp, PnpOps, RemoveDevice, StartDevice, driver_set_evt_device_add,
+        driver_set_evt_probe_device,
     },
     request_handler,
     status::DriverStatus,
@@ -23,21 +23,20 @@ use kernel_api::{
 use spin::Mutex;
 
 use crate::{
-    block_dev::{flush, BlockDev},
+    block_dev::{BlockDev, flush},
     volume::{
-        Fat32Fs, FileHandleTable, MountedFat32, VolCtrlDevExt, FILE_HANDLE_CAPACITY,
-        METADATA_OWNER_ID,
+        FILE_HANDLE_CAPACITY, Fat32Fs, FileHandleTable, METADATA_OWNER_ID, MountedFat32,
+        VolCtrlDevExt,
     },
 };
 
 #[inline]
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
-    dev.try_devext().expect("failed to get FAT32 device extension")
+    dev.try_devext()
+        .expect("failed to get FAT32 device extension")
 }
 
-fn volume_geometry(
-    protocol: &ProtocolHandle<VolmgrProtocol>,
-) -> Result<(u16, u64), DriverStatus> {
+fn volume_geometry(protocol: &ProtocolHandle<VolumeProtocol>) -> Result<(u16, u64), DriverStatus> {
     let info = (protocol.partition_info)(protocol.provider())?;
     let entry = info.gpt_entry.ok_or(DriverStatus::InvalidParameter)?;
     let sector_size = if info.disk.logical_block_size == 0 {
@@ -59,7 +58,7 @@ extern "C" fn fat32_probe(
 ) -> FfiFuture<ProbeOutcome> {
     let context = context.clone();
     async move {
-        let protocol = match open_public_protocol::<VolmgrProtocol>(&context.devnode) {
+        let protocol = match open_public_protocol::<VolumeProtocol>(&context.devnode) {
             Ok(protocol) => protocol,
             Err(status) => return ProbeOutcome::Error(status),
         };
@@ -136,7 +135,7 @@ async fn fat32_start(
     _op: PnpOp,
     _request: &mut StartDevice,
 ) -> DriverStep {
-    let protocol = match open_protocol_to_next_lower::<VolmgrProtocol>(device) {
+    let protocol = match open_protocol_to_next_lower::<VolumeProtocol>(device) {
         Ok(protocol) => protocol,
         Err(status) => return DriverStep::complete(status),
     };
