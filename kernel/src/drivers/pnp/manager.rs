@@ -24,7 +24,7 @@ use kernel_types::pnp::{
     BootType, DeviceEvent, DeviceIds, DeviceRelationType, DriverRole, DriverStep, InitComplete,
     ProbeContext, ProbeOutcome, QueryDeviceRelations, RemoveDevice, StartDevice,
 };
-use kernel_types::protocol::volmgr::VolmgrProtocol;
+use kernel_types::protocol::volmgr::VolumeProtocol;
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassEventCallback;
 use spin::{Mutex, RwLock};
@@ -365,7 +365,7 @@ impl PnpManager {
             None => Ok(Some(package)),
         }
     }
-
+    // TODO: this impl is temporary, I plan to change this so that pnp management doesn't know about the volume protocol maybe doesn't even special case the volume device
     async fn filesystem_hint(dn: &Arc<DevNode>) -> Option<String> {
         if !dn
             .class
@@ -374,7 +374,7 @@ impl PnpManager {
         {
             return None;
         }
-        let protocol = open_public_protocol::<VolmgrProtocol>(dn).ok()?;
+        let protocol = open_public_protocol::<VolumeProtocol>(dn).ok()?;
         let info = (protocol.partition_info)(protocol.provider()).ok()?;
         let guid = info.gpt_entry?.unique_partition_guid;
         if guid.iter().all(|byte| *byte == 0) {

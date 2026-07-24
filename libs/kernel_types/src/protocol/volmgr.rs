@@ -1,18 +1,18 @@
-use alloc::sync::Arc;
 use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
 use crate::io::PartitionInfo;
 use crate::status::DriverStatus;
+use alloc::sync::Arc;
 
 #[repr(C)]
-pub struct VolmgrProtocolVTable {
+pub struct VolumeProtocolVTable {
     pub partition_info: extern "C" fn(&Arc<DeviceObject>) -> Result<PartitionInfo, DriverStatus>,
 }
 
-pub enum VolmgrProtocol {}
+pub enum VolumeProtocol {}
 
-unsafe impl Protocol for VolmgrProtocol {
+unsafe impl Protocol for VolumeProtocol {
     const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000003);
     const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 
-    type VTable = VolmgrProtocolVTable;
+    type VTable = VolumeProtocolVTable;
 }

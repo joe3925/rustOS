@@ -48,7 +48,7 @@ mod sync_platform;
 mod syscalls;
 mod util;
 
-use crate::util::{panic_common, KERNEL_INITIALIZED};
+use crate::util::{KERNEL_INITIALIZED, panic_common};
 
 use alloc::{format, vec};
 use core::mem::MaybeUninit;
@@ -57,9 +57,8 @@ use core::ptr::{addr_of_mut, copy_nonoverlapping};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_abi::{
     BootInfo, FrameBuffer, KernelSection, KernelSections, KernelSymbol, KernelSymbolString,
-    KernelSymbols, MemoryRegion, MemoryRegions, Optional, MAX_BOOT_MEMORY_REGIONS,
-    MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS, MAX_KERNEL_SECTIONS,
-    MAX_KERNEL_SYMBOL_STRING_BYTES,
+    KernelSymbols, MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
+    MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, MemoryRegion, MemoryRegions, Optional,
 };
 use kernel_abi::{RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION};
 use lazy_static::lazy_static;
@@ -92,7 +91,7 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 fn panic(info: &PanicInfo) -> ! {
     panic_common(MOD_NAME, info)
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_pe_entry(boot_info: *const ActiveBootInfo) -> ! {
     if boot_info.is_null() {
         panic!("kernel_pe_entry received a null boot info pointer");

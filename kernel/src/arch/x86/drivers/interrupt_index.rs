@@ -4,12 +4,12 @@ use super::super::gdt::PER_CPU_GDT;
 use super::super::idt::load_idt;
 use super::super::syscalls::syscall::syscall_init;
 use super::timer_driver::set_num_cores;
+use crate::KERNEL_INITIALIZED;
 use crate::machine::MachineInterruptInfo;
-use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
+use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu_vec::PerCpuVec;
-use crate::util::{boot_info, CORE_LOCK, CPU_ID, INIT_LOCK};
-use crate::KERNEL_INITIALIZED;
+use crate::util::{CORE_LOCK, CPU_ID, INIT_LOCK, boot_info};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -24,8 +24,8 @@ use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::sgdt;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{PageTableFlags, PhysFrame};
 use x86_64::structures::DescriptorTablePointer;
+use x86_64::structures::paging::{PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
 
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
@@ -93,7 +93,7 @@ fn unmap_range(addr: VirtAddr, size: u64) {
     unsafe { crate::memory::paging::unmap_range(addr.into(), size) };
 }
 
-extern "C" {
+unsafe extern "C" {
     static trampoline: u8;
     static trampoline_end: u8;
 }

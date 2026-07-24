@@ -4,7 +4,7 @@ use crate::scheduling::scheduler::{ipi_eoi_only, ipi_handler_c, kernel_task_end,
 use crate::scheduling::task::{IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
 
 #[unsafe(naked)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ipi_entry() {
     naked_asm!(
         "/* {upper} {lower} {eoi_only} */",

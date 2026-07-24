@@ -24,14 +24,6 @@ use kernel_api::kernel_types::pci::BarKind;
 
 use kernel_api::kernel_types::protocol::pci::PciProtocol;
 
-use kernel_api::memory::map_mmio_region;
-use kernel_api::pnp::InitComplete;
-use kernel_api::pnp::QueryDeviceRelations;
-use kernel_api::pnp::QueryId;
-use kernel_api::pnp::RegisterDmaBacking;
-use kernel_api::pnp::RemoveDevice;
-use kernel_api::pnp::StartDevice;
-use kernel_api::pnp::io::send_next_lower;
 use alloc::{sync::Arc, vec, vec::Vec};
 use blk::{BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP};
 use core::cell::UnsafeCell;
@@ -56,11 +48,19 @@ use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
 };
-use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
 use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
+use kernel_api::memory::map_mmio_region;
 use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::RegisterDmaBacking;
+use kernel_api::pnp::RemoveDevice;
+use kernel_api::pnp::StartDevice;
+use kernel_api::pnp::io::send_next_lower;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources,
     driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
@@ -265,7 +265,7 @@ fn continue_req<K>(_req: &mut K) -> DriverStep {
     DriverStep::Continue
 }
 
-pub(crate) fn virtio_device_error(message: impl Into<alloc::string::String>) -> DriverStatus {
+pub(crate) fn virtio_device_error(message: &'static str) -> DriverStatus {
     DriverStatus::DeviceError {
         message: message.into(),
     }
@@ -274,15 +274,10 @@ pub(crate) fn virtio_device_error(message: impl Into<alloc::string::String>) -> 
 pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
     match status {
         VIRTIO_BLK_S_OK => DriverStatus::Success,
-        VIRTIO_BLK_S_IOERR => virtio_device_error(alloc::format!(
-            "virtio-blk: {operation} failed: device reported I/O error"
-        )),
-        VIRTIO_BLK_S_UNSUPP => virtio_device_error(alloc::format!(
-            "virtio-blk: {operation} failed: request unsupported by device"
-        )),
-        other => virtio_device_error(alloc::format!(
-            "virtio-blk: {operation} failed: unknown device status {other:#x}"
-        )),
+        // TODO: FIX THIS IMPORTANT
+        VIRTIO_BLK_S_IOERR => todo!(),
+        VIRTIO_BLK_S_UNSUPP => todo!(),
+        other => todo!(),
     }
 }
 
@@ -403,10 +398,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     _op: PnpOp,
     req: &'b mut InitComplete,
 ) -> DriverStep {
-    let proto = match open_protocol_to_next_lower::<
-        PciProtocol,
-    >(dev)
-    {
+    let proto = match open_protocol_to_next_lower::<PciProtocol>(dev) {
         Ok(p) => p,
         Err(e) => {
             println!("virtio-blk: no PCI protocol on parent");
@@ -419,14 +411,9 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     let mut mapped_bars = alloc::vec::Vec::new();
     for i in 0..6 {
         if let Some(bar) = (proto.get_bar)(&proto.provider(), i) {
-            if bar.kind == BarKind::Mem32
-                || bar.kind == BarKind::Mem64
-            {
+            if bar.kind == BarKind::Mem32 || bar.kind == BarKind::Mem64 {
                 if bar.size > 0 {
-                    if let Ok(va) = map_mmio_region(
-                        PhysAddr::new(bar.base),
-                        bar.size,
-                    ) {
+                    if let Ok(va) = map_mmio_region(PhysAddr::new(bar.base), bar.size) {
                         mapped_bars.push((i as u32, va, bar.size));
                     }
                 }
@@ -497,12 +484,13 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unsafe { unmap_mmio_region(va, sz) };
             }
-            return complete_req(
-                req,
-                virtio_device_error(alloc::format!(
-                    "virtio-blk: device init / feature negotiation failed: {message}"
-                )),
-            );
+            todo!("fix this");
+            // return complete_req(
+            //     req,
+            //     virtio_device_error(alloc::format!(
+            //         "virtio-blk: device init / feature negotiation failed: {message}"
+            //     )),
+            // );
         }
     };
 
@@ -527,12 +515,13 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unsafe { unmap_mmio_region(va, sz) };
         }
-        return complete_req(
-            req,
-            virtio_device_error(alloc::format!(
-                "virtio-blk: no queues created; requested {target_queue_count}"
-            )),
-        );
+        todo!("");
+        // return complete_req(
+        //     req,
+        //     virtio_device_error(alloc::format!(
+        //         "virtio-blk: no queues created; requested {target_queue_count}"
+        //     )),
+        // );
     }
 
     let actual_queue_count = virtqueues.len();
@@ -734,12 +723,13 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                return complete_req(
-                    req,
-                    virtio_device_error(alloc::format!(
-                        "virtio-blk: failed to create completion slots for queue {i}"
-                    )),
-                );
+                todo!("");
+                // return complete_req(
+                //     req,
+                //     virtio_device_error(alloc::format!(
+                //         "virtio-blk: failed to create completion slots for queue {i}"
+                //     )),
+                // );
             }
         };
 
@@ -887,12 +877,13 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unsafe { unmap_mmio_region(va, sz) };
         }
-        return complete_req(
-            req,
-            virtio_device_error(alloc::format!(
-                "virtio-blk: device status bad after DRIVER_OK: status={status:#x}"
-            )),
-        );
+        todo!("");
+        // return complete_req(
+        //     req,
+        //     virtio_device_error(alloc::format!(
+        //         "virtio-blk: device status bad after DRIVER_OK: status={status:#x}"
+        //     )),
+        // );
     }
 
     let msix_pba = match msix_cap {
@@ -1155,13 +1146,8 @@ pub async fn virtio_pdo_start<'req, 'data, 'b>(
 ) -> DriverStep {
     if let Some(dn) = _dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
-            register_protocol::<DiskInfoProtocol>(
-                _dev,
-                &VIRTIO_DISK_INFO_VTABLE,
-            );
-            publish_stack_protocol::<
-                DiskInfoProtocol,
-            >(&dn);
+            register_protocol::<DiskInfoProtocol>(_dev, &VIRTIO_DISK_INFO_VTABLE);
+            publish_stack_protocol::<DiskInfoProtocol>(&dn);
         }
     }
     complete_req(req, DriverStatus::Success)

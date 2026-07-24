@@ -16,12 +16,12 @@ use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
     benchmarking::{
-        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
+        BenchSpanGuard, BenchWindow, bench_log_span_end, bench_span_guard, bench_submit_rip_sample,
     },
     console::CONSOLE,
     drivers::{
-        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
         ACPI::ACPIImpl,
+        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
     },
     file_system::{
         file::{self, File},
@@ -47,6 +47,7 @@ use alloc::{
 };
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::{
+    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
     async_ffi::{FfiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
@@ -64,7 +65,6 @@ use kernel_types::{
     pnp::{DeviceIds, DeviceRelationType},
     runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
-    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
 
@@ -236,7 +236,7 @@ pub extern "C" fn kernel_dma_map_persistent_contiguous_backing(
 ) -> Result<(), DmaMapError> {
     crate::memory::dma::map_persistent_contiguous_backing(device, backing)
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
     crate::platform::cpu_topology_ids()
 }
@@ -270,7 +270,7 @@ pub extern "C" fn kernel_cycle_counter() -> u64 {
 pub extern "C" fn kernel_cycle_counter_frequency_hz() -> u64 {
     crate::platform::cycle_counter_frequency_hz()
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn file_open(
     path: &Path,
     flags: &[OpenFlags],
@@ -281,28 +281,28 @@ pub extern "C" fn file_open(
     async move { File::open(&path, &flags_vec).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>> {
     let path = path.clone();
 
     async move { File::list_dir(&path).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
     let path = path.clone();
 
     async move { File::remove_dir(&path).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
     let path = path.clone();
 
     async move { File::make_dir(&path).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>> {
     let key_path = key_path.to_string();
     let name = name.to_string();
@@ -310,7 +310,7 @@ pub extern "C" fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<
     async move { reg::get_value(key_path.as_str(), name.as_str()).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reg_set_value(
     key_path: &str,
     name: &str,
@@ -322,21 +322,21 @@ pub extern "C" fn reg_set_value(
     async move { reg::set_value(key_path.as_str(), name.as_str(), data).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>> {
     let path = path.to_string();
 
     async move { reg::create_key(path).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>> {
     let path = path.to_string();
 
     async move { reg::delete_key(path.as_str()).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reg_delete_value(
     key_path: &str,
     name: &str,
@@ -347,14 +347,14 @@ pub extern "C" fn reg_delete_value(
     async move { reg::delete_value(key_path.as_str(), name.as_str()).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
     let base_path = base_path.to_string();
 
     async move { reg::list_keys(base_path.as_str()).await }.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
     let base_path = base_path.to_string();
 
@@ -447,7 +447,7 @@ pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(
     )
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pnp_invalidate_device_relations(
     device: &Arc<DeviceObject>,
     relation: DeviceRelationType,
@@ -527,7 +527,7 @@ pub extern "C" fn pnp_add_class_listener(
 
 static BLOCKING_INIT: Once = Once::new();
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_yield() {
     crate::platform::with_interrupts_disabled(|| {
         crate::platform::request_task_yield();
@@ -540,7 +540,7 @@ pub unsafe extern "C" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>
 
 /// Notify VFS that a drive label has been published.
 /// Called by mount manager when a new label symlink is created.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vfs_notify_label_published(
     label_ptr: *const u8,
     label_len: usize,
@@ -565,7 +565,7 @@ pub extern "C" fn vfs_notify_label_published(
 
 /// Notify VFS that a drive label has been unpublished.
 /// Called by mount manager when a label symlink is removed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize) {
     if label_ptr.is_null() {
         return;
@@ -579,35 +579,35 @@ pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: 
     VFS_PROVIDER.remove_label(label_str);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
     kernel_executor::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()> {
     let handle = kernel_spawn(fut);
     handle.into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_detached_ffi(fut: FfiFuture<()>) {
     kernel_spawn_detached(async move {
         fut.await;
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_block_on_ffi(fut: FfiFuture<()>) {
     kernel_block_on(fut);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState> {
     scheduling::tls::current_block_on_thread_state()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize) {
     // Wrap the raw trampoline in the kernel-side blocking executor
     kernel_spawn_blocking(move || {
@@ -615,12 +615,12 @@ pub extern "C" fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ct
     });
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usize) {
     GlobalAsyncExecutor::global().submit(trampoline, ctx);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_async_set_parallelism(n: usize) {
     todo!();
 }
@@ -632,7 +632,7 @@ fn bench_windows() -> &'static Mutex<BTreeMap<u32, BenchWindow>> {
     BENCH_WINDOWS.call_once(|| Mutex::new(BTreeMap::new()))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle {
     let w = BenchWindow::new(cfg);
     let id = NEXT_BENCH_WINDOW.fetch_add(1, Ordering::Relaxed);
@@ -640,12 +640,12 @@ pub extern "C" fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWin
     BenchWindowHandle(id)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool {
     bench_windows().lock().remove(&handle.0).is_some()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool {
     let w = bench_windows().lock().get(&handle.0).cloned();
     if let Some(w) = w {
@@ -656,7 +656,7 @@ pub extern "C" fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool {
     let w = bench_windows().lock().get(&handle.0).cloned();
     if let Some(w) = w {
@@ -667,7 +667,7 @@ pub extern "C" fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool> {
     let w = bench_windows().lock().get(&handle.0).cloned();
     async move {
@@ -681,7 +681,7 @@ pub extern "C" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiF
     .into_ffi()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_submit_rip_sample(
     core: BenchCoreId,
     rip: u64,
@@ -697,7 +697,7 @@ pub extern "C" fn bench_kernel_submit_rip_sample(
     bench_submit_rip_sample(core.0 as usize, rip, stack);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_span_begin(
     tag: BenchTag,
     object_id: BenchObjectId,
@@ -705,7 +705,7 @@ pub extern "C" fn bench_kernel_span_begin(
     bench_span_guard(tag, object_id.0)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bench_kernel_span_end(
     span_id: BenchSpanId,
     tag: BenchTag,
@@ -714,11 +714,11 @@ pub extern "C" fn bench_kernel_span_end(
     bench_log_span_end(span_id.0, tag, object_id.0);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_current_cpu_id() -> usize {
     crate::platform::current_cpu_id()
 }
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageFlags,
@@ -726,7 +726,7 @@ pub extern "C" fn allocate_auto_kernel_range_mapped(
     crate::memory::paging::allocate_auto_kernel_range_mapped(size, flags)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
     size: u64,
     flags: PageFlags,
@@ -734,7 +734,7 @@ pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
     crate::memory::paging::allocate_auto_kernel_range_mapped_contiguous(size, flags)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn allocate_kernel_range_mapped(
     base: u64,
     size: u64,
@@ -743,17 +743,17 @@ pub extern "C" fn allocate_kernel_range_mapped(
     crate::memory::paging::allocate_kernel_range_mapped(base, size, flags)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     unsafe { crate::memory::paging::deallocate_kernel_range(addr, size) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
     unsafe { crate::memory::paging::unmap_range(virtual_addr, size) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags) {
     let _ = crate::memory::paging::identity_map_page(
         frame_addr,
@@ -762,7 +762,7 @@ pub extern "C" fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags) {
     );
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn map_physical_pages(
     phys: PhysAddr,
     size: u64,
@@ -771,7 +771,7 @@ pub extern "C" fn map_physical_pages(
     crate::memory::paging::map_physical_pages(phys, size, cache)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn unmap_physical_pages(
     base: VirtAddr,
     size: u64,
@@ -779,12 +779,12 @@ pub unsafe extern "C" fn unmap_physical_pages(
     unsafe { crate::memory::paging::unmap_physical_pages(base, size) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     crate::memory::paging::virt_to_phys(addr)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     let result = crate::memory::paging::resolve_virtual_range_frame(addr);
     result
@@ -797,14 +797,14 @@ pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, Ph
 
 /// Resolve a symlink/path to a device target
 /// Linker seam for kernel_routing when compiled with kernel_link feature
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn routing_resolve_path_to_device_impl(path: &str) -> Option<IoTarget> {
     PNP_MANAGER.resolve_targetio_from_symlink(path.to_string())
 }
 
 /// Get the top device from a weak DevNode reference
 /// Linker seam for kernel_routing when compiled with kernel_link feature
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn routing_get_stack_top_from_weak_impl(
     dev_node_weak: &alloc::sync::Weak<DevNode>,
 ) -> Option<Arc<DeviceObject>> {
@@ -818,12 +818,12 @@ pub fn routing_get_stack_top_from_weak_impl(
 }
 
 // FFI exports for drivers (extern "C" ABI)
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget> {
     routing_resolve_path_to_device_impl(path)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn routing_get_stack_top_from_weak(
     dev_node_weak: &alloc::sync::Weak<DevNode>,
 ) -> Option<Arc<DeviceObject>> {

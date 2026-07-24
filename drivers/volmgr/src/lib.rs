@@ -9,8 +9,6 @@ extern crate alloc;
 use kernel_api::pnp::InitComplete;
 use kernel_api::pnp::QueryDeviceRelations;
 
-use kernel_api::pnp::RemoveDevice;
-use kernel_api::pnp::StartDevice;
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::hint::{cold_path, unlikely};
 use core::panic::PanicInfo;
@@ -18,30 +16,33 @@ use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::async_ffi::FutureExt;
 use kernel_api::dma::dma::IoBufferBacking;
+use kernel_api::pnp::RemoveDevice;
+use kernel_api::pnp::StartDevice;
 use kernel_api::println;
 
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
+use kernel_api::device::{open_public_protocol, publish_stack_protocol, register_protocol};
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::PartitionInfo;
-use kernel_api::kernel_types::protocol::disk::PartitionInfoProtocol;
-use kernel_api::kernel_types::protocol::volmgr::{VolmgrProtocol, VolmgrProtocolVTable};
 use kernel_api::kernel_types::io::{
-    DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceFlushOwner, DeviceFlushOwnerOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
+    DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceFlushOwner,
+    DeviceFlushOwnerOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::protocol::disk::PartitionInfoProtocol;
+use kernel_api::kernel_types::protocol::volmgr::{VolumeProtocol, VolumeProtocolVTable};
 use kernel_api::pnp::DeviceRelationType;
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpOp;
 use kernel_api::pnp::PnpOps;
+use kernel_api::pnp::RegisterDmaBacking;
 use kernel_api::pnp::driver_set_evt_device_add;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_get_device_target;
-use kernel_api::device::{register_protocol, publish_stack_protocol, open_public_protocol};
-use kernel_api::pnp::{RegisterDmaBacking};
 use kernel_api::pnp::{io, pnp};
 use kernel_api::request::{Flush, FlushDirty, FlushOwner, Read, Write};
 use kernel_api::request_handler;
@@ -606,7 +607,9 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     let mut pnp_ops = PnpOps::new();
     pnp_ops.start_device.set(vol_pdo_start);
     pnp_ops.remove_device.set(vol_pdo_remove_device);
-    pnp_ops.register_dma_backing.set(vol_pdo_register_dma_backing);
+    pnp_ops
+        .register_dma_backing
+        .set(vol_pdo_register_dma_backing);
 
     let mut init = DeviceInit::with_pnp(Some(pnp_ops));
     init.ops.register::<DeviceReadOp, VolPdoIo>();
@@ -881,8 +884,8 @@ async fn vol_pdo_start<'req, 'data, 'b>(
 ) -> DriverStep {
     if let Some(dn) = dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
-            register_protocol::<VolmgrProtocol>(dev, &VOLMGR_INFO_VTABLE);
-            publish_stack_protocol::<VolmgrProtocol>(&dn);
+            register_protocol::<VolumeProtocol>(dev, &VOLMGR_INFO_VTABLE);
+            publish_stack_protocol::<VolumeProtocol>(&dn);
         }
     }
     DriverStep::Continue
@@ -914,7 +917,9 @@ async fn vol_pdo_register_dma_backing<'req, 'data, 'b>(
     DriverStep::complete(DriverStatus::Success)
 }
 
-extern "C" fn vol_partition_info(device: &Arc<DeviceObject>) -> Result<PartitionInfo, DriverStatus> {
+extern "C" fn vol_partition_info(
+    device: &Arc<DeviceObject>,
+) -> Result<PartitionInfo, DriverStatus> {
     let dx = ext::<VolPdoExt>(device);
     if let Some(pi) = dx.part.get() {
         Ok(pi.clone())
@@ -922,6 +927,6 @@ extern "C" fn vol_partition_info(device: &Arc<DeviceObject>) -> Result<Partition
         Err(DriverStatus::Unsuccessful)
     }
 }
-const VOLMGR_INFO_VTABLE: VolmgrProtocolVTable = VolmgrProtocolVTable {
+const VOLMGR_INFO_VTABLE: VolumeProtocolVTable = VolumeProtocolVTable {
     partition_info: vol_partition_info,
 };

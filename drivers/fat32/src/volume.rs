@@ -65,7 +65,9 @@ pub struct MountedFat32 {
 
 impl Default for VolCtrlDevExt {
     fn default() -> Self {
-        Self { mounted: Once::new() }
+        Self {
+            mounted: Once::new(),
+        }
     }
 }
 
@@ -83,7 +85,9 @@ impl Deref for VolCtrlDevExt {
     type Target = MountedFat32;
 
     fn deref(&self) -> &Self::Target {
-        self.mounted.get().expect("FAT32 device used before StartDevice completed")
+        self.mounted
+            .get()
+            .expect("FAT32 device used before StartDevice completed")
     }
 }
 
@@ -313,7 +317,7 @@ async fn write_file_zeros(file: &mut FatFile<'_>, mut len: u64) -> Result<(), Fs
 
 fn missing_cached_file_state(fs_file_id: u64) -> FileStatus {
     println!("Missing cached file state for fs_file_id {}", fs_file_id);
-    FileStatus::UnknownFail
+    FileStatus::FileSystemError
 }
 
 #[derive(Clone, Copy)]
@@ -565,7 +569,7 @@ impl FileSystem for Fat32Fs {
             let offset = params.offset;
 
             let read_res: Result<usize, FileStatus> = match params.buffer.take() {
-                None => Err(FileStatus::UnknownFail),
+                None => Err(FileStatus::NoBuffer),
                 Some(buffer) => {
                     let state = take_cached_file_state(&vdx, fs_file_id);
                     match state {
@@ -639,7 +643,7 @@ impl FileSystem for Fat32Fs {
             let write_through = params.write_through;
 
             let write_res: Result<usize, FileStatus> = match params.buffer.take() {
-                None => Err(FileStatus::UnknownFail),
+                None => Err(FileStatus::NoBuffer),
                 Some(buffer) => {
                     let state = take_cached_file_state(&vdx, fs_file_id);
                     match state {
@@ -1047,7 +1051,7 @@ impl FileSystem for Fat32Fs {
             let write_through = params.write_through;
 
             let append_res: Result<(usize, u64), FileStatus> = match params.buffer.take() {
-                None => Err(FileStatus::UnknownFail),
+                None => Err(FileStatus::NoBuffer),
                 Some(buffer) => {
                     let start_off = {
                         let handles = vdx.handles.lock();
