@@ -39,7 +39,9 @@ fn kernel_pe_target() -> KernelPeTarget {
 }
 
 fn main() {
-    let kernel_pe = kernel_pe_path();
+    let Some(kernel_pe) = kernel_pe_path() else {
+        return;
+    };
     validate_kernel_pe(&kernel_pe, kernel_pe_target());
     generate_boot_packages();
 
@@ -47,7 +49,7 @@ fn main() {
     println!("cargo:rustc-env=KERNEL_PE_PATH={}", kernel_pe.display());
 }
 
-fn kernel_pe_path() -> PathBuf {
+fn kernel_pe_path() -> Option<PathBuf> {
     println!("cargo:rerun-if-env-changed=KERNEL_PE_PATH");
     if let Some(path) = env::var_os("KERNEL_PE_PATH").map(PathBuf::from) {
         if !path.is_file() {
@@ -57,10 +59,10 @@ fn kernel_pe_path() -> PathBuf {
             );
         }
 
-        return path;
+        return Some(path);
     }
 
-    panic!("KERNEL_PE_PATH is not set; build through `cargo run -p xtask` so the PE kernel is built first")
+    return None;
 }
 
 fn generate_boot_packages() {

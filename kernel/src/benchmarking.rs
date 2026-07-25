@@ -7,14 +7,14 @@ use crate::memory::{
     paging::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::unwind::{
-    capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
+    CapturedCallchain, MAX_CALLCHAIN_DEPTH, capture_callchain_from_state_limited,
 };
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
-use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
+use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_archive_for_path};
 use crate::structs::stopwatch::Stopwatch;
-use crate::util::{boot_info, TOTAL_TIME};
+use crate::util::{TOTAL_TIME, boot_info};
 use crate::{platform, print, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -30,26 +30,26 @@ use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{
-    block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
+    JoinAll, block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached,
 };
+use kernel_types::Message;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
+    BENCH_FLAG_IRQ, BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
     BenchDroppedSampleCounterProto, BenchLevelResult, BenchOverflowPolicy, BenchSampleChunkProto,
-    BenchSampleProto, BenchSweepParams, BenchSweepResult, BenchWindowConfig, BENCH_FLAG_IRQ,
-    BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
+    BenchSampleProto, BenchSweepParams, BenchSweepResult, BenchWindowConfig,
 };
-use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
+use kernel_types::benchmark::{BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1, BenchSweepBothResult};
 use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::DeviceControl;
 use kernel_types::status::{DriverStatus, FileStatus};
-use kernel_types::Message;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use spin::{Mutex, Once};
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-pub const BENCH_ENABLED: bool = false;
+pub const BENCH_ENABLED: bool = true;
 
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
@@ -2175,22 +2175,24 @@ impl BenchWindow {
                 let interval = secs;
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
-                spawn_blocking(move || loop {
-                    platform::wait_duration(interval);
+                spawn_blocking(move || {
+                    loop {
+                        platform::wait_duration(interval);
 
-                    if !BENCH_ENABLED {
-                        return;
-                    }
-
-                    {
-                        let inner = this_arc.inner.lock();
-                        if !inner.running {
-                            break;
+                        if !BENCH_ENABLED {
+                            return;
                         }
-                    }
 
-                    let moved = Arc::clone(&this_arc);
-                    block_on(moved.persist());
+                        {
+                            let inner = this_arc.inner.lock();
+                            if !inner.running {
+                                break;
+                            }
+                        }
+
+                        let moved = Arc::clone(&this_arc);
+                        block_on(moved.persist());
+                    }
                 });
             }
         }
@@ -2773,11 +2775,7 @@ fn safe_ratio(num: u64, den: u64) -> f64 {
 
 #[inline(always)]
 fn safe_ratio_f64(num: f64, den: f64) -> f64 {
-    if den == 0.0 {
-        0.0
-    } else {
-        num / den
-    }
+    if den == 0.0 { 0.0 } else { num / den }
 }
 
 #[inline(always)]
@@ -3479,19 +3477,19 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 100 * 1024 * 1024;
 const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 10 * 1024 * 1024;
 
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
-    16 * 1024,
-    32 * 1024,
-    64 * 1024,
-    256 * 1024,
-    512 * 1024,
-    1024 * 1024,
-    2 * 1024 * 1024,
-    4 * 1024 * 1024,
+    // 16 * 1024,
+    // 32 * 1024,
+    // 64 * 1024,
+    // 256 * 1024,
+    // 512 * 1024,
+    // 1024 * 1024,
+    // 2 * 1024 * 1024,
+    // 4 * 1024 * 1024,
     //64 * 1024 * 1024,
 ];
 

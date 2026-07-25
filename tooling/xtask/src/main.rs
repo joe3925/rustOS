@@ -353,14 +353,24 @@ fn build_kernel(root: &Path, plan: &BuildPlan, release: bool) -> Result<KernelAr
     let output = artifact_root(root, plan, release).join("kernel");
     let published = output.join("kernel.exe");
     copy_artifact(&kernel_pe, &published, "kernel PE")?;
+
+    let stable_output = root.join("target").join(profile(release));
+    let stable_kernel = stable_output.join("kernel.exe");
+    copy_artifact(&kernel_pe, &stable_kernel, "stable kernel PE")?;
+
     let pdb = kernel_pe.with_extension("pdb");
     let published_pdb = if pdb.is_file() {
         let destination = output.join("kernel.pdb");
         copy_artifact(&pdb, &destination, "kernel PDB")?;
+
+        let stable_pdb = stable_output.join("kernel.pdb");
+        copy_artifact(&pdb, &stable_pdb, "stable kernel PDB")?;
+
         Some(destination)
     } else {
         None
     };
+
     Ok(KernelArtifact {
         pe: published,
         debug_info: published_pdb,

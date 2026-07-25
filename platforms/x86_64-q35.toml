@@ -97,6 +97,6 @@ firmware_files_from_qemu = [
 ]
 machine = "q35"
 cpu = "qemu64,+apic,+acpi"
-default_memory = "8G"
+default_memory = "12G"
 iommu = "amd-iommu,dma-remap=on,dma-translation=on"
 iommu_whpx = "intel-iommu,intremap=off"
