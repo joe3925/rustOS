@@ -44,7 +44,7 @@ pub static LAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
 
 pub static APIC_TICKS_PER_NS: PerCpuVec<AtomicU64> = PerCpuVec::new();
 
-pub const TIMER_FREQ: u64 = 300_000;
+pub const TIMER_FREQ: u64 = 300;
 
 const PIT_FREQUENCY_HZ: u32 = 1_193_182;
 const PIT_CONTROL_PORT: u16 = 0x43;

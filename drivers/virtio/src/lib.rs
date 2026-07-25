@@ -270,17 +270,26 @@ pub(crate) fn virtio_device_error(message: &'static str) -> DriverStatus {
         message: message.into(),
     }
 }
-
 pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
     match status {
         VIRTIO_BLK_S_OK => DriverStatus::Success,
-        // TODO: FIX THIS IMPORTANT
-        VIRTIO_BLK_S_IOERR => todo!(),
-        VIRTIO_BLK_S_UNSUPP => todo!(),
-        other => todo!(),
+        VIRTIO_BLK_S_IOERR => DriverStatus::DeviceError {
+            message: format_args!("virtio-blk {operation}: I/O error")
+                .as_str()
+                .unwrap_or("virtio-blk I/O error"),
+        },
+        VIRTIO_BLK_S_UNSUPP => DriverStatus::DeviceError {
+            message: format_args!("virtio-blk {operation}: unsupported operation")
+                .as_str()
+                .unwrap_or("virtio-blk unsupported operation"),
+        },
+        other => DriverStatus::DeviceError {
+            message: format_args!("virtio-blk {operation}: unknown status {other}")
+                .as_str()
+                .unwrap_or("virtio-blk unknown status"),
+        },
     }
 }
-
 pub(crate) fn map_request_buffer<'buffer, D>(
     device: &Arc<DeviceObject>,
     buffer: IoBuffer<'buffer, 'buffer, D>,
@@ -484,13 +493,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unsafe { unmap_mmio_region(va, sz) };
             }
-            todo!("fix this");
-            // return complete_req(
-            //     req,
-            //     virtio_device_error(alloc::format!(
-            //         "virtio-blk: device init / feature negotiation failed: {message}"
-            //     )),
-            // );
+            return complete_req(
+                req,
+                virtio_device_error(
+                    format_args!("virtio-blk: device init / feature negotiation failed: {message}")
+                        .as_str()
+                        .unwrap_or("failed to format error string"),
+                ),
+            );
         }
     };
 
@@ -515,13 +525,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unsafe { unmap_mmio_region(va, sz) };
         }
-        todo!("");
-        // return complete_req(
-        //     req,
-        //     virtio_device_error(alloc::format!(
-        //         "virtio-blk: no queues created; requested {target_queue_count}"
-        //     )),
-        // );
+        return complete_req(
+            req,
+            virtio_device_error(
+                format_args!("virtio-blk: no queues created; requested {target_queue_count}")
+                    .as_str()
+                    .unwrap_or("failed to format error string"),
+            ),
+        );
     }
 
     let actual_queue_count = virtqueues.len();
@@ -723,13 +734,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                todo!("");
-                // return complete_req(
-                //     req,
-                //     virtio_device_error(alloc::format!(
-                //         "virtio-blk: failed to create completion slots for queue {i}"
-                //     )),
-                // );
+                return complete_req(
+                    req,
+                    virtio_device_error(
+                        format_args!("virtio-blk: failed to create completion slots for queue {i}")
+                            .as_str()
+                            .unwrap_or("failed to format error string"),
+                    ),
+                );
             }
         };
 
@@ -877,13 +889,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unsafe { unmap_mmio_region(va, sz) };
         }
-        todo!("");
-        // return complete_req(
-        //     req,
-        //     virtio_device_error(alloc::format!(
-        //         "virtio-blk: device status bad after DRIVER_OK: status={status:#x}"
-        //     )),
-        // );
+        return complete_req(
+            req,
+            virtio_device_error(
+                format_args!("virtio-blk: device status bad after DRIVER_OK: status={status:#x}")
+                    .as_str()
+                    .unwrap_or("failed to format error string"),
+            ),
+        );
     }
 
     let msix_pba = match msix_cap {

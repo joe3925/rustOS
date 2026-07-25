@@ -293,6 +293,29 @@ impl FileStatus {
         }
     }
 }
+impl From<FileStatus> for u32 {
+    fn from(status: FileStatus) -> Self {
+        match status {
+            FileStatus::Success => 0,
+            FileStatus::FileAlreadyExist => 1,
+            FileStatus::PathNotFound => 2,
+            FileStatus::UnknownFail => 3,
+            FileStatus::NoBuffer => 4,
+            FileStatus::BufferError(_) => 5,
+            FileStatus::FileSystemError => 6,
+            FileStatus::DriverError(_) => 7,
+            FileStatus::NotFat => 8,
+            FileStatus::DriveNotFound => 9,
+            FileStatus::IncompatibleFlags => 10,
+            FileStatus::CorruptFilesystem => 11,
+            FileStatus::InternalError => 12,
+            FileStatus::BadPath => 13,
+            FileStatus::AccessDenied => 14,
+            FileStatus::NoSpace => 15,
+            FileStatus::FileTooLarge => 16,
+        }
+    }
+}
 impl PartialEq for FileStatus {
     fn eq(&self, other: &FileStatus) -> bool {
         self.to_str() == other.to_str()

@@ -464,29 +464,31 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     //
     spawn_detached(async move {
         //loop {
-        let window = BenchWindow::new(BenchWindowConfig {
-            name: "drive".to_string(),
-            folder: "C:\\system\\logs".to_string(),
-            log_samples: true,
-            log_spans: false,
-            log_mem_on_persist: false,
-            export_debug_metadata: true,
-            end_on_drop: false,
-            timeout_ms: None,
-            auto_persist_secs: None,
-            sample_reserve: 4000000,
-            span_reserve: 0,
-            overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
-            sample_capacity: None,
-            sample_chunk_capacity: None,
-            max_unwind_depth: None,
-            disable_per_core: true,
-        });
+        // let window = BenchWindow::new(BenchWindowConfig {
+        //     name: "drive".to_string(),
+        //     folder: "C:\\system\\logs".to_string(),
+        //     log_samples: true,
+        //     log_spans: false,
+        //     log_mem_on_persist: false,
+        //     export_debug_metadata: true,
+        //     end_on_drop: false,
+        //     timeout_ms: None,
+        //     auto_persist_secs: None,
+        //     sample_reserve: 4000000,
+        //     span_reserve: 0,
+        //     overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
+        //     sample_capacity: None,
+        //     sample_chunk_capacity: None,
+        //     max_unwind_depth: None,
+        //     disable_per_core: true,
+        // });
         // bench_async_vs_sync_call_latency_async().await;
         // bench_runtime_executor_async().await;
-        window.start();
-        bench_c_drive_io_async(true).await;
-        window.stop_and_persist().await;
+        //window.start();
+        loop {
+            bench_c_drive_io_async(true).await;
+        }
+        //window.stop_and_persist().await;
         //test_full_heap_parallel();
         //}
         // loop {

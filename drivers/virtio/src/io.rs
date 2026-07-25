@@ -28,10 +28,11 @@ use kernel_api::status::DriverStatus;
 pub(crate) struct VirtioPdoIo;
 
 fn too_many_dma_segments_status(operation: &str) -> DriverStatus {
-    todo!("");
-    // virtio_device_error(alloc::format!(
-    //     "virtio-blk: {operation} request has too many DMA segments"
-    // ))
+    virtio_device_error(
+        format_args!("virtio-blk: {operation} request has too many DMA segments")
+            .as_str()
+            .unwrap_or("virtio-blk: request has too many DMA segments"),
+    )
 }
 
 impl DeviceRead for VirtioPdoIo {
@@ -157,9 +158,13 @@ async fn submit_virtio_no_data_request(
 
     match wait_completion_hybrid(qs, completion, 0).await {
         Ok(device_status) => blk_status_to_driver_status(operation, device_status),
-        Err(_) => todo!(""), // virtio_device_error(alloc::format!(
-                             //     "virtio-blk: {operation} failed: completion canceled before device status"
-                             // )),
+        Err(_) => virtio_device_error(
+            format_args!(
+                "virtio-blk: {operation} failed: completion canceled before device status"
+            )
+            .as_str()
+            .unwrap_or("virtio-blk: completion canceled before device status"),
+        ),
     }
 }
 
@@ -420,10 +425,13 @@ async fn wait_submitted_batch(
         let status =
             match wait_completion_hybrid(qs, submitted.completion, submitted.byte_len).await {
                 Ok(device_status) => blk_status_to_driver_status(operation, device_status),
-                Err(_) => todo!(""),
-                // virtio_device_error(alloc::format!(
-                //     "virtio-blk: {operation} failed: completion canceled before device status"
-                // )),
+                Err(_) => virtio_device_error(
+                    format_args!(
+                        "virtio-blk: {operation} failed: completion canceled before device status"
+                    )
+                    .as_str()
+                    .unwrap_or("virtio-blk: completion canceled before device status"),
+                ),
             };
 
         if final_status == DriverStatus::Success && status != DriverStatus::Success {
