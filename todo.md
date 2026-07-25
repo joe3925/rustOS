@@ -29,3 +29,7 @@ todo list because I have been forgetting stuff i need to complete
   2. [ ] Symbolic stack unwinds
   3. [ ] Clearer stack unwind api, I like what the std lib does with Backtrace 
   4. [ ] Change the registry from inline proto to a .proto file
+
+### Error handling (all around messy and I need to refactor it, not sure in what direction I want to take it yet)
+  1. [ ] Figure out how error handling should be refactored
+  2. [ ] Stop using format_args its gonna be none pretty much all the time.  
