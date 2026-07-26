@@ -1,0 +1,34 @@
+schema = 1
+id = "qemu-aarch64-virt-hvf"
+provider = "qemu"
+executable = "qemu-system-aarch64"
+compatible_platforms = ["aarch64-uefi"]
+supported_hosts = ["macos"]
+supported_host_arches = ["aarch64"]
+firmware_files = [
+    "edk2-aarch64-code.fd",
+    "edk2-arm-code.fd",
+    "QEMU_EFI.fd",
+    "QEMU_EFI-pflash.raw",
+]
+args = [
+    "-m", "{memory}",
+    "-cpu", "host",
+    "-machine", "virt,gic-version=3",
+    "-accel", "hvf",
+    "-smp", "{cpus}",
+    "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",
+    "-serial", "{primary_serial}",
+    "-display", "none",
+    "-drive", "file={boot_image},format=raw",
+    "-drive", "file={system_disk},if=none,format={system_disk_format},id=sysdisk",
+    "-device", "virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off",
+]
+
+[defaults]
+memory = "12G"
+cpus = "1"
+
+[capabilities]
+debug = false
+lldb_metadata = false

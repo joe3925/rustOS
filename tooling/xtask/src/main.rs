@@ -354,6 +354,12 @@ fn build_kernel(root: &Path, plan: &BuildPlan, release: bool) -> Result<KernelAr
             root.join("target/cargo").join(&plan.id).join("kernel"),
         );
 
+    if plan.kernel.no_default_features {
+        kernel.arg("--no-default-features");
+    }
+    if !plan.kernel.features.is_empty() {
+        kernel.arg("--features").arg(plan.kernel.features.join(","));
+    }
     if release {
         kernel.arg("--release");
     }
@@ -777,6 +783,18 @@ fn validate_launch(
         return Err(format!(
             "launch `{}` does not support host OS `{}` selected by host configuration `{}`",
             launch.id, host.os, host.id
+        ));
+    }
+    if !launch.supported_host_arches.is_empty()
+        && !launch
+            .supported_host_arches
+            .iter()
+            .any(|arch| arch == std::env::consts::ARCH)
+    {
+        return Err(format!(
+            "launch `{}` does not support host architecture `{}`",
+            launch.id,
+            std::env::consts::ARCH
         ));
     }
     if options.debug && !launch.capabilities.debug {

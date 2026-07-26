@@ -4,35 +4,26 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-struct KernelTarget {
-    mimalloc: Option<MimallocTarget>,
-}
-
 struct MimallocTarget {
-    clang_target: &'static str,
+    clang_target: String,
     flags: &'static [&'static str],
 }
 
-fn kernel_target(target: &str) -> Result<KernelTarget, Box<dyn Error>> {
-    if target.contains("x86_64") {
-        return Ok(KernelTarget {
-            mimalloc: Some(MimallocTarget {
-                clang_target: "x86_64-pc-windows-msvc",
-                flags: &["-mno-red-zone", "-mcmodel=large"],
-            }),
-        });
-    }
-
-    if target.contains("aarch64") {
-        return Ok(KernelTarget { mimalloc: None });
-    }
-
-    Err(format!("unsupported kernel target architecture: {target}").into())
+fn mimalloc_target(arch: &str) -> Result<MimallocTarget, Box<dyn Error>> {
+    let flags: &'static [&'static str] = match arch {
+        "x86_64" => &["-mno-red-zone", "-mcmodel=large"],
+        "aarch64" => &[],
+        _ => return Err(format!("unsupported mimalloc target architecture: {arch}").into()),
+    };
+    Ok(MimallocTarget {
+        clang_target: format!("{arch}-pc-windows-msvc"),
+        flags,
+    })
 }
 
 fn compile_mimalloc(
     manifest_dir: &std::path::Path,
-    target: &str,
+    arch: &str,
     out_dir: &PathBuf,
 ) -> Result<(), Box<dyn Error>> {
     let workspace_dir = manifest_dir
@@ -50,10 +41,7 @@ fn compile_mimalloc(
     println!("cargo:rerun-if-changed={}", include_dir.display());
     println!("cargo:rerun-if-changed={}", src_dir.display());
 
-    let target_config = kernel_target(target)?;
-    let mimalloc_target = target_config
-        .mimalloc
-        .ok_or_else(|| format!("rustOS mimalloc platform is not implemented for {target}"))?;
+    let mimalloc_target = mimalloc_target(arch)?;
 
     let mut build = cc::Build::new();
     let clang_target_flag = format!("--target={}", mimalloc_target.clang_target);
@@ -74,7 +62,6 @@ fn compile_mimalloc(
         .flag("-U_MSC_BUILD")
         .flag("-std=c11")
         .flag("-ffreestanding")
-        .flag("-fno-builtin")
         .flag("-fno-stack-protector")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-unused-function")
@@ -160,10 +147,12 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
     emit_kernel_pe_link_args(&target);
     if env::var_os("CARGO_FEATURE_ALLOCATOR_MIMALLOC").is_some() {
-        compile_mimalloc(&manifest_dir, &target, &out_dir).expect("Failed to compile mimalloc");
+        compile_mimalloc(&manifest_dir, &target_arch, &out_dir)
+            .expect("Failed to compile mimalloc");
     }
 
     println!("cargo:rerun-if-changed=build.rs");

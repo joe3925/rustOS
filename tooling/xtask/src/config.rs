@@ -19,6 +19,10 @@ pub struct KernelFile {
     pub binary: String,
     pub target: PathBuf,
     pub import_library_machine: String,
+    #[serde(default)]
+    pub no_default_features: bool,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +86,8 @@ pub struct KernelPlan {
     pub binary: String,
     pub target: PathBuf,
     pub import_library_machine: String,
+    pub no_default_features: bool,
+    pub features: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -128,6 +134,8 @@ struct LaunchFile {
     executable: String,
     compatible_platforms: Vec<String>,
     supported_hosts: Vec<String>,
+    #[serde(default)]
+    supported_host_arches: Vec<String>,
     firmware_files: Vec<PathBuf>,
     #[serde(default)]
     args: Vec<String>,
@@ -157,6 +165,7 @@ pub struct LaunchPlan {
     pub executable: String,
     pub compatible_platforms: Vec<String>,
     pub supported_hosts: Vec<String>,
+    pub supported_host_arches: Vec<String>,
     pub firmware_files: Vec<PathBuf>,
     pub args: Vec<String>,
     pub debug_args: Vec<String>,
@@ -259,6 +268,8 @@ pub fn load_platform(root: &Path, selector: &str) -> Result<BuildPlan, String> {
             binary: parsed.kernel.binary,
             target: kernel_target,
             import_library_machine: parsed.kernel.import_library_machine,
+            no_default_features: parsed.kernel.no_default_features,
+            features: parsed.kernel.features,
         },
         drivers: DriversPlan {
             target: driver_target,
@@ -307,6 +318,7 @@ pub fn load_launch(root: &Path, selector: &str) -> Result<LaunchPlan, String> {
         executable: parsed.executable,
         compatible_platforms: parsed.compatible_platforms,
         supported_hosts: parsed.supported_hosts,
+        supported_host_arches: parsed.supported_host_arches,
         firmware_files: parsed.firmware_files,
         args: parsed.args,
         debug_args: parsed.debug_args,
@@ -443,11 +455,21 @@ mod tests {
         let platform = load_platform(root, "x86_64-uefi").unwrap();
         let tcg = load_launch(root, "qemu-x86_64-q35-tcg").unwrap();
         let whpx = load_launch(root, "qemu-x86_64-q35-whpx").unwrap();
+        let aarch64 = load_platform(root, "aarch64-uefi").unwrap();
+        let aarch64_tcg = load_launch(root, "qemu-aarch64-virt-tcg").unwrap();
+        let aarch64_hvf = load_launch(root, "qemu-aarch64-virt-hvf").unwrap();
+        let aarch64_kvm = load_launch(root, "qemu-aarch64-virt-kvm").unwrap();
         let windows = load_host(root, "windows").unwrap();
 
         assert_eq!(platform.id, "x86_64-uefi");
         assert!(tcg.capabilities.debug);
         assert!(!whpx.capabilities.debug);
+        assert_eq!(aarch64.id, "aarch64-uefi");
+        assert!(aarch64.kernel.no_default_features);
+        assert_eq!(aarch64.kernel.features, ["allocator-mimalloc"]);
+        assert!(aarch64_tcg.capabilities.debug);
+        assert!(!aarch64_hvf.capabilities.debug);
+        assert!(!aarch64_kvm.capabilities.debug);
         assert_eq!(windows.id, "windows");
         assert_eq!(windows.os, "windows");
     }
