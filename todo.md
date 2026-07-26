@@ -15,7 +15,7 @@ If there is a * it must be completed before user space is started
 1. [ ] Add a nvme driver.
 2. [ ] Add a usb driver.
 3. [ ] * Create the mouse stack. 
-4. [ ] Change how the filesystem hint works so that preferably the pnp manager has no filesystem specific code.
+4. [x] Change how the filesystem hint works so that preferably the pnp manager has no filesystem specific code.
 5. [ ] Expand the pci(e) protocol. 
 
 ## User I/O (UIO)

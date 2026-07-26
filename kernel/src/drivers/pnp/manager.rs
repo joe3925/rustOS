@@ -7,7 +7,7 @@ use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;
 
 use crate::println;
-use crate::registry::reg::{get_key, get_value, list_keys};
+use crate::registry::reg::{create_key, get_key, get_value, list_keys, set_value};
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
@@ -17,7 +17,7 @@ use kernel_routing::pnp;
 use kernel_types::ClassEventCallback;
 use kernel_types::device::{
     DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
-    DriverRuntime, DriverState, StackLayer, open_public_protocol,
+    DriverRuntime, DriverState, StackLayer,
 };
 use kernel_types::fs::Path;
 use kernel_types::io::IoTarget;
@@ -25,7 +25,6 @@ use kernel_types::pnp::{
     BootType, DeviceEvent, DeviceIds, DeviceRelationType, DriverRole, DriverStep, InitComplete,
     ProbeContext, ProbeOutcome, QueryDeviceRelations, RemoveDevice, StartDevice,
 };
-use kernel_types::protocol::volmgr::VolumeProtocol;
 use kernel_types::status::Data;
 use spin::{Mutex, RwLock};
 
@@ -49,6 +48,9 @@ pub struct PnpManager {
 }
 
 impl PnpManager {
+    const BINDINGS_KEY: &'static str = "SYSTEM/CurrentControlSet/Pnp/Bindings";
+    const PREFERRED_FUNCTION_DRIVER: &'static str = "PreferredFunctionDriver";
+
     pub fn new() -> Self {
         Self {
             hw: RwLock::new(Arc::new(HwIndex::new())),
@@ -333,7 +335,7 @@ impl PnpManager {
             )
         })?;
 
-        if let Some(hint) = Self::filesystem_hint(dn).await {
+        if let Some(hint) = Self::preferred_function_driver(dn).await {
             if let Some(index) = candidates
                 .iter()
                 .position(|candidate| candidate.pkg.name == hint)
@@ -384,32 +386,42 @@ impl PnpManager {
             None => Ok(Some(package)),
         }
     }
-    // TODO: this impl is temporary, I plan to change this so that pnp management doesn't know about the volume protocol maybe doesn't even special case the volume device
-    async fn filesystem_hint(dn: &Arc<DevNode>) -> Option<String> {
-        if !dn
-            .class
-            .as_ref()
-            .is_some_and(|class| class.eq_ignore_ascii_case("Volume"))
-        {
-            return None;
-        }
-        let protocol = open_public_protocol::<VolumeProtocol>(dn).ok()?;
-        let info = (protocol.partition_info)(protocol.provider()).ok()?;
-        let guid = info.gpt_entry?.unique_partition_guid;
-        if guid.iter().all(|byte| *byte == 0) {
-            return None;
-        }
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        let mut stable_id = String::from("GPT.");
-        for byte in guid {
-            stable_id.push(HEX[(byte >> 4) as usize] as char);
-            stable_id.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        let key = alloc::format!("SYSTEM/CurrentControlSet/MountMgr/FilesystemHints/{stable_id}");
-        match get_value(&key, "Service").await {
-            Some(Data::Str(service)) if !service.is_empty() => Some(service),
+    fn binding_key(instance_path: &str) -> String {
+        alloc::format!(
+            "{}/{}",
+            Self::BINDINGS_KEY,
+            driver_index::escape_key(instance_path)
+        )
+    }
+
+    async fn preferred_function_driver(dn: &Arc<DevNode>) -> Option<String> {
+        let key = Self::binding_key(&dn.instance_path);
+        match get_value(&key, Self::PREFERRED_FUNCTION_DRIVER).await {
+            Some(Data::Str(driver_name)) if !driver_name.is_empty() => Some(driver_name),
             _ => None,
         }
+    }
+
+    pub async fn set_preferred_function_driver(
+        &self,
+        instance_path: &str,
+        driver_name: &str,
+    ) -> Result<(), KernelError> {
+        for key in [
+            "SYSTEM/CurrentControlSet/Pnp",
+            Self::BINDINGS_KEY,
+            &Self::binding_key(instance_path),
+        ] {
+            if get_key(key).await.is_none() {
+                create_key(key.to_string()).await?;
+            }
+        }
+        set_value(
+            &Self::binding_key(instance_path),
+            Self::PREFERRED_FUNCTION_DRIVER,
+            Data::Str(driver_name.to_string()),
+        )
+        .await
     }
 
     fn hardware_ids(dn: &Arc<DevNode>) -> Vec<&str> {

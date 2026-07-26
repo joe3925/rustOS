@@ -393,6 +393,20 @@ pub extern "C" fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>
     PNP_MANAGER.get_device_target(instance_path)
 }
 
+pub extern "C" fn pnp_set_preferred_function_driver(
+    instance_path: &str,
+    driver_name: &str,
+) -> FfiFuture<Result<(), KernelError>> {
+    let instance_path = instance_path.to_string();
+    let driver_name = driver_name.to_string();
+    async move {
+        PNP_MANAGER
+            .set_preferred_function_driver(&instance_path, &driver_name)
+            .await
+    }
+    .into_ffi()
+}
+
 pub extern "C" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
     PNP_MANAGER.queue_dpc(func, arg)
 }

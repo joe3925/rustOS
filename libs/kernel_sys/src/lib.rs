@@ -197,6 +197,10 @@ unsafe extern "C" {
 
     pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), KernelError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
+    pub fn pnp_set_preferred_function_driver(
+        instance_path: &str,
+        driver_name: &str,
+    ) -> FfiFuture<Result<(), KernelError>>;
 
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> Result<(), OmError>;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> Result<(), OmError>;

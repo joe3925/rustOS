@@ -34,6 +34,7 @@ use kernel_api::{
     pnp::{
         DriverStep, io, pnp_add_class_listener, pnp_create_control_device_and_link,
         pnp_create_device_symlink_top, pnp_create_symlink, pnp_remove_symlink,
+        pnp_set_preferred_function_driver,
     },
     reg::{self, switch_to_vfs_async},
     request::{DeviceControl, Fs, FsOpen, FsPayload},
@@ -46,7 +47,6 @@ use spin::RwLock;
 
 const MOD_NAME: &str = env!("CARGO_PKG_NAME");
 const DRIVE_LETTERS_KEY: &str = "SYSTEM/CurrentControlSet/MountMgr/DriveLetters";
-const HINTS_KEY: &str = "SYSTEM/CurrentControlSet/MountMgr/FilesystemHints";
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -59,7 +59,7 @@ struct MountedVolume {
     instance_path: String,
     stable_id: String,
     stable_link: String,
-    filesystem_service: String,
+    filesystem_driver_name: String,
     assigned_label: Option<String>,
 }
 
@@ -151,14 +151,14 @@ async fn handle_started(node: Arc<DevNode>) -> Result<(), KernelError> {
 
     let stable_id = guid_id(&entry.unique_partition_guid);
     let stable_link = alloc::format!("\\GLOBAL\\Volumes\\{stable_id}");
-    let service = node
+    let driver_name = node
         .stack
         .read()
         .as_ref()
         .and_then(|stack| stack.function.as_ref())
         .map(|layer| layer.driver.driver_name.clone())
         .unwrap_or_default();
-    if service.is_empty() {
+    if driver_name.is_empty() {
         return Err(kernel_api::error::error_with_message(
             DriverErrorKind::DeviceError,
             format_args!("volume `{}` has no function driver", node.instance_path),
@@ -177,11 +177,18 @@ async fn handle_started(node: Arc<DevNode>) -> Result<(), KernelError> {
         instance_path: node.instance_path.clone(),
         stable_id: stable_id.clone(),
         stable_link: stable_link.clone(),
-        filesystem_service: service.clone(),
+        filesystem_driver_name: driver_name.clone(),
         assigned_label: None,
     };
     MOUNTED.write().insert(node.instance_path.clone(), mounted);
-    write_filesystem_hint(&stable_id, &service).await?;
+    pnp_set_preferred_function_driver(&node.instance_path, &driver_name)
+        .await
+        .with_context(|| {
+            format!(
+                "recording preferred function driver for `{}`",
+                node.instance_path
+            )
+        })?;
 
     if VFS_ACTIVE.load(Ordering::Acquire) {
         assign_label(&node.instance_path, false).await?;
@@ -210,15 +217,6 @@ fn guid_id(guid: &[u8; 16]) -> String {
         id.push(HEX[(byte & 0x0f) as usize] as char);
     }
     id
-}
-
-async fn write_filesystem_hint(stable_id: &str, service: &str) -> Result<(), KernelError> {
-    create_registry_key_if_missing(HINTS_KEY).await?;
-    let key = alloc::format!("{HINTS_KEY}/{stable_id}");
-    create_registry_key_if_missing(&key).await?;
-    reg::set_value(&key, "Service", Data::Str(service.to_string()))
-        .await
-        .with_context(|| format!("writing filesystem hint for `{stable_id}`"))
 }
 
 fn start_boot_probe(instance_path: String, stable_id: String, stable_link: String) {
@@ -436,7 +434,7 @@ fn status_blob() -> Vec<u8> {
             "{};{};{};{}",
             volume.instance_path,
             volume.stable_id,
-            volume.filesystem_service,
+            volume.filesystem_driver_name,
             volume.assigned_label.as_deref().unwrap_or("")
         ));
     }
@@ -447,7 +445,7 @@ fn filesystem_blob() -> Vec<u8> {
     let services: BTreeSet<_> = MOUNTED
         .read()
         .values()
-        .map(|volume| volume.filesystem_service.clone())
+        .map(|volume| volume.filesystem_driver_name.clone())
         .collect();
     services
         .into_iter()

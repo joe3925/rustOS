@@ -85,6 +85,7 @@ export! {
     pnp_create_pdo,
     pnp_bind_and_start,
     pnp_get_device_target,
+    pnp_set_preferred_function_driver,
     pnp_queue_dpc,
     pnp_create_child_devnode_and_pdo_with_init,
     pnp_create_symlink,

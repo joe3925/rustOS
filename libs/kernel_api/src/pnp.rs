@@ -130,6 +130,13 @@ pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget> {
     unsafe { kernel_sys::pnp_get_device_target(instance_path) }
 }
 
+pub async fn pnp_set_preferred_function_driver(
+    instance_path: &str,
+    driver_name: &str,
+) -> Result<(), KernelError> {
+    unsafe { kernel_sys::pnp_set_preferred_function_driver(instance_path, driver_name).await }
+}
+
 pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit) -> Arc<DeviceObject> {
     unsafe { kernel_sys::pnp_create_control_device_with_init(name, init) }
 }
