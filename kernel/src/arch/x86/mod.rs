@@ -8,6 +8,7 @@ pub mod memory;
 pub mod platform;
 pub(crate) mod scheduling;
 pub(crate) mod serial;
+pub(crate) mod unwind;
 
 pub mod drivers {
     pub(crate) mod interrupt_index;

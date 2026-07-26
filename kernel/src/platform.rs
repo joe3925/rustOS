@@ -12,6 +12,7 @@ use crate::memory::paging::types::UserVmLayout;
 use acpi::AcpiTables;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{MsiMessage, MsiRequest};
+use kernel_types::memory::Module;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
@@ -194,6 +195,22 @@ pub trait TaskPlatform: CpuPlatform {
     fn ensure_current_thread_runtime_initialized();
     fn current_block_on_thread_state() -> Arc<BlockOnThreadState>;
     fn request_task_yield();
+}
+
+pub trait UnwindPlatform: TaskPlatform {
+    type UnwindContext;
+
+    fn begin_current_unwind() -> crate::profiling::backtrace::UnwindStart<Self::UnwindContext>;
+
+    fn begin_unwind(
+        state: &Self::TaskContext,
+    ) -> crate::profiling::backtrace::UnwindStart<Self::UnwindContext>;
+
+    fn unwind_next(
+        context: &mut Self::UnwindContext,
+        module: Option<&Module>,
+        stack_bounds: crate::profiling::backtrace::StackBounds,
+    ) -> crate::profiling::backtrace::UnwindStep;
 }
 
 pub trait DebugPlatform: Platform {

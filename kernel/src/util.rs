@@ -19,9 +19,11 @@ use crate::memory::paging::{
     KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked,
 };
 use crate::platform::{current_cpu_id, cycle_counter};
+use crate::profiling::backtrace::{self, Backtrace};
 use crate::scheduling::runtime::runtime::init_executor_platform;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::state::State;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::{
@@ -43,7 +45,7 @@ use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_types::arch::VirtAddr;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
-use kernel_types::memory::Module;
+use kernel_types::memory::{Module, PeInfo, PeSectionInfo};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
@@ -54,8 +56,8 @@ pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
-static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
-
+static PANIC_OWNER: Once<u32> = Once::new();
+pub static PANIC_STATE: Once<State> = Once::new();
 // lazy_static! {
 //     pub static ref DRIVE_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
 //         name: "drive",
@@ -109,14 +111,6 @@ pub unsafe fn init() {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
         initialize_bootstrap_provider();
-        {
-            let boot = boot_info();
-            crate::profiling::unwind::register_kernel_pe_unwind_module(
-                boot.kernel_image_base,
-                boot.kernel_image_size,
-                boot.kernel_sections.as_slice(),
-            );
-        }
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
         crate::platform::init_boot_processor();
@@ -167,7 +161,6 @@ pub extern "C" fn kernel_main(ctx: usize) {
         crate::memory::paging::kernel_address_space_root(),
         KERNEL_RANGE_TRACKER.clone(),
     );
-
     program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
 
     program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
@@ -175,12 +168,14 @@ pub extern "C" fn kernel_main(ctx: usize) {
         image_path: Path::from_string(""),
         parent_pid: 0,
         image_base: VirtAddr::new(kernel_image_base).into(),
-        symbols: EXPORTS.to_vec(),
-        pe_info: None,
+        image_size: boot_info().kernel_image_size,
+        exports: EXPORTS.to_vec(),
+        pe_info: Some(kernel_pe_info()),
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
+        trigger_breakpoint();
         crate::registry::init()
             .await
             .expect("Failed to init registry");
@@ -193,12 +188,82 @@ pub extern "C" fn kernel_main(ctx: usize) {
     });
     println!("");
 }
+
+fn kernel_pe_info() -> PeInfo {
+    let boot = boot_info();
+    let sections = boot
+        .kernel_sections
+        .as_slice()
+        .iter()
+        .map(|section| {
+            let name_len = section
+                .name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(section.name.len());
+            let name = core::str::from_utf8(&section.name[..name_len])
+                .unwrap_or("unknown")
+                .to_string();
+
+            PeSectionInfo {
+                name,
+                virtual_address: section.virtual_address,
+                virtual_size: section.virtual_size,
+                raw_offset: section.raw_offset,
+                raw_size: section.raw_size,
+                characteristics: section.characteristics,
+            }
+        })
+        .collect();
+
+    PeInfo {
+        is_64: true,
+        is_dll: false,
+        machine: 0x8664,
+        characteristics: 0,
+        time_date_stamp: 0,
+        optional_magic: 0x20b,
+        subsystem: 0,
+        dll_characteristics: 0,
+        preferred_image_base: boot.kernel_image_base,
+        loaded_image_base: VirtAddr::new(boot.kernel_image_base),
+        entry_rva: 0,
+        size_of_image: boot.kernel_image_size.min(u32::MAX as u64) as u32,
+        size_of_headers: 0,
+        section_alignment: 0,
+        file_alignment: 0,
+        size_of_code: 0,
+        size_of_initialized_data: 0,
+        size_of_uninitialized_data: 0,
+        stack_reserve: 0,
+        stack_commit: 0,
+        heap_reserve: 0,
+        heap_commit: 0,
+        aslr: false,
+        relocated: false,
+        sections,
+        imports: Vec::new(),
+        exports: Vec::new(),
+        pdb: None,
+    }
+}
 #[inline(never)]
 fn halt_loop() -> ! {
     crate::platform::halt()
 }
+
+fn current_cpu_owns_panic() -> bool {
+    let current_cpu = crate::platform::current_logical_id() as u32;
+    PANIC_OWNER.call_once(|| current_cpu);
+    PANIC_OWNER.get().is_some_and(|owner| *owner == current_cpu)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
+    if !current_cpu_owns_panic() {
+        halt_loop()
+    }
+
     if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
         halt_loop()
     }
@@ -209,81 +274,91 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
             crate::memory::paging::kernel_address_space_root(),
         );
     }
+    let backtrace = if let Some(state) = PANIC_STATE.get() {
+        Backtrace::from_state(
+            state,
+            // PANIC_OWNER can't be none
+            SCHEDULER
+                .get_current_task(*PANIC_OWNER.get().unwrap() as usize)
+                .as_deref(),
+        )
+    } else {
+        Backtrace::capture()
+    };
     crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
 
-    let me = crate::platform::current_logical_id() as u32;
-    let is_owner = match PANIC_OWNER.try_lock() {
-        Some(mut g) => {
-            if g.is_none() {
-                *g = Some(me);
-                true
-            } else {
-                g.as_ref() == Some(&me)
-            }
-        }
-        None => false,
-    };
-    if is_owner {
-        println!("=== KERNEL PANIC [{}] ===", mod_name);
-        println!(
-            "is in interrupt: {:#?}",
-            crate::platform::current_is_in_interrupt()
-        );
-        println!("{}", info);
+    println!("=== KERNEL PANIC [{}] ===", mod_name);
+    println!(
+        "is in interrupt: {:#?}",
+        crate::platform::current_is_in_interrupt()
+    );
+    println!("{}", info);
+    println!("Backtrace:");
+    for trace in backtrace.iter() {
+        println!("{:#X}", trace.instruction_pointer().as_u64())
+    }
+    // let dump = dump_scheduler();
+    // println!("--- Running tasks at panic ---");
+    // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+    //     if let Some(task) = slot {
+    //         let name = unsafe { task_name_panic(task) };
+    //         println!(
+    //             "  CPU {}: \"{}\" (id={})",
+    //             cpu_id,
+    //             name,
+    //             task.id.load(Ordering::Relaxed)
+    //         );
+    //     } else {
+    //         println!("  CPU {}: <idle>", cpu_id);
+    //     }
+    // }
+    // println!("--- Tasks in run queue and ipi queue ---");
+    // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
+    //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+    //     println!(
+    //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
+    //         cpu_id, some_count, queue.captured, queue.total_before_drain
+    //     );
+    // }
 
-        // let dump = dump_scheduler();
-        // println!("--- Running tasks at panic ---");
-        // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-        //     if let Some(task) = slot {
-        //         let name = unsafe { task_name_panic(task) };
-        //         println!(
-        //             "  CPU {}: \"{}\" (id={})",
-        //             cpu_id,
-        //             name,
-        //             task.id.load(Ordering::Relaxed)
-        //         );
-        //     } else {
-        //         println!("  CPU {}: <idle>", cpu_id);
-        //     }
-        // }
-        // println!("--- Tasks in run queue and ipi queue ---");
-        // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
-        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-        //     println!(
-        //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
-        //         cpu_id, some_count, queue.captured, queue.total_before_drain
-        //     );
-        // }
+    // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
+    //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+    //     println!(
+    //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
+    //         cpu_id, some_count, queue.captured, queue.total_before_drain
+    //     );
+    // }
+    // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+    //     match task {
+    //         Some(task) => {
+    //             let stack_size = task.stack_size.load(core::sync::atomic::Ordering::Acquire);
+    //             let guard_page = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
 
-        // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
-        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-        //     println!(
-        //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
-        //         cpu_id, some_count, queue.captured, queue.total_before_drain
-        //     );
-        // }
-        // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-        //     match task {
-        //         Some(task) => {
-        //             let stack_size = task.stack_size.load(core::sync::atomic::Ordering::Acquire);
-        //             let guard_page = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
+    //             println!(
+    //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
+    //                 cpu_id, stack_size, guard_page
+    //             );
+    //         }
+    //         None => {
+    //             println!("  CPU {}: current_task=None", cpu_id);
+    //         }
+    //     }
+    // }
+    crate::platform::broadcast_panic_stop();
 
-        //             println!(
-        //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
-        //                 cpu_id, stack_size, guard_page
-        //             );
-        //         }
-        //         None => {
-        //             println!("  CPU {}: current_task=None", cpu_id);
-        //         }
-        //     }
-        // }
-        crate::platform::broadcast_panic_stop();
+    halt_loop()
+}
 
-        halt_loop()
-    } else {
+pub fn exception_panic(
+    message: alloc::string::String,
+    state: &crate::scheduling::state::State,
+) -> ! {
+    if !current_cpu_owns_panic() {
         halt_loop()
     }
+
+    PANIC_STATE.call_once(|| *state);
+    panic!("{}", message)
 }
 
 #[unsafe(no_mangle)]

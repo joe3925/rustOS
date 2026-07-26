@@ -1,7 +1,7 @@
 use super::driver_index::{self, HwIndex};
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::object_manager::{ObjRef, Object, ObjectPayload, OBJECT_MANAGER};
+use crate::object_manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;
 use kernel_types::status::DriverError;
@@ -11,12 +11,13 @@ use crate::registry::reg::{get_key, get_value, list_keys};
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_routing::pnp;
+use kernel_types::ClassEventCallback;
 use kernel_types::device::{
-    open_public_protocol, DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack,
-    DriverObject, DriverPackage, DriverRuntime, DriverState, StackLayer,
+    DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
+    DriverRuntime, DriverState, StackLayer, open_public_protocol,
 };
 use kernel_types::fs::Path;
 use kernel_types::io::IoTarget;
@@ -26,7 +27,6 @@ use kernel_types::pnp::{
 };
 use kernel_types::protocol::volmgr::VolumeProtocol;
 use kernel_types::status::{Data, DriverStatus, RegError};
-use kernel_types::ClassEventCallback;
 use spin::{Mutex, RwLock};
 
 #[repr(C)]
@@ -708,7 +708,7 @@ impl PnpManager {
             _ => {}
         }
         let m = rt.module.read();
-        if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "DriverEntry") {
+        if let Some((_, rva)) = m.exports.iter().find(|(s, _)| s == "DriverEntry") {
             let entry: unsafe extern "C" fn(&Arc<DriverObject>) -> DriverStatus =
                 unsafe { core::mem::transmute((m.image_base.as_u64() + *rva as u64) as *const ()) };
             let st = unsafe { entry(drv) };

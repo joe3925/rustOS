@@ -8,6 +8,7 @@ use crate::benchmarking::yield_once;
 use crate::benchmarking::BenchWindow;
 use crate::benchmarking::bench_c_drive_io;
 use crate::memory::heap::allocator::test_full_heap_parallel;
+use crate::profiling::backtrace::Backtrace;
 use crate::static_handlers::print;
 use crate::util::trigger_triple_fault;
 use alloc::format;
@@ -485,9 +486,11 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
         // bench_async_vs_sync_call_latency_async().await;
         // bench_runtime_executor_async().await;
         //window.start();
-        loop {
-            bench_c_drive_io_async(true).await;
-        }
+        let backtrace = Backtrace::capture();
+        println!("{:#?}", backtrace);
+        // loop {
+        //     bench_c_drive_io_async(true).await;
+        // }
         //window.stop_and_persist().await;
         //test_full_heap_parallel();
         //}

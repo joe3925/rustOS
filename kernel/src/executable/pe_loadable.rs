@@ -5,15 +5,14 @@ use crate::file_system::file::File;
 use crate::memory::paging::base_page_size;
 use crate::platform;
 use crate::println;
-use crate::profiling::unwind::register_pe_unwind_module;
 use crate::scheduling::task::Task;
 use crate::structs::range_tracker::RangeTracker;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
+use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use kernel_types::arch::VirtAddr;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
@@ -23,7 +22,7 @@ use kernel_types::memory::{
 use kernel_types::status::LoadError;
 use spin::rwlock::RwLock;
 
-use super::program::{Program, PROGRAM_MANAGER};
+use super::program::{PROGRAM_MANAGER, Program};
 
 pub struct PELoader {
     buffer: Box<[u8]>,
@@ -232,7 +231,6 @@ impl PELoader {
         let base = self.current_base.as_u64();
         let relocated = base != preferred_base;
         let pe_info = self.collect_pe_info(relocated)?;
-        register_pe_unwind_module(base, image_size, &pe_info.sections);
 
         let title = self.path.file_name().unwrap_or("unknown").to_string();
         let pdb_path = pe_info
@@ -276,7 +274,8 @@ impl PELoader {
             image_path: self.path.clone(),
             parent_pid: program.pid,
             image_base: self.current_base.into(),
-            symbols: exports.clone(),
+            image_size,
+            exports: exports.clone(),
             pe_info: Some(pe_info),
         };
 

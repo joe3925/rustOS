@@ -15,13 +15,13 @@ use spin::{Mutex, RwLock};
 
 use crate::{
     executable::pe_loadable::PELoader,
-    object_manager::{Object, ObjectPayload, OBJECT_MANAGER},
+    object_manager::{OBJECT_MANAGER, Object, ObjectPayload},
     platform,
     scheduling::task::TaskHandle,
     util::generate_guid,
 };
 use crate::{
-    memory::paging::{map_range, unmap_range_unchecked, AddressSpaceRoot},
+    memory::paging::{AddressSpaceRoot, map_range, unmap_range_unchecked},
     scheduling::scheduler::SCHEDULER,
     structs::range_tracker::RangeTracker,
 };
@@ -431,7 +431,7 @@ impl Program {
             let have = strip_ext(&m.title);
 
             if have.eq_ignore_ascii_case(want) {
-                if let Some((_, rva)) = m.symbols.iter().find(|(name, _)| name == symbol_name) {
+                if let Some((_, rva)) = m.exports.iter().find(|(name, _)| name == symbol_name) {
                     return Ok((m.image_base + *rva as u64).into());
                 }
             }
@@ -447,6 +447,17 @@ impl Program {
             .read()
             .iter()
             .any(|m| strip_ext(&m.read().title).eq_ignore_ascii_case(want))
+    }
+
+    pub fn module_containing(&self, address: VirtAddr) -> Option<ModuleHandle> {
+        let modules = self.modules.try_read()?;
+
+        modules.iter().find_map(|module| {
+            let image = module.try_read()?;
+            let start = image.image_base.as_u64();
+            let end = start.checked_add(image.image_size)?;
+            (address.as_u64() >= start && address.as_u64() < end).then(|| Arc::clone(module))
+        })
     }
 
     pub fn resolve_handle(&self, handle: UserHandle) -> Option<ObjectRef> {

@@ -6,9 +6,7 @@ use crate::memory::{
     heap::heap_capacity_bytes,
     paging::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
-use crate::profiling::unwind::{
-    CapturedCallchain, MAX_CALLCHAIN_DEPTH, capture_callchain_from_state_limited,
-};
+use crate::profiling::backtrace::{Backtrace, BacktraceStatus, MAX_BACKTRACE_DEPTH};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
@@ -47,6 +45,115 @@ use kernel_types::request::DeviceControl;
 use kernel_types::status::{DriverStatus, FileStatus};
 use serde_json::{Value, json};
 use spin::{Mutex, Once};
+
+const MAX_CALLCHAIN_DEPTH: usize = MAX_BACKTRACE_DEPTH;
+
+#[derive(Clone, Copy)]
+struct BenchCallchain {
+    frames: [u64; MAX_CALLCHAIN_DEPTH],
+    frame_kinds: [u32; MAX_CALLCHAIN_DEPTH],
+    depth: u8,
+    status: u32,
+    stack_low: u64,
+    stack_high: u64,
+}
+
+impl Default for BenchCallchain {
+    fn default() -> Self {
+        Self {
+            frames: [0; MAX_CALLCHAIN_DEPTH],
+            frame_kinds: [kernel_types::benchmark::BENCH_FRAME_KIND_UNKNOWN; MAX_CALLCHAIN_DEPTH],
+            depth: 0,
+            status: kernel_types::benchmark::BENCH_UNWIND_STATUS_OK,
+            stack_low: 0,
+            stack_high: 0,
+        }
+    }
+}
+
+impl From<Backtrace> for BenchCallchain {
+    fn from(backtrace: Backtrace) -> Self {
+        let mut callchain = Self::default();
+        for (index, frame) in backtrace.frames().iter().enumerate() {
+            let ip = frame.instruction_pointer().as_u64();
+            callchain.frames[index] = ip;
+            callchain.frame_kinds[index] = bench_frame_kind(ip);
+            callchain.depth += 1;
+        }
+        if let Some(bounds) = backtrace.stack_bounds() {
+            callchain.stack_low = bounds.low.as_u64();
+            callchain.stack_high = bounds.high.as_u64();
+        }
+        callchain.status = bench_unwind_status(backtrace.status());
+        callchain
+    }
+}
+
+fn bench_unwind_status(status: BacktraceStatus) -> u32 {
+    let mut wire = kernel_types::benchmark::BENCH_UNWIND_STATUS_OK;
+    for (semantic, encoded) in [
+        (
+            BacktraceStatus::TRUNCATED,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_TRUNCATED,
+        ),
+        (
+            BacktraceStatus::NO_UNWIND_INFO,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_NO_UNWIND_INFO,
+        ),
+        (
+            BacktraceStatus::BAD_STACK_READ,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_BAD_STACK_READ,
+        ),
+        (
+            BacktraceStatus::BAD_UNWIND_INFO,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_BAD_UNWIND_INFO,
+        ),
+        (
+            BacktraceStatus::UNSUPPORTED_OPERATION,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_UNSUPPORTED_OPCODE,
+        ),
+        (
+            BacktraceStatus::LEAF_FALLBACK,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_LEAF_FALLBACK,
+        ),
+        (
+            BacktraceStatus::PE_UNWIND,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_PE_UNWIND,
+        ),
+        (
+            BacktraceStatus::UNKNOWN_FRAME,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_UNKNOWN_FRAME,
+        ),
+        (
+            BacktraceStatus::STACK_BOUNDS_MISSING,
+            kernel_types::benchmark::BENCH_UNWIND_STATUS_STACK_BOUNDS_MISSING,
+        ),
+    ] {
+        if status.contains(semantic) {
+            wire |= encoded;
+        }
+    }
+    wire
+}
+
+fn bench_frame_kind(ip: u64) -> u32 {
+    for program in PROGRAM_MANAGER.all() {
+        let Some(program) = program.try_read() else {
+            continue;
+        };
+        let Some(module) = program.module_containing(kernel_types::arch::VirtAddr::new(ip)) else {
+            continue;
+        };
+        if module
+            .try_read()
+            .and_then(|module| module.pe_info.as_ref().map(|pe| pe.is_64))
+            .unwrap_or(false)
+        {
+            return kernel_types::benchmark::BENCH_FRAME_KIND_PE_X64;
+        }
+    }
+    kernel_types::benchmark::BENCH_FRAME_KIND_UNKNOWN
+}
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
 pub const BENCH_ENABLED: bool = true;
@@ -258,7 +365,7 @@ impl BenchRing {
         &mut self,
         rip: u64,
         task_id: u64,
-        mut callchain: CapturedCallchain,
+        mut callchain: BenchCallchain,
         ts: u64,
         core_id: u16,
         max_unwind_depth: usize,
@@ -645,8 +752,8 @@ pub fn bench_submit_rip_sample(core_id: usize, rip: u64, stack: &[u64]) {
     bench_capture_metrics(core_id, ts);
 }
 
-fn callchain_from_external_stack(rip: u64, stack: &[u64]) -> CapturedCallchain {
-    let mut out = CapturedCallchain::default();
+fn callchain_from_external_stack(rip: u64, stack: &[u64]) -> BenchCallchain {
+    let mut out = BenchCallchain::default();
     let max_depth = ACTIVE_MAX_UNWIND_DEPTH
         .load(Ordering::Relaxed)
         .clamp(1, MAX_CALLCHAIN_DEPTH);
@@ -843,7 +950,7 @@ fn bench_log_sample_for_core(
     core_id: usize,
     rip: u64,
     task_id: u64,
-    callchain: CapturedCallchain,
+    callchain: BenchCallchain,
     ts: u64,
 ) {
     let Some(state) = bench_state() else {
@@ -873,7 +980,7 @@ fn bench_log_sample_for_core_try(
     core_id: usize,
     rip: u64,
     task_id: u64,
-    callchain: CapturedCallchain,
+    callchain: BenchCallchain,
     ts: u64,
 ) {
     let Some(state) = bench_state_get() else {
@@ -974,7 +1081,8 @@ pub fn bench_submit_interrupt_sample_current_core(state: &State) {
     }
     let task_id = task.as_ref().map(|t| t.task_id()).unwrap_or(0);
     let max_unwind_depth = ACTIVE_MAX_UNWIND_DEPTH.load(Ordering::Relaxed);
-    let callchain = capture_callchain_from_state_limited(state, task.as_deref(), max_unwind_depth);
+    let callchain: BenchCallchain =
+        Backtrace::from_state_limited(state, task.as_deref(), max_unwind_depth).into();
     if callchain.status
         & (kernel_types::benchmark::BENCH_UNWIND_STATUS_BAD_STACK_READ
             | kernel_types::benchmark::BENCH_UNWIND_STATUS_BAD_UNWIND_INFO

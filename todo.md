@@ -36,10 +36,8 @@ If there is a * it must be completed before user space is started
 3. [ ] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
 
 ## Kernel General (KEG)
-1. [ ] Move stack unwinding out of the kernel to its own crate 
-2. [ ] Symbolic stack unwinds
-3. [ ] Clearer stack unwind api, I like what the std lib does with Backtrace 
-4. [ ] * Change the registry from inline proto to a .proto file
+1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 
+2. [ ] * Change the registry from inline proto to a .proto file
 
 ## Error handling (ERH) (all around messy and I need to refactor it, not sure in what direction I want to take it yet)
 1. [ ] * Figure out how error handling should be refactored
