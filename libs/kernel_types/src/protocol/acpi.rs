@@ -1,13 +1,14 @@
+use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
+use crate::error::KernelError;
+use crate::pci::{EcamSegment, PrtEntry};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
-use crate::pci::{EcamSegment, PrtEntry};
-use crate::status::DriverStatus;
 
 #[repr(C)]
 pub struct AcpiPciProtocolVTable {
-    pub get_ecam_segments: extern "C" fn(&Arc<DeviceObject>) -> Result<Vec<EcamSegment>, DriverStatus>,
-    pub get_prt_entries: extern "C" fn(&Arc<DeviceObject>) -> Result<Vec<PrtEntry>, DriverStatus>,
+    pub get_ecam_segments:
+        extern "C" fn(&Arc<DeviceObject>) -> Result<Vec<EcamSegment>, KernelError>,
+    pub get_prt_entries: extern "C" fn(&Arc<DeviceObject>) -> Result<Vec<PrtEntry>, KernelError>,
 }
 
 pub enum AcpiPciProtocol {}

@@ -1,21 +1,21 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use kernel_types::error::KernelError;
 pub use kernel_types::fs::*;
 use kernel_types::fs::{File, OpenFlags, Path};
-use kernel_types::status::FileStatus;
-pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<File, FileStatus> {
+pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<File, KernelError> {
     unsafe { kernel_sys::file_open(path, flags).await }
 }
 
-pub async fn list_dir(path: &Path) -> Result<Vec<String>, FileStatus> {
+pub async fn list_dir(path: &Path) -> Result<Vec<String>, KernelError> {
     unsafe { kernel_sys::fs_list_dir(path).await }
 }
 
-pub async fn make_dir(path: &Path) -> Result<(), FileStatus> {
+pub async fn make_dir(path: &Path) -> Result<(), KernelError> {
     unsafe { kernel_sys::fs_make_dir(path).await }
 }
 
-pub async fn remove_dir(path: &Path) -> Result<(), FileStatus> {
+pub async fn remove_dir(path: &Path) -> Result<(), KernelError> {
     unsafe { kernel_sys::fs_remove_dir(path).await }
 }
 

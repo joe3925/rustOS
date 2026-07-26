@@ -25,6 +25,9 @@ use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
 use kernel_api::device::{open_public_protocol, publish_stack_protocol, register_protocol};
+use kernel_api::error::{
+    error, error_with_message, DriverErrorKind, ErrorKind, KernelError, ResultErrorContext,
+};
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::PartitionInfo;
@@ -46,7 +49,6 @@ use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::{io, pnp};
 use kernel_api::request::{Flush, FlushDirty, FlushOwner, Read, Write};
 use kernel_api::request_handler;
-use kernel_api::status::DriverStatus;
 
 use spin::Once;
 
@@ -68,7 +70,7 @@ impl DeviceRead for VolPdoIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut Read<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         vol_pdo_read_impl(dev, req).await
     }
 }
@@ -78,28 +80,28 @@ impl DeviceWrite for VolPdoIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut Write<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         vol_pdo_write_impl(dev, req).await
     }
 }
 
 impl DeviceFlush for VolPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut Flush) -> DriverStep {
+    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut Flush) -> Result<DriverStep, kernel_api::error::KernelError> {
         vol_pdo_flush_impl(dev, req).await
     }
 }
 
 impl DeviceFlushDirty for VolPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut FlushDirty) -> DriverStep {
+    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut FlushDirty) -> Result<DriverStep, kernel_api::error::KernelError> {
         vol_pdo_flush_dirty_impl(dev, req).await
     }
 }
 
 impl DeviceFlushOwner for VolPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut FlushOwner) -> DriverStep {
+    async fn handler<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut FlushOwner) -> Result<DriverStep, kernel_api::error::KernelError> {
         vol_pdo_flush_owner_impl(dev, req).await
     }
 }
@@ -141,7 +143,7 @@ impl CacheBackend {
 }
 
 impl VolumeCacheBackend for CacheBackend {
-    type Error = DriverStatus;
+    type Error = KernelError;
 
     fn read_phys_framed<'a, 'buffer>(
         &'a self,
@@ -157,7 +159,11 @@ impl VolumeCacheBackend for CacheBackend {
 
             let Some(offset) = lba.checked_mul(BLOCK_SIZE as u64) else {
                 cold_path();
-                return Err(DriverStatus::InvalidParameter);
+                return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                    alloc::format!(
+                        "calculating volmgr cache read offset for LBA {lba}, block count {blocks}"
+                    )
+                });
             };
 
             let mut total_len = 0usize;
@@ -165,7 +171,11 @@ impl VolumeCacheBackend for CacheBackend {
             while block_idx < blocks {
                 let Some(block_lba) = lba.checked_add(block_idx as u64) else {
                     cold_path();
-                    return Err(DriverStatus::InvalidParameter);
+                    return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                        alloc::format!(
+                            "calculating volmgr cache block LBA from base {lba} and index {block_idx}"
+                        )
+                    });
                 };
                 let block_len = match self.block_len(block_lba) {
                     Some(block_len) => block_len,
@@ -175,12 +185,21 @@ impl VolumeCacheBackend for CacheBackend {
                             "volmgr: CacheBackend::read_phys_framed invalid lba {} for volume length {}",
                             block_lba, self.volume_bytes
                         );
-                        return Err(DriverStatus::InvalidParameter);
+                        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                            alloc::format!(
+                                "reading cache block LBA {block_lba} beyond volume length {}",
+                                self.volume_bytes
+                            )
+                        });
                     }
                 };
                 let Some(next_total_len) = total_len.checked_add(block_len) else {
                     cold_path();
-                    return Err(DriverStatus::InvalidParameter);
+                    return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                        alloc::format!(
+                            "accumulating cache read length at block index {block_idx}"
+                        )
+                    });
                 };
                 total_len = next_total_len;
                 block_idx += 1;
@@ -188,23 +207,26 @@ impl VolumeCacheBackend for CacheBackend {
 
             if unlikely(buffer.len() < total_len) {
                 cold_path();
-                return Err(DriverStatus::InvalidParameter);
+                return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                    alloc::format!(
+                        "cache read buffer has {} bytes but {total_len} are required for LBA {lba}, block count {blocks}",
+                        buffer.len()
+                    )
+                });
             }
 
             let mut req =  Read::new(
                 offset,
                  total_len,
                  false,Some(buffer),);
-            let status = io::send_down_stack(self.target.clone(), &mut req).await;
-
-            if unlikely(status != DriverStatus::Success) {
-                cold_path();
-                println!(
-                    "volmgr: CacheBackend::read_phys_framed lower read failed at lba {} blocks {} len {}: {}",
-                    lba, blocks, total_len, status
-                );
-                return Err(status);
-            }
+            io::send_down_stack(self.target.clone(), &mut req)
+                .await
+                .map(|_| ())
+                .with_context(|| {
+                    alloc::format!(
+                        "reading lower volume at cache LBA {lba}, block count {blocks}, byte length {total_len}"
+                    )
+                })?;
 
             Ok(total_len)
         }
@@ -234,7 +256,14 @@ impl VolumeCacheBackend for CacheBackend {
                                     len,
                                     self.volume_bytes
                                 );
-                                return Err(DriverStatus::InvalidParameter);
+                                return Err(error(DriverErrorKind::InvalidParameter)).with_context(
+                                    || {
+                                        alloc::format!(
+                                            "reading volume at offset {offset} with length {len} beyond volume length {}",
+                                            self.volume_bytes
+                                        )
+                                    },
+                                );
                             }
                         };
 
@@ -247,18 +276,32 @@ impl VolumeCacheBackend for CacheBackend {
                                 max_len,
                                 self.volume_bytes
                             );
-                            return Err(DriverStatus::InvalidParameter);
+                            return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                                alloc::format!(
+                                    "volume read at offset {offset} with length {len} exceeds remaining length {max_len}"
+                                )
+                            });
                         }
 
                         if !body.no_buffer {
                             let buffer = body
                                 .buffer
                                 .as_mut()
-                                .ok_or(DriverStatus::InvalidParameter)?;
+                                .ok_or_else(|| error(DriverErrorKind::InvalidParameter))
+                                .with_context(|| {
+                                    alloc::format!(
+                                        "volume read at offset {offset} with length {len} is missing its buffer"
+                                    )
+                                })?;
 
                             buffer
                                 .ensure_phys_described()
-                                .map_err(|_| DriverStatus::InsufficientResources)?;
+                                .map_err(|_| error(DriverErrorKind::InsufficientResources))
+                                .with_context(|| {
+                                    alloc::format!(
+                                        "describing the physical buffer for volume read at offset {offset} with length {len}"
+                                    )
+                                })?;
                         }
 
                         if first {
@@ -271,17 +314,14 @@ impl VolumeCacheBackend for CacheBackend {
                 (first_offset, first_len)
             };
 
-            let status = io::send_down_stack(self.target.clone(), req).await;
-            if unlikely(status != DriverStatus::Success) {
-                cold_path();
-                println!(
-                    "volmgr: CacheBackend::read_request lower read failed at offset {} len {}: {}",
-                    first_offset,
-                    first_len,
-                    status
-                );
-                return Err(status);
-            }
+            io::send_down_stack(self.target.clone(), req)
+                .await
+                .map(|_| ())
+                .with_context(|| {
+                    alloc::format!(
+                        "forwarding volume read chain beginning at offset {first_offset}, length {first_len}"
+                    )
+                })?;
 
             Ok(())
         }
@@ -310,7 +350,14 @@ impl VolumeCacheBackend for CacheBackend {
                                 "volmgr: CacheBackend::write_request invalid write offset {} len {} for volume length {}",
                                 offset, len, self.volume_bytes
                             );
-                            return Err(DriverStatus::InvalidParameter);
+                            return Err(error(DriverErrorKind::InvalidParameter)).with_context(
+                                || {
+                                    alloc::format!(
+                                        "writing volume at offset {offset} with length {len} beyond volume length {}",
+                                        self.volume_bytes
+                                    )
+                                },
+                            );
                         }
                     };
 
@@ -323,18 +370,32 @@ impl VolumeCacheBackend for CacheBackend {
                             max_len,
                             self.volume_bytes
                         );
-                        return Err(DriverStatus::InvalidParameter);
+                        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                            alloc::format!(
+                                "volume write at offset {offset} with length {len} exceeds remaining length {max_len}"
+                            )
+                        });
                     }
 
                     if !body.no_buffer {
                         let buffer = body
                             .buffer
                             .as_mut()
-                            .ok_or(DriverStatus::InvalidParameter)?;
+                            .ok_or_else(|| error(DriverErrorKind::InvalidParameter))
+                            .with_context(|| {
+                                alloc::format!(
+                                    "volume write at offset {offset} with length {len} is missing its buffer"
+                                )
+                            })?;
 
                         buffer
                             .ensure_phys_described()
-                            .map_err(|_| DriverStatus::InsufficientResources)?;
+                            .map_err(|_| error(DriverErrorKind::InsufficientResources))
+                            .with_context(|| {
+                                alloc::format!(
+                                    "describing the physical buffer for volume write at offset {offset} with length {len}"
+                                )
+                            })?;
                     }
 
                     if first {
@@ -347,15 +408,14 @@ impl VolumeCacheBackend for CacheBackend {
                 (first_offset, first_len)
             };
 
-            let status = io::send_down_stack(self.target.clone(), req).await;
-            if unlikely(status != DriverStatus::Success) {
-                cold_path();
-                println!(
-                    "volmgr: CacheBackend::write_request lower write failed at offset {} len {}: {}",
-                    first_offset, first_len, status
-                );
-                return Err(status);
-            }
+            io::send_down_stack(self.target.clone(), req)
+                .await
+                .map(|_| ())
+                .with_context(|| {
+                    alloc::format!(
+                        "forwarding volume write chain beginning at offset {first_offset}, length {first_len}"
+                    )
+                })?;
 
             Ok(())
         }
@@ -365,14 +425,15 @@ impl VolumeCacheBackend for CacheBackend {
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let mut req = Flush { should_block: true };
-            let status = io::send_down_stack(self.target.clone(), &mut req).await;
-            if unlikely(status != DriverStatus::Success && status != DriverStatus::NotImplemented) {
-                cold_path();
-                println!(
-                    "volmgr: CacheBackend::flush_device lower flush failed: {}",
-                    status
-                );
-                return Err(status);
+            match io::send_down_stack(self.target.clone(), &mut req).await {
+                Ok(_) => {}
+                Err(err)
+                    if err.kind()
+                        == ErrorKind::Driver(DriverErrorKind::NotImplemented) => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| "flushing the lower device for the volume cache")
+                }
             }
             Ok(())
         }
@@ -382,16 +443,10 @@ impl VolumeCacheBackend for CacheBackend {
         async move {
             let mut req = RegisterDmaBacking { backing: &*backing };
 
-            let status = pnp::send_down_stack(self.target.clone(), &mut req).await;
-
-            if unlikely(status != DriverStatus::Success) {
-                cold_path();
-                println!(
-                    "volmgr: CacheBackend::dma_map_cache lower RegisterDmaBacking failed: {}",
-                    status
-                );
-                return Err(status);
-            }
+            pnp::send_down_stack(self.target.clone(), &mut req)
+                .await
+                .map(|_| ())
+                .with_context(|| "registering volume-cache DMA backing with the lower device")?;
 
             Ok(())
         }
@@ -476,41 +531,53 @@ fn partition_len_bytes(pi: &PartitionInfo) -> Option<u64> {
 }
 
 #[inline]
-fn cache_error_status(context: &str, err: CacheError<DriverStatus>) -> DriverStatus {
+fn cache_error(context: &str, err: CacheError<KernelError>) -> KernelError {
     match err {
-        CacheError::Backend(status) => {
-            cold_path();
-            println!("volmgr: {} lower-device error: {}", context, status);
-            status
-        }
-        err => {
-            cold_path();
-            println!("volmgr: {} cache error: {:?}", context, err);
-            match err {
-                CacheError::InvalidIoBuffer(_) => DriverStatus::InvalidParameter,
-                _ => DriverStatus::Unsuccessful,
-            }
-        }
+        CacheError::Backend(err) => err.with_context(context),
+        CacheError::InvalidConfig => error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("{context}: invalid cache configuration"),
+        ),
+        CacheError::OffsetOverflow => error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("{context}: cache offset overflow"),
+        ),
+        CacheError::Closed => error_with_message(
+            DriverErrorKind::DeviceNotReady,
+            format_args!("{context}: volume cache is closed"),
+        ),
+        CacheError::NoFreePages => error_with_message(
+            DriverErrorKind::InsufficientResources,
+            format_args!("{context}: volume cache has no free pages"),
+        ),
+        CacheError::InsufficientResources => error_with_message(
+            DriverErrorKind::InsufficientResources,
+            format_args!("{context}: insufficient cache resources"),
+        ),
+        CacheError::InvalidIoBuffer(buffer_error) => error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("{context}: invalid cache I/O buffer: {buffer_error:?}"),
+        ),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, vol_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn vol_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp_ops = PnpOps::new();
     pnp_ops.init_complete.set(vol_init_complete);
     pnp_ops.query_device_relations.set(vol_enumerate_devices);
 
     dev_init.set_dev_ext_default::<VolExt>();
     dev_init.pnp_ops = Some(pnp_ops);
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -518,27 +585,28 @@ pub async fn vol_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut InitComplete,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let devnode = dev.dev_node.get().unwrap().upgrade().unwrap();
     let proto = match open_public_protocol::<PartitionInfoProtocol>(&devnode) {
         Ok(p) => p,
         Err(e) => {
             cold_path();
-            return DriverStep::complete(e);
+            return Err(error(e))
+                .with_context(|| "opening the public partition-info protocol in volmgr");
         }
     };
     let pi = match (proto.query)(&proto.provider()) {
         Ok(pi) => pi,
         Err(e) => {
             cold_path();
-            return DriverStep::complete(e);
+            return Err(e).with_context(|| "querying partition information in volmgr");
         }
     };
 
     let dx = ext::<VolExt>(&dev);
     dx.part.call_once(|| pi);
 
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 #[request_handler]
@@ -546,34 +614,35 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dx = ext::<VolExt>(&device);
 
     let binding = dx.part.get();
     let pi = if let Some(ref pi) = binding {
         pi
     } else {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     };
 
     let binding = (pi.gpt_header, pi.gpt_entry);
     let (_hdr, ent) = if let (Some(ref hdr), Some(ref ent)) = binding {
         (hdr, ent)
     } else {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     };
 
     if dx
         .enumerated
         .swap(true, core::sync::atomic::Ordering::AcqRel)
     {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let parent_dn = if let Some(dn) = device.dev_node.get().unwrap().upgrade() {
         dn
     } else {
-        return DriverStep::complete(DriverStatus::Unsuccessful);
+        return Err(error(DriverErrorKind::NoSuchDevice))
+            .with_context(|| "enumerating a volume whose parent device node was removed");
     };
 
     let zero = [0u8; 16];
@@ -592,7 +661,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
 
     let ptype = ent.partition_type_guid;
     if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT || ptype == MICROSOFT_RESERVED {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let part_guid_s = guid_to_string(&ent.unique_partition_guid);
@@ -628,45 +697,47 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         init,
     );
 
-    if let Some(tgt) = pnp_get_device_target(&parent_dn.instance_path) {
-        let pdx = ext::<VolPdoExt>(&pdo);
-        let tgt_clone = tgt.clone();
-        let part_info = dx.part.get().unwrap().clone();
-        let vol_len = partition_len_bytes(&part_info).unwrap_or(0);
+    let tgt = pnp_get_device_target(&parent_dn.instance_path).ok_or_else(|| {
+        error(DriverErrorKind::NoSuchDevice).with_context(alloc::format!(
+            "resolving the lower I/O target for volume parent {}",
+            parent_dn.instance_path
+        ))
+    })?;
+    let pdx = ext::<VolPdoExt>(&pdo);
+    let tgt_clone = tgt.clone();
+    let part_info = dx.part.get().unwrap().clone();
+    let vol_len = partition_len_bytes(&part_info).ok_or_else(|| {
+        error(DriverErrorKind::InvalidParameter)
+            .with_context("calculating volume length from GPT partition information")
+    })?;
 
-        pdx.backing.call_once(|| tgt);
-        pdx.part.call_once(|| part_info);
-        pdx.len_bytes.call_once(|| vol_len);
+    pdx.backing.call_once(|| tgt);
+    pdx.part.call_once(|| part_info);
+    pdx.len_bytes.call_once(|| vol_len);
 
-        if vol_len != 0 {
-            let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
-            // TODO: set this based on system memory and maybe volume size
-            let cfg = CacheConfig::new(CACHE_CAPACITY_BYTES / BLOCK_SIZE, 50, 25);
-            match VolCache::new(backend, cfg).await {
-                Ok(cache) => {
-                    pdx.cache.call_once(|| Arc::new(cache));
-                }
-                Err(err) => {
-                    println!("volmgr: vol_enumerate_devices cache init failed: {:?}", err);
-                }
-            }
-        }
-    }
+    let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
+    // TODO: set this based on system memory and maybe volume size
+    let cfg = CacheConfig::new(CACHE_CAPACITY_BYTES / BLOCK_SIZE, 50, 25);
+    let cache = VolCache::new(backend, cfg)
+        .await
+        .map_err(|err| cache_error("initializing the volume cache", err))?;
+    pdx.cache.call_once(|| Arc::new(cache));
 
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 async fn vol_pdo_read_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut Read<'data>,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dx = ext::<VolPdoExt>(dev);
 
     let vol_len = match dx.len_bytes.get() {
         Some(v) => *v,
         None => {
             cold_path();
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::NoSuchDevice))
+                .with_context(|| "reading a volume before its length was initialized");
         }
     };
 
@@ -682,12 +753,16 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
 
     if unlikely(len_req == 0) {
         cold_path();
-        return DriverStep::complete(DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
 
     if unlikely(offset >= vol_len) {
         cold_path();
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+            alloc::format!(
+                "volume read offset {offset} is outside volume length {vol_len}"
+            )
+        });
     }
 
     if unlikely(
@@ -696,7 +771,11 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
             .map_or(true, |end| end > vol_len),
     ) {
         cold_path();
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+            alloc::format!(
+                "volume read range offset {offset}, length {len_req} exceeds volume length {vol_len}"
+            )
+        });
     }
 
     let len = if no_buffer {
@@ -707,7 +786,7 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
 
     if unlikely(len == 0) {
         cold_path();
-        return DriverStep::complete(DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
 
     {
@@ -719,15 +798,16 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
         Some(c) => c,
         None => {
             cold_path();
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::DeviceNotReady))
+                .with_context(|| "reading a volume before its cache was initialized");
         }
     };
 
     match cache.read_request(req).await {
-        Ok(()) => DriverStep::complete(DriverStatus::Success),
+        Ok(()) => Ok(DriverStep::Complete),
         Err(err) => {
             cold_path();
-            DriverStep::complete(cache_error_status("vol_pdo_read cache.read_request", err))
+            Err(cache_error("servicing a cached volume read", err))
         }
     }
 }
@@ -735,14 +815,15 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
 async fn vol_pdo_write_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut Write<'data>,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dx = ext::<VolPdoExt>(dev);
 
     let vol_len = match dx.len_bytes.get() {
         Some(v) => *v,
         None => {
             cold_path();
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::NoSuchDevice))
+                .with_context(|| "writing a volume before its length was initialized");
         }
     };
 
@@ -758,12 +839,16 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
 
     if unlikely(len_req == 0) {
         cold_path();
-        return DriverStep::complete(DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
 
     if unlikely(offset >= vol_len) {
         cold_path();
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+            alloc::format!(
+                "volume write offset {offset} is outside volume length {vol_len}"
+            )
+        });
     }
 
     if unlikely(
@@ -772,7 +857,11 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
             .map_or(true, |end| end > vol_len),
     ) {
         cold_path();
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+            alloc::format!(
+                "volume write range offset {offset}, length {len_req} exceeds volume length {vol_len}"
+            )
+        });
     }
 
     let len = if no_buffer {
@@ -783,7 +872,7 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
 
     if unlikely(len == 0) {
         cold_path();
-        return DriverStep::complete(DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
 
     {
@@ -795,34 +884,35 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
         Some(c) => c,
         None => {
             cold_path();
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::DeviceNotReady))
+                .with_context(|| "writing a volume before its cache was initialized");
         }
     };
 
     match cache.write_request(req).await {
-        Ok(()) => DriverStep::complete(DriverStatus::Success),
+        Ok(()) => Ok(DriverStep::Complete),
         Err(err) => {
             cold_path();
-            DriverStep::complete(cache_error_status("vol_pdo_write cache.write_request", err))
+            Err(cache_error("servicing a cached volume write", err))
         }
     }
 }
 
-async fn vol_pdo_flush_impl<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut Flush) -> DriverStep {
+async fn vol_pdo_flush_impl<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut Flush) -> Result<DriverStep, kernel_api::error::KernelError> {
     vol_pdo_flush_common(dev, req.should_block, None).await
 }
 
 async fn vol_pdo_flush_dirty_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut FlushDirty,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     vol_pdo_flush_common(dev, req.should_block, None).await
 }
 
 async fn vol_pdo_flush_owner_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut FlushOwner,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let body = req;
     vol_pdo_flush_common(dev, body.should_block, Some(body.owner)).await
 }
@@ -831,14 +921,15 @@ async fn vol_pdo_flush_common(
     dev: &Arc<DeviceObject>,
     should_block: bool,
     flush_owner: Option<u64>,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dx = ext::<VolPdoExt>(dev);
 
     let cache = match dx.cache.get() {
         Some(c) => c,
         None => {
             cold_path();
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::DeviceNotReady))
+                .with_context(|| "flushing a volume before its cache was initialized");
         }
     };
 
@@ -846,33 +937,33 @@ async fn vol_pdo_flush_common(
         if should_block {
             match cache.flush_owner(owner).await {
                 Ok(()) => {
-                    return DriverStep::complete(DriverStatus::Success);
+                    return Ok(DriverStep::Complete);
                 }
                 Err(err) => {
                     cold_path();
-                    return DriverStep::complete(cache_error_status(
-                        "vol_pdo_flush cache.flush_owner",
+                    return Err(cache_error(
+                        &alloc::format!("flushing volume-cache owner {owner}"),
                         err,
                     ));
                 }
             }
         } else {
             VolCache::flush_owner_background(cache, owner);
-            return DriverStep::complete(DriverStatus::Success);
+            return Ok(DriverStep::Complete);
         }
     }
 
     if should_block {
         match cache.flush().await {
-            Ok(()) => DriverStep::complete(DriverStatus::Success),
+            Ok(()) => Ok(DriverStep::Complete),
             Err(err) => {
                 cold_path();
-                DriverStep::complete(cache_error_status("vol_pdo_flush cache.flush", err))
+                Err(cache_error("flushing the volume cache", err))
             }
         }
     } else {
         cache.flush_background_pass();
-        DriverStep::complete(DriverStatus::Success)
+        Ok(DriverStep::Complete)
     }
 }
 
@@ -881,14 +972,18 @@ async fn vol_pdo_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if let Some(dn) = dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
-            register_protocol::<VolumeProtocol>(dev, &VOLMGR_INFO_VTABLE);
-            publish_stack_protocol::<VolumeProtocol>(&dn);
+            register_protocol::<VolumeProtocol>(dev, &VOLMGR_INFO_VTABLE)
+                .map_err(error)
+                .with_context(|| "registering the volmgr volume protocol")?;
+            publish_stack_protocol::<VolumeProtocol>(&dn)
+                .map_err(error)
+                .with_context(|| "publishing the volmgr volume protocol")?;
         }
     }
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 #[request_handler]
@@ -896,16 +991,19 @@ pub async fn vol_pdo_remove_device<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut RemoveDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dx = ext::<VolPdoExt>(dev);
 
     if let Some(cache) = dx.cache.get() {
         if let Err(err) = cache.close_and_flush().await {
-            let _ = cache_error_status("vol_pdo_remove_device cache.close_and_flush", err);
+            return Err(cache_error(
+                "closing and flushing the volume cache during device removal",
+                err,
+            ));
         }
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -913,18 +1011,19 @@ async fn vol_pdo_register_dma_backing<'req, 'data, 'b>(
     _pdo: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut RegisterDmaBacking<'data>,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Complete)
 }
 
 extern "C" fn vol_partition_info(
     device: &Arc<DeviceObject>,
-) -> Result<PartitionInfo, DriverStatus> {
+) -> Result<PartitionInfo, KernelError> {
     let dx = ext::<VolPdoExt>(device);
     if let Some(pi) = dx.part.get() {
         Ok(pi.clone())
     } else {
-        Err(DriverStatus::Unsuccessful)
+        Err(error(DriverErrorKind::DeviceNotReady))
+            .with_context(|| "querying partition information before volmgr initialized it")
     }
 }
 const VOLMGR_INFO_VTABLE: VolumeProtocolVTable = VolumeProtocolVTable {

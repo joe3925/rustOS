@@ -20,7 +20,6 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::runtime::spawn_blocking;
-use kernel_api::status::DriverStatus;
 use kernel_api::{println, request_handler};
 use spin::RwLock;
 
@@ -37,15 +36,15 @@ fn panic(info: &PanicInfo) -> ! {
     panic_common(MOD_NAME, info)
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, bus_driver_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp_ops = PnpOps::new();
     pnp_ops.start_device.set(bus_driver_prepare_hardware);
     pnp_ops.query_device_relations.set(enumerate_bus);
@@ -53,7 +52,7 @@ pub extern "C" fn bus_driver_device_add(
     dev_init_ptr.set_dev_ext_default::<DevExt>();
     dev_init_ptr.pnp_ops = Some(pnp_ops);
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -61,7 +60,7 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let (dsdt, ssdts) = {
         let acpi_tables = get_acpi_tables();
 
@@ -119,13 +118,13 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     .await;
 
     let Ok(aml_ctx) = parsed else {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     };
 
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
 
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let offset = paddr & (PAGE_SIZE - 1);
@@ -150,7 +149,7 @@ pub async fn enumerate_bus<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = device
@@ -189,7 +188,7 @@ pub async fn enumerate_bus<'req, 'data, 'b>(
     }
     create_synthetic_i8042_pdo(&parent_dev_node);
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
     let ids = DeviceIds {

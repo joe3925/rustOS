@@ -8,7 +8,7 @@ use kernel_types::dma::{
     DmaBufferView, DmaMapError, DmaMappedBuffer, DmaMappingStrategy, IoBuffer, IoBufferAccess,
     IoBufferDmaSegment, IoBufferError, IoBufferPageFrame,
 };
-use kernel_types::status::DriverStatus;
+use kernel_types::error::DriverErrorKind;
 
 pub fn dma_base_page_size() -> usize {
     unsafe { kernel_sys::kernel_dma_base_page_size() as usize }
@@ -17,20 +17,20 @@ pub fn dma_base_page_size() -> usize {
 pub fn register_pci_pdo(
     pdo: &Arc<DeviceObject>,
     identity: dma::DmaPciDeviceIdentity,
-) -> DriverStatus {
+) -> Result<(), DriverErrorKind> {
     unsafe { kernel_sys::kernel_dma_register_pci_pdo(pdo, identity) }
 }
 
 pub fn register_platform_pdo(
     pdo: &Arc<DeviceObject>,
     identity: dma::DeviceMmuPlatformDeviceIdentity,
-) -> DriverStatus {
+) -> Result<(), DriverErrorKind> {
     unsafe { kernel_sys::kernel_dma_register_platform_pdo(pdo, identity) }
 }
 
 pub fn open_device_handle(
     device: &Arc<DeviceObject>,
-) -> Result<dma::DmaDeviceHandle, DriverStatus> {
+) -> Result<dma::DmaDeviceHandle, DriverErrorKind> {
     unsafe { kernel_sys::kernel_dma_open_device_handle(device) }
 }
 

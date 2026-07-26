@@ -13,8 +13,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -109,7 +109,7 @@ impl Cli {
                         }
                         "-h" | "--help" => return Err(usage()),
                         other => {
-                            return Err(format!("unknown build argument `{other}`\n\n{}", usage()))
+                            return Err(format!("unknown build argument `{other}`\n\n{}", usage()));
                         }
                     }
                 }
@@ -171,7 +171,7 @@ impl Cli {
                         }
                         "-h" | "--help" => return Err(usage()),
                         other => {
-                            return Err(format!("unknown qemu argument `{other}`\n\n{}", usage()))
+                            return Err(format!("unknown qemu argument `{other}`\n\n{}", usage()));
                         }
                     }
                 }
@@ -495,8 +495,12 @@ fn generate_kernel_def(root: &Path, def_path: &Path) -> Result<(), String> {
     let exports_path = root.join("kernel").join("src").join("exports.rs");
     let contents = fs::read_to_string(&exports_path)
         .map_err(|err| format!("failed to read {}: {err}", exports_path.display()))?;
-    let start = contents
+    let export_macro = contents
+        .find("export!")
+        .ok_or_else(|| "missing `export!` macro".to_string())?;
+    let start = contents[export_macro..]
         .find('{')
+        .map(|offset| export_macro + offset)
         .ok_or_else(|| "missing opening `{` in export! macro".to_string())?;
     let end = contents
         .rfind('}')
@@ -691,11 +695,7 @@ fn build_std_args() -> [&'static str; 4] {
 }
 
 fn profile(release: bool) -> &'static str {
-    if release {
-        "release"
-    } else {
-        "debug"
-    }
+    if release { "release" } else { "debug" }
 }
 
 fn copy_artifact(source: &Path, destination: &Path, what: &str) -> Result<(), String> {

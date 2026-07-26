@@ -3,9 +3,9 @@ use alloc::sync::Arc;
 use kernel_sys::KernelAcpiHandler;
 
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_types::error::{DriverErrorKind, KernelError};
 use kernel_types::fdt::FdtHeader;
 use kernel_types::io::IoTarget;
-use kernel_types::status::{DriverError, DriverStatus};
 use kernel_types::{ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload};
 
 pub use kernel_types::pnp::*;
@@ -14,32 +14,39 @@ pub mod io {
     use alloc::sync::{Arc, Weak};
     use kernel_routing::IoRequest;
     use kernel_types::device::{DevNode, DeviceObject};
+    use kernel_types::error::KernelError;
     use kernel_types::io::IoTarget;
-    use kernel_types::status::DriverStatus;
+    use kernel_types::pnp::DriverStep;
 
     pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
         kernel_routing::io::resolve_target(link_path)
     }
 
-    pub async fn send_to_device<K: IoRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+    pub async fn send_to_device<K: IoRequest>(
+        target: IoTarget,
+        req: &mut K,
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::io::send_to_device(target, req).await
     }
 
-    pub async fn send_down_stack<K: IoRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+    pub async fn send_down_stack<K: IoRequest>(
+        target: IoTarget,
+        req: &mut K,
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::io::send_down_stack(target, req).await
     }
 
     pub async fn send_next_lower<K: IoRequest>(
         from: Arc<DeviceObject>,
         req: &mut K,
-    ) -> DriverStatus {
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::io::send_next_lower(from, req).await
     }
 
     pub async fn send_to_stack_top<K: IoRequest>(
         dev_node_weak: Weak<DevNode>,
         req: &mut K,
-    ) -> DriverStatus {
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::io::send_to_stack_top(dev_node_weak, req).await
     }
 }
@@ -48,32 +55,39 @@ pub mod pnp {
     use alloc::sync::{Arc, Weak};
     use kernel_routing::PnpRequest;
     use kernel_types::device::{DevNode, DeviceObject};
+    use kernel_types::error::KernelError;
     use kernel_types::io::IoTarget;
-    use kernel_types::status::DriverStatus;
+    use kernel_types::pnp::DriverStep;
 
     pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
         kernel_routing::pnp::resolve_target(link_path)
     }
 
-    pub async fn send_to_device<K: PnpRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+    pub async fn send_to_device<K: PnpRequest>(
+        target: IoTarget,
+        req: &mut K,
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::pnp::send_to_device(target, req).await
     }
 
-    pub async fn send_down_stack<K: PnpRequest>(target: IoTarget, req: &mut K) -> DriverStatus {
+    pub async fn send_down_stack<K: PnpRequest>(
+        target: IoTarget,
+        req: &mut K,
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::pnp::send_down_stack(target, req).await
     }
 
     pub async fn send_next_lower<K: PnpRequest>(
         from: Arc<DeviceObject>,
         req: &mut K,
-    ) -> DriverStatus {
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::pnp::send_next_lower(from, req).await
     }
 
     pub async fn send_to_stack_top<K: PnpRequest>(
         dev_node_weak: Weak<DevNode>,
         req: &mut K,
-    ) -> DriverStatus {
+    ) -> Result<DriverStep, KernelError> {
         kernel_routing::pnp::send_to_stack_top(dev_node_weak, req).await
     }
 }
@@ -108,7 +122,7 @@ pub fn pnp_create_child_devnode_and_pdo_with_init(
     }
 }
 
-pub async fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), DriverError> {
+pub async fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), KernelError> {
     unsafe { kernel_sys::pnp_bind_and_start(dn).await }
 }
 
@@ -149,7 +163,7 @@ pub fn pnp_create_device_symlink_top(
     unsafe { kernel_sys::pnp_create_device_symlink_top(instance_path, link_path) }
 }
 
-pub fn pnp_remove_symlink(link_path: String) -> DriverStatus {
+pub fn pnp_remove_symlink(link_path: String) -> Result<(), DriverErrorKind> {
     unsafe { kernel_sys::pnp_remove_symlink(link_path) }
 }
 

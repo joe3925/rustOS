@@ -57,6 +57,7 @@ use kernel_types::{
         DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappedBuffer,
         DmaMappingStrategy, DmaPciDeviceIdentity,
     },
+    error::{DriverErrorKind, KernelError},
     fdt::FdtHeader,
     fs::{OpenFlags, Path},
     io::IoTarget,
@@ -64,7 +65,7 @@ use kernel_types::{
     pci::PciConfigAddress,
     pnp::{DeviceIds, DeviceRelationType},
     runtime::BlockOnThreadState,
-    status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
+    status::{Data, PageMapError},
 };
 use spin::{Mutex, Once};
 
@@ -198,20 +199,20 @@ pub extern "C" fn kernel_dma_base_page_size() -> u64 {
 pub extern "C" fn kernel_dma_register_pci_pdo(
     pdo: &Arc<DeviceObject>,
     identity: DmaPciDeviceIdentity,
-) -> DriverStatus {
+) -> Result<(), DriverErrorKind> {
     dma::register_pci_pdo(pdo, identity)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_register_platform_pdo(
     pdo: &Arc<DeviceObject>,
     identity: DeviceMmuPlatformDeviceIdentity,
-) -> DriverStatus {
+) -> Result<(), DriverErrorKind> {
     dma::register_platform_pdo(pdo, identity)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_open_device_handle(
     device: &Arc<DeviceObject>,
-) -> Result<DmaDeviceHandle, DriverStatus> {
+) -> Result<DmaDeviceHandle, DriverErrorKind> {
     dma::open_device_handle(device)
 }
 
@@ -274,7 +275,7 @@ pub extern "C" fn kernel_cycle_counter_frequency_hz() -> u64 {
 pub extern "C" fn file_open(
     path: &Path,
     flags: &[OpenFlags],
-) -> FfiFuture<Result<File, FileStatus>> {
+) -> FfiFuture<Result<File, KernelError>> {
     let path = path.clone();
     let flags_vec: Vec<OpenFlags> = flags.to_vec();
 
@@ -282,21 +283,21 @@ pub extern "C" fn file_open(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>> {
+pub extern "C" fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, KernelError>> {
     let path = path.clone();
 
     async move { File::list_dir(&path).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
+pub extern "C" fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), KernelError>> {
     let path = path.clone();
 
     async move { File::remove_dir(&path).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
+pub extern "C" fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), KernelError>> {
     let path = path.clone();
 
     async move { File::make_dir(&path).await }.into_ffi()
@@ -315,7 +316,7 @@ pub extern "C" fn reg_set_value(
     key_path: &str,
     name: &str,
     data: Data,
-) -> FfiFuture<Result<(), RegError>> {
+) -> FfiFuture<Result<(), KernelError>> {
     let key_path = key_path.to_string();
     let name = name.to_string();
 
@@ -323,14 +324,14 @@ pub extern "C" fn reg_set_value(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>> {
+pub extern "C" fn reg_create_key(path: &str) -> FfiFuture<Result<(), KernelError>> {
     let path = path.to_string();
 
     async move { reg::create_key(path).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>> {
+pub extern "C" fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, KernelError>> {
     let path = path.to_string();
 
     async move { reg::delete_key(path.as_str()).await }.into_ffi()
@@ -340,7 +341,7 @@ pub extern "C" fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>
 pub extern "C" fn reg_delete_value(
     key_path: &str,
     name: &str,
-) -> FfiFuture<Result<bool, RegError>> {
+) -> FfiFuture<Result<bool, KernelError>> {
     let key_path = key_path.to_string();
     let name = name.to_string();
 
@@ -348,14 +349,14 @@ pub extern "C" fn reg_delete_value(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
+pub extern "C" fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, KernelError>> {
     let base_path = base_path.to_string();
 
     async move { reg::list_keys(base_path.as_str()).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>> {
+pub extern "C" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, KernelError>> {
     let base_path = base_path.to_string();
 
     async move { reg::list_values(base_path.as_str()).await }.into_ffi()
@@ -382,7 +383,7 @@ pub extern "C" fn pnp_create_pdo(
     PNP_MANAGER.create_child_devnode_and_pdo(parent_devnode, name, instance_path, ids, class)
 }
 
-pub extern "C" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>> {
+pub extern "C" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), KernelError>> {
     let dn = dn.clone();
 
     async move { PNP_MANAGER.bind_and_start(&dn).await }.into_ffi()
@@ -451,14 +452,14 @@ pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(
 pub extern "C" fn pnp_invalidate_device_relations(
     device: &Arc<DeviceObject>,
     relation: DeviceRelationType,
-) -> FfiFuture<DriverStatus> {
+) -> FfiFuture<Result<(), KernelError>> {
     let device = device.clone();
     async move {
         let Some(dn) = device.dev_node.get() else {
-            return DriverStatus::NoSuchDevice;
+            return Err(crate::error::error(DriverErrorKind::NoSuchDevice));
         };
         let Some(up) = dn.upgrade() else {
-            return DriverStatus::NoSuchDevice;
+            return Err(crate::error::error(DriverErrorKind::NoSuchDevice));
         };
         PNP_MANAGER
             .invalidate_device_relations_for_node(&up, relation)
@@ -492,10 +493,10 @@ pub extern "C" fn pnp_create_device_symlink_top(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
+pub extern "C" fn pnp_remove_symlink(link_path: String) -> Result<(), DriverErrorKind> {
     match PNP_MANAGER.remove_symlink(link_path) {
-        Ok(()) => DriverStatus::Success,
-        Err(_) => DriverStatus::NoSuchDevice,
+        Ok(()) => Ok(()),
+        Err(_) => Err(DriverErrorKind::NoSuchDevice),
     }
 }
 #[unsafe(no_mangle)]
@@ -534,7 +535,7 @@ pub unsafe extern "C" fn task_yield() {
     });
 }
 
-pub unsafe extern "C" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>> {
+pub unsafe extern "C" fn switch_to_vfs_async() -> FfiFuture<Result<(), KernelError>> {
     file::switch_to_vfs().into_ffi()
 }
 
@@ -815,6 +816,11 @@ pub fn routing_get_stack_top_from_weak_impl(
         .as_ref()
         .and_then(|s| s.get_top_device_object());
     stack_top.or_else(|| dn.get_pdo())
+}
+
+#[unsafe(no_mangle)]
+pub fn routing_capture_error_backtrace_impl(output: &mut kernel_types::error::ErrorBacktrace) {
+    *output = crate::error::capture();
 }
 
 // FFI exports for drivers (extern "C" ABI)

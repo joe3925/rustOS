@@ -1,4 +1,5 @@
 use crate::alloc::string::ToString;
+use crate::error::{kernel_capture_error_backtrace, kernel_resolve_error_context_module};
 use crate::export;
 use crate::function;
 use crate::get_rva;
@@ -47,6 +48,9 @@ export! {
 
     kernel_alloc,
     kernel_free,
+
+    kernel_capture_error_backtrace,
+    kernel_resolve_error_context_module,
 
     kernel_dma_base_page_size,
     kernel_dma_register_pci_pdo,

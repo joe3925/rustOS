@@ -64,7 +64,6 @@ impl PciConfigAddress {
 use alloc::vec::Vec;
 use alloc::sync::Arc;
 use crate::device::{Protocol, ProtocolId, ProtocolVersion, DeviceObject};
-use crate::status::DriverStatus;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PrtEntry {

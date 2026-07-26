@@ -6,11 +6,8 @@ use alloc::{
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::{println, util::BootPkg};
-use kernel_types::{
-    fs::*,
-    status::{DriverStatus, FileStatus},
-};
+use crate::{error::error, println, util::BootPkg};
+use kernel_types::{error::FileErrorKind, fs::*};
 
 const C_PREFIX: &str = "C:/";
 const REG_DIR: &str = "C:/system/registry";
@@ -187,10 +184,10 @@ impl BootstrapProvider {
         }
     }
 
-    fn must_c(&self, path: &str) -> Result<String, FileStatus> {
+    fn must_c(&self, path: &str) -> Result<String, FileErrorKind> {
         let p = norm_upcase(path);
         if !p.starts_with(C_PREFIX) {
-            return Err(FileStatus::PathNotFound);
+            return Err(FileErrorKind::PathNotFound);
         }
         Ok(p)
     }
@@ -223,17 +220,14 @@ impl BootstrapProvider {
         file_id: u64,
         offset: i64,
         origin: FsSeekWhence,
-    ) -> (FsSeekResult, DriverStatus) {
+    ) -> FsSeekResult {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsSeekResult {
-                        pos: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsSeekResult {
+                    pos: 0,
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
@@ -248,24 +242,21 @@ impl BootstrapProvider {
         let new_pos_i = base + offset as i128;
         let new_pos = if new_pos_i < 0 { 0 } else { new_pos_i as u64 };
 
-        (
-            FsSeekResult {
-                pos: new_pos,
-                error: None,
-            },
-            DriverStatus::Success,
-        )
+        (FsSeekResult {
+            pos: new_pos,
+            error: None,
+        })
     }
 
-    fn read_slice(&self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>, FileStatus> {
+    fn read_slice(&self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>, FileErrorKind> {
         let mut cur = path.to_string();
 
         let data_vec = loop {
             let map = self.nodes.read();
-            let node = map.get(&cur).ok_or(FileStatus::PathNotFound)?;
+            let node = map.get(&cur).ok_or(FileErrorKind::PathNotFound)?;
 
             if node.is_dir {
-                return Err(FileStatus::BadPath);
+                return Err(FileErrorKind::BadPath);
             }
 
             match node.data.as_ref().unwrap() {
@@ -283,12 +274,12 @@ impl BootstrapProvider {
         Ok(data_vec[off..off + take].to_vec())
     }
 
-    fn write_slice(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, FileStatus> {
+    fn write_slice(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, FileErrorKind> {
         let mut map = self.nodes.write();
-        let node = map.get_mut(path).ok_or(FileStatus::PathNotFound)?;
+        let node = map.get_mut(path).ok_or(FileErrorKind::PathNotFound)?;
 
         if node.is_dir {
-            return Err(FileStatus::BadPath);
+            return Err(FileErrorKind::BadPath);
         }
 
         match node.data.as_mut().unwrap() {
@@ -304,16 +295,16 @@ impl BootstrapProvider {
             DataRef::Boot(_) => {
                 println!("DataRef::Boot(_)");
 
-                Err(FileStatus::UnknownFail)
+                Err(FileErrorKind::UnknownFailure)
             }
             DataRef::Alias(_t) => Ok(data.len() as u32),
         }
     }
 
-    fn ensure_dir(&self, p: &str) -> Result<(), FileStatus> {
+    fn ensure_dir(&self, p: &str) -> Result<(), FileErrorKind> {
         let p = norm_upcase(p);
         if !p.starts_with(C_PREFIX) {
-            return Err(FileStatus::PathNotFound);
+            return Err(FileErrorKind::PathNotFound);
         }
         let mut map = self.nodes.write();
         if map.contains_key(&p) {
@@ -321,11 +312,11 @@ impl BootstrapProvider {
             if is_dir {
                 return Ok(());
             }
-            return Err(FileStatus::BadPath);
+            return Err(FileErrorKind::BadPath);
         }
         let parent = parent_of(&p).to_string();
         if !map.contains_key(&parent) {
-            return Err(FileStatus::BadPath);
+            return Err(FileErrorKind::BadPath);
         }
         map.insert(p.clone(), Node::dir());
         map.get_mut(&parent)
@@ -335,10 +326,10 @@ impl BootstrapProvider {
         Ok(())
     }
 
-    fn create_file_if_missing(&self, path: &str) -> Result<(), FileStatus> {
+    fn create_file_if_missing(&self, path: &str) -> Result<(), FileErrorKind> {
         let p = norm_upcase(path);
         if !p.starts_with(C_PREFIX) {
-            return Err(FileStatus::PathNotFound);
+            return Err(FileErrorKind::PathNotFound);
         }
 
         let mut map = self.nodes.write();
@@ -352,8 +343,8 @@ impl BootstrapProvider {
         let parent = parent_of(&p).to_string();
         match map.get(&parent) {
             Some(n) if n.is_dir => {}
-            Some(_) => return Err(FileStatus::BadPath),
-            None => return Err(FileStatus::PathNotFound),
+            Some(_) => return Err(FileErrorKind::BadPath),
+            None => return Err(FileErrorKind::PathNotFound),
         }
 
         // Create empty RAM-backed file
@@ -366,23 +357,16 @@ impl BootstrapProvider {
 }
 
 impl BootstrapProvider {
-    pub(crate) fn open_path_sync(
-        &self,
-        path: &str,
-        flags: &[OpenFlags],
-    ) -> (FsOpenResult, DriverStatus) {
+    pub(crate) fn open_path_sync(&self, path: &str, flags: &[OpenFlags]) -> FsOpenResult {
         let p = match self.must_c(path) {
             Ok(p) => p,
             Err(e) => {
-                return (
-                    FsOpenResult {
-                        fs_file_id: 0,
-                        is_dir: false,
-                        size: 0,
-                        error: Some(e),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsOpenResult {
+                    fs_file_id: 0,
+                    is_dir: false,
+                    size: 0,
+                    error: Some(error(e)),
+                });
             }
         };
 
@@ -402,37 +386,28 @@ impl BootstrapProvider {
             if wants_create {
                 // Try to create the file
                 if let Err(e) = self.create_file_if_missing(&p) {
-                    return (
-                        FsOpenResult {
-                            fs_file_id: 0,
-                            is_dir: false,
-                            size: 0,
-                            error: Some(e),
-                        },
-                        DriverStatus::Success,
-                    );
-                }
-            } else {
-                return (
-                    FsOpenResult {
+                    return (FsOpenResult {
                         fs_file_id: 0,
                         is_dir: false,
                         size: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                );
-            }
-        } else if wants_create_new {
-            return (
-                FsOpenResult {
+                        error: Some(error(e)),
+                    });
+                }
+            } else {
+                return (FsOpenResult {
                     fs_file_id: 0,
                     is_dir: false,
                     size: 0,
-                    error: Some(FileStatus::FileAlreadyExist),
-                },
-                DriverStatus::Success,
-            );
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
+            }
+        } else if wants_create_new {
+            return (FsOpenResult {
+                fs_file_id: 0,
+                is_dir: false,
+                size: 0,
+                error: Some(error(FileErrorKind::AlreadyExists)),
+            });
         }
 
         let id = self.next_id.fetch_add(1, Ordering::AcqRel).max(1);
@@ -447,124 +422,93 @@ impl BootstrapProvider {
             }
         };
 
-        (
-            FsOpenResult {
-                fs_file_id: id,
-                is_dir,
-                size,
-                error: None,
-            },
-            DriverStatus::Success,
-        )
+        (FsOpenResult {
+            fs_file_id: id,
+            is_dir,
+            size,
+            error: None,
+        })
     }
 
-    pub(crate) fn close_handle_sync(&self, file_id: u64) -> (FsCloseResult, DriverStatus) {
+    pub(crate) fn close_handle_sync(&self, file_id: u64) -> FsCloseResult {
         let removed = self.handles.write().remove(&file_id).is_some();
-        (
-            FsCloseResult {
-                error: if removed {
-                    None
-                } else {
-                    Some(FileStatus::PathNotFound)
-                },
+        (FsCloseResult {
+            error: if removed {
+                None
+            } else {
+                Some(error(FileErrorKind::PathNotFound))
             },
-            DriverStatus::Success,
-        )
+        })
     }
 
-    pub(crate) fn read_at_sync(
-        &self,
-        file_id: u64,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> (FsReadResult, DriverStatus) {
+    pub(crate) fn read_at_sync(&self, file_id: u64, offset: u64, buf: &mut [u8]) -> FsReadResult {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsReadResult {
-                        bytes_read: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsReadResult {
+                    bytes_read: 0,
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
         match self.read_slice(&path, offset, buf.len() as u32) {
             Ok(v) => {
                 let n = v.len().min(buf.len());
                 buf[..n].copy_from_slice(&v[..n]);
-                (
-                    FsReadResult {
-                        bytes_read: n,
-                        error: None,
-                    },
-                    DriverStatus::Success,
-                )
+                (FsReadResult {
+                    bytes_read: n,
+                    error: None,
+                })
             }
-            Err(e) => (
-                FsReadResult {
+            Err(e) => {
+                (FsReadResult {
                     bytes_read: 0,
-                    error: Some(e),
-                },
-                DriverStatus::Success,
-            ),
+                    error: Some(error(e)),
+                })
+            }
         }
     }
 
-    pub(crate) fn write_at_sync(
-        &self,
-        file_id: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> (FsWriteResult, DriverStatus) {
+    pub(crate) fn write_at_sync(&self, file_id: u64, offset: u64, data: &[u8]) -> FsWriteResult {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsWriteResult {
-                        written: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsWriteResult {
+                    written: 0,
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
         match self.write_slice(&path, offset, data) {
-            Ok(w) => (
-                FsWriteResult {
+            Ok(w) => {
+                (FsWriteResult {
                     written: w as usize,
                     error: None,
-                },
-                DriverStatus::Success,
-            ),
-            Err(e) => (
-                FsWriteResult {
+                })
+            }
+            Err(e) => {
+                (FsWriteResult {
                     written: 0,
-                    error: Some(e),
-                },
-                DriverStatus::Success,
-            ),
+                    error: Some(error(e)),
+                })
+            }
         }
     }
 
-    pub(crate) fn flush_handle_sync(&self, _file_id: u64) -> (FsFlushResult, DriverStatus) {
-        (FsFlushResult { error: None }, DriverStatus::Success)
+    pub(crate) fn flush_handle_sync(&self, _file_id: u64) -> FsFlushResult {
+        (FsFlushResult { error: None })
     }
 
-    pub(crate) fn get_info_sync(&self, file_id: u64) -> (FsGetInfoResult, DriverStatus) {
+    pub(crate) fn get_info_sync(&self, file_id: u64) -> FsGetInfoResult {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsGetInfoResult {
-                        size: 0,
-                        is_dir: false,
-                        attrs: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsGetInfoResult {
+                    size: 0,
+                    is_dir: false,
+                    attrs: 0,
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
         let (exists, is_dir, size) = {
@@ -575,38 +519,29 @@ impl BootstrapProvider {
             }
         };
         if !exists {
-            return (
-                FsGetInfoResult {
-                    size: 0,
-                    is_dir: false,
-                    attrs: 0,
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
-        }
-        (
-            FsGetInfoResult {
-                size,
-                is_dir,
+            return (FsGetInfoResult {
+                size: 0,
+                is_dir: false,
                 attrs: 0,
-                error: None,
-            },
-            DriverStatus::Success,
-        )
+                error: Some(error(FileErrorKind::PathNotFound)),
+            });
+        }
+        (FsGetInfoResult {
+            size,
+            is_dir,
+            attrs: 0,
+            error: None,
+        })
     }
 
-    pub(crate) fn list_dir_path_sync(&self, path: &str) -> (FsListDirResult, DriverStatus) {
+    pub(crate) fn list_dir_path_sync(&self, path: &str) -> FsListDirResult {
         let p = match self.must_c(path) {
             Ok(p) => p,
             Err(e) => {
-                return (
-                    FsListDirResult {
-                        names: None,
-                        error: Some(e),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsListDirResult {
+                    names: None,
+                    error: Some(error(e)),
+                });
             }
         };
         let (exists, is_dir, names) = {
@@ -624,60 +559,53 @@ impl BootstrapProvider {
             }
         };
         if !exists {
-            return (
-                FsListDirResult {
-                    names: None,
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
+            return (FsListDirResult {
+                names: None,
+                error: Some(error(FileErrorKind::PathNotFound)),
+            });
         }
         if !is_dir {
-            return (
-                FsListDirResult {
-                    names: None,
-                    error: Some(FileStatus::BadPath),
-                },
-                DriverStatus::Success,
-            );
+            return (FsListDirResult {
+                names: None,
+                error: Some(error(FileErrorKind::BadPath)),
+            });
         }
-        (
-            FsListDirResult {
-                names: Some(names),
-                error: None,
-            },
-            DriverStatus::Success,
-        )
+        (FsListDirResult {
+            names: Some(names),
+            error: None,
+        })
     }
 
-    pub(crate) fn make_dir_path_sync(&self, path: &str) -> (FsCreateResult, DriverStatus) {
+    pub(crate) fn make_dir_path_sync(&self, path: &str) -> FsCreateResult {
         let r = self.ensure_dir(path).err();
-        (
-            FsCreateResult {
-                error: r.map(|e| e),
-            },
-            DriverStatus::Success,
-        )
+        (FsCreateResult {
+            error: r.map(error),
+        })
     }
 
-    pub(crate) fn remove_dir_path_sync(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
+    pub(crate) fn remove_dir_path_sync(&self, _path: &str) -> FsCreateResult {
         println!("remove_dir_path_sync");
-        (
-            FsCreateResult {
-                error: Some(FileStatus::UnknownFail),
-            },
-            DriverStatus::Success,
-        )
+        (FsCreateResult {
+            error: Some(error(FileErrorKind::UnknownFailure)),
+        })
     }
 
-    pub(crate) fn rename_path_sync(&self, src: &str, dst: &str) -> (FsRenameResult, DriverStatus) {
+    pub(crate) fn rename_path_sync(&self, src: &str, dst: &str) -> FsRenameResult {
         let s = match self.must_c(src) {
             Ok(p) => p,
-            Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
+            Err(e) => {
+                return (FsRenameResult {
+                    error: Some(error(e)),
+                });
+            }
         };
         let d = match self.must_c(dst) {
             Ok(p) => p,
-            Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
+            Err(e) => {
+                return (FsRenameResult {
+                    error: Some(error(e)),
+                });
+            }
         };
 
         let mut map = self.nodes.write();
@@ -685,30 +613,21 @@ impl BootstrapProvider {
         let src_node_exists = match map.get(&s) {
             Some(n) if !n.is_dir => true,
             Some(_) => {
-                return (
-                    FsRenameResult {
-                        error: Some(FileStatus::BadPath),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsRenameResult {
+                    error: Some(error(FileErrorKind::BadPath)),
+                });
             }
             None => {
-                return (
-                    FsRenameResult {
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsRenameResult {
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
         if !src_node_exists {
-            return (
-                FsRenameResult {
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
+            return (FsRenameResult {
+                error: Some(error(FileErrorKind::PathNotFound)),
+            });
         }
 
         let dparent = parent_of(&d).to_string();
@@ -716,20 +635,14 @@ impl BootstrapProvider {
         match map.get(&dparent) {
             Some(n) if n.is_dir => {}
             Some(_) => {
-                return (
-                    FsRenameResult {
-                        error: Some(FileStatus::BadPath),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsRenameResult {
+                    error: Some(error(FileErrorKind::BadPath)),
+                });
             }
             None => {
-                return (
-                    FsRenameResult {
-                        error: Some(FileStatus::BadPath),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsRenameResult {
+                    error: Some(error(FileErrorKind::BadPath)),
+                });
             }
         }
 
@@ -739,13 +652,17 @@ impl BootstrapProvider {
             .children
             .insert(dleaf, d.clone());
 
-        (FsRenameResult { error: None }, DriverStatus::Success)
+        (FsRenameResult { error: None })
     }
 
-    pub(crate) fn delete_path_sync(&self, path: &str) -> (FsCreateResult, DriverStatus) {
+    pub(crate) fn delete_path_sync(&self, path: &str) -> FsCreateResult {
         let p = match self.must_c(path) {
             Ok(p) => p,
-            Err(e) => return (FsCreateResult { error: Some(e) }, DriverStatus::Success),
+            Err(e) => {
+                return (FsCreateResult {
+                    error: Some(error(e)),
+                });
+            }
         };
 
         // Handle registry files specially - clear content instead of deleting
@@ -757,7 +674,7 @@ impl BootstrapProvider {
             }) = map.get_mut(&p)
             {
                 v.clear();
-                return (FsCreateResult { error: None }, DriverStatus::Success);
+                return (FsCreateResult { error: None });
             }
         }
 
@@ -768,20 +685,14 @@ impl BootstrapProvider {
         match map.get(&p) {
             Some(n) if !n.is_dir => {}
             Some(_) => {
-                return (
-                    FsCreateResult {
-                        error: Some(FileStatus::BadPath),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsCreateResult {
+                    error: Some(error(FileErrorKind::BadPath)),
+                });
             }
             None => {
-                return (
-                    FsCreateResult {
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsCreateResult {
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         }
 
@@ -795,23 +706,16 @@ impl BootstrapProvider {
         // Remove the node itself
         map.remove(&p);
 
-        (FsCreateResult { error: None }, DriverStatus::Success)
+        (FsCreateResult { error: None })
     }
 
-    pub(crate) fn set_len_sync(
-        &self,
-        file_id: u64,
-        new_size: u64,
-    ) -> (FsSetLenResult, DriverStatus) {
+    pub(crate) fn set_len_sync(&self, file_id: u64, new_size: u64) -> FsSetLenResult {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsSetLenResult {
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsSetLenResult {
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
@@ -819,65 +723,51 @@ impl BootstrapProvider {
         let node = match map.get_mut(&path) {
             Some(n) => n,
             None => {
-                return (
-                    FsSetLenResult {
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsSetLenResult {
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
         if node.is_dir {
-            return (
-                FsSetLenResult {
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            );
+            return (FsSetLenResult {
+                error: Some(error(FileErrorKind::AccessDenied)),
+            });
         }
 
         match node.data.as_mut() {
             Some(DataRef::Ram(v)) => {
                 v.resize(new_size as usize, 0);
-                (FsSetLenResult { error: None }, DriverStatus::Success)
+                (FsSetLenResult { error: None })
             }
-            Some(DataRef::Boot(_)) => (
-                FsSetLenResult {
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            ),
-            Some(DataRef::Alias(_)) => (
-                FsSetLenResult {
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            ),
+            Some(DataRef::Boot(_)) => {
+                (FsSetLenResult {
+                    error: Some(error(FileErrorKind::AccessDenied)),
+                })
+            }
+            Some(DataRef::Alias(_)) => {
+                (FsSetLenResult {
+                    error: Some(error(FileErrorKind::AccessDenied)),
+                })
+            }
             None => {
                 println!("set_len_sync: node not found");
-                (
-                    FsSetLenResult {
-                        error: Some(FileStatus::UnknownFail),
-                    },
-                    DriverStatus::Success,
-                )
+                (FsSetLenResult {
+                    error: Some(error(FileErrorKind::UnknownFailure)),
+                })
             }
         }
     }
 
-    pub(crate) fn append_sync(&self, file_id: u64, data: &[u8]) -> (FsAppendResult, DriverStatus) {
+    pub(crate) fn append_sync(&self, file_id: u64, data: &[u8]) -> FsAppendResult {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsAppendResult {
-                        written: 0,
-                        new_size: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
@@ -885,86 +775,64 @@ impl BootstrapProvider {
         let node = match map.get_mut(&path) {
             Some(n) => n,
             None => {
-                return (
-                    FsAppendResult {
-                        written: 0,
-                        new_size: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
         if node.is_dir {
-            return (
-                FsAppendResult {
-                    written: 0,
-                    new_size: 0,
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            );
+            return (FsAppendResult {
+                written: 0,
+                new_size: 0,
+                error: Some(error(FileErrorKind::AccessDenied)),
+            });
         }
 
         match node.data.as_mut() {
             Some(DataRef::Ram(v)) => {
                 v.extend_from_slice(data);
                 let new_size = v.len() as u64;
-                (
-                    FsAppendResult {
-                        written: data.len(),
-                        new_size,
-                        error: None,
-                    },
-                    DriverStatus::Success,
-                )
+                (FsAppendResult {
+                    written: data.len(),
+                    new_size,
+                    error: None,
+                })
             }
-            Some(DataRef::Boot(_)) => (
-                FsAppendResult {
+            Some(DataRef::Boot(_)) => {
+                (FsAppendResult {
                     written: 0,
                     new_size: 0,
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            ),
-            Some(DataRef::Alias(_)) => (
-                FsAppendResult {
+                    error: Some(error(FileErrorKind::AccessDenied)),
+                })
+            }
+            Some(DataRef::Alias(_)) => {
+                (FsAppendResult {
                     written: 0,
                     new_size: 0,
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            ),
+                    error: Some(error(FileErrorKind::AccessDenied)),
+                })
+            }
             None => {
                 println!("append_sync: node not found");
-                (
-                    FsAppendResult {
-                        written: 0,
-                        new_size: 0,
-                        error: Some(FileStatus::UnknownFail),
-                    },
-                    DriverStatus::Success,
-                )
+                (FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(error(FileErrorKind::UnknownFailure)),
+                })
             }
         }
     }
 
-    pub(crate) fn zero_range_sync(
-        &self,
-        file_id: u64,
-        offset: u64,
-        len: u64,
-    ) -> (FsZeroRangeResult, DriverStatus) {
+    pub(crate) fn zero_range_sync(&self, file_id: u64, offset: u64, len: u64) -> FsZeroRangeResult {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsZeroRangeResult {
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsZeroRangeResult {
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
@@ -972,34 +840,25 @@ impl BootstrapProvider {
         let node = match map.get_mut(&path) {
             Some(n) => n,
             None => {
-                return (
-                    FsZeroRangeResult {
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (FsZeroRangeResult {
+                    error: Some(error(FileErrorKind::PathNotFound)),
+                });
             }
         };
 
         if node.is_dir {
-            return (
-                FsZeroRangeResult {
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            );
+            return (FsZeroRangeResult {
+                error: Some(error(FileErrorKind::AccessDenied)),
+            });
         }
 
         match node.data.as_mut() {
             Some(DataRef::Ram(v)) => {
                 let file_len = v.len() as u64;
                 if offset > file_len {
-                    return (
-                        FsZeroRangeResult {
-                            error: Some(FileStatus::BadPath),
-                        },
-                        DriverStatus::Success,
-                    );
+                    return (FsZeroRangeResult {
+                        error: Some(error(FileErrorKind::BadPath)),
+                    });
                 }
                 let end = (offset.saturating_add(len)).min(file_len);
                 let zero_len = end.saturating_sub(offset) as usize;
@@ -1009,28 +868,23 @@ impl BootstrapProvider {
                         v[i] = 0;
                     }
                 }
-                (FsZeroRangeResult { error: None }, DriverStatus::Success)
+                (FsZeroRangeResult { error: None })
             }
-            Some(DataRef::Boot(_)) => (
-                FsZeroRangeResult {
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            ),
-            Some(DataRef::Alias(_)) => (
-                FsZeroRangeResult {
-                    error: Some(FileStatus::AccessDenied),
-                },
-                DriverStatus::Success,
-            ),
+            Some(DataRef::Boot(_)) => {
+                (FsZeroRangeResult {
+                    error: Some(error(FileErrorKind::AccessDenied)),
+                })
+            }
+            Some(DataRef::Alias(_)) => {
+                (FsZeroRangeResult {
+                    error: Some(error(FileErrorKind::AccessDenied)),
+                })
+            }
             None => {
                 println!("zero_range_sync: node not found");
-                (
-                    FsZeroRangeResult {
-                        error: Some(FileStatus::UnknownFail),
-                    },
-                    DriverStatus::Success,
-                )
+                (FsZeroRangeResult {
+                    error: Some(error(FileErrorKind::UnknownFailure)),
+                })
             }
         }
     }

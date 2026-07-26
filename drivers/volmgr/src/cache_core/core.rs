@@ -1952,7 +1952,16 @@ where
         dirty != 0 && dirty >= self.cfg.dirty_high_watermark_blocks
     }
 
-    async fn background_writeback_loop(&self) {
+    fn report_background_writeback_error(error: &CacheError<B::Error>) {
+        cold_path();
+        // TODO: Find a better policy for asynchronous write-back failures.
+        println!(
+            "[volmgr] background cache write-back failed; affected pages remain dirty: {:?}",
+            error
+        );
+    }
+
+    async fn background_writeback_loop(&self) -> Result<(), CacheError<B::Error>> {
         loop {
             if unlikely(self.closed.load(Ordering::Acquire)) {
                 cold_path();
@@ -1969,11 +1978,7 @@ where
                     Ok(pass) => pass,
                     Err(err) => {
                         cold_path();
-                        println!(
-                            "volmgr: VolumeCache::background_writeback_loop failed: {:?}",
-                            err
-                        );
-                        break;
+                        return Err(err);
                     }
                 };
 
@@ -1983,6 +1988,8 @@ where
                 break;
             }
         }
+
+        Ok(())
     }
 
     fn maybe_start_background_writeback(cache: &Arc<Self>) {
@@ -2000,12 +2007,19 @@ where
         let cache_for_task = Arc::clone(cache);
 
         spawn_detached(async move {
-            cache_for_task.background_writeback_loop().await;
+            let writeback_succeeded = match cache_for_task.background_writeback_loop().await {
+                Ok(()) => true,
+                Err(err) => {
+                    Self::report_background_writeback_error(&err);
+                    false
+                }
+            };
             cache_for_task
                 .background_writeback_active
                 .store(false, Ordering::Release);
 
-            if cache_for_task.should_start_background_writeback()
+            if writeback_succeeded
+                && cache_for_task.should_start_background_writeback()
                 && !cache_for_task
                     .background_writeback_active
                     .swap(true, Ordering::AcqRel)
@@ -2013,7 +2027,9 @@ where
                 let cache_for_followup = Arc::clone(&cache_for_task);
 
                 spawn_detached(async move {
-                    cache_for_followup.background_writeback_loop().await;
+                    if let Err(err) = cache_for_followup.background_writeback_loop().await {
+                        Self::report_background_writeback_error(&err);
+                    }
                     cache_for_followup
                         .background_writeback_active
                         .store(false, Ordering::Release);
@@ -2032,11 +2048,7 @@ where
 
         spawn_detached(async move {
             if let Err(err) = cache.flush_internal_owner_to_backend(owner).await {
-                cold_path();
-                println!(
-                    "volmgr: VolumeCache::flush_owner_background owner {} failed: {:?}",
-                    owner, err
-                );
+                Self::report_background_writeback_error(&err);
             }
         });
     }
@@ -2447,7 +2459,9 @@ where
         let cache = Arc::clone(self);
 
         spawn_detached(async move {
-            let _ = cache.flush_internal_all().await;
+            if let Err(err) = cache.flush_internal_all().await {
+                VolumeCache::<B, BLOCK_SIZE, F>::report_background_writeback_error(&err);
+            }
         });
     }
 }

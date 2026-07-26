@@ -1,5 +1,5 @@
 use crate::dma::{FromDevice, IoBuffer, ToDevice};
-use crate::status::FileStatus;
+use crate::error::KernelError;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -122,7 +122,7 @@ pub struct FsOpenResult {
     pub fs_file_id: u64,
     pub is_dir: bool,
     pub size: u64,
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -134,7 +134,7 @@ pub struct FsCloseParams {
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsCloseResult {
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -149,7 +149,7 @@ pub struct FsReadParams<'a> {
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsReadResult {
     pub bytes_read: usize,
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -165,7 +165,7 @@ pub struct FsWriteParams<'a> {
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsWriteResult {
     pub written: usize,
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -188,7 +188,7 @@ pub struct FsSeekParams {
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsSeekResult {
     pub pos: u64,
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -200,7 +200,7 @@ pub struct FsFlushParams {
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsFlushResult {
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -214,7 +214,7 @@ pub struct FsCreateParams {
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsCreateResult {
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -227,7 +227,7 @@ pub struct FsRenameParams {
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsRenameResult {
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -239,7 +239,7 @@ pub struct FsListDirParams {
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsListDirResult {
     pub names: Option<Vec<String>>,
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
@@ -253,7 +253,7 @@ pub struct FsGetInfoResult {
     pub size: u64,
     pub is_dir: bool,
     pub attrs: u32,
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -266,7 +266,7 @@ pub struct FsSetLenParams {
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsSetLenResult {
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -281,7 +281,7 @@ pub struct FsAppendParams<'a> {
 pub struct FsAppendResult {
     pub written: usize,
     pub new_size: u64,
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[repr(C)]
@@ -295,7 +295,7 @@ pub struct FsZeroRangeParams {
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsZeroRangeResult {
-    pub error: Option<FileStatus>,
+    pub error: Option<KernelError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

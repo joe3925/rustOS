@@ -7,7 +7,7 @@ use kernel_api::kernel_types::pci::{EcamSegment, PciConfigAddress, Bar, BarKind,
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pci::{pci_read_config_u32, pci_write_config_u32};
 use kernel_api::pnp::{QueryResources, ResourceSet};
-use kernel_api::status::{DriverStatus, PageMapError};
+use kernel_api::status::PageMapError;
 
 use kernel_api::pnp::pnp;
 
@@ -528,16 +528,15 @@ pub fn parse_prt_from_blob(blob: &[u8]) -> Vec<PrtEntry> {
     entries
 }
 
-pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment> {
+pub async fn load_segments_from_parent(
+    device: &Arc<DeviceObject>,
+) -> Result<Vec<McfgSegment>, kernel_api::error::KernelError> {
     let mut handle = QueryResources {
         resources: ResourceSet::default(),
     };
-    let status = pnp::send_next_lower(device.clone(), &mut handle).await;
-
-    if status != DriverStatus::Success {
-        println!("[PCI] parent QueryResources failed; no ECAM");
-        return alloc::vec::Vec::new();
-    }
+    pnp::send_next_lower(device.clone(), &mut handle)
+        .await
+        .map_err(|error| error.with_context("querying parent PCI resources"))?;
 
     let blob = match handle.resources {
         ResourceSet::Encoded(blob) => blob,
@@ -548,7 +547,7 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
     if segs.is_empty() {
         kernel_api::println!("[PCI] no ECAM block found in parent resources");
     }
-    segs
+    Ok(segs)
 }
 
 #[inline]

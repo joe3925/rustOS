@@ -7,7 +7,8 @@ extern crate alloc;
 mod dev_ext;
 mod msix;
 
-use kernel_api::device::publish_stack_protocol;
+use kernel_api::device::{publish_stack_protocol, register_protocol};
+use kernel_api::error::{error, DriverErrorKind, ErrorKind, KernelError, ResultErrorContext};
 use kernel_api::pnp::QueryDeviceRelations;
 use kernel_api::pnp::QueryId;
 use kernel_api::pnp::StartDevice;
@@ -38,7 +39,6 @@ use kernel_api::{
     request::DeviceControl,
     request_handler,
     runtime::spawn_blocking,
-    status::DriverStatus,
 };
 use spin::Once;
 
@@ -92,12 +92,12 @@ impl DeviceControlHandler for PciPdoIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut DeviceControl<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let code = req.code;
 
         match code {
             IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev.clone(), req).await,
-            _ => DriverStep::complete(DriverStatus::NotImplemented),
+            _ => Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented)),
         }
     }
 }
@@ -110,15 +110,15 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, bus_driver_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut vt = PnpOps::new();
     vt.start_device.set(pci_bus_pnp_start);
     vt.query_device_relations.set(pci_bus_pnp_query_devrels);
@@ -129,7 +129,7 @@ pub extern "C" fn bus_driver_device_add(
         prt: Once::new(),
     });
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -137,19 +137,13 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut query_handle = QueryResources {
         resources: ResourceSet::default(),
     };
 
-    let st = pnp::send_next_lower(device.clone(), &mut query_handle).await;
-
-    if st != DriverStatus::NoSuchDevice {
-        let qst = st;
-        if qst != DriverStatus::Success {
-            return DriverStep::complete(qst);
-        }
-
+    match pnp::send_next_lower(device.clone(), &mut query_handle).await {
+        Ok(_) => {
         let blob = match query_handle.resources {
             ResourceSet::Encoded(blob) => blob,
             _ => Vec::new(),
@@ -158,7 +152,7 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
 
         if segs.is_empty() {
             println!("[PCI] no ECAM block found in parent resources");
-            return DriverStep::Continue;
+            return Ok(DriverStep::Continue);
         }
 
         let prt_entries = parse_prt_from_blob(&blob);
@@ -169,20 +163,27 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
                 ext.prt.call_once(|| prt_entries);
             }
         } else {
-            return DriverStep::Continue;
+            return Ok(DriverStep::Continue);
         }
-    } else {
-        let segs = load_segments_from_parent(&device).await;
+        }
+        Err(error) if error.kind() == ErrorKind::Driver(DriverErrorKind::NoSuchDevice) => {
+        let segs = load_segments_from_parent(&device)
+            .await
+            .with_context(|| "loading PCI segments from the parent device")?;
         if let Ok(ext) = device.try_devext::<DevExt>() {
             if !segs.is_empty() {
                 ext.segments.call_once(|| segs);
             }
         } else {
-            return DriverStep::Continue;
+            return Ok(DriverStep::Continue);
+        }
+        }
+        Err(error) => {
+            return Err(error.with_context("querying parent resources for PCI ECAM data"));
         }
     }
 
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 #[request_handler]
@@ -190,18 +191,16 @@ pub async fn pci_bus_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let relation = req.relation;
     if relation == DeviceRelationType::BusRelations {
-        let st = enumerate_bus(&device).await;
-        if st == DriverStatus::Success {
-            return DriverStep::Continue;
-        } else {
-            return DriverStep::complete(st);
-        }
+        enumerate_bus(&device)
+            .await
+            .with_context(|| "enumerating the PCI bus")?;
+        return Ok(DriverStep::Continue);
     }
 
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
@@ -227,12 +226,12 @@ struct BusWork {
     bus_base: VirtAddr,
 }
 
-pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
+pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> Result<(), KernelError> {
     let devnode = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
             println!("[PCI] PDO missing DevNode");
-            return DriverStatus::NoSuchDevice;
+            return Err(error(DriverErrorKind::NoSuchDevice));
         }
     };
 
@@ -243,7 +242,7 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
         ),
         Err(_) => {
             println!("[PCI] missing DevExt");
-            return DriverStatus::NoSuchDevice;
+            return Err(error(DriverErrorKind::NoSuchDevice));
         }
     };
 
@@ -252,7 +251,7 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
     if segments.is_none() {
         if !dev_ext::platform_config_access_available() {
             println!("[PCI] no ECAM segments and no platform PCI config access");
-            return DriverStatus::NotImplemented;
+            return Err(error(DriverErrorKind::NotImplemented));
         }
 
         println!("[PCI] No ECAM segments; scanning through platform PCI config access.");
@@ -272,7 +271,7 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
                 }
             }
         }
-        return DriverStatus::Success;
+        return Ok(());
     }
 
     let mut unmaps: Vec<MapToUnmap> = Vec::new();
@@ -344,7 +343,7 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
     for m in unmaps {
         let _ = unsafe { unmap_mmio_region(m.base, m.size) };
     }
-    DriverStatus::Success
+    Ok(())
 }
 
 fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
@@ -381,7 +380,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
         flags |= DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
     }
 
-    let status = register_pci_pdo(
+    let result = register_pci_pdo(
         &child_pdo,
         DmaPciDeviceIdentity {
             segment: p.seg,
@@ -395,10 +394,10 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
             config_space_phys: p.cfg_phys,
         },
     );
-    if status != DriverStatus::Success {
+    if let Err(error) = result {
         panic!(
             "[PCI] DMA manager registration failed for {}:{}:{}.{}: {:?}",
-            p.seg, p.bus, p.dev, p.func, status
+            p.seg, p.bus, p.dev, p.func, error
         );
     }
 }
@@ -408,13 +407,12 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryId,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice)),
     };
 
-    let status = DriverStatus::Success;
     match req.id_type {
         QueryIdType::HardwareIds => {
             let (hw, _cmp, _) = hwids_for(&ext);
@@ -429,14 +427,14 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
             if let Some(primary) = hw.first() {
                 req.ids.push(primary.clone());
             } else {
-                return DriverStep::complete(DriverStatus::NoSuchDevice);
+                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
             }
         }
         QueryIdType::InstanceId => {
             req.ids.push(instance_path_for(&ext));
         }
     }
-    DriverStep::complete(status)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -444,14 +442,19 @@ pub async fn pci_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
-    if let Some(dn) = _dev.dev_node.get() {
-        if let Some(dn) = dn.upgrade() {
-            _dev.register_protocol::<PciProtocol>(&PCI_PROTO_VTABLE);
-            publish_stack_protocol::<PciProtocol>(&dn);
-        }
-    }
-    DriverStep::complete(DriverStatus::Success)
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    let dn = _dev
+        .dev_node
+        .get()
+        .and_then(|node| node.upgrade())
+        .ok_or_else(|| error(DriverErrorKind::NoSuchDevice))?;
+    register_protocol::<PciProtocol>(_dev, &PCI_PROTO_VTABLE)
+        .map_err(error)
+        .with_context(|| "registering the PCI protocol on the PDO")?;
+    publish_stack_protocol::<PciProtocol>(&dn)
+        .map_err(error)
+        .with_context(|| "publishing the PCI protocol on the device stack")?;
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -459,6 +462,6 @@ pub async fn pci_pdo_query_devrels<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Complete)
 }

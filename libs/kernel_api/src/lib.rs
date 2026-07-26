@@ -3,7 +3,7 @@
 #![allow(non_upper_case_globals)]
 pub extern crate alloc;
 
-pub use kernel_types::{async_ffi, device, request, status};
+pub use kernel_types::{async_ffi, request, status};
 
 pub use kernel_routing;
 pub use kernel_types;
@@ -11,7 +11,9 @@ pub use kernel_types;
 pub use acpi;
 pub use kernel_macros::request_handler;
 pub mod benchmark;
+pub mod device;
 pub mod dma;
+pub mod error;
 pub mod fs;
 pub mod irq;
 pub mod memory;

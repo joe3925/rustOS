@@ -175,13 +175,17 @@ pub extern "C" fn kernel_main(ctx: usize) {
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
-        trigger_breakpoint();
         crate::registry::init()
             .await
             .expect("Failed to init registry");
-        let _ = install_prepacked_drivers().await;
+        install_prepacked_drivers()
+            .await
+            .expect("failed to install prepacked drivers");
         // BOOT_WINDOW.start();
-        let _ = PNP_MANAGER.init_from_registry().await;
+        PNP_MANAGER
+            .init_from_registry()
+            .await
+            .expect("failed to initialize PnP from the registry");
         // bench_async_vs_sync_call_latency_async().await;
 
         // benchmark_async_async().await;
@@ -293,7 +297,7 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
         crate::platform::current_is_in_interrupt()
     );
     println!("{}", info);
-    println!("Backtrace:");
+    println!("Panic-site backtrace:");
     for trace in backtrace.iter() {
         println!("{:#X}", trace.instruction_pointer().as_u64())
     }

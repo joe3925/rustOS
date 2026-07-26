@@ -9,7 +9,6 @@ use kernel_api::kernel_types::irq::{
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
 use kernel_api::request::DeviceControl;
-use kernel_api::status::DriverStatus;
 
 use crate::dev_ext::PciPdoExt;
 use kernel_api::kernel_types::pci::BarKind;
@@ -32,20 +31,20 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 pub async fn pci_setup_msix<'req, 'data>(
     dev: Arc<DeviceObject>,
     req: &mut DeviceControl<'data>,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(e) => e,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice)),
     };
 
     let msix = match ext.msix.as_ref() {
         Some(m) => m,
-        None => return DriverStep::complete(DriverStatus::NotImplemented),
+        None => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented)),
     };
 
     let msi_request = match { req.data.view::<MsiRequest>().copied() } {
         Some(request) => request,
-        None => return DriverStep::complete(DriverStatus::InvalidParameter),
+        None => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter)),
     };
 
     if msi_request.kind != MSI_KIND_MSIX
@@ -55,12 +54,12 @@ pub async fn pci_setup_msix<'req, 'data>(
             MSI_TARGET_ANY | MSI_TARGET_PLATFORM_CPU
         )
     {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
     }
 
     let table_bar = &ext.bars[msix.table_bar as usize];
     if table_bar.kind == BarKind::None {
-        return DriverStep::complete(DriverStatus::NotImplemented);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
     }
 
     let table_region_size = ((msix.table_size as u64 * 16) + 0xFFF) & !0xFFF;
@@ -68,7 +67,7 @@ pub async fn pci_setup_msix<'req, 'data>(
 
     let table_va = match map_mmio_region(PhysAddr::new(table_phys), table_region_size) {
         Ok(va) => va,
-        Err(_) => return DriverStep::complete(DriverStatus::InsufficientResources),
+        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InsufficientResources)),
     };
 
     let msi_request =
@@ -77,7 +76,7 @@ pub async fn pci_setup_msix<'req, 'data>(
         Some(message) => message,
         None => {
             let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-            return DriverStep::complete(DriverStatus::NotImplemented);
+            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
         }
     };
 
@@ -106,7 +105,7 @@ pub async fn pci_setup_msix<'req, 'data>(
         Ok(va) => va,
         Err(_) => {
             let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-            return DriverStep::complete(DriverStatus::InsufficientResources);
+            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InsufficientResources));
         }
     };
 
@@ -127,5 +126,5 @@ pub async fn pci_setup_msix<'req, 'data>(
     let _ = unsafe { unmap_mmio_region(cfg_va, 4096) };
     let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }

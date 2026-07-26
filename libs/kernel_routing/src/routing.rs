@@ -5,15 +5,16 @@ use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
 use kernel_types::async_ffi::FfiFuture;
 use kernel_types::device::{DevNode, DeviceObject};
+use kernel_types::error::{DriverErrorKind, ErrorBacktrace, ErrorKind, KernelError};
 use kernel_types::io::{DeviceOps, IoHandler, IoTarget};
 use kernel_types::pnp::{
     DriverStep, InitComplete, PnpHandler, PnpOp, PnpOps, QueryDeviceRelations, QueryId,
     QueryResources, RegisterDmaBacking, RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
+    UnhandledBehavior,
 };
 use kernel_types::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Read, Write,
 };
-use kernel_types::status::DriverStatus;
 
 #[cfg(feature = "kernel_link")]
 unsafe extern "Rust" {
@@ -22,6 +23,7 @@ unsafe extern "Rust" {
     fn routing_get_stack_top_from_weak_impl(
         dev_node_weak: &Weak<DevNode>,
     ) -> Option<Arc<DeviceObject>>;
+    fn routing_capture_error_backtrace_impl(output: &mut ErrorBacktrace);
 }
 
 #[cfg(feature = "kernel_link")]
@@ -42,6 +44,12 @@ fn get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceOb
     unsafe { routing_get_stack_top_from_weak_impl(dev_node_weak) }
 }
 
+#[cfg(feature = "kernel_link")]
+#[inline]
+fn capture_error_backtrace(output: &mut ErrorBacktrace) {
+    unsafe { routing_capture_error_backtrace_impl(output) }
+}
+
 #[cfg(not(feature = "kernel_link"))]
 #[inline]
 fn resolve_path_to_device(path: &str) -> Option<IoTarget> {
@@ -60,6 +68,18 @@ fn get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceOb
     unsafe { kernel_sys::routing_get_stack_top_from_weak(dev_node_weak) }
 }
 
+#[cfg(not(feature = "kernel_link"))]
+#[inline]
+fn capture_error_backtrace(output: &mut ErrorBacktrace) {
+    unsafe { kernel_sys::kernel_capture_error_backtrace(output) }
+}
+
+fn routing_error(kind: DriverErrorKind) -> KernelError {
+    let mut backtrace = ErrorBacktrace::empty();
+    capture_error_backtrace(&mut backtrace);
+    KernelError::from_parts(ErrorKind::Driver(kind), None, Some(backtrace))
+}
+
 #[macro_export]
 macro_rules! println {
     () => { $crate::print("\n") };
@@ -72,10 +92,10 @@ pub trait RoutedOperation: Sized {
     fn invoke_at<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Self,
-    ) -> impl Future<Output = Option<DriverStep>> + Send + 'a;
+    ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a;
 
-    fn default_unhandled_status(&self) -> DriverStatus {
-        DriverStatus::NotImplemented
+    fn default_result_for_unhandled(&self) -> Result<DriverStep, KernelError> {
+        Err(routing_error(DriverErrorKind::NotImplemented))
     }
 }
 
@@ -88,7 +108,7 @@ pub trait IoRequest: RoutedOperation {
         handler: Self::Handler,
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Self,
-    ) -> FfiFuture<DriverStep>;
+    ) -> FfiFuture<Result<DriverStep, KernelError>>;
 }
 
 pub trait PnpRequest: RoutedOperation {
@@ -102,14 +122,20 @@ pub trait PnpRequest: RoutedOperation {
         dev: &'a Arc<DeviceObject>,
         op: PnpOp,
         req: &'a mut Self,
-    ) -> FfiFuture<DriverStep>;
+    ) -> FfiFuture<Result<DriverStep, KernelError>>;
 
-    fn default_status_for_unhandled() -> DriverStatus {
-        Self::OP.default_status_for_unhandled()
+    fn default_result_for_unhandled() -> Result<DriverStep, KernelError> {
+        match Self::OP.unhandled_behavior() {
+            UnhandledBehavior::Complete => Ok(DriverStep::Complete),
+            UnhandledBehavior::Error(kind) => Err(routing_error(kind)),
+        }
     }
 }
 
-async fn invoke_io_handler<K: IoRequest>(dev: &Arc<DeviceObject>, req: &mut K) -> Option<DriverStep>
+async fn invoke_io_handler<K: IoRequest>(
+    dev: &Arc<DeviceObject>,
+    req: &mut K,
+) -> Option<Result<DriverStep, KernelError>>
 where
     K::Handler: Sync,
 {
@@ -127,7 +153,7 @@ where
 async fn invoke_pnp_handler<K: PnpRequest>(
     dev: &Arc<DeviceObject>,
     req: &mut K,
-) -> Option<DriverStep>
+) -> Option<Result<DriverStep, KernelError>>
 where
     K::Handler: Sync,
 {
@@ -151,7 +177,7 @@ macro_rules! impl_io_request {
                 handler: Self::Handler,
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> FfiFuture<DriverStep> {
+            ) -> FfiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, req)
             }
         }
@@ -161,7 +187,7 @@ macro_rules! impl_io_request {
             fn invoke_at<'a>(
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> impl Future<Output = Option<DriverStep>> + Send + 'a {
+            ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
                 async move { invoke_io_handler::<Self>(dev, req).await }
             }
         }
@@ -180,7 +206,7 @@ macro_rules! impl_io_request {
                 handler: Self::Handler,
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> FfiFuture<DriverStep> {
+            ) -> FfiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, req)
             }
         }
@@ -190,7 +216,7 @@ macro_rules! impl_io_request {
             fn invoke_at<'a>(
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> impl Future<Output = Option<DriverStep>> + Send + 'a {
+            ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
                 async move { invoke_io_handler::<Self>(dev, req).await }
             }
         }
@@ -225,7 +251,7 @@ where
         handler: Self::Handler,
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Self,
-    ) -> FfiFuture<DriverStep> {
+    ) -> FfiFuture<Result<DriverStep, KernelError>> {
         O::call(handler, dev, req)
     }
 }
@@ -240,7 +266,7 @@ where
     fn invoke_at<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Self,
-    ) -> impl Future<Output = Option<DriverStep>> + Send + 'a {
+    ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
         async move { invoke_io_handler::<Self>(dev, req).await }
     }
 }
@@ -260,7 +286,7 @@ macro_rules! impl_pnp_request {
                 dev: &'a Arc<DeviceObject>,
                 op: PnpOp,
                 req: &'a mut Self,
-            ) -> FfiFuture<DriverStep> {
+            ) -> FfiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, op, req)
             }
         }
@@ -269,12 +295,12 @@ macro_rules! impl_pnp_request {
             fn invoke_at<'a>(
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> impl Future<Output = Option<DriverStep>> + Send + 'a {
+            ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
                 async move { invoke_pnp_handler::<Self>(dev, req).await }
             }
 
-            fn default_unhandled_status(&self) -> DriverStatus {
-                <$ty as PnpRequest>::default_status_for_unhandled()
+            fn default_result_for_unhandled(&self) -> Result<DriverStep, KernelError> {
+                <$ty as PnpRequest>::default_result_for_unhandled()
             }
         }
     };
@@ -292,7 +318,7 @@ macro_rules! impl_pnp_request {
                 dev: &'a Arc<DeviceObject>,
                 op: PnpOp,
                 req: &'a mut Self,
-            ) -> FfiFuture<DriverStep> {
+            ) -> FfiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, op, req)
             }
         }
@@ -301,12 +327,12 @@ macro_rules! impl_pnp_request {
             fn invoke_at<'a>(
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> impl Future<Output = Option<DriverStep>> + Send + 'a {
+            ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
                 async move { invoke_pnp_handler::<Self>(dev, req).await }
             }
 
-            fn default_unhandled_status(&self) -> DriverStatus {
-                <$ty as PnpRequest>::default_status_for_unhandled()
+            fn default_result_for_unhandled(&self) -> Result<DriverStep, KernelError> {
+                <$ty as PnpRequest>::default_result_for_unhandled()
             }
         }
     };
@@ -367,25 +393,44 @@ impl_pnp_request!(
     stop_device
 );
 
-async fn call_one_device<K: RoutedOperation>(dev: &Arc<DeviceObject>, req: &mut K) -> DriverStatus {
+fn default_unhandled<K: RoutedOperation>(req: &K) -> Result<DriverStep, KernelError> {
+    req.default_result_for_unhandled()
+}
+
+async fn call_one_device<K: RoutedOperation>(
+    dev: &Arc<DeviceObject>,
+    req: &mut K,
+) -> Result<DriverStep, KernelError> {
     match K::invoke_at(dev, req).await {
-        Some(DriverStep::Complete { status }) => status,
-        Some(DriverStep::Continue) | None => K::default_unhandled_status(req),
+        Some(result) => match result? {
+            DriverStep::Complete => Ok(DriverStep::Complete),
+            DriverStep::Continue => default_unhandled(req),
+        },
+        None => default_unhandled(req),
     }
 }
 
 async fn call_down_stack<K: RoutedOperation>(
     mut dev: Arc<DeviceObject>,
     req: &mut K,
-) -> DriverStatus {
+) -> Result<DriverStep, KernelError> {
     loop {
         match K::invoke_at(&dev, req).await {
-            Some(DriverStep::Complete { status }) => return status,
-            Some(DriverStep::Continue) | None => {
+            Some(result) => match result? {
+                DriverStep::Complete => return Ok(DriverStep::Complete),
+                DriverStep::Continue => {
+                    let lower = dev.lower_device.read().clone();
+                    match lower {
+                        Some(lower) => dev = lower,
+                        None => return default_unhandled(req),
+                    }
+                }
+            },
+            None => {
                 let lower = dev.lower_device.read().clone();
                 match lower {
                     Some(lower) => dev = lower,
-                    None => return K::default_unhandled_status(req),
+                    None => return default_unhandled(req),
                 }
             }
         }
@@ -397,20 +442,26 @@ macro_rules! routing_api {
         pub mod $module {
             use super::*;
 
-            pub async fn send_to_device<K: $bound>(target: IoTarget, req: &mut K) -> DriverStatus {
+            pub async fn send_to_device<K: $bound>(
+                target: IoTarget,
+                req: &mut K,
+            ) -> Result<DriverStep, KernelError> {
                 call_one_device(&target, req).await
             }
 
-            pub async fn send_down_stack<K: $bound>(target: IoTarget, req: &mut K) -> DriverStatus {
+            pub async fn send_down_stack<K: $bound>(
+                target: IoTarget,
+                req: &mut K,
+            ) -> Result<DriverStep, KernelError> {
                 call_down_stack(target, req).await
             }
 
             pub async fn send_next_lower<K: $bound>(
                 from: Arc<DeviceObject>,
                 req: &mut K,
-            ) -> DriverStatus {
+            ) -> Result<DriverStep, KernelError> {
                 let Some(target) = from.lower_device.read().clone() else {
-                    return DriverStatus::NoSuchDevice;
+                    return Err(routing_error(DriverErrorKind::NoSuchDevice));
                 };
                 call_down_stack(target, req).await
             }
@@ -418,10 +469,10 @@ macro_rules! routing_api {
             pub async fn send_to_stack_top<K: $bound>(
                 dev_node_weak: Weak<DevNode>,
                 req: &mut K,
-            ) -> DriverStatus {
+            ) -> Result<DriverStep, KernelError> {
                 match get_stack_top_from_weak(&dev_node_weak) {
                     Some(target) => call_down_stack(target, req).await,
-                    None => DriverStatus::NoSuchDevice,
+                    None => Err(routing_error(DriverErrorKind::NoSuchDevice)),
                 }
             }
 

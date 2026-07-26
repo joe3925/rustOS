@@ -21,8 +21,8 @@ use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::{
     dma::{FromDevice, IoBuffer, ToDevice},
+    error::{ErrorKind, FileErrorKind, KernelError},
     fs::{OpenFlags, Path},
-    status::{DriverStatus, FileStatus, RegError},
 };
 use rand_core::block;
 
@@ -80,23 +80,23 @@ impl File {
         }
     }
 
-    pub extern "C" fn check_path(path: &str) -> Result<(), FileStatus> {
+    pub extern "C" fn check_path(path: &str) -> Result<(), FileErrorKind> {
         let sanitized = Self::remove_drive_from_path(path);
         let parts = sanitized.trim_matches('\\').split('\\');
         for comp in parts {
             if comp.is_empty() || comp == "." || comp == ".." {
-                return Err(FileStatus::BadPath);
+                return Err(FileErrorKind::BadPath);
             }
             if comp.chars().count() > 255 {
-                return Err(FileStatus::BadPath);
+                return Err(FileErrorKind::BadPath);
             }
             if comp.ends_with(' ') || comp.ends_with('.') {
-                return Err(FileStatus::BadPath);
+                return Err(FileErrorKind::BadPath);
             }
             let invalid = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
             for ch in comp.chars() {
                 if ch < '\u{20}' || invalid.contains(&ch) {
-                    return Err(FileStatus::BadPath);
+                    return Err(FileErrorKind::BadPath);
                 }
             }
         }
@@ -106,14 +106,11 @@ impl File {
         self.write_through = enable;
     }
 
-    pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
+    pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<Self, KernelError> {
         let write_through = flags.contains(&OpenFlags::WriteThrough);
-        let (res, st) = file_provider::provider()
+        let res = file_provider::provider()
             .open_path(path, flags, write_through)
-            .await;
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         if let Some(e) = res.error {
             return Err(e);
         }
@@ -126,43 +123,34 @@ impl File {
         })
     }
 
-    pub async fn delete(&mut self) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().delete_path(&self.path).await;
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+    pub async fn delete(&mut self) -> Result<(), KernelError> {
+        let r = file_provider::provider().delete_path(&self.path).await?;
         match r.error {
             None => Ok(()),
             Some(e) => Err(e),
         }
     }
 
-    pub async fn list_dir(path: &Path) -> Result<Vec<String>, FileStatus> {
-        let (r, st) = file_provider::provider().list_dir_path(path).await;
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+    pub async fn list_dir(path: &Path) -> Result<Vec<String>, KernelError> {
+        let r = file_provider::provider().list_dir_path(path).await?;
         match &r.names {
             Some(names) => Ok(names.clone()),
             None => Err(r.error.expect("Names is none but there is no error")),
         }
     }
 
-    pub async fn remove_dir(path: &Path) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().remove_dir_path(path).await;
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+    pub async fn remove_dir(path: &Path) -> Result<(), KernelError> {
+        let r = file_provider::provider().remove_dir_path(path).await?;
         match r.error {
             None => Ok(()),
             Some(e) => Err(e),
         }
     }
 
-    pub async fn make_dir(path: &Path) -> Result<(), FileStatus> {
+    pub async fn make_dir(path: &Path) -> Result<(), KernelError> {
         let drive = match path.symlink {
             Some(d) => d,
-            None => return Err(FileStatus::BadPath),
+            None => return Err(crate::error::error(FileErrorKind::BadPath)),
         };
 
         if path.components.is_empty() {
@@ -176,13 +164,10 @@ impl File {
             let comp = &raw[sp.start..sp.end];
             cur_path.push(comp);
 
-            let (r, st) = file_provider::provider().make_dir_path(&cur_path).await;
-            if st != DriverStatus::Success {
-                return Err(FileStatus::DriverError(st));
-            }
+            let r = file_provider::provider().make_dir_path(&cur_path).await?;
 
             if let Some(e) = r.error {
-                if e != FileStatus::FileAlreadyExist {
+                if e.kind() != ErrorKind::File(FileErrorKind::AlreadyExists) {
                     return Err(e);
                 }
             }
@@ -190,11 +175,11 @@ impl File {
 
         Ok(())
     }
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, FileStatus> {
+    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, KernelError> {
         self.read_at(0, buf).await
     }
 
-    pub async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileStatus> {
+    pub async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, KernelError> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -209,25 +194,21 @@ impl File {
         &self,
         offset: u64,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> Result<usize, FileStatus> {
+    ) -> Result<usize, KernelError> {
         if buffer.is_empty() {
             return Ok(0);
         }
 
-        let (res, st) = file_provider::provider()
+        let res = file_provider::provider()
             .read_iobuffer_at(self.fs_file_id, offset, buffer)
-            .await;
-
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         match res.error {
             None => Ok(res.bytes_read),
             Some(e) => Err(e),
         }
     }
 
-    pub async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FileStatus> {
+    pub async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, KernelError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -242,17 +223,14 @@ impl File {
         &mut self,
         offset: u64,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
-    ) -> Result<usize, FileStatus> {
+    ) -> Result<usize, KernelError> {
         if buffer.is_empty() {
             return Ok(0);
         }
 
-        let (wr, st) = file_provider::provider()
+        let wr = file_provider::provider()
             .write_iobuffer_at(self.fs_file_id, offset, buffer, self.write_through)
-            .await;
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         match wr.error {
             None => {
                 self.size = self.size.max(offset.saturating_add(wr.written as u64));
@@ -262,15 +240,14 @@ impl File {
         }
     }
 
-    pub async fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), KernelError> {
         self.write_at(0, data).await.map(|_| ())
     }
 
-    pub async fn move_no_copy(&self, dst: &Path) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().rename_path(&self.path, dst).await;
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+    pub async fn move_no_copy(&self, dst: &Path) -> Result<(), KernelError> {
+        let r = file_provider::provider()
+            .rename_path(&self.path, dst)
+            .await?;
         match r.error {
             None => Ok(()),
             Some(e) => Err(e),
@@ -280,45 +257,33 @@ impl File {
         &self,
         offset: i64,
         origin: kernel_types::fs::FsSeekWhence,
-    ) -> Result<u64, FileStatus> {
-        let (res, st) = file_provider::provider()
+    ) -> Result<u64, KernelError> {
+        let res = file_provider::provider()
             .seek_handle(self.fs_file_id, offset, origin)
-            .await;
-
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         if let Some(e) = res.error {
             return Err(e);
         }
         Ok(res.pos)
     }
 
-    pub async fn flush(&self) -> Result<(), FileStatus> {
-        let (res, st) = file_provider::provider()
+    pub async fn flush(&self) -> Result<(), KernelError> {
+        let res = file_provider::provider()
             .flush_handle(self.fs_file_id)
-            .await;
-
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         match res.error {
             None => Ok(()),
             Some(e) => Err(e),
         }
     }
 
-    pub async fn close(mut self) -> Result<(), FileStatus> {
+    pub async fn close(mut self) -> Result<(), KernelError> {
         let id = core::mem::take(&mut self.fs_file_id);
         if id == 0 {
             return Ok(());
         }
 
-        let (res, st) = file_provider::provider().close_handle(id).await;
-
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+        let res = file_provider::provider().close_handle(id).await?;
         match res.error {
             None => Ok(()),
             Some(e) => Err(e),
@@ -329,14 +294,10 @@ impl File {
     /// If `new_size` is less than the current size, the file is truncated.
     /// If `new_size` is greater than the current size, the file is extended
     /// with zero bytes for reads in the extended region.
-    pub async fn set_len(&mut self, new_size: u64) -> Result<(), FileStatus> {
-        let (res, st) = file_provider::provider()
+    pub async fn set_len(&mut self, new_size: u64) -> Result<(), KernelError> {
+        let res = file_provider::provider()
             .set_len(self.fs_file_id, new_size)
-            .await;
-
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         if let Some(e) = res.error {
             return Err(e);
         }
@@ -346,7 +307,7 @@ impl File {
 
     /// Appends data to the end of the file atomically.
     /// Returns the number of bytes written and updates the cached file size.
-    pub async fn append(&mut self, data: &[u8]) -> Result<usize, FileStatus> {
+    pub async fn append(&mut self, data: &[u8]) -> Result<usize, KernelError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -360,18 +321,14 @@ impl File {
     pub async fn append_iobuffer<'buffer>(
         &mut self,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
-    ) -> Result<usize, FileStatus> {
+    ) -> Result<usize, KernelError> {
         if buffer.is_empty() {
             return Ok(0);
         }
 
-        let (res, st) = file_provider::provider()
+        let res = file_provider::provider()
             .append_iobuffer(self.fs_file_id, buffer, self.write_through)
-            .await;
-
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         if let Some(e) = res.error {
             return Err(e);
         }
@@ -382,14 +339,10 @@ impl File {
     /// Zeros the specified byte range within the file.
     /// The range must be within the current file bounds (offset <= file_len).
     /// If the range extends past EOF, only bytes up to EOF are zeroed.
-    pub async fn zero_range(&mut self, offset: u64, len: u64) -> Result<(), FileStatus> {
-        let (res, st) = file_provider::provider()
+    pub async fn zero_range(&mut self, offset: u64, len: u64) -> Result<(), KernelError> {
+        let res = file_provider::provider()
             .zero_range(self.fs_file_id, offset, len)
-            .await;
-
-        if st != DriverStatus::Success {
-            return Err(FileStatus::DriverError(st));
-        }
+            .await?;
         match res.error {
             None => Ok(()),
             Some(e) => Err(e),
@@ -403,12 +356,14 @@ impl Drop for File {
             return;
         }
         // TODO: find a way so this doesnt block
-        block_on(file_provider::provider().close_handle(id));
+        if let Err(error) = block_on(file_provider::provider().close_handle(id)) {
+            println!("failed to close dropped file handle {id}: {error}");
+        }
     }
 }
 
 async fn list(dir: &Path) -> Option<alloc::vec::Vec<alloc::string::String>> {
-    let (res, _) = provider().list_dir_path(dir).await;
+    let res = provider().list_dir_path(dir).await.ok()?;
     if res.error.is_none() {
         res.names.clone()
     } else {
@@ -428,8 +383,13 @@ async fn read_all(path: &Path) -> Option<alloc::vec::Vec<u8>> {
     }
 }
 
-async fn ensure_dir(path: &Path) {
-    let _ = provider().make_dir_path(path).await;
+async fn ensure_dir(path: &Path) -> Result<(), KernelError> {
+    let result = provider().make_dir_path(path).await?;
+    match result.error {
+        None => Ok(()),
+        Some(error) if error.kind() == ErrorKind::File(FileErrorKind::AlreadyExists) => Ok(()),
+        Some(error) => Err(error),
+    }
 }
 
 async fn file_exists(path: &Path) -> bool {
@@ -438,15 +398,15 @@ async fn file_exists(path: &Path) -> bool {
         .is_ok()
 }
 
-pub async fn switch_to_vfs() -> Result<(), RegError> {
+pub async fn switch_to_vfs() -> Result<(), KernelError> {
     install_file_provider(ProviderKind::Vfs);
 
     rebind_and_persist_after_provider_switch().await?;
 
     let vfs_mod = Path::from_string("C:\\system\\mod");
     let vfs_toml = Path::from_string("C:\\system\\toml");
-    ensure_dir(&vfs_mod).await;
-    ensure_dir(&vfs_toml).await;
+    ensure_dir(&vfs_mod).await?;
+    ensure_dir(&vfs_toml).await?;
 
     let boot_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
     let secs = boot_ms as f64 / 1000 as f64;
@@ -486,11 +446,9 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
         // bench_async_vs_sync_call_latency_async().await;
         // bench_runtime_executor_async().await;
         //window.start();
-        let backtrace = Backtrace::capture();
-        println!("{:#?}", backtrace);
-        // loop {
-        //     bench_c_drive_io_async(true).await;
-        // }
+        loop {
+            bench_c_drive_io_async(true).await;
+        }
         //window.stop_and_persist().await;
         //test_full_heap_parallel();
         //}

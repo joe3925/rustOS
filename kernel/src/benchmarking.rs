@@ -39,10 +39,10 @@ use kernel_types::benchmark::{
 };
 use kernel_types::benchmark::{BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1, BenchSweepBothResult};
 use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
+use kernel_types::error::KernelError;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::DeviceControl;
-use kernel_types::status::{DriverStatus, FileStatus};
 use serde_json::{Value, json};
 use spin::{Mutex, Once};
 
@@ -3520,7 +3520,7 @@ fn ilog2_u64(mut x: u64) -> u32 {
     r
 }
 
-async fn open_for_append(path: &Path) -> Result<File, FileStatus> {
+async fn open_for_append(path: &Path) -> Result<File, KernelError> {
     let try_existing = File::open(
         path,
         &[
@@ -3547,7 +3547,7 @@ async fn open_for_append(path: &Path) -> Result<File, FileStatus> {
     .await
 }
 
-async fn ensure_csv_header(path: &Path, header: &str) -> Result<(), FileStatus> {
+async fn ensure_csv_header(path: &Path, header: &str) -> Result<(), KernelError> {
     if let Ok(f) = File::open(
         path,
         &[
@@ -3571,7 +3571,7 @@ async fn ensure_csv_header(path: &Path, header: &str) -> Result<(), FileStatus> 
     Ok(())
 }
 
-async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
+async fn append_csv_line(path: &Path, line: &str) -> Result<(), KernelError> {
     let mut f = open_for_append(path).await?;
     let mut s = String::new();
     s.push_str(line);
@@ -4227,7 +4227,7 @@ fn bench_sweep_append_csv_rows(
     }
 }
 
-async fn open_csv_root_c_create(name: &str) -> Result<File, FileStatus> {
+async fn open_csv_root_c_create(name: &str) -> Result<File, KernelError> {
     let mut path_str = String::from("C:\\");
     path_str.push_str(name);
 
@@ -4242,14 +4242,14 @@ async fn open_csv_root_c_create(name: &str) -> Result<File, FileStatus> {
     File::open(&path, &flags).await
 }
 
-async fn write_csv_header_to_file(f: &mut File) -> Result<(), FileStatus> {
+async fn write_csv_header_to_file(f: &mut File) -> Result<(), KernelError> {
     let mut hdr = String::new();
     csv_push_header(&mut hdr);
     f.append(hdr.as_bytes()).await?;
     Ok(())
 }
 
-async fn write_csv_chunk_to_file(f: &mut File, chunk: &str) -> Result<(), FileStatus> {
+async fn write_csv_chunk_to_file(f: &mut File, chunk: &str) -> Result<(), KernelError> {
     if chunk.is_empty() {
         return Ok(());
     }
@@ -4378,10 +4378,10 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                                 "[virtio-bench] Completed trial {} for run_id {} with status: {:?}",
                                 trial, run_id, st
                             );
-                            if st != DriverStatus::Success {
+                            if let Err(error) = st {
                                 println!(
-                                    "[virtio-bench] IOCTL_BOTH failed: {:?} (run_id={})",
-                                    st, run_id
+                                    "[virtio-bench] IOCTL_BOTH failed: {} (run_id={})",
+                                    error, run_id
                                 );
                                 run_id = run_id.wrapping_add(1);
                                 trial += 1;

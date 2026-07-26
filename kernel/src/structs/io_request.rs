@@ -6,8 +6,8 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
-use kernel_types::status::FileStatus;
 use spin::Mutex;
 
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
@@ -590,9 +590,32 @@ impl IoRequestTable {
         Err(RequestTableError::NotFound)
     }
 }
-// TODO: let the buffer error or file status propogate
-fn file_status(status: FileStatus) -> u64 {
-    IO_STATUS_FILE_ERROR_BASE | (u32::from(status) as u64)
+fn kernel_error_status(error: KernelError) -> u64 {
+    match error.kind() {
+        ErrorKind::Driver(DriverErrorKind::InvalidParameter) => IO_STATUS_INVALID_PARAMETER,
+        ErrorKind::Driver(DriverErrorKind::InsufficientResources) => IO_STATUS_NO_MEMORY,
+        ErrorKind::File(kind) => {
+            let code = match kind {
+                FileErrorKind::AlreadyExists => 1,
+                FileErrorKind::PathNotFound => 2,
+                FileErrorKind::UnknownFailure => 3,
+                FileErrorKind::NoBuffer => 4,
+                FileErrorKind::BufferError(_) => 5,
+                FileErrorKind::FilesystemError => 6,
+                FileErrorKind::NotFat => 8,
+                FileErrorKind::DriveNotFound => 9,
+                FileErrorKind::IncompatibleFlags => 10,
+                FileErrorKind::CorruptFilesystem => 11,
+                FileErrorKind::InternalError => 12,
+                FileErrorKind::BadPath => 13,
+                FileErrorKind::AccessDenied => 14,
+                FileErrorKind::NoSpace => 15,
+                FileErrorKind::FileTooLarge => 16,
+            };
+            IO_STATUS_FILE_ERROR_BASE | code
+        }
+        ErrorKind::Driver(_) | ErrorKind::Registry(_) => IO_STATUS_FILE_ERROR_BASE | 3,
+    }
 }
 
 #[inline(always)]
@@ -718,7 +741,7 @@ async fn run_file_open(
             Ok(handle) => IoRequestOutput::success(handle, 0),
             Err(status) => IoRequestOutput::error(status),
         },
-        Err(status) => IoRequestOutput::error(file_status(status)),
+        Err(error) => IoRequestOutput::error(kernel_error_status(error)),
     }
 }
 
@@ -737,7 +760,7 @@ async fn run_file_read(
     let mut data = alloc::vec![0u8; length];
     let n = match lease.file().read_at(offset, &mut data).await {
         Ok(n) => n,
-        Err(status) => return IoRequestOutput::error(file_status(status)),
+        Err(error) => return IoRequestOutput::error(kernel_error_status(error)),
     };
     data.truncate(n);
     drop(lease);
@@ -757,7 +780,7 @@ async fn run_file_write(file: Arc<FileObject>, data: Vec<u8>, offset: u64) -> Io
     let mut lease = file.take().await;
     match lease.file_mut().write_at(offset, &data).await {
         Ok(written) => IoRequestOutput::success(written as u64, 0),
-        Err(status) => IoRequestOutput::error(file_status(status)),
+        Err(error) => IoRequestOutput::error(kernel_error_status(error)),
     }
 }
 
@@ -765,26 +788,26 @@ async fn run_file_delete_handle(file: Arc<FileObject>) -> IoRequestOutput {
     let mut lease = file.take().await;
     match lease.file_mut().delete().await {
         Ok(()) => IoRequestOutput::success(0, 0),
-        Err(status) => IoRequestOutput::error(file_status(status)),
+        Err(error) => IoRequestOutput::error(kernel_error_status(error)),
     }
 }
 
 async fn run_file_delete_path(path: Path) -> IoRequestOutput {
     let mut file = match File::open(&path, &[OpenFlags::Open, OpenFlags::ReadWrite]).await {
         Ok(file) => file,
-        Err(status) => return IoRequestOutput::error(file_status(status)),
+        Err(error) => return IoRequestOutput::error(kernel_error_status(error)),
     };
 
     match file.delete().await {
         Ok(()) => IoRequestOutput::success(0, 0),
-        Err(status) => IoRequestOutput::error(file_status(status)),
+        Err(error) => IoRequestOutput::error(kernel_error_status(error)),
     }
 }
 
 async fn run_list_dir(owner: ProgramHandle, path: Path) -> IoRequestOutput {
     let entries = match File::list_dir(&path).await {
         Ok(entries) => entries,
-        Err(status) => return IoRequestOutput::error(file_status(status)),
+        Err(error) => return IoRequestOutput::error(kernel_error_status(error)),
     };
 
     let joined = if entries.is_empty() {
@@ -803,7 +826,7 @@ async fn run_list_dir(owner: ProgramHandle, path: Path) -> IoRequestOutput {
 
 async fn run_change_directory(owner: ProgramHandle, path: Path) -> IoRequestOutput {
     if let Err(status) = File::list_dir(&path).await {
-        return IoRequestOutput::error(file_status(status));
+        return IoRequestOutput::error(kernel_error_status(status));
     }
 
     owner.write().working_dir = path;

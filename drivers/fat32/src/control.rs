@@ -18,8 +18,8 @@ use kernel_api::{
         driver_set_evt_probe_device,
     },
     request_handler,
-    status::DriverStatus,
 };
+use kernel_api::error::{error, DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext};
 use spin::Mutex;
 
 use crate::{
@@ -36,19 +36,38 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
         .expect("failed to get FAT32 device extension")
 }
 
-fn volume_geometry(protocol: &ProtocolHandle<VolumeProtocol>) -> Result<(u16, u64), DriverStatus> {
-    let info = (protocol.partition_info)(protocol.provider())?;
-    let entry = info.gpt_entry.ok_or(DriverStatus::InvalidParameter)?;
+fn volume_geometry(
+    protocol: &ProtocolHandle<VolumeProtocol>,
+) -> Result<(u16, u64), KernelError> {
+    let info = (protocol.partition_info)(protocol.provider())
+        .with_context(|| "querying FAT32 volume partition information")?;
+    let entry = info.gpt_entry.ok_or_else(|| {
+        error(DriverErrorKind::InvalidParameter)
+            .with_context("FAT32 volume partition information has no GPT entry")
+    })?;
     let sector_size = if info.disk.logical_block_size == 0 {
         512
     } else {
-        u16::try_from(info.disk.logical_block_size).map_err(|_| DriverStatus::InvalidParameter)?
+        u16::try_from(info.disk.logical_block_size)
+            .map_err(|_| error(DriverErrorKind::InvalidParameter))
+            .with_context(|| {
+                alloc::format!(
+                    "FAT32 logical block size {} does not fit in u16",
+                    info.disk.logical_block_size
+                )
+            })?
     };
     let sectors = entry
         .last_lba
         .checked_sub(entry.first_lba)
         .and_then(|count| count.checked_add(1))
-        .ok_or(DriverStatus::InvalidParameter)?;
+        .ok_or_else(|| {
+            error(DriverErrorKind::InvalidParameter).with_context(alloc::format!(
+                "invalid FAT32 GPT LBA range {}..={}",
+                entry.first_lba,
+                entry.last_lba
+            ))
+        })?;
     Ok((sector_size, sectors))
 }
 
@@ -60,11 +79,15 @@ extern "C" fn fat32_probe(
     async move {
         let protocol = match open_public_protocol::<VolumeProtocol>(&context.devnode) {
             Ok(protocol) => protocol,
-            Err(status) => return ProbeOutcome::Error(status),
+            Err(kind) => {
+                return ProbeOutcome::Error(
+                    error(kind).with_context("opening the FAT32 probe volume protocol"),
+                )
+            }
         };
         let (sector_size, sectors) = match volume_geometry(&protocol) {
             Ok(geometry) => geometry,
-            Err(status) => return ProbeOutcome::Error(status),
+            Err(err) => return ProbeOutcome::Error(err),
         };
         let should_flush = Arc::new(AtomicBool::new(false));
         let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
@@ -76,12 +99,15 @@ extern "C" fn fat32_probe(
             current_owner.clone(),
         );
         let mut boot_sector = [0_u8; 512];
-        if probe_block
+        if let Err(probe_error) = probe_block
             .read_exact(&mut boot_sector, IoKind::Metadata)
             .await
-            .is_err()
         {
-            return ProbeOutcome::Error(DriverStatus::Unsuccessful);
+            return ProbeOutcome::Error(
+                probe_error
+                    .0
+                    .with_context("reading the FAT32 probe boot sector"),
+            );
         }
         let fat32_signature = boot_sector[510..512] == [0x55, 0xaa]
             && boot_sector[17..19] == [0, 0]
@@ -109,8 +135,13 @@ extern "C" fn fat32_probe(
         .await
         {
             Ok(_) => ProbeOutcome::Match,
-            Err(Error::Io(_)) => ProbeOutcome::Error(DriverStatus::Unsuccessful),
-            Err(_) => ProbeOutcome::Error(DriverStatus::Unsuccessful),
+            Err(Error::Io(err)) => {
+                ProbeOutcome::Error(err.0.with_context("mounting FAT32 during probe"))
+            }
+            Err(other) => ProbeOutcome::Error(
+                error(DriverErrorKind::DeviceError)
+                    .with_context(alloc::format!("mounting FAT32 during probe: {other:?}")),
+            ),
         }
     }
     .into_ffi()
@@ -119,14 +150,14 @@ extern "C" fn fat32_probe(
 pub extern "C" fn fat32_device_add(
     _driver: &Arc<DriverObject>,
     init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp = PnpOps::new();
     pnp.start_device.set(fat32_start);
     pnp.remove_device.set(fat32_remove);
     init.pnp_ops = Some(pnp);
     init.ops.fs.register::<Fat32Fs>();
     init.set_dev_ext_default::<VolCtrlDevExt>();
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -134,17 +165,21 @@ async fn fat32_start(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     _request: &mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let protocol = match open_protocol_to_next_lower::<VolumeProtocol>(device) {
         Ok(protocol) => protocol,
-        Err(status) => return DriverStep::complete(status),
+        Err(kind) => {
+            return Err(error(kind))
+                .with_context(|| "opening the lower volume protocol while starting FAT32")
+        }
     };
     let (sector_size, sectors) = match volume_geometry(&protocol) {
         Ok(geometry) => geometry,
-        Err(status) => return DriverStep::complete(status),
+        Err(err) => return Err(err),
     };
     let Some(volume_target) = device.lower_device.read().clone() else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(error(DriverErrorKind::NoSuchDevice))
+            .with_context(|| "starting FAT32 without a lower volume target");
     };
 
     let should_flush = Arc::new(AtomicBool::new(false));
@@ -163,7 +198,13 @@ async fn fat32_start(
     .await
     {
         Ok(filesystem) => filesystem,
-        Err(_) => return DriverStep::complete(DriverStatus::Unsuccessful),
+        Err(Error::Io(err)) => {
+            return Err(err.0).with_context(|| "mounting the FAT32 filesystem")
+        }
+        Err(other) => {
+            return Err(error(DriverErrorKind::DeviceError))
+                .with_context(|| alloc::format!("mounting the FAT32 filesystem: {other:?}"))
+        }
     };
 
     let mounted = MountedFat32 {
@@ -176,9 +217,10 @@ async fn fat32_start(
         current_owner,
     };
     if ext_mut::<VolCtrlDevExt>(device).mount(mounted).is_err() {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return Err(error(DriverErrorKind::InvalidParameter))
+            .with_context(|| "mounting FAT32 more than once on the same device");
     }
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -186,16 +228,16 @@ async fn fat32_remove(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     _request: &mut RemoveDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if device.is_started() {
         flush(&ext_mut::<VolCtrlDevExt>(device));
     }
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_probe_device(driver, fat32_probe);
     driver_set_evt_device_add(driver, fat32_device_add);
-    DriverStatus::Success
+    Ok(())
 }

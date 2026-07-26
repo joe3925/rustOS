@@ -1,11 +1,11 @@
-use alloc::sync::Arc;
 use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
+use crate::error::KernelError;
 use crate::io::{DiskInfo, PartitionInfo};
-use crate::status::DriverStatus;
+use alloc::sync::Arc;
 
 #[repr(C)]
 pub struct DiskInfoProtocolVTable {
-    pub query: extern "C" fn(&Arc<DeviceObject>) -> Result<DiskInfo, DriverStatus>,
+    pub query: extern "C" fn(&Arc<DeviceObject>) -> Result<DiskInfo, KernelError>,
 }
 
 pub enum DiskInfoProtocol {}
@@ -19,7 +19,7 @@ unsafe impl Protocol for DiskInfoProtocol {
 
 #[repr(C)]
 pub struct PartitionInfoProtocolVTable {
-    pub query: extern "C" fn(&Arc<DeviceObject>) -> Result<PartitionInfo, DriverStatus>,
+    pub query: extern "C" fn(&Arc<DeviceObject>) -> Result<PartitionInfo, KernelError>,
 }
 
 pub enum PartitionInfoProtocol {}

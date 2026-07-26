@@ -30,8 +30,8 @@ use kernel_api::{
     },
     request::{DeviceControl, Flush, Read, Write},
     request_handler,
-    status::DriverStatus,
 };
+use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
@@ -47,7 +47,7 @@ struct DiskIo;
 fn validate_disk_read_chain<'io>(
     first: &Read<'io>,
     block_size: u64,
-) -> Result<(u64, u64), DriverStatus> {
+) -> Result<(u64, u64), DriverErrorKind> {
     let mut requests = 0u64;
     let mut bytes = 0u64;
 
@@ -57,34 +57,34 @@ fn validate_disk_read_chain<'io>(
         }
 
         if read.no_buffer {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         let Some(buffer) = read.buffer.as_ref() else {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         };
 
         if !has_from_device_buffer(buffer, read.len) {
-            return Err(DriverStatus::InsufficientResources);
+            return Err(DriverErrorKind::InsufficientResources);
         }
 
         let len = read.len as u64;
 
         if read.offset % block_size != 0 || !len.is_multiple_of(block_size) {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         read.offset
             .checked_add(len)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
 
         requests = requests
             .checked_add(1)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
 
         bytes = bytes
             .checked_add(len)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
     }
 
     Ok((requests, bytes))
@@ -93,7 +93,7 @@ fn validate_disk_read_chain<'io>(
 fn validate_disk_write_chain<'io>(
     first: &Write<'io>,
     block_size: u64,
-) -> Result<(u64, u64), DriverStatus> {
+) -> Result<(u64, u64), DriverErrorKind> {
     let mut requests = 0u64;
     let mut bytes = 0u64;
 
@@ -103,35 +103,35 @@ fn validate_disk_write_chain<'io>(
         }
 
         if write.no_buffer {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         let Some(buffer) = write.buffer.as_ref() else {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         };
 
         if !has_to_device_buffer(buffer, write.len) {
-            return Err(DriverStatus::InsufficientResources);
+            return Err(DriverErrorKind::InsufficientResources);
         }
 
         let len = write.len as u64;
 
         if write.offset % block_size != 0 || !len.is_multiple_of(block_size) {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         write
             .offset
             .checked_add(len)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
 
         requests = requests
             .checked_add(1)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
 
         bytes = bytes
             .checked_add(len)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
     }
 
     Ok((requests, bytes))
@@ -142,13 +142,13 @@ impl DeviceRead for DiskIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut Read<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = disk_ext(&dev);
 
         let bs = dx.block_size.load(Ordering::Acquire) as u64;
         if unlikely(bs == 0) {
             cold_path();
-            return DriverStep::complete(DriverStatus::InvalidParameter);
+            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
         }
 
         let (requests, bytes) = {
@@ -156,18 +156,20 @@ impl DeviceRead for DiskIo {
 
             match validate_disk_read_chain(body, bs) {
                 Ok(v) => v,
-                Err(st) => {
+                Err(kind) => {
                     cold_path();
-                    return DriverStep::complete(st);
+                    return Err(error(kind));
                 }
             }
         };
 
         if requests == 0 {
-            return DriverStep::complete(DriverStatus::Success);
+            return Ok(DriverStep::Complete);
         }
 
-        DriverStep::complete(io::send_next_lower(dev.clone(), req).await)
+        io::send_next_lower(dev.clone(), req)
+            .await
+            .with_context(|| "forwarding disk read to the lower device")
     }
 }
 
@@ -176,13 +178,13 @@ impl DeviceWrite for DiskIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut Write<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = disk_ext(&dev);
 
         let bs = dx.block_size.load(Ordering::Acquire) as u64;
         if unlikely(bs == 0) {
             cold_path();
-            return DriverStep::complete(DriverStatus::InvalidParameter);
+            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
         }
 
         let (requests, bytes) = {
@@ -190,24 +192,28 @@ impl DeviceWrite for DiskIo {
 
             match validate_disk_write_chain(body, bs) {
                 Ok(v) => v,
-                Err(st) => {
+                Err(kind) => {
                     cold_path();
-                    return DriverStep::complete(st);
+                    return Err(error(kind));
                 }
             }
         };
 
         if requests == 0 {
-            return DriverStep::complete(DriverStatus::Success);
+            return Ok(DriverStep::Complete);
         }
 
-        DriverStep::complete(io::send_next_lower(dev.clone(), req).await)
+        io::send_next_lower(dev.clone(), req)
+            .await
+            .with_context(|| "forwarding disk write to the lower device")
     }
 }
 impl DeviceFlush for DiskIo {
     #[request_handler]
-    async fn handler<'req, 'b>(_dev: &Arc<DeviceObject>, _req: &'b mut Flush) -> DriverStep {
-        DriverStep::complete(io::send_next_lower(_dev.clone(), _req).await)
+    async fn handler<'req, 'b>(_dev: &Arc<DeviceObject>, _req: &'b mut Flush) -> Result<DriverStep, kernel_api::error::KernelError> {
+        io::send_next_lower(_dev.clone(), _req)
+            .await
+            .with_context(|| "forwarding disk flush to the lower device")
     }
 }
 
@@ -216,32 +222,24 @@ impl DeviceControlHandler for DiskIo {
     async fn handler<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut DeviceControl<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let code = req.code;
 
         match code {
             IOCTL_DRIVE_IDENTIFY => {
                 let devnode = dev.dev_node.get().unwrap().upgrade().unwrap();
-                let info = match open_public_protocol::<DiskInfoProtocol>(&devnode) {
-                    Ok(proto) => {
-                        match (proto.query)(&proto.provider()) {
-                            Ok(di) => di,
-                            Err(_) => {
-                                cold_path();
-                                return DriverStep::complete(DriverStatus::Unsuccessful);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        cold_path();
-                        return DriverStep::complete(DriverStatus::Unsuccessful);
-                    }
-                };
+                let proto = open_public_protocol::<DiskInfoProtocol>(&devnode)
+                    .map_err(error)
+                    .with_context(|| "opening the disk information protocol")?;
+                let info = (proto.query)(&proto.provider())
+                    .with_context(|| "querying disk identification information")?;
 
                 req.set_data_t::<DiskInfo>(info);
-                DriverStep::complete(DriverStatus::Success)
+                Ok(DriverStep::Complete)
             }
-            _ => DriverStep::complete(io::send_next_lower(dev.clone(), req).await),
+            _ => io::send_next_lower(dev.clone(), req)
+                .await
+                .with_context(|| "forwarding an unsupported disk control request"),
         }
     }
 }
@@ -279,16 +277,16 @@ async fn disk_pnp_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let devnode = match dev.dev_node.get() {
         Some(dn) => match dn.upgrade() {
             Some(dn) => dn,
-            None => return DriverStep::complete(DriverStatus::Unsuccessful),
+            None => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::Unsuccessful)),
         },
-        None => return DriverStep::complete(DriverStatus::Unsuccessful),
+        None => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::Unsuccessful)),
     };
 
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 #[request_handler]
@@ -296,24 +294,24 @@ async fn disk_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut InitComplete,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if let Err(st) = query_props_sync(dev) {
         cold_path();
-        return DriverStep::complete(st);
+        return Err(st);
     }
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, disk_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     dev_init.ops.register::<DeviceReadOp, DiskIo>();
     dev_init.ops.register::<DeviceWriteOp, DiskIo>();
     dev_init.ops.register::<DeviceControlOp, DiskIo>();
@@ -326,7 +324,7 @@ pub extern "C" fn disk_device_add(
     dev_init.pnp_ops = Some(pnp_vt);
 
     dev_init.set_dev_ext_default::<DiskExt>();
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -334,8 +332,8 @@ async fn disk_pnp_remove<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut RemoveDevice,
-) -> DriverStep {
-    DriverStep::Continue
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Continue)
 }
 
 #[inline]
@@ -343,15 +341,16 @@ fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
     dev.try_devext::<DiskExt>().expect("disk dev ext missing")
 }
 
-fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
+fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), KernelError> {
     let proto = match open_protocol_to_next_lower::<DiskInfoProtocol>(dev) {
         Ok(p) => p,
-        Err(e) => {
+        Err(kind) => {
             cold_path();
-            return Err(e);
+            return Err(error(kind));
         }
     };
-    let di = (proto.query)(&proto.provider())?;
+    let di = (proto.query)(&proto.provider())
+        .with_context(|| "querying lower-disk properties")?;
 
     let dx = disk_ext(dev);
     *dx.info.write() = Some(di.clone());

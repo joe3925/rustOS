@@ -1254,7 +1254,7 @@ macro_rules! define_fs_request_operations {
                 handler: Self::Handler,
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Fs<'data, Self>,
-            ) -> FfiFuture<DriverStep>;
+            ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
         }
 
         $(
@@ -1273,7 +1273,7 @@ macro_rules! define_fs_request_operations {
                     handler: Self::Handler,
                     dev: &'a Arc<DeviceObject>,
                     req: &'a mut Fs<'data, Self>,
-                ) -> FfiFuture<DriverStep> {
+                ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>> {
                     handler(dev, req)
                 }
             }

@@ -40,8 +40,8 @@ If there is a * it must be completed before user space is started
 2. [ ] * Change the registry from inline proto to a .proto file
 
 ## Error handling (ERH) (all around messy and I need to refactor it, not sure in what direction I want to take it yet)
-1. [ ] * Figure out how error handling should be refactored
-2. [ ] Stop using format_args its gonna be none pretty much all the time.  
+1. [x] * Figure out how error handling should be refactored
+2. [x] Stop using format_args its gonna be none pretty much all the time.  
 
 ## Benchmarking (BEN)
 1. [ ] An all around mess needs to be cleaned up but im not sure how yet. 

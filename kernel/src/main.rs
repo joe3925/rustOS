@@ -31,6 +31,7 @@ mod console;
 mod crt;
 mod debug_metadata;
 mod drivers;
+mod error;
 mod executable;
 mod exports;
 mod file_system;

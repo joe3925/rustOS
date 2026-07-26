@@ -8,10 +8,10 @@ use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::device::{DeviceInit, DeviceObject};
 use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
-use kernel_types::io::{DeviceOps, DeviceRead};
+use kernel_types::error::{DriverErrorKind, ErrorKind, KernelError};
+use kernel_types::io::{DeviceOps, DeviceRead, DeviceReadOp};
 use kernel_types::pnp::{DriverStep, PnpOps, QueryId, QueryIdType, StartDevice};
 use kernel_types::request::Read;
-use kernel_types::status::DriverStatus;
 
 use crate::{io, pnp};
 
@@ -49,13 +49,13 @@ fn device_with_ops(ops: DeviceOps) -> Arc<DeviceObject> {
 extern "C" fn read_handler<'a, 'io>(
     _dev: &'a Arc<DeviceObject>,
     request: &'a mut Read<'io>,
-) -> FfiFuture<DriverStep> {
+) -> FfiFuture<Result<DriverStep, KernelError>> {
     async move {
         if let Some(buffer) = request.buffer.as_mut() {
             let out = buffer.try_as_mut_slice().unwrap();
             out[0] = request.len as u8;
         }
-        DriverStep::complete(DriverStatus::Success)
+        Ok(DriverStep::Complete)
     }
     .into_ffi()
 }
@@ -63,8 +63,8 @@ extern "C" fn read_handler<'a, 'io>(
 extern "C" fn continue_handler<'a, 'io>(
     _dev: &'a Arc<DeviceObject>,
     _request: &'a mut Read<'io>,
-) -> FfiFuture<DriverStep> {
-    async { DriverStep::Continue }.into_ffi()
+) -> FfiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Continue) }.into_ffi()
 }
 
 struct TestRead;
@@ -72,7 +72,7 @@ impl DeviceRead for TestRead {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Read<'io>,
-    ) -> FfiFuture<DriverStep> {
+    ) -> FfiFuture<Result<DriverStep, KernelError>> {
         read_handler(dev, request)
     }
 }
@@ -82,7 +82,7 @@ impl DeviceRead for ContinueRead {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Read<'io>,
-    ) -> FfiFuture<DriverStep> {
+    ) -> FfiFuture<Result<DriverStep, KernelError>> {
         continue_handler(dev, request)
     }
 }
@@ -90,7 +90,7 @@ impl DeviceRead for ContinueRead {
 #[test]
 fn typed_read_updates_buffer() {
     let mut ops = DeviceOps::empty();
-    ops.read.register::<TestRead>();
+    ops.register::<DeviceReadOp, TestRead>();
     let device = device_with_ops(ops);
     let mut out = [0u8; 1];
     let status = {
@@ -103,17 +103,17 @@ fn typed_read_updates_buffer() {
         let mut request = Read::new(0, 7, false, Some(buffer));
         block_on_ready(io::send_to_device(device, &mut request))
     };
-    assert_eq!(status, DriverStatus::Success);
+    assert!(matches!(status, Ok(DriverStep::Complete)));
     assert_eq!(out, [7]);
 }
 
 #[test]
 fn continue_traverses_to_lower_device() {
     let mut upper_ops = DeviceOps::empty();
-    upper_ops.read.register::<ContinueRead>();
+    upper_ops.register::<DeviceReadOp, ContinueRead>();
     let upper = device_with_ops(upper_ops);
     let mut lower_ops = DeviceOps::empty();
-    lower_ops.read.register::<TestRead>();
+    lower_ops.register::<DeviceReadOp, TestRead>();
     let lower = device_with_ops(lower_ops);
     DeviceObject::set_lower_upper(&upper, lower);
 
@@ -128,7 +128,7 @@ fn continue_traverses_to_lower_device() {
         let mut request = Read::new(0, 3, false, Some(buffer));
         block_on_ready(io::send_down_stack(upper, &mut request))
     };
-    assert_eq!(status, DriverStatus::Success);
+    assert!(matches!(status, Ok(DriverStep::Complete)));
     assert_eq!(out, [3]);
 }
 
@@ -139,16 +139,17 @@ fn typed_pnp_uses_operation_default_when_unhandled() {
         id_type: QueryIdType::DeviceId,
         ids: Vec::new(),
     };
+    let error = block_on_ready(pnp::send_down_stack(device.clone(), &mut query)).unwrap_err();
     assert_eq!(
-        block_on_ready(pnp::send_down_stack(device.clone(), &mut query)),
-        DriverStatus::NotImplemented
+        error.kind(),
+        ErrorKind::Driver(DriverErrorKind::NotImplemented)
     );
 
     let mut start = StartDevice {
         resources: Vec::new(),
     };
-    assert_eq!(
+    assert!(matches!(
         block_on_ready(pnp::send_down_stack(device, &mut start)),
-        DriverStatus::Success
-    );
+        Ok(DriverStep::Complete)
+    ));
 }

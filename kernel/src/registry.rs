@@ -6,13 +6,19 @@ use alloc::vec::Vec;
 
 use embedded_crc32c::crc32c;
 use kernel_types::async_types::AsyncMutex;
+use kernel_types::error::{KernelError, RegistryErrorKind, ResultErrorContext};
 use kernel_types::fs::{OpenFlags, Path};
-use kernel_types::status::{Data, RegError};
+use kernel_types::status::Data;
 use prost::Message;
 use spin::{Once, RwLock};
 
 use crate::file_system::file::File;
 use crate::println;
+
+#[inline]
+fn registry_error(kind: RegistryErrorKind) -> KernelError {
+    crate::error::error(kind)
+}
 
 const REG_PATH: &str = "C:\\system\\registry\\registry.pb";
 const WAL_PATH: &str = "C:\\system\\registry\\registry.wal";
@@ -197,11 +203,11 @@ impl From<&Registry> for RegistryProto {
 }
 
 impl TryFrom<RegistryProto> for Registry {
-    type Error = RegError;
+    type Error = KernelError;
 
     fn try_from(proto: RegistryProto) -> Result<Self, Self::Error> {
         if proto.schema_version != REGISTRY_SCHEMA_VERSION {
-            return Err(RegError::EncodingFailed);
+            return Err(registry_error(RegistryErrorKind::EncodingFailed));
         }
 
         let mut root = BTreeMap::new();
@@ -232,7 +238,7 @@ impl From<&Key> for KeyProto {
 }
 
 impl TryFrom<KeyProto> for Key {
-    type Error = RegError;
+    type Error = KernelError;
 
     fn try_from(proto: KeyProto) -> Result<Self, Self::Error> {
         let mut values = BTreeMap::new();
@@ -282,10 +288,13 @@ impl From<Data> for ValueProto {
 }
 
 impl TryFrom<ValueProto> for Data {
-    type Error = RegError;
+    type Error = KernelError;
 
     fn try_from(proto: ValueProto) -> Result<Self, Self::Error> {
-        match proto.value.ok_or(RegError::EncodingFailed)? {
+        match proto
+            .value
+            .ok_or_else(|| registry_error(RegistryErrorKind::EncodingFailed))?
+        {
             ValueKindProto::U32(value) => Ok(Data::U32(value)),
             ValueKindProto::U64(value) => Ok(Data::U64(value)),
             ValueKindProto::I32(value) => Ok(Data::I32(value)),
@@ -297,14 +306,14 @@ impl TryFrom<ValueProto> for Data {
 }
 
 impl RegistryStore {
-    async fn create_key(&self, path: String) -> Result<(), RegError> {
+    async fn create_key(&self, path: String) -> Result<(), KernelError> {
         let _io = self.io.lock().await;
 
         {
             let state = self.state.read();
 
             if path_parts(&path).next().is_none() {
-                return Err(RegError::KeyAlreadyExists);
+                return Err(registry_error(RegistryErrorKind::KeyAlreadyExists));
             }
 
             if walk(&state.registry, &path).is_some() {
@@ -338,7 +347,7 @@ impl RegistryStore {
         Ok(())
     }
 
-    async fn delete_key(&self, path: &str) -> Result<bool, RegError> {
+    async fn delete_key(&self, path: &str) -> Result<bool, KernelError> {
         let _io = self.io.lock().await;
 
         if walk(&self.state.read().registry, path).is_none() {
@@ -369,12 +378,13 @@ impl RegistryStore {
         Ok(true)
     }
 
-    async fn set_value(&self, key_path: &str, name: &str, data: Data) -> Result<(), RegError> {
+    async fn set_value(&self, key_path: &str, name: &str, data: Data) -> Result<(), KernelError> {
         let _io = self.io.lock().await;
 
         {
             let state = self.state.read();
-            let key = walk(&state.registry, key_path).ok_or(RegError::KeyNotFound)?;
+            let key = walk(&state.registry, key_path)
+                .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
 
             if key.values.get(name) == Some(&data) {
                 return Ok(());
@@ -395,7 +405,8 @@ impl RegistryStore {
 
         {
             let mut state = self.state.write();
-            let key = walk_mut(&mut state.registry, key_path).ok_or(RegError::KeyNotFound)?;
+            let key = walk_mut(&mut state.registry, key_path)
+                .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
 
             key.values.insert(name.to_string(), data);
 
@@ -408,7 +419,7 @@ impl RegistryStore {
         Ok(())
     }
 
-    async fn delete_value(&self, key_path: &str, name: &str) -> Result<bool, RegError> {
+    async fn delete_value(&self, key_path: &str, name: &str) -> Result<bool, KernelError> {
         let _io = self.io.lock().await;
 
         {
@@ -589,7 +600,7 @@ fn fresh_registry() -> Registry {
     registry
 }
 
-fn encode_frame(version: u32, seq: u64, message: &impl Message) -> Result<Vec<u8>, RegError> {
+fn encode_frame(version: u32, seq: u64, message: &impl Message) -> Result<Vec<u8>, KernelError> {
     let payload_len = message.encoded_len();
 
     let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + payload_len + FRAME_CHECKSUM_LEN);
@@ -600,29 +611,29 @@ fn encode_frame(version: u32, seq: u64, message: &impl Message) -> Result<Vec<u8
 
     message
         .encode(&mut bytes)
-        .map_err(|_| RegError::EncodingFailed)?;
+        .map_err(|_| registry_error(RegistryErrorKind::EncodingFailed))?;
 
     bytes.extend_from_slice(&crc32c(&bytes).to_le_bytes());
 
     Ok(bytes)
 }
 
-fn decode_frame(bytes: &[u8], expected_version: u32) -> Result<(u64, &[u8], usize), RegError> {
+fn decode_frame(bytes: &[u8], expected_version: u32) -> Result<(u64, &[u8], usize), KernelError> {
     if bytes.len() < FRAME_HEADER_LEN + FRAME_CHECKSUM_LEN {
-        return Err(RegError::EncodingFailed);
+        return Err(registry_error(RegistryErrorKind::EncodingFailed));
     }
 
     let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
 
     if version != expected_version {
-        return Err(RegError::EncodingFailed);
+        return Err(registry_error(RegistryErrorKind::EncodingFailed));
     }
 
     let seq = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
     let payload_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
 
     if payload_len > bytes.len() - FRAME_HEADER_LEN - FRAME_CHECKSUM_LEN {
-        return Err(RegError::EncodingFailed);
+        return Err(registry_error(RegistryErrorKind::EncodingFailed));
     }
 
     let payload_end = FRAME_HEADER_LEN + payload_len;
@@ -631,13 +642,13 @@ fn decode_frame(bytes: &[u8], expected_version: u32) -> Result<(u64, &[u8], usiz
     let expected_crc = u32::from_le_bytes(bytes[payload_end..frame_end].try_into().unwrap());
 
     if crc32c(&bytes[..payload_end]) != expected_crc {
-        return Err(RegError::EncodingFailed);
+        return Err(registry_error(RegistryErrorKind::EncodingFailed));
     }
 
     Ok((seq, &bytes[FRAME_HEADER_LEN..payload_end], frame_end))
 }
 
-fn encode_snapshot(registry: &Registry, last_wal_seq: u64) -> Result<Vec<u8>, RegError> {
+fn encode_snapshot(registry: &Registry, last_wal_seq: u64) -> Result<Vec<u8>, KernelError> {
     encode_frame(
         SNAPSHOT_VERSION,
         last_wal_seq,
@@ -645,19 +656,20 @@ fn encode_snapshot(registry: &Registry, last_wal_seq: u64) -> Result<Vec<u8>, Re
     )
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<(Registry, u64), RegError> {
+fn decode_snapshot(bytes: &[u8]) -> Result<(Registry, u64), KernelError> {
     let (last_wal_seq, payload, frame_len) = decode_frame(bytes, SNAPSHOT_VERSION)?;
 
     if frame_len != bytes.len() {
-        return Err(RegError::EncodingFailed);
+        return Err(registry_error(RegistryErrorKind::EncodingFailed));
     }
 
-    let proto = RegistryProto::decode(payload).map_err(|_| RegError::EncodingFailed)?;
+    let proto = RegistryProto::decode(payload)
+        .map_err(|_| registry_error(RegistryErrorKind::EncodingFailed))?;
 
     Ok((Registry::try_from(proto)?, last_wal_seq))
 }
 
-async fn read_file(path: &str) -> Result<Vec<u8>, RegError> {
+async fn read_file(path: &str) -> Result<Vec<u8>, KernelError> {
     let file = File::open(
         &Path::from_string(path),
         &[OpenFlags::Open, OpenFlags::ReadOnly],
@@ -669,8 +681,7 @@ async fn read_file(path: &str) -> Result<Vec<u8>, RegError> {
     let read = match file.read(&mut bytes).await {
         Ok(read) => read,
         Err(error) => {
-            let _ = file.close().await;
-            return Err(error.into());
+            return Err(close_preserving_error(file, error, "after a registry read failed").await);
         }
     };
 
@@ -681,12 +692,22 @@ async fn read_file(path: &str) -> Result<Vec<u8>, RegError> {
     Ok(bytes)
 }
 
-async fn load_best_snapshot() -> Result<(Registry, u64), RegError> {
+async fn close_preserving_error(file: File, error: KernelError, context: &str) -> KernelError {
+    match file.close().await {
+        Ok(()) => error,
+        Err(close_error) => error.with_related_error(
+            format!("{context}; closing the registry file also failed"),
+            close_error,
+        ),
+    }
+}
+
+async fn load_best_snapshot() -> Result<(Registry, u64), KernelError> {
     let bytes = read_file(REG_PATH).await?;
     decode_snapshot(&bytes)
 }
 
-async fn persist_snapshot(bytes: &[u8]) -> Result<(), RegError> {
+async fn persist_snapshot(bytes: &[u8]) -> Result<(), KernelError> {
     let mut file = match File::open(
         &Path::from_string(REG_PATH),
         &[OpenFlags::Create, OpenFlags::WriteThrough],
@@ -695,7 +716,12 @@ async fn persist_snapshot(bytes: &[u8]) -> Result<(), RegError> {
     {
         Ok(file) => file,
 
-        Err(_) => {
+        Err(error)
+            if error.kind()
+                == kernel_types::error::ErrorKind::File(
+                    kernel_types::error::FileErrorKind::AlreadyExists,
+                ) =>
+        {
             File::open(
                 &Path::from_string(REG_PATH),
                 &[
@@ -706,24 +732,32 @@ async fn persist_snapshot(bytes: &[u8]) -> Result<(), RegError> {
             )
             .await?
         }
+        Err(error) => {
+            return Err(error.with_context("creating the registry snapshot file"));
+        }
     };
 
     if let Err(error) = file.set_len(0).await {
-        let _ = file.close().await;
-        return Err(error.into());
+        return Err(
+            close_preserving_error(file, error, "after truncating the snapshot failed").await,
+        );
     }
 
     let written = match file.write_at(0, bytes).await {
         Ok(written) => written,
         Err(error) => {
-            let _ = file.close().await;
-            return Err(error.into());
+            return Err(
+                close_preserving_error(file, error, "after writing the snapshot failed").await,
+            );
         }
     };
 
     if written != bytes.len() {
-        let _ = file.close().await;
-        return Err(RegError::PersistenceFailed);
+        let error = registry_error(RegistryErrorKind::PersistenceFailed).with_context(format!(
+            "snapshot write was short: wrote {written} of {} bytes",
+            bytes.len()
+        ));
+        return Err(close_preserving_error(file, error, "after a short snapshot write").await);
     }
 
     file.close().await?;
@@ -731,7 +765,7 @@ async fn persist_snapshot(bytes: &[u8]) -> Result<(), RegError> {
     Ok(())
 }
 
-async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), RegError> {
+async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), KernelError> {
     let record = encode_frame(WAL_VERSION, seq, delta)?;
 
     let mut file = match File::open(
@@ -742,7 +776,12 @@ async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), RegError> {
     {
         Ok(file) => file,
 
-        Err(_) => {
+        Err(error)
+            if error.kind()
+                == kernel_types::error::ErrorKind::File(
+                    kernel_types::error::FileErrorKind::AlreadyExists,
+                ) =>
+        {
             File::open(
                 &Path::from_string(WAL_PATH),
                 &[
@@ -753,6 +792,9 @@ async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), RegError> {
             )
             .await?
         }
+        Err(error) => {
+            return Err(error.with_context("creating the registry WAL file"));
+        }
     };
 
     let original_len = file.size;
@@ -760,15 +802,23 @@ async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), RegError> {
     let written = match file.append(&record).await {
         Ok(written) => written,
         Err(error) => {
-            let _ = file.close().await;
-            return Err(error.into());
+            return Err(
+                close_preserving_error(file, error, "after appending the WAL failed").await,
+            );
         }
     };
 
     if written != record.len() {
-        let _ = file.set_len(original_len).await;
-        let _ = file.close().await;
-        return Err(RegError::PersistenceFailed);
+        let mut error = registry_error(RegistryErrorKind::PersistenceFailed).with_context(format!(
+            "WAL append was short: wrote {written} of {} bytes",
+            record.len()
+        ));
+        if let Err(restore_error) = file.set_len(original_len).await {
+            error = error.with_context(format!(
+                "restoring the WAL to {original_len} bytes also failed: {restore_error}"
+            ));
+        }
+        return Err(close_preserving_error(file, error, "after a short WAL append").await);
     }
 
     file.close().await?;
@@ -776,8 +826,8 @@ async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), RegError> {
     Ok(())
 }
 
-async fn clear_wal() -> Result<(), RegError> {
-    let Ok(mut file) = File::open(
+async fn clear_wal() -> Result<(), KernelError> {
+    let mut file = match File::open(
         &Path::from_string(WAL_PATH),
         &[
             OpenFlags::Open,
@@ -786,13 +836,21 @@ async fn clear_wal() -> Result<(), RegError> {
         ],
     )
     .await
-    else {
-        return Ok(());
+    {
+        Ok(file) => file,
+        Err(error)
+            if error.kind()
+                == kernel_types::error::ErrorKind::File(
+                    kernel_types::error::FileErrorKind::PathNotFound,
+                ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.with_context("opening the WAL for clearing")),
     };
 
     if let Err(error) = file.set_len(0).await {
-        let _ = file.close().await;
-        return Err(error.into());
+        return Err(close_preserving_error(file, error, "after clearing the WAL failed").await);
     }
 
     file.close().await?;
@@ -800,7 +858,7 @@ async fn clear_wal() -> Result<(), RegError> {
     Ok(())
 }
 
-async fn truncate_wal(len: u64) -> Result<(), RegError> {
+async fn truncate_wal(len: u64) -> Result<(), KernelError> {
     let mut file = File::open(
         &Path::from_string(WAL_PATH),
         &[
@@ -812,8 +870,7 @@ async fn truncate_wal(len: u64) -> Result<(), RegError> {
     .await?;
 
     if let Err(error) = file.set_len(len).await {
-        let _ = file.close().await;
-        return Err(error.into());
+        return Err(close_preserving_error(file, error, "after truncating the WAL failed").await);
     }
 
     file.close().await?;
@@ -821,11 +878,14 @@ async fn truncate_wal(len: u64) -> Result<(), RegError> {
     Ok(())
 }
 
-fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), RegError> {
-    match delta.delta.ok_or(RegError::EncodingFailed)? {
+fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), KernelError> {
+    match delta
+        .delta
+        .ok_or_else(|| registry_error(RegistryErrorKind::EncodingFailed))?
+    {
         DeltaKindProto::CreateKey(delta) => {
             if path_parts(&delta.path).next().is_none() {
-                return Err(RegError::EncodingFailed);
+                return Err(registry_error(RegistryErrorKind::EncodingFailed));
             }
 
             create_key_inner(registry, &delta.path);
@@ -836,11 +896,16 @@ fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), Reg
         }
 
         DeltaKindProto::SetValue(delta) => {
-            let key = walk_mut(registry, &delta.key_path).ok_or(RegError::KeyNotFound)?;
+            let key = walk_mut(registry, &delta.key_path)
+                .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
 
             key.values.insert(
                 delta.name,
-                Data::try_from(delta.data.ok_or(RegError::EncodingFailed)?)?,
+                Data::try_from(
+                    delta
+                        .data
+                        .ok_or_else(|| registry_error(RegistryErrorKind::EncodingFailed))?,
+                )?,
             );
         }
 
@@ -854,7 +919,7 @@ fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), Reg
     Ok(())
 }
 
-async fn replay_wal(registry: &mut Registry, snapshot_seq: u64) -> Result<WalReplay, RegError> {
+async fn replay_wal(registry: &mut Registry, snapshot_seq: u64) -> Result<WalReplay, KernelError> {
     let bytes = match read_file(WAL_PATH).await {
         Ok(bytes) => bytes,
 
@@ -911,7 +976,7 @@ async fn replay_wal(registry: &mut Registry, snapshot_seq: u64) -> Result<WalRep
     })
 }
 
-async fn load_registry_state() -> Result<RegistryState, RegError> {
+async fn load_registry_state() -> Result<RegistryState, KernelError> {
     let (mut registry, snapshot_seq) = match load_best_snapshot().await {
         Ok(snapshot) => snapshot,
 
@@ -943,7 +1008,7 @@ async fn load_registry_state() -> Result<RegistryState, RegError> {
     })
 }
 
-pub async fn init() -> Result<(), RegError> {
+pub async fn init() -> Result<(), KernelError> {
     if REGISTRY.get().is_some() {
         return Ok(());
     }
@@ -1081,18 +1146,18 @@ pub mod reg {
         walk(&store.state.read().registry, path).cloned()
     }
 
-    pub async fn create_key(path: String) -> Result<(), RegError> {
+    pub async fn create_key(path: String) -> Result<(), KernelError> {
         REGISTRY
             .get()
-            .ok_or(RegError::PersistenceFailed)?
+            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
             .create_key(path)
             .await
     }
 
-    pub async fn delete_key(path: &str) -> Result<bool, RegError> {
+    pub async fn delete_key(path: &str) -> Result<bool, KernelError> {
         REGISTRY
             .get()
-            .ok_or(RegError::PersistenceFailed)?
+            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
             .delete_key(path)
             .await
     }
@@ -1104,18 +1169,18 @@ pub mod reg {
         walk(&state.registry, key_path)?.values.get(name).cloned()
     }
 
-    pub async fn set_value(key_path: &str, name: &str, data: Data) -> Result<(), RegError> {
+    pub async fn set_value(key_path: &str, name: &str, data: Data) -> Result<(), KernelError> {
         REGISTRY
             .get()
-            .ok_or(RegError::PersistenceFailed)?
+            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
             .set_value(key_path, name, data)
             .await
     }
 
-    pub async fn delete_value(key_path: &str, name: &str) -> Result<bool, RegError> {
+    pub async fn delete_value(key_path: &str, name: &str) -> Result<bool, KernelError> {
         REGISTRY
             .get()
-            .ok_or(RegError::PersistenceFailed)?
+            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
             .delete_value(key_path, name)
             .await
     }
@@ -1132,12 +1197,15 @@ pub mod reg {
         }
     }
 
-    pub async fn list_keys(base_path: &str) -> Result<Vec<String>, RegError> {
-        let store = REGISTRY.get().ok_or(RegError::PersistenceFailed)?;
+    pub async fn list_keys(base_path: &str) -> Result<Vec<String>, KernelError> {
+        let store = REGISTRY
+            .get()
+            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?;
 
         let state = store.state.read();
 
-        let key = walk(&state.registry, base_path).ok_or(RegError::KeyNotFound)?;
+        let key = walk(&state.registry, base_path)
+            .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
 
         Ok(key
             .sub_keys
@@ -1146,19 +1214,24 @@ pub mod reg {
             .collect())
     }
 
-    pub async fn list_values(base_path: &str) -> Result<Vec<String>, RegError> {
-        let store = REGISTRY.get().ok_or(RegError::PersistenceFailed)?;
+    pub async fn list_values(base_path: &str) -> Result<Vec<String>, KernelError> {
+        let store = REGISTRY
+            .get()
+            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?;
 
         let state = store.state.read();
 
-        let key = walk(&state.registry, base_path).ok_or(RegError::KeyNotFound)?;
+        let key = walk(&state.registry, base_path)
+            .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
 
         Ok(key.values.keys().cloned().collect())
     }
 }
 
-pub async fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> {
-    let store = REGISTRY.get().ok_or(RegError::PersistenceFailed)?;
+pub async fn rebind_and_persist_after_provider_switch() -> Result<(), KernelError> {
+    let store = REGISTRY
+        .get()
+        .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?;
 
     let _io = store.io.lock().await;
 

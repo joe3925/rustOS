@@ -2,7 +2,7 @@ use crate::artifacts::{DriverPackageArtifact, DriverProvenance, KernelSdkArtifac
 use crate::config::{BootPackageSource, BuildPlan};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;

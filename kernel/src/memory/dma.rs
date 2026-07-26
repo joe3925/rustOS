@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use kernel_types::device::DeviceObject;
+use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaBufferView;
 use kernel_types::dma::DmaDeviceHandle;
@@ -22,8 +23,7 @@ use kernel_types::dma::DmaPciDeviceIdentity;
 use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::IoBufferDmaMappingLayout;
 use kernel_types::dma::IoBufferPageFrame;
-use kernel_types::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
-use kernel_types::status::DriverStatus;
+use kernel_types::error::DriverErrorKind;
 use spin::Mutex;
 use spin::Once;
 static DMA_MANAGER: Once<DmaManager> = Once::new();
@@ -34,16 +34,19 @@ pub fn init_dma_manager() {
 pub fn get_info() -> DeviceMmuBackendInfo {
     manager().get_info()
 }
-pub fn register_pci_pdo(pdo: &Arc<DeviceObject>, identity: DmaPciDeviceIdentity) -> DriverStatus {
+pub fn register_pci_pdo(
+    pdo: &Arc<DeviceObject>,
+    identity: DmaPciDeviceIdentity,
+) -> Result<(), DriverErrorKind> {
     manager().register_pci_pdo(pdo, identity)
 }
 pub fn register_platform_pdo(
     pdo: &Arc<DeviceObject>,
     identity: DeviceMmuPlatformDeviceIdentity,
-) -> DriverStatus {
+) -> Result<(), DriverErrorKind> {
     manager().register_platform_pdo(pdo, identity)
 }
-pub fn open_device_handle(device: &Arc<DeviceObject>) -> Result<DmaDeviceHandle, DriverStatus> {
+pub fn open_device_handle(device: &Arc<DeviceObject>) -> Result<DmaDeviceHandle, DriverErrorKind> {
     manager().open_device_handle(device)
 }
 
@@ -51,7 +54,7 @@ pub fn query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState> 
     manager().query_device_state(device)
 }
 
-pub fn unregister_device(device: &Arc<DeviceObject>) -> DriverStatus {
+pub fn unregister_device(device: &Arc<DeviceObject>) -> Result<(), DriverErrorKind> {
     manager().unregister_device(device)
 }
 
@@ -728,15 +731,15 @@ impl DmaManager {
         &self,
         pdo: &Arc<DeviceObject>,
         identity: DmaPciDeviceIdentity,
-    ) -> DriverStatus {
+    ) -> Result<(), DriverErrorKind> {
         if compute_pci_requester_id(identity.bus, identity.device, identity.function)
             != identity.requester_id
         {
-            return DriverStatus::InvalidParameter;
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         if (identity.flags & DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE) == 0 {
-            return DriverStatus::InvalidParameter;
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         let key = device_key(pdo);
@@ -751,15 +754,15 @@ impl DmaManager {
             }),
         );
 
-        DriverStatus::Success
+        Ok(())
     }
     fn register_platform_pdo(
         &self,
         pdo: &Arc<DeviceObject>,
         identity: DeviceMmuPlatformDeviceIdentity,
-    ) -> DriverStatus {
+    ) -> Result<(), DriverErrorKind> {
         if identity.iommu_id_count == 0 {
-            return DriverStatus::InvalidParameter;
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         let key = device_key(pdo);
@@ -774,24 +777,24 @@ impl DmaManager {
             }),
         );
 
-        DriverStatus::Success
+        Ok(())
     }
     fn open_device_handle(
         &self,
         device: &Arc<DeviceObject>,
-    ) -> Result<DmaDeviceHandle, DriverStatus> {
+    ) -> Result<DmaDeviceHandle, DriverErrorKind> {
         let pdo = resolve_hardware_pdo(device)?;
         let key = device_key(&pdo);
         let state = self.state.lock();
 
         let Some(entry) = state.devices.get(&key) else {
-            return Err(DriverStatus::NoSuchDevice);
+            return Err(DriverErrorKind::NoSuchDevice);
         };
 
         if entry.pdo.upgrade().is_some() {
             Ok(DmaDeviceHandle(key as u64))
         } else {
-            Err(DriverStatus::NoSuchDevice)
+            Err(DriverErrorKind::NoSuchDevice)
         }
     }
 
@@ -827,9 +830,9 @@ impl DmaManager {
         })
     }
 
-    fn unregister_device(&self, device: &Arc<DeviceObject>) -> DriverStatus {
+    fn unregister_device(&self, device: &Arc<DeviceObject>) -> Result<(), DriverErrorKind> {
         let Ok(pdo) = resolve_hardware_pdo(device) else {
-            return DriverStatus::NoSuchDevice;
+            return Err(DriverErrorKind::NoSuchDevice);
         };
 
         let key = device_key(&pdo);
@@ -838,14 +841,14 @@ impl DmaManager {
             let mut state = self.state.lock();
 
             let Some(entry) = state.devices.get(&key).cloned() else {
-                return DriverStatus::NoSuchDevice;
+                return Err(DriverErrorKind::NoSuchDevice);
             };
 
             {
                 let mut runtime = entry.runtime.lock();
 
                 if runtime.unregistering || runtime.in_flight_maps != 0 {
-                    return DriverStatus::InvalidParameter;
+                    return Err(DriverErrorKind::InvalidParameter);
                 }
 
                 if state
@@ -854,7 +857,7 @@ impl DmaManager {
                     .filter_map(|slot| slot.as_ref())
                     .any(|pending| pending.device_key == key)
                 {
-                    return DriverStatus::InvalidParameter;
+                    return Err(DriverErrorKind::InvalidParameter);
                 }
 
                 runtime.unregistering = true;
@@ -864,7 +867,7 @@ impl DmaManager {
         };
 
         let Some(entry) = removed else {
-            return DriverStatus::NoSuchDevice;
+            return Err(DriverErrorKind::NoSuchDevice);
         };
 
         let (domain, attachment) = {
@@ -884,7 +887,7 @@ impl DmaManager {
             self.device_mmu.destroy_domain(&domain);
         }
 
-        DriverStatus::Success
+        Ok(())
     }
 
     fn begin_mapping(&self, key: usize) -> Result<ActiveDmaMapping, DmaMapError> {
@@ -1215,16 +1218,16 @@ struct PendingUnmap {
     records: PendingMappingRecords,
 }
 
-fn resolve_hardware_pdo(device: &Arc<DeviceObject>) -> Result<Arc<DeviceObject>, DriverStatus> {
+fn resolve_hardware_pdo(device: &Arc<DeviceObject>) -> Result<Arc<DeviceObject>, DriverErrorKind> {
     let Some(devnode_weak) = device.dev_node.get() else {
-        return Err(DriverStatus::NoSuchDevice);
+        return Err(DriverErrorKind::NoSuchDevice);
     };
 
     let Some(devnode) = devnode_weak.upgrade() else {
-        return Err(DriverStatus::NoSuchDevice);
+        return Err(DriverErrorKind::NoSuchDevice);
     };
 
-    devnode.get_pdo().ok_or(DriverStatus::NoSuchDevice)
+    devnode.get_pdo().ok_or(DriverErrorKind::NoSuchDevice)
 }
 
 fn device_key(device: &Arc<DeviceObject>) -> usize {
