@@ -1,0 +1,17 @@
+schema = 1
+id = "linux"
+os = "linux"
+
+[qemu]
+executable_patterns = [
+    "/usr/bin/{executable}",
+    "/usr/local/bin/{executable}",
+]
+data_directories = [
+    "../qemu",
+    "/usr/share/qemu",
+    "/usr/share/OVMF",
+    "/usr/share/ovmf",
+    "/usr/share/edk2/x64",
+    "/usr/share/edk2-ovmf/x64",
+]

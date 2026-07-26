@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -13,15 +13,17 @@ pub struct KernelSdkArtifact {
     pub import_library: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DriverPackageArtifact {
     pub name: String,
     pub configuration: PathBuf,
     pub binary: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_info: Option<PathBuf>,
     pub source: DriverProvenance,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum DriverProvenance {
     LocalCargo {
@@ -45,7 +47,7 @@ pub struct BootArtifact {
     pub image: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ArtifactManifest {
     pub schema: u32,
     pub platform: String,
@@ -55,15 +57,16 @@ pub struct ArtifactManifest {
     pub stub: PathBuf,
     pub boot_image: PathBuf,
     pub boot_packages: Vec<DriverPackageArtifact>,
+    pub debug_search_paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PublishedSdk {
     pub definition_file: PathBuf,
     pub import_library: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PublishedKernel {
     pub image: PathBuf,
     pub debug: Option<PathBuf>,

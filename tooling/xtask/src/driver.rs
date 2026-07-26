@@ -2,7 +2,7 @@ use crate::artifacts::{DriverPackageArtifact, DriverProvenance, KernelSdkArtifac
 use crate::config::{BootPackageSource, BuildPlan};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
@@ -289,8 +289,17 @@ fn resolve_files(
         name,
         configuration: configuration.to_path_buf(),
         binary: binary.to_path_buf(),
+        debug_info: find_pdb(binary),
         source: provenance,
     })
+}
+
+fn find_pdb(binary: &Path) -> Option<PathBuf> {
+    let filename = binary.with_extension("pdb").file_name()?.to_owned();
+    let parent = binary.parent()?;
+    [parent.join(&filename), parent.join("deps").join(filename)]
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 pub fn cargo_artifact(
