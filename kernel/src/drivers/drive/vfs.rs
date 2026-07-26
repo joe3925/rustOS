@@ -1,4 +1,5 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
+use crate::error::error;
 use crate::println;
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
@@ -186,21 +187,17 @@ impl Vfs {
             )
         })
     }
-    fn file_error(kind: FileErrorKind) -> KernelError {
-        crate::error::error(kind)
-    }
-
     async fn handle(&self, file_id: u64) -> Result<VfsHandle, KernelError> {
         self.handles
             .read()
             .await
             .get(&file_id)
             .cloned()
-            .ok_or_else(|| Self::file_error(FileErrorKind::PathNotFound))
+            .ok_or_else(|| error(FileErrorKind::PathNotFound))
     }
 
     pub async fn open(&self, p: FsOpenParams) -> Result<FsOpenResult, KernelError> {
-        let (symlink, fs_path) = self.resolve_path(p.path).map_err(Self::file_error)?;
+        let (symlink, fs_path) = self.resolve_path(p.path).map_err(error)?;
         let target = self.resolve_target(&symlink);
 
         if p.flags.contains(OpenFlags::CreateNew) {
@@ -299,7 +296,7 @@ impl Vfs {
             .write()
             .await
             .remove(&p.fs_file_id)
-            .ok_or_else(|| Self::file_error(FileErrorKind::PathNotFound))?;
+            .ok_or_else(|| error(FileErrorKind::PathNotFound))?;
         self.call_fs::<FsClose>(
             &handle.volume_symlink,
             handle.target,
@@ -319,7 +316,7 @@ impl Vfs {
         {
             return Ok(FsReadResult {
                 bytes_read: 0,
-                error: Some(Self::file_error(FileErrorKind::NoBuffer)),
+                error: Some(error(FileErrorKind::NoBuffer)),
             });
         }
         let handle = self.handle(p.fs_file_id).await?;
@@ -337,7 +334,7 @@ impl Vfs {
         {
             return Ok(FsWriteResult {
                 written: 0,
-                error: Some(Self::file_error(FileErrorKind::NoBuffer)),
+                error: Some(error(FileErrorKind::NoBuffer)),
             });
         }
         let handle = self.handle(p.fs_file_id).await?;
@@ -372,7 +369,7 @@ impl Vfs {
     }
 
     pub async fn create(&self, mut p: FsCreateParams) -> Result<FsCreateResult, KernelError> {
-        let (symlink, path) = self.resolve_path(p.path).map_err(Self::file_error)?;
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
         p.path = path.clone();
         self.call_fs::<FsCreate>(&symlink, self.resolve_target(&symlink), p)
             .await
@@ -380,9 +377,8 @@ impl Vfs {
     }
 
     pub async fn rename(&self, mut p: FsRenameParams) -> Result<FsRenameResult, KernelError> {
-        let (source_symlink, source) = self.resolve_path(p.src).map_err(Self::file_error)?;
-        let (destination_symlink, destination) =
-            self.resolve_path(p.dst).map_err(Self::file_error)?;
+        let (source_symlink, source) = self.resolve_path(p.src).map_err(error)?;
+        let (destination_symlink, destination) = self.resolve_path(p.dst).map_err(error)?;
         if source_symlink != destination_symlink {
             return Ok(FsRenameResult {
                 error: Some(crate::error::error_with_message(
@@ -399,7 +395,7 @@ impl Vfs {
     }
 
     pub async fn list_dir(&self, mut p: FsListDirParams) -> Result<FsListDirResult, KernelError> {
-        let (symlink, path) = self.resolve_path(p.path).map_err(Self::file_error)?;
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
         p.path = path.clone();
         self.call_fs::<FsReadDir>(&symlink, self.resolve_target(&symlink), p)
             .await
@@ -426,7 +422,7 @@ impl Vfs {
             return Ok(FsAppendResult {
                 written: 0,
                 new_size: 0,
-                error: Some(Self::file_error(FileErrorKind::NoBuffer)),
+                error: Some(error(FileErrorKind::NoBuffer)),
             });
         }
         let handle = self.handle(p.fs_file_id).await?;

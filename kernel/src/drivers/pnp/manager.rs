@@ -1,5 +1,6 @@
 use super::driver_index::{self, HwIndex};
 use crate::drivers::pnp::device::DevNodeExt;
+use crate::error::error_with_message;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
 use kernel_types::error::{DriverErrorKind, KernelError, ResultErrorContext};
@@ -27,10 +28,6 @@ use kernel_types::pnp::{
 };
 use kernel_types::status::Data;
 use spin::{Mutex, RwLock};
-
-fn pnp_error(kind: DriverErrorKind, message: impl core::fmt::Display) -> KernelError {
-    crate::error::error_with_message(kind, format_args!("{message}"))
-}
 
 #[repr(C)]
 pub struct ClassListener {
@@ -254,9 +251,9 @@ impl PnpManager {
 
     pub async fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), KernelError> {
         let pdo = dn.get_pdo().ok_or_else(|| {
-            pnp_error(
+            error_with_message(
                 DriverErrorKind::NoSuchDevice,
-                format!("device node `{}` has no PDO", dn.instance_path),
+                format_args!("device node `{}` has no PDO", dn.instance_path),
             )
         })?;
         if let Err(error) = Self::start_device_object(&pdo).await {
@@ -329,9 +326,9 @@ impl PnpManager {
         let ids = Self::all_driver_ids(dn);
         let mut candidates = self.hw.read().matching(&ids, DriverRole::Function);
         let target = dn.get_pdo().ok_or_else(|| {
-            pnp_error(
+            error_with_message(
                 DriverErrorKind::NoSuchDevice,
-                format!("device node `{}` has no PDO", dn.instance_path),
+                format_args!("device node `{}` has no PDO", dn.instance_path),
             )
         })?;
 
@@ -736,9 +733,9 @@ impl PnpManager {
         match rt.get_state() {
             DriverState::Started | DriverState::Continue => return Ok(()),
             DriverState::Failed => {
-                return Err(pnp_error(
+                return Err(error_with_message(
                     DriverErrorKind::DeviceError,
-                    format!(
+                    format_args!(
                         "driver `{}` previously failed initialization",
                         drv.driver_name
                     ),
@@ -762,9 +759,9 @@ impl PnpManager {
             }
         } else {
             rt.set_state(DriverState::Failed);
-            Err(pnp_error(
+            Err(error_with_message(
                 DriverErrorKind::DeviceError,
-                format!("driver `{}` does not export DriverEntry", drv.driver_name),
+                format_args!("driver `{}` does not export DriverEntry", drv.driver_name),
             ))
         }
     }
@@ -1128,9 +1125,9 @@ impl PnpManager {
             prog.load_module(pkg.image_path.clone())
                 .await
                 .map_err(|load_error| {
-                    pnp_error(
+                    error_with_message(
                         DriverErrorKind::DeviceError,
-                        format!(
+                        format_args!(
                             "failed to load driver module `{}` from `{:?}`: {load_error:?}",
                             pkg.name, pkg.image_path
                         ),
@@ -1179,9 +1176,9 @@ impl PnpManager {
             .and_then(|s| s.get_top_device_object())
             .or_else(|| dev_node.get_pdo())
         else {
-            return Err(pnp_error(
+            return Err(error_with_message(
                 DriverErrorKind::NoSuchDevice,
-                format!(
+                format_args!(
                     "device node `{}` has no routable device",
                     dev_node.instance_path
                 ),

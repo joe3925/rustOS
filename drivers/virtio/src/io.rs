@@ -6,7 +6,7 @@ use crate::outstanding::{
 };
 use crate::{
     IOCTL_BLOCK_FLUSH, SubmitTasksGuard, check_blk_status, drain_queue_completions,
-    map_request_buffer, virtio_device_error, wait_completion_hybrid,
+    map_request_buffer, wait_completion_hybrid,
 };
 use alloc::format;
 use alloc::sync::Arc;
@@ -29,12 +29,6 @@ use kernel_api::request::{DeviceControl, Flush, Read, Write};
 use kernel_api::request_handler;
 
 pub(crate) struct VirtioPdoIo;
-
-fn too_many_dma_segments_error(operation: &str) -> KernelError {
-    virtio_device_error(format_args!(
-        "virtio-blk: {operation} request has too many DMA segments"
-    ))
-}
 
 impl DeviceRead for VirtioPdoIo {
     #[request_handler]
@@ -140,7 +134,10 @@ async fn submit_virtio_no_data_request(
                 }
                 Err(SubmitRequestError::TooManyDataSegments) => {
                     cold_path();
-                    return Err(too_many_dma_segments_error(operation));
+                    return Err(error_with_message(
+                        DriverErrorKind::DeviceError,
+                        format_args!("virtio-blk: {operation} request has too many DMA segments"),
+                    ));
                 }
             }
         };
@@ -164,9 +161,12 @@ async fn submit_virtio_no_data_request(
 
     match wait_completion_hybrid(qs, completion, 0).await {
         Ok(device_status) => check_blk_status(operation, device_status),
-        Err(_) => Err(virtio_device_error(format_args!(
-            "virtio-blk: {operation} failed: completion canceled before device status"
-        ))),
+        Err(_) => Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!(
+                "virtio-blk: {operation} failed: completion canceled before device status"
+            ),
+        )),
     }
 }
 
@@ -432,9 +432,12 @@ async fn wait_submitted_batch(
         let result =
             match wait_completion_hybrid(qs, submitted.completion, submitted.byte_len).await {
                 Ok(device_status) => check_blk_status(operation, device_status),
-                Err(_) => Err(virtio_device_error(format_args!(
-                    "virtio-blk: {operation} failed: completion canceled before device status"
-                ))),
+                Err(_) => Err(error_with_message(
+                    DriverErrorKind::DeviceError,
+                    format_args!(
+                        "virtio-blk: {operation} failed: completion canceled before device status"
+                    ),
+                )),
             };
 
         if first_error.is_none() {
@@ -571,7 +574,12 @@ where
                             wait_submitted_batch(qs, &mut completions, operation).await?;
                         }
 
-                        return Err(too_many_dma_segments_error(operation));
+                        return Err(error_with_message(
+                            DriverErrorKind::DeviceError,
+                            format_args!(
+                                "virtio-blk: {operation} request has too many DMA segments"
+                            ),
+                        ));
                     }
                 }
             }

@@ -12,13 +12,9 @@ use kernel_types::status::Data;
 use prost::Message;
 use spin::{Once, RwLock};
 
+use crate::error::error;
 use crate::file_system::file::File;
 use crate::println;
-
-#[inline]
-fn registry_error(kind: RegistryErrorKind) -> KernelError {
-    crate::error::error(kind)
-}
 
 const REG_PATH: &str = "C:\\system\\registry\\registry.pb";
 const WAL_PATH: &str = "C:\\system\\registry\\registry.wal";
@@ -207,7 +203,7 @@ impl TryFrom<RegistryProto> for Registry {
 
     fn try_from(proto: RegistryProto) -> Result<Self, Self::Error> {
         if proto.schema_version != REGISTRY_SCHEMA_VERSION {
-            return Err(registry_error(RegistryErrorKind::EncodingFailed));
+            return Err(error(RegistryErrorKind::EncodingFailed));
         }
 
         let mut root = BTreeMap::new();
@@ -293,7 +289,7 @@ impl TryFrom<ValueProto> for Data {
     fn try_from(proto: ValueProto) -> Result<Self, Self::Error> {
         match proto
             .value
-            .ok_or_else(|| registry_error(RegistryErrorKind::EncodingFailed))?
+            .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?
         {
             ValueKindProto::U32(value) => Ok(Data::U32(value)),
             ValueKindProto::U64(value) => Ok(Data::U64(value)),
@@ -313,7 +309,7 @@ impl RegistryStore {
             let state = self.state.read();
 
             if path_parts(&path).next().is_none() {
-                return Err(registry_error(RegistryErrorKind::KeyAlreadyExists));
+                return Err(error(RegistryErrorKind::KeyAlreadyExists));
             }
 
             if walk(&state.registry, &path).is_some() {
@@ -384,7 +380,7 @@ impl RegistryStore {
         {
             let state = self.state.read();
             let key = walk(&state.registry, key_path)
-                .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
+                .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
             if key.values.get(name) == Some(&data) {
                 return Ok(());
@@ -406,7 +402,7 @@ impl RegistryStore {
         {
             let mut state = self.state.write();
             let key = walk_mut(&mut state.registry, key_path)
-                .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
+                .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
             key.values.insert(name.to_string(), data);
 
@@ -611,7 +607,7 @@ fn encode_frame(version: u32, seq: u64, message: &impl Message) -> Result<Vec<u8
 
     message
         .encode(&mut bytes)
-        .map_err(|_| registry_error(RegistryErrorKind::EncodingFailed))?;
+        .map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
 
     bytes.extend_from_slice(&crc32c(&bytes).to_le_bytes());
 
@@ -620,20 +616,20 @@ fn encode_frame(version: u32, seq: u64, message: &impl Message) -> Result<Vec<u8
 
 fn decode_frame(bytes: &[u8], expected_version: u32) -> Result<(u64, &[u8], usize), KernelError> {
     if bytes.len() < FRAME_HEADER_LEN + FRAME_CHECKSUM_LEN {
-        return Err(registry_error(RegistryErrorKind::EncodingFailed));
+        return Err(error(RegistryErrorKind::EncodingFailed));
     }
 
     let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
 
     if version != expected_version {
-        return Err(registry_error(RegistryErrorKind::EncodingFailed));
+        return Err(error(RegistryErrorKind::EncodingFailed));
     }
 
     let seq = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
     let payload_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
 
     if payload_len > bytes.len() - FRAME_HEADER_LEN - FRAME_CHECKSUM_LEN {
-        return Err(registry_error(RegistryErrorKind::EncodingFailed));
+        return Err(error(RegistryErrorKind::EncodingFailed));
     }
 
     let payload_end = FRAME_HEADER_LEN + payload_len;
@@ -642,7 +638,7 @@ fn decode_frame(bytes: &[u8], expected_version: u32) -> Result<(u64, &[u8], usiz
     let expected_crc = u32::from_le_bytes(bytes[payload_end..frame_end].try_into().unwrap());
 
     if crc32c(&bytes[..payload_end]) != expected_crc {
-        return Err(registry_error(RegistryErrorKind::EncodingFailed));
+        return Err(error(RegistryErrorKind::EncodingFailed));
     }
 
     Ok((seq, &bytes[FRAME_HEADER_LEN..payload_end], frame_end))
@@ -660,11 +656,11 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(Registry, u64), KernelError> {
     let (last_wal_seq, payload, frame_len) = decode_frame(bytes, SNAPSHOT_VERSION)?;
 
     if frame_len != bytes.len() {
-        return Err(registry_error(RegistryErrorKind::EncodingFailed));
+        return Err(error(RegistryErrorKind::EncodingFailed));
     }
 
-    let proto = RegistryProto::decode(payload)
-        .map_err(|_| registry_error(RegistryErrorKind::EncodingFailed))?;
+    let proto =
+        RegistryProto::decode(payload).map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
 
     Ok((Registry::try_from(proto)?, last_wal_seq))
 }
@@ -753,7 +749,7 @@ async fn persist_snapshot(bytes: &[u8]) -> Result<(), KernelError> {
     };
 
     if written != bytes.len() {
-        let error = registry_error(RegistryErrorKind::PersistenceFailed).with_context(format!(
+        let error = error(RegistryErrorKind::PersistenceFailed).with_context(format!(
             "snapshot write was short: wrote {written} of {} bytes",
             bytes.len()
         ));
@@ -809,7 +805,7 @@ async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), KernelError> {
     };
 
     if written != record.len() {
-        let mut error = registry_error(RegistryErrorKind::PersistenceFailed).with_context(format!(
+        let mut error = error(RegistryErrorKind::PersistenceFailed).with_context(format!(
             "WAL append was short: wrote {written} of {} bytes",
             record.len()
         ));
@@ -881,11 +877,11 @@ async fn truncate_wal(len: u64) -> Result<(), KernelError> {
 fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), KernelError> {
     match delta
         .delta
-        .ok_or_else(|| registry_error(RegistryErrorKind::EncodingFailed))?
+        .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?
     {
         DeltaKindProto::CreateKey(delta) => {
             if path_parts(&delta.path).next().is_none() {
-                return Err(registry_error(RegistryErrorKind::EncodingFailed));
+                return Err(error(RegistryErrorKind::EncodingFailed));
             }
 
             create_key_inner(registry, &delta.path);
@@ -897,14 +893,14 @@ fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), Ker
 
         DeltaKindProto::SetValue(delta) => {
             let key = walk_mut(registry, &delta.key_path)
-                .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
+                .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
             key.values.insert(
                 delta.name,
                 Data::try_from(
                     delta
                         .data
-                        .ok_or_else(|| registry_error(RegistryErrorKind::EncodingFailed))?,
+                        .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?,
                 )?,
             );
         }
@@ -1149,7 +1145,7 @@ pub mod reg {
     pub async fn create_key(path: String) -> Result<(), KernelError> {
         REGISTRY
             .get()
-            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?
             .create_key(path)
             .await
     }
@@ -1157,7 +1153,7 @@ pub mod reg {
     pub async fn delete_key(path: &str) -> Result<bool, KernelError> {
         REGISTRY
             .get()
-            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?
             .delete_key(path)
             .await
     }
@@ -1172,7 +1168,7 @@ pub mod reg {
     pub async fn set_value(key_path: &str, name: &str, data: Data) -> Result<(), KernelError> {
         REGISTRY
             .get()
-            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?
             .set_value(key_path, name, data)
             .await
     }
@@ -1180,7 +1176,7 @@ pub mod reg {
     pub async fn delete_value(key_path: &str, name: &str) -> Result<bool, KernelError> {
         REGISTRY
             .get()
-            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?
             .delete_value(key_path, name)
             .await
     }
@@ -1200,12 +1196,12 @@ pub mod reg {
     pub async fn list_keys(base_path: &str) -> Result<Vec<String>, KernelError> {
         let store = REGISTRY
             .get()
-            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?;
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
         let state = store.state.read();
 
         let key = walk(&state.registry, base_path)
-            .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
+            .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
         Ok(key
             .sub_keys
@@ -1217,12 +1213,12 @@ pub mod reg {
     pub async fn list_values(base_path: &str) -> Result<Vec<String>, KernelError> {
         let store = REGISTRY
             .get()
-            .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?;
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
         let state = store.state.read();
 
         let key = walk(&state.registry, base_path)
-            .ok_or_else(|| registry_error(RegistryErrorKind::KeyNotFound))?;
+            .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
         Ok(key.values.keys().cloned().collect())
     }
@@ -1231,7 +1227,7 @@ pub mod reg {
 pub async fn rebind_and_persist_after_provider_switch() -> Result<(), KernelError> {
     let store = REGISTRY
         .get()
-        .ok_or_else(|| registry_error(RegistryErrorKind::PersistenceFailed))?;
+        .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
     let _io = store.io.lock().await;
 

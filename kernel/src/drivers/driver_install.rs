@@ -10,6 +10,7 @@ use toml::Spanned;
 use toml::de::{DeInteger, DeTable};
 
 use crate::alloc::string::ToString;
+use crate::error::error_with_message;
 use crate::{file_system::file::File, registry::reg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,10 +63,6 @@ fn inner<T>(s: &Spanned<T>) -> &T {
     s.get_ref()
 }
 
-fn invalid_manifest(message: impl core::fmt::Display) -> KernelError {
-    crate::error::error_with_message(DriverErrorKind::InvalidParameter, format_args!("{message}"))
-}
-
 async fn ensure_directory(path: &Path) -> Result<(), KernelError> {
     match File::make_dir(path).await {
         Ok(()) => Ok(()),
@@ -79,8 +76,12 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
     let mut bytes = alloc::vec![0u8; f.size as usize];
     let n = f.read(&mut bytes).await?;
     bytes.truncate(n);
-    let src = core::str::from_utf8(&bytes)
-        .map_err(|_| invalid_manifest("driver manifest is not valid UTF-8"))?;
+    let src = core::str::from_utf8(&bytes).map_err(|_| {
+        error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("driver manifest is not valid UTF-8"),
+        )
+    })?;
 
     let (tbl_span, _errs) = DeTable::parse_recoverable(src);
     let tbl: &DeTable = inner(&tbl_span);
@@ -89,13 +90,23 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
         .get("image")
         .and_then(|v| inner(v).as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| invalid_manifest("driver manifest is missing `image`"))?;
+        .ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!("driver manifest is missing `image`"),
+            )
+        })?;
 
     let start = tbl
         .get("start")
         .and_then(|v| inner(v).as_str())
         .and_then(BootType::from_str)
-        .ok_or_else(|| invalid_manifest("driver manifest has an invalid `start` value"))?;
+        .ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!("driver manifest has an invalid `start` value"),
+            )
+        })?;
 
     let has_filter_tbl = tbl
         .get("filter")
@@ -108,7 +119,12 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
     } else {
         explicit_role
             .and_then(DriverRole::from_str)
-            .ok_or_else(|| invalid_manifest("driver manifest has an invalid `role`"))?
+            .ok_or_else(|| {
+                error_with_message(
+                    DriverErrorKind::InvalidParameter,
+                    format_args!("driver manifest has an invalid `role`"),
+                )
+            })?
     };
 
     let valid_start_role = matches!(
@@ -120,7 +136,10 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
             )
     );
     if !valid_start_role {
-        return Err(invalid_manifest("filter table requires the filter role"));
+        return Err(error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("filter table requires the filter role"),
+        ));
     }
 
     let hwids = tbl
@@ -146,7 +165,12 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
                 .get("position")
                 .and_then(|v| inner(v).as_str())
                 .and_then(FilterPosition::from_str)
-                .ok_or_else(|| invalid_manifest("filter target is missing"))?;
+                .ok_or_else(|| {
+                    error_with_message(
+                        DriverErrorKind::InvalidParameter,
+                        format_args!("filter target is missing"),
+                    )
+                })?;
 
             let order = ftbl
                 .get("order")
@@ -161,7 +185,10 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
             } else if let Some(s) = ftbl.get("driver").and_then(|v| inner(v).as_str()) {
                 FilterTarget::Driver(s.to_string())
             } else {
-                return Err(invalid_manifest("filter target kind is invalid"));
+                return Err(error_with_message(
+                    DriverErrorKind::InvalidParameter,
+                    format_args!("filter target kind is invalid"),
+                ));
             };
 
             Ok::<FilterSpec, KernelError>(FilterSpec {
@@ -173,7 +200,10 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
         .transpose()?;
 
     if role == DriverRole::Filter && filter.is_none() {
-        return Err(invalid_manifest("driver manifest has incompatible fields"));
+        return Err(error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("driver manifest has incompatible fields"),
+        ));
     }
 
     let reg_writes: Vec<RegWrite> = tbl
@@ -367,9 +397,12 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), KernelError> {
         Path::from_string(&alloc::format!("C:/system/toml/{}.toml", driver_name));
     let img_target_path = Path::from_string(&alloc::format!("C:/system/mod/{}", driver.image));
 
-    let toml_dir = toml_path
-        .parent()
-        .ok_or_else(|| invalid_manifest("driver manifest path has no parent"))?;
+    let toml_dir = toml_path.parent().ok_or_else(|| {
+        error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("driver manifest path has no parent"),
+        )
+    })?;
     let img_src_full = toml_dir.clone().join(&driver.image);
 
     ensure_directory(&Path::from_string("C:/system")).await?;
@@ -436,10 +469,12 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), KernelError> {
         }
 
         DriverRole::Filter => {
-            let f = driver
-                .filter
-                .as_ref()
-                .ok_or_else(|| invalid_manifest("filter driver is missing its filter table"))?;
+            let f = driver.filter.as_ref().ok_or_else(|| {
+                error_with_message(
+                    DriverErrorKind::InvalidParameter,
+                    format_args!("filter driver is missing its filter table"),
+                )
+            })?;
             let flt_key = alloc::format!("{}/Filter", key_path.trim_end_matches('/'));
             reg::create_key(flt_key.clone()).await?;
             let pos_s = match f.position {
