@@ -2,7 +2,8 @@ use kernel_types::arch::VirtAddr;
 
 use crate::memory::paging::KernelVirtualLayout;
 
-pub const KERNEL_SPACE_BASE: u64 = kernel_abi::layout::x86_64::BOOT_VIRTUAL_LAYOUT.kernel_image_base;
+pub const KERNEL_SPACE_BASE: u64 =
+    kernel_abi::layout::x86_64::BOOT_VIRTUAL_LAYOUT.kernel_image_base;
 pub const MMIO_BASE: u64 = 0xFFFF_9000_0000_0000;
 pub const MANAGED_KERNEL_RANGE_START: u64 = MMIO_BASE;
 pub const HEAP_RANGE_START: u64 = 0xFFFF_C000_0000_0000;

@@ -175,40 +175,42 @@ fn pop_queued_task(cpu: &FifoCpuState, inbound_drain: InboundDrain) -> Option<Ta
 }
 
 fn steal_youngest_runnable(src_cpu_id: usize, src_cpu: &FifoCpuState) -> Option<TaskHandle> {
-    crate::scheduling::scheduler::SCHEDULER.with_core_sched_lock(src_cpu_id, || loop {
-        let len = src_cpu.run_queue.len();
+    crate::scheduling::scheduler::SCHEDULER.with_core_sched_lock(src_cpu_id, || {
+        loop {
+            let len = src_cpu.run_queue.len();
 
-        if len == 0 {
-            return None;
-        }
+            if len == 0 {
+                return None;
+            }
 
-        let mut rotated = 0usize;
+            let mut rotated = 0usize;
 
-        while rotated + 1 < len {
+            while rotated + 1 < len {
+                let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
+                    return None;
+                };
+
+                if src_cpu.run_queue.try_push(task).is_err() {
+                    panic!("run queue rotation overflow on cpu {}", src_cpu_id);
+                }
+
+                rotated += 1;
+            }
+
             let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
                 return None;
             };
 
-            if src_cpu.run_queue.try_push(task).is_err() {
-                panic!("run queue rotation overflow on cpu {}", src_cpu_id);
-            }
+            src_cpu.load.fetch_sub(1, Ordering::Release);
 
-            rotated += 1;
-        }
-
-        let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
-            return None;
-        };
-
-        src_cpu.load.fetch_sub(1, Ordering::Release);
-
-        match task.sched_state() {
-            SchedState::Terminated => {
-                crate::scheduling::scheduler::SCHEDULER.unregister_task_from_domain(&task);
-            }
-            SchedState::Parking | SchedState::Blocked => {}
-            SchedState::Runnable | SchedState::Running => {
-                return Some(task);
+            match task.sched_state() {
+                SchedState::Terminated => {
+                    crate::scheduling::scheduler::SCHEDULER.unregister_task_from_domain(&task);
+                }
+                SchedState::Parking | SchedState::Blocked => {}
+                SchedState::Runnable | SchedState::Running => {
+                    return Some(task);
+                }
             }
         }
     })?

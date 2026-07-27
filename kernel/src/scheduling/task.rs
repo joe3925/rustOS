@@ -1,5 +1,5 @@
 use crate::memory::paging::{
-    allocate_kernel_stack, base_page_size, deallocate_kernel_stack, map_range, StackSize,
+    StackSize, allocate_kernel_stack, base_page_size, deallocate_kernel_stack, map_range,
 };
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicPtr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
 use spin::Mutex;
@@ -861,11 +861,7 @@ impl TaskTable {
         slot.state.store(TASK_SLOT_EMPTY, Ordering::Release);
         self.free_hint.store(idx, Ordering::Release);
 
-        if p.is_null() {
-            None
-        } else {
-            Some(p)
-        }
+        if p.is_null() { None } else { Some(p) }
     }
 
     pub(crate) fn reap_retired(&self) {

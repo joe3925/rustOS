@@ -10,17 +10,17 @@ pub mod types;
 pub mod virt_tracker;
 
 pub use address_space::{
-    address_space_root_phys, create_user_address_space, current_address_space_root,
-    destroy_user_address_space, init_kernel_address_space_root, kernel_address_space_root,
-    switch_address_space_root, AddressSpaceRoot,
+    AddressSpaceRoot, address_space_root_phys, create_user_address_space,
+    current_address_space_root, destroy_user_address_space, init_kernel_address_space_root,
+    kernel_address_space_root, switch_address_space_root,
 };
 pub use frame_alloc::{
-    boot_usable_bytes, resize_bitmap_for_ram, total_usable_bytes, used_bytes, KernelFrameAllocator,
-    KernelPageTableFrameAllocator,
+    KernelFrameAllocator, KernelPageTableFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram,
+    total_usable_bytes, used_bytes,
 };
 pub use layout::{
-    align_up_to_base_page, base_page_size, kernel_space_base, kernel_virtual_layout,
-    heap_range_end, heap_range_start, low_physical_reserve_bytes, managed_kernel_range_end,
+    align_up_to_base_page, base_page_size, heap_range_end, heap_range_start, kernel_space_base,
+    kernel_virtual_layout, low_physical_reserve_bytes, managed_kernel_range_end,
     managed_kernel_range_start, mmio_base, paging_capabilities, supported_mapping_sizes,
 };
 pub use map::{
@@ -32,8 +32,8 @@ pub use map::{
 };
 pub use mmio::{map_physical_pages, map_physical_pages_aligned, unmap_physical_pages};
 pub use stack::{
-    allocate_kernel_stack, deallocate_kernel_stack, kernel_stack_max_bytes,
-    kernel_stack_reservation_bytes, StackSize,
+    StackSize, allocate_kernel_stack, deallocate_kernel_stack, kernel_stack_max_bytes,
+    kernel_stack_reservation_bytes,
 };
 pub use tlb::{
     handle_remote_tlb_shootdown, trigger_tlb_shootdown, trigger_tlb_shootdown_range,

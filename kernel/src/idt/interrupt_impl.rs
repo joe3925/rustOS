@@ -8,8 +8,8 @@ use core::task::{Context, Poll};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
     AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqFrame, IrqHandle, IrqHandleInner, IrqIsrFn,
-    IrqMeta, IrqSafeRwLock, IrqWaitResult, WaiterSlot, WAITER_CLAIMED, WAITER_FREE,
-    WAITER_MAX_TICKET, WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING,
+    IrqMeta, IrqSafeRwLock, IrqWaitResult, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET,
+    WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING, WaiterSlot,
 };
 use spin::{Mutex, Once};
 
@@ -168,11 +168,7 @@ impl IrqHandleOps for IrqHandleInner {
         let _ = self
             .pending_signals
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                if pending == 0 {
-                    Some(1)
-                } else {
-                    Some(pending)
-                }
+                if pending == 0 { Some(1) } else { Some(pending) }
             });
 
         self.signal_phase.fetch_add(1, Ordering::AcqRel);
@@ -284,11 +280,7 @@ fn next_waiter_ticket(handle: &IrqHandleInner) -> usize {
         .wrapping_add(1)
         & WAITER_MAX_TICKET;
 
-    if ticket == 0 {
-        1
-    } else {
-        ticket
-    }
+    if ticket == 0 { 1 } else { ticket }
 }
 
 fn try_consume_pending(handle: &IrqHandleInner) -> Option<IrqWaitResult> {

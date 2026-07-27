@@ -10,13 +10,13 @@ use kernel_sync::bounded_mpmc::BoundedSendError;
 use kernel_sync::mpmc::TryRecvError;
 
 use crate::sync_platform::{
-    bounded_mpmc_channel, BoundedMpmcReceiver as BoundedReceiver,
-    BoundedMpmcSender as BoundedSender,
+    BoundedMpmcReceiver as BoundedReceiver, BoundedMpmcSender as BoundedSender,
+    bounded_mpmc_channel,
 };
 
 use super::io_request::{
-    CompleteTransition, IoOpcode, IoRequestFuture, IoRequestOutput, IoRequestTable, KernelIoOp,
-    RequestId, RequestTableError, UserIoCompletion, IO_STATUS_CANCELLED,
+    CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestFuture, IoRequestOutput,
+    IoRequestTable, KernelIoOp, RequestId, RequestTableError, UserIoCompletion,
 };
 
 pub struct CompletionQueue {

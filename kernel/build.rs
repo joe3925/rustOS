@@ -215,8 +215,9 @@ fn emit_kernel_pe_link_args(target_os: &str, target_arch: &str) {
         return;
     }
 
-    let layout = kernel_abi::layout::boot_virtual_layout(target_arch)
-        .unwrap_or_else(|| panic!("no kernel image layout for target architecture `{target_arch}`"));
+    let layout = kernel_abi::layout::boot_virtual_layout(target_arch).unwrap_or_else(|| {
+        panic!("no kernel image layout for target architecture `{target_arch}`")
+    });
     let image_base = format!("/BASE:{:#X}", layout.kernel_image_base);
     for arg in [
         "/NOLOGO",

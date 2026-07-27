@@ -3,8 +3,8 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_types::arch::VirtAddr;
 
-use crate::platform::{ActivePlatform, PagingPlatform};
 use crate::KERNEL_INITIALIZED;
+use crate::platform::{ActivePlatform, PagingPlatform};
 
 use super::layout::base_page_size;
 use super::types::TlbShootdownRange;

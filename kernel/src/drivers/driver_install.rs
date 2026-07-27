@@ -359,8 +359,8 @@ async fn reg_append_class_member(class: &str, service: &str) -> Result<(), Kerne
     }
 
     if let Some(k) = reg::get_key(&members_key).await {
-        for (_k, v) in k.values {
-            if let Data::Str(s) = v {
+        for name in k.values.keys() {
+            if let Some(Data::Str(s)) = reg::get_value(&members_key, name).await {
                 if s == service {
                     return Ok(());
                 }

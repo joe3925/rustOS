@@ -132,7 +132,7 @@ pub trait SchedulerClass: Send + Sync + 'static {
     );
 
     fn pick_next(&self, cpu_id: usize, cpu: &Self::CpuState, now_cycles: u64)
-        -> Option<TaskHandle>;
+    -> Option<TaskHandle>;
 
     fn on_switch_out(
         &self,

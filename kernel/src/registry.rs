@@ -1,15 +1,14 @@
 // We explictly use File::close everywhere here because its used in early boot and nested block on is forbiden.
-use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use embedded_crc32c::crc32c;
 use kernel_types::async_types::AsyncMutex;
 use kernel_types::error::{KernelError, RegistryErrorKind, ResultErrorContext};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::status::Data;
 use prost::Message;
+use registry_format::{CreateKey, DeleteKey, DeleteValue, Delta, Key, Registry, SetValue, Value};
 use spin::{Once, RwLock};
 
 use crate::error::error;
@@ -23,8 +22,6 @@ const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_VERSION: u32 = 1;
 const WAL_VERSION: u32 = 2;
 
-const FRAME_HEADER_LEN: usize = 20;
-const FRAME_CHECKSUM_LEN: usize = 4;
 const SNAPSHOT_DELTA_THRESHOLD: u64 = 100;
 
 const CLASS_LIST: &[(&str, &str)] = &[
@@ -42,23 +39,6 @@ const CLASS_LIST: &[(&str, &str)] = &[
     ("serial", "Serial ports / UART"),
     ("parallel", "Parallel ports"),
 ];
-
-#[derive(Clone, Debug, Default)]
-pub struct Key {
-    pub values: BTreeMap<String, Data>,
-    pub sub_keys: BTreeMap<String, Key>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Registry {
-    pub root: BTreeMap<String, Key>,
-}
-
-impl Registry {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RegDelta {
@@ -92,92 +72,6 @@ struct RegistryStore {
 
 static REGISTRY: Once<RegistryStore> = Once::new();
 
-#[derive(Clone, PartialEq, Message)]
-struct RegistryProto {
-    #[prost(uint32, tag = "1")]
-    schema_version: u32,
-    #[prost(btree_map = "string, message", tag = "2")]
-    root: BTreeMap<String, KeyProto>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct KeyProto {
-    #[prost(btree_map = "string, message", tag = "1")]
-    values: BTreeMap<String, ValueProto>,
-    #[prost(btree_map = "string, message", tag = "2")]
-    sub_keys: BTreeMap<String, KeyProto>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct ValueProto {
-    #[prost(oneof = "ValueKindProto", tags = "1, 2, 3, 4, 5, 6")]
-    value: Option<ValueKindProto>,
-}
-
-#[derive(Clone, PartialEq, prost::Oneof)]
-enum ValueKindProto {
-    #[prost(uint32, tag = "1")]
-    U32(u32),
-    #[prost(uint64, tag = "2")]
-    U64(u64),
-    #[prost(sint32, tag = "3")]
-    I32(i32),
-    #[prost(sint64, tag = "4")]
-    I64(i64),
-    #[prost(bool, tag = "5")]
-    Bool(bool),
-    #[prost(string, tag = "6")]
-    Str(String),
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct DeltaProto {
-    #[prost(oneof = "DeltaKindProto", tags = "1, 2, 3, 4")]
-    delta: Option<DeltaKindProto>,
-}
-
-#[derive(Clone, PartialEq, prost::Oneof)]
-enum DeltaKindProto {
-    #[prost(message, tag = "1")]
-    CreateKey(CreateKeyDeltaProto),
-    #[prost(message, tag = "2")]
-    DeleteKey(DeleteKeyDeltaProto),
-    #[prost(message, tag = "3")]
-    SetValue(SetValueDeltaProto),
-    #[prost(message, tag = "4")]
-    DeleteValue(DeleteValueDeltaProto),
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct CreateKeyDeltaProto {
-    #[prost(string, tag = "1")]
-    path: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct DeleteKeyDeltaProto {
-    #[prost(string, tag = "1")]
-    path: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct SetValueDeltaProto {
-    #[prost(string, tag = "1")]
-    key_path: String,
-    #[prost(string, tag = "2")]
-    name: String,
-    #[prost(message, optional, tag = "3")]
-    data: Option<ValueProto>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct DeleteValueDeltaProto {
-    #[prost(string, tag = "1")]
-    key_path: String,
-    #[prost(string, tag = "2")]
-    name: String,
-}
-
 struct WalReplay {
     max_seq: u64,
     applied: u64,
@@ -185,119 +79,29 @@ struct WalReplay {
     file_len: u64,
 }
 
-impl From<&Registry> for RegistryProto {
-    fn from(registry: &Registry) -> Self {
-        Self {
-            schema_version: REGISTRY_SCHEMA_VERSION,
-            root: registry
-                .root
-                .iter()
-                .map(|(name, key)| (name.clone(), KeyProto::from(key)))
-                .collect(),
-        }
-    }
+fn value_from_data(data: &Data) -> Value {
+    let value = match data {
+        Data::U32(value) => registry_format::value::Value::U32(*value),
+        Data::U64(value) => registry_format::value::Value::U64(*value),
+        Data::I32(value) => registry_format::value::Value::I32(*value),
+        Data::I64(value) => registry_format::value::Value::I64(*value),
+        Data::Bool(value) => registry_format::value::Value::Bool(*value),
+        Data::Str(value) => registry_format::value::Value::Str(value.clone()),
+    };
+    Value { value: Some(value) }
 }
 
-impl TryFrom<RegistryProto> for Registry {
-    type Error = KernelError;
-
-    fn try_from(proto: RegistryProto) -> Result<Self, Self::Error> {
-        if proto.schema_version != REGISTRY_SCHEMA_VERSION {
-            return Err(error(RegistryErrorKind::EncodingFailed));
-        }
-
-        let mut root = BTreeMap::new();
-
-        for (name, key) in proto.root {
-            root.insert(name, Key::try_from(key)?);
-        }
-
-        Ok(Self { root })
-    }
-}
-
-impl From<&Key> for KeyProto {
-    fn from(key: &Key) -> Self {
-        Self {
-            values: key
-                .values
-                .iter()
-                .map(|(name, value)| (name.clone(), ValueProto::from(value)))
-                .collect(),
-            sub_keys: key
-                .sub_keys
-                .iter()
-                .map(|(name, key)| (name.clone(), KeyProto::from(key)))
-                .collect(),
-        }
-    }
-}
-
-impl TryFrom<KeyProto> for Key {
-    type Error = KernelError;
-
-    fn try_from(proto: KeyProto) -> Result<Self, Self::Error> {
-        let mut values = BTreeMap::new();
-
-        for (name, value) in proto.values {
-            values.insert(name, Data::try_from(value)?);
-        }
-
-        let mut sub_keys = BTreeMap::new();
-
-        for (name, key) in proto.sub_keys {
-            sub_keys.insert(name, Key::try_from(key)?);
-        }
-
-        Ok(Self { values, sub_keys })
-    }
-}
-
-impl From<&Data> for ValueProto {
-    fn from(data: &Data) -> Self {
-        let value = match data {
-            Data::U32(value) => ValueKindProto::U32(*value),
-            Data::U64(value) => ValueKindProto::U64(*value),
-            Data::I32(value) => ValueKindProto::I32(*value),
-            Data::I64(value) => ValueKindProto::I64(*value),
-            Data::Bool(value) => ValueKindProto::Bool(*value),
-            Data::Str(value) => ValueKindProto::Str(value.clone()),
-        };
-
-        Self { value: Some(value) }
-    }
-}
-
-impl From<Data> for ValueProto {
-    fn from(data: Data) -> Self {
-        let value = match data {
-            Data::U32(value) => ValueKindProto::U32(value),
-            Data::U64(value) => ValueKindProto::U64(value),
-            Data::I32(value) => ValueKindProto::I32(value),
-            Data::I64(value) => ValueKindProto::I64(value),
-            Data::Bool(value) => ValueKindProto::Bool(value),
-            Data::Str(value) => ValueKindProto::Str(value),
-        };
-
-        Self { value: Some(value) }
-    }
-}
-
-impl TryFrom<ValueProto> for Data {
-    type Error = KernelError;
-
-    fn try_from(proto: ValueProto) -> Result<Self, Self::Error> {
-        match proto
-            .value
-            .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?
-        {
-            ValueKindProto::U32(value) => Ok(Data::U32(value)),
-            ValueKindProto::U64(value) => Ok(Data::U64(value)),
-            ValueKindProto::I32(value) => Ok(Data::I32(value)),
-            ValueKindProto::I64(value) => Ok(Data::I64(value)),
-            ValueKindProto::Bool(value) => Ok(Data::Bool(value)),
-            ValueKindProto::Str(value) => Ok(Data::Str(value)),
-        }
+fn data_from_value(value: Value) -> Result<Data, KernelError> {
+    match value
+        .value
+        .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?
+    {
+        registry_format::value::Value::U32(value) => Ok(Data::U32(value)),
+        registry_format::value::Value::U64(value) => Ok(Data::U64(value)),
+        registry_format::value::Value::I32(value) => Ok(Data::I32(value)),
+        registry_format::value::Value::I64(value) => Ok(Data::I64(value)),
+        registry_format::value::Value::Bool(value) => Ok(Data::Bool(value)),
+        registry_format::value::Value::Str(value) => Ok(Data::Str(value)),
     }
 }
 
@@ -319,13 +123,13 @@ impl RegistryStore {
 
         let seq = self.state.read().wal_seq + 1;
 
-        let delta = DeltaProto {
-            delta: Some(DeltaKindProto::CreateKey(CreateKeyDeltaProto { path })),
+        let delta = Delta {
+            delta: Some(registry_format::delta::Delta::CreateKey(CreateKey { path })),
         };
 
         append_wal(seq, &delta).await?;
 
-        let Some(DeltaKindProto::CreateKey(delta)) = delta.delta else {
+        let Some(registry_format::delta::Delta::CreateKey(delta)) = delta.delta else {
             unreachable!();
         };
 
@@ -352,8 +156,8 @@ impl RegistryStore {
 
         let seq = self.state.read().wal_seq + 1;
 
-        let delta = DeltaProto {
-            delta: Some(DeltaKindProto::DeleteKey(DeleteKeyDeltaProto {
+        let delta = Delta {
+            delta: Some(registry_format::delta::Delta::DeleteKey(DeleteKey {
                 path: path.to_string(),
             })),
         };
@@ -382,18 +186,18 @@ impl RegistryStore {
             let key = walk(&state.registry, key_path)
                 .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
-            if key.values.get(name) == Some(&data) {
+            if key.values.get(name) == Some(&value_from_data(&data)) {
                 return Ok(());
             }
         }
 
         let seq = self.state.read().wal_seq + 1;
 
-        let delta = DeltaProto {
-            delta: Some(DeltaKindProto::SetValue(SetValueDeltaProto {
+        let delta = Delta {
+            delta: Some(registry_format::delta::Delta::SetValue(SetValue {
                 key_path: key_path.to_string(),
                 name: name.to_string(),
-                data: Some(ValueProto::from(&data)),
+                data: Some(value_from_data(&data)),
             })),
         };
 
@@ -404,7 +208,7 @@ impl RegistryStore {
             let key = walk_mut(&mut state.registry, key_path)
                 .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
-            key.values.insert(name.to_string(), data);
+            key.values.insert(name.to_string(), value_from_data(&data));
 
             state.wal_seq = seq;
             state.deltas_since_snapshot += 1;
@@ -431,8 +235,8 @@ impl RegistryStore {
 
         let seq = self.state.read().wal_seq + 1;
 
-        let delta = DeltaProto {
-            delta: Some(DeltaKindProto::DeleteValue(DeleteValueDeltaProto {
+        let delta = Delta {
+            delta: Some(registry_format::delta::Delta::DeleteValue(DeleteValue {
                 key_path: key_path.to_string(),
                 name: name.to_string(),
             })),
@@ -565,26 +369,32 @@ fn delete_key_inner(registry: &mut Registry, path: &str) -> bool {
 }
 
 fn fresh_registry() -> Registry {
-    let mut registry = Registry::default();
+    let mut registry = Registry {
+        schema_version: REGISTRY_SCHEMA_VERSION,
+        ..Registry::default()
+    };
 
     get_or_create_key_mut(&mut registry, "SYSTEM/SETUP")
         .unwrap()
         .values
-        .insert("FirstBoot".to_string(), Data::Bool(true));
+        .insert("FirstBoot".to_string(), value_from_data(&Data::Bool(true)));
 
     for (class, description) in CLASS_LIST {
         let path = format!("SYSTEM/CurrentControlSet/Class/{class}");
         let key = get_or_create_key_mut(&mut registry, &path).unwrap();
 
-        key.values
-            .insert("Class".to_string(), Data::Str(String::new()));
+        key.values.insert(
+            "Class".to_string(),
+            value_from_data(&Data::Str(String::new())),
+        );
 
         key.values.insert(
             "Description".to_string(),
-            Data::Str((*description).to_string()),
+            value_from_data(&Data::Str((*description).to_string())),
         );
 
-        key.values.insert("Version".to_string(), Data::U32(1));
+        key.values
+            .insert("Version".to_string(), value_from_data(&Data::U32(1)));
 
         key.sub_keys.entry("UpperFilters".to_string()).or_default();
 
@@ -596,73 +406,26 @@ fn fresh_registry() -> Registry {
     registry
 }
 
-fn encode_frame(version: u32, seq: u64, message: &impl Message) -> Result<Vec<u8>, KernelError> {
-    let payload_len = message.encoded_len();
-
-    let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + payload_len + FRAME_CHECKSUM_LEN);
-
-    bytes.extend_from_slice(&version.to_le_bytes());
-    bytes.extend_from_slice(&seq.to_le_bytes());
-    bytes.extend_from_slice(&(payload_len as u64).to_le_bytes());
-
-    message
-        .encode(&mut bytes)
-        .map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
-
-    bytes.extend_from_slice(&crc32c(&bytes).to_le_bytes());
-
-    Ok(bytes)
-}
-
-fn decode_frame(bytes: &[u8], expected_version: u32) -> Result<(u64, &[u8], usize), KernelError> {
-    if bytes.len() < FRAME_HEADER_LEN + FRAME_CHECKSUM_LEN {
-        return Err(error(RegistryErrorKind::EncodingFailed));
-    }
-
-    let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-
-    if version != expected_version {
-        return Err(error(RegistryErrorKind::EncodingFailed));
-    }
-
-    let seq = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
-    let payload_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
-
-    if payload_len > bytes.len() - FRAME_HEADER_LEN - FRAME_CHECKSUM_LEN {
-        return Err(error(RegistryErrorKind::EncodingFailed));
-    }
-
-    let payload_end = FRAME_HEADER_LEN + payload_len;
-    let frame_end = payload_end + FRAME_CHECKSUM_LEN;
-
-    let expected_crc = u32::from_le_bytes(bytes[payload_end..frame_end].try_into().unwrap());
-
-    if crc32c(&bytes[..payload_end]) != expected_crc {
-        return Err(error(RegistryErrorKind::EncodingFailed));
-    }
-
-    Ok((seq, &bytes[FRAME_HEADER_LEN..payload_end], frame_end))
-}
-
 fn encode_snapshot(registry: &Registry, last_wal_seq: u64) -> Result<Vec<u8>, KernelError> {
-    encode_frame(
-        SNAPSHOT_VERSION,
-        last_wal_seq,
-        &RegistryProto::from(registry),
-    )
+    registry_format::encode_frame(SNAPSHOT_VERSION, last_wal_seq, registry)
+        .map_err(|_| error(RegistryErrorKind::EncodingFailed))
 }
 
 fn decode_snapshot(bytes: &[u8]) -> Result<(Registry, u64), KernelError> {
-    let (last_wal_seq, payload, frame_len) = decode_frame(bytes, SNAPSHOT_VERSION)?;
+    let (last_wal_seq, payload, frame_len) = registry_format::decode_frame(bytes, SNAPSHOT_VERSION)
+        .map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
 
     if frame_len != bytes.len() {
         return Err(error(RegistryErrorKind::EncodingFailed));
     }
 
-    let proto =
-        RegistryProto::decode(payload).map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
+    let registry =
+        Registry::decode(payload).map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
+    if registry.schema_version != REGISTRY_SCHEMA_VERSION {
+        return Err(error(RegistryErrorKind::EncodingFailed));
+    }
 
-    Ok((Registry::try_from(proto)?, last_wal_seq))
+    Ok((registry, last_wal_seq))
 }
 
 async fn read_file(path: &str) -> Result<Vec<u8>, KernelError> {
@@ -761,8 +524,9 @@ async fn persist_snapshot(bytes: &[u8]) -> Result<(), KernelError> {
     Ok(())
 }
 
-async fn append_wal(seq: u64, delta: &DeltaProto) -> Result<(), KernelError> {
-    let record = encode_frame(WAL_VERSION, seq, delta)?;
+async fn append_wal(seq: u64, delta: &Delta) -> Result<(), KernelError> {
+    let record = registry_format::encode_frame(WAL_VERSION, seq, delta)
+        .map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
 
     let mut file = match File::open(
         &Path::from_string(WAL_PATH),
@@ -874,12 +638,12 @@ async fn truncate_wal(len: u64) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), KernelError> {
+fn apply_wal_delta(registry: &mut Registry, delta: Delta) -> Result<(), KernelError> {
     match delta
         .delta
         .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?
     {
-        DeltaKindProto::CreateKey(delta) => {
+        registry_format::delta::Delta::CreateKey(delta) => {
             if path_parts(&delta.path).next().is_none() {
                 return Err(error(RegistryErrorKind::EncodingFailed));
             }
@@ -887,25 +651,23 @@ fn apply_wal_delta(registry: &mut Registry, delta: DeltaProto) -> Result<(), Ker
             create_key_inner(registry, &delta.path);
         }
 
-        DeltaKindProto::DeleteKey(delta) => {
+        registry_format::delta::Delta::DeleteKey(delta) => {
             delete_key_inner(registry, &delta.path);
         }
 
-        DeltaKindProto::SetValue(delta) => {
+        registry_format::delta::Delta::SetValue(delta) => {
             let key = walk_mut(registry, &delta.key_path)
                 .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
             key.values.insert(
                 delta.name,
-                Data::try_from(
-                    delta
-                        .data
-                        .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?,
-                )?,
+                delta
+                    .data
+                    .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?,
             );
         }
 
-        DeltaKindProto::DeleteValue(delta) => {
+        registry_format::delta::Delta::DeleteValue(delta) => {
             if let Some(key) = walk_mut(registry, &delta.key_path) {
                 key.values.remove(&delta.name);
             }
@@ -935,7 +697,9 @@ async fn replay_wal(registry: &mut Registry, snapshot_seq: u64) -> Result<WalRep
     let mut applied = 0;
 
     while offset < bytes.len() {
-        let Ok((seq, payload, frame_len)) = decode_frame(&bytes[offset..], WAL_VERSION) else {
+        let Ok((seq, payload, frame_len)) =
+            registry_format::decode_frame(&bytes[offset..], WAL_VERSION)
+        else {
             break;
         };
 
@@ -948,7 +712,7 @@ async fn replay_wal(registry: &mut Registry, snapshot_seq: u64) -> Result<WalRep
                 break;
             }
 
-            let Ok(delta) = DeltaProto::decode(payload) else {
+            let Ok(delta) = Delta::decode(payload) else {
                 break;
             };
 
@@ -1036,7 +800,8 @@ fn emit_created_tree(path: &str, key: &Key, out: &mut Vec<RegDelta>) {
         out.push(RegDelta::SetValue {
             key_path: path.to_string(),
             name: name.clone(),
-            data: data.clone(),
+            data: data_from_value(data.clone())
+                .expect("registry contains a value without a value kind"),
         });
     }
 
@@ -1056,7 +821,8 @@ fn diff_key(path: &str, from: &Key, to: &Key, out: &mut Vec<RegDelta>) {
             Some(next) if next != value => out.push(RegDelta::SetValue {
                 key_path: path.to_string(),
                 name: name.clone(),
-                data: next.clone(),
+                data: data_from_value(next.clone())
+                    .expect("registry contains a value without a value kind"),
             }),
 
             Some(_) => {}
@@ -1068,7 +834,8 @@ fn diff_key(path: &str, from: &Key, to: &Key, out: &mut Vec<RegDelta>) {
             out.push(RegDelta::SetValue {
                 key_path: path.to_string(),
                 name: name.clone(),
-                data: value.clone(),
+                data: data_from_value(value.clone())
+                    .expect("registry contains a value without a value kind"),
             });
         }
     }
@@ -1162,7 +929,7 @@ pub mod reg {
         let store = REGISTRY.get()?;
         let state = store.state.read();
 
-        walk(&state.registry, key_path)?.values.get(name).cloned()
+        data_from_value(walk(&state.registry, key_path)?.values.get(name)?.clone()).ok()
     }
 
     pub async fn set_value(key_path: &str, name: &str, data: Data) -> Result<(), KernelError> {

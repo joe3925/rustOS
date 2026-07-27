@@ -8,7 +8,6 @@ use core::ptr::NonNull;
 
 use kernel_types::arch::{PhysAddr, VirtAddr};
 
-
 unsafe impl Send for AcpiFirmware {}
 unsafe impl Sync for AcpiFirmware {}
 pub struct AcpiFirmware {

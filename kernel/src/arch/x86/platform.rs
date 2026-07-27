@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use super::memory::iommu::X86DeviceMmu;
 use super::scheduling::state::{FpuState, State};
-use super::scheduling::{idle_task, task_return_trampoline, TaskEntry};
+use super::scheduling::{TaskEntry, idle_task, task_return_trampoline};
 use crate::drivers::ACPI::ACPIImpl;
 use crate::machine::MachineInfo;
 use crate::machine::MachineInterruptInfo;
@@ -17,7 +17,7 @@ use crate::memory::paging::{
     UnmapFrameDisposition,
 };
 use kernel_types::irq::{
-    MsiMessage, MsiRequest, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
+    MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiMessage, MsiRequest,
 };
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
@@ -32,11 +32,11 @@ use x86_64::structures::paging::{PageSize, Size1GiB, Size2MiB, Size4KiB};
 
 use super::cpu::get_cpu_info;
 use super::drivers::interrupt_index::{
+    APIC, APIC_START_PERIOD, ApicImpl, IpiDest, IpiKind, LocalApic, PICS, TSC_HZ,
     apic_calibrate_ticks_per_ns_via_wait, apic_logical_ids, apic_program_period_ns, calibrate_tsc,
     current_cpu_id as x86_current_cpu_id, current_is_in_interrupt_atomic,
     get_current_logical_id as x86_current_logical_id, init_percpu_gs, send_eoi as x86_send_eoi,
-    wait_duration as x86_wait_duration, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
-    APIC, APIC_START_PERIOD, PICS, TSC_HZ,
+    wait_duration as x86_wait_duration, wait_using_pit_50ms,
 };
 use super::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TIMER_TIME_SCHED};
 use super::gdt::PER_CPU_GDT;

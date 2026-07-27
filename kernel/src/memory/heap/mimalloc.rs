@@ -152,8 +152,7 @@ unsafe extern "C" {
     fn rustos_mi_manage_arena(start: *mut c_void, size: usize) -> bool;
 }
 
-static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> =
-    Locked::new(RangeAllocator::new(0, 0));
+static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocator::new(0, 0));
 
 pub unsafe fn enable_mimalloc_impl() {
     let arena_start = mimalloc_arena_start();
@@ -168,9 +167,7 @@ pub unsafe fn enable_mimalloc_impl() {
     MIMALLOC_OS_ALLOCATOR
         .lock()
         .configure(mimalloc_heap_start(), mimalloc_os_heap_size());
-    MIMALLOC_COMMIT_TRACKER
-        .lock()
-        .init(arena_start, arena_size);
+    MIMALLOC_COMMIT_TRACKER.lock().init(arena_start, arena_size);
     MIMALLOC_ARENA_COMMITTED.store(0, Ordering::Release);
 
     mi_process_init();
@@ -371,8 +368,14 @@ impl RangeAllocator {
     }
 
     fn configure(&mut self, start: usize, size: usize) {
-        assert!(!self.initialized, "mimalloc OS allocator already initialized");
-        assert!(start != 0 && size != 0, "invalid mimalloc OS allocator range");
+        assert!(
+            !self.initialized,
+            "mimalloc OS allocator already initialized"
+        );
+        assert!(
+            start != 0 && size != 0,
+            "invalid mimalloc OS allocator range"
+        );
         self.start = start;
         self.size = size;
         self.free_bytes = 0;
@@ -725,8 +728,7 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
         return false;
     }
 
-    let decommit_start =
-        align_up_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY).max(arena_start);
+    let decommit_start = align_up_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY).max(arena_start);
     let decommit_end = align_down_const(end_usize, MIMALLOC_COMMIT_GRANULARITY).min(arena_end);
     if decommit_end <= decommit_start {
         return true;

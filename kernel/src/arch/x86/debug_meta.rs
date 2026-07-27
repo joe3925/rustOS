@@ -57,7 +57,9 @@ fn can_transmit() -> bool {
 fn transmit_byte(byte: u8) {
     for _ in 0..100_000_usize {
         if can_transmit() {
-            unsafe { Port::<u8>::new(COM2_BASE + UART_DATA).write(byte); }
+            unsafe {
+                Port::<u8>::new(COM2_BASE + UART_DATA).write(byte);
+            }
             return;
         }
         core::hint::spin_loop();
