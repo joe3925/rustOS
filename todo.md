@@ -37,7 +37,7 @@ If there is a * it must be completed before user space is started
 
 ## Kernel General (KEG)
 1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 
-2. [ ] * Change the registry from inline proto to a .proto file
+2. [x] * Change the registry from inline proto to a .proto file
 
 ## Error handling (ERH) (all around messy and I need to refactor it, not sure in what direction I want to take it yet)
 1. [x] * Figure out how error handling should be refactored

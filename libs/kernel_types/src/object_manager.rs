@@ -10,6 +10,7 @@ pub enum OmError {
     Unsupported,
 }
 
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectTag {
     Directory,

@@ -15,7 +15,7 @@ use spin::{Mutex, RwLock};
 
 use crate::{
     executable::pe_loadable::PELoader,
-    object_manager::{OBJECT_MANAGER, Object, ObjectPayload},
+    object_manager::{InterfaceMask, OBJECT_MANAGER, Object, ObjectPayload},
     platform,
     scheduling::task::TaskHandle,
     util::generate_guid,
@@ -33,6 +33,9 @@ type ObjectRef = Arc<Object>;
 pub type ProgramHandle = Arc<RwLock<Program>>;
 pub type QueueHandle = Arc<RwLock<MessageQueue>>;
 pub type UserHandle = u64;
+
+const INITIAL_HANDLE_CAPACITY: usize = 128;
+const HANDLE_SLOT_MASK: u64 = u32::MAX as u64;
 
 #[inline]
 fn obj_as_program(obj: &ObjectRef) -> Option<ProgramHandle> {
@@ -72,6 +75,7 @@ fn guid_to_string(g: &[u8; 16]) -> String {
 pub struct MessageQueue {
     queue: VecDeque<Message>,
     waiters: Vec<Waker>,
+    closed: bool,
 }
 
 impl core::fmt::Debug for MessageQueue {
@@ -88,10 +92,14 @@ impl MessageQueue {
         Self {
             queue: VecDeque::new(),
             waiters: Vec::new(),
+            closed: false,
         }
     }
 
     pub fn push_message(&mut self, msg: Message) {
+        if self.closed {
+            return;
+        }
         self.queue.push_back(msg);
         self.wake_waiters();
     }
@@ -120,29 +128,176 @@ impl MessageQueue {
             waiter.wake();
         }
     }
+
+    pub fn shutdown(&mut self) {
+        self.closed = true;
+        self.queue.clear();
+        self.wake_waiters();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
 }
 #[derive(Debug)]
-pub struct HandleTable {
-    pub handles: BTreeMap<UserHandle, ObjectRef>,
+struct HandleSlot {
+    generation: u32,
+    entry: Option<HandleEntry>,
+    retired: bool,
 }
+
+#[derive(Debug, Clone)]
+pub struct HandleEntry {
+    pub object: ObjectRef,
+    pub interface: InterfaceMask,
+}
+
+#[derive(Debug)]
+pub struct HandleTable {
+    slots: Vec<HandleSlot>,
+    free: Vec<u32>,
+}
+
 impl HandleTable {
     pub fn new() -> Self {
-        Self {
-            handles: BTreeMap::new(),
+        let mut slots = Vec::with_capacity(INITIAL_HANDLE_CAPACITY);
+        let mut free = Vec::with_capacity(INITIAL_HANDLE_CAPACITY);
+
+        // Slot zero is permanently reserved so handle value zero is invalid.
+        slots.push(HandleSlot {
+            generation: 0,
+            entry: None,
+            retired: true,
+        });
+
+        for index in 1..INITIAL_HANDLE_CAPACITY {
+            slots.push(HandleSlot {
+                generation: 1,
+                entry: None,
+                retired: false,
+            });
+            free.push(index as u32);
         }
+
+        Self { slots, free }
     }
+
+    #[inline]
+    fn encode(slot: u32, generation: u32) -> UserHandle {
+        ((generation as u64) << 32) | slot as u64
+    }
+
+    #[inline]
+    fn decode(handle: UserHandle) -> Option<(usize, u32)> {
+        if handle == 0 {
+            return None;
+        }
+        Some(((handle & HANDLE_SLOT_MASK) as usize, (handle >> 32) as u32))
+    }
+
+    fn grow(&mut self) -> Result<(), ()> {
+        let old_len = self.slots.len();
+        let additional = old_len.max(INITIAL_HANDLE_CAPACITY);
+        self.slots.try_reserve(additional).map_err(|_| ())?;
+        self.free.try_reserve(additional).map_err(|_| ())?;
+
+        for index in old_len..old_len + additional {
+            if index > u32::MAX as usize {
+                break;
+            }
+            self.slots.push(HandleSlot {
+                generation: 1,
+                entry: None,
+                retired: false,
+            });
+            self.free.push(index as u32);
+        }
+
+        (!self.free.is_empty()).then_some(()).ok_or(())
+    }
+
+    pub fn insert(
+        &mut self,
+        object: ObjectRef,
+        interface: InterfaceMask,
+    ) -> Result<UserHandle, ()> {
+        if self.free.is_empty() {
+            self.grow()?;
+        }
+
+        let slot_index = self.free.pop().ok_or(())?;
+        let slot = self.slots.get_mut(slot_index as usize).ok_or(())?;
+        debug_assert!(!slot.retired && slot.entry.is_none());
+        slot.entry = Some(HandleEntry { object, interface });
+        Ok(Self::encode(slot_index, slot.generation))
+    }
+
     pub fn resolve(&self, handle: UserHandle) -> Option<ObjectRef> {
-        self.handles.get(&handle).cloned()
+        self.resolve_entry(handle).map(|entry| entry.object.clone())
     }
+
+    pub fn resolve_entry(&self, handle: UserHandle) -> Option<&HandleEntry> {
+        let (slot_index, generation) = Self::decode(handle)?;
+        let slot = self.slots.get(slot_index)?;
+        if slot.retired || slot.generation != generation {
+            return None;
+        }
+        let entry = slot.entry.as_ref()?;
+        entry.object.is_alive().then_some(entry)
+    }
+
+    pub fn close(&mut self, handle: UserHandle) -> Option<ObjectRef> {
+        let (slot_index, generation) = Self::decode(handle)?;
+        let slot = self.slots.get_mut(slot_index)?;
+        if slot.retired || slot.generation != generation {
+            return None;
+        }
+
+        let object = slot.entry.take()?.object;
+        if slot.generation == u32::MAX {
+            slot.retired = true;
+        } else {
+            slot.generation += 1;
+            self.free.push(slot_index as u32);
+        }
+        Some(object)
+    }
+
+    pub fn duplicate(
+        &mut self,
+        handle: UserHandle,
+        interface: InterfaceMask,
+    ) -> Result<UserHandle, ()> {
+        let entry = self.resolve_entry(handle).cloned().ok_or(())?;
+        if !entry.interface.contains(interface) {
+            return Err(());
+        }
+        self.insert(entry.object, interface)
+    }
+
     pub fn handle_to_program(&self, target_pid: u64) -> Option<UserHandle> {
-        self.handles.iter().find_map(|(uh, obj)| {
+        self.slots.iter().enumerate().find_map(|(index, slot)| {
+            let obj = &slot.entry.as_ref()?.object;
             if let Some(ph) = obj_as_program(obj) {
                 if ph.read().pid == target_pid {
-                    return Some(*uh);
+                    return Some(Self::encode(index as u32, slot.generation));
                 }
             }
             None
         })
+    }
+
+    pub fn drain(&mut self) {
+        self.free.clear();
+        for (index, slot) in self.slots.iter_mut().enumerate().skip(1) {
+            slot.entry.take();
+            if slot.generation == u32::MAX {
+                slot.retired = true;
+            } else if !slot.retired {
+                slot.generation += 1;
+                self.free.push(index as u32);
+            }
+        }
     }
 }
 
@@ -164,6 +319,7 @@ pub enum MessageId {
 pub struct Message {
     pub id: MessageId,
     pub sender: Option<UserHandle>,
+    pub delivery: Option<UserHandle>,
     pub wparam: usize,
     pub lparam: usize,
     pub timestamp: u64,
@@ -461,24 +617,49 @@ impl Program {
     }
 
     pub fn resolve_handle(&self, handle: UserHandle) -> Option<ObjectRef> {
-        // Prefer local cache. Fallback to global index.
-        self.handle_table
-            .read()
-            .resolve(handle)
-            .or_else(|| OBJECT_MANAGER.open_by_id(handle))
+        self.handle_table.read().resolve(handle)
+    }
+
+    pub fn resolve_handle_entry(&self, handle: UserHandle) -> Option<HandleEntry> {
+        self.handle_table.read().resolve_entry(handle).cloned()
     }
 
     pub fn create_user_handle_for_object(&self, obj: ObjectRef) -> UserHandle {
-        let id = obj.id;
-        self.handle_table.write().handles.insert(id, obj);
-        id
+        let interface = obj.behavior().supported_interfaces();
+        self.create_user_handle_with_interface(obj, interface)
+    }
+
+    pub fn create_user_handle_with_interface(
+        &self,
+        obj: ObjectRef,
+        interface: InterfaceMask,
+    ) -> UserHandle {
+        self.handle_table
+            .write()
+            .insert(obj, interface)
+            .unwrap_or(0)
+    }
+
+    pub fn close_user_handle(&self, handle: UserHandle) -> bool {
+        self.handle_table.write().close(handle).is_some()
+    }
+
+    pub fn duplicate_user_handle(
+        &self,
+        handle: UserHandle,
+        interface: InterfaceMask,
+    ) -> UserHandle {
+        self.handle_table
+            .write()
+            .duplicate(handle, interface)
+            .unwrap_or(0)
     }
 
     pub fn new_mq(&self) -> ObjectRef {
         let qh = Arc::new(RwLock::new(MessageQueue::new()));
-        let base = alloc::format!("\\Proc\\{}\\Queues", self.pid);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Proc");
-        let _ = OBJECT_MANAGER.mkdir_p(alloc::format!("\\Proc\\{}", self.pid));
+        let base = alloc::format!("\\Process\\{}\\Resources\\Queues", self.pid);
+        let _ = OBJECT_MANAGER.mkdir_p("\\Process");
+        let _ = OBJECT_MANAGER.mkdir_p(alloc::format!("\\Process\\{}", self.pid));
         let _ = OBJECT_MANAGER.mkdir_p(base.clone());
 
         let name = guid_to_string(&generate_guid());
@@ -563,6 +744,7 @@ impl ProgramManager {
     }
 
     pub fn add_program(&self, mut prog: Program) -> u64 {
+        let _ = OBJECT_MANAGER.ensure_standard_roots();
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         prog.pid = pid;
         if let Some(ref mut task) = prog.main_thread {
@@ -574,9 +756,21 @@ impl ProgramManager {
         let handle = Arc::new(RwLock::new(prog));
         self.programs.write().insert(pid, handle.clone());
 
-        let proc_dir = alloc::format!("\\Proc\\{}", pid);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Proc");
+        let proc_dir = alloc::format!("\\Process\\{}", pid);
+        let resource_dir = alloc::format!("{}\\Resources", proc_dir);
+        let queue_dir = alloc::format!("{}\\Queues", resource_dir);
+        let thread_dir = alloc::format!("{}\\Threads", resource_dir);
+        let completion_dir = alloc::format!("{}\\CompletionQueues", resource_dir);
+        let endpoint_dir = alloc::format!("{}\\IoEndpoints", resource_dir);
+        let module_dir = alloc::format!("{}\\Modules", resource_dir);
+        let _ = OBJECT_MANAGER.mkdir_p("\\Process");
         let _ = OBJECT_MANAGER.mkdir_p(proc_dir.clone());
+        let _ = OBJECT_MANAGER.mkdir_p(resource_dir);
+        let _ = OBJECT_MANAGER.mkdir_p(queue_dir.clone());
+        let _ = OBJECT_MANAGER.mkdir_p(thread_dir.clone());
+        let _ = OBJECT_MANAGER.mkdir_p(completion_dir);
+        let _ = OBJECT_MANAGER.mkdir_p(endpoint_dir);
+        let _ = OBJECT_MANAGER.mkdir_p(module_dir.clone());
 
         let prog_obj = Object::with_name(
             ObjectTag::Program,
@@ -590,7 +784,30 @@ impl ProgramManager {
             "DefaultQueue".to_string(),
             ObjectPayload::Queue(handle.read().default_queue.clone()),
         );
-        let _ = OBJECT_MANAGER.link(alloc::format!("{}\\DefaultQueue", proc_dir), &dq_obj);
+        let _ = OBJECT_MANAGER.link(alloc::format!("{}\\Default", queue_dir), &dq_obj);
+
+        if let Some(main_thread) = handle.read().main_thread.clone() {
+            let thread_obj = Object::with_name(
+                ObjectTag::Thread,
+                main_thread.task_id().to_string(),
+                ObjectPayload::Thread(main_thread.clone()),
+            );
+            let _ = OBJECT_MANAGER.link(
+                alloc::format!("{}\\{}", thread_dir, main_thread.task_id()),
+                &thread_obj,
+            );
+        }
+
+        let modules = handle.read().modules.read().clone();
+        for module in modules {
+            let name = guid_to_string(&generate_guid());
+            let module_obj = Object::with_name(
+                ObjectTag::Module,
+                name.clone(),
+                ObjectPayload::Module(module),
+            );
+            let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", module_dir, name), &module_obj);
+        }
 
         pid
     }
@@ -616,7 +833,8 @@ impl ProgramManager {
             .write()
             .remove(&pid)
             .ok_or(LoadError::BadPID)?;
-        let _ = OBJECT_MANAGER.unlink(alloc::format!("\\Proc\\{}", pid));
+        let _ = OBJECT_MANAGER.retire_subtree(alloc::format!("\\Process\\{}", pid));
+        handle.write().handle_table.write().drain();
         handle.write().kill()?;
         Ok(())
     }

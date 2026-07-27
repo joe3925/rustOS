@@ -29,6 +29,36 @@ use kernel_types::pnp::{
 use kernel_types::status::Data;
 use spin::{Mutex, RwLock};
 
+fn device_link_path(path: &str) -> String {
+    let trimmed = path.trim_start_matches(['\\', '/']);
+    let relative = trimmed
+        .strip_prefix("GLOBAL\\")
+        .or_else(|| trimmed.strip_prefix("global\\"))
+        .or_else(|| {
+            trimmed
+                .get(..14)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("Links\\Devices\\"))
+                .map(|_| &trimmed[14..])
+        })
+        .unwrap_or(trimmed);
+    alloc::format!("\\Links\\Devices\\{}", relative)
+}
+
+fn device_link_path_if_public(path: &str) -> String {
+    let trimmed = path.trim_start_matches(['\\', '/']);
+    if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GLOBAL\\"))
+        || trimmed
+            .get(..14)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Links\\Devices\\"))
+    {
+        device_link_path(path)
+    } else {
+        path.to_string()
+    }
+}
+
 #[repr(C)]
 pub struct ClassListener {
     pub class: String,
@@ -1203,12 +1233,16 @@ impl PnpManager {
     }
 
     pub fn create_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
+        let link_path = device_link_path(&link_path);
+        let target_path = device_link_path_if_public(&target_path);
         OBJECT_MANAGER
             .symlink(&link_path, target_path.to_string(), true)
             .map(|_| ())
     }
 
     pub fn replace_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
+        let link_path = device_link_path(&link_path);
+        let target_path = device_link_path_if_public(&target_path);
         let _ = OBJECT_MANAGER.unlink(&link_path);
         OBJECT_MANAGER
             .symlink(&link_path, target_path.to_string(), true)
@@ -1221,11 +1255,12 @@ impl PnpManager {
         link_path: String,
     ) -> Result<(), OmError> {
         let target = alloc::format!("\\Device\\{}\\Top", instance_path);
+        let link_path = device_link_path(&link_path);
         OBJECT_MANAGER.symlink(&link_path, target, true).map(|_| ())
     }
 
     pub fn remove_symlink(&self, link_path: String) -> Result<(), OmError> {
-        OBJECT_MANAGER.unlink(&link_path)
+        OBJECT_MANAGER.unlink(device_link_path(&link_path))
     }
 
     pub fn resolve_targetio_from_symlink(&self, p: String) -> Option<IoTarget> {
@@ -1236,7 +1271,6 @@ impl PnpManager {
         enum ResolvePath<'a> {
             Borrowed(&'a str),
             Owned(String),
-            Shared(Arc<str>),
         }
 
         impl ResolvePath<'_> {
@@ -1244,12 +1278,16 @@ impl PnpManager {
                 match self {
                     Self::Borrowed(p) => p,
                     Self::Owned(p) => p.as_str(),
-                    Self::Shared(p) => p.as_ref(),
                 }
             }
         }
 
-        let mut p = ResolvePath::Borrowed(p);
+        let public_path = device_link_path_if_public(p);
+        let mut p = if public_path == p {
+            ResolvePath::Borrowed(p)
+        } else {
+            ResolvePath::Owned(public_path)
+        };
         for _ in 0..32 {
             let o = OBJECT_MANAGER.open(p.as_str()).ok()?;
             match &o.payload {
@@ -1257,9 +1295,7 @@ impl PnpManager {
                 ObjectPayload::Directory(_) => {
                     p = ResolvePath::Owned(alloc::format!("{}\\Top", p.as_str()));
                 }
-                ObjectPayload::Symlink(target) => {
-                    p = ResolvePath::Shared(target.target.clone());
-                }
+                ObjectPayload::Symlink(_) => return None,
                 _ => return None,
             }
         }

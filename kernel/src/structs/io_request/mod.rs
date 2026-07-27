@@ -17,6 +17,10 @@ use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload};
 use crate::platform;
 use crate::util::generate_guid;
 
+mod message;
+pub use message::MessageDelivery;
+use message::{MessageSendFuture, MqReceiveFuture};
+
 pub type RequestId = u64;
 
 pub const IO_STATUS_SUCCESS: u64 = 0;
@@ -38,6 +42,8 @@ pub enum IoOpcode {
     ListDir = 5,
     ChangeDirectory = 6,
     MqReceive = 7,
+    ObjectDestroy = 8,
+    MessageSendAwait = 9,
 
     SocketRecv = 64,
     SocketSend = 65,
@@ -56,6 +62,8 @@ impl IoOpcode {
             5 => Some(Self::ListDir),
             6 => Some(Self::ChangeDirectory),
             7 => Some(Self::MqReceive),
+            8 => Some(Self::ObjectDestroy),
+            9 => Some(Self::MessageSendAwait),
             64 => Some(Self::SocketRecv),
             65 => Some(Self::SocketSend),
             66 => Some(Self::TimerWait),
@@ -147,6 +155,24 @@ impl IoRequestOutput {
 
 pub type IoRequestFuture = Pin<Box<dyn Future<Output = IoRequestOutput> + Send + 'static>>;
 
+pub enum KernelIoFuture {
+    Cold(IoRequestFuture),
+    MessageReceive(MqReceiveFuture),
+    MessageSend(MessageSendFuture),
+}
+
+impl Future for KernelIoFuture {
+    type Output = IoRequestOutput;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.as_mut().get_mut() {
+            Self::Cold(future) => future.as_mut().poll(cx),
+            Self::MessageReceive(future) => Pin::new(future).poll(cx),
+            Self::MessageSend(future) => Pin::new(future).poll(cx),
+        }
+    }
+}
+
 struct FileObjectState {
     file: Option<File>,
     waiters: Vec<Waker>,
@@ -205,6 +231,10 @@ impl FileLease {
     #[inline]
     pub fn file_mut(&mut self) -> &mut File {
         self.file.as_mut().expect("file lease missing file")
+    }
+
+    pub fn close(mut self) {
+        self.file.take();
     }
 }
 
@@ -291,6 +321,15 @@ pub enum KernelIoOp {
         length: usize,
         user_token: u64,
     },
+    ObjectDestroy {
+        object: Arc<Object>,
+        user_token: u64,
+    },
+    MessageSendAwait {
+        target: ProgramHandle,
+        message: Message,
+        user_token: u64,
+    },
 }
 
 impl KernelIoOp {
@@ -304,6 +343,8 @@ impl KernelIoOp {
             Self::ListDir { .. } => IoOpcode::ListDir,
             Self::ChangeDirectory { .. } => IoOpcode::ChangeDirectory,
             Self::MqReceive { .. } => IoOpcode::MqReceive,
+            Self::ObjectDestroy { .. } => IoOpcode::ObjectDestroy,
+            Self::MessageSendAwait { .. } => IoOpcode::MessageSendAwait,
         }
     }
 
@@ -317,11 +358,13 @@ impl KernelIoOp {
             | Self::FileDeletePath { user_token, .. }
             | Self::ListDir { user_token, .. }
             | Self::ChangeDirectory { user_token, .. }
-            | Self::MqReceive { user_token, .. } => *user_token,
+            | Self::MqReceive { user_token, .. }
+            | Self::ObjectDestroy { user_token, .. } => *user_token,
+            Self::MessageSendAwait { user_token, .. } => *user_token,
         }
     }
 
-    pub fn into_future(self) -> IoRequestFuture {
+    pub fn into_future(self) -> KernelIoFuture {
         match self {
             Self::FileOpen {
                 owner_pid,
@@ -329,7 +372,9 @@ impl KernelIoOp {
                 path,
                 flags,
                 ..
-            } => Box::pin(async move { run_file_open(owner_pid, owner, path, flags).await }),
+            } => KernelIoFuture::Cold(Box::pin(async move {
+                run_file_open(owner_pid, owner, path, flags).await
+            })),
             Self::FileRead {
                 owner,
                 file,
@@ -337,34 +382,49 @@ impl KernelIoOp {
                 length,
                 offset,
                 ..
-            } => Box::pin(async move { run_file_read(owner, file, buffer, length, offset).await }),
+            } => KernelIoFuture::Cold(Box::pin(async move {
+                run_file_read(owner, file, buffer, length, offset).await
+            })),
             Self::FileWrite {
                 file, data, offset, ..
-            } => Box::pin(async move { run_file_write(file, data, offset).await }),
+            } => KernelIoFuture::Cold(Box::pin(
+                async move { run_file_write(file, data, offset).await },
+            )),
             Self::FileDeleteHandle { file, .. } => {
-                Box::pin(async move { run_file_delete_handle(file).await })
+                KernelIoFuture::Cold(Box::pin(async move { run_file_delete_handle(file).await }))
             }
             Self::FileDeletePath { path, .. } => {
-                Box::pin(async move { run_file_delete_path(path).await })
+                KernelIoFuture::Cold(Box::pin(async move { run_file_delete_path(path).await }))
             }
             Self::ListDir { owner, path, .. } => {
-                Box::pin(async move { run_list_dir(owner, path).await })
+                KernelIoFuture::Cold(Box::pin(async move { run_list_dir(owner, path).await }))
             }
-            Self::ChangeDirectory { owner, path, .. } => {
-                Box::pin(async move { run_change_directory(owner, path).await })
-            }
+            Self::ChangeDirectory { owner, path, .. } => KernelIoFuture::Cold(Box::pin(
+                async move { run_change_directory(owner, path).await },
+            )),
             Self::MqReceive {
                 owner,
                 queue,
                 buffer,
                 length,
                 ..
-            } => Box::pin(MqReceiveFuture {
+            } => KernelIoFuture::MessageReceive(MqReceiveFuture {
                 owner,
                 queue,
                 buffer,
                 length,
             }),
+            Self::ObjectDestroy { object, .. } => KernelIoFuture::Cold(Box::pin(async move {
+                let output = object.behavior().destroy().await;
+                if output.status == IO_STATUS_SUCCESS {
+                    let _ = OBJECT_MANAGER.unlink_object(&object);
+                    object.mark_dead();
+                }
+                output
+            })),
+            Self::MessageSendAwait {
+                target, message, ..
+            } => KernelIoFuture::MessageSend(MessageSendFuture::new(target, message)),
         }
     }
 }
@@ -542,6 +602,36 @@ impl IoRequestTable {
         }
     }
 
+    pub fn cancel_all(&self) {
+        use core::sync::atomic::Ordering;
+
+        for slot in &self.slots {
+            loop {
+                let state = IoRequestState::from_u8(slot.state.load(Ordering::Acquire));
+                match state {
+                    IoRequestState::Submitted | IoRequestState::Running => {
+                        if slot
+                            .state
+                            .compare_exchange(
+                                state as u8,
+                                IoRequestState::CancelRequested as u8,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            if let Some(waker) = slot.waker.lock().take() {
+                                waker.wake();
+                            }
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
     pub fn set_waker(&self, request_id: RequestId, waker: &Waker) {
         if let Ok(slot) = self.find_slot(request_id) {
             let mut guard = slot.waker.lock();
@@ -663,7 +753,11 @@ fn copy_to_user_bytes(owner: &ProgramHandle, dst: u64, bytes: &[u8]) -> Result<(
     Ok(())
 }
 
-fn copy_to_user_value<T: Clone>(owner: &ProgramHandle, dst: u64, value: &T) -> Result<(), u64> {
+pub(super) fn copy_to_user_value<T: Clone>(
+    owner: &ProgramHandle,
+    dst: u64,
+    value: &T,
+) -> Result<(), u64> {
     if !user_ptr_range_ok(dst, core::mem::size_of::<T>()) {
         return Err(IO_STATUS_INVALID_PARAMETER);
     }
@@ -711,7 +805,7 @@ fn create_file_handle(
     owner: &ProgramHandle,
     file: File,
 ) -> Result<UserHandle, u64> {
-    let dir = alloc::format!("\\Process\\{}\\Files", owner_pid);
+    let dir = alloc::format!("\\Process\\{}\\Resources\\IoEndpoints", owner_pid);
     OBJECT_MANAGER
         .mkdir_p(dir.clone())
         .map_err(|_| IO_STATUS_INVALID_PARAMETER)?;
@@ -831,39 +925,4 @@ async fn run_change_directory(owner: ProgramHandle, path: Path) -> IoRequestOutp
 
     owner.write().working_dir = path;
     IoRequestOutput::success(0, 0)
-}
-
-pub struct MqReceiveFuture {
-    owner: ProgramHandle,
-    queue: QueueHandle,
-    buffer: u64,
-    length: usize,
-}
-
-impl Future for MqReceiveFuture {
-    type Output = IoRequestOutput;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut queue = this.queue.write();
-
-        if let Some(message) = queue.try_pop_message() {
-            drop(queue);
-
-            let message_size = core::mem::size_of::<Message>();
-            if this.length < message_size {
-                return Poll::Ready(IoRequestOutput::error(IO_STATUS_BUFFER_TOO_SMALL));
-            }
-
-            return Poll::Ready(
-                match copy_to_user_value(&this.owner, this.buffer, &message) {
-                    Ok(()) => IoRequestOutput::success(message_size as u64, 0),
-                    Err(status) => IoRequestOutput::error(status),
-                },
-            );
-        }
-
-        queue.register_waker(cx.waker());
-        Poll::Pending
-    }
 }

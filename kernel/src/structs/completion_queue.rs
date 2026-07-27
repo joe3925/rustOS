@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use kernel_executor::global_async::{ExecutorDomainId, KERNEL_NORMAL_EXECUTOR_DOMAIN};
@@ -15,8 +15,8 @@ use crate::sync_platform::{
 };
 
 use super::io_request::{
-    CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestFuture, IoRequestOutput,
-    IoRequestTable, KernelIoOp, RequestId, RequestTableError, UserIoCompletion,
+    CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable,
+    KernelIoFuture, KernelIoOp, RequestId, RequestTableError, UserIoCompletion,
 };
 
 pub struct CompletionQueue {
@@ -30,6 +30,7 @@ pub struct CompletionQueue {
     completion_sender: BoundedSender<UserIoCompletion>,
     completion_receiver: BoundedReceiver<UserIoCompletion>,
     completion_permits: AtomicUsize,
+    closed: AtomicBool,
 }
 
 impl core::fmt::Debug for CompletionQueue {
@@ -51,6 +52,7 @@ pub enum CompletionQueueError {
     CompletionQueueFull,
     RequestNotFound,
     RequestAlreadyComplete,
+    Closed,
 }
 
 impl CompletionQueue {
@@ -78,10 +80,14 @@ impl CompletionQueue {
             completion_sender,
             completion_receiver,
             completion_permits: AtomicUsize::new(completion_capacity),
+            closed: AtomicBool::new(false),
         }))
     }
 
     pub fn enqueue(self: &Arc<Self>, op: KernelIoOp) -> Result<RequestId, CompletionQueueError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CompletionQueueError::Closed);
+        }
         self.reserve_completion_permit()?;
 
         let request_id = match self.request_table.allocate() {
@@ -198,6 +204,12 @@ impl CompletionQueue {
             })
     }
 
+    pub fn shutdown(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.request_table.cancel_all();
+        }
+    }
+
     fn reserve_completion_permit(&self) -> Result<(), CompletionQueueError> {
         self.completion_permits
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
@@ -255,7 +267,7 @@ struct IoRequestDriverFuture {
     request_id: RequestId,
     opcode: IoOpcode,
     user_token: u64,
-    inner: IoRequestFuture,
+    inner: KernelIoFuture,
 }
 
 impl Future for IoRequestDriverFuture {
@@ -285,7 +297,7 @@ impl Future for IoRequestDriverFuture {
             Err(_) => return Poll::Ready(()),
         }
 
-        match this.inner.as_mut().poll(cx) {
+        match Pin::new(&mut this.inner).poll(cx) {
             Poll::Ready(output) => {
                 this.queue
                     .complete_entry(this.request_id, this.opcode, this.user_token, output);
