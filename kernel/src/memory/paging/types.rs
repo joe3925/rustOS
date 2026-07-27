@@ -19,6 +19,8 @@ pub struct KernelVirtualLayout {
     pub kernel_space_base: VirtAddr,
     pub managed_kernel_range_start: VirtAddr,
     pub managed_kernel_range_end: VirtAddr,
+    pub heap_range_start: VirtAddr,
+    pub heap_range_end: VirtAddr,
     pub mmio_base: VirtAddr,
     pub low_physical_reserve_bytes: u64,
 }

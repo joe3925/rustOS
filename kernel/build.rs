@@ -146,10 +146,10 @@ impl MsvcLibTool {
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target = env::var("TARGET").unwrap();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    emit_kernel_pe_link_args(&target);
+    emit_kernel_pe_link_args(&target_os, &target_arch);
     if env::var_os("CARGO_FEATURE_ALLOCATOR_MIMALLOC").is_some() {
         compile_mimalloc(&manifest_dir, &target_arch, &out_dir)
             .expect("Failed to compile mimalloc");
@@ -210,11 +210,14 @@ fn find_tool_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn emit_kernel_pe_link_args(target: &str) {
-    if !target.ends_with("windows-msvc") {
+fn emit_kernel_pe_link_args(target_os: &str, target_arch: &str) {
+    if target_os != "windows" {
         return;
     }
 
+    let layout = kernel_abi::layout::boot_virtual_layout(target_arch)
+        .unwrap_or_else(|| panic!("no kernel image layout for target architecture `{target_arch}`"));
+    let image_base = format!("/BASE:{:#X}", layout.kernel_image_base);
     for arg in [
         "/NOLOGO",
         "/NODEFAULTLIB",
@@ -222,9 +225,9 @@ fn emit_kernel_pe_link_args(target: &str) {
         "/ENTRY:kernel_pe_entry",
         "/FIXED",
         "/DYNAMICBASE:NO",
-        "/BASE:0xFFFF850000000000",
         "/EXPORT:kernel_pe_entry",
     ] {
         println!("cargo:rustc-link-arg-bin=kernel={arg}");
     }
+    println!("cargo:rustc-link-arg-bin=kernel={image_base}");
 }

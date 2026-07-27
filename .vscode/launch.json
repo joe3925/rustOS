@@ -12,7 +12,7 @@
             "processCreateCommands": [
                 "settings set target.debug-file-search-paths \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\"",
                 "gdb-remote localhost:1234",
-                "target modules load --file kernel.efi .text 0xFFFF850000000000",
+                "target modules load --file kernel.efi .text 0xFFFF800000000000",
                 // acpi.dll
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\acpi.dll\"",
                 "target modules load --file \"acpi.dll\" .text 0xffff900003c13000",

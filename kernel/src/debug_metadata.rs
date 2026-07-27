@@ -101,6 +101,14 @@ fn sink_write(bytes: &[u8]) {
     }
 }
 
+fn poll_sink() {
+    let sink = *META_SINK.lock();
+
+    if let Some(sink) = sink {
+        sink(&[]);
+    }
+}
+
 fn write_quoted(buf: &mut impl core::fmt::Write, value: &str) {
     debug_assert!(
         !value.contains('"') && !value.contains('\\'),
@@ -202,6 +210,10 @@ pub fn module_loaded(module: &DebugLoadedModule<'_>) {
         }
     }
 
+    // Poll the transport even before a debugger has completed its handshake.
+    // Passing an empty slice lets transport implementations service receive
+    // data without transmitting module metadata to an absent host.
+    poll_sink();
     emit_module(id, module);
 }
 

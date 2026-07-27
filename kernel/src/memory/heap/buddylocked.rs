@@ -3,7 +3,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::memory::heap::HEAP_START;
+use crate::memory::paging::heap_range_start;
 use crate::platform::with_interrupts_disabled;
 
 #[cfg(feature = "allocator-buddy")]
@@ -35,7 +35,9 @@ impl BuddyLocked {
                     #[cfg(feature = "allocator-buddy")]
                     let size = HEAP_SIZE as usize;
 
-                    self.inner.lock().init(HEAP_START, size);
+                    self.inner
+                        .lock()
+                        .init(heap_range_start().as_u64() as usize, size);
                     self.init.store(true, Ordering::Release);
                 }
             });

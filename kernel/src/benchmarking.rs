@@ -2725,7 +2725,7 @@ pub fn used_memory() -> usize {
     cfg_if::cfg_if! {
         if #[cfg(feature = "allocator-mimalloc")] {
             let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
-                + crate::memory::heap::MIMALLOC_OS_HEAP_SIZE as usize;
+                + crate::memory::heap::mimalloc_os_heap_size();
             let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
             let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
                 .load(core::sync::atomic::Ordering::Relaxed);

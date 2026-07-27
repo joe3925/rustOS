@@ -41,7 +41,6 @@
       "/ENTRY:kernel_pe_entry",
       "/FIXED",
       "/DYNAMICBASE:NO",
-      "/BASE:0xFFFF850000000000",
       "/EXPORT:kernel_pe_entry",
       "/DEBUG:SYMTAB"
     ],
@@ -52,7 +51,6 @@
       "/ENTRY:kernel_pe_entry",
       "/FIXED",
       "/DYNAMICBASE:NO",
-      "/BASE:0xFFFF850000000000",
       "/EXPORT:kernel_pe_entry",
       "/DEBUG:SYMTAB"
     ]

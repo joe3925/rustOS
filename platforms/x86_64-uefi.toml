@@ -52,7 +52,7 @@ manifest = "../boot/kernel_stub/Cargo.toml"
 package = "kernel_stub"
 binary = "kernel_stub"
 target = "x86_64-unknown-none"
-rustflags = "-C link-args=--image-base=0xFFFF880000000000 -C link-arg=-no-pie -C relocation-model=static -C code-model=large"
+rustflags = "-C link-arg=-no-pie -C relocation-model=static -C code-model=large"
 
 [bootloader]
 provider = "local"

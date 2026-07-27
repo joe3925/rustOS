@@ -20,8 +20,8 @@ pub use frame_alloc::{
 };
 pub use layout::{
     align_up_to_base_page, base_page_size, kernel_space_base, kernel_virtual_layout,
-    low_physical_reserve_bytes, managed_kernel_range_end, managed_kernel_range_start, mmio_base,
-    paging_capabilities, supported_mapping_sizes,
+    heap_range_end, heap_range_start, low_physical_reserve_bytes, managed_kernel_range_end,
+    managed_kernel_range_start, mmio_base, paging_capabilities, supported_mapping_sizes,
 };
 pub use map::{
     allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous,

@@ -23,5 +23,6 @@ x86_64 = { version = "=0.15.2", default-features = false, features = [
 ] }
 
 [build-dependencies]
+kernel_abi = { path = "../../libs/kernel_abi" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"

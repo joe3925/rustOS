@@ -555,7 +555,5 @@ pub async fn install_prepacked_drivers() -> Result<(), KernelError> {
             .await
             .with_context(|| format!("installing prepacked driver `{toml_path:?}`"))?;
     }
-    PNP_MANAGER.recheck_all_devices().await;
-
     Ok(())
 }

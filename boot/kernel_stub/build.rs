@@ -23,22 +23,38 @@ struct KernelPeTarget {
     machine_name: &'static str,
     optional_magic: u16,
     image_base: u64,
+    image_end_limit: u64,
 }
 
 fn kernel_pe_target() -> KernelPeTarget {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let layout = kernel_abi::layout::boot_virtual_layout(&target_arch).unwrap_or_else(|| {
+        panic!("no boot virtual layout for target architecture `{target_arch}`")
+    });
     match target_arch.as_str() {
         "x86_64" => KernelPeTarget {
             machine: 0x8664,
             machine_name: "x86_64",
             optional_magic: 0x20B,
-            image_base: 0xFFFF_8500_0000_0000,
+            image_base: layout.kernel_image_base,
+            image_end_limit: layout.stub_image_base,
         },
         _ => panic!("kernel_stub build does not have an implementation for target architecture `{target_arch}`"),
     }
 }
 
 fn main() {
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let layout = kernel_abi::layout::boot_virtual_layout(&target_arch).unwrap_or_else(|| {
+        panic!("no boot virtual layout for target architecture `{target_arch}`")
+    });
+    if layout.stub_image_base != 0 {
+        println!(
+            "cargo:rustc-link-arg-bin=kernel_stub=--image-base={:#X}",
+            layout.stub_image_base
+        );
+    }
+
     let Some(kernel_pe) = kernel_pe_path() else {
         return;
     };
@@ -151,6 +167,7 @@ fn validate_kernel_pe(path: &PathBuf, target: KernelPeTarget) {
     let machine = read_u16(&bytes, coff);
     let magic = read_u16(&bytes, optional);
     let image_base = read_u64(&bytes, optional + 24);
+    let image_size = read_u32(&bytes, optional + 56) as u64;
 
     if machine != target.machine {
         panic!(
@@ -165,6 +182,15 @@ fn validate_kernel_pe(path: &PathBuf, target: KernelPeTarget) {
         panic!(
             "kernel PE image base is 0x{image_base:x}, expected 0x{:x}; build it through the kernel_stub artifact dependency",
             target.image_base
+        );
+    }
+    let image_end = image_base
+        .checked_add(image_size)
+        .expect("kernel PE image range overflows");
+    if image_end > target.image_end_limit {
+        panic!(
+            "kernel PE range 0x{image_base:x}..0x{image_end:x} overlaps the next platform image band at 0x{:x}",
+            target.image_end_limit
         );
     }
 }
