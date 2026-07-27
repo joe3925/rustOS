@@ -461,6 +461,18 @@ impl PagingPlatform for X86Platform {
         super::memory::paging::mapper::resolve_mapping(virt)
     }
 
+    fn resolve_mapping_in_root(root: Self::Root, virt: VirtAddr) -> Option<ResolvedMapping> {
+        let previous = super::memory::paging::address_space::current_root();
+        if previous != root {
+            unsafe { super::memory::paging::address_space::switch_root(root) };
+        }
+        let resolved = super::memory::paging::mapper::resolve_mapping(virt);
+        if previous != root {
+            unsafe { super::memory::paging::address_space::switch_root(previous) };
+        }
+        resolved
+    }
+
     fn local_flush_tlb_all() {
         super::memory::paging::tlb::local_flush_tlb_all();
     }

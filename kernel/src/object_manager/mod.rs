@@ -17,6 +17,7 @@ use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 
 use crate::executable::program::{MessageQueue, ProgramHandle};
+use crate::memory::io_buffer::MappedIoBufferBacking;
 use crate::scheduling::task::TaskHandle;
 use crate::structs::completion_queue::CompletionQueue;
 use crate::structs::io_request::FileObject;
@@ -101,6 +102,7 @@ pub enum ObjectPayload {
     File(Arc<FileObject>),
     Module(ModuleHandle),
     Device(Arc<DeviceObject>),
+    IoBufferBacking(Arc<MappedIoBufferBacking>),
 }
 
 #[derive(Debug)]
@@ -218,6 +220,7 @@ impl Object {
             ObjectPayload::File(body) => body,
             ObjectPayload::Module(body) => body,
             ObjectPayload::Device(body) => body,
+            ObjectPayload::IoBufferBacking(body) => body,
         }
     }
 
@@ -289,6 +292,27 @@ impl ObjectBehavior for SymlinkBody {
 impl_object_behavior!(ObjRef, ObjectTag::Generic);
 impl_object_behavior!(ModuleHandle, ObjectTag::Module);
 impl_object_behavior!(Arc<DeviceObject>, ObjectTag::Device);
+
+impl ObjectBehavior for Arc<MappedIoBufferBacking> {
+    fn class(&self) -> ObjectTag {
+        ObjectTag::IoBufferBacking
+    }
+
+    fn supported_interfaces(&self) -> InterfaceMask {
+        behavior::standard_interfaces(ObjectTag::IoBufferBacking)
+    }
+
+    fn required_interface(&self, operation: ObjectOperation) -> Option<InterfaceMask> {
+        Some(behavior::interface_for_operation(
+            ObjectTag::IoBufferBacking,
+            operation,
+        ))
+    }
+
+    fn destroy(&self) -> crate::structs::io_request::IoRequestFuture {
+        behavior::successful_destroy()
+    }
+}
 
 impl ObjectBehavior for TaskQueueRef {
     fn class(&self) -> ObjectTag {
@@ -788,7 +812,8 @@ impl ObjectManager {
                 | ObjectTag::CompletionQueue
                 | ObjectTag::File
                 | ObjectTag::Module
-                | ObjectTag::Device => {
+                | ObjectTag::Device
+                | ObjectTag::IoBufferBacking => {
                     if idx + 1 == comps.len() {
                         return Ok(next);
                     }
@@ -842,7 +867,8 @@ impl ObjectManager {
                 | ObjectTag::CompletionQueue
                 | ObjectTag::File
                 | ObjectTag::Module
-                | ObjectTag::Device => {
+                | ObjectTag::Device
+                | ObjectTag::IoBufferBacking => {
                     if idx + 1 == comps.len() {
                         return Ok(next);
                     }

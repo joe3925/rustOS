@@ -10,7 +10,9 @@ use crate::object_manager::{InterfaceMask, Object, ObjectPayload};
 use kernel_types::object_manager::ObjectTag;
 use spin::Mutex;
 
-use super::{IO_STATUS_BUFFER_TOO_SMALL, IO_STATUS_CANCELLED, IoRequestOutput, copy_to_user_value};
+use super::{IO_STATUS_BUFFER_TOO_SMALL, IO_STATUS_CANCELLED, IoRequestOutput};
+use crate::memory::io_buffer::OwnedIoBuffer;
+use kernel_types::dma::FromDevice;
 
 struct DeliveryInner {
     completion: Option<IoRequestOutput>,
@@ -117,10 +119,8 @@ impl Drop for MessageSendFuture {
 }
 
 pub(crate) struct MqReceiveFuture {
-    pub owner: ProgramHandle,
     pub queue: QueueHandle,
-    pub buffer: u64,
-    pub length: usize,
+    pub buffer: Option<OwnedIoBuffer<FromDevice>>,
 }
 
 impl Future for MqReceiveFuture {
@@ -140,15 +140,23 @@ impl Future for MqReceiveFuture {
         drop(queue);
 
         let message_size = core::mem::size_of::<Message>();
-        if this.length < message_size {
+        if this
+            .buffer
+            .as_ref()
+            .is_none_or(|buffer| buffer.len() < message_size)
+        {
             return Poll::Ready(IoRequestOutput::error(IO_STATUS_BUFFER_TOO_SMALL));
         }
 
-        Poll::Ready(
-            match copy_to_user_value(&this.owner, this.buffer, &message) {
-                Ok(()) => IoRequestOutput::success(message_size as u64, 0),
-                Err(status) => IoRequestOutput::error(status),
-            },
-        )
+        let bytes = unsafe {
+            core::slice::from_raw_parts(&message as *const Message as *const u8, message_size)
+        };
+        let mut buffer = this.buffer.take().unwrap();
+        let result = buffer.copy_from_slice(bytes);
+        drop(buffer);
+        Poll::Ready(match result {
+            Ok(()) => IoRequestOutput::success(message_size as u64, 0),
+            Err(_) => IoRequestOutput::error(IO_STATUS_BUFFER_TOO_SMALL),
+        })
     }
 }

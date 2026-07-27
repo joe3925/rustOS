@@ -24,4 +24,5 @@ pub enum ObjectTag {
     File,
     Module,
     Device,
+    IoBufferBacking,
 }

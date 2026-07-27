@@ -1,6 +1,7 @@
 use crate::executable::program::{
     Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
 };
+use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::{base_page_size, kernel_space_base};
 use crate::platform;
@@ -16,6 +17,8 @@ use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use kernel_types::arch::{PhysAddr, VirtAddr};
+use kernel_types::dma::IoBufferError;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
 
@@ -300,6 +303,141 @@ fn resolve_file_object(handle: UserHandle, caller: &ProgramHandle) -> Result<Arc
     }
 }
 
+fn resolve_io_buffer_backing(
+    caller: &ProgramHandle,
+    handle: UserHandle,
+) -> Result<Arc<MappedIoBufferBacking>, u64> {
+    let entry = caller.read().resolve_handle_entry(handle).ok_or_else(|| {
+        make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )
+    })?;
+    if !entry
+        .object
+        .behavior()
+        .matches(entry.interface, ObjectOperation::Submit)
+    {
+        return Err(make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        ));
+    }
+    match &entry.object.payload {
+        ObjectPayload::IoBufferBacking(backing) => Ok(backing.clone()),
+        _ => Err(make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )),
+    }
+}
+
+fn map_io_buffer_error(error: IoBufferError) -> u64 {
+    match error {
+        IoBufferError::AllocationFailed
+        | IoBufferError::LeaseCapacityExceeded { .. }
+        | IoBufferError::DmaRecordCapacityExceeded { .. }
+        | IoBufferError::PageCapacityExceeded { .. }
+        | IoBufferError::ExtentCapacityExceeded { .. }
+        | IoBufferError::SegmentCapacityExceeded { .. } => {
+            make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0)
+        }
+        IoBufferError::LeaseConflict { .. } | IoBufferError::ActiveLeases => {
+            make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0)
+        }
+        IoBufferError::TranslationFailed { .. } | IoBufferError::PhysicalDescriptionMissing => {
+            make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0)
+        }
+        IoBufferError::InvalidBackingKind => {
+            make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0)
+        }
+        _ => make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    }
+}
+
+pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u32) -> u64 {
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(error) => return error,
+    };
+    let access = match UserBufferAccess::from_raw(access) {
+        Some(access) => access,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, access),
+    };
+    if length == 0 || !user_ptr_ok(user_address as *const u8, length) {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+
+    let page_size = base_page_size();
+    let first_page = user_address - user_address % page_size;
+    let end = match user_address.checked_add(length as u64) {
+        Some(end) => end,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    };
+    let mapped_end = match crate::memory::paging::align_up_to_base_page(end) {
+        Some(end) => end,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    };
+    let page_count = ((mapped_end - first_page) / page_size) as usize;
+    let mut physical_pages = Vec::new();
+    if physical_pages.try_reserve_exact(page_count).is_err() {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    }
+
+    {
+        let program = caller.read();
+        let _page_table_guard = program.page_table_lock.lock();
+        for index in 0..page_count {
+            let virt = VirtAddr::new(first_page + index as u64 * page_size);
+            let Some(mapping) =
+                crate::platform::resolve_mapping_in_root(program.address_space_root, virt)
+            else {
+                return make_err(ErrClass::Memory, MemErr::MapFailed as u16, index as u32);
+            };
+            if !mapping.user_accessible
+                || (access == UserBufferAccess::ReadWrite && !mapping.writable)
+            {
+                return make_err(
+                    ErrClass::Common,
+                    CommonErr::AccessDenied as u16,
+                    index as u32,
+                );
+            }
+            physical_pages.push(PhysAddr::new(mapping.phys_addr.as_u64() & !(page_size - 1)));
+        }
+    }
+
+    let backing = match MappedIoBufferBacking::new(
+        physical_pages,
+        (user_address - first_page) as usize,
+        length,
+        access,
+    ) {
+        Ok(backing) => Arc::new(backing),
+        Err(error) => return map_io_buffer_error(error),
+    };
+    let directory = alloc::format!("\\Process\\{}\\Resources\\IoBufferBackings", caller_pid);
+    if OBJECT_MANAGER.mkdir_p(directory.clone()).is_err() {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    }
+    let name = guid_to_string(&generate_guid());
+    let object = Object::with_name(
+        ObjectTag::IoBufferBacking,
+        name.clone(),
+        ObjectPayload::IoBufferBacking(backing),
+    );
+    if OBJECT_MANAGER
+        .link(alloc::format!("{}\\{}", directory, name), &object)
+        .is_err()
+    {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    }
+    caller.read().create_user_handle_for_object(object)
+}
+
 fn resolve_message_queue(
     handle: UserHandle,
     caller_pid: u64,
@@ -413,22 +551,29 @@ fn build_kernel_io_op(
             })
         }
         IoOpcode::FileRead => {
-            let length = op.length as usize;
-            validate_user_buffer(op.buffer, length)?;
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_from_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
             Ok(KernelIoOp::FileRead {
-                owner: caller.clone(),
                 file: resolve_file_object(op.target_handle, caller)?,
-                buffer: op.buffer,
-                length,
+                buffer,
                 offset: op.offset,
                 user_token: op.user_token,
             })
         }
         IoOpcode::FileWrite => {
-            let data = copy_user_bytes(op.buffer, op.length as usize)?;
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_to_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
             Ok(KernelIoOp::FileWrite {
                 file: resolve_file_object(op.target_handle, caller)?,
-                data,
+                buffer,
                 offset: op.offset,
                 user_token: op.user_token,
             })
@@ -476,13 +621,15 @@ fn build_kernel_io_op(
             })
         }
         IoOpcode::MqReceive => {
-            let length = op.length as usize;
-            validate_user_buffer(op.buffer, length)?;
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_from_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
             Ok(KernelIoOp::MqReceive {
-                owner: caller.clone(),
                 queue: resolve_message_queue(op.target_handle, caller_pid, caller)?,
-                buffer: op.buffer,
-                length,
+                buffer,
                 user_token: op.user_token,
             })
         }
@@ -514,11 +661,19 @@ fn build_kernel_io_op(
             })
         }
         IoOpcode::MessageSendAwait => {
-            if op.buffer == 0
-                || !user_ptr_ok(op.buffer as *const Message, core::mem::size_of::<Message>())
-            {
-                return Err(make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0));
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            if length < core::mem::size_of::<Message>() {
+                return Err(make_err(
+                    ErrClass::Common,
+                    CommonErr::BufferTooSmall as u16,
+                    length as u32,
+                ));
             }
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_to_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
             let entry = caller
                 .read()
                 .resolve_handle_entry(op.target_handle)
@@ -550,13 +705,12 @@ fn build_kernel_io_op(
                     ));
                 }
             };
-            let mut message = unsafe { core::ptr::read_unaligned(op.buffer as *const Message) };
             let sender_object = ensure_process_object(caller_pid, caller);
-            message.sender = Some(target.read().create_user_handle_for_object(sender_object));
-            message.delivery = None;
+            let sender = target.read().create_user_handle_for_object(sender_object);
             Ok(KernelIoOp::MessageSendAwait {
                 target,
-                message,
+                buffer,
+                sender,
                 user_token: op.user_token,
             })
         }
@@ -1283,6 +1437,7 @@ fn object_tag_from_raw(raw: u32) -> Option<ObjectTag> {
         7 => Some(ObjectTag::File),
         8 => Some(ObjectTag::Module),
         9 => Some(ObjectTag::Device),
+        10 => Some(ObjectTag::IoBufferBacking),
         _ => None,
     }
 }

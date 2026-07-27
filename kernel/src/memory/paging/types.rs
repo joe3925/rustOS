@@ -35,6 +35,8 @@ pub struct UserVmLayout {
 pub struct ResolvedMapping {
     pub mapping_size: u64,
     pub phys_addr: PhysAddr,
+    pub user_accessible: bool,
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -142,6 +142,7 @@ pub trait PagingPlatform: AddressSpacePlatform {
     ) -> Result<Option<PhysAddr>, PageMapError>;
 
     fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping>;
+    fn resolve_mapping_in_root(root: Self::Root, virt: VirtAddr) -> Option<ResolvedMapping>;
 
     fn local_flush_tlb_all();
     fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64);
@@ -222,6 +223,15 @@ pub const MAX_CPUS: usize = <ActivePlatform as CpuPlatform>::MAX_CPUS;
 
 pub fn user_vm_layout() -> UserVmLayout {
     <ActivePlatform as PagingPlatform>::user_virtual_layout()
+}
+
+pub fn resolve_mapping_in_root(
+    root: <ActivePlatform as AddressSpacePlatform>::Root,
+    virt: VirtAddr,
+) -> Option<ResolvedMapping> {
+    <ActivePlatform as InterruptPlatform>::with_interrupts_disabled(|| {
+        <ActivePlatform as PagingPlatform>::resolve_mapping_in_root(root, virt)
+    })
 }
 pub fn current_cpu_id() -> usize {
     <ActivePlatform as CpuPlatform>::current_cpu_id()

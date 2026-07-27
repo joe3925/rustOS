@@ -6,12 +6,15 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::dma::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
 use spin::Mutex;
 
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
+use crate::memory::io_buffer::OwnedIoBuffer;
 use crate::memory::paging::{base_page_size, kernel_space_base};
 use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload};
 use crate::platform;
@@ -156,7 +159,7 @@ impl IoRequestOutput {
 pub type IoRequestFuture = Pin<Box<dyn Future<Output = IoRequestOutput> + Send + 'static>>;
 
 pub enum KernelIoFuture {
-    Cold(IoRequestFuture),
+    Cold(FfiFuture<IoRequestOutput>),
     MessageReceive(MqReceiveFuture),
     MessageSend(MessageSendFuture),
 }
@@ -166,7 +169,7 @@ impl Future for KernelIoFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.as_mut().get_mut() {
-            Self::Cold(future) => future.as_mut().poll(cx),
+            Self::Cold(future) => Pin::new(future).poll(cx),
             Self::MessageReceive(future) => Pin::new(future).poll(cx),
             Self::MessageSend(future) => Pin::new(future).poll(cx),
         }
@@ -283,16 +286,14 @@ pub enum KernelIoOp {
         user_token: u64,
     },
     FileRead {
-        owner: ProgramHandle,
         file: Arc<FileObject>,
-        buffer: u64,
-        length: usize,
+        buffer: OwnedIoBuffer<FromDevice>,
         offset: u64,
         user_token: u64,
     },
     FileWrite {
         file: Arc<FileObject>,
-        data: Vec<u8>,
+        buffer: OwnedIoBuffer<ToDevice>,
         offset: u64,
         user_token: u64,
     },
@@ -315,10 +316,8 @@ pub enum KernelIoOp {
         user_token: u64,
     },
     MqReceive {
-        owner: ProgramHandle,
         queue: QueueHandle,
-        buffer: u64,
-        length: usize,
+        buffer: OwnedIoBuffer<FromDevice>,
         user_token: u64,
     },
     ObjectDestroy {
@@ -327,7 +326,8 @@ pub enum KernelIoOp {
     },
     MessageSendAwait {
         target: ProgramHandle,
-        message: Message,
+        buffer: OwnedIoBuffer<ToDevice>,
+        sender: UserHandle,
         user_token: u64,
     },
 }
@@ -372,59 +372,82 @@ impl KernelIoOp {
                 path,
                 flags,
                 ..
-            } => KernelIoFuture::Cold(Box::pin(async move {
-                run_file_open(owner_pid, owner, path, flags).await
-            })),
+            } => KernelIoFuture::Cold(
+                async move { run_file_open(owner_pid, owner, path, flags).await }.into_ffi(),
+            ),
             Self::FileRead {
-                owner,
                 file,
                 buffer,
-                length,
                 offset,
                 ..
-            } => KernelIoFuture::Cold(Box::pin(async move {
-                run_file_read(owner, file, buffer, length, offset).await
-            })),
+            } => KernelIoFuture::Cold(
+                async move { run_file_read(file, buffer, offset).await }.into_ffi(),
+            ),
             Self::FileWrite {
-                file, data, offset, ..
-            } => KernelIoFuture::Cold(Box::pin(
-                async move { run_file_write(file, data, offset).await },
-            )),
+                file,
+                buffer,
+                offset,
+                ..
+            } => KernelIoFuture::Cold(
+                async move { run_file_write(file, buffer, offset).await }.into_ffi(),
+            ),
             Self::FileDeleteHandle { file, .. } => {
-                KernelIoFuture::Cold(Box::pin(async move { run_file_delete_handle(file).await }))
+                KernelIoFuture::Cold(async move { run_file_delete_handle(file).await }.into_ffi())
             }
             Self::FileDeletePath { path, .. } => {
-                KernelIoFuture::Cold(Box::pin(async move { run_file_delete_path(path).await }))
+                KernelIoFuture::Cold(async move { run_file_delete_path(path).await }.into_ffi())
             }
             Self::ListDir { owner, path, .. } => {
-                KernelIoFuture::Cold(Box::pin(async move { run_list_dir(owner, path).await }))
+                KernelIoFuture::Cold(async move { run_list_dir(owner, path).await }.into_ffi())
             }
-            Self::ChangeDirectory { owner, path, .. } => KernelIoFuture::Cold(Box::pin(
-                async move { run_change_directory(owner, path).await },
-            )),
-            Self::MqReceive {
-                owner,
-                queue,
-                buffer,
-                length,
-                ..
-            } => KernelIoFuture::MessageReceive(MqReceiveFuture {
-                owner,
-                queue,
-                buffer,
-                length,
-            }),
-            Self::ObjectDestroy { object, .. } => KernelIoFuture::Cold(Box::pin(async move {
-                let output = object.behavior().destroy().await;
-                if output.status == IO_STATUS_SUCCESS {
-                    let _ = OBJECT_MANAGER.unlink_object(&object);
-                    object.mark_dead();
+            Self::ChangeDirectory { owner, path, .. } => KernelIoFuture::Cold(
+                async move { run_change_directory(owner, path).await }.into_ffi(),
+            ),
+            Self::MqReceive { queue, buffer, .. } => {
+                KernelIoFuture::MessageReceive(MqReceiveFuture {
+                    queue,
+                    buffer: Some(buffer),
+                })
+            }
+            Self::ObjectDestroy { object, .. } => KernelIoFuture::Cold(
+                async move {
+                    let output = object.behavior().destroy().await;
+                    if output.status == IO_STATUS_SUCCESS {
+                        let _ = OBJECT_MANAGER.unlink_object(&object);
+                        object.mark_dead();
+                    }
+                    output
                 }
-                output
-            })),
+                .into_ffi(),
+            ),
             Self::MessageSendAwait {
-                target, message, ..
-            } => KernelIoFuture::MessageSend(MessageSendFuture::new(target, message)),
+                target,
+                buffer,
+                sender,
+                ..
+            } => {
+                let buffer = buffer;
+                let mut message = core::mem::MaybeUninit::<Message>::uninit();
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        message.as_mut_ptr() as *mut u8,
+                        core::mem::size_of::<Message>(),
+                    )
+                };
+                let result = buffer.copy_to_slice(bytes);
+                drop(buffer);
+                match result {
+                    Ok(()) => {
+                        let mut message = unsafe { message.assume_init() };
+                        message.sender = Some(sender);
+                        message.delivery = None;
+                        KernelIoFuture::MessageSend(MessageSendFuture::new(target, message))
+                    }
+                    Err(_) => KernelIoFuture::Cold(
+                        async { IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER) }.into_ffi(),
+                    ),
+                }
+            }
         }
     }
 }
@@ -840,42 +863,44 @@ async fn run_file_open(
 }
 
 async fn run_file_read(
-    owner: ProgramHandle,
     file: Arc<FileObject>,
-    buffer: u64,
-    length: usize,
+    buffer: OwnedIoBuffer<FromDevice>,
     offset: u64,
 ) -> IoRequestOutput {
-    if length == 0 {
+    if buffer.len() == 0 {
         return IoRequestOutput::success(0, 0);
     }
 
     let lease = file.take().await;
-    let mut data = alloc::vec![0u8; length];
-    let n = match lease.file().read_at(offset, &mut data).await {
+    let mut buffer = buffer;
+    let io_buffer = buffer.take();
+    let n = match lease.file().read_iobuffer_at(offset, io_buffer).await {
         Ok(n) => n,
         Err(error) => return IoRequestOutput::error(kernel_error_status(error)),
     };
-    data.truncate(n);
+    drop(buffer);
     drop(lease);
-
-    if let Err(status) = copy_to_user_bytes(&owner, buffer, &data) {
-        return IoRequestOutput::error(status);
-    }
-
-    IoRequestOutput::success(data.len() as u64, 0)
+    IoRequestOutput::success(n as u64, 0)
 }
 
-async fn run_file_write(file: Arc<FileObject>, data: Vec<u8>, offset: u64) -> IoRequestOutput {
-    if data.is_empty() {
+async fn run_file_write(
+    file: Arc<FileObject>,
+    buffer: OwnedIoBuffer<ToDevice>,
+    offset: u64,
+) -> IoRequestOutput {
+    if buffer.len() == 0 {
         return IoRequestOutput::success(0, 0);
     }
 
     let mut lease = file.take().await;
-    match lease.file_mut().write_at(offset, &data).await {
+    let mut buffer = buffer;
+    let io_buffer = buffer.take();
+    let output = match lease.file_mut().write_iobuffer_at(offset, io_buffer).await {
         Ok(written) => IoRequestOutput::success(written as u64, 0),
         Err(error) => IoRequestOutput::error(kernel_error_status(error)),
-    }
+    };
+    drop(buffer);
+    output
 }
 
 async fn run_file_delete_handle(file: Arc<FileObject>) -> IoRequestOutput {

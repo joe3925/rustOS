@@ -99,20 +99,23 @@ pub unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
 
 pub fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping> {
     let recursive_index = boot_info().arch_info.recursive_index.into_option()?;
-    let (mapping_size, phys_addr) = translate_addr(recursive_index, virt)?;
+    let (mapping_size, phys_addr, user_accessible, writable) =
+        translate_addr(recursive_index, virt)?;
     Some(ResolvedMapping {
         mapping_size,
         phys_addr,
+        user_accessible,
+        writable,
     })
 }
 
 pub fn resolve_virtual_range_frame(addr: X86VirtAddr) -> Option<(u64, X86PhysAddr)> {
     let recursive_index = boot_info().arch_info.recursive_index.into_option()?;
-    let (mapping_size, phys_addr) = translate_addr(recursive_index, addr.into())?;
+    let (mapping_size, phys_addr, _, _) = translate_addr(recursive_index, addr.into())?;
     Some((mapping_size, phys_addr.into()))
 }
 
-fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr, bool, bool)> {
     let rec = u64::from(recursive_index);
     let v_u64 = addr.as_u64();
 
@@ -126,16 +129,22 @@ fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr
     if !p4_entry.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }
+    let mut user = p4_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
+    let mut writable = p4_entry.flags().contains(PageTableFlags::WRITABLE);
 
     let p3_table = unsafe { &*(recursive_table_addr(rec, rec, rec, p4_idx) as *const PageTable) };
     let p3_entry = &p3_table[p3_idx as usize];
     if !p3_entry.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }
+    user &= p3_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
+    writable &= p3_entry.flags().contains(PageTableFlags::WRITABLE);
     if p3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
         return Some((
             Size1GiB::SIZE,
             PhysAddr::new(p3_entry.addr().as_u64() + (v_u64 & (Size1GiB::SIZE - 1))),
+            user,
+            writable,
         ));
     }
 
@@ -145,10 +154,14 @@ fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr
     if !p2_entry.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }
+    user &= p2_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
+    writable &= p2_entry.flags().contains(PageTableFlags::WRITABLE);
     if p2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
         return Some((
             Size2MiB::SIZE,
             PhysAddr::new(p2_entry.addr().as_u64() + (v_u64 & (Size2MiB::SIZE - 1))),
+            user,
+            writable,
         ));
     }
 
@@ -158,10 +171,14 @@ fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr
     if !p1_entry.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }
+    user &= p1_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE);
+    writable &= p1_entry.flags().contains(PageTableFlags::WRITABLE);
 
     Some((
         Size4KiB::SIZE,
         PhysAddr::new(p1_entry.addr().as_u64() + (v_u64 & (Size4KiB::SIZE - 1))),
+        user,
+        writable,
     ))
 }
 

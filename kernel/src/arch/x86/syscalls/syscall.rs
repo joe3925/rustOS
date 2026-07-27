@@ -165,6 +165,13 @@ make_wrapper!(
 make_wrapper!(wrap_object_close, sys_object_close, UserHandle);
 make_wrapper!(wrap_object_duplicate, sys_object_duplicate, UserHandle, u64);
 make_wrapper!(
+    wrap_io_buffer_register,
+    sys_io_buffer_register,
+    u64,
+    usize,
+    u32
+);
+make_wrapper!(
     wrap_symlink_create,
     sys_symlink_create,
     u64,
@@ -204,6 +211,7 @@ const SYSCALL_TABLE: &[Handler] = &[
     wrap_symlink_withdraw,        // 19
     wrap_message_complete,        // 20
     wrap_object_duplicate,        // 21
+    wrap_io_buffer_register,      // 22
 ];
 
 #[unsafe(no_mangle)]
