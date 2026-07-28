@@ -30,9 +30,10 @@
 
 # FBM-GEN
 
-# IOB-GEN 
-**Relevant commits**
-- 79bfcbe5cc1fafb14d447d8aa89ad9f054b14054: reduce size of futures.
+# IOB-2 
+**Stuff tried:**
+  - Linear scan, cost was to high.
+  - Sorted binary search cost was to high. 
 
-**The Issue:** IoBuffers are passed by value down the file io stack. Because of the way rust futures work this large struct (about 160 bytes) was componding for each inlined future causing a huge size of the futures. 
-To fix this I changed IoBuffers to store there actually lease info on the backing and to contain a back pointer to there lease, reducing the size to like 8 bytes. The side effect of this is a big performance hit from the extra pointer redirect on all the iobuffer operations; it kills the cache and its another operation in the hot path so something better needs to be found.
+**Potential solution:**
+  - Divide the backing into a tree of ranges, similar to a page table. An IO buffer reserves one large range when possible, or a few smaller ranges when needed. Each reserved range points to the IO buffer that owns it, making overlap checks and releasing the range potentially cheap just a few array indexes and some comparisions.
