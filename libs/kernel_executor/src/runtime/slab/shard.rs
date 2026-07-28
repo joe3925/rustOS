@@ -1,29 +1,21 @@
 use alloc::{boxed::Box, vec::Vec};
+use core::sync::atomic::{AtomicPtr, Ordering as CoreOrdering};
 
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
 
-use super::slot::{JoinableSlot, SlabSlot, TaskSlot};
+use super::slot::TaskSlot;
 use super::storage::CachePadded;
-use super::{
-    MAX_JOINABLE_SLOTS_PER_SHARD, MAX_SLOTS_PER_SHARD, MIN_JOINABLE_SLOTS_PER_SHARD,
-    MIN_SLOTS_PER_SHARD,
-};
+use super::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD};
 
-pub(super) struct SlotShard<S, const MIN_SLOTS: usize, const MAX_SLOTS: usize> {
+pub(super) struct TaskChunk {
     pub(super) free_bitmap: Box<[AtomicU64]>,
-    pub(super) alloc_hint: CachePadded<AtomicUsize>,
-    pub(super) slots: Box<[S]>,
-    pub(super) active_slots: usize,
-    pub(super) allocated_count: CachePadded<AtomicUsize>,
+    pub(super) slots: Box<[TaskSlot]>,
 }
 
-impl<S, const MIN_SLOTS: usize, const MAX_SLOTS: usize> SlotShard<S, MIN_SLOTS, MAX_SLOTS>
-where
-    S: SlabSlot,
-{
+impl TaskChunk {
     pub(super) fn new(num_slots: usize) -> Self {
-        let num_slots = num_slots.min(MAX_SLOTS).max(MIN_SLOTS);
+        let num_slots = num_slots.min(MAX_SLOTS_PER_SHARD).max(MIN_SLOTS_PER_SHARD);
         let num_words = num_slots.div_ceil(64);
 
         let mut bitmap = Vec::with_capacity(num_words);
@@ -54,25 +46,113 @@ where
 
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
-            slots.push(S::new());
+            slots.push(TaskSlot::new());
         }
 
         Self {
             free_bitmap: bitmap.into_boxed_slice(),
-            alloc_hint: CachePadded::new(AtomicUsize::new(0)),
             slots: slots.into_boxed_slice(),
-            active_slots: num_slots,
+        }
+    }
+}
+
+pub(super) struct SlabShard {
+    pub(super) slots_per_chunk: usize,
+    pub(super) max_chunks: usize,
+    pub(super) chunks: Box<[AtomicPtr<TaskChunk>]>,
+    pub(super) published_chunks: AtomicUsize,
+    pub(super) alloc_hint: CachePadded<AtomicUsize>,
+    pub(super) allocated_count: CachePadded<AtomicUsize>,
+}
+
+impl SlabShard {
+    pub(super) fn new(slots_per_chunk: usize) -> Self {
+        let slots_per_chunk = slots_per_chunk
+            .min(MAX_SLOTS_PER_SHARD)
+            .max(MIN_SLOTS_PER_SHARD);
+        let max_addressable_slots = 1 << 16;
+        let max_chunks = max_addressable_slots / slots_per_chunk;
+
+        let mut chunks = Vec::with_capacity(max_chunks);
+        for _ in 0..max_chunks {
+            chunks.push(AtomicPtr::new(core::ptr::null_mut()));
+        }
+
+        let shard = Self {
+            slots_per_chunk,
+            max_chunks,
+            chunks: chunks.into_boxed_slice(),
+            published_chunks: AtomicUsize::new(0),
+            alloc_hint: CachePadded::new(AtomicUsize::new(0)),
             allocated_count: CachePadded::new(AtomicUsize::new(0)),
+        };
+
+        shard.grow_chunk_internal();
+        shard
+    }
+
+    fn grow_chunk_internal(&self) -> bool {
+        let published = self.published_chunks.load(Ordering::Acquire);
+        if published >= self.max_chunks {
+            return false; // Reached capacity
+        }
+
+        let new_chunk = Box::into_raw(Box::new(TaskChunk::new(self.slots_per_chunk)));
+
+        match self.chunks[published].compare_exchange(
+            core::ptr::null_mut(),
+            new_chunk,
+            CoreOrdering::AcqRel,
+            CoreOrdering::Acquire,
+        ) {
+            Ok(_) => {
+                let _ = self.published_chunks.compare_exchange(
+                    published,
+                    published + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                true
+            }
+            Err(_) => {
+                unsafe { drop(Box::from_raw(new_chunk)) };
+                let current_val = self.chunks[published].load(CoreOrdering::Acquire);
+                if !current_val.is_null() {
+                    let _ = self.published_chunks.compare_exchange(
+                        published,
+                        published + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                true // Did not grow ourselves but someone else did
+            }
         }
     }
 
     pub(super) fn try_allocate(&self) -> Option<usize> {
         let hint = self.alloc_hint.load(Ordering::Relaxed);
-        let num_words = self.free_bitmap.len();
+        let published = self.published_chunks.load(Ordering::Acquire);
+        let total_slots = published * self.slots_per_chunk;
+        let num_words_per_chunk = self.slots_per_chunk.div_ceil(64);
+        let total_words = published * num_words_per_chunk;
 
-        for offset in 0..num_words {
-            let word_idx = (hint / 64 + offset) % num_words;
-            let word = &self.free_bitmap[word_idx];
+        if total_words == 0 {
+            return None;
+        }
+
+        for offset in 0..total_words {
+            let word_idx_global = (hint / 64 + offset) % total_words;
+            let chunk_idx = word_idx_global / num_words_per_chunk;
+            let word_idx_local = word_idx_global % num_words_per_chunk;
+
+            let chunk_ptr = self.chunks[chunk_idx].load(CoreOrdering::Acquire);
+            if chunk_ptr.is_null() {
+                continue;
+            }
+            let chunk = unsafe { &*chunk_ptr };
+
+            let word = &chunk.free_bitmap[word_idx_local];
 
             loop {
                 let bits = word.load(Ordering::Relaxed);
@@ -81,9 +161,9 @@ where
                 }
 
                 let bit_idx = bits.trailing_zeros() as usize;
-                let slot_idx = word_idx * 64 + bit_idx;
+                let slot_idx_local = word_idx_local * 64 + bit_idx;
 
-                if slot_idx >= self.active_slots {
+                if slot_idx_local >= self.slots_per_chunk {
                     break;
                 }
 
@@ -96,9 +176,11 @@ where
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        self.alloc_hint.store(slot_idx + 1, Ordering::Relaxed);
+                        let global_slot_idx = chunk_idx * self.slots_per_chunk + slot_idx_local;
+                        self.alloc_hint
+                            .store((global_slot_idx + 1) % total_slots, Ordering::Relaxed);
                         self.allocated_count.fetch_add(1, Ordering::Relaxed);
-                        return Some(slot_idx);
+                        return Some(global_slot_idx);
                     }
                     Err(_) => {
                         spin_loop();
@@ -108,32 +190,51 @@ where
             }
         }
 
+        if self.grow_chunk_internal() {
+            return self.try_allocate();
+        }
+
         None
     }
 
     pub(super) fn deallocate(&self, slot_idx: usize) {
-        if slot_idx >= self.active_slots {
+        let chunk_idx = slot_idx / self.slots_per_chunk;
+        let slot_idx_local = slot_idx % self.slots_per_chunk;
+
+        let chunk_ptr = self.chunks[chunk_idx].load(CoreOrdering::Acquire);
+        if chunk_ptr.is_null() {
             return;
         }
+        let chunk = unsafe { &*chunk_ptr };
 
-        let word_idx = slot_idx / 64;
-        let bit_idx = slot_idx % 64;
+        let word_idx = slot_idx_local / 64;
+        let bit_idx = slot_idx_local % 64;
         let mask = 1u64 << bit_idx;
 
-        self.free_bitmap[word_idx].fetch_or(mask, Ordering::Relaxed);
+        chunk.free_bitmap[word_idx].fetch_or(mask, Ordering::Relaxed);
         self.alloc_hint.store(slot_idx, Ordering::Relaxed);
         self.allocated_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     #[inline]
-    pub(super) fn get_slot(&self, idx: usize) -> Option<&S> {
-        if idx >= self.active_slots {
+    pub(super) fn get_slot(&self, idx: usize) -> Option<&TaskSlot> {
+        let chunk_idx = idx / self.slots_per_chunk;
+        let slot_idx_local = idx % self.slots_per_chunk;
+
+        let published = self.published_chunks.load(Ordering::Acquire);
+        if chunk_idx >= published {
             return None;
         }
-        Some(&self.slots[idx])
+
+        let chunk_ptr = self.chunks[chunk_idx].load(CoreOrdering::Acquire);
+        if chunk_ptr.is_null() {
+            return None;
+        }
+
+        let chunk = unsafe { &*chunk_ptr };
+        if slot_idx_local >= self.slots_per_chunk {
+            return None;
+        }
+        Some(&chunk.slots[slot_idx_local])
     }
 }
-
-pub(super) type SlabShard = SlotShard<TaskSlot, MIN_SLOTS_PER_SHARD, MAX_SLOTS_PER_SHARD>;
-pub(super) type JoinableShard =
-    SlotShard<JoinableSlot, MIN_JOINABLE_SLOTS_PER_SHARD, MAX_JOINABLE_SLOTS_PER_SHARD>;

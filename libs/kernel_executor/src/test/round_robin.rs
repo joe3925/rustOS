@@ -2,7 +2,7 @@ use crate::{
     global_async::{
         DestroyExecutorDomainResult, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
         ExecutorDomainState, ExecutorDomainTable, ExecutorSubmitErrorKind,
-        KERNEL_NORMAL_EXECUTOR_DOMAIN, SimpleRoundRobinScheduler, WorkItem,
+        SimpleRoundRobinScheduler, WorkItem, KERNEL_NORMAL_EXECUTOR_DOMAIN,
     },
     round_robin::{ScheduledDomain, SchedulerPolicy, WeightedDeficitRoundRobinScheduler},
 };

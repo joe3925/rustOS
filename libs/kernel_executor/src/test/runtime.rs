@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::future::Future;
-use core::mem::{ManuallyDrop, align_of, size_of};
+use core::mem::{align_of, size_of, ManuallyDrop};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use crate::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId, ExecutorSubmitErrorKind,
-    GlobalAsyncExecutor, KERNEL_NORMAL_EXECUTOR_DOMAIN, SimpleRoundRobinScheduler,
-    WeightedDeficitRoundRobinScheduler,
+    GlobalAsyncExecutor, SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler,
+    KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 use crate::runtime::ffi_spawn::kernel_spawn_ffi_internal;
 use crate::runtime::runtime::{
-    JoinAll, block_on, spawn, spawn_detached, spawn_detached_in_executor_domain,
-    spawn_in_executor_domain,
+    block_on, spawn, spawn_detached, spawn_detached_in_executor_domain, spawn_in_executor_domain,
+    JoinAll,
 };
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, INLINE_FUTURE_SIZE, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::FutureExt;

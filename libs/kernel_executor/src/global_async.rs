@@ -1,6 +1,6 @@
-use crate::platform::{Job, platform};
-use crate::sync::Arc;
+use crate::platform::{platform, Job};
 use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::Arc;
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Once;
 
@@ -10,10 +10,10 @@ use crate::round_robin::SchedulerPolicy;
 use alloc::boxed::Box;
 
 pub use crate::domain::{
-    DRIVER_EXECUTOR_DOMAIN, DestroyExecutorDomainError, DestroyExecutorDomainResult,
-    ExecutorAdmissionPolicy, ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig,
-    ExecutorDomainId, ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable,
-    ExecutorSubmitError, ExecutorSubmitErrorKind, GlobalExecutorStats,
+    DestroyExecutorDomainError, DestroyExecutorDomainResult, ExecutorAdmissionPolicy,
+    ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
+    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable, ExecutorSubmitError,
+    ExecutorSubmitErrorKind, GlobalExecutorStats, DRIVER_EXECUTOR_DOMAIN,
     KERNEL_BACKGROUND_EXECUTOR_DOMAIN, KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 

@@ -4,6 +4,7 @@ use core::hint::{cold_path, unlikely};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, IoKind, Read, ReadIoBuffer, Seek, SeekFrom, Write, WriteIoBuffer};
+use kernel_api::error::{DriverErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::{
     kernel_types::{
         async_ffi::{FfiFuture, FutureExt},
@@ -17,7 +18,6 @@ use kernel_api::{
     println,
     request::{Read as ReadRequest, Write as WriteRequest},
 };
-use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 
 use crate::volume::{METADATA_OWNER_ID, VolCtrlDevExt};
 
@@ -112,9 +112,7 @@ impl BlockDev {
                 cold_path();
                 self.restore_io_scratch(IoBufferBackingScratch::new());
                 return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
-                    alloc::format!(
-                        "creating FAT32 read backing at offset {offset} for {len} bytes"
-                    )
+                    alloc::format!("creating FAT32 read backing at offset {offset} for {len} bytes")
                 });
             }
         };
@@ -301,7 +299,13 @@ impl Write for BlockDev {
         buf: &'a [u8],
         kind: IoKind,
     ) -> FfiFuture<Result<usize, Self::Error>> {
-        async move { self.write_bytes(buf, kind).await.map_err(FatIoError) }.into_ffi()
+        async move {
+            self.write_bytes(buf, kind)
+                .into_ffi()
+                .await
+                .map_err(FatIoError)
+        }
+        .into_ffi()
     }
 
     fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
