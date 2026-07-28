@@ -15,6 +15,7 @@ use crate::memory::paging::{
     KernelPageTableFrameAllocator, LocalTlbFlush, MappingSize, UnmapFrameDisposition,
     allocate_auto_kernel_range, base_page_size, deallocate_kernel_range,
 };
+use crate::memory::user_pins::UserRangePin;
 use crate::platform::{ActivePlatform, PagingPlatform};
 
 #[repr(u32)]
@@ -112,6 +113,7 @@ pub struct MappedIoBufferBacking {
     backing: ManuallyDrop<IoBufferBacking<'static>>,
     mapping: KernelIoMapping,
     access: UserBufferAccess,
+    _user_pin: UserRangePin,
 }
 
 impl core::fmt::Debug for MappedIoBufferBacking {
@@ -131,6 +133,7 @@ impl MappedIoBufferBacking {
         first_page_offset: usize,
         length: usize,
         access: UserBufferAccess,
+        user_pin: UserRangePin,
     ) -> Result<Self, IoBufferError> {
         let mapping = KernelIoMapping::map_pages(&physical_pages)
             .map_err(|_| IoBufferError::AllocationFailed)?;
@@ -170,6 +173,7 @@ impl MappedIoBufferBacking {
             }),
             mapping,
             access,
+            _user_pin: user_pin,
         })
     }
 

@@ -387,9 +387,9 @@ pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u
         return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
     }
 
-    {
+    let user_pin = {
         let program = caller.read();
-        let _page_table_guard = program.page_table_lock.lock();
+        let mut user_memory = program.user_memory.lock();
         for index in 0..page_count {
             let virt = VirtAddr::new(first_page + index as u64 * page_size);
             let Some(mapping) =
@@ -408,17 +408,30 @@ pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u
             }
             physical_pages.push(PhysAddr::new(mapping.phys_addr.as_u64() & !(page_size - 1)));
         }
-    }
+        match user_memory.pin(first_page, mapped_end) {
+            Ok(pin) => pin,
+            Err(()) => return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0),
+        }
+    };
 
     let backing = match MappedIoBufferBacking::new(
         physical_pages,
         (user_address - first_page) as usize,
         length,
         access,
+        user_pin,
     ) {
         Ok(backing) => Arc::new(backing),
         Err(error) => return map_io_buffer_error(error),
     };
+    publish_io_buffer_backing(caller_pid, &caller, backing)
+}
+
+fn publish_io_buffer_backing(
+    caller_pid: u64,
+    caller: &ProgramHandle,
+    backing: Arc<MappedIoBufferBacking>,
+) -> u64 {
     let directory = alloc::format!("\\Process\\{}\\Resources\\IoBufferBackings", caller_pid);
     if OBJECT_MANAGER.mkdir_p(directory.clone()).is_err() {
         return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);

@@ -31,9 +31,9 @@
 # FBM-GEN
 
 # IOB-2 
-**Stuff tried:**
+## Stuff tried
   - Linear scan, cost was to high.
   - Sorted binary search cost was to high. 
 
-**Potential solution:**
+## Potential solutions
   - Divide the backing into a tree of ranges, similar to a page table. An IO buffer reserves one large range when possible, or a few smaller ranges when needed. Each reserved range points to the IO buffer that owns it, making overlap checks and releasing the range potentially cheap just a few array indexes and some comparisions.

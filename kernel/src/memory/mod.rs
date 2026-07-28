@@ -4,3 +4,4 @@ pub mod heap;
 //pub mod iommu;
 pub mod io_buffer;
 pub mod paging;
+pub mod user_pins;

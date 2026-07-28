@@ -19,8 +19,8 @@ If there is a * it must be completed before user space is started
 5. [ ] Expand the pci(e) protocol. 
 
 ## User I/O (UIO)
-1. [ ] * Currently the request_io code expects the user to provide a raw unpinned buffer. Change this to expect some type of registered buffer and so that read no longer allocates.
-2. [ ] * Expose a way for users to register there buffers. 
+1. [x] * Currently the request_io code expects the user to provide a raw unpinned buffer. Change this to expect some type of registered buffer and so that read no longer allocates.
+2. [x] * Expose a way for users to register there buffers. 
 3. [ ] * properly handle invalid user ptrs.
 
 ## Proc Management (PRM)
@@ -31,7 +31,7 @@ If there is a * it must be completed before user space is started
 1. [ ] * Figure out how I will share the frame buffer with User Space.  
 
 ## Paging (PAG)
-1. [ ] * Pinned pages for iobuffers and stuff
+1. [x] * Pinned pages for iobuffers and stuff
 2. [ ] subsytem for providing zeroed frames; i like how windows does this. 
 3. [ ] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
 

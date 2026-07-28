@@ -36,6 +36,7 @@ pub enum PageMapError {
     TranslationFailed(),
     NoMemory(),
     NoMemoryMap(),
+    RangePinned(),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -21,7 +21,8 @@ use crate::{
     util::generate_guid,
 };
 use crate::{
-    memory::paging::{AddressSpaceRoot, map_range, unmap_range_unchecked},
+    memory::paging::{AddressSpaceRoot, map_range},
+    memory::user_pins::UserMemoryPins,
     scheduling::scheduler::SCHEDULER,
     structs::range_tracker::RangeTracker,
 };
@@ -362,7 +363,7 @@ pub struct Program {
     pub extra_queues: Mutex<BTreeMap<u64, QueueHandle>>,
 
     pub routing_rules: Mutex<RuleList>,
-    pub page_table_lock: Mutex<()>,
+    pub user_memory: Arc<UserMemoryPins>,
 }
 impl Program {
     pub fn new(
@@ -387,17 +388,20 @@ impl Program {
             handle_table: RwLock::new(HandleTable::new()),
             working_dir,
             default_queue: Arc::new(RwLock::new(MessageQueue::new())),
-            page_table_lock: Mutex::new(()),
+            user_memory: Arc::new(UserMemoryPins::new()),
             extra_queues: Mutex::new(BTreeMap::new()),
             routing_rules: Mutex::new(Vec::new()),
         }
     }
 
     pub fn virtual_map_alloc(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
-        let _guard = self.page_table_lock.lock();
+        let _guard = self.user_memory.lock();
 
         let start = virt_addr;
         let end = virt_addr + size as u64;
+        if _guard.is_pinned(start.as_u64(), end.as_u64()) {
+            return Err(PageMapError::RangePinned());
+        }
         self.tracker
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
@@ -423,6 +427,10 @@ impl Program {
     pub unsafe fn virtual_map(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
         let start = virt_addr;
         let end = virt_addr + size as u64;
+        let guard = self.user_memory.lock();
+        if guard.is_pinned(start.as_u64(), end.as_u64()) {
+            return Err(PageMapError::RangePinned());
+        }
         let old_address_space_root = crate::memory::paging::current_address_space_root();
 
         unsafe {
@@ -440,7 +448,7 @@ impl Program {
         result
     }
     pub fn virtual_map_auto_alloc(&self, size: usize) -> Result<VirtAddr, PageMapError> {
-        let _guard = self.page_table_lock.lock();
+        let _guard = self.user_memory.lock();
         let start: VirtAddr = self
             .tracker
             .alloc_auto(size as u64)
@@ -485,7 +493,10 @@ impl Program {
             return Err(PageMapError::NoMemory());
         }
 
-        let _guard = self.page_table_lock.lock();
+        let guard = self.user_memory.lock();
+        if guard.is_pinned(start, end) {
+            return Err(PageMapError::RangePinned());
+        }
 
         unsafe { self.tracker.dealloc(start, size) };
 
@@ -571,9 +582,8 @@ impl Program {
             }
         }
 
-        for (start, end) in self.tracker.get_allocations() {
-            unsafe { unmap_range_unchecked(VirtAddr::new(start).into(), end - start) };
-        }
+        self.user_memory
+            .teardown_or_defer(self.address_space_root, self.tracker.clone());
 
         Ok(())
     }
