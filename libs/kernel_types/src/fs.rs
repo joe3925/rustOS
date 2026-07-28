@@ -219,6 +219,30 @@ pub struct FsCreateResult {
 
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
+pub struct FsRemoveDirParams {
+    pub path: Path,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
+pub struct FsRemoveDirResult {
+    pub error: Option<KernelError>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
+pub struct FsDeleteParams {
+    pub path: Path,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
+pub struct FsDeleteResult {
+    pub error: Option<KernelError>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsRenameParams {
     pub src: Path,
     pub dst: Path,

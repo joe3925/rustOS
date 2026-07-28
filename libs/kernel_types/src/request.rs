@@ -3,16 +3,18 @@ use crate::device::DeviceObject;
 use crate::dma::{FromDevice, IoBuffer, ToDevice};
 use crate::fs::{
     FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult,
-    FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams,
-    FsListDirResult, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams,
-    FsRenameResult, FsSeekParams, FsSeekResult, FsSetLenParams, FsSetLenResult, FsWriteParams,
-    FsWriteResult, FsZeroRangeParams, FsZeroRangeResult,
+    FsDeleteParams, FsDeleteResult, FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult,
+    FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult,
+    FsRemoveDirParams, FsRemoveDirResult, FsRenameParams, FsRenameResult, FsSeekParams,
+    FsSeekResult, FsSetLenParams, FsSetLenResult, FsWriteParams, FsWriteResult, FsZeroRangeParams,
+    FsZeroRangeResult,
 };
 use crate::io::{FsOps, IoHandler};
 use crate::pnp::DriverStep;
 use crate::{
-    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
-    EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
+    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsDelete, EvtFsFlush, EvtFsGetInfo, EvtFsOpen,
+    EvtFsRead, EvtFsReadDir, EvtFsRemoveDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite,
+    EvtFsZeroRange,
 };
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -85,6 +87,22 @@ macro_rules! for_each_fs_operation {
                 handler: EvtFsCreate,
                 method: create,
                 depth: CREATE_DEPTH = 0
+            },
+            remove_dir {
+                op: FsRemoveDir,
+                params: FsRemoveDirParams,
+                result: FsRemoveDirResult,
+                handler: EvtFsRemoveDir,
+                method: remove_dir,
+                depth: REMOVE_DIR_DEPTH = 0
+            },
+            delete {
+                op: FsDelete,
+                params: FsDeleteParams,
+                result: FsDeleteResult,
+                handler: EvtFsDelete,
+                method: delete,
+                depth: DELETE_DEPTH = 0
             },
             rename {
                 op: FsRename,

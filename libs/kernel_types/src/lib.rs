@@ -50,9 +50,9 @@ use crate::pnp::{
     RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
 };
 use crate::request::{
-    DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsAppend, FsClose, FsCreate, FsFlush,
-    FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, Read,
-    Write,
+    DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsAppend, FsClose, FsCreate, FsDelete,
+    FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek, FsSetLen,
+    FsWrite, FsZeroRange, Read, Write,
 };
 pub type EvtDriverDeviceAdd = extern "C" fn(
     driver: &Arc<device::DriverObject>,
@@ -131,6 +131,16 @@ pub type EvtFsCreate =
     for<'a, 'data> extern "C" fn(
         &'a Arc<DeviceObject>,
         &'a mut Fs<'data, FsCreate>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsRemoveDir =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsRemoveDir>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsDelete =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsDelete>,
     ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 pub type EvtFsRename =
     for<'a, 'data> extern "C" fn(

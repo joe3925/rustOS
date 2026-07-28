@@ -230,18 +230,18 @@ impl Provider {
         }
     }
 
-    pub async fn remove_dir_path(self, path: &Path) -> Result<FsCreateResult, KernelError> {
+    pub async fn remove_dir_path(self, path: &Path) -> Result<FsRemoveDirResult, KernelError> {
         match self {
             Provider::Bootstrap => Ok(bootstrap(|| {
-                BOOTSTRAP_PROVIDER.remove_dir_path_sync(&path.to_string())
+                let result = BOOTSTRAP_PROVIDER.remove_dir_path_sync(&path.to_string());
+                FsRemoveDirResult {
+                    error: result.error,
+                }
             })),
             Provider::Vfs => {
-                // TODO: add a vfs remove dir path path
-                todo!("");
-
-                Ok(FsCreateResult {
-                    error: Some(crate::error::error(FileErrorKind::UnknownFailure)),
-                })
+                VFS_PROVIDER
+                    .remove_dir(FsRemoveDirParams { path: path.clone() })
+                    .await
             }
         }
     }
@@ -262,17 +262,18 @@ impl Provider {
         }
     }
 
-    pub async fn delete_path(self, path: &Path) -> Result<FsCreateResult, KernelError> {
+    pub async fn delete_path(self, path: &Path) -> Result<FsDeleteResult, KernelError> {
         match self {
             Provider::Bootstrap => Ok(bootstrap(|| {
-                BOOTSTRAP_PROVIDER.delete_path_sync(&path.to_string())
+                let result = BOOTSTRAP_PROVIDER.delete_path_sync(&path.to_string());
+                FsDeleteResult {
+                    error: result.error,
+                }
             })),
             Provider::Vfs => {
-                // TODO: add a vfs delete path
-                todo!("");
-                Ok(FsCreateResult {
-                    error: Some(crate::error::error(FileErrorKind::UnknownFailure)),
-                })
+                VFS_PROVIDER
+                    .delete(FsDeleteParams { path: path.clone() })
+                    .await
             }
         }
     }

@@ -13,8 +13,8 @@ use kernel_types::error::{
 use kernel_types::fs::{Path, *};
 use kernel_types::io::IoTarget;
 use kernel_types::request::{
-    Fs, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsOperation, FsPayload, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
+    Fs, FsAppend, FsClose, FsCreate, FsDelete, FsFlush, FsGetInfo, FsOpen, FsOperation, FsPayload,
+    FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
 };
 
 #[derive(Clone, Debug)]
@@ -374,6 +374,25 @@ impl Vfs {
         self.call_fs::<FsCreate>(&symlink, self.resolve_target(&symlink), p)
             .await
             .with_context(|| format!("creating `{path:?}`"))
+    }
+
+    pub async fn remove_dir(
+        &self,
+        mut p: FsRemoveDirParams,
+    ) -> Result<FsRemoveDirResult, KernelError> {
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
+        p.path = path.clone();
+        self.call_fs::<FsRemoveDir>(&symlink, self.resolve_target(&symlink), p)
+            .await
+            .with_context(|| format!("removing directory `{path:?}`"))
+    }
+
+    pub async fn delete(&self, mut p: FsDeleteParams) -> Result<FsDeleteResult, KernelError> {
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
+        p.path = path.clone();
+        self.call_fs::<FsDelete>(&symlink, self.resolve_target(&symlink), p)
+            .await
+            .with_context(|| format!("deleting file `{path:?}`"))
     }
 
     pub async fn rename(&self, mut p: FsRenameParams) -> Result<FsRenameResult, KernelError> {

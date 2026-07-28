@@ -4,13 +4,14 @@ use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate,
-    FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite,
-    FsZeroRange, Read, Write,
+    FsDelete, FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek,
+    FsSetLen, FsWrite, FsZeroRange, Read, Write,
 };
 use crate::{
-    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
-    EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
-    EvtIoDeviceControl, EvtIoFlush, EvtIoFlushDirty, EvtIoFlushOwner, EvtIoRead, EvtIoWrite,
+    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsDelete, EvtFsFlush, EvtFsGetInfo, EvtFsOpen,
+    EvtFsRead, EvtFsReadDir, EvtFsRemoveDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite,
+    EvtFsZeroRange, EvtIoDeviceControl, EvtIoFlush, EvtIoFlushDirty, EvtIoFlushOwner, EvtIoRead,
+    EvtIoWrite,
 };
 use alloc::boxed::Box;
 use alloc::sync::Arc;

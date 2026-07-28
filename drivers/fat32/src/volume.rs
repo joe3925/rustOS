@@ -11,22 +11,21 @@ use fatfs::{
     LossyOemCpConverter, NullTimeProvider, RenamedFileState, SeekFrom, Write,
 };
 use kernel_api::device::DeviceObject;
+use kernel_api::error::{DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, io};
 use kernel_api::request::{
-    FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
-};
-use kernel_api::error::{
-    error, DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext,
+    FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate, FsDelete, FsFlush, FsGetInfo, FsOpen,
+    FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
 };
 use kernel_api::{
     fs::{
-        FileAttribute, FsAppendResult, FsCloseResult, FsCreateResult, FsFlushResult,
-        FsGetInfoResult, FsListDirResult, FsOpenResult, FsReadResult, FsRenameResult, FsSeekResult,
-        FsSeekWhence, FsSetLenResult, FsWriteResult, FsZeroRangeResult,
+        FileAttribute, FsAppendResult, FsCloseResult, FsCreateResult, FsDeleteResult,
+        FsFlushResult, FsGetInfoResult, FsListDirResult, FsOpenResult, FsReadResult,
+        FsRemoveDirResult, FsRenameResult, FsSeekResult, FsSeekWhence, FsSetLenResult,
+        FsWriteResult, FsZeroRangeResult,
     },
     println, request_handler,
 };
@@ -164,22 +163,23 @@ impl FileHandleTable {
     }
 
     fn ctx(&self, fs_file_id: u64) -> Result<&FileCtx, KernelError> {
-        let (index, generation) = self
-            .index_and_generation(fs_file_id)
-            .ok_or_else(|| {
-                error(FileErrorKind::PathNotFound)
-                    .with_context(alloc::format!("decoding FAT32 file handle {fs_file_id}"))
-            })?;
+        let (index, generation) = self.index_and_generation(fs_file_id).ok_or_else(|| {
+            error(FileErrorKind::PathNotFound)
+                .with_context(alloc::format!("decoding FAT32 file handle {fs_file_id}"))
+        })?;
         let slot = &self.slots[index];
         if slot.generation == generation {
             slot.ctx.as_ref().ok_or_else(|| {
-                error(FileErrorKind::PathNotFound)
-                    .with_context(alloc::format!("accessing closed FAT32 file handle {fs_file_id}"))
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "accessing closed FAT32 file handle {fs_file_id}"
+                ))
             })
         } else {
-            Err(error(FileErrorKind::PathNotFound).with_context(alloc::format!(
-                "accessing stale FAT32 file handle {fs_file_id}"
-            )))
+            Err(
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "accessing stale FAT32 file handle {fs_file_id}"
+                )),
+            )
         }
     }
 
@@ -195,24 +195,27 @@ impl FileHandleTable {
     }
 
     fn remove(&mut self, fs_file_id: u64) -> Result<FileCtx, KernelError> {
-        let (index, generation) = self
-            .index_and_generation(fs_file_id)
-            .ok_or_else(|| {
-                error(FileErrorKind::PathNotFound)
-                    .with_context(alloc::format!("closing invalid FAT32 file handle {fs_file_id}"))
-            })?;
+        let (index, generation) = self.index_and_generation(fs_file_id).ok_or_else(|| {
+            error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                "closing invalid FAT32 file handle {fs_file_id}"
+            ))
+        })?;
         let slot = &mut self.slots[index];
         if unlikely(slot.generation != generation) {
             cold_path();
-            return Err(error(FileErrorKind::PathNotFound).with_context(alloc::format!(
-                "closing stale FAT32 file handle {fs_file_id}"
-            )));
+            return Err(
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "closing stale FAT32 file handle {fs_file_id}"
+                )),
+            );
         }
         let Some(ctx) = slot.ctx.take() else {
             cold_path();
-            return Err(error(FileErrorKind::PathNotFound).with_context(alloc::format!(
-                "closing already-closed FAT32 file handle {fs_file_id}"
-            )));
+            return Err(
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "closing already-closed FAT32 file handle {fs_file_id}"
+                )),
+            );
         };
         slot.generation = slot.generation.wrapping_add(1);
         slot.next_free = self.free_head;
@@ -224,9 +227,11 @@ impl FileHandleTable {
         let ctx = self.ctx_mut(fs_file_id)?;
         if unlikely(ctx.is_dir) {
             cold_path();
-            return Err(error(FileErrorKind::AccessDenied).with_context(alloc::format!(
-                "using directory handle {fs_file_id} as a FAT32 file"
-            )));
+            return Err(
+                error(FileErrorKind::AccessDenied).with_context(alloc::format!(
+                    "using directory handle {fs_file_id} as a FAT32 file"
+                )),
+            );
         }
         ctx.cached
             .take()
@@ -391,9 +396,9 @@ async fn flush_cached_file(
         Ok(()) => None,
         Err(FatError::Io(err)) => {
             let restore_error = restore_cached_file(vdx, fs_file_id, file).err();
-            let mut err = err.0.with_context(alloc::format!(
-                "flushing FAT32 file handle {fs_file_id}"
-            ));
+            let mut err = err
+                .0
+                .with_context(alloc::format!("flushing FAT32 file handle {fs_file_id}"));
             if let Some(restore_error) = restore_error {
                 err = err.with_context(alloc::format!(
                     "also failed to restore the cached file state: {restore_error}"
@@ -713,12 +718,12 @@ impl FileSystem for Fat32Fs {
                             let mut file = state.into_file(&*fs);
                             let res = match file.seek(SeekFrom::Start(offset)).await {
                                 Err(e) => Err(map_fatfs_err(&e)),
-                                Ok(_) => match
-                                    file.write_iobuffer(buffer, fatfs::IoKind::Data).await
-                                {
-                                    Ok(n) => Ok(n),
-                                    Err(e) => Err(map_fatfs_err(&e)),
-                                },
+                                Ok(_) => {
+                                    match file.write_iobuffer(buffer, fatfs::IoKind::Data).await {
+                                        Ok(n) => Ok(n),
+                                        Err(e) => Err(map_fatfs_err(&e)),
+                                    }
+                                }
                             };
                             let lower_flush = if write_through && res.is_ok() {
                                 LowerFlush::Blocking
@@ -892,6 +897,78 @@ impl FileSystem for Fat32Fs {
             };
             flush_owner_blocking(&vdx, METADATA_OWNER_ID);
             payload.result = Some(FsCreateResult { error: err });
+        }
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await?;
+        Ok(DriverStep::Complete)
+    }
+
+    #[request_handler]
+    async fn remove_dir<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut FsRequest<'data, FsRemoveDir>,
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let mut fs = fs_arc.lock().await;
+            let path = req.payload.params.path.as_str();
+            let root = fs.root_dir();
+            let result = match root.open_dir(path).await {
+                Ok(dir) => {
+                    drop(dir);
+                    root.remove(path).await
+                }
+                Err(error) => Err(error),
+            };
+            flush_owner_blocking(&vdx, METADATA_OWNER_ID);
+            req.payload.result = Some(FsRemoveDirResult {
+                error: result.err().map(|error| map_fatfs_err(&error)),
+            });
+        }
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await?;
+        Ok(DriverStep::Complete)
+    }
+
+    #[request_handler]
+    async fn delete<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut FsRequest<'data, FsDelete>,
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let mut fs = fs_arc.lock().await;
+            let path = req.payload.params.path.as_str();
+            let root = fs.root_dir();
+            let result = match root.open_file(path).await {
+                Ok(file) => {
+                    drop(file);
+                    root.remove(path).await
+                }
+                Err(error) => Err(error),
+            };
+            flush_owner_blocking(&vdx, METADATA_OWNER_ID);
+            req.payload.result = Some(FsDeleteResult {
+                error: result.err().map(|error| map_fatfs_err(&error)),
+            });
         }
         finish_fs_request(
             volume_target,
@@ -1109,11 +1186,10 @@ impl FileSystem for Fat32Fs {
                     let start_off = {
                         let handles = vdx.handles.lock();
                         match handles.ctx(fs_file_id) {
-                            Ok(ctx) if ctx.is_dir => Err(
-                                error(FileErrorKind::AccessDenied).with_context(alloc::format!(
+                            Ok(ctx) if ctx.is_dir => Err(error(FileErrorKind::AccessDenied)
+                                .with_context(alloc::format!(
                                     "appending to directory handle {fs_file_id}"
-                                )),
-                            ),
+                                ))),
                             Ok(ctx) => Ok(ctx.size),
                             Err(e) => Err(e),
                         }
@@ -1144,7 +1220,8 @@ impl FileSystem for Fat32Fs {
                                         LowerFlush::None
                                     };
                                     let flush_err = if write_through {
-                                        flush_cached_file(&vdx, fs_file_id, file, lower_flush).await?
+                                        flush_cached_file(&vdx, fs_file_id, file, lower_flush)
+                                            .await?
                                     } else {
                                         restore_cached_file(&vdx, fs_file_id, file)?;
                                         None
