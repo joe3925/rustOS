@@ -632,7 +632,6 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let mut final_error = None;
     let mut pending = PendingOpBatch::new(&qs.read_ops);
 
     {
@@ -644,11 +643,7 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                     submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read")
                         .await;
                 pending.clear();
-
-                if let Err(err) = result {
-                    final_error = Some(err);
-                    break;
-                }
+                result.with_context(|| "processing a virtio-blk read request chain")?;
             }
 
             let offset = read.offset;
@@ -661,10 +656,9 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
             match validate_common_block_io(offset, len) {
                 Ok(()) => {}
                 Err(error_kind) => {
-                    final_error = Some(error(error_kind).with_context(alloc::format!(
+                    return Err(error(error_kind).with_context(alloc::format!(
                         "validating virtio-blk read at offset {offset} with length {len}: offset and length must be 512-byte aligned"
                     )));
-                    break;
                 }
             }
 
@@ -672,12 +666,11 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                 Some(buffer) if buffer.len() >= len => {}
                 Some(_) | None => {
                     cold_path();
-                    final_error = Some(error(DriverErrorKind::InvalidParameter).with_context(
+                    return Err(error(DriverErrorKind::InvalidParameter).with_context(
                         alloc::format!(
                             "virtio-blk read at offset {offset} requested {len} bytes without a sufficiently large buffer"
                         ),
                     ));
-                    break;
                 }
             }
 
@@ -694,11 +687,7 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                     )
                     .await;
                     pending.clear();
-
-                    if let Err(err) = result {
-                        final_error = Some(err);
-                        break;
-                    }
+                    result.with_context(|| "processing a virtio-blk read request chain")?;
 
                     match qs.read_ops.alloc() {
                         Some(lease) => lease,
@@ -712,12 +701,11 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                 Some(buffer) => buffer,
                 None => {
                     cold_path();
-                    final_error = Some(error(DriverErrorKind::InvalidParameter).with_context(
+                    return Err(error(DriverErrorKind::InvalidParameter).with_context(
                         alloc::format!(
                             "virtio-blk read buffer disappeared at offset {offset} with length {len}"
                         ),
                     ));
-                    break;
                 }
             };
 
@@ -725,10 +713,9 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
                 Ok(buffer) => buffer,
                 Err(error_kind) => {
                     cold_path();
-                    final_error = Some(error(error_kind).with_context(alloc::format!(
+                    return Err(error(error_kind).with_context(alloc::format!(
                         "DMA-mapping virtio-blk read at offset {offset} with length {len}"
                     )));
-                    break;
                 }
             };
 
@@ -742,18 +729,13 @@ pub(crate) async fn virtio_pdo_read_impl<'req, 'data, 'b>(
         }
     }
 
-    if final_error.is_none() && !pending.is_empty() {
-        if let Err(err) =
-            submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read").await
-        {
-            final_error = Some(err);
-        }
+    if !pending.is_empty() {
+        submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_IN, &pending, false, "read")
+            .await
+            .with_context(|| "processing a virtio-blk read request chain")?;
     }
 
-    match final_error {
-        Some(err) => Err(err).with_context(|| "processing a virtio-blk read request chain"),
-        None => Ok(DriverStep::Complete),
-    }
+    Ok(DriverStep::Complete)
 }
 #[inline(always)]
 pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
@@ -772,7 +754,6 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let mut final_error = None;
     let mut pending = PendingOpBatch::new(&qs.write_ops);
 
     {
@@ -790,11 +771,7 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                 )
                 .await;
                 pending.clear();
-
-                if let Err(err) = result {
-                    final_error = Some(err);
-                    break;
-                }
+                result.with_context(|| "processing a virtio-blk write request chain")?;
             }
 
             let offset = write.offset;
@@ -807,10 +784,9 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
             match validate_common_block_io(offset, len) {
                 Ok(()) => {}
                 Err(error_kind) => {
-                    final_error = Some(error(error_kind).with_context(alloc::format!(
+                    return Err(error(error_kind).with_context(alloc::format!(
                         "validating virtio-blk write at offset {offset} with length {len}: offset and length must be 512-byte aligned"
                     )));
-                    break;
                 }
             }
 
@@ -818,12 +794,11 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                 Some(buffer) if buffer.len() >= len => {}
                 Some(_) | None => {
                     cold_path();
-                    final_error = Some(error(DriverErrorKind::InvalidParameter).with_context(
+                    return Err(error(DriverErrorKind::InvalidParameter).with_context(
                         alloc::format!(
                             "virtio-blk write at offset {offset} requested {len} bytes without a sufficiently large buffer"
                         ),
                     ));
-                    break;
                 }
             }
 
@@ -840,11 +815,7 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                     )
                     .await;
                     pending.clear();
-
-                    if let Err(err) = result {
-                        final_error = Some(err);
-                        break;
-                    }
+                    result.with_context(|| "processing a virtio-blk write request chain")?;
 
                     match qs.write_ops.alloc() {
                         Some(lease) => lease,
@@ -858,12 +829,11 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                 Some(buffer) => buffer,
                 None => {
                     cold_path();
-                    final_error = Some(error(DriverErrorKind::InvalidParameter).with_context(
+                    return Err(error(DriverErrorKind::InvalidParameter).with_context(
                         alloc::format!(
                             "virtio-blk write buffer disappeared at offset {offset} with length {len}"
                         ),
                     ));
-                    break;
                 }
             };
 
@@ -871,10 +841,9 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
                 Ok(buffer) => buffer,
                 Err(error_kind) => {
                     cold_path();
-                    final_error = Some(error(error_kind).with_context(alloc::format!(
+                    return Err(error(error_kind).with_context(alloc::format!(
                         "DMA-mapping virtio-blk write at offset {offset} with length {len}"
                     )));
-                    break;
                 }
             };
 
@@ -888,18 +857,13 @@ pub(crate) async fn virtio_pdo_write_impl<'req, 'data, 'b>(
         }
     }
 
-    if final_error.is_none() && !pending.is_empty() {
-        if let Err(err) =
-            submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_OUT, &pending, true, "write").await
-        {
-            final_error = Some(err);
-        }
+    if !pending.is_empty() {
+        submit_block_ops_to_queue(&inner, qs, VIRTIO_BLK_T_OUT, &pending, true, "write")
+            .await
+            .with_context(|| "processing a virtio-blk write request chain")?;
     }
 
-    match final_error {
-        Some(err) => Err(err).with_context(|| "processing a virtio-blk write request chain"),
-        None => Ok(DriverStep::Complete),
-    }
+    Ok(DriverStep::Complete)
 }
 #[inline(always)]
 pub(crate) async fn virtio_pdo_flush_impl<'req, 'b>(

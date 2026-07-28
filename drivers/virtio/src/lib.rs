@@ -79,7 +79,7 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 const PIC_BASE_VECTOR: u8 = 0x20;
 
 const COMPLETION_POLL_MIN_NS: u64 = 2_000;
-const COMPLETION_POLL_MAX_NS: u64 = 500_000;
+const COMPLETION_POLL_MAX_NS: u64 = 550_000;
 const COMPLETION_FIT_MIN_SAMPLES: u64 = 32;
 const COMPLETION_FIT_FALLBACK_BASE_NS: u64 = 5_000;
 const COMPLETION_FIT_FALLBACK_NS_PER_KIB: u64 = 1_250;
@@ -174,9 +174,6 @@ pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
     }
 
     let ns = ((pred_num + (pred_den / 2)) / pred_den) as u64;
-    // if (byte_len == 1024) {
-    //     println!("1024 bytes: ns {}", ns)
-    // }
     if ns > COMPLETION_POLL_MAX_NS {
         None
     } else {

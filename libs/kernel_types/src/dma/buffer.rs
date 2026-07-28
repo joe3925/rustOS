@@ -1,11 +1,15 @@
 pub struct IoBuffer<'backing, 'data, Access: IoBufferAccess> {
-    source: IoBufferSource<'backing>,
-    _backing: PhantomData<&'backing IoBufferBacking<'data>>,
+    source: IoBufferSource<'backing, 'data>,
+    offset: usize,
+    len: usize,
     _access: PhantomData<fn() -> Access>,
 }
 
-enum IoBufferSource<'backing> {
-    Backing(&'backing LeaseSlot),
+enum IoBufferSource<'backing, 'data> {
+    Backing {
+        backing: &'backing IoBufferBacking<'data>,
+        lease: LeaseHandle,
+    },
     Virt(alloc::boxed::Box<VirtIoBuffer>),
 }
 
@@ -111,53 +115,30 @@ fn split_virt_phys(
 
 impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> {
     fn new(backing: &'backing IoBufferBacking<'data>, lease: LeaseHandle) -> Self {
-        let lease = backing
-            .lease_ref(lease)
+        let snapshot = backing
+            .lease_snapshot(lease)
             .expect("new IoBuffer requires an active lease");
         Self {
-            source: IoBufferSource::Backing(lease),
-            _backing: PhantomData,
+            source: IoBufferSource::Backing { backing, lease },
+            offset: snapshot.start,
+            len: snapshot.len,
             _access: PhantomData,
         }
     }
 
     pub fn backing(&self) -> Option<&'backing IoBufferBacking<'data>> {
-        match &self.source {
-            IoBufferSource::Backing(lease) => {
-                let lease: &'backing LeaseSlot = *lease;
-                Some(
-                    lease
-                        .context()
-                        .expect("IoBuffer backing lease is inactive")
-                        .0,
-                )
-            }
+        match self.source {
+            IoBufferSource::Backing { backing, .. } => Some(backing),
             IoBufferSource::Virt(_) => None,
         }
     }
 
     pub fn offset(&self) -> usize {
-        match &self.source {
-            IoBufferSource::Backing(lease) => {
-                lease
-                    .snapshot()
-                    .expect("IoBuffer backing lease is inactive")
-                    .start
-            }
-            IoBufferSource::Virt(_) => 0,
-        }
+        self.offset
     }
 
     pub fn len(&self) -> usize {
-        match &self.source {
-            IoBufferSource::Backing(lease) => {
-                lease
-                    .snapshot()
-                    .expect("IoBuffer backing lease is inactive")
-                    .len
-            }
-            IoBufferSource::Virt(virt) => virt.len,
-        }
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -165,8 +146,7 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
     }
 
     pub fn split_at(self, mid: usize) -> Result<(Self, Self), (Self, IoBufferError)> {
-        let len = self.len();
-        if mid > len {
+        if mid > self.len {
             return Err((self, IoBufferError::InvalidRange));
         }
         if matches!(&self.source, IoBufferSource::Virt(virt) if virt.dma.is_some()) {
@@ -179,22 +159,16 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
         }
         let this = ManuallyDrop::new(self);
         match &this.source {
-            IoBufferSource::Backing(lease) => {
-                let (backing, handle, _) = match lease.context() {
-                    Ok(context) => context,
-                    Err(err) => return Err((ManuallyDrop::into_inner(this), err)),
-                };
-                match backing.split_lease(handle, mid) {
-                    Ok(right) => Ok((Self::new(backing, handle), Self::new(backing, right))),
-                    Err(err) => Err((ManuallyDrop::into_inner(this), err)),
-                }
-            }
+            IoBufferSource::Backing { backing, lease } => match backing.split_lease(*lease, mid) {
+                Ok(right) => Ok((Self::new(backing, *lease), Self::new(backing, right))),
+                Err(err) => Err((ManuallyDrop::into_inner(this), err)),
+            },
             IoBufferSource::Virt(_) => {
                 let source = unsafe { ptr::read(&this.source) };
                 let IoBufferSource::Virt(mut virt) = source else {
                     unreachable!()
                 };
-                let right_len = len - mid;
+                let right_len = this.len - mid;
                 let right_base = virt.virt_base + mid;
                 let left_base = virt.virt_base;
                 let (left_phys, right_phys) = match virt.phys.take() {
@@ -217,7 +191,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                 phys,
                 dma: None,
             })),
-            _backing: PhantomData,
+            offset: 0,
+            len,
             _access: PhantomData,
         }
     }
@@ -226,7 +201,7 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
     /// Backing-based buffers are physically described when their backing is created.
     pub fn ensure_phys_described(&mut self) -> Result<(), IoBufferError> {
         match &mut self.source {
-            IoBufferSource::Backing(_) => Ok(()),
+            IoBufferSource::Backing { .. } => Ok(()),
             IoBufferSource::Virt(virt) => virt.ensure_phys_described().map(|_| ()),
         }
     }
@@ -234,16 +209,13 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
     /// Returns a side-effect-free DMA view of an already physically described buffer.
     pub fn dma_buffer_view(&self) -> Result<DmaBufferView<'_>, IoBufferError> {
         match &self.source {
-            IoBufferSource::Backing(lease) => {
-                let (backing, _, snapshot) = lease.context()?;
-                Ok(DmaBufferView::from_iobuffer_parts(
-                    snapshot.len,
-                    &backing.extents,
-                    &backing.frames,
-                    snapshot.start,
-                    snapshot.len,
-                ))
-            }
+            IoBufferSource::Backing { backing, .. } => Ok(DmaBufferView::from_iobuffer_parts(
+                self.len,
+                &backing.extents,
+                &backing.frames,
+                self.offset,
+                self.len,
+            )),
             IoBufferSource::Virt(virt) => {
                 let phys = virt
                     .phys
@@ -261,18 +233,13 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
     }
     pub fn regions(&self) -> IoBufferRegionIter<'_> {
         match &self.source {
-            IoBufferSource::Backing(lease) => {
-                let (backing, _, snapshot) =
-                    lease.context().expect("IoBuffer backing lease is inactive");
-                IoBufferRegionIter::new(
-                    &backing.extents,
-                    &backing.frames,
-                    snapshot.start,
-                    snapshot.len,
-                )
+            IoBufferSource::Backing { backing, .. } => {
+                IoBufferRegionIter::new(&backing.extents, &backing.frames, self.offset, self.len)
             }
             IoBufferSource::Virt(virt) => match &virt.phys {
-                Some(phys) => IoBufferRegionIter::new(&phys.extents, &phys.frames, 0, virt.len),
+                Some(phys) => {
+                    IoBufferRegionIter::new(&phys.extents, &phys.frames, self.offset, self.len)
+                }
                 None => IoBufferRegionIter::new(&[], &[], 0, 0),
             },
         }
@@ -304,20 +271,17 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
     pub fn try_as_slice(&self) -> Option<&[u8]> {
         match &self.source {
             IoBufferSource::Virt(virt) => {
-                checked_slice(virt.virt_base as *const u8, virt.len, 0, virt.len)
+                checked_slice(virt.virt_base as *const u8, virt.len, self.offset, self.len)
             }
-            IoBufferSource::Backing(lease) => {
-                let (backing, _, snapshot) = lease.context().ok()?;
-                match backing.memory {
-                    BackingMemory::SingleRead { ptr, len, .. } => {
-                        checked_slice(ptr as *const u8, len, snapshot.start, snapshot.len)
-                    }
-                    BackingMemory::SingleWrite { ptr, len, .. } => {
-                        checked_slice(ptr as *const u8, len, snapshot.start, snapshot.len)
-                    }
-                    _ => None,
+            IoBufferSource::Backing { backing, .. } => match backing.memory {
+                BackingMemory::SingleRead { ptr, len, .. } => {
+                    checked_slice(ptr as *const u8, len, self.offset, self.len)
                 }
-            }
+                BackingMemory::SingleWrite { ptr, len, .. } => {
+                    checked_slice(ptr as *const u8, len, self.offset, self.len)
+                }
+                _ => None,
+            },
         }
     }
 
@@ -347,7 +311,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
         if let IoBufferSource::Virt(virt) = &self.source {
             let source = virt
                 .virt_base
-                .checked_add(offset)
+                .checked_add(self.offset)
+                .and_then(|address| address.checked_add(offset))
                 .ok_or(IoBufferError::LengthOverflow)?;
             unsafe { ptr::copy_nonoverlapping(source as *const u8, dst.as_mut_ptr(), dst.len()) };
             return Ok(());
@@ -403,17 +368,14 @@ impl<'backing, 'data, Access: WritableIoBufferAccess> IoBuffer<'backing, 'data, 
     pub fn try_as_mut_slice(&mut self) -> Option<&mut [u8]> {
         match &self.source {
             IoBufferSource::Virt(virt) => {
-                checked_slice_mut(virt.virt_base as *mut u8, virt.len, 0, virt.len)
+                checked_slice_mut(virt.virt_base as *mut u8, virt.len, self.offset, self.len)
             }
-            IoBufferSource::Backing(lease) => {
-                let (backing, _, snapshot) = lease.context().ok()?;
-                match backing.memory {
-                    BackingMemory::SingleWrite { ptr, len, .. } => {
-                        checked_slice_mut(ptr as *mut u8, len, snapshot.start, snapshot.len)
-                    }
-                    _ => None,
+            IoBufferSource::Backing { backing, .. } => match backing.memory {
+                BackingMemory::SingleWrite { ptr, len, .. } => {
+                    checked_slice_mut(ptr as *mut u8, len, self.offset, self.len)
                 }
-            }
+                _ => None,
+            },
         }
     }
 
@@ -429,7 +391,8 @@ impl<'backing, 'data, Access: WritableIoBufferAccess> IoBuffer<'backing, 'data, 
         if let IoBufferSource::Virt(virt) = &self.source {
             let destination = virt
                 .virt_base
-                .checked_add(offset)
+                .checked_add(self.offset)
+                .and_then(|address| address.checked_add(offset))
                 .ok_or(IoBufferError::LengthOverflow)?;
             unsafe { ptr::copy_nonoverlapping(src.as_ptr(), destination as *mut u8, src.len()) };
             return Ok(());
@@ -501,8 +464,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                 return Err((self_, err));
             }
             virt.dma = Some(VirtDma {
-                mapped_start: 0,
-                mapped_len: virt.len,
+                mapped_start: self_.offset,
+                mapped_len: self_.len,
                 layout: layout.into(),
                 drop_ctx: Some(DmaDropContext {
                     mapped_by,
@@ -513,17 +476,19 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
             return Ok(self_);
         }
         let this = ManuallyDrop::new(self_);
-        let IoBufferSource::Backing(lease) = &this.source else {
+        let IoBufferSource::Backing { backing, lease } = &this.source else {
             unreachable!()
         };
-        let (backing, handle, snapshot) = match lease.context() {
-            Ok(context) => context,
+        let backing = *backing;
+        let lease = *lease;
+        match backing.lease_snapshot(lease) {
+            Ok(_) => {}
             Err(err) => return Err((ManuallyDrop::into_inner(this), err)),
-        };
+        }
 
         let record = match backing.allocate_dma_record(
-            snapshot.start,
-            snapshot.len,
+            this.offset,
+            this.len,
             layout,
             mapped_by,
             unmap,
@@ -533,8 +498,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
             Err(err) => return Err((ManuallyDrop::into_inner(this), err)),
         };
 
-        match backing.set_lease_dma_record(handle, record) {
-            Ok(()) => Ok(IoBuffer::new(backing, handle)),
+        match backing.set_lease_dma_record(lease, record) {
+            Ok(()) => Ok(ManuallyDrop::into_inner(this)),
             Err(err) => {
                 backing.release_dma_record(record);
                 Err((ManuallyDrop::into_inner(this), err))
@@ -554,25 +519,23 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
             return Ok(self_);
         }
         let this = ManuallyDrop::new(self_);
-        let IoBufferSource::Backing(lease) = &this.source else {
+        let IoBufferSource::Backing { backing, lease } = &this.source else {
             unreachable!()
         };
-        let (backing, handle, _) = match lease.context() {
-            Ok(context) => context,
-            Err(err) => return Err((ManuallyDrop::into_inner(this), err)),
-        };
+        let backing = *backing;
+        let lease = *lease;
 
-        match backing.clear_lease_dma_record(handle) {
-            Ok(()) => Ok(IoBuffer::new(backing, handle)),
+        match backing.clear_lease_dma_record(lease) {
+            Ok(()) => Ok(ManuallyDrop::into_inner(this)),
             Err(err) => Err((ManuallyDrop::into_inner(this), err)),
         }
     }
 
     pub fn is_dma_mapped(&self) -> bool {
         match &self.source {
-            IoBufferSource::Backing(lease) => lease
-                .context()
-                .and_then(|(backing, _, snapshot)| backing.dma_record_snapshot_for_lease(snapshot))
+            IoBufferSource::Backing { backing, lease } => backing
+                .lease_snapshot(*lease)
+                .and_then(|snapshot| backing.dma_record_snapshot_for_lease(snapshot))
                 .map(|record| record.is_some())
                 .unwrap_or(false),
             IoBufferSource::Virt(virt) => virt.dma.is_some(),
@@ -581,9 +544,9 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
 
     pub fn dma_segments(&self) -> IoBufferDmaSegmentIter<'_> {
         match &self.source {
-            IoBufferSource::Backing(lease) => {
-                let Ok((backing, _, snapshot)) = lease.context() else {
-                    return IoBufferDmaSegmentIter::empty(&[], &[]);
+            IoBufferSource::Backing { backing, lease } => {
+                let Ok(snapshot) = backing.lease_snapshot(*lease) else {
+                    return IoBufferDmaSegmentIter::empty(&backing.extents, &backing.frames);
                 };
                 let Ok(Some((mapped_start, mapped_len, layout))) =
                     backing.dma_record_snapshot_for_lease(snapshot)
@@ -594,8 +557,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                     layout,
                     mapped_start,
                     mapped_len,
-                    snapshot.start,
-                    snapshot.len,
+                    self.offset,
+                    self.len,
                     &backing.extents,
                     &backing.frames,
                 )
@@ -605,8 +568,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                     dma.layout,
                     dma.mapped_start,
                     dma.mapped_len,
-                    0,
-                    virt.len,
+                    self.offset,
+                    self.len,
                     &phys.extents,
                     &phys.frames,
                 ),
@@ -620,11 +583,7 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
 impl<'backing, 'data, Access: IoBufferAccess> Drop for IoBuffer<'backing, 'data, Access> {
     fn drop(&mut self) {
         match &mut self.source {
-            IoBufferSource::Backing(lease) => {
-                if let Ok((backing, handle, _)) = lease.context() {
-                    backing.release_lease(handle);
-                }
-            }
+            IoBufferSource::Backing { backing, lease } => backing.release_lease(*lease),
             IoBufferSource::Virt(virt) => {
                 if let Some(mut dma) = virt.dma.take() {
                     if let Some(ctx) = dma.drop_ctx.take() {
@@ -639,7 +598,7 @@ impl<'backing, 'data, Access: IoBufferAccess> Drop for IoBuffer<'backing, 'data,
 impl<'backing, 'data, Access: IoBufferAccess> fmt::Debug for IoBuffer<'backing, 'data, Access> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (source, phys_described) = match &self.source {
-            IoBufferSource::Backing(_) => ("Backing", true),
+            IoBufferSource::Backing { .. } => ("Backing", true),
             IoBufferSource::Virt(virt) => ("Virt", virt.phys.is_some()),
         };
         f.debug_struct("IoBuffer")

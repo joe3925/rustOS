@@ -11,85 +11,15 @@ use kernel_types::{ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice,
 pub use kernel_types::pnp::*;
 
 pub mod io {
-    use alloc::sync::{Arc, Weak};
-    use kernel_routing::IoRequest;
-    use kernel_types::device::{DevNode, DeviceObject};
-    use kernel_types::error::KernelError;
-    use kernel_types::io::IoTarget;
-    use kernel_types::pnp::DriverStep;
-
-    pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
-        kernel_routing::io::resolve_target(link_path)
-    }
-
-    pub async fn send_to_device<K: IoRequest>(
-        target: IoTarget,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::io::send_to_device(target, req).await
-    }
-
-    pub async fn send_down_stack<K: IoRequest>(
-        target: IoTarget,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::io::send_down_stack(target, req).await
-    }
-
-    pub async fn send_next_lower<K: IoRequest>(
-        from: Arc<DeviceObject>,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::io::send_next_lower(from, req).await
-    }
-
-    pub async fn send_to_stack_top<K: IoRequest>(
-        dev_node_weak: Weak<DevNode>,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::io::send_to_stack_top(dev_node_weak, req).await
-    }
+    pub use kernel_routing::io::{
+        resolve_target, send_down_stack, send_next_lower, send_to_device, send_to_stack_top,
+    };
 }
 
 pub mod pnp {
-    use alloc::sync::{Arc, Weak};
-    use kernel_routing::PnpRequest;
-    use kernel_types::device::{DevNode, DeviceObject};
-    use kernel_types::error::KernelError;
-    use kernel_types::io::IoTarget;
-    use kernel_types::pnp::DriverStep;
-
-    pub fn resolve_target(link_path: &str) -> Option<IoTarget> {
-        kernel_routing::pnp::resolve_target(link_path)
-    }
-
-    pub async fn send_to_device<K: PnpRequest>(
-        target: IoTarget,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::pnp::send_to_device(target, req).await
-    }
-
-    pub async fn send_down_stack<K: PnpRequest>(
-        target: IoTarget,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::pnp::send_down_stack(target, req).await
-    }
-
-    pub async fn send_next_lower<K: PnpRequest>(
-        from: Arc<DeviceObject>,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::pnp::send_next_lower(from, req).await
-    }
-
-    pub async fn send_to_stack_top<K: PnpRequest>(
-        dev_node_weak: Weak<DevNode>,
-        req: &mut K,
-    ) -> Result<DriverStep, KernelError> {
-        kernel_routing::pnp::send_to_stack_top(dev_node_weak, req).await
-    }
+    pub use kernel_routing::pnp::{
+        resolve_target, send_down_stack, send_next_lower, send_to_device, send_to_stack_top,
+    };
 }
 
 pub fn create_pdo(

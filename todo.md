@@ -48,6 +48,7 @@ If there is a * it must be completed before user space is started
 
 ### IoBuffers (IOB)
 1. [ ] Address the iobuffer back pointer causing performance loss. 
+2. [ ] Add iobuffer overlap checking without hurting performance.
 
 
 # User Space 

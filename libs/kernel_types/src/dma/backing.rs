@@ -109,11 +109,10 @@ impl IoBufferBackingScratch {
     }
 }
 
+
 struct LeaseSlot {
     state: AtomicU8,
     generation: AtomicU32,
-    backing: AtomicUsize,
-    index: AtomicUsize,
     start: AtomicUsize,
     len: AtomicUsize,
     access: AtomicU8,
@@ -125,8 +124,6 @@ impl LeaseSlot {
         Self {
             state: AtomicU8::new(LEASE_FREE),
             generation: AtomicU32::new(1),
-            backing: AtomicUsize::new(0),
-            index: AtomicUsize::new(usize::MAX),
             start: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
             access: AtomicU8::new(0),
@@ -150,8 +147,6 @@ impl LeaseSlot {
 
     fn activate(
         &self,
-        backing: usize,
-        index: usize,
         start: usize,
         len: usize,
         access: u8,
@@ -167,8 +162,6 @@ impl LeaseSlot {
             .map_err(|_| IoBufferError::InvalidLease)?;
 
         let generation = self.generation.load(Ordering::Relaxed);
-        self.backing.store(backing, Ordering::Relaxed);
-        self.index.store(index, Ordering::Relaxed);
         self.start.store(start, Ordering::Relaxed);
         self.len.store(len, Ordering::Relaxed);
         self.access.store(access, Ordering::Relaxed);
@@ -196,8 +189,6 @@ impl LeaseSlot {
             return None;
         }
 
-        self.backing.store(0, Ordering::Relaxed);
-        self.index.store(usize::MAX, Ordering::Relaxed);
         self.start.store(0, Ordering::Relaxed);
         self.len.store(0, Ordering::Relaxed);
         self.access.store(0, Ordering::Relaxed);
@@ -210,27 +201,6 @@ impl LeaseSlot {
         } else {
             Some(dma_record)
         }
-    }
-
-    fn context<'backing, 'data>(
-        &'backing self,
-    ) -> Result<(&'backing IoBufferBacking<'data>, LeaseHandle, LeaseSnapshot), IoBufferError> {
-        let snapshot = self.snapshot().ok_or(IoBufferError::InvalidLease)?;
-        let backing = self.backing.load(Ordering::Acquire);
-        let index = self.index.load(Ordering::Acquire);
-        if backing == 0 || index == usize::MAX {
-            return Err(IoBufferError::InvalidLease);
-        }
-
-        let backing = unsafe { &*(backing as *const IoBufferBacking<'data>) };
-        Ok((
-            backing,
-            LeaseHandle {
-                index,
-                generation: snapshot.generation,
-            },
-            snapshot,
-        ))
     }
 }
 
@@ -494,45 +464,21 @@ impl<'data> IoBufferBacking<'data> {
     ) -> Result<LeaseHandle, IoBufferError> {
         self.validate_range(start, len)?;
 
-        let leases = self.leases.read();
-        let _alloc_guard = self.lease_alloc_lock.lock();
-        if len != 0 {
-            let end = start
-                .checked_add(len)
-                .ok_or(IoBufferError::LengthOverflow)?;
-            for slot in leases.iter() {
-                let Some(existing) = slot.snapshot() else {
-                    continue;
-                };
-                let existing_end = existing
-                    .start
-                    .checked_add(existing.len)
-                    .ok_or(IoBufferError::LengthOverflow)?;
-                if existing.len != 0 && start < existing_end && existing.start < end {
-                    return Err(IoBufferError::LeaseConflict { start, len });
-                }
-            }
-        }
-
         let dma_record =
             match self.try_retain_persistent_dma_record_for_range(start, len, access)? {
                 Some(record) => record,
                 None => NO_DMA_RECORD,
             };
 
+        let leases = self.leases.read();
+        let _alloc_guard = self.lease_alloc_lock.lock();
+
         for (index, slot) in leases.iter().enumerate() {
             if slot.state.load(Ordering::Acquire) != LEASE_FREE {
                 continue;
             }
 
-            match slot.activate(
-                self as *const Self as usize,
-                index,
-                start,
-                len,
-                access,
-                dma_record,
-            ) {
+            match slot.activate(start, len, access, dma_record) {
                 Ok(generation) => {
                     return Ok(LeaseHandle { index, generation });
                 }
@@ -673,14 +619,7 @@ impl<'data> IoBufferBacking<'data> {
                 self.retain_dma_record(snapshot.dma_record)?;
             }
 
-            match slot.activate(
-                self as *const Self as usize,
-                index,
-                right_start,
-                right_len,
-                snapshot.access,
-                snapshot.dma_record,
-            ) {
+            match slot.activate(right_start, right_len, snapshot.access, snapshot.dma_record) {
                 Ok(generation) => {
                     parent.len.store(mid, Ordering::Release);
                     return Ok(LeaseHandle { index, generation });
@@ -718,22 +657,6 @@ impl<'data> IoBufferBacking<'data> {
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
         validate_snapshot(slot, handle)
-    }
-
-    fn lease_ref<'backing>(
-        &'backing self,
-        handle: LeaseHandle,
-    ) -> Result<&'backing LeaseSlot, IoBufferError> {
-        let leases = self.leases.read();
-        let slot = leases
-            .get(handle.index)
-            .ok_or(IoBufferError::InvalidLease)?;
-        validate_snapshot(slot, handle)?;
-        let slot = slot as *const LeaseSlot;
-        drop(leases);
-
-        // Lease storage is fixed for the lifetime of IoBufferBacking.
-        Ok(unsafe { &*slot })
     }
 
     fn set_lease_dma_record(

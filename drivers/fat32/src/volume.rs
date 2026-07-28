@@ -711,16 +711,14 @@ impl FileSystem for Fat32Fs {
                         Err(e) => Err(e),
                         Ok(state) => {
                             let mut file = state.into_file(&*fs);
-                            let seek_res = file.seek(SeekFrom::Start(offset)).await;
-                            let res = if let Err(e) = seek_res {
-                                Err(map_fatfs_err(&e))
-                            } else {
-                                let write_res =
-                                    file.write_iobuffer(buffer, fatfs::IoKind::Data).await;
-                                match write_res {
+                            let res = match file.seek(SeekFrom::Start(offset)).await {
+                                Err(e) => Err(map_fatfs_err(&e)),
+                                Ok(_) => match
+                                    file.write_iobuffer(buffer, fatfs::IoKind::Data).await
+                                {
                                     Ok(n) => Ok(n),
                                     Err(e) => Err(map_fatfs_err(&e)),
-                                }
+                                },
                             };
                             let lower_flush = if write_through && res.is_ok() {
                                 LowerFlush::Blocking

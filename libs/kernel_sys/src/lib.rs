@@ -309,9 +309,9 @@ impl acpi::AcpiHandler for KernelAcpiHandler {
 #[repr(C)]
 #[derive(Debug)]
 pub struct BenchSpanGuard {
-    span_id: BenchSpanId,
     tag: BenchTag,
     object_id: BenchObjectId,
+    span_id: BenchSpanId,
     enabled: bool,
 }
 

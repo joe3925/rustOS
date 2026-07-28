@@ -188,7 +188,7 @@ macro_rules! impl_io_request {
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
             ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
-                async move { invoke_io_handler::<Self>(dev, req).await }
+                invoke_io_handler::<Self>(dev, req)
             }
         }
     };
@@ -217,7 +217,7 @@ macro_rules! impl_io_request {
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
             ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
-                async move { invoke_io_handler::<Self>(dev, req).await }
+                invoke_io_handler::<Self>(dev, req)
             }
         }
     };
@@ -267,7 +267,7 @@ where
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Self,
     ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
-        async move { invoke_io_handler::<Self>(dev, req).await }
+        invoke_io_handler::<Self>(dev, req)
     }
 }
 
@@ -296,7 +296,7 @@ macro_rules! impl_pnp_request {
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
             ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
-                async move { invoke_pnp_handler::<Self>(dev, req).await }
+                invoke_pnp_handler::<Self>(dev, req)
             }
 
             fn default_result_for_unhandled(&self) -> Result<DriverStep, KernelError> {
@@ -328,7 +328,7 @@ macro_rules! impl_pnp_request {
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
             ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
-                async move { invoke_pnp_handler::<Self>(dev, req).await }
+                invoke_pnp_handler::<Self>(dev, req)
             }
 
             fn default_result_for_unhandled(&self) -> Result<DriverStep, KernelError> {
@@ -449,11 +449,11 @@ macro_rules! routing_api {
                 call_one_device(&target, req).await
             }
 
-            pub async fn send_down_stack<K: $bound>(
+            pub fn send_down_stack<K: $bound>(
                 target: IoTarget,
                 req: &mut K,
-            ) -> Result<DriverStep, KernelError> {
-                call_down_stack(target, req).await
+            ) -> impl Future<Output = Result<DriverStep, KernelError>> + '_ {
+                call_down_stack(target, req)
             }
 
             pub async fn send_next_lower<K: $bound>(

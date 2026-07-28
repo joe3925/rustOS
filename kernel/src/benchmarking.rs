@@ -1158,9 +1158,9 @@ pub fn bench_log_span_end(span_id: u32, tag: &'static str, object_id: u64) {
 #[repr(C)]
 #[derive(Debug)]
 pub struct BenchSpanGuard {
-    span_id: u32,
     tag: &'static str,
     object_id: u64,
+    span_id: u32,
     enabled: bool,
 }
 
@@ -3587,6 +3587,7 @@ const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 10 * 1024 * 1024;
+const DISK_BENCH_IOBUFFER_CREATE_OPS: u64 = 1_000_000;
 
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
@@ -3772,6 +3773,35 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         passes
     );
 
+    let mut create_ns = 0u128;
+    for _ in 0..DISK_BENCH_IOBUFFER_CREATE_OPS {
+        let timer = Stopwatch::start();
+        let io_buffer = io_backing.create_bidirectional(0, max_size);
+        create_ns += timer.elapsed_nanos() as u128;
+
+        let io_buffer = match io_buffer {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                println!("[disk-bench] I/O buffer creation benchmark failed: {:?}", e);
+                let _ = file.close().await;
+                return;
+            }
+        };
+        black_box(&io_buffer);
+        drop(io_buffer);
+    }
+
+    let create_ops_per_sec = if create_ns == 0 {
+        0.0
+    } else {
+        DISK_BENCH_IOBUFFER_CREATE_OPS as f64 * 1_000_000_000.0 / create_ns as f64
+    };
+    let create_avg_ns = create_ns as f64 / DISK_BENCH_IOBUFFER_CREATE_OPS as f64;
+    println!(
+        "[disk-bench] iobuffer creation: {:.2} buffers/s, {:.2} ns/buffer ({} buffers)",
+        create_ops_per_sec, create_avg_ns, DISK_BENCH_IOBUFFER_CREATE_OPS
+    );
+
     println!(
         "{:>10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
         "size", "wr MiB/s", "wr ops/s", "wr ns/op", "rd MiB/s", "rd ops/s", "rd ns/op",
@@ -3840,8 +3870,6 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             let mut offset = 0u64;
             let mut ops = 0u64;
 
-            let timer = Stopwatch::start();
-
             while offset < bench_len {
                 let remaining = (bench_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
@@ -3870,7 +3898,10 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     }
                 };
 
-                if let Err(e) = file.write_iobuffer_at(offset, io_buffer).await {
+                let timer = Stopwatch::start();
+                let result = file.write_iobuffer_at(offset, io_buffer).await;
+                write_ns += timer.elapsed_nanos() as u128;
+                if let Err(e) = result {
                     println!(
                         "[disk-bench] write failed size={} offset={}: {:?}",
                         size, offset, e
@@ -3885,7 +3916,6 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
 
             write_bytes += offset;
             write_ops += ops;
-            write_ns += timer.elapsed_nanos() as u128;
 
             if let Err(e) = file.flush().await {
                 println!(
@@ -3900,8 +3930,6 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             let mut ops = 0u64;
             let mut checksum = 0u64;
 
-            let timer = Stopwatch::start();
-
             while offset < bench_len {
                 let remaining = (bench_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
@@ -3915,7 +3943,10 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     }
                 };
 
-                if let Err(e) = file.read_iobuffer_at(offset, io_buffer).await {
+                let timer = Stopwatch::start();
+                let result = file.read_iobuffer_at(offset, io_buffer).await;
+                read_ns += timer.elapsed_nanos() as u128;
+                if let Err(e) = result {
                     println!(
                         "[disk-bench] read failed size={} offset={}: {:?}",
                         size, offset, e
@@ -3940,7 +3971,6 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
 
             read_bytes += offset;
             read_ops += ops;
-            read_ns += timer.elapsed_nanos() as u128;
         }
 
         let wr_ns_op = if write_ops == 0 {

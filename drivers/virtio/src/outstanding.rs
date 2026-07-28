@@ -60,8 +60,8 @@ where
     D: IoBufferAccess + 'static,
 {
     pool: &'pool PendingOpPool<D>,
-    indices: [usize; VIRTIO_QUEUE_BATCH_LIMIT],
-    len: usize,
+    indices: [u16; VIRTIO_QUEUE_BATCH_LIMIT],
+    len: u8,
     _data: PhantomData<PendingBlockOp<'data, D>>,
 }
 
@@ -85,8 +85,8 @@ pub(crate) struct SubmittedCompletionLease<'pool, 'completion> {
 
 pub(crate) struct SubmittedCompletionBatch<'pool, 'completion> {
     pool: &'pool SubmittedCompletionPool,
-    indices: [usize; VIRTIO_QUEUE_BATCH_LIMIT],
-    len: usize,
+    indices: [u16; VIRTIO_QUEUE_BATCH_LIMIT],
+    len: u8,
     _completion: PhantomData<SubmittedCompletion<'completion>>,
 }
 
@@ -230,15 +230,10 @@ where
     pub(crate) fn new(pool: &'pool PendingOpPool<D>) -> Self {
         Self {
             pool,
-            indices: [usize::MAX; VIRTIO_QUEUE_BATCH_LIMIT],
+            indices: [u16::MAX; VIRTIO_QUEUE_BATCH_LIMIT],
             len: 0,
             _data: PhantomData,
         }
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.len
     }
 
     #[inline]
@@ -247,27 +242,34 @@ where
     }
 
     #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
     pub(crate) fn is_full(&self) -> bool {
-        self.len == VIRTIO_QUEUE_BATCH_LIMIT
+        self.len as usize == VIRTIO_QUEUE_BATCH_LIMIT
     }
 
     pub(crate) fn push(&mut self, lease: PendingOpLease<'pool, 'data, D>) {
         assert!(!self.is_full());
-        self.indices[self.len] = lease.into_initialized_index();
+        let index = lease.into_initialized_index();
+        self.indices[self.len as usize] =
+            u16::try_from(index).expect("virtio pending-op pool exceeds u16 index capacity");
         self.len += 1;
     }
 
     #[inline]
     pub(crate) fn get(&self, index: usize) -> &PendingBlockOp<'data, D> {
-        assert!(index < self.len);
-        unsafe { &*self.pool.ptr::<'data>(self.indices[index]) }
+        assert!(index < self.len as usize);
+        unsafe { &*self.pool.ptr::<'data>(self.indices[index] as usize) }
     }
 
     pub(crate) fn clear(&mut self) {
         while self.len != 0 {
             self.len -= 1;
-            let index = self.indices[self.len];
-            self.indices[self.len] = usize::MAX;
+            let index = self.indices[self.len as usize] as usize;
+            self.indices[self.len as usize] = u16::MAX;
             unsafe {
                 self.pool.drop_initialized::<'data>(index);
             }
@@ -414,7 +416,7 @@ impl<'pool, 'completion> SubmittedCompletionBatch<'pool, 'completion> {
     pub(crate) fn new(pool: &'pool SubmittedCompletionPool) -> Self {
         Self {
             pool,
-            indices: [usize::MAX; VIRTIO_QUEUE_BATCH_LIMIT],
+            indices: [u16::MAX; VIRTIO_QUEUE_BATCH_LIMIT],
             len: 0,
             _completion: PhantomData,
         }
@@ -422,17 +424,19 @@ impl<'pool, 'completion> SubmittedCompletionBatch<'pool, 'completion> {
 
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
-        self.len == VIRTIO_QUEUE_BATCH_LIMIT
+        self.len as usize == VIRTIO_QUEUE_BATCH_LIMIT
     }
 
     pub(crate) fn push(&mut self, lease: SubmittedCompletionLease<'pool, 'completion>) {
         assert!(!self.is_full());
-        self.indices[self.len] = lease.into_initialized_index();
+        let index = lease.into_initialized_index();
+        self.indices[self.len as usize] =
+            u16::try_from(index).expect("virtio completion pool exceeds u16 index capacity");
         self.len += 1;
     }
 
@@ -440,18 +444,17 @@ impl<'pool, 'completion> SubmittedCompletionBatch<'pool, 'completion> {
         if self.len == 0 {
             return None;
         }
-
         self.len -= 1;
-        let index = self.indices[self.len];
-        self.indices[self.len] = usize::MAX;
+        let index = self.indices[self.len as usize] as usize;
+        self.indices[self.len as usize] = u16::MAX;
         Some(unsafe { self.pool.take_initialized::<'completion>(index) })
     }
 
     pub(crate) fn clear(&mut self) {
         while self.len != 0 {
             self.len -= 1;
-            let index = self.indices[self.len];
-            self.indices[self.len] = usize::MAX;
+            let index = self.indices[self.len as usize] as usize;
+            self.indices[self.len as usize] = u16::MAX;
             unsafe {
                 self.pool.drop_initialized::<'completion>(index);
             }
