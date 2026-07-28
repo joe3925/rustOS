@@ -29,3 +29,10 @@
 - Considering how simple this is for me to impl, it greatly improves the best case performance and the worse case (The IoBufferBacking is exceeded because the user is running a bunch of IoOps at the same time), isn't hurt at all, this fast path could be worth it, I will probably end up needing to solve the IoBufferBacking parallelism problem if I impl this in the dll or not.
 
 # FBM-GEN
+
+# IOB-GEN 
+**Relevant commits**
+- 79bfcbe5cc1fafb14d447d8aa89ad9f054b14054: reduce size of futures.
+
+**The Issue:** IoBuffers are passed by value down the file io stack. Because of the way rust futures work this large struct (about 160 bytes) was componding for each inlined future causing a huge size of the futures. 
+To fix this I changed IoBuffers to store there actually lease info on the backing and to contain a back pointer to there lease, reducing the size to like 8 bytes. The side effect of this is a big performance hit from the extra pointer redirect on all the iobuffer operations; it kills the cache and its another operation in the hot path so something better needs to be found.
