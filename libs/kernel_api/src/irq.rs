@@ -1,6 +1,6 @@
 use kernel_sys::{
     irq_handle_get_user_ctx, irq_handle_is_closed, irq_handle_set_user_ctx, irq_handle_unregister,
-    irq_handle_wait_ffi, kernel_irq_alloc_vector, kernel_irq_borrowed_ensure_signal,
+    irq_handle_wait_abi, kernel_irq_alloc_vector, kernel_irq_borrowed_ensure_signal,
     kernel_irq_borrowed_signal, kernel_irq_borrowed_signal_all, kernel_irq_borrowed_signal_n,
     kernel_irq_compose_msi_message, kernel_irq_free_vector, kernel_irq_register,
     kernel_irq_register_gsi, kernel_platform_cpu_ids,
@@ -11,7 +11,7 @@ pub use kernel_types::irq::{
     MsiRequester, MsiTarget, IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK,
 };
 
-use kernel_types::async_ffi::FfiFuture;
+use kernel_types::async_ffi::AbiFuture;
 
 use crate::println;
 
@@ -20,7 +20,7 @@ pub trait IrqHandleExt {
     fn is_closed(&self) -> bool;
     fn set_user_ctx(&self, v: usize);
     fn user_ctx(&self) -> usize;
-    fn wait(&self, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
+    fn wait(&self, meta: IrqMeta) -> AbiFuture<IrqWaitResult>;
 }
 
 impl IrqHandleExt for IrqHandle {
@@ -45,8 +45,8 @@ impl IrqHandleExt for IrqHandle {
     }
 
     #[inline]
-    fn wait(&self, meta: IrqMeta) -> FfiFuture<IrqWaitResult> {
-        unsafe { irq_handle_wait_ffi(self, meta) }
+    fn wait(&self, meta: IrqMeta) -> AbiFuture<IrqWaitResult> {
+        unsafe { irq_handle_wait_abi(self, meta) }
     }
 }
 

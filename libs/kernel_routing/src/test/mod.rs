@@ -5,7 +5,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_types::arch::{PhysAddr, VirtAddr};
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::device::{DeviceInit, DeviceObject};
 use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::error::{DriverErrorKind, ErrorKind, KernelError};
@@ -49,7 +49,7 @@ fn device_with_ops(ops: DeviceOps) -> Arc<DeviceObject> {
 extern "C" fn read_handler<'a, 'io>(
     _dev: &'a Arc<DeviceObject>,
     request: &'a mut Read<'io>,
-) -> FfiFuture<Result<DriverStep, KernelError>> {
+) -> AbiFuture<Result<DriverStep, KernelError>> {
     async move {
         if let Some(buffer) = request.buffer.as_mut() {
             let out = buffer.try_as_mut_slice().unwrap();
@@ -57,14 +57,14 @@ extern "C" fn read_handler<'a, 'io>(
         }
         Ok(DriverStep::Complete)
     }
-    .into_ffi()
+    .into_abi()
 }
 
 extern "C" fn continue_handler<'a, 'io>(
     _dev: &'a Arc<DeviceObject>,
     _request: &'a mut Read<'io>,
-) -> FfiFuture<Result<DriverStep, KernelError>> {
-    async { Ok(DriverStep::Continue) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Continue) }.into_abi()
 }
 
 struct TestRead;
@@ -72,7 +72,7 @@ impl DeviceRead for TestRead {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Read<'io>,
-    ) -> FfiFuture<Result<DriverStep, KernelError>> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         read_handler(dev, request)
     }
 }
@@ -82,7 +82,7 @@ impl DeviceRead for ContinueRead {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Read<'io>,
-    ) -> FfiFuture<Result<DriverStep, KernelError>> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         continue_handler(dev, request)
     }
 }

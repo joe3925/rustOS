@@ -7,12 +7,13 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 
+use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{platform, Job};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
 
-use super::slab::{get_task_slab, slab_task_poll_trampoline};
+use super::slab::{get_task_table, slab_task_poll_trampoline};
 
 pub(crate) fn submit_global(trampoline: extern "C" fn(usize), ctx: usize) {
     GlobalAsyncExecutor::global().submit(trampoline, ctx);
@@ -110,19 +111,7 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let slab = get_task_slab();
-
-    // The slab will automatically grow if full. We just panic if we actually run out
-    // of all possible slot IDs.
-    let slot_handle = slab.allocate().expect("Task slab allocation failed");
-    let (shard_idx, local_idx, generation) = slot_handle.init_and_enqueue(future);
-    JoinHandle {
-        shard_idx,
-        local_idx,
-        generation,
-        consumed: false,
-        _marker: PhantomData,
-    }
+    spawn_in_executor_domain(crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN, future)
 }
 
 pub fn spawn_in_executor_domain<F, T>(domain_id: ExecutorDomainId, future: F) -> JoinHandle<T>
@@ -130,20 +119,36 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let slab = get_task_slab();
-    let slot_handle = slab.allocate().expect("Task slab allocation failed");
+    let domain = GlobalAsyncExecutor::global()
+        .get_executor_domain(domain_id)
+        .expect("invalid executor domain");
+    let allocation = domain
+        .future_arena()
+        .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+        .expect("future arena allocation failed");
+    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
+    let slab = get_task_table();
+    let slot_handle = match slab.allocate() {
+        Some(handle) => handle,
+        None => unsafe {
+            release_unpublished_future::<F>(&domain, allocation);
+            panic!("task table allocation failed");
+        },
+    };
 
     let (shard_idx, local_idx, generation) = slot_handle.indices();
 
-    if let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) {
-        unsafe { slot.init(future) };
+    let slot = slab
+        .get_slot(shard_idx, local_idx, generation)
+        .expect("reserved task slot disappeared before initialization");
+    unsafe { slot.init::<F, T>(domain_id, allocation) };
+    domain.retain_task();
 
-        slab.increment_ref(shard_idx, local_idx, generation);
-        slab.increment_ref(shard_idx, local_idx, generation);
+    slab.increment_ref(shard_idx, local_idx, generation);
+    slab.increment_ref(shard_idx, local_idx, generation);
 
-        let encoded = slot_handle.encoded_ptr();
-        submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
-    }
+    let encoded = slot_handle.encoded_ptr();
+    submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
 
     JoinHandle {
         shard_idx: shard_idx as u8,
@@ -172,7 +177,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
             panic!("JoinHandle polled after completion");
         }
 
-        let slab = get_task_slab();
+        let slab = get_task_table();
 
         let Some(slot) = slab.get_slot(
             this.shard_idx as usize,
@@ -217,7 +222,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
 impl<T: Send + 'static> Drop for JoinHandle<T> {
     fn drop(&mut self) {
         if !self.consumed {
-            get_task_slab().decrement_ref(
+            get_task_table().decrement_ref(
                 self.shard_idx as usize,
                 self.local_idx as usize,
                 self.generation,
@@ -230,42 +235,51 @@ pub fn spawn_detached<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let slab = get_task_slab();
-
-    // Detached task is just a joinable task with Output = () whose join handle is discarded.
-    // So we don't retain the extra anchor ref from JoinHandle.
-
-    let slot_handle = slab.allocate().expect("Task slab allocation failed");
-    let (shard_idx, local_idx, generation) = slot_handle.indices();
-
-    if let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) {
-        unsafe { slot.init(future) };
-
-        // We only increment ref ONCE for the queued reference.
-        // We do NOT increment for a JoinHandle.
-        slab.increment_ref(shard_idx, local_idx, generation);
-
-        let encoded = slot_handle.encoded_ptr();
-        submit_global(slab_task_poll_trampoline, encoded);
-    }
+    spawn_detached_in_executor_domain(crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN, future);
 }
 
 pub fn spawn_detached_in_executor_domain<F>(domain_id: ExecutorDomainId, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let slab = get_task_slab();
+    let domain = GlobalAsyncExecutor::global()
+        .get_executor_domain(domain_id)
+        .expect("invalid executor domain");
+    let allocation = domain
+        .future_arena()
+        .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+        .expect("future arena allocation failed");
+    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
+    let slab = get_task_table();
 
-    let slot_handle = slab.allocate().expect("Task slab allocation failed");
+    let slot_handle = match slab.allocate() {
+        Some(handle) => handle,
+        None => unsafe {
+            release_unpublished_future::<F>(&domain, allocation);
+            panic!("task table allocation failed");
+        },
+    };
     let (shard_idx, local_idx, generation) = slot_handle.indices();
 
-    if let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) {
-        unsafe { slot.init(future) };
+    let slot = slab
+        .get_slot(shard_idx, local_idx, generation)
+        .expect("reserved task slot disappeared before initialization");
+    unsafe { slot.init::<F, ()>(domain_id, allocation) };
+    domain.retain_task();
 
-        slab.increment_ref(shard_idx, local_idx, generation);
+    slab.increment_ref(shard_idx, local_idx, generation);
 
-        let encoded = slot_handle.encoded_ptr();
-        submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
+    let encoded = slot_handle.encoded_ptr();
+    submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
+}
+
+unsafe fn release_unpublished_future<F>(
+    domain: &crate::global_async::ExecutorDomain,
+    allocation: FutureAllocation,
+) {
+    unsafe {
+        core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
+        assert!(domain.future_arena().release(allocation));
     }
 }
 

@@ -48,7 +48,7 @@ use alloc::{
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::{
     ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
-    async_ffi::{FfiFuture, FutureExt},
+    async_ffi::{AbiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
@@ -243,12 +243,12 @@ pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
-    crate::arch::serial_write_bytes(str.as_bytes());
+    crate::platform::serial_write_bytes(str.as_bytes());
     CONSOLE.lock().print(str.as_bytes());
 }
 #[unsafe(no_mangle)]
 pub fn routing_print_impl(s: &str) {
-    crate::arch::serial_write_bytes(s.as_bytes());
+    crate::platform::serial_write_bytes(s.as_bytes());
     CONSOLE.lock().print(s.as_bytes());
 }
 #[unsafe(no_mangle)]
@@ -275,40 +275,40 @@ pub extern "C" fn kernel_cycle_counter_frequency_hz() -> u64 {
 pub extern "C" fn file_open(
     path: &Path,
     flags: &[OpenFlags],
-) -> FfiFuture<Result<File, KernelError>> {
+) -> AbiFuture<Result<File, KernelError>> {
     let path = path.clone();
     let flags_vec: Vec<OpenFlags> = flags.to_vec();
 
-    async move { File::open(&path, &flags_vec).await }.into_ffi()
+    async move { File::open(&path, &flags_vec).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, KernelError>> {
+pub extern "C" fn fs_list_dir(path: &Path) -> AbiFuture<Result<Vec<String>, KernelError>> {
     let path = path.clone();
 
-    async move { File::list_dir(&path).await }.into_ffi()
+    async move { File::list_dir(&path).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), KernelError>> {
+pub extern "C" fn fs_remove_dir(path: &Path) -> AbiFuture<Result<(), KernelError>> {
     let path = path.clone();
 
-    async move { File::remove_dir(&path).await }.into_ffi()
+    async move { File::remove_dir(&path).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), KernelError>> {
+pub extern "C" fn fs_make_dir(path: &Path) -> AbiFuture<Result<(), KernelError>> {
     let path = path.clone();
 
-    async move { File::make_dir(&path).await }.into_ffi()
+    async move { File::make_dir(&path).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>> {
+pub extern "C" fn reg_get_value(key_path: &str, name: &str) -> AbiFuture<Option<Data>> {
     let key_path = key_path.to_string();
     let name = name.to_string();
 
-    async move { reg::get_value(key_path.as_str(), name.as_str()).await }.into_ffi()
+    async move { reg::get_value(key_path.as_str(), name.as_str()).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
@@ -316,50 +316,50 @@ pub extern "C" fn reg_set_value(
     key_path: &str,
     name: &str,
     data: Data,
-) -> FfiFuture<Result<(), KernelError>> {
+) -> AbiFuture<Result<(), KernelError>> {
     let key_path = key_path.to_string();
     let name = name.to_string();
 
-    async move { reg::set_value(key_path.as_str(), name.as_str(), data).await }.into_ffi()
+    async move { reg::set_value(key_path.as_str(), name.as_str(), data).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_create_key(path: &str) -> FfiFuture<Result<(), KernelError>> {
+pub extern "C" fn reg_create_key(path: &str) -> AbiFuture<Result<(), KernelError>> {
     let path = path.to_string();
 
-    async move { reg::create_key(path).await }.into_ffi()
+    async move { reg::create_key(path).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, KernelError>> {
+pub extern "C" fn reg_delete_key(path: &str) -> AbiFuture<Result<bool, KernelError>> {
     let path = path.to_string();
 
-    async move { reg::delete_key(path.as_str()).await }.into_ffi()
+    async move { reg::delete_key(path.as_str()).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn reg_delete_value(
     key_path: &str,
     name: &str,
-) -> FfiFuture<Result<bool, KernelError>> {
+) -> AbiFuture<Result<bool, KernelError>> {
     let key_path = key_path.to_string();
     let name = name.to_string();
 
-    async move { reg::delete_value(key_path.as_str(), name.as_str()).await }.into_ffi()
+    async move { reg::delete_value(key_path.as_str(), name.as_str()).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, KernelError>> {
+pub extern "C" fn reg_list_keys(base_path: &str) -> AbiFuture<Result<Vec<String>, KernelError>> {
     let base_path = base_path.to_string();
 
-    async move { reg::list_keys(base_path.as_str()).await }.into_ffi()
+    async move { reg::list_keys(base_path.as_str()).await }.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, KernelError>> {
+pub extern "C" fn reg_list_values(base_path: &str) -> AbiFuture<Result<Vec<String>, KernelError>> {
     let base_path = base_path.to_string();
 
-    async move { reg::list_values(base_path.as_str()).await }.into_ffi()
+    async move { reg::list_values(base_path.as_str()).await }.into_abi()
 }
 
 pub extern "C" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
@@ -383,10 +383,10 @@ pub extern "C" fn pnp_create_pdo(
     PNP_MANAGER.create_child_devnode_and_pdo(parent_devnode, name, instance_path, ids, class)
 }
 
-pub extern "C" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), KernelError>> {
+pub extern "C" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> AbiFuture<Result<(), KernelError>> {
     let dn = dn.clone();
 
-    async move { PNP_MANAGER.bind_and_start(&dn).await }.into_ffi()
+    async move { PNP_MANAGER.bind_and_start(&dn).await }.into_abi()
 }
 
 pub extern "C" fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget> {
@@ -396,7 +396,7 @@ pub extern "C" fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>
 pub extern "C" fn pnp_set_preferred_function_driver(
     instance_path: &str,
     driver_name: &str,
-) -> FfiFuture<Result<(), KernelError>> {
+) -> AbiFuture<Result<(), KernelError>> {
     let instance_path = instance_path.to_string();
     let driver_name = driver_name.to_string();
     async move {
@@ -404,7 +404,7 @@ pub extern "C" fn pnp_set_preferred_function_driver(
             .set_preferred_function_driver(&instance_path, &driver_name)
             .await
     }
-    .into_ffi()
+    .into_abi()
 }
 
 pub extern "C" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
@@ -466,7 +466,7 @@ pub extern "C" fn pnp_create_child_devnode_and_pdo_with_init(
 pub extern "C" fn pnp_invalidate_device_relations(
     device: &Arc<DeviceObject>,
     relation: DeviceRelationType,
-) -> FfiFuture<Result<(), KernelError>> {
+) -> AbiFuture<Result<(), KernelError>> {
     let device = device.clone();
     async move {
         let Some(dn) = device.dev_node.get() else {
@@ -479,7 +479,7 @@ pub extern "C" fn pnp_invalidate_device_relations(
             .invalidate_device_relations_for_node(&up, relation)
             .await
     }
-    .into_ffi()
+    .into_abi()
 }
 
 #[unsafe(no_mangle)]
@@ -549,8 +549,8 @@ pub unsafe extern "C" fn task_yield() {
     });
 }
 
-pub unsafe extern "C" fn switch_to_vfs_async() -> FfiFuture<Result<(), KernelError>> {
-    file::switch_to_vfs().into_ffi()
+pub unsafe extern "C" fn switch_to_vfs_async() -> AbiFuture<Result<(), KernelError>> {
+    file::switch_to_vfs().into_abi()
 }
 
 /// Notify VFS that a drive label has been published.
@@ -595,25 +595,25 @@ pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
-    kernel_executor::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
+pub extern "C" fn kernel_spawn_abi(fut: AbiFuture<()>) {
+    kernel_executor::runtime::abi_spawn::kernel_spawn_abi_internal(fut);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()> {
+pub extern "C" fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()> {
     let handle = kernel_spawn(fut);
-    handle.into_ffi()
+    handle.into_abi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_spawn_detached_ffi(fut: FfiFuture<()>) {
+pub extern "C" fn kernel_spawn_detached_abi(fut: AbiFuture<()>) {
     kernel_spawn_detached(async move {
         fut.await;
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_block_on_ffi(fut: FfiFuture<()>) {
+pub extern "C" fn kernel_block_on_abi(fut: AbiFuture<()>) {
     kernel_block_on(fut);
 }
 
@@ -683,7 +683,7 @@ pub extern "C" fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool> {
+pub extern "C" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> AbiFuture<bool> {
     let w = bench_windows().lock().get(&handle.0).cloned();
     async move {
         if let Some(w) = w {
@@ -693,7 +693,7 @@ pub extern "C" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiF
             false
         }
     }
-    .into_ffi()
+    .into_abi()
 }
 
 #[unsafe(no_mangle)]

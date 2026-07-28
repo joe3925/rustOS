@@ -1,6 +1,6 @@
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
-use super::slab::{decode_slab_task_ptr, encode_slab_task_ptr, enqueue_slab_task, get_task_slab};
+use super::slab::{decode_slab_task_ptr, encode_slab_task_ptr, enqueue_slab_task, get_task_table};
 
 #[inline]
 fn encoded_to_waker_ptr(encoded: usize) -> *const () {
@@ -54,6 +54,6 @@ unsafe fn slab_drop_waker(_ptr: *const ()) {
 #[allow(dead_code)]
 unsafe extern "C" fn drop_slab_ctx(ctx: usize) {
     if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(ctx) {
-        get_task_slab().decrement_ref(shard_idx, local_idx, generation);
+        get_task_table().decrement_ref(shard_idx, local_idx, generation);
     }
 }

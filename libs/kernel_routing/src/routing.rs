@@ -3,7 +3,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
-use kernel_types::async_ffi::FfiFuture;
+use kernel_types::async_ffi::AbiFuture;
 use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::error::{DriverErrorKind, ErrorBacktrace, ErrorKind, KernelError};
 use kernel_types::io::{DeviceOps, IoHandler, IoTarget};
@@ -108,7 +108,7 @@ pub trait IoRequest: RoutedOperation {
         handler: Self::Handler,
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Self,
-    ) -> FfiFuture<Result<DriverStep, KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, KernelError>>;
 }
 
 pub trait PnpRequest: RoutedOperation {
@@ -122,7 +122,7 @@ pub trait PnpRequest: RoutedOperation {
         dev: &'a Arc<DeviceObject>,
         op: PnpOp,
         req: &'a mut Self,
-    ) -> FfiFuture<Result<DriverStep, KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, KernelError>>;
 
     fn default_result_for_unhandled() -> Result<DriverStep, KernelError> {
         match Self::OP.unhandled_behavior() {
@@ -177,7 +177,7 @@ macro_rules! impl_io_request {
                 handler: Self::Handler,
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> FfiFuture<Result<DriverStep, KernelError>> {
+            ) -> AbiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, req)
             }
         }
@@ -206,7 +206,7 @@ macro_rules! impl_io_request {
                 handler: Self::Handler,
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Self,
-            ) -> FfiFuture<Result<DriverStep, KernelError>> {
+            ) -> AbiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, req)
             }
         }
@@ -251,7 +251,7 @@ where
         handler: Self::Handler,
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Self,
-    ) -> FfiFuture<Result<DriverStep, KernelError>> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         O::call(handler, dev, req)
     }
 }
@@ -286,7 +286,7 @@ macro_rules! impl_pnp_request {
                 dev: &'a Arc<DeviceObject>,
                 op: PnpOp,
                 req: &'a mut Self,
-            ) -> FfiFuture<Result<DriverStep, KernelError>> {
+            ) -> AbiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, op, req)
             }
         }
@@ -318,7 +318,7 @@ macro_rules! impl_pnp_request {
                 dev: &'a Arc<DeviceObject>,
                 op: PnpOp,
                 req: &'a mut Self,
-            ) -> FfiFuture<Result<DriverStep, KernelError>> {
+            ) -> AbiFuture<Result<DriverStep, KernelError>> {
                 handler(dev, op, req)
             }
         }

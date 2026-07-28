@@ -13,7 +13,7 @@ use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::hint::{cold_path, unlikely};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
-use kernel_api::async_ffi::FfiFuture;
+use kernel_api::async_ffi::AbiFuture;
 use kernel_api::async_ffi::FutureExt;
 use kernel_api::dma::dma::IoBufferBacking;
 use kernel_api::pnp::RemoveDevice;
@@ -150,7 +150,7 @@ impl VolumeCacheBackend for CacheBackend {
         lba: u64,
         blocks: usize,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
+    ) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             if unlikely(blocks == 0) {
                 cold_path();
@@ -230,12 +230,12 @@ impl VolumeCacheBackend for CacheBackend {
 
             Ok(total_len)
         }
-        .into_ffi()
+        .into_abi()
     }
     fn read_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Read<'data>,
-    ) -> FfiFuture<Result<(), Self::Error>> {
+    ) -> AbiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
                 let r = &mut *req;
@@ -325,12 +325,12 @@ impl VolumeCacheBackend for CacheBackend {
 
             Ok(())
         }
-        .into_ffi()
+        .into_abi()
     }
     fn write_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Write<'data>,
-    ) -> FfiFuture<Result<(), Self::Error>> {
+    ) -> AbiFuture<Result<(), Self::Error>> {
         async move {
             let (first_offset, first_len) = {
                 let w = &mut *req;
@@ -419,10 +419,10 @@ impl VolumeCacheBackend for CacheBackend {
 
             Ok(())
         }
-        .into_ffi()
+        .into_abi()
     }
 
-    fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>> {
+    fn flush_device(&self) -> AbiFuture<Result<(), Self::Error>> {
         async move {
             let mut req = Flush { should_block: true };
             match io::send_down_stack(self.target.clone(), &mut req).await {
@@ -437,9 +437,9 @@ impl VolumeCacheBackend for CacheBackend {
             }
             Ok(())
         }
-        .into_ffi()
+        .into_abi()
     }
-    fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> FfiFuture<Result<(), Self::Error>> {
+    fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> AbiFuture<Result<(), Self::Error>> {
         async move {
             let mut req = RegisterDmaBacking { backing: &*backing };
 
@@ -450,7 +450,7 @@ impl VolumeCacheBackend for CacheBackend {
 
             Ok(())
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 

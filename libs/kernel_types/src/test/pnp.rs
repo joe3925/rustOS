@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::async_ffi::{FfiFuture, FutureExt};
+use crate::async_ffi::{AbiFuture, FutureExt};
 use crate::device::DeviceObject;
 use crate::error::KernelError;
 use crate::pnp::{BootType, DriverStep, PnpOp, PnpOps, StartDevice, UnhandledBehavior};
@@ -9,8 +9,8 @@ extern "C" fn start_device_handler(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _request: &mut StartDevice,
-) -> FfiFuture<Result<DriverStep, KernelError>> {
-    async { Ok(DriverStep::Complete) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Complete) }.into_abi()
 }
 
 #[test]

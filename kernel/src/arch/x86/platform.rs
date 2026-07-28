@@ -42,9 +42,9 @@ use super::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TIMER_TI
 use super::gdt::PER_CPU_GDT;
 use super::idt::load_idt;
 use crate::platform::{
-    AddressSpacePlatform, CpuPlatform, DebugPlatform, DeviceMmuPlatform, InterruptPlatform,
-    MachinePlatform, PageTableFrameAllocator, PagingPlatform, PciConfigPlatform, Platform,
-    TaskPlatform, TimerPlatform,
+    AddressSpacePlatform, ConsolePlatform, CpuPlatform, DebugPlatform, DebugTransportPlatform,
+    DeviceMmuPlatform, InterruptPlatform, MachinePlatform, PageTableFrameAllocator, PagingPlatform,
+    PciConfigPlatform, Platform, TaskPlatform, TimerPlatform,
 };
 use crate::println;
 use crate::structs::stopwatch::Stopwatch;
@@ -94,11 +94,13 @@ impl Platform for X86Platform {
         }
         Self::disable_interrupts();
         super::syscalls::syscall::syscall_init();
-        super::debug_meta::init_debug_metadata_transport();
+        <Self as DebugTransportPlatform>::init_debug_metadata_transport();
     }
 }
 
 impl CpuPlatform for X86Platform {
+    type PerCpuState = super::drivers::interrupt_index::PerCpu;
+
     const MAX_CPUS: usize = super::MAX_CPUS;
 
     fn current_cpu_id() -> usize {
@@ -119,6 +121,19 @@ impl CpuPlatform for X86Platform {
 
     fn init_current_cpu_local_state(logical_id: u32) {
         init_percpu_gs(logical_id);
+    }
+
+    fn current_percpu() -> &'static Self::PerCpuState {
+        super::drivers::interrupt_index::current_percpu()
+    }
+
+    fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
+        use core::sync::atomic::Ordering;
+        let per_cpu = Self::current_percpu();
+        (
+            per_cpu.executor_task_id.swap(task_id, Ordering::AcqRel),
+            per_cpu.executor_domain_id.swap(domain_id, Ordering::AcqRel),
+        )
     }
 
     fn start_secondary_cpus() -> bool {
@@ -159,6 +174,18 @@ impl CpuPlatform for X86Platform {
                 a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi);
             }
         }
+    }
+}
+
+impl ConsolePlatform for X86Platform {
+    fn serial_write_bytes(bytes: &[u8]) {
+        super::serial::write_bytes(bytes);
+    }
+}
+
+impl DebugTransportPlatform for X86Platform {
+    fn init_debug_metadata_transport() {
+        super::debug_meta::init_debug_metadata_transport();
     }
 }
 

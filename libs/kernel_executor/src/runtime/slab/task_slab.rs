@@ -1,17 +1,13 @@
-use core::future::Future;
 use core::mem::MaybeUninit;
-use core::ptr;
 
 use spin::Once;
 
-use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::growable_slab::{GrowableSlab, SlabHandle};
+use crate::sync::atomic::{AtomicU64, Ordering};
 
-use super::super::runtime::submit_global;
 use super::config::{SlabConfig, SlabConfigBuilder, SlabStats};
-use super::ptr::{encode_slab_task_ptr, slab_task_poll_trampoline};
-use super::shard::SlabShard;
+use super::ptr::encode_slab_task_ptr;
 use super::slot::TaskSlot;
-use super::storage::CachePadded;
 use super::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
 
 const GEN_SHIFT: u32 = 16;
@@ -33,73 +29,55 @@ fn unpack_ref(packed: u32) -> u32 {
     packed & REF_MASK
 }
 
-static TASK_SLAB_PTR: Once<&'static TaskSlab> = Once::new();
-static mut TASK_SLAB_STORAGE: MaybeUninit<TaskSlab> = MaybeUninit::uninit();
+fn new_task_slot() -> TaskSlot {
+    TaskSlot::new()
+}
 
-pub struct TaskSlab {
-    shards: [SlabShard; NUM_SHARDS],
-    config: SlabConfig,
-    shard_counter: CachePadded<AtomicUsize>,
+static TASK_TABLE_PTR: Once<&'static TaskTable> = Once::new();
+static mut TASK_TABLE_STORAGE: MaybeUninit<TaskTable> = MaybeUninit::uninit();
+
+pub struct TaskTable {
+    slab: GrowableSlab<TaskSlot>,
     total_allocations: AtomicU64,
 }
 
-impl TaskSlab {
-    fn init_in_place(dst: *mut TaskSlab, mut config: SlabConfig) {
+impl TaskTable {
+    fn new(mut config: SlabConfig) -> Self {
         config.slots_per_shard = config
             .slots_per_shard
-            .min(MAX_SLOTS_PER_SHARD)
-            .max(MIN_SLOTS_PER_SHARD);
-
-        let mut shards: MaybeUninit<[SlabShard; NUM_SHARDS]> = MaybeUninit::uninit();
-        let shards_ptr = shards.as_mut_ptr() as *mut SlabShard;
-
-        unsafe {
-            for i in 0..NUM_SHARDS {
-                shards_ptr
-                    .add(i)
-                    .write(SlabShard::new(config.slots_per_shard));
-            }
-
-            ptr::write(
-                dst,
-                TaskSlab {
-                    shards: shards.assume_init(),
-                    config,
-                    shard_counter: CachePadded::new(AtomicUsize::new(0)),
-                    total_allocations: AtomicU64::new(0),
-                },
-            );
+            .clamp(MIN_SLOTS_PER_SHARD, MAX_SLOTS_PER_SHARD);
+        let max_chunks = (1usize << 16) / config.slots_per_shard;
+        Self {
+            slab: GrowableSlab::new(
+                NUM_SHARDS,
+                config.slots_per_shard,
+                max_chunks,
+                new_task_slot,
+            ),
+            total_allocations: AtomicU64::new(0),
         }
     }
 
-    pub fn allocate(&self) -> Option<SlotHandle<'_>> {
-        let start_shard = self.shard_hint();
+    pub fn allocate(&self) -> Option<SlotHandle> {
+        let handle = self.slab.reserve()?;
+        let slot = self.slab.get(handle)?;
+        slot.prepare_for_allocation();
+        slot.gen_ref
+            .store(pack_gen_ref(handle.generation, 1), Ordering::Release);
+        self.total_allocations.fetch_add(1, Ordering::Relaxed);
+        Some(SlotHandle { handle })
+    }
 
-        for offset in 0..NUM_SHARDS {
-            let shard_idx = (start_shard + offset) % NUM_SHARDS;
-            let shard = &self.shards[shard_idx];
-
-            if let Some(local_idx) = shard.try_allocate() {
-                let slot = shard.get_slot(local_idx)?;
-                slot.prepare_for_allocation();
-
-                let old = slot.gen_ref().load(Ordering::Acquire);
-                let new_gen = (unpack_gen(old).wrapping_add(1)) & GEN_MASK;
-                slot.gen_ref()
-                    .store(pack_gen_ref(new_gen, 1), Ordering::Release);
-
-                self.total_allocations.fetch_add(1, Ordering::Relaxed);
-
-                return Some(SlotHandle {
-                    slab: self,
-                    shard_idx: shard_idx as u8,
-                    local_idx: local_idx as u16,
-                    generation: new_gen,
-                });
-            }
+    #[inline]
+    fn make_handle(&self, shard: usize, local: usize, generation: u32) -> Option<SlabHandle> {
+        if shard >= NUM_SHARDS || local > u16::MAX as usize {
+            return None;
         }
-
-        None
+        Some(SlabHandle {
+            shard: shard as u8,
+            local_index: local as u16,
+            generation: generation & GEN_MASK,
+        })
     }
 
     #[inline]
@@ -109,15 +87,10 @@ impl TaskSlab {
         local_idx: usize,
         expected_gen: u32,
     ) -> Option<&TaskSlot> {
-        if shard_idx >= NUM_SHARDS {
-            return None;
-        }
-        let slot = self.shards[shard_idx].get_slot(local_idx)?;
-        let packed = slot.gen_ref().load(Ordering::Acquire);
-        if unpack_gen(packed) != (expected_gen & GEN_MASK) {
-            return None;
-        }
-        Some(slot)
+        let handle = self.make_handle(shard_idx, local_idx, expected_gen)?;
+        let slot = self.slab.get(handle)?;
+        let packed = slot.gen_ref.load(Ordering::Acquire);
+        (unpack_gen(packed) == (expected_gen & GEN_MASK)).then_some(slot)
     }
 
     pub(crate) fn increment_ref(
@@ -126,184 +99,126 @@ impl TaskSlab {
         local_idx: usize,
         expected_gen: u32,
     ) -> bool {
-        if shard_idx >= NUM_SHARDS {
-            return false;
-        }
-
-        let shard = &self.shards[shard_idx];
-        let Some(slot) = shard.get_slot(local_idx) else {
+        let Some(slot) = self.get_slot(shard_idx, local_idx, expected_gen) else {
             return false;
         };
-
         let expected_gen = expected_gen & GEN_MASK;
-
         loop {
-            let cur = slot.gen_ref().load(Ordering::Acquire);
-
-            if unpack_gen(cur) != expected_gen {
+            let current = slot.gen_ref.load(Ordering::Acquire);
+            if unpack_gen(current) != expected_gen {
                 return false;
             }
-
-            let rc = unpack_ref(cur);
-
-            if rc == 0 || rc >= REF_MASK {
+            let refs = unpack_ref(current);
+            if refs == 0 || refs == REF_MASK {
                 return false;
             }
-
-            let new = pack_gen_ref(expected_gen, rc + 1);
-
-            match slot.gen_ref().compare_exchange_weak(
-                cur,
-                new,
+            match slot.gen_ref.compare_exchange_weak(
+                current,
+                pack_gen_ref(expected_gen, refs + 1),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => return true,
-                Err(v) if unpack_gen(v) != expected_gen => return false,
+                Err(next) if unpack_gen(next) != expected_gen => return false,
                 Err(_) => core::hint::spin_loop(),
             }
         }
     }
 
     pub(crate) fn decrement_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
-        if shard_idx >= NUM_SHARDS {
-            return;
-        }
-
-        let shard = &self.shards[shard_idx];
-        let Some(slot) = shard.get_slot(local_idx) else {
+        let Some(handle) = self.make_handle(shard_idx, local_idx, expected_gen) else {
             return;
         };
-
+        let Some(slot) = self.slab.get(handle) else {
+            return;
+        };
         let expected_gen = expected_gen & GEN_MASK;
         loop {
-            let cur = slot.gen_ref().load(Ordering::Acquire);
-            if unpack_gen(cur) != expected_gen {
+            let current = slot.gen_ref.load(Ordering::Acquire);
+            if unpack_gen(current) != expected_gen {
                 return;
             }
-            let rc = unpack_ref(cur);
-            if rc == 0 {
+            let refs = unpack_ref(current);
+            if refs == 0 {
                 return;
             }
-            let new = pack_gen_ref(expected_gen, rc - 1);
-            match slot.gen_ref().compare_exchange_weak(
-                cur,
-                new,
+            match slot.gen_ref.compare_exchange_weak(
+                current,
+                pack_gen_ref(expected_gen, refs - 1),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if rc == 1 {
+                    if refs == 1 {
                         slot.release_last_ref();
-                        shard.deallocate(local_idx);
+                        unsafe {
+                            let _ = self.slab.release(handle);
+                        }
                     }
                     return;
                 }
-                Err(v) if unpack_gen(v) != expected_gen => return,
+                Err(next) if unpack_gen(next) != expected_gen => return,
                 Err(_) => core::hint::spin_loop(),
             }
         }
     }
 
-    #[inline]
-    fn shard_hint(&self) -> usize {
-        self.shard_counter.fetch_add(1, Ordering::Relaxed) % NUM_SHARDS
-    }
-
     pub fn stats(&self) -> SlabStats {
-        let allocated: usize = self
-            .shards
-            .iter()
-            .map(|s| s.allocated_count.load(Ordering::Relaxed))
-            .sum();
-
         SlabStats {
-            total_capacity: self.config.slots_per_shard * NUM_SHARDS,
-            currently_allocated: allocated,
+            total_capacity: self.slab.capacity(),
+            currently_allocated: self.slab.allocated_count(),
             total_allocations: self.total_allocations.load(Ordering::Relaxed),
-            fallback_allocations: 0,
         }
     }
 }
 
-pub struct SlotHandle<'a> {
-    slab: &'a TaskSlab,
-    shard_idx: u8,
-    local_idx: u16,
-    generation: u32,
+pub struct SlotHandle {
+    handle: SlabHandle,
 }
 
-impl<'a> SlotHandle<'a> {
-    pub fn init_and_enqueue<F, T>(self, future: F) -> (u8, u16, u32)
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        if let Some(slot) = self.slab.get_slot(
-            self.shard_idx as usize,
-            self.local_idx as usize,
-            self.generation,
-        ) {
-            unsafe { slot.init(future) };
-
-            self.slab.increment_ref(
-                self.shard_idx as usize,
-                self.local_idx as usize,
-                self.generation,
-            );
-
-            self.slab.increment_ref(
-                self.shard_idx as usize,
-                self.local_idx as usize,
-                self.generation,
-            );
-
-            let encoded = encode_slab_task_ptr(self.shard_idx, self.local_idx, self.generation);
-            submit_global(slab_task_poll_trampoline, encoded);
-        }
-
-        (self.shard_idx, self.local_idx, self.generation)
-    }
-
+impl SlotHandle {
     #[inline]
     pub fn encoded_ptr(&self) -> usize {
-        encode_slab_task_ptr(self.shard_idx, self.local_idx, self.generation)
+        encode_slab_task_ptr(
+            self.handle.shard,
+            self.handle.local_index,
+            self.handle.generation,
+        )
     }
 
     #[inline]
     pub fn indices(&self) -> (usize, usize, u32) {
         (
-            self.shard_idx as usize,
-            self.local_idx as usize,
-            self.generation,
+            self.handle.shard as usize,
+            self.handle.local_index as usize,
+            self.handle.generation,
         )
     }
 }
 
-pub fn init_task_slab(config: SlabConfig) {
-    TASK_SLAB_PTR.call_once(|| unsafe {
-        let p = core::ptr::addr_of_mut!(TASK_SLAB_STORAGE).cast::<TaskSlab>();
-        TaskSlab::init_in_place(p, config);
-        &*p
+pub fn init_task_table(config: SlabConfig) {
+    TASK_TABLE_PTR.call_once(|| unsafe {
+        let ptr = core::ptr::addr_of_mut!(TASK_TABLE_STORAGE).cast::<TaskTable>();
+        ptr.write(TaskTable::new(config));
+        &*ptr
     });
 }
 
-pub fn init_task_slab_with<F>(f: F)
+pub fn init_task_table_with<F>(configure: F)
 where
     F: FnOnce(SlabConfigBuilder) -> SlabConfigBuilder,
 {
-    let config = f(SlabConfigBuilder::new()).build();
-    init_task_slab(config);
+    init_task_table(configure(SlabConfigBuilder::new()).build());
 }
 
-pub fn get_task_slab() -> &'static TaskSlab {
-    TASK_SLAB_PTR.call_once(|| unsafe {
-        let p = core::ptr::addr_of_mut!(TASK_SLAB_STORAGE).cast::<TaskSlab>();
-        TaskSlab::init_in_place(p, SlabConfig::default());
-        &*p
+pub fn get_task_table() -> &'static TaskTable {
+    TASK_TABLE_PTR.call_once(|| unsafe {
+        let ptr = core::ptr::addr_of_mut!(TASK_TABLE_STORAGE).cast::<TaskTable>();
+        ptr.write(TaskTable::new(SlabConfig::default()));
+        &*ptr
     })
 }
 
 pub fn slab_stats() -> SlabStats {
-    get_task_slab().stats()
+    get_task_table().stats()
 }

@@ -1,4 +1,3 @@
-pub const INLINE_FUTURE_SIZE: usize = 5096;
 pub const JOINABLE_STORAGE_SIZE: usize = 480;
 pub const INLINE_FUTURE_ALIGN: usize = 8;
 
@@ -10,7 +9,6 @@ pub(super) const MAX_SLOTS_PER_SHARD: usize = 4096;
 
 mod config;
 mod ptr;
-mod shard;
 mod slot;
 mod storage;
 mod task_slab;
@@ -24,5 +22,5 @@ pub use ptr::{
 };
 pub use slot::{NotifyResult, TaskSlot};
 pub use task_slab::{
-    get_task_slab, init_task_slab, init_task_slab_with, slab_stats, SlotHandle, TaskSlab,
+    get_task_table, init_task_table, init_task_table_with, slab_stats, SlotHandle, TaskTable,
 };

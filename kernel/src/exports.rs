@@ -10,6 +10,7 @@ use crate::util::random_number;
 use crate::vec;
 use alloc::string::String;
 use alloc::vec::Vec;
+use kernel_executor::runtime::abi_future::{kernel_abi_future_allocate, kernel_abi_future_free};
 use kernel_executor::runtime::runtime::try_steal_blocking_one;
 
 export! {
@@ -48,6 +49,8 @@ export! {
 
     kernel_alloc,
     kernel_free,
+    kernel_abi_future_allocate,
+    kernel_abi_future_free,
 
     kernel_capture_error_backtrace,
     kernel_resolve_error_context_module,
@@ -75,7 +78,7 @@ export! {
     irq_handle_is_closed,
     irq_handle_set_user_ctx,
     irq_handle_get_user_ctx,
-    irq_handle_wait_ffi,
+    irq_handle_wait_abi,
 
     file_open,
     fs_list_dir,
@@ -112,11 +115,11 @@ export! {
     reg_list_keys,
     reg_list_values,
 
-    kernel_spawn_ffi,
-    kernel_spawn_joinable_ffi,
+    kernel_spawn_abi,
+    kernel_spawn_joinable_abi,
     kernel_async_submit,
-    kernel_spawn_detached_ffi,
-    kernel_block_on_ffi,
+    kernel_spawn_detached_abi,
+    kernel_block_on_abi,
     kernel_block_on_thread_state,
     kernel_spawn_blocking_raw,
 

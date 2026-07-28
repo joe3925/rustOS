@@ -58,42 +58,42 @@ impl<IO: ReadWriteSeek, TP, OCC> Clone for DirRawStream<'_, IO, TP, OCC> {
     }
 }
 
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::async_ffi::{AbiFuture, FutureExt};
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> IoBase for DirRawStream<'_, IO, TP, OCC> {
     type Error = Error<IO::Error>;
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for DirRawStream<'_, IO, TP, OCC> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             match self {
                 DirRawStream::File(file) => file.read(buf, kind).await,
                 DirRawStream::Root(raw) => raw.read(buf, kind).await,
             }
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for DirRawStream<'_, IO, TP, OCC> {
-    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             match self {
                 DirRawStream::File(file) => file.write(buf, kind).await,
                 DirRawStream::Root(raw) => raw.write(buf, kind).await,
             }
         }
-        .into_ffi()
+        .into_abi()
     }
-    fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
+    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
         async move {
             match self {
                 DirRawStream::File(file) => file.flush().await,
                 DirRawStream::Root(raw) => raw.flush().await,
             }
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 

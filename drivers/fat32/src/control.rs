@@ -8,7 +8,7 @@ use kernel_api::{
         open_protocol_to_next_lower, open_public_protocol,
     },
     kernel_types::{
-        async_ffi::{FfiFuture, FutureExt},
+        async_ffi::{AbiFuture, FutureExt},
         async_types::AsyncMutex,
         pnp::{ProbeContext, ProbeOutcome},
         protocol::volmgr::VolumeProtocol,
@@ -74,7 +74,7 @@ fn volume_geometry(
 extern "C" fn fat32_probe(
     _driver: &Arc<DriverObject>,
     context: &ProbeContext,
-) -> FfiFuture<ProbeOutcome> {
+) -> AbiFuture<ProbeOutcome> {
     let context = context.clone();
     async move {
         let protocol = match open_public_protocol::<VolumeProtocol>(&context.devnode) {
@@ -144,7 +144,7 @@ extern "C" fn fat32_probe(
             ),
         }
     }
-    .into_ffi()
+    .into_abi()
 }
 
 pub extern "C" fn fat32_device_add(

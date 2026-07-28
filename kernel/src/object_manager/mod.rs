@@ -224,6 +224,44 @@ impl Object {
         }
     }
 
+    pub async fn destroy(&self) -> crate::structs::io_request::IoRequestOutput {
+        use crate::structs::io_request::{IO_STATUS_INVALID_PARAMETER, IoRequestOutput};
+
+        match &self.payload {
+            ObjectPayload::IoBufferBacking(_) => IoRequestOutput::success(0, 0),
+            ObjectPayload::Queue(queue) => {
+                queue.write().shutdown();
+                IoRequestOutput::success(0, 0)
+            }
+            ObjectPayload::CompletionQueue(queue) => {
+                queue.shutdown();
+                IoRequestOutput::success(0, 0)
+            }
+            ObjectPayload::File(file) => {
+                file.take().await.close();
+                IoRequestOutput::success(0, 0)
+            }
+            ObjectPayload::Program(program) => {
+                let pid = program.read().pid;
+                match crate::executable::program::PROGRAM_MANAGER.kill_program(pid) {
+                    Ok(()) => IoRequestOutput::success(0, 0),
+                    Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
+                }
+            }
+            ObjectPayload::Thread(task) => {
+                match crate::scheduling::scheduler::SCHEDULER.delete_task(task.task_id()) {
+                    Ok(()) => IoRequestOutput::success(0, 0),
+                    Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
+                }
+            }
+            ObjectPayload::Directory(_)
+            | ObjectPayload::Symlink(_)
+            | ObjectPayload::Generic(_)
+            | ObjectPayload::Module(_)
+            | ObjectPayload::Device(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
+        }
+    }
+
     #[inline]
     pub fn is_alive(&self) -> bool {
         self.state.load(Ordering::Acquire) == OBJECT_ALIVE
@@ -308,10 +346,6 @@ impl ObjectBehavior for Arc<MappedIoBufferBacking> {
             operation,
         ))
     }
-
-    fn destroy(&self) -> crate::structs::io_request::IoRequestFuture {
-        behavior::successful_destroy()
-    }
 }
 
 impl ObjectBehavior for TaskQueueRef {
@@ -326,13 +360,6 @@ impl ObjectBehavior for TaskQueueRef {
             ObjectTag::Queue,
             operation,
         ))
-    }
-    fn destroy(&self) -> crate::structs::io_request::IoRequestFuture {
-        let queue = self.clone();
-        alloc::boxed::Box::pin(async move {
-            queue.write().shutdown();
-            crate::structs::io_request::IoRequestOutput::success(0, 0)
-        })
     }
 }
 
@@ -349,13 +376,6 @@ impl ObjectBehavior for Arc<CompletionQueue> {
             operation,
         ))
     }
-    fn destroy(&self) -> crate::structs::io_request::IoRequestFuture {
-        let queue = self.clone();
-        alloc::boxed::Box::pin(async move {
-            queue.shutdown();
-            crate::structs::io_request::IoRequestOutput::success(0, 0)
-        })
-    }
 }
 
 impl ObjectBehavior for Arc<FileObject> {
@@ -370,13 +390,6 @@ impl ObjectBehavior for Arc<FileObject> {
             ObjectTag::File,
             operation,
         ))
-    }
-    fn destroy(&self) -> crate::structs::io_request::IoRequestFuture {
-        let file = self.clone();
-        alloc::boxed::Box::pin(async move {
-            file.take().await.close();
-            crate::structs::io_request::IoRequestOutput::success(0, 0)
-        })
     }
 }
 
@@ -393,17 +406,6 @@ impl ObjectBehavior for ProgramHandle {
             operation,
         ))
     }
-    fn destroy(&self) -> crate::structs::io_request::IoRequestFuture {
-        let pid = self.read().pid;
-        alloc::boxed::Box::pin(async move {
-            match crate::executable::program::PROGRAM_MANAGER.kill_program(pid) {
-                Ok(()) => crate::structs::io_request::IoRequestOutput::success(0, 0),
-                Err(_) => crate::structs::io_request::IoRequestOutput::error(
-                    crate::structs::io_request::IO_STATUS_INVALID_PARAMETER,
-                ),
-            }
-        })
-    }
 }
 
 impl ObjectBehavior for TaskHandle {
@@ -418,17 +420,6 @@ impl ObjectBehavior for TaskHandle {
             ObjectTag::Thread,
             operation,
         ))
-    }
-    fn destroy(&self) -> crate::structs::io_request::IoRequestFuture {
-        let id = self.task_id();
-        alloc::boxed::Box::pin(async move {
-            match crate::scheduling::scheduler::SCHEDULER.delete_task(id) {
-                Ok(()) => crate::structs::io_request::IoRequestOutput::success(0, 0),
-                Err(_) => crate::structs::io_request::IoRequestOutput::error(
-                    crate::structs::io_request::IO_STATUS_INVALID_PARAMETER,
-                ),
-            }
-        })
     }
 }
 

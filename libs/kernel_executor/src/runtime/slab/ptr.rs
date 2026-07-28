@@ -2,7 +2,7 @@ use crate::sync::spin_loop;
 
 use super::super::runtime::submit_global;
 use super::slot::NotifyResult;
-use super::task_slab::get_task_slab;
+use super::task_slab::get_task_table;
 
 const PTR_SHARD_BITS: usize = 3;
 const PTR_LOCAL_BITS: usize = 16;
@@ -39,7 +39,7 @@ fn poll_slab_task(ctx: usize) {
         return;
     };
 
-    let slab = get_task_slab();
+    let slab = get_task_table();
     let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
         return;
     };
@@ -57,7 +57,7 @@ fn poll_slab_task(ctx: usize) {
 
 #[inline(always)]
 pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
-    let slab = get_task_slab();
+    let slab = get_task_table();
 
     if !slab.increment_ref(shard_idx, local_idx, generation) {
         return;

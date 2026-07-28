@@ -4,7 +4,7 @@ use kernel_sys::{
     bench_kernel_window_stop, BenchSpanGuard,
 };
 use kernel_types::{
-    async_ffi::FfiFuture,
+    async_ffi::AbiFuture,
     benchmark::{BenchCoreId, BenchObjectId, BenchTag, BenchWindowConfig, BenchWindowHandle},
 };
 
@@ -41,7 +41,7 @@ impl BenchWindow {
     }
 
     #[inline]
-    pub fn persist(&self) -> FfiFuture<bool> {
+    pub fn persist(&self) -> AbiFuture<bool> {
         unsafe { bench_kernel_window_persist(self.handle) }
     }
 

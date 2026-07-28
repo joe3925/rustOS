@@ -15,19 +15,19 @@ use kernel_types::arch::{Platform, PlatformInfo};
 use spin::Mutex;
 
 use kernel_sys::{
-    kernel_block_on_thread_state, kernel_spawn_blocking_raw, kernel_spawn_detached_ffi,
-    kernel_spawn_joinable_ffi, try_steal_blocking_one as sys_try_steal_blocking_one,
+    kernel_block_on_thread_state, kernel_spawn_blocking_raw, kernel_spawn_detached_abi,
+    kernel_spawn_joinable_abi, try_steal_blocking_one as sys_try_steal_blocking_one,
 };
-use kernel_types::async_ffi::{FfiFuture, FutureExt, WakerExt};
+use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::runtime::BlockOnThreadState;
 
 /// Spawn an async task on the kernel executor (shared singleton in the kernel) and
 /// return a join handle that can be awaited for completion.
-pub fn spawn<F>(future: F) -> FfiFuture<()>
+pub fn spawn<F>(future: F) -> AbiFuture<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    unsafe { kernel_spawn_joinable_ffi(future.into_ffi()) }
+    unsafe { kernel_spawn_joinable_abi(future.into_abi()) }
 }
 
 /// Spawn a detached async task (fire-and-forget).
@@ -35,7 +35,7 @@ pub fn spawn_detached<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    unsafe { kernel_spawn_detached_ffi(future.into_ffi()) };
+    unsafe { kernel_spawn_detached_abi(future.into_abi()) };
 }
 
 struct BlockOnActiveGuard<'a> {
@@ -69,7 +69,7 @@ impl Wake for BlockOnWaker {
 }
 
 pub fn block_on<F: Future + Send>(future: F) -> F::Output {
-    let mut ffi_fut = future.into_ffi();
+    let mut future = core::pin::pin!(future);
     let state = unsafe { kernel_block_on_thread_state() };
 
     if !state.try_enter() {
@@ -82,16 +82,11 @@ pub fn block_on<F: Future + Send>(future: F) -> F::Output {
     let waker = Waker::from(Arc::new(BlockOnWaker {
         state: state.clone(),
     }));
-    let ffi_waker = waker.into_ffi();
+    let mut context = Context::from_waker(&waker);
 
     loop {
-        let poll = unsafe { ffi_fut.poll(&ffi_waker as *const _) };
-
-        if poll.is_ready() {
-            match unsafe { poll.into_poll() } {
-                Poll::Ready(v) => return v,
-                Poll::Pending => unreachable!(),
-            }
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
         }
 
         if !state.take_ready() {}

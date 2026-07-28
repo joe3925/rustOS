@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -6,7 +5,6 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::dma::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
@@ -152,26 +150,6 @@ impl IoRequestOutput {
             status,
             result: 0,
             extra: 0,
-        }
-    }
-}
-
-pub type IoRequestFuture = Pin<Box<dyn Future<Output = IoRequestOutput> + Send + 'static>>;
-
-pub enum KernelIoFuture {
-    Cold(FfiFuture<IoRequestOutput>),
-    MessageReceive(MqReceiveFuture),
-    MessageSend(MessageSendFuture),
-}
-
-impl Future for KernelIoFuture {
-    type Output = IoRequestOutput;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.as_mut().get_mut() {
-            Self::Cold(future) => Pin::new(future).poll(cx),
-            Self::MessageReceive(future) => Pin::new(future).poll(cx),
-            Self::MessageSend(future) => Pin::new(future).poll(cx),
         }
     }
 }
@@ -364,7 +342,7 @@ impl KernelIoOp {
         }
     }
 
-    pub fn into_future(self) -> KernelIoFuture {
+    pub async fn execute(self) -> IoRequestOutput {
         match self {
             Self::FileOpen {
                 owner_pid,
@@ -372,54 +350,38 @@ impl KernelIoOp {
                 path,
                 flags,
                 ..
-            } => KernelIoFuture::Cold(
-                async move { run_file_open(owner_pid, owner, path, flags).await }.into_ffi(),
-            ),
+            } => run_file_open(owner_pid, owner, path, flags).await,
             Self::FileRead {
                 file,
                 buffer,
                 offset,
                 ..
-            } => KernelIoFuture::Cold(
-                async move { run_file_read(file, buffer, offset).await }.into_ffi(),
-            ),
+            } => run_file_read(file, buffer, offset).await,
             Self::FileWrite {
                 file,
                 buffer,
                 offset,
                 ..
-            } => KernelIoFuture::Cold(
-                async move { run_file_write(file, buffer, offset).await }.into_ffi(),
-            ),
-            Self::FileDeleteHandle { file, .. } => {
-                KernelIoFuture::Cold(async move { run_file_delete_handle(file).await }.into_ffi())
-            }
-            Self::FileDeletePath { path, .. } => {
-                KernelIoFuture::Cold(async move { run_file_delete_path(path).await }.into_ffi())
-            }
-            Self::ListDir { owner, path, .. } => {
-                KernelIoFuture::Cold(async move { run_list_dir(owner, path).await }.into_ffi())
-            }
-            Self::ChangeDirectory { owner, path, .. } => KernelIoFuture::Cold(
-                async move { run_change_directory(owner, path).await }.into_ffi(),
-            ),
+            } => run_file_write(file, buffer, offset).await,
+            Self::FileDeleteHandle { file, .. } => run_file_delete_handle(file).await,
+            Self::FileDeletePath { path, .. } => run_file_delete_path(path).await,
+            Self::ListDir { owner, path, .. } => run_list_dir(owner, path).await,
+            Self::ChangeDirectory { owner, path, .. } => run_change_directory(owner, path).await,
             Self::MqReceive { queue, buffer, .. } => {
-                KernelIoFuture::MessageReceive(MqReceiveFuture {
+                MqReceiveFuture {
                     queue,
                     buffer: Some(buffer),
-                })
-            }
-            Self::ObjectDestroy { object, .. } => KernelIoFuture::Cold(
-                async move {
-                    let output = object.behavior().destroy().await;
-                    if output.status == IO_STATUS_SUCCESS {
-                        let _ = OBJECT_MANAGER.unlink_object(&object);
-                        object.mark_dead();
-                    }
-                    output
                 }
-                .into_ffi(),
-            ),
+                .await
+            }
+            Self::ObjectDestroy { object, .. } => {
+                let output = object.destroy().await;
+                if output.status == IO_STATUS_SUCCESS {
+                    let _ = OBJECT_MANAGER.unlink_object(&object);
+                    object.mark_dead();
+                }
+                output
+            }
             Self::MessageSendAwait {
                 target,
                 buffer,
@@ -441,11 +403,9 @@ impl KernelIoOp {
                         let mut message = unsafe { message.assume_init() };
                         message.sender = Some(sender);
                         message.delivery = None;
-                        KernelIoFuture::MessageSend(MessageSendFuture::new(target, message))
+                        MessageSendFuture::new(target, message).await
                     }
-                    Err(_) => KernelIoFuture::Cold(
-                        async { IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER) }.into_ffi(),
-                    ),
+                    Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
                 }
             }
         }

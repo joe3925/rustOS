@@ -5,9 +5,14 @@ mod executor;
 mod round_robin;
 mod runtime;
 
-use crate::platform::{ExecutorPlatform, Job};
+use crate::platform::{CurrentExecutorContext, ExecutorPlatform, Job};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+
+std::thread_local! {
+    static EXECUTOR_CONTEXT: std::cell::Cell<Option<CurrentExecutorContext>> =
+        const { std::cell::Cell::new(None) };
+}
 
 const TEST_MAX_WORK_ITEMS: usize = 2_000_000;
 const EXECUTOR_MAX_SHARDS: usize = 32;
@@ -78,6 +83,17 @@ impl ExecutorPlatform for ThreadPoolPlatform {
 
     fn print(&self, string: &str) {
         std::print!("{string}");
+    }
+
+    fn swap_executor_context(
+        &self,
+        context: Option<CurrentExecutorContext>,
+    ) -> Option<CurrentExecutorContext> {
+        EXECUTOR_CONTEXT.with(|slot| slot.replace(context))
+    }
+
+    fn current_executor_context(&self) -> Option<CurrentExecutorContext> {
+        EXECUTOR_CONTEXT.with(std::cell::Cell::get)
     }
 }
 

@@ -1,10 +1,4 @@
-use alloc::boxed::Box;
-
 use kernel_types::object_manager::ObjectTag;
-
-use crate::structs::io_request::{
-    IO_STATUS_INVALID_PARAMETER, IO_STATUS_SUCCESS, IoRequestFuture, IoRequestOutput,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfaceMask {
@@ -85,10 +79,6 @@ pub trait ObjectBehavior: Send + Sync {
         self.required_interface(operation)
             .is_some_and(|required| granted.contains(required))
     }
-
-    fn destroy(&self) -> IoRequestFuture {
-        Box::pin(async { IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER) })
-    }
 }
 
 pub const OBSERVE_BIT: u64 = 1 << 0;
@@ -133,8 +123,4 @@ pub const fn interface_for_operation(
         ObjectOperation::Destroy => DESTROY_BIT,
     };
     InterfaceMask::new(class, bit)
-}
-
-pub fn successful_destroy() -> IoRequestFuture {
-    Box::pin(async { IoRequestOutput::success(IO_STATUS_SUCCESS, 0) })
 }

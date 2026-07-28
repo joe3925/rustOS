@@ -1,3 +1,4 @@
+use crate::future_arena::{FutureArena, FutureArenaConfig};
 use crate::global_async::{CacheAligned, WorkItem};
 use crate::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use crate::sync::Arc;
@@ -35,6 +36,10 @@ impl ExecutorDomainId {
 
     pub const fn raw(self) -> u64 {
         self.0
+    }
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 
     pub const fn slot(self) -> u32 {
@@ -135,6 +140,7 @@ pub struct ExecutorDomainConfig {
     pub quantum: usize,
     pub weight: usize,
     pub admission_policy: ExecutorAdmissionPolicy,
+    pub future_arena: FutureArenaConfig,
 }
 
 impl ExecutorDomainConfig {
@@ -146,6 +152,7 @@ impl ExecutorDomainConfig {
             quantum: class.default_quantum(),
             weight: class.default_weight(),
             admission_policy: ExecutorAdmissionPolicy::RejectWhenFull,
+            future_arena: FutureArenaConfig::default(),
         }
     }
 
@@ -224,6 +231,9 @@ pub struct ExecutorDomainStats {
     pub state: ExecutorDomainState,
     pub queued_count: usize,
     pub active_count: usize,
+    pub live_task_count: usize,
+    pub live_future_count: usize,
+    pub live_future_bytes: usize,
     pub max_active: usize,
     pub max_queued: usize,
     pub admission_policy: ExecutorAdmissionPolicy,
@@ -343,6 +353,8 @@ pub struct ExecutorDomain {
     class: ExecutorDomainClass,
     admission_policy: ExecutorAdmissionPolicy,
     queues: ShardedQueues,
+    future_arena: FutureArena,
+    live_task_count: CacheAligned,
 
     state: AtomicU8,
     max_queued: usize,
@@ -375,6 +387,8 @@ impl ExecutorDomain {
             class: config.class,
             admission_policy: config.admission_policy,
             queues: ShardedQueues::new(shards, config.max_queued),
+            future_arena: FutureArena::new(id, config.future_arena),
+            live_task_count: CacheAligned(AtomicUsize::new(0)),
 
             state: AtomicU8::new(ExecutorDomainState::Active as u8),
             max_queued: config.max_queued,
@@ -442,6 +456,23 @@ impl ExecutorDomain {
 
     pub fn active_count(&self) -> usize {
         self.active_count.0.load(Ordering::Acquire)
+    }
+
+    pub fn future_arena(&self) -> &FutureArena {
+        &self.future_arena
+    }
+
+    pub fn live_task_count(&self) -> usize {
+        self.live_task_count.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn retain_task(&self) {
+        self.live_task_count.0.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn release_task(&self) {
+        self.live_task_count.0.fetch_sub(1, Ordering::AcqRel);
+        self.maybe_finish_draining();
     }
 
     pub fn has_queued_work(&self) -> bool {
@@ -650,6 +681,8 @@ impl ExecutorDomain {
         if self.state() == ExecutorDomainState::Draining
             && self.queued_count() == 0
             && self.active_count() == 0
+            && self.live_task_count() == 0
+            && self.future_arena.live_futures() == 0
         {
             self.move_to_dead();
         }
@@ -663,6 +696,9 @@ impl ExecutorDomain {
             state: self.state(),
             queued_count: self.queued_count(),
             active_count: self.active_count(),
+            live_task_count: self.live_task_count(),
+            live_future_count: self.future_arena.live_futures(),
+            live_future_bytes: self.future_arena.live_bytes(),
             max_active: self.max_active(),
             max_queued: self.max_queued,
             admission_policy: self.admission_policy,
@@ -970,7 +1006,11 @@ impl ExecutorDomainTable {
             return Err(DestroyExecutorDomainError::InvalidDomain);
         };
 
-        if domain.queued_count() == 0 && domain.active_count() == 0 {
+        if domain.queued_count() == 0
+            && domain.active_count() == 0
+            && domain.live_task_count() == 0
+            && domain.future_arena().live_futures() == 0
+        {
             domain.move_to_dead();
 
             if slot

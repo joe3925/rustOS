@@ -10,7 +10,7 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::time::Duration;
-use kernel_types::async_ffi::FfiFuture;
+use kernel_types::async_ffi::AbiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
@@ -84,7 +84,7 @@ unsafe extern "C" {
     pub fn irq_handle_set_user_ctx(h: &IrqHandle, v: usize);
     pub fn irq_handle_get_user_ctx(h: &IrqHandle) -> usize;
 
-    pub fn irq_handle_wait_ffi(h: &IrqHandle, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
+    pub fn irq_handle_wait_abi(h: &IrqHandle, meta: IrqMeta) -> AbiFuture<IrqWaitResult>;
     pub fn kernel_irq_alloc_vector() -> i32;
     pub fn kernel_irq_free_vector(vector: u8) -> bool;
     pub fn kernel_irq_compose_msi_message(request: &MsiRequest, out: &mut MsiMessage) -> bool;
@@ -142,27 +142,27 @@ unsafe extern "C" {
     pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     pub fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     // Registry (async FFI)
-    pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
+    pub fn reg_get_value(key_path: &str, name: &str) -> AbiFuture<Option<Data>>;
     pub fn reg_set_value(
         key_path: &str,
         name: &str,
         data: Data,
-    ) -> FfiFuture<Result<(), KernelError>>;
-    pub fn reg_create_key(path: &str) -> FfiFuture<Result<(), KernelError>>;
-    pub fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, KernelError>>;
-    pub fn reg_delete_value(key_path: &str, name: &str) -> FfiFuture<Result<bool, KernelError>>;
-    pub fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, KernelError>>;
-    pub fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, KernelError>>;
-    pub fn switch_to_vfs_async() -> FfiFuture<Result<(), KernelError>>;
+    ) -> AbiFuture<Result<(), KernelError>>;
+    pub fn reg_create_key(path: &str) -> AbiFuture<Result<(), KernelError>>;
+    pub fn reg_delete_key(path: &str) -> AbiFuture<Result<bool, KernelError>>;
+    pub fn reg_delete_value(key_path: &str, name: &str) -> AbiFuture<Result<bool, KernelError>>;
+    pub fn reg_list_keys(base_path: &str) -> AbiFuture<Result<Vec<String>, KernelError>>;
+    pub fn reg_list_values(base_path: &str) -> AbiFuture<Result<Vec<String>, KernelError>>;
+    pub fn switch_to_vfs_async() -> AbiFuture<Result<(), KernelError>>;
 
     // File System (async FFI)
-    pub fn file_open(path: &Path, flags: &[OpenFlags]) -> FfiFuture<Result<File, KernelError>>;
-    pub fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, KernelError>>;
-    pub fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), KernelError>>;
-    pub fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), KernelError>>;
-    pub fn file_read(file: &File) -> FfiFuture<Result<Vec<u8>, KernelError>>;
-    pub fn file_write(file: &mut File, data: &[u8]) -> FfiFuture<Result<(), KernelError>>;
-    pub fn file_delete(file: &mut File) -> FfiFuture<Result<(), KernelError>>;
+    pub fn file_open(path: &Path, flags: &[OpenFlags]) -> AbiFuture<Result<File, KernelError>>;
+    pub fn fs_list_dir(path: &Path) -> AbiFuture<Result<Vec<String>, KernelError>>;
+    pub fn fs_remove_dir(path: &Path) -> AbiFuture<Result<(), KernelError>>;
+    pub fn fs_make_dir(path: &Path) -> AbiFuture<Result<(), KernelError>>;
+    pub fn file_read(file: &File) -> AbiFuture<Result<Vec<u8>, KernelError>>;
+    pub fn file_write(file: &mut File, data: &[u8]) -> AbiFuture<Result<(), KernelError>>;
+    pub fn file_delete(file: &mut File) -> AbiFuture<Result<(), KernelError>>;
     pub fn vfs_notify_label_published(
         label_ptr: *const u8,
         label_len: usize,
@@ -195,12 +195,12 @@ unsafe extern "C" {
         init: DeviceInit,
     ) -> (Arc<DevNode>, Arc<DeviceObject>);
 
-    pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), KernelError>>;
+    pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> AbiFuture<Result<(), KernelError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
     pub fn pnp_set_preferred_function_driver(
         instance_path: &str,
         driver_name: &str,
-    ) -> FfiFuture<Result<(), KernelError>>;
+    ) -> AbiFuture<Result<(), KernelError>>;
 
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> Result<(), OmError>;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> Result<(), OmError>;
@@ -228,7 +228,7 @@ unsafe extern "C" {
     pub fn pnp_invalidate_device_relations(
         device: &Arc<DeviceObject>,
         relation: DeviceRelationType,
-    ) -> FfiFuture<Result<(), KernelError>>;
+    ) -> AbiFuture<Result<(), KernelError>>;
 
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
     pub fn kernel_platform_cpu_ids() -> Vec<u8>;
@@ -238,7 +238,7 @@ unsafe extern "C" {
     pub fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool;
     pub fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool;
     pub fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool;
-    pub fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool>;
+    pub fn bench_kernel_window_persist(handle: BenchWindowHandle) -> AbiFuture<bool>;
 
     pub fn bench_kernel_submit_rip_sample(
         core: BenchCoreId,
@@ -250,11 +250,11 @@ unsafe extern "C" {
     pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
 
     // Async Runtime (global)
-    pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
-    pub fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()>;
+    pub fn kernel_spawn_abi(fut: AbiFuture<()>);
+    pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()>;
     pub fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usize);
-    pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
-    pub fn kernel_block_on_ffi(fut: FfiFuture<()>);
+    pub fn kernel_spawn_detached_abi(fut: AbiFuture<()>);
+    pub fn kernel_block_on_abi(fut: AbiFuture<()>);
     pub fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState>;
     pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize);
 

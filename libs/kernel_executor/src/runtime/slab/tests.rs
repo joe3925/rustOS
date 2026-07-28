@@ -1,9 +1,6 @@
 #[cfg(not(any(loom, feature = "loom")))]
 mod threaded {
-    use crate::runtime::slab::{
-        decode_slab_task_ptr, encode_slab_task_ptr, enqueue_slab_task, get_task_slab, slab_stats,
-        SlabConfigBuilder,
-    };
+    use crate::runtime::slab::{enqueue_slab_task, get_task_table, slab_stats, SlabConfigBuilder};
     use alloc::{sync::Arc, vec::Vec};
     use core::future::Future;
     use core::pin::Pin;
@@ -38,13 +35,12 @@ mod threaded {
     }
 
     // This test exists to verify that caller-provided slab configuration is clamped
-    // to supported bounds without losing the fallback policy bit.
+    // to supported bounds.
     #[test]
-    fn slab_config_builder_clamps_capacity_and_preserves_fallback_policy() {
-        let config = SlabConfigBuilder::new().capacity(1).fallback(false).build();
+    fn slab_config_builder_clamps_capacity() {
+        let config = SlabConfigBuilder::new().capacity(1).build();
 
         assert!(config.slots_per_shard >= 64);
-        assert!(!config.allow_fallback);
 
         let config = SlabConfigBuilder::new().slots_per_shard(usize::MAX).build();
         assert!(config.slots_per_shard <= 4096);
@@ -58,7 +54,7 @@ mod threaded {
         let _guard = crate::test::global_runtime_lock();
         crate::test::init_threaded_runtime();
 
-        let slab = get_task_slab();
+        let slab = get_task_table();
         let handle = slab.allocate().expect("expected a joinable slab slot");
         let (shard_idx, local_idx, generation) = handle.indices();
         let slot = slab
@@ -94,7 +90,7 @@ mod threaded {
         let _guard = crate::test::global_runtime_lock();
         crate::test::init_threaded_runtime();
 
-        let slab = get_task_slab();
+        let slab = get_task_table();
         let handle = slab.allocate().expect("expected a joinable slab slot");
         let (shard_idx, local_idx, generation) = handle.indices();
 
@@ -126,15 +122,13 @@ mod threaded {
     }
 
     // This test exists to verify the detached slab exhaustion path. It holds every
-    // slab slot pending, submits extra detached work through the Arc fallback path,
-    // then wakes all tasks to prove both storage paths still complete.
+    // first published chunk pending, forces growth, then wakes all tasks.
     #[test]
-    fn slab_stats_record_detached_slot_exhaustion_fallbacks() {
+    fn task_table_grows_for_detached_tasks() {
         let _guard = crate::test::global_runtime_lock();
         crate::test::init_threaded_runtime();
 
         let stats = slab_stats();
-        let before = stats.fallback_allocations;
         let tasks = stats.total_capacity + 64;
         let gate = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicUsize::new(0));
@@ -155,9 +149,6 @@ mod threaded {
                 .len()
                 == tasks
         });
-
-        // The exact number of fallbacks is not guaranteed, but they are now allocated via growable chunks
-        // So fallback_allocations isn't used exactly as before, but total allocations grows.
 
         gate.store(true, Ordering::Release);
         let stored_wakers = {

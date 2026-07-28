@@ -1,4 +1,4 @@
-use crate::async_ffi::FfiFuture;
+use crate::async_ffi::AbiFuture;
 use crate::device::DeviceObject;
 use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
@@ -609,7 +609,7 @@ pub trait DeviceRead {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Read<'io>,
-    ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceWrite {
@@ -618,7 +618,7 @@ pub trait DeviceWrite {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Write<'io>,
-    ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceFlush {
@@ -627,7 +627,7 @@ pub trait DeviceFlush {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Flush,
-    ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceFlushDirty {
@@ -636,7 +636,7 @@ pub trait DeviceFlushDirty {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut FlushDirty,
-    ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceFlushOwner {
@@ -645,7 +645,7 @@ pub trait DeviceFlushOwner {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut FlushOwner,
-    ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceControlHandler {
@@ -654,7 +654,7 @@ pub trait DeviceControlHandler {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut DeviceControl<'data>,
-    ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 #[repr(C)]
@@ -710,7 +710,7 @@ macro_rules! define_fs_io_operations {
                 extern "C" fn $method<'a, 'data>(
                     dev: &'a Arc<DeviceObject>,
                     req: &'a mut FsRequest<'data, $op>,
-                ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+                ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
             )+
         }
 

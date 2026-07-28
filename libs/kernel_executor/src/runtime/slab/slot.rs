@@ -5,6 +5,9 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+use crate::future_arena::FutureAllocation;
+use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
+use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
 use crate::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use crate::sync::spin_loop;
 
@@ -14,7 +17,7 @@ use super::super::task::{
 };
 use super::ptr::{encode_slab_task_ptr, slab_task_poll_trampoline};
 use super::storage::drop_inline;
-use super::task_slab::get_task_slab;
+use super::task_slab::get_task_table;
 use super::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 
 const CW_NONE: u8 = 0;
@@ -88,6 +91,8 @@ pub struct TaskSlot {
     pub(super) waker_state: AtomicU8,
     pub(super) cached_waker_state: AtomicU8,
     pub(super) _pad: u8,
+    pub(super) domain_id: UnsafeCell<Option<ExecutorDomainId>>,
+    pub(super) future: UnsafeCell<Option<FutureAllocation>>,
     pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
     pub(super) drop_fn: UnsafeCell<Option<TaskDropFn>>,
     pub(super) result_drop_fn: UnsafeCell<Option<TaskDropFn>>,
@@ -106,6 +111,8 @@ impl TaskSlot {
             waker_state: AtomicU8::new(WAKER_NONE),
             cached_waker_state: AtomicU8::new(CW_NONE),
             _pad: 0,
+            domain_id: UnsafeCell::new(None),
+            future: UnsafeCell::new(None),
             poll_fn: UnsafeCell::new(None),
             drop_fn: UnsafeCell::new(None),
             result_drop_fn: UnsafeCell::new(None),
@@ -116,11 +123,6 @@ impl TaskSlot {
     }
 
     #[inline]
-    pub(super) fn gen_ref(&self) -> &AtomicU32 {
-        &self.gen_ref
-    }
-
-    #[inline]
     pub(super) fn prepare_for_allocation(&self) {
         self.state.store(STATE_IDLE, Ordering::Relaxed);
         self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
@@ -128,12 +130,23 @@ impl TaskSlot {
         write_poll_fn(&self.poll_fn, None);
         write_drop_fn(&self.drop_fn, None);
         write_drop_fn(&self.result_drop_fn, None);
+        unsafe {
+            *self.domain_id.get() = None;
+            *self.future.get() = None;
+        }
     }
 
     #[inline]
     pub(super) fn release_last_ref(&self) {
         if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
-            unsafe { drop_fn((*self.buffer.get()).as_mut_ptr()) };
+            unsafe {
+                if let Some(allocation) = (&mut *self.future.get()).take() {
+                    drop_fn(allocation.ptr.as_ptr());
+                    release_future_allocation(allocation);
+                } else {
+                    drop_fn((*self.buffer.get()).as_mut_ptr());
+                }
+            };
         }
         write_drop_fn(&self.drop_fn, None);
 
@@ -156,49 +169,41 @@ impl TaskSlot {
         write_poll_fn(&self.poll_fn, None);
         write_drop_fn(&self.result_drop_fn, None);
         self.state.store(STATE_IDLE, Ordering::Release);
+        if let Some(domain_id) = unsafe { (&mut *self.domain_id.get()).take() } {
+            if let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) {
+                domain.release_task();
+            }
+        }
     }
 
-    pub unsafe fn init<F, T>(&self, future: F)
+    pub unsafe fn init<F, T>(&self, domain_id: ExecutorDomainId, allocation: FutureAllocation)
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let size = core::mem::size_of::<F>();
-        let align = core::mem::align_of::<F>();
-
         let result_size = core::mem::size_of::<T>();
         let result_align = core::mem::align_of::<T>();
 
         if result_size > JOINABLE_STORAGE_SIZE || result_align > INLINE_FUTURE_ALIGN {
-            let boxed_future = async move { Box::new(future.await) };
-            self.init_internal(boxed_future);
+            self.init_internal::<F, T>(domain_id, allocation, poll_and_store_arena_boxed::<F, T>);
         } else {
-            self.init_internal(future);
+            self.init_internal::<F, T>(domain_id, allocation, poll_and_store_arena::<F, T>);
         }
     }
 
-    unsafe fn init_internal<F, T>(&self, future: F)
-    where
+    unsafe fn init_internal<F, T>(
+        &self,
+        domain_id: ExecutorDomainId,
+        allocation: FutureAllocation,
+        poll_fn: TaskPollFn,
+    ) where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let size = core::mem::size_of::<F>();
-        let align = core::mem::align_of::<F>();
-
-        let buf_ptr = (*self.buffer.get()).as_mut_ptr();
-
-        if size <= JOINABLE_STORAGE_SIZE && align <= INLINE_FUTURE_ALIGN {
-            let ptr = buf_ptr as *mut F;
-            core::ptr::write(ptr, future);
-            write_poll_fn(&self.poll_fn, Some(poll_and_store_inline::<F, T>));
-            write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
-        } else {
-            let boxed: Pin<Box<dyn Future<Output = T> + Send + 'static>> = Box::pin(future);
-            let ptr = buf_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
-            core::ptr::write(ptr, Some(boxed));
-            write_poll_fn(&self.poll_fn, Some(poll_and_store_boxed::<T>));
-            write_drop_fn(&self.drop_fn, Some(drop_boxed_future::<T>));
-        }
+        *self.domain_id.get() = Some(domain_id);
+        *self.future.get() = Some(allocation);
+        write_poll_fn(&self.poll_fn, Some(poll_fn));
+        write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
 
         write_drop_fn(&self.result_drop_fn, Some(drop_inline::<T>));
 
@@ -233,6 +238,12 @@ impl TaskSlot {
             return true;
         };
 
+        let domain_id =
+            unsafe { *self.domain_id.get() }.expect("task domain missing while polling");
+        let _context_guard = CurrentExecutorContextGuard::enter(CurrentExecutorContext {
+            task_id: encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation),
+            domain_id: domain_id.raw(),
+        });
         let is_ready = unsafe { poll_fn(self, &mut cx) };
 
         if is_ready {
@@ -249,7 +260,7 @@ impl TaskSlot {
             );
             if let Err(STATE_NOTIFIED) = prev {
                 self.state.store(STATE_QUEUED, Ordering::Release);
-                let slab = get_task_slab();
+                let slab = get_task_table();
                 slab.increment_ref(shard_idx, local_idx, generation);
                 let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
                 submit_global(slab_task_poll_trampoline, encoded);
@@ -469,18 +480,25 @@ impl TaskSlot {
     }
 }
 
-unsafe fn poll_and_store_inline<F, T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
+unsafe fn poll_and_store_arena<F, T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
     F: Future<Output = T>,
     T: Send + 'static,
 {
     let buffer_ptr = (*slot.buffer.get()).as_mut_ptr();
-    let future = &mut *(buffer_ptr as *mut F);
-    let poll_res = Pin::new_unchecked(future).poll(cx);
+    let allocation = (&mut *slot.future.get())
+        .as_mut()
+        .expect("task future allocation missing");
+    let future = &mut *(allocation.ptr.as_ptr() as *mut F);
+    let poll_res = Pin::new_unchecked(&mut *future).poll(cx);
 
     match poll_res {
         Poll::Ready(result) => {
-            core::ptr::drop_in_place(buffer_ptr as *mut F);
+            core::ptr::drop_in_place(future);
+            let allocation = (&mut *slot.future.get())
+                .take()
+                .expect("task future allocation missing on completion");
+            release_future_allocation(allocation);
             let result_ptr = buffer_ptr as *mut T;
             core::ptr::write(result_ptr, result);
 
@@ -493,36 +511,36 @@ where
     }
 }
 
-unsafe fn poll_and_store_boxed<T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
+unsafe fn poll_and_store_arena_boxed<F, T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
+    F: Future<Output = T>,
     T: Send + 'static,
 {
     let buffer_ptr = (*slot.buffer.get()).as_mut_ptr();
-    let boxed_ptr = buffer_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
-
-    let poll_res = if let Some(fut) = (*boxed_ptr).as_mut() {
-        fut.as_mut().poll(cx)
-    } else {
-        return true;
-    };
-
-    match poll_res {
+    let allocation = (&mut *slot.future.get())
+        .as_mut()
+        .expect("task future allocation missing");
+    let future = &mut *(allocation.ptr.as_ptr() as *mut F);
+    match Pin::new_unchecked(&mut *future).poll(cx) {
         Poll::Ready(result) => {
-            *boxed_ptr = None;
-
-            let result_ptr = buffer_ptr as *mut T;
-            core::ptr::write(result_ptr, result);
-
-            let result_drop = read_drop_fn(&slot.result_drop_fn);
-            write_drop_fn(&slot.drop_fn, result_drop);
-
+            core::ptr::drop_in_place(future);
+            let allocation = (&mut *slot.future.get())
+                .take()
+                .expect("task future allocation missing on completion");
+            release_future_allocation(allocation);
+            core::ptr::write(buffer_ptr as *mut Box<T>, Box::new(result));
+            write_drop_fn(&slot.drop_fn, Some(drop_inline::<Box<T>>));
             true
         }
         Poll::Pending => false,
     }
 }
 
-unsafe fn drop_boxed_future<T>(ptr: *mut u8) {
-    let boxed_ptr = ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
-    core::ptr::drop_in_place(boxed_ptr);
+unsafe fn release_future_allocation(allocation: FutureAllocation) {
+    let domain_id = allocation.owner_domain;
+    let domain = GlobalAsyncExecutor::global()
+        .get_executor_domain(domain_id)
+        .expect("future owner domain disappeared while allocation was live");
+    assert!(domain.future_arena().release(allocation));
+    domain.maybe_finish_draining();
 }

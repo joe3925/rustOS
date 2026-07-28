@@ -15,8 +15,8 @@ use crate::sync_platform::{
 };
 
 use super::io_request::{
-    CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable,
-    KernelIoFuture, KernelIoOp, RequestId, RequestTableError, UserIoCompletion,
+    CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable, KernelIoOp,
+    RequestId, RequestTableError, UserIoCompletion,
 };
 
 pub struct CompletionQueue {
@@ -104,13 +104,7 @@ impl CompletionQueue {
 
         let opcode = op.opcode();
         let user_token = op.user_token();
-        let future = IoRequestDriverFuture {
-            queue: self.clone(),
-            request_id,
-            opcode,
-            user_token,
-            inner: op.into_future(),
-        };
+        let future = drive_io_request(self.clone(), request_id, opcode, user_token, op);
 
         spawn_detached_in_executor_domain(self.bound_executor_domain, future);
         Ok(request_id)
@@ -262,48 +256,24 @@ impl CompletionQueue {
     }
 }
 
-struct IoRequestDriverFuture {
+async fn drive_io_request(
     queue: Arc<CompletionQueue>,
     request_id: RequestId,
     opcode: IoOpcode,
     user_token: u64,
-    inner: KernelIoFuture,
-}
-
-impl Future for IoRequestDriverFuture {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        this.queue
-            .request_table
-            .set_waker(this.request_id, cx.waker());
-
-        match this
-            .queue
-            .request_table
-            .mark_running_or_cancelled(this.request_id)
-        {
-            Ok(CompleteTransition::Normal) => {}
+    op: KernelIoOp,
+) {
+    let mut operation = core::pin::pin!(op.execute());
+    let output = core::future::poll_fn(|cx| {
+        queue.request_table.set_waker(request_id, cx.waker());
+        match queue.request_table.mark_running_or_cancelled(request_id) {
+            Ok(CompleteTransition::Normal) => operation.as_mut().poll(cx),
             Ok(CompleteTransition::Cancelled) => {
-                this.queue.complete_entry(
-                    this.request_id,
-                    this.opcode,
-                    this.user_token,
-                    IoRequestOutput::error(IO_STATUS_CANCELLED),
-                );
-                return Poll::Ready(());
+                Poll::Ready(IoRequestOutput::error(IO_STATUS_CANCELLED))
             }
-            Err(_) => return Poll::Ready(()),
+            Err(_) => Poll::Ready(IoRequestOutput::error(IO_STATUS_CANCELLED)),
         }
-
-        match Pin::new(&mut this.inner).poll(cx) {
-            Poll::Ready(output) => {
-                this.queue
-                    .complete_entry(this.request_id, this.opcode, this.user_token, output);
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
+    })
+    .await;
+    queue.complete_entry(request_id, opcode, user_token, output);
 }

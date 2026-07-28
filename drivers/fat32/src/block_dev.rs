@@ -7,7 +7,7 @@ use fatfs::{IoBase, IoKind, Read, ReadIoBuffer, Seek, SeekFrom, Write, WriteIoBu
 use kernel_api::error::{DriverErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::{
     kernel_types::{
-        async_ffi::{FfiFuture, FutureExt},
+        async_ffi::{AbiFuture, FutureExt},
         dma::{
             FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
             IoBufferBackingScratch, ToDevice,
@@ -288,8 +288,8 @@ impl Read for BlockDev {
         &'a mut self,
         buf: &'a mut [u8],
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
-        async move { self.read_bytes(buf, kind).await.map_err(FatIoError) }.into_ffi()
+    ) -> AbiFuture<Result<usize, Self::Error>> {
+        async move { self.read_bytes(buf, kind).await.map_err(FatIoError) }.into_abi()
     }
 }
 
@@ -298,18 +298,18 @@ impl Write for BlockDev {
         &'a mut self,
         buf: &'a [u8],
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
+    ) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             self.write_bytes(buf, kind)
-                .into_ffi()
+                .into_abi()
                 .await
                 .map_err(FatIoError)
         }
-        .into_ffi()
+        .into_abi()
     }
 
-    fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move { Ok(()) }.into_ffi()
+    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
+        async move { Ok(()) }.into_abi()
     }
 }
 
@@ -318,7 +318,7 @@ impl ReadIoBuffer for BlockDev {
         &'a mut self,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
+    ) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             if buffer.is_empty() {
                 return Ok(0);
@@ -349,7 +349,7 @@ impl ReadIoBuffer for BlockDev {
             let _ = kind;
             Ok(read)
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 
@@ -358,7 +358,7 @@ impl WriteIoBuffer for BlockDev {
         &'a mut self,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
+    ) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             if buffer.is_empty() {
                 return Ok(0);
@@ -389,7 +389,7 @@ impl WriteIoBuffer for BlockDev {
             let _ = kind;
             Ok(written)
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 

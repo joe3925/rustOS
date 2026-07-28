@@ -5,7 +5,9 @@ extern crate alloc;
 extern crate std;
 
 mod domain;
+pub mod future_arena;
 pub mod global_async;
+pub mod growable_slab;
 pub mod platform;
 mod round_robin;
 pub mod runtime;

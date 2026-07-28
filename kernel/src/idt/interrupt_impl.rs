@@ -5,7 +5,7 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::irq::{
     AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqFrame, IrqHandle, IrqHandleInner, IrqIsrFn,
     IrqMeta, IrqSafeRwLock, IrqWaitResult, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET,
@@ -92,8 +92,8 @@ pub extern "C" fn irq_handle_signal_n(h: &IrqHandle, meta: IrqMeta, n: u32) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn irq_handle_wait_ffi(h: &IrqHandle, _meta: IrqMeta) -> FfiFuture<IrqWaitResult> {
-    irq_wait_future(h).into_ffi()
+pub extern "C" fn irq_handle_wait_abi(h: &IrqHandle, _meta: IrqMeta) -> AbiFuture<IrqWaitResult> {
+    irq_wait_future(h).into_abi()
 }
 
 pub(crate) fn signal_all(handle: &IrqHandle, meta: IrqMeta) {

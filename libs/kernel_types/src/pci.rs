@@ -61,9 +61,9 @@ impl PciConfigAddress {
     }
 }
 
-use alloc::vec::Vec;
+use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
 use alloc::sync::Arc;
-use crate::device::{Protocol, ProtocolId, ProtocolVersion, DeviceObject};
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PrtEntry {
@@ -72,10 +72,13 @@ pub struct PrtEntry {
     pub gsi: u16,
 }
 
-
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BarKind { None, Io, Mem32, Mem64 }
+pub enum BarKind {
+    None,
+    Io,
+    Mem32,
+    Mem64,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Bar {
@@ -94,8 +97,6 @@ pub struct MsixInfo {
     pub pba_bar: u8,
     pub pba_offset: u32,
 }
-
-
 
 impl Default for Bar {
     fn default() -> Self {

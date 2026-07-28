@@ -304,7 +304,9 @@ pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
         is_in_interrupt: AtomicBool::new(false),
         reserved_interrupt_pad: [0; 0x7],
         cpu_id: lapic_id as u64,
-        reserved0: [0; 0x48],
+        executor_task_id: AtomicU64::new(0),
+        executor_domain_id: AtomicU64::new(0),
+        reserved0: [0; 0x38],
         tls_array_pointer: 0,
     }));
 
@@ -317,7 +319,9 @@ pub struct PerCpu {
     pub is_in_interrupt: AtomicBool, // 0x00
     reserved_interrupt_pad: [u8; 0x7],
     pub cpu_id: u64, // 0x08
-    reserved0: [u8; 0x48],
+    pub executor_task_id: AtomicU64,
+    pub executor_domain_id: AtomicU64,
+    reserved0: [u8; 0x38],
     pub tls_array_pointer: u64, // 0x58
 }
 
@@ -1059,6 +1063,12 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
     let ptr = p as *const PerCpu;
     unsafe {
         (*(ptr as *mut PerCpu)).cpu_id = lapic_id as u64;
+        (*(ptr as *mut PerCpu))
+            .executor_task_id
+            .store(0, Ordering::Relaxed);
+        (*(ptr as *mut PerCpu))
+            .executor_domain_id
+            .store(0, Ordering::Relaxed);
         (*(ptr as *mut PerCpu)).tls_array_pointer = 0;
     }
     unsafe { set_gs_bases(ptr) };

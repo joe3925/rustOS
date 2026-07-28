@@ -1,4 +1,4 @@
-use crate::async_ffi::FfiFuture;
+use crate::async_ffi::AbiFuture;
 use crate::device::DeviceObject;
 use crate::dma::{FromDevice, IoBuffer, ToDevice};
 use crate::fs::{
@@ -1254,7 +1254,7 @@ macro_rules! define_fs_request_operations {
                 handler: Self::Handler,
                 dev: &'a Arc<DeviceObject>,
                 req: &'a mut Fs<'data, Self>,
-            ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>>;
+            ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
         }
 
         $(
@@ -1273,7 +1273,7 @@ macro_rules! define_fs_request_operations {
                     handler: Self::Handler,
                     dev: &'a Arc<DeviceObject>,
                     req: &'a mut Fs<'data, Self>,
-                ) -> FfiFuture<Result<DriverStep, crate::error::KernelError>> {
+                ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>> {
                     handler(dev, req)
                 }
             }

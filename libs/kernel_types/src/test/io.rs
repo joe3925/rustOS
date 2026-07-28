@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use crate::async_ffi::{FfiFuture, FutureExt};
+use crate::async_ffi::{AbiFuture, FutureExt};
 use crate::device::DeviceObject;
 use crate::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use crate::error::{DriverErrorKind, KernelError};
@@ -15,7 +15,7 @@ extern "C" fn read_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut Read<'_>,
     len: usize,
-) -> FfiFuture<Result<DriverStep, KernelError>> {
+) -> AbiFuture<Result<DriverStep, KernelError>> {
     async move {
         if len == 4 {
             Ok(DriverStep::Complete)
@@ -27,29 +27,29 @@ extern "C" fn read_handler(
             ))
         }
     }
-    .into_ffi()
+    .into_abi()
 }
 
 extern "C" fn write_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut Write<'_>,
     _len: usize,
-) -> FfiFuture<Result<DriverStep, KernelError>> {
-    async { Ok(DriverStep::Continue) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Continue) }.into_abi()
 }
 
 extern "C" fn device_control_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut DeviceControl<'_>,
-) -> FfiFuture<Result<DriverStep, KernelError>> {
-    async { Ok(DriverStep::Complete) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Complete) }.into_abi()
 }
 
 extern "C" fn flush_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut Flush,
-) -> FfiFuture<Result<DriverStep, KernelError>> {
-    async { Ok(DriverStep::Complete) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Complete) }.into_abi()
 }
 
 struct TestRead;
@@ -60,7 +60,7 @@ impl DeviceRead for TestRead {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Read<'data>,
-    ) -> FfiFuture<Result<DriverStep, KernelError>> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         let len = request.len;
         read_handler(dev, request, len)
     }
@@ -72,7 +72,7 @@ impl DeviceWrite for TestWrite {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Write<'data>,
-    ) -> FfiFuture<Result<DriverStep, KernelError>> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         let len = request.len;
         write_handler(dev, request, len)
     }
@@ -84,7 +84,7 @@ impl DeviceFlush for TestFlush {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Flush,
-    ) -> FfiFuture<Result<DriverStep, KernelError>> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         flush_handler(dev, request)
     }
 }
@@ -95,7 +95,7 @@ impl DeviceControlHandler for TestDeviceControl {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut DeviceControl<'data>,
-    ) -> FfiFuture<Result<DriverStep, KernelError>> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         device_control_handler(dev, request)
     }
 }

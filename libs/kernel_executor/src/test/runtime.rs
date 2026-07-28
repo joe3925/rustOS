@@ -13,13 +13,13 @@ use crate::global_async::{
     GlobalAsyncExecutor, SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler,
     KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
-use crate::runtime::ffi_spawn::kernel_spawn_ffi_internal;
+use crate::runtime::abi_spawn::kernel_spawn_abi_internal;
 use crate::runtime::runtime::{
     block_on, spawn, spawn_detached, spawn_detached_in_executor_domain, spawn_in_executor_domain,
     JoinAll,
 };
-use crate::runtime::slab::{INLINE_FUTURE_ALIGN, INLINE_FUTURE_SIZE, JOINABLE_STORAGE_SIZE};
-use kernel_types::async_ffi::FutureExt;
+use crate::runtime::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
+use kernel_types::async_ffi::{AbiFuture, FutureExt};
 
 fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
     unsafe fn clone(ptr: *const ()) -> RawWaker {
@@ -206,7 +206,7 @@ impl Future for OverAlignedJoinFuture {
 }
 
 struct LargeDetachedFuture {
-    _padding: [u8; INLINE_FUTURE_SIZE + 1],
+    _padding: [u8; 4097],
     counter: Arc<AtomicUsize>,
 }
 
@@ -401,7 +401,7 @@ fn join_all_polls_ready_queue_after_child_wakes_parent() {
 // thread pool: inline futures, oversized futures, oversized results, and
 // over-aligned futures all have to complete through the same public spawn API.
 #[test]
-fn spawn_joinhandle_completes_inline_and_fallback_storage_paths() {
+fn spawn_joinhandle_completes_small_and_large_arena_storage_paths() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
@@ -479,10 +479,10 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     ));
 }
 
-// This test mirrors the slab wake contract on the Arc fallback path. It prevents
+// This test mirrors the slab wake contract on the large arena-backed path. It prevents
 // the large-future path from depending on eager repolling by block_on/JoinAll.
 #[test]
-fn arc_fallback_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
+fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
@@ -518,7 +518,7 @@ fn arc_fallback_joinhandle_pending_poll_wakes_registered_waiter_on_completion() 
 
     assert!(
         join_wake.wait_for_wakes(1, Duration::from_secs(10)),
-        "Arc fallback JoinHandle was not woken after its child completed"
+        "large arena-backed JoinHandle was not woken after its child completed"
     );
     assert_eq!(completed.load(Ordering::Acquire), 1);
     assert!(matches!(
@@ -582,11 +582,11 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
     ));
 }
 
-// This test protects waker replacement on Arc fallback JoinHandles. The fallback
+// This test protects waker replacement on large arena-backed JoinHandles. The fallback
 // JoinableTask path uses a different waker store than slab slots, so it needs the
 // same stale-waiter check independently.
 #[test]
-fn arc_fallback_joinhandle_completion_uses_latest_registered_waiter() {
+fn joinhandle_completion_uses_latest_registered_waiter() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
@@ -623,12 +623,12 @@ fn arc_fallback_joinhandle_completion_uses_latest_registered_waiter() {
 
     assert!(
         latest_waiter.wait_for_wakes(1, Duration::from_secs(10)),
-        "latest Arc fallback JoinHandle waiter was not woken"
+        "latest large arena-backed JoinHandle waiter was not woken"
     );
     assert_eq!(
         stale_waiter.wake_count(),
         0,
-        "stale Arc fallback JoinHandle waiter was woken after replacement"
+        "stale large arena-backed JoinHandle waiter was woken after replacement"
     );
     assert!(matches!(
         poll_once(&mut handle, &latest_waiter.waker()),
@@ -726,11 +726,11 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
     });
 }
 
-// This test covers the Arc fallback completed-but-unawaited cleanup path. Large
+// This test covers the large arena-backed completed-but-unawaited cleanup path. Large
 // futures store their result in JoinableTask; dropping the unconsumed handle must
 // still drop that result exactly once.
 #[test]
-fn dropping_completed_arc_fallback_joinhandle_drops_unconsumed_result_once() {
+fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
@@ -767,7 +767,7 @@ fn dropping_completed_arc_fallback_joinhandle_drops_unconsumed_result_once() {
     take_child_waker(&child_waker).wake();
     assert!(
         join_wake.wait_for_wakes(1, Duration::from_secs(10)),
-        "Arc fallback JoinHandle did not wake after storing an unconsumed result"
+        "large arena-backed JoinHandle did not wake after storing an unconsumed result"
     );
     assert_eq!(completed.load(Ordering::Acquire), 1);
 
@@ -778,11 +778,11 @@ fn dropping_completed_arc_fallback_joinhandle_drops_unconsumed_result_once() {
     });
 }
 
-// This test covers the Arc fallback pending-then-dropped cleanup path. Dropping
+// This test covers the large arena-backed pending-then-dropped cleanup path. Dropping
 // the JoinHandle must not cancel a large future, and its eventual result must be
 // dropped when the task finishes with no waiter left.
 #[test]
-fn dropping_pending_arc_fallback_joinhandle_drops_result_after_task_finishes() {
+fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
@@ -885,15 +885,15 @@ fn many_joinable_tasks_reschedule_across_core_count_shards() {
     assert_eq!(results.into_iter().sum::<usize>(), expected);
 }
 
-// This test exists to cover detached work on both slab-inline and Arc fallback
+// This test exists to cover detached work on both slab-inline and large arena-backed
 // storage. Detached tasks have no JoinHandle, so completion is observed through
 // shared state instead.
 #[test]
-fn spawn_detached_runs_inline_and_large_fallback_futures() {
+fn spawn_detached_runs_size_class_and_large_direct_futures() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
-    assert!(size_of::<LargeDetachedFuture>() > INLINE_FUTURE_SIZE);
+    assert!(size_of::<LargeDetachedFuture>() > 4096);
 
     let counter = Arc::new(AtomicUsize::new(0));
     let inline_tasks = super::stress_task_count(128);
@@ -906,7 +906,7 @@ fn spawn_detached_runs_inline_and_large_fallback_futures() {
     }
 
     spawn_detached(LargeDetachedFuture {
-        _padding: [0; INLINE_FUTURE_SIZE + 1],
+        _padding: [0; 4097],
         counter: counter.clone(),
     });
 
@@ -916,7 +916,7 @@ fn spawn_detached_runs_inline_and_large_fallback_futures() {
 }
 
 // This test exists to prove that dropping a JoinHandle does not cancel already
-// queued work. It covers both the slab-backed small future and the fallback
+// queued work. It covers both the slab-backed small future and the large-future path
 // oversized future cleanup paths.
 #[test]
 fn dropping_joinhandles_does_not_cancel_queued_work() {
@@ -964,26 +964,116 @@ fn externally_woken_future_is_rescheduled_by_executor_waker() {
     assert_eq!(value, 1);
 }
 
-// This test exists to cover the FFI spawn entrypoint used by external crates.
-// It verifies that an owned FfiFuture is accepted, scheduled as detached work,
+// This test exists to cover the ABI spawn entrypoint used by external crates.
+// It verifies that an owned AbiFuture is accepted, scheduled as detached work,
 // and driven to completion by the same executor backend.
 #[test]
-fn ffi_spawn_internal_runs_owned_ffi_future() {
+fn abi_spawn_internal_runs_owned_abi_future() {
     let _guard = super::global_runtime_lock();
     super::init_threaded_runtime();
 
     let completed = Arc::new(AtomicUsize::new(0));
     let completed_for_future = completed.clone();
-    let future = async move {
-        completed_for_future.fetch_add(1, Ordering::AcqRel);
-    }
-    .into_ffi();
-
-    kernel_spawn_ffi_internal(future);
+    block_on(spawn(async move {
+        let future = async move {
+            completed_for_future.fetch_add(1, Ordering::AcqRel);
+        }
+        .into_abi();
+        kernel_spawn_abi_internal(future);
+    }));
 
     super::wait_until(Duration::from_secs(10), || {
         completed.load(Ordering::Acquire) == 1
     });
+}
+
+struct ContextRecordingFuture {
+    seen_context: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Future for ContextRecordingFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.seen_context
+            .store((cx as *mut Context<'_>) as usize, Ordering::Release);
+        Poll::Ready(())
+    }
+}
+
+impl Drop for ContextRecordingFuture {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct RootAbiProbe {
+    parent_context: Arc<AtomicUsize>,
+    child_context: Arc<AtomicUsize>,
+    child_drops: Arc<AtomicUsize>,
+    child: Option<AbiFuture<()>>,
+}
+
+impl Future for RootAbiProbe {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.parent_context
+            .store((cx as *mut Context<'_>) as usize, Ordering::Release);
+        if self.child.is_none() {
+            self.child = Some(
+                ContextRecordingFuture {
+                    seen_context: self.child_context.clone(),
+                    drops: self.child_drops.clone(),
+                }
+                .into_abi(),
+            );
+        }
+        Pin::new(self.child.as_mut().unwrap()).poll(cx)
+    }
+}
+
+#[test]
+fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let domain_id =
+        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
+    let before = GlobalAsyncExecutor::global()
+        .executor_domain_stats(domain_id)
+        .unwrap();
+    let parent_context = Arc::new(AtomicUsize::new(0));
+    let child_context = Arc::new(AtomicUsize::new(0));
+    let child_drops = Arc::new(AtomicUsize::new(0));
+
+    block_on(spawn_in_executor_domain(
+        domain_id,
+        RootAbiProbe {
+            parent_context: parent_context.clone(),
+            child_context: child_context.clone(),
+            child_drops: child_drops.clone(),
+            child: None,
+        },
+    ));
+
+    super::wait_until(Duration::from_secs(5), || {
+        GlobalAsyncExecutor::global()
+            .executor_domain_stats(domain_id)
+            .is_some_and(|stats| stats.live_task_count == 0)
+    });
+    let after = GlobalAsyncExecutor::global()
+        .executor_domain_stats(domain_id)
+        .unwrap();
+    assert_eq!(
+        parent_context.load(Ordering::Acquire),
+        child_context.load(Ordering::Acquire)
+    );
+    assert_eq!(child_drops.load(Ordering::Acquire), 1);
+    assert_eq!(after.submitted - before.submitted, 1);
+    assert_eq!(after.live_future_count, 0);
+    assert_eq!(after.live_task_count, 0);
 }
 
 // This test exists to hit GlobalAsyncExecutor directly, without going through

@@ -1,4 +1,4 @@
-use kernel_api::async_ffi::FfiFuture;
+use kernel_api::async_ffi::AbiFuture;
 use kernel_api::dma::dma::{IoBufferBacking, IoBufferError};
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
 use kernel_api::request::{Read, Write};
@@ -94,23 +94,23 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
     fn read_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Read<'data>,
-    ) -> FfiFuture<Result<(), Self::Error>>;
+    ) -> AbiFuture<Result<(), Self::Error>>;
 
     fn read_phys_framed<'a, 'buffer>(
         &'a self,
         lba: u64,
         blocks: usize,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> FfiFuture<Result<usize, Self::Error>>;
+    ) -> AbiFuture<Result<usize, Self::Error>>;
 
     fn write_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Write<'data>,
-    ) -> FfiFuture<Result<(), Self::Error>>;
+    ) -> AbiFuture<Result<(), Self::Error>>;
 
-    fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
+    fn flush_device(&self) -> AbiFuture<Result<(), Self::Error>>;
 
-    fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> FfiFuture<Result<(), Self::Error>>;
+    fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> AbiFuture<Result<(), Self::Error>>;
 }
 
 pub trait VolumeCacheOps {
