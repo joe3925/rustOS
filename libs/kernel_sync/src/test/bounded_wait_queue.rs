@@ -26,7 +26,7 @@ fn enqueue_clear_and_already_queued() {
 }
 
 #[test]
-fn capacity_is_enforced_across_tasks() {
+fn capacity_grows_across_tasks() {
     let queue = Arc::new(BoundedWaitQueue::<P>::new(1));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -44,10 +44,12 @@ fn capacity_is_enforced_across_tasks() {
     let second_queue = queue.clone();
     let second = std::thread::spawn(move || {
         result_tx.send(second_queue.enqueue_current()).unwrap();
+        second_queue.clear_current_if_queued();
     });
 
-    assert_eq!(recv_timeout(&result_rx), Err(BoundedWaitQueueError::Full));
-    assert_eq!(queue.wake_all(), 1);
+    assert!(recv_timeout(&result_rx).is_ok());
+    assert_eq!(queue.capacity(), 2);
+    queue.wake_all();
 
     first.join().unwrap();
     second.join().unwrap();

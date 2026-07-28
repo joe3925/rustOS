@@ -91,6 +91,8 @@ pub type MpmcSender<T> = kernel_sync::mpmc::Sender<KernelPlatform, T>;
 pub type MpmcReceiver<T> = kernel_sync::mpmc::Receiver<KernelPlatform, T>;
 pub type BoundedMpmcSender<T> = kernel_sync::bounded_mpmc::BoundedSender<KernelPlatform, T>;
 pub type BoundedMpmcReceiver<T> = kernel_sync::bounded_mpmc::BoundedReceiver<KernelPlatform, T>;
+pub type CompletionPort<T> = kernel_sync::CompletionPort<KernelPlatform, T>;
+pub type CompletionPortPermit<T> = kernel_sync::PortPermit<KernelPlatform, T>;
 pub type ChannelSender<T> = kernel_sync::channel::Sender<KernelPlatform, T>;
 pub type ChannelReceiver<T> = kernel_sync::channel::Receiver<KernelPlatform, T>;
 

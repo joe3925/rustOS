@@ -142,7 +142,7 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
                     continue;
                 }
                 Err(BoundedWaitQueueError::NoCurrentTask) => continue,
-                Err(BoundedWaitQueueError::Full) => {
+                Err(BoundedWaitQueueError::Full | BoundedWaitQueueError::AllocationFailed) => {
                     if let Some(value) = self.inner.queue.try_pop() {
                         return Ok(value);
                     }

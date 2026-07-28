@@ -4,6 +4,7 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
 
 pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 
@@ -352,4 +353,138 @@ fn join_all_take_output<F: Future>(slots: &mut [FutureSlot<F>]) -> Vec<F::Output
     }
 
     out
+}
+
+struct PortFuture<F, P: CompletionPermit<T>, T> {
+    future: F,
+    permit: Option<P>,
+    key: u64,
+    token: usize,
+    completed: bool,
+    _output: PhantomData<T>,
+}
+
+impl<F, P, T> Future for PortFuture<F, P, T>
+where
+    F: Future<Output = T>,
+    P: CompletionPermit<T>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(output) => {
+                this.completed = true;
+                let permit = this.permit.take().expect("completion permit missing");
+                permit.complete(TaskCompletion {
+                    task: TaskToken::from_raw(this.token).expect("invalid task token"),
+                    key: this.key,
+                    outcome: TaskOutcome::Completed(output),
+                });
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl<F, P, T> Drop for PortFuture<F, P, T>
+where
+    P: CompletionPermit<T>,
+{
+    fn drop(&mut self) {
+        if !self.completed {
+            if let (Some(permit), Some(task)) =
+                (self.permit.take(), TaskToken::from_raw(self.token))
+            {
+                permit.complete(TaskCompletion {
+                    task,
+                    key: self.key,
+                    outcome: TaskOutcome::Cancelled,
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnToPortError {
+    InvalidDomain,
+    FutureAllocationFailed,
+    TaskAllocationFailed,
+}
+
+pub fn try_spawn_to_port_in_executor_domain<F, P, T>(
+    domain_id: ExecutorDomainId,
+    future: F,
+    completion_key: u64,
+    permit: P,
+) -> Result<TaskToken, SpawnToPortError>
+where
+    F: Future<Output = T> + Send + 'static,
+    P: CompletionPermit<T>,
+    T: Send + 'static,
+{
+    let domain = GlobalAsyncExecutor::global()
+        .get_executor_domain(domain_id)
+        .ok_or(SpawnToPortError::InvalidDomain)?;
+    let allocation = domain
+        .future_arena()
+        .allocate(
+            core::mem::size_of::<PortFuture<F, P, T>>(),
+            core::mem::align_of::<PortFuture<F, P, T>>(),
+        )
+        .ok_or(SpawnToPortError::FutureAllocationFailed)?;
+    unsafe {
+        allocation
+            .ptr
+            .as_ptr()
+            .cast::<PortFuture<F, P, T>>()
+            .write(PortFuture {
+                future,
+                permit: Some(permit),
+                key: completion_key,
+                token: 0,
+                completed: false,
+                _output: PhantomData,
+            });
+    }
+    let slab = get_task_table();
+    let Some(handle) = slab.allocate() else {
+        unsafe { release_unpublished_future::<PortFuture<F, P, T>>(&domain, allocation) };
+        return Err(SpawnToPortError::TaskAllocationFailed);
+    };
+    let (shard, local, generation) = handle.indices();
+    let Some(token) = TaskToken::from_raw(handle.encoded_ptr()) else {
+        unsafe { release_unpublished_future::<PortFuture<F, P, T>>(&domain, allocation) };
+        return Err(SpawnToPortError::TaskAllocationFailed);
+    };
+    unsafe { (*allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>()).token = token.raw() };
+    let slot = slab
+        .get_slot(shard, local, generation)
+        .expect("reserved task slot disappeared");
+    unsafe { slot.init_abortable::<PortFuture<F, P, T>>(domain_id, allocation) };
+    domain.retain_task();
+    slab.increment_ref(shard, local, generation);
+    submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, handle.encoded_ptr());
+    Ok(token)
+}
+
+pub fn abort_task(token: TaskToken) -> bool {
+    let Some((shard, local, generation)) = super::slab::decode_slab_task_ptr(token.raw()) else {
+        return false;
+    };
+    let slab = get_task_table();
+    if !slab.increment_ref(shard, local, generation) {
+        return false;
+    }
+    let result = slab
+        .get_slot(shard, local, generation)
+        .is_some_and(|slot| slot.request_abort());
+    if result {
+        super::slab::enqueue_slab_task(shard, local, generation);
+    }
+    slab.decrement_ref(shard, local, generation);
+    result
 }

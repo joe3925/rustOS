@@ -18,6 +18,7 @@ pub mod async_types;
 pub mod bench_archive;
 pub mod benchmark;
 pub mod bounded_mpmc;
+pub mod completion;
 pub mod device;
 pub mod dma;
 pub mod error;

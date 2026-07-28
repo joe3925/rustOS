@@ -4,11 +4,12 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
+use kernel_types::completion::TaskToken;
 
 use kernel_types::dma::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
@@ -413,24 +414,29 @@ impl KernelIoOp {
 }
 
 pub struct IoRequestSlot {
+    pub generation: core::sync::atomic::AtomicU32,
     pub request_id: core::sync::atomic::AtomicU64,
     pub state: core::sync::atomic::AtomicU8,
-    pub waker: Mutex<Option<Waker>>,
+    pub task: core::sync::atomic::AtomicUsize,
 }
 
 impl IoRequestSlot {
     pub fn new() -> Self {
         Self {
             request_id: core::sync::atomic::AtomicU64::new(0),
+            generation: core::sync::atomic::AtomicU32::new(0),
             state: core::sync::atomic::AtomicU8::new(IoRequestState::Free as u8),
-            waker: Mutex::new(None),
+            task: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
 
 pub struct IoRequestTable {
-    slots: Vec<IoRequestSlot>,
-    next_request_id: core::sync::atomic::AtomicU64,
+    slots: RwLock<Vec<Arc<IoRequestSlot>>>,
+    initial_capacity: usize,
+    next_generation: core::sync::atomic::AtomicU32,
+    live: core::sync::atomic::AtomicUsize,
+    maintenance: core::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,43 +456,63 @@ impl IoRequestTable {
     pub fn new(capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            slots.push(IoRequestSlot::new());
+            slots.push(Arc::new(IoRequestSlot::new()));
         }
 
         Self {
-            slots,
-            next_request_id: core::sync::atomic::AtomicU64::new(1),
+            slots: RwLock::new(slots),
+            initial_capacity: capacity,
+            next_generation: core::sync::atomic::AtomicU32::new(1),
+            live: core::sync::atomic::AtomicUsize::new(0),
+            maintenance: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
     pub fn capacity(&self) -> usize {
-        self.slots.len()
+        self.slots.read().len()
     }
 
     pub fn allocate(&self) -> Result<RequestId, RequestTableError> {
         use core::sync::atomic::Ordering;
 
-        for slot in &self.slots {
-            if slot
-                .state
-                .compare_exchange(
-                    IoRequestState::Free as u8,
-                    IoRequestState::Submitted as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
+        loop {
+            let slots = self.slots.read();
+            for (index, slot) in slots.iter().enumerate() {
+                if slot
+                    .state
+                    .compare_exchange(
+                        IoRequestState::Free as u8,
+                        IoRequestState::Submitted as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+
+                let generation = self.next_generation.fetch_add(1, Ordering::AcqRel).max(1);
+                slot.generation.store(generation, Ordering::Release);
+                let request_id = ((generation as u64) << 32) | ((index as u64) + 1);
+                slot.request_id.store(request_id, Ordering::Release);
+                slot.task.store(0, Ordering::Release);
+                self.live.fetch_add(1, Ordering::AcqRel);
+                return Ok(request_id);
+            }
+            let current = slots.len();
+            drop(slots);
+            let add = current.div_ceil(2).max(1);
+            let mut slots = self.slots.write();
+            if slots.len() != current {
                 continue;
             }
-
-            let request_id = self.next_request_id.fetch_add(1, Ordering::AcqRel);
-            slot.request_id.store(request_id, Ordering::Release);
-            *slot.waker.lock() = None;
-            return Ok(request_id);
+            if slots.try_reserve(add).is_err() {
+                return Err(RequestTableError::Full);
+            }
+            for _ in 0..add {
+                slots.push(Arc::new(IoRequestSlot::new()));
+            }
         }
-
-        Err(RequestTableError::Full)
     }
 
     pub fn mark_running_or_cancelled(
@@ -547,7 +573,7 @@ impl IoRequestTable {
                 )
                 .is_ok()
             {
-                *slot.waker.lock() = None;
+                slot.task.store(0, Ordering::Release);
                 return Ok(transition);
             }
         }
@@ -571,8 +597,8 @@ impl IoRequestTable {
                         )
                         .is_ok()
                     {
-                        if let Some(waker) = slot.waker.lock().take() {
-                            waker.wake();
+                        if let Some(task) = TaskToken::from_raw(slot.task.load(Ordering::Acquire)) {
+                            let _ = kernel_executor::runtime::runtime::abort_task(task);
                         }
                         return Ok(());
                     }
@@ -588,7 +614,8 @@ impl IoRequestTable {
     pub fn cancel_all(&self) {
         use core::sync::atomic::Ordering;
 
-        for slot in &self.slots {
+        let slots = self.slots.read();
+        for slot in slots.iter() {
             loop {
                 let state = IoRequestState::from_u8(slot.state.load(Ordering::Acquire));
                 match state {
@@ -603,8 +630,10 @@ impl IoRequestTable {
                             )
                             .is_ok()
                         {
-                            if let Some(waker) = slot.waker.lock().take() {
-                                waker.wake();
+                            if let Some(task) =
+                                TaskToken::from_raw(slot.task.load(Ordering::Acquire))
+                            {
+                                let _ = kernel_executor::runtime::runtime::abort_task(task);
                             }
                             break;
                         }
@@ -615,14 +644,14 @@ impl IoRequestTable {
         }
     }
 
-    pub fn set_waker(&self, request_id: RequestId, waker: &Waker) {
+    pub fn install_task(&self, request_id: RequestId, task: TaskToken) {
+        use core::sync::atomic::Ordering;
         if let Ok(slot) = self.find_slot(request_id) {
-            let mut guard = slot.waker.lock();
-            if guard
-                .as_ref()
-                .is_none_or(|current| !current.will_wake(waker))
+            slot.task.store(task.raw(), Ordering::Release);
+            if IoRequestState::from_u8(slot.state.load(Ordering::Acquire))
+                == IoRequestState::CancelRequested
             {
-                *guard = Some(waker.clone());
+                let _ = kernel_executor::runtime::runtime::abort_task(task);
             }
         }
     }
@@ -645,22 +674,82 @@ impl IoRequestTable {
             .is_ok()
         {
             slot.request_id.store(0, Ordering::Release);
-            *slot.waker.lock() = None;
+            slot.task.store(0, Ordering::Release);
             slot.state
                 .store(IoRequestState::Free as u8, Ordering::Release);
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            self.shrink_if_underused();
         }
     }
 
-    fn find_slot(&self, request_id: RequestId) -> Result<&IoRequestSlot, RequestTableError> {
+    pub fn reap_submitted(&self, request_id: RequestId) {
+        use core::sync::atomic::Ordering;
+        let Ok(slot) = self.find_slot(request_id) else {
+            return;
+        };
+        if slot
+            .state
+            .compare_exchange(
+                IoRequestState::Submitted as u8,
+                IoRequestState::Free as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            slot.task.store(0, Ordering::Release);
+            slot.request_id.store(0, Ordering::Release);
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            self.shrink_if_underused();
+        }
+    }
+
+    fn shrink_if_underused(&self) {
+        use core::sync::atomic::Ordering;
+        let capacity = self.capacity();
+        let live = self.live.load(Ordering::Acquire);
+        if capacity <= self.initial_capacity || live.saturating_mul(2) > capacity {
+            return;
+        }
+        if self.maintenance.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let target = capacity
+            .saturating_sub(capacity.div_ceil(4))
+            .max(self.initial_capacity)
+            .max(live);
+        let mut slots = self.slots.write();
+        while slots.len() > target {
+            let removable = slots.last().is_some_and(|slot| {
+                slot.state.load(Ordering::Acquire) == IoRequestState::Free as u8
+            });
+            if !removable {
+                break;
+            }
+            slots.pop();
+        }
+        self.maintenance.store(false, Ordering::Release);
+    }
+
+    fn find_slot(&self, request_id: RequestId) -> Result<Arc<IoRequestSlot>, RequestTableError> {
         use core::sync::atomic::Ordering;
 
-        for slot in &self.slots {
-            if slot.request_id.load(Ordering::Acquire) == request_id {
-                return Ok(slot);
-            }
+        let raw_index = request_id as u32;
+        if raw_index == 0 {
+            return Err(RequestTableError::NotFound);
         }
-
-        Err(RequestTableError::NotFound)
+        let index = raw_index as usize - 1;
+        let slot = self
+            .slots
+            .read()
+            .get(index)
+            .cloned()
+            .ok_or(RequestTableError::NotFound)?;
+        if slot.request_id.load(Ordering::Acquire) == request_id {
+            Ok(slot)
+        } else {
+            Err(RequestTableError::NotFound)
+        }
     }
 }
 fn kernel_error_status(error: KernelError) -> u64 {
