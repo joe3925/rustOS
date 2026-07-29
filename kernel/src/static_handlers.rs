@@ -635,11 +635,6 @@ pub extern "C" fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usi
     GlobalAsyncExecutor::global().submit(trampoline, ctx);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_async_set_parallelism(n: usize) {
-    todo!();
-}
-
 static BENCH_WINDOWS: Once<Mutex<BTreeMap<u32, BenchWindow>>> = Once::new();
 static NEXT_BENCH_WINDOW: AtomicU32 = AtomicU32::new(1);
 

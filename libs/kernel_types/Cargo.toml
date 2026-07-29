@@ -12,17 +12,8 @@ crate-type = ["rlib"]
 [dependencies]
 kernel_macros = { path = "../kernel_macros" }
 
-strum = { version = "0.24", default-features = false, features = ["derive"] }
 acpi = "5.0.0"
 spin = "0.10.0"
-bincode = { version = "2.0.1", default-features = false, features = [
-    "alloc",
-    "derive",
-] }
-crossbeam-queue = { version = "0.3", default-features = false, features = [
-    "alloc",
-] }
-array-init = "2.0.0"
 prost = { version = "0.14.3", default-features = false, features = ["derive"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

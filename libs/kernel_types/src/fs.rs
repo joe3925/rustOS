@@ -1,11 +1,7 @@
 use crate::dma::{FromDevice, IoBuffer, ToDevice};
 use crate::error::KernelError;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::hint::black_box;
-use core::ptr;
-use core::sync::atomic::AtomicU64;
 use kernel_macros;
 #[repr(C)]
 pub struct File {

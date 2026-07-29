@@ -315,7 +315,7 @@ async fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
 
 async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
     let old_size = file.seek(SeekFrom::End(0)).await?;
-    if new_size as u32 > u32::MAX {
+    if new_size > u32::MAX as u64 {
         return Err(FsError::FileTooLarge);
     }
     if new_size <= old_size {

@@ -447,9 +447,8 @@ where
     }
 
     #[inline]
-    unsafe fn page_slice_mut(&self, page: &CachePage) -> &mut [u8] {
-        let ptr = (self.cache_base.as_u64() as usize + Self::page_offset(page.slot)) as *mut u8;
-        unsafe { core::slice::from_raw_parts_mut(ptr, BLOCK_SIZE) }
+    fn page_ptr(&self, page: &CachePage) -> *mut u8 {
+        (self.cache_base.as_u64() as usize + Self::page_offset(page.slot)) as *mut u8
     }
 
     fn create_cache_from_device_buffer_at<'a>(
@@ -926,7 +925,8 @@ where
             cold_path();
             let _data_guard = page.data_lock.write();
             unsafe {
-                self.page_slice_mut(page)[bytes_read..].fill(0);
+                core::slice::from_raw_parts_mut(self.page_ptr(page), BLOCK_SIZE)[bytes_read..]
+                    .fill(0);
             }
         }
 
@@ -1042,7 +1042,8 @@ where
             cold_path();
             let _data_guard = page.data_lock.write();
             unsafe {
-                self.page_slice_mut(page)[bytes_read..].fill(0);
+                core::slice::from_raw_parts_mut(self.page_ptr(page), BLOCK_SIZE)[bytes_read..]
+                    .fill(0);
             }
         }
 
@@ -1205,7 +1206,10 @@ where
             {
                 let _guard = page.data_lock.write();
                 let destination =
-                    unsafe { &mut self.page_slice_mut(&page)[block_off..block_off + take] };
+                    unsafe {
+                        &mut core::slice::from_raw_parts_mut(self.page_ptr(&page), BLOCK_SIZE)
+                            [block_off..block_off + take]
+                    };
                 if let Err(err) = remaining
                     .as_ref()
                     .expect("direct write buffer disappeared")
@@ -2136,10 +2140,8 @@ where
                 WriteAcquire::Cached(page) => {
                     let bits = Self::granule_mask_for_range(block_off, take)?;
 
-                    while page.writeback_mask.load(Ordering::Acquire) & bits != 0 {
-                        match cache.wait_for_writeback_progress(&FlushFilter::All).await {
-                            WritebackWaitResult::Clean | WritebackWaitResult::NeedsFlush => break,
-                        }
+                    if page.writeback_mask.load(Ordering::Acquire) & bits != 0 {
+                        cache.wait_for_writeback_progress(&FlushFilter::All).await;
                     }
 
                     if !Self::range_covers_whole_granules(block_off, take) {
@@ -2151,7 +2153,10 @@ where
                     {
                         let _guard = page.data_lock.write();
                         let destination = unsafe {
-                            &mut cache.page_slice_mut(&page)[block_off..block_off + take]
+                            &mut core::slice::from_raw_parts_mut(
+                                cache.page_ptr(&page),
+                                BLOCK_SIZE,
+                            )[block_off..block_off + take]
                         };
                         remaining
                             .as_ref()

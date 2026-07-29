@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::{
     env, fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 #[derive(Deserialize)]

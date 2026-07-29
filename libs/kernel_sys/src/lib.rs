@@ -160,9 +160,6 @@ unsafe extern "C" {
     pub fn fs_list_dir(path: &Path) -> AbiFuture<Result<Vec<String>, KernelError>>;
     pub fn fs_remove_dir(path: &Path) -> AbiFuture<Result<(), KernelError>>;
     pub fn fs_make_dir(path: &Path) -> AbiFuture<Result<(), KernelError>>;
-    pub fn file_read(file: &File) -> AbiFuture<Result<Vec<u8>, KernelError>>;
-    pub fn file_write(file: &mut File, data: &[u8]) -> AbiFuture<Result<(), KernelError>>;
-    pub fn file_delete(file: &mut File) -> AbiFuture<Result<(), KernelError>>;
     pub fn vfs_notify_label_published(
         label_ptr: *const u8,
         label_len: usize,

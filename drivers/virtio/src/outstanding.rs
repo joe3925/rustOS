@@ -120,11 +120,6 @@ where
         })
     }
 
-    #[inline]
-    pub(crate) fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
     pub(crate) fn alloc<'pool, 'data>(&'pool self) -> Option<PendingOpLease<'pool, 'data, D>> {
         let capacity = self.slots.len();
         if capacity == 0 {
@@ -167,7 +162,7 @@ where
 
     unsafe fn drop_initialized<'data>(&self, index: usize) {
         unsafe {
-            core::ptr::drop_in_place(self.ptr::<'data>(index));
+            core::ptr::drop_in_place(self.ptr(index));
         }
         self.release(index);
     }
@@ -187,7 +182,7 @@ where
         assert!(!self.initialized);
 
         unsafe {
-            self.pool.ptr::<'data>(self.index).write(op);
+            self.pool.ptr(self.index).write(op);
         }
         self.initialized = true;
         self.pool.slots[self.index]
@@ -215,7 +210,7 @@ where
 
         if self.initialized {
             unsafe {
-                self.pool.drop_initialized::<'data>(self.index);
+                self.pool.drop_initialized(self.index);
             }
         } else {
             self.pool.release(self.index);
@@ -262,7 +257,7 @@ where
     #[inline]
     pub(crate) fn get(&self, index: usize) -> &PendingBlockOp<'data, D> {
         assert!(index < self.len as usize);
-        unsafe { &*self.pool.ptr::<'data>(self.indices[index] as usize) }
+        unsafe { &*self.pool.ptr(self.indices[index] as usize) }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -271,7 +266,7 @@ where
             let index = self.indices[self.len as usize] as usize;
             self.indices[self.len as usize] = u16::MAX;
             unsafe {
-                self.pool.drop_initialized::<'data>(index);
+                self.pool.drop_initialized(index);
             }
         }
     }
@@ -302,11 +297,6 @@ impl SubmittedCompletionPool {
             slots: slots.into_boxed_slice(),
             cursor: AtomicUsize::new(0),
         })
-    }
-
-    #[inline]
-    pub(crate) fn capacity(&self) -> usize {
-        self.slots.len()
     }
 
     pub(crate) fn alloc<'pool, 'completion>(
@@ -355,14 +345,14 @@ impl SubmittedCompletionPool {
         &self,
         index: usize,
     ) -> SubmittedCompletion<'completion> {
-        let value = unsafe { self.ptr::<'completion>(index).read() };
+        let value = unsafe { self.ptr(index).read() };
         self.release(index);
         value
     }
 
     unsafe fn drop_initialized<'completion>(&self, index: usize) {
         unsafe {
-            core::ptr::drop_in_place(self.ptr::<'completion>(index));
+            core::ptr::drop_in_place(self.ptr(index));
         }
         self.release(index);
     }
@@ -379,7 +369,7 @@ impl<'pool, 'completion> SubmittedCompletionLease<'pool, 'completion> {
         assert!(!self.initialized);
 
         unsafe {
-            self.pool.ptr::<'completion>(self.index).write(submitted);
+            self.pool.ptr(self.index).write(submitted);
         }
         self.initialized = true;
         self.pool.slots[self.index]
@@ -404,7 +394,7 @@ impl<'pool, 'completion> Drop for SubmittedCompletionLease<'pool, 'completion> {
 
         if self.initialized {
             unsafe {
-                self.pool.drop_initialized::<'completion>(self.index);
+                self.pool.drop_initialized(self.index);
             }
         } else {
             self.pool.release(self.index);
@@ -447,7 +437,7 @@ impl<'pool, 'completion> SubmittedCompletionBatch<'pool, 'completion> {
         self.len -= 1;
         let index = self.indices[self.len as usize] as usize;
         self.indices[self.len as usize] = u16::MAX;
-        Some(unsafe { self.pool.take_initialized::<'completion>(index) })
+        Some(unsafe { self.pool.take_initialized(index) })
     }
 
     pub(crate) fn clear(&mut self) {
@@ -456,7 +446,7 @@ impl<'pool, 'completion> SubmittedCompletionBatch<'pool, 'completion> {
             let index = self.indices[self.len as usize] as usize;
             self.indices[self.len as usize] = u16::MAX;
             unsafe {
-                self.pool.drop_initialized::<'completion>(index);
+                self.pool.drop_initialized(index);
             }
         }
     }

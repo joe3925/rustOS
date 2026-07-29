@@ -1,12 +1,11 @@
-use crate::blk::{SubmitRequestError, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+use crate::blk::{SubmitRequestError, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 use crate::dev_ext::{ChildExt, DevExt, DevExtInner, QueueState};
 use crate::outstanding::{
     PendingBlockOp, PendingOpBatch, PendingOpLease, PendingOpPool, SubmittedCompletion,
     SubmittedCompletionBatch, VIRTIO_QUEUE_BATCH_LIMIT,
 };
 use crate::{
-    IOCTL_BLOCK_FLUSH, SubmitTasksGuard, check_blk_status, drain_queue_completions,
-    map_request_buffer, wait_completion_hybrid,
+    check_blk_status, drain_queue_completions, map_request_buffer, wait_completion_hybrid,
 };
 use alloc::format;
 use alloc::sync::Arc;
@@ -71,123 +70,6 @@ impl DeviceControlHandler for VirtioPdoIo {
         ))
         //virtio_pdo_ioctl_impl(pdo, req).await
     }
-}
-
-async fn submit_virtio_no_data_request(
-    inner: &DevExtInner,
-    qs: &QueueState,
-    req_type: u32,
-    operation: &str,
-) -> Result<(), KernelError> {
-    let completion = loop {
-        let completion = match qs.completion_slots.alloc() {
-            Some(completion) => completion,
-            None => {
-                cold_path();
-
-                let drained = drain_queue_completions(qs);
-                if unlikely(drained == 0) {
-                    let mut done = false;
-                    core::future::poll_fn(|cx| {
-                        if done {
-                            core::task::Poll::Ready(())
-                        } else {
-                            done = true;
-                            cx.waker().wake_by_ref();
-                            core::task::Poll::Pending
-                        }
-                    })
-                    .await;
-                }
-
-                continue;
-            }
-        };
-
-        let mut completion = Some(completion);
-        let submitted = {
-            let mut vq = qs.queue.write();
-            match qs.arena.submit_request(
-                &mut vq,
-                req_type,
-                0,
-                core::iter::empty::<IoBufferDmaSegment>(),
-                false,
-            ) {
-                Ok(h) => {
-                    qs.completion_slots
-                        .attach(h, completion.as_ref().expect("completion missing"));
-                    let queue_full = vq.num_free == 0;
-                    let _submit_guard = SubmitTasksGuard::new(
-                        &qs.submitting_tasks,
-                        &vq,
-                        inner.notify_base,
-                        inner.notify_off_multiplier,
-                        queue_full,
-                    );
-                    true
-                }
-                Err(SubmitRequestError::QueueFull) => {
-                    cold_path();
-                    unsafe { vq.notify(inner.notify_base, inner.notify_off_multiplier) };
-                    false
-                }
-                Err(SubmitRequestError::TooManyDataSegments) => {
-                    cold_path();
-                    return Err(error_with_message(
-                        DriverErrorKind::DeviceError,
-                        format_args!("virtio-blk: {operation} request has too many DMA segments"),
-                    ));
-                }
-            }
-        };
-
-        if submitted {
-            break completion.take().expect("completion missing");
-        }
-
-        let mut done = false;
-        core::future::poll_fn(|cx| {
-            if done {
-                core::task::Poll::Ready(())
-            } else {
-                done = true;
-                cx.waker().wake_by_ref();
-                core::task::Poll::Pending
-            }
-        })
-        .await;
-    };
-
-    match wait_completion_hybrid(qs, completion, 0).await {
-        Ok(device_status) => check_blk_status(operation, device_status),
-        Err(_) => Err(error_with_message(
-            DriverErrorKind::DeviceError,
-            format_args!(
-                "virtio-blk: {operation} failed: completion canceled before device status"
-            ),
-        )),
-    }
-}
-
-async fn flush_virtio_cache(pdo: &Arc<DeviceObject>) -> Result<(), KernelError> {
-    let (_parent, inner) = match get_parent_inner(pdo) {
-        Ok(v) => v,
-        Err(s) => {
-            cold_path();
-            return Err(error(s)).with_context(|| "locating the virtio block device for flush");
-        }
-    };
-
-    if unlikely(!inner.flush_supported) {
-        cold_path();
-        return Err(error(DriverErrorKind::NotImplemented))
-            .with_context(|| "flushing a virtio block device without flush support");
-    }
-
-    let queue_idx = inner.select_queue();
-    let qs = inner.get_queue(queue_idx);
-    submit_virtio_no_data_request(&inner, qs, VIRTIO_BLK_T_FLUSH, "flush").await
 }
 
 fn get_parent_inner(

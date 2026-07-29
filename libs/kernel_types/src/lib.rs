@@ -1,11 +1,8 @@
 #![no_std]
-#![feature(variant_count)]
-#![feature(try_trait_v2)]
 #![feature(const_type_name)]
 #![allow(static_mut_refs)]
 #![feature(generic_const_exprs)]
 #![feature(specialization)]
-#![feature(try_trait_v2_residual)]
 #![feature(lazy_type_alias)]
 #![feature(allocator_api)]
 extern crate alloc;

@@ -30,7 +30,7 @@ use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU64;
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
@@ -180,26 +180,6 @@ pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
         Some(ns.max(COMPLETION_POLL_MIN_NS) as usize)
     }
 }
-#[inline]
-fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64 {
-    if unlikely(frequency_hz == 0) {
-        cold_path();
-        return 0;
-    }
-
-    let nanos = duration.as_nanos();
-    if unlikely(nanos == 0) {
-        cold_path();
-        return 0;
-    }
-
-    let cycles = nanos
-        .saturating_mul(frequency_hz as u128)
-        .saturating_add(999_999_999)
-        / 1_000_000_000;
-    cycles.min(u64::MAX as u128) as u64
-}
-
 pub(crate) async fn wait_completion_hybrid<F>(
     qs: &QueueState,
     completion: F,
@@ -680,16 +660,16 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             }
         };
 
-        let (irq_handle, msix_vector, msix_table_index) = if use_msix && i < msix_allocations.len()
+        let (irq_handle, msix_vector) = if use_msix && i < msix_allocations.len()
         {
             match msix_allocations[i].take() {
-                Some((vec, handle, table_idx)) => (Some(handle), Some(vec), Some(table_idx)),
-                None => (None, None, None),
+                Some((vec, handle, _table_idx)) => (Some(handle), Some(vec)),
+                None => (None, None),
             }
         } else if i == 0 && !use_msix {
-            (line_irq_handle.clone(), None, None)
+            (line_irq_handle.clone(), None)
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         let vq_capacity = vq.size as usize;
@@ -842,9 +822,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             arena,
             irq_handle: UnsafeCell::new(irq_handle),
             msix_vector,
-            msix_table_index,
-            submitting_tasks: AtomicU32::new(0),
-            use_indirect: init_result.indirect_desc_supported,
             completion_slots,
             read_ops,
             write_ops,
@@ -892,14 +869,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         ));
     }
 
-    let msix_pba = match msix_cap {
-        Some(cap) if use_msix => mapped_bars
-            .iter()
-            .find(|(idx, _, _)| *idx == cap.pba_bar as u32)
-            .map(|(_, va, _)| VirtAddr::new(va.as_u64() + cap.pba_offset as u64)),
-        _ => None,
-    };
-
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
     let bar_list: Vec<(u32, VirtAddr, u64)> = mapped_bars.iter().copied().collect();
 
@@ -908,17 +877,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             common_cfg: caps.common_cfg,
             notify_base: caps.notify_base,
             notify_off_multiplier: caps.notify_off_multiplier,
-            isr_cfg: caps.isr_cfg,
-            device_cfg: caps.device_cfg,
             queues: queue_states,
             queue_count: final_queue_count,
             queue_strategy: QueueSelectionStrategy::RoundRobin,
             rr_counter: AtomicUsize::new(0),
             capacity: init_result.capacity,
             mapped_bars: Mutex::new(bar_list),
-            msix_pba,
-            indirect_desc_enabled: init_result.indirect_desc_supported,
-            flush_supported: init_result.flush_supported,
         })
     });
 
@@ -1051,41 +1015,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
 
 /// Tracks concurrent submitters on a queue so only the last one kicks.
 /// Notify happens automatically in Drop — no manual finish call required.
-pub(crate) struct SubmitTasksGuard<'a> {
-    counter: &'a AtomicU32,
-    vq: &'a Virtqueue,
-    notify_base: VirtAddr,
-    notify_off_multiplier: u32,
-    force_notify: bool,
-}
-impl<'a> SubmitTasksGuard<'a> {
-    #[inline]
-    fn new(
-        counter: &'a AtomicU32,
-        vq: &'a Virtqueue,
-        notify_base: VirtAddr,
-        notify_off_multiplier: u32,
-        force_notify: bool,
-    ) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self {
-            counter,
-            vq,
-            notify_base,
-            notify_off_multiplier,
-            force_notify,
-        }
-    }
-}
-impl<'a> Drop for SubmitTasksGuard<'a> {
-    fn drop(&mut self) {
-        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
-        if likely(self.force_notify || prev == 1) {
-            unsafe { self.vq.notify(self.notify_base, self.notify_off_multiplier) };
-        }
-    }
-}
-
 pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
     if likely(!qs.has_pending_used()) {
         return 0;
@@ -1141,8 +1070,6 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
         drain_queue_completions(qs);
     }
 }
-
-pub(crate) const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 
 #[request_handler]
 pub async fn virtio_pdo_start<'req, 'data, 'b>(

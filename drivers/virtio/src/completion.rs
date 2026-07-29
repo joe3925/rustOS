@@ -330,55 +330,6 @@ impl CompletionTable {
         }
     }
 
-    fn try_recv_token(
-        &self,
-        cell_idx: u16,
-        generation: u32,
-    ) -> Result<Option<u8>, CompletionError> {
-        let mut ready = None;
-
-        {
-            let cell = &self.cells[cell_idx as usize];
-            let mut state = cell.state.lock();
-            if unlikely(state.generation != generation) {
-                cold_path();
-                return Err(CompletionError::Canceled);
-            }
-
-            match state.phase {
-                PHASE_COMPLETE => {
-                    ready = Some(Ok(state.status));
-                    state.status = 0xFF;
-                    state.phase = PHASE_FREE;
-                    state.waker = None;
-                }
-                PHASE_CANCELED => {
-                    ready = Some(Err(CompletionError::Canceled));
-                    state.status = 0xFF;
-                    state.phase = PHASE_FREE;
-                    state.waker = None;
-                }
-                PHASE_WAITING | PHASE_ALLOCATED => {}
-                _ => {
-                    cold_path();
-                    return Err(CompletionError::Canceled);
-                }
-            }
-        }
-
-        match ready {
-            Some(Ok(status)) => {
-                self.push_free(cell_idx);
-                Ok(Some(status))
-            }
-            Some(Err(err)) => {
-                self.push_free(cell_idx);
-                Err(err)
-            }
-            None => Ok(None),
-        }
-    }
-
     fn drop_token(&self, cell_idx: u16, generation: u32) {
         let mut should_free = false;
 
@@ -429,27 +380,6 @@ pub struct CompletionToken<'a> {
     cell_idx: u16,
     generation: u32,
     active: bool,
-}
-
-impl CompletionToken<'_> {
-    pub fn try_recv(&mut self) -> Result<Option<u8>, CompletionError> {
-        if unlikely(!self.active) {
-            cold_path();
-            return Err(CompletionError::Canceled);
-        }
-
-        match self.table.try_recv_token(self.cell_idx, self.generation) {
-            Ok(Some(status)) => {
-                self.active = false;
-                Ok(Some(status))
-            }
-            Err(err) => {
-                self.active = false;
-                Err(err)
-            }
-            Ok(None) => Ok(None),
-        }
-    }
 }
 
 impl Future for CompletionToken<'_> {

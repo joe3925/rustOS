@@ -14,19 +14,5 @@ test = false
 [package.metadata.rustos-driver]
 configuration = "src/i8042.toml"
 
-[profile.dev]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
-
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
-
 [dependencies]
 kernel_api = { workspace = true }
-bitflags = "2.6.0"
-spin = { version = "0.10", default-features = false, features = ["mutex"] }
