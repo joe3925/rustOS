@@ -31,6 +31,7 @@ pub const VIRTIO_BLK_S_OK: u8 = 0;
 pub const VIRTIO_BLK_S_IOERR: u8 = 1;
 pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
+pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 /// Mandatory for modern virtio-pci devices.
 pub const VIRTIO_F_VERSION_1: u64 = 1u64 << 32;
 
@@ -99,6 +100,7 @@ pub(crate) unsafe fn init_device(
     // Check for feature support
     let mq_supported = (dev_features & VIRTIO_BLK_F_MQ) != 0;
     let indirect_supported = (dev_features & VIRTIO_F_INDIRECT_DESC) != 0;
+    let flush_supported = (dev_features & VIRTIO_BLK_F_FLUSH) != 0;
     let access_platform_supported = (dev_features & VIRTIO_F_ACCESS_PLATFORM) != 0;
 
     if unlikely(!access_platform_supported) {
@@ -116,6 +118,9 @@ pub(crate) unsafe fn init_device(
     }
     if indirect_supported {
         supported_features |= VIRTIO_F_INDIRECT_DESC;
+    }
+    if flush_supported {
+        supported_features |= VIRTIO_BLK_F_FLUSH;
     }
     let driver_features = dev_features & supported_features;
 
