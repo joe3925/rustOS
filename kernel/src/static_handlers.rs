@@ -5,8 +5,8 @@ use core::{
 };
 use kernel_executor::global_async::GlobalAsyncExecutor;
 use kernel_executor::runtime::runtime::{
-    block_on as kernel_block_on, spawn as kernel_spawn, spawn_blocking as kernel_spawn_blocking,
-    spawn_detached as kernel_spawn_detached,
+    block_on as kernel_block_on, spawn_blocking as kernel_spawn_blocking,
+    spawn_detached as kernel_spawn_detached, spawn_join_owned as kernel_spawn,
 };
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::IoBufferBacking;

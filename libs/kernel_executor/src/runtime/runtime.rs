@@ -1,7 +1,8 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
@@ -14,6 +15,7 @@ use crate::platform::{platform, Job};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
 
+use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
 use super::slab::{get_task_table, slab_task_poll_trampoline};
 
 pub(crate) fn submit_global(trampoline: extern "C" fn(usize), ctx: usize) {
@@ -107,15 +109,52 @@ where
     }
 }
 
-pub fn spawn<F, T>(future: F) -> JoinHandle<T>
+pub struct JoinStorage<T> {
+    output: UnsafeCell<MaybeUninit<T>>,
+    _pin: core::marker::PhantomPinned,
+}
+
+impl<T> JoinStorage<T> {
+    pub const fn new() -> Self {
+        Self {
+            output: UnsafeCell::new(MaybeUninit::uninit()),
+            _pin: core::marker::PhantomPinned,
+        }
+    }
+
+    pub(crate) unsafe fn write(&self, output: T) {
+        (*self.output.get()).write(output);
+    }
+
+    unsafe fn take(&self) -> T {
+        (*self.output.get()).assume_init_read()
+    }
+
+    unsafe fn drop_output(&self) {
+        (*self.output.get()).assume_init_drop();
+    }
+}
+
+unsafe impl<T: Send> Send for JoinStorage<T> {}
+unsafe impl<T: Send> Sync for JoinStorage<T> {}
+
+pub fn spawn<'a, F, T>(storage: Pin<&'a mut JoinStorage<T>>, future: F) -> JoinHandle<'a, T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    spawn_in_executor_domain(crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN, future)
+    spawn_in_executor_domain(
+        crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN,
+        storage,
+        future,
+    )
 }
 
-pub fn spawn_in_executor_domain<F, T>(domain_id: ExecutorDomainId, future: F) -> JoinHandle<T>
+pub fn spawn_in_executor_domain<'a, F, T>(
+    domain_id: ExecutorDomainId,
+    storage: Pin<&'a mut JoinStorage<T>>,
+    future: F,
+) -> JoinHandle<'a, T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -142,7 +181,8 @@ where
     let slot = slab
         .get_slot(shard_idx, local_idx, generation)
         .expect("reserved task slot disappeared before initialization");
-    unsafe { slot.init::<F, T>(domain_id, allocation) };
+    let storage_ptr = unsafe { storage.get_unchecked_mut() as *mut JoinStorage<T> };
+    unsafe { slot.init_joinable::<F, T>(domain_id, allocation, storage_ptr) };
     domain.retain_task();
 
     slab.increment_ref(shard_idx, local_idx, generation);
@@ -156,19 +196,23 @@ where
         local_idx: local_idx as u16,
         generation,
         consumed: false,
+        storage: storage_ptr,
         _marker: PhantomData,
     }
 }
 
-pub struct JoinHandle<T: Send + 'static> {
+pub struct JoinHandle<'a, T: Send + 'static> {
     shard_idx: u8,
     local_idx: u16,
     generation: u32,
     consumed: bool,
-    _marker: PhantomData<T>,
+    storage: *mut JoinStorage<T>,
+    _marker: PhantomData<&'a mut JoinStorage<T>>,
 }
 
-impl<T: Send + 'static> Future for JoinHandle<T> {
+unsafe impl<T: Send + 'static> Send for JoinHandle<'_, T> {}
+
+impl<T: Send + 'static> Future for JoinHandle<'_, T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
@@ -189,7 +233,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
         };
 
         if slot.is_completed() {
-            let result = unsafe { slot.take_result::<T>() };
+            let result = unsafe { (&*this.storage).take() };
 
             slab.decrement_ref(
                 this.shard_idx as usize,
@@ -203,7 +247,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
             slot.update_join_waker(cx.waker());
 
             if slot.is_completed() {
-                let result = unsafe { slot.take_result::<T>() };
+                let result = unsafe { (&*this.storage).take() };
 
                 slab.decrement_ref(
                     this.shard_idx as usize,
@@ -220,15 +264,92 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     }
 }
 
-impl<T: Send + 'static> Drop for JoinHandle<T> {
+impl<T: Send + 'static> Drop for JoinHandle<'_, T> {
     fn drop(&mut self) {
         if !self.consumed {
-            get_task_table().decrement_ref(
+            let slab = get_task_table();
+            if let Some(slot) = slab.get_slot(
+                self.shard_idx as usize,
+                self.local_idx as usize,
+                self.generation,
+            ) {
+                loop {
+                    let ptr = slot.result_ptr.load(Ordering::Acquire);
+                    if ptr == RESULT_ABANDONED {
+                        break;
+                    }
+                    if ptr == RESULT_CLAIMED {
+                        while !slot.is_completed() {
+                            core::hint::spin_loop();
+                        }
+                        unsafe { (&*self.storage).drop_output() };
+                        break;
+                    }
+                    if slot
+                        .result_ptr
+                        .compare_exchange(
+                            ptr,
+                            RESULT_ABANDONED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+            slab.decrement_ref(
                 self.shard_idx as usize,
                 self.local_idx as usize,
                 self.generation,
             );
         }
+    }
+}
+
+pub struct OwnedJoinHandle<T: Send + 'static> {
+    handle: JoinHandle<'static, T>,
+    _storage: Pin<Box<JoinStorage<T>>>,
+}
+
+impl<T: Send + 'static> Future for OwnedJoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let this = unsafe { self.get_unchecked_mut() };
+        unsafe { Pin::new_unchecked(&mut this.handle) }.poll(cx)
+    }
+}
+
+#[doc(hidden)]
+pub fn spawn_join_owned<F, T>(future: F) -> OwnedJoinHandle<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_join_owned_in_executor_domain(crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN, future)
+}
+
+#[doc(hidden)]
+pub fn spawn_join_owned_in_executor_domain<F, T>(
+    domain_id: ExecutorDomainId,
+    future: F,
+) -> OwnedJoinHandle<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut storage = Box::pin(JoinStorage::new());
+    let storage_ref = unsafe {
+        core::mem::transmute::<Pin<&mut JoinStorage<T>>, Pin<&'static mut JoinStorage<T>>>(
+            storage.as_mut(),
+        )
+    };
+    let handle = spawn_in_executor_domain(domain_id, storage_ref, future);
+    OwnedJoinHandle {
+        handle,
+        _storage: storage,
     }
 }
 
@@ -265,7 +386,7 @@ where
     let slot = slab
         .get_slot(shard_idx, local_idx, generation)
         .expect("reserved task slot disappeared before initialization");
-    unsafe { slot.init::<F, ()>(domain_id, allocation) };
+    unsafe { slot.init_detached::<F>(domain_id, allocation) };
     domain.retain_task();
 
     slab.increment_ref(shard_idx, local_idx, generation);

@@ -28,7 +28,8 @@ use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{
-    JoinAll, block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached,
+    JoinAll, block_on, spawn_blocking, spawn_blocking_many, spawn_detached,
+    spawn_join_owned as spawn,
 };
 use kernel_types::Message;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;

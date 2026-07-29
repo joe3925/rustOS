@@ -27,7 +27,7 @@ use kernel_types::{
 use rand_core::block;
 
 use crate::file_system::file_provider::provider;
-use kernel_executor::runtime::runtime::{JoinAll, spawn};
+use kernel_executor::runtime::runtime::{JoinAll, spawn_join_owned as spawn};
 
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},

@@ -9,7 +9,7 @@ pub(super) const MAX_SLOTS_PER_SHARD: usize = 4096;
 
 mod config;
 mod ptr;
-mod slot;
+pub(crate) mod slot;
 mod storage;
 mod task_slab;
 

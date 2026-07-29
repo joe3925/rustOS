@@ -15,8 +15,8 @@ use crate::global_async::{
 };
 use crate::runtime::abi_spawn::kernel_spawn_abi_internal;
 use crate::runtime::runtime::{
-    block_on, spawn, spawn_detached, spawn_detached_in_executor_domain, spawn_in_executor_domain,
-    JoinAll,
+    block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
+    spawn_join_owned_in_executor_domain as spawn_in_executor_domain, JoinAll,
 };
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
@@ -41,6 +41,18 @@ fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
 
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
     unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(count) as *const (), &VTABLE)) }
+}
+
+#[test]
+fn caller_storage_and_spawn_join_macro_return_results() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let mut storage = core::pin::pin!(crate::runtime::runtime::JoinStorage::<usize>::new());
+    let explicit = crate::runtime::runtime::spawn(storage.as_mut(), async { 41usize });
+    assert_eq!(block_on(explicit), 41);
+
+    assert_eq!(block_on(crate::spawn_join!(async { 42usize })), 42);
 }
 
 fn poll_once<F: Future + Unpin>(future: &mut F, waker: &Waker) -> Poll<F::Output> {
