@@ -6,6 +6,7 @@ use crate::{
     },
     round_robin::{ScheduledDomain, SchedulerPolicy, WeightedDeficitRoundRobinScheduler},
 };
+use kernel_types::capacity::{GeometricResizePolicy, ResizePolicyKind};
 
 extern "C" fn noop(_ctx: usize) {}
 
@@ -42,7 +43,8 @@ fn domain_table_rejects_invalid_and_stale_domain_ids() {
 fn full_domain_submission_fails_cleanly() {
     let table = ExecutorDomainTable::new(1, 8);
     let id = table.create_executor_domain(ExecutorDomainConfig {
-        max_queued: 1,
+        initial_queue_capacity: 1,
+        resize_policy: ResizePolicyKind::Fixed,
         ..ExecutorDomainConfig::default()
     });
 
@@ -91,7 +93,7 @@ fn scheduler_runnable_tracking_deduplicates_domains() {
 fn scheduler_skips_empty_domains_and_requeues_remaining_work() {
     let table = ExecutorDomainTable::new(1, 8);
     let id = table.create_executor_domain(ExecutorDomainConfig {
-        max_queued: 4,
+        initial_queue_capacity: 4,
         quantum: 1,
         ..ExecutorDomainConfig::default()
     });
@@ -126,14 +128,14 @@ fn weighted_scheduler_uses_weighted_budget_without_starving_low_weight_domain() 
         class: ExecutorDomainClass::KernelHigh,
         weight: 8,
         quantum: 8,
-        max_queued: 8,
+        initial_queue_capacity: 8,
         ..ExecutorDomainConfig::default()
     });
     let low = table.create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelBackground,
         weight: 1,
         quantum: 8,
-        max_queued: 8,
+        initial_queue_capacity: 8,
         ..ExecutorDomainConfig::default()
     });
     let mut scheduler = WeightedDeficitRoundRobinScheduler::new();
@@ -161,7 +163,7 @@ fn zero_quantum_and_zero_limits_are_clamped() {
     let table = ExecutorDomainTable::new(1, 8);
     let id = table.create_executor_domain(ExecutorDomainConfig {
         max_active: 0,
-        max_queued: 0,
+        initial_queue_capacity: 0,
         quantum: 0,
         weight: 0,
         ..ExecutorDomainConfig::default()
@@ -172,7 +174,52 @@ fn zero_quantum_and_zero_limits_are_clamped() {
         .expect("domain missing")
         .stats();
     assert_eq!(stats.max_active, 1);
-    assert_eq!(stats.max_queued, 1);
+    assert_eq!(stats.initial_queue_capacity, 1);
     assert_eq!(stats.quantum, 1);
     assert_eq!(stats.weight, 1);
+}
+
+#[test]
+fn geometric_policy_grows_and_best_effort_shrinks_to_initial_capacity() {
+    let table = ExecutorDomainTable::new(1, 8);
+    let id = table.create_executor_domain(ExecutorDomainConfig {
+        initial_queue_capacity: 2,
+        resize_policy: ResizePolicyKind::Geometric(GeometricResizePolicy::new(2, 2, 50, 75)),
+        ..ExecutorDomainConfig::default()
+    });
+
+    table.submit_to_executor_domain(id, item()).unwrap();
+    table.submit_to_executor_domain(id, item()).unwrap();
+    table.submit_to_executor_domain(id, item()).unwrap();
+
+    let domain = table.get_executor_domain(id).unwrap();
+    assert!(domain.stats().queue_capacity >= 4);
+
+    domain.pop_work(0).unwrap();
+    domain.pop_work(0).unwrap();
+    domain.pop_work(0).unwrap();
+
+    let stats = domain.stats();
+    assert_eq!(stats.queued_count, 0);
+    assert_eq!(stats.queue_capacity, stats.queue_minimum_capacity);
+}
+
+#[test]
+fn live_policy_can_be_replaced_with_fixed() {
+    use crate::global_async::ReplaceResizePolicyResult;
+
+    let table = ExecutorDomainTable::new(1, 8);
+    let id = table.create_executor_domain(ExecutorDomainConfig {
+        initial_queue_capacity: 1,
+        ..ExecutorDomainConfig::default()
+    });
+    let domain = table.get_executor_domain(id).unwrap();
+
+    assert_eq!(
+        domain.replace_resize_policy(ResizePolicyKind::Fixed),
+        ReplaceResizePolicyResult::Changed
+    );
+    table.submit_to_executor_domain(id, item()).unwrap();
+    let error = table.submit_to_executor_domain(id, item()).unwrap_err();
+    assert_eq!(error.kind, ExecutorSubmitErrorKind::DomainFull);
 }

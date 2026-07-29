@@ -3,7 +3,7 @@ use crate::memory::paging::{
 };
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
-use crate::scheduling::scheduler::default_task_sched_binding;
+use crate::scheduling::scheduler::{kernel_task_sched_binding, user_task_sched_binding};
 use crate::scheduling::state::{FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
 use crate::vec::Vec;
@@ -12,6 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::{mem, ptr};
 use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
 use spin::Mutex;
@@ -58,7 +59,7 @@ pub struct TaskRef {
     pub inner: RwLock<Task>,
 
     /// Fast path for kernel mode check
-    pub is_kernel_mode: AtomicBool,
+    is_kernel_mode: AtomicBool,
 
     /// Top of the allocated stack region (write-once, read lock-free)
     pub stack_start: AtomicU64,
@@ -179,20 +180,15 @@ impl TaskRef {
     }
 
     #[inline(always)]
-    pub(crate) fn with_class_state<T, R>(
-        &self,
-        expected_domain: DomainId,
-        f: impl FnOnce(&T) -> R,
-    ) -> R {
+    pub(crate) fn with_class_state<T, R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let binding = self.sched_binding.read();
-        assert_eq!(
-            binding.domain_id(),
-            expected_domain,
-            "task scheduled through non-owning domain"
-        );
-
         let ptr = binding.class_state();
         f(unsafe { ptr.cast::<T>().as_ref() })
+    }
+
+    #[inline(always)]
+    pub fn is_kernel_mode(&self) -> bool {
+        self.is_kernel_mode.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_pending_sched_binding(
@@ -233,7 +229,7 @@ impl TaskRef {
     ) -> TaskSchedBinding {
         let new_domain_id = sched_binding.domain_id();
         let mut active = self.sched_binding.write();
-        let old = core::mem::replace(&mut *active, sched_binding);
+        let old = mem::replace(&mut *active, sched_binding);
         self.active_domain_id
             .store(new_domain_id.0 as u32, Ordering::Release);
         old
@@ -305,7 +301,6 @@ pub struct Task {
     pub context: State,
     pub fpu_state: FpuState,
     pub kernel_tls: Option<KernelTls>,
-    pub is_user_mode: bool,
     pub parent_pid: u64,
     pub executer_id: Option<u64>,
 
@@ -333,11 +328,11 @@ impl Task {
             name,
             stack_pointer,
             parent_pid,
-            default_task_sched_binding(),
+            user_task_sched_binding(),
         )
     }
 
-    pub fn new_user_mode_with_sched_binding(
+    fn new_user_mode_with_sched_binding(
         entry_point: TaskEntry,
         context: usize,
         stack_size: u64,
@@ -357,7 +352,6 @@ impl Task {
             context: state,
             fpu_state: FpuState::default(),
             kernel_tls: None,
-            is_user_mode: true,
             parent_pid,
             executer_id: None,
             sched_in_cycles: AtomicU64::new(0),
@@ -402,11 +396,11 @@ impl Task {
             stack_size,
             name,
             parent_pid,
-            default_task_sched_binding(),
+            kernel_task_sched_binding(),
         )
     }
 
-    pub fn new_kernel_mode_with_sched_binding(
+    fn new_kernel_mode_with_sched_binding(
         entry_point: TaskEntry,
         context: usize,
         stack_size: StackSize,
@@ -431,7 +425,6 @@ impl Task {
             context: state,
             fpu_state: FpuState::default(),
             kernel_tls,
-            is_user_mode: false,
             parent_pid,
             executer_id: None,
             sched_in_cycles: AtomicU64::new(0),
@@ -552,7 +545,7 @@ impl CurrentTask {
     #[inline(always)]
     pub(crate) fn is_task(&self, task: &TaskHandle) -> bool {
         let p = self.ptr.load(Ordering::Acquire);
-        core::ptr::eq(p, Arc::as_ptr(task) as *mut TaskRef)
+        ptr::eq(p, Arc::as_ptr(task) as *mut TaskRef)
     }
 }
 
@@ -594,7 +587,7 @@ impl TaskSlot {
             generation: AtomicU64::new(0),
             readers: AtomicUsize::new(0),
             retired_next: AtomicUsize::new(0),
-            ptr: AtomicPtr::new(core::ptr::null_mut()),
+            ptr: AtomicPtr::new(ptr::null_mut()),
             state: AtomicUsize::new(TASK_SLOT_EMPTY),
         }
     }
@@ -840,7 +833,7 @@ impl TaskTable {
             return None;
         }
 
-        let p = slot.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let p = slot.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
 
         if slot
             .generation

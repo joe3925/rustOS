@@ -258,11 +258,16 @@ unsafe impl<T: Send> Sync for BoundedTreiberStack<T> {}
 
 impl<T> BoundedTreiberStack<T> {
     pub fn new(capacity: usize) -> Self {
+        Self::try_new(capacity).expect("failed to allocate BoundedTreiberStack")
+    }
+
+    pub fn try_new(capacity: usize) -> Result<Self, alloc::collections::TryReserveError> {
         if capacity >= NULL_INDEX as usize {
             panic!("BoundedTreiberStack capacity too large");
         }
 
-        let mut nodes = Vec::with_capacity(capacity);
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(capacity)?;
 
         let mut i = 0usize;
         while i < capacity {
@@ -282,12 +287,12 @@ impl<T> BoundedTreiberStack<T> {
 
         let free = if capacity == 0 { NULL_INDEX } else { 0 };
 
-        Self {
+        Ok(Self {
             head: AtomicU64::new(Self::pack(NULL_INDEX, 0)),
             free: AtomicU64::new(Self::pack(free, 0)),
             nodes,
             len: AtomicUsize::new(0),
-        }
+        })
     }
 
     #[inline]

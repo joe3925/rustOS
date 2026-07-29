@@ -4,6 +4,9 @@ use super::super::gdt::PER_CPU_GDT;
 use crate::executable::program::{Message, UserHandle};
 use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
+use kernel_types::executor::{
+    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
+};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
 use x86_64::VirtAddr;
@@ -118,9 +121,27 @@ make_wrapper!(wrap_create, sys_create_task, usize);
 make_wrapper!(
     wrap_completion_queue_create,
     sys_completion_queue_create,
+    UserHandle,
     usize,
     usize,
     u64
+);
+make_wrapper!(
+    wrap_executor_domain_create,
+    sys_executor_domain_create,
+    *const UserExecutorDomainCreate
+);
+make_wrapper!(
+    wrap_executor_domain_configure,
+    sys_executor_domain_configure,
+    UserHandle,
+    *const UserExecutorDomainUpdate
+);
+make_wrapper!(
+    wrap_executor_domain_query,
+    sys_executor_domain_query,
+    UserHandle,
+    *mut UserExecutorDomainInfo
 );
 make_wrapper!(wrap_io_enqueue, sys_io_enqueue, UserHandle, *const UserIoOp);
 make_wrapper!(
@@ -212,6 +233,9 @@ const SYSCALL_TABLE: &[Handler] = &[
     wrap_message_complete,        // 20
     wrap_object_duplicate,        // 21
     wrap_io_buffer_register,      // 22
+    wrap_executor_domain_create,  // 23
+    wrap_executor_domain_configure, // 24
+    wrap_executor_domain_query,   // 25
 ];
 
 #[unsafe(no_mangle)]

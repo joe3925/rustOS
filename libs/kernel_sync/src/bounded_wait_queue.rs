@@ -1,11 +1,12 @@
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::platform::Platform;
-use spin::RwLock;
+use crate::sync::RwLock;
 
-static NEXT_BOUNDED_WAIT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_BOUNDED_WAIT_QUEUE_ID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
 
 const SLOT_EMPTY: usize = 0;
 const SLOT_RESERVED: usize = 1;
@@ -15,7 +16,7 @@ const SLOT_CLEARING: usize = 4;
 const SLOT_CANCELING: usize = 5;
 
 fn alloc_wait_queue_id() -> u64 {
-    NEXT_BOUNDED_WAIT_QUEUE_ID.fetch_add(1, Ordering::Relaxed)
+    NEXT_BOUNDED_WAIT_QUEUE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +46,7 @@ struct WaitSlot<P: Platform> {
 }
 
 impl<P: Platform> WaitSlot<P> {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             state: AtomicUsize::new(SLOT_EMPTY),
             task_id: AtomicU64::new(0),

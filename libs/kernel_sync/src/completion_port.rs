@@ -1,10 +1,10 @@
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::sync::RwLock;
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use kernel_types::completion::{CompletionPermit, TaskCompletion};
-use spin::RwLock;
 
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};

@@ -229,6 +229,7 @@ impl HandleTable {
         let slot_index = self.free.pop().ok_or(())?;
         let slot = self.slots.get_mut(slot_index as usize).ok_or(())?;
         debug_assert!(!slot.retired && slot.entry.is_none());
+        object.user_handle_opened();
         slot.entry = Some(HandleEntry { object, interface });
         Ok(Self::encode(slot_index, slot.generation))
     }
@@ -255,6 +256,7 @@ impl HandleTable {
         }
 
         let object = slot.entry.take()?.object;
+        object.user_handle_closed();
         if slot.generation == u32::MAX {
             slot.retired = true;
         } else {
@@ -650,8 +652,8 @@ impl Program {
             .unwrap_or(0)
     }
 
-    pub fn close_user_handle(&self, handle: UserHandle) -> bool {
-        self.handle_table.write().close(handle).is_some()
+    pub fn close_user_handle(&self, handle: UserHandle) -> Option<ObjectRef> {
+        self.handle_table.write().close(handle)
     }
 
     pub fn duplicate_user_handle(

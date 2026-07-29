@@ -8,16 +8,21 @@ edition = "2021"
 [lib]
 crate-type = ["rlib"]
 
-[features]
-default = ["std"]
-std = []
-
 [dependencies]
 crossbeam-queue = { version = "0.3.12", default-features = false, features = [
     "alloc",
 ] }
 kernel_types = { path = "../kernel_types" }
 spin = "0.10"
+loom = { version = "0.7", optional = true }
+
+[features]
+default = ["std"]
+std = []
+loom = ["std", "dep:loom"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dev-dependencies]
 kernel_types = { path = "../kernel_types", features = ["hosted-tests"] }

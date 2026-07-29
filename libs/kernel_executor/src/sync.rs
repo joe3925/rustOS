@@ -15,7 +15,7 @@ pub mod atomic {
 pub use alloc::sync::Arc;
 
 #[cfg(not(any(loom, feature = "loom")))]
-pub use spin::Mutex;
+pub use spin::{Mutex, RwLock};
 
 #[cfg(any(loom, feature = "loom"))]
 pub struct Mutex<T>(loom::sync::Mutex<T>);
@@ -28,6 +28,32 @@ impl<T> Mutex<T> {
 
     pub fn lock(&self) -> loom::sync::MutexGuard<'_, T> {
         self.0.lock().expect("loom mutex poisoned")
+    }
+}
+
+#[cfg(any(loom, feature = "loom"))]
+pub struct RwLock<T>(loom::sync::RwLock<T>);
+
+#[cfg(any(loom, feature = "loom"))]
+impl<T> RwLock<T> {
+    pub fn new(value: T) -> Self {
+        Self(loom::sync::RwLock::new(value))
+    }
+
+    pub fn read(&self) -> loom::sync::RwLockReadGuard<'_, T> {
+        self.0.read().expect("loom rwlock poisoned")
+    }
+
+    pub fn write(&self) -> loom::sync::RwLockWriteGuard<'_, T> {
+        self.0.write().expect("loom rwlock poisoned")
+    }
+
+    pub fn try_read(&self) -> Option<loom::sync::RwLockReadGuard<'_, T>> {
+        self.0.try_read().ok()
+    }
+
+    pub fn try_write(&self) -> Option<loom::sync::RwLockWriteGuard<'_, T>> {
+        self.0.try_write().ok()
     }
 }
 

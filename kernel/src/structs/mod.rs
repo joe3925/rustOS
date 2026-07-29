@@ -1,6 +1,7 @@
 pub(crate) mod aligned_buffer;
 pub mod bench_archive;
 pub mod completion_queue;
+pub mod executor_domain;
 pub mod io_request;
 pub(crate) mod linked_list;
 pub(crate) mod per_cpu_vec;

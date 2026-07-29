@@ -12,14 +12,22 @@ use crate::file_system::file_provider::{
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::memory::heap::{heap_capacity_bytes, init_heap};
+use crate::memory::heap::{enable_mimalloc, heap_capacity_bytes, init_heap};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::memory::paging::{
-    KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram, unmap_reserved_range_unchecked,
+    KernelFrameAllocator, boot_usable_bytes, init_kernel_address_space_root,
+    kernel_address_space_root, resize_bitmap_for_ram, switch_address_space_root,
+    unmap_reserved_range_unchecked,
 };
-use crate::platform::{current_cpu_id, cycle_counter};
+use crate::platform::{
+    breakpoint, broadcast_panic_stop, calibrate_boot_timer, current_cpu_id,
+    current_is_in_interrupt, current_logical_id, cycle_counter, disable_interrupts,
+    enable_interrupts, enable_interrupts_and_halt, fatal_reset, halt, init_boot_processor,
+    init_current_cpu_local_state, init_periodic_timer, processor_count, start_secondary_cpus,
+};
 use crate::profiling::backtrace::{self, Backtrace};
+use crate::registry::init as init_registry;
 use crate::scheduling::runtime::runtime::init_executor_platform;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
@@ -30,13 +38,16 @@ use crate::{
     ActiveBootInfo, BOOT_FRAMEBUFFER, BOOT_FRAMEBUFFER_AVAILABLE, BOOT_FRAMEBUFFER_TAKEN,
     BOOT_INFO, BOOT_INFO_INITIALIZED, println,
 };
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use core::cmp::max;
+use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::panic::PanicInfo;
+use core::ptr::{addr_of, addr_of_mut};
+use core::str::from_utf8;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel_abi::FrameBuffer;
@@ -71,7 +82,7 @@ pub static PANIC_STATE: Once<State> = Once::new();
 //         auto_persist_secs: None,
 //         sample_reserve: 400000,
 //         span_reserve: 0,
-//         overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
+//         overflow_policy: Some(BenchOverflowPolicy::Panic),
 //         sample_capacity: None,
 //         sample_chunk_capacity: None,
 //         max_unwind_depth: None,
@@ -104,7 +115,7 @@ static mut TLS_TEST_ZERO_U64: u64 = 0;
 #[thread_local]
 static mut TLS_TEST_ZERO_BYTES: [u8; 16] = [0; 16];
 pub unsafe fn init() {
-    crate::memory::paging::init_kernel_address_space_root();
+    init_kernel_address_space_root();
     let memory_map = &boot_info().memory_regions;
     KernelFrameAllocator::init_from_boot_memory_map();
     {
@@ -113,20 +124,20 @@ pub unsafe fn init() {
         initialize_bootstrap_provider();
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
-        crate::platform::init_boot_processor();
+        init_boot_processor();
         init_dma_manager();
-        crate::platform::calibrate_boot_timer();
+        calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
-        crate::platform::start_secondary_cpus();
+        start_secondary_cpus();
     }
 
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {
-        core::hint::spin_loop();
+        spin_loop();
     }
 
-    crate::platform::init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+    init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
 
-    crate::platform::init_periodic_timer();
+    init_periodic_timer();
     SCHEDULER.init_core(current_cpu_id());
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
@@ -136,21 +147,21 @@ pub unsafe fn init() {
         0,
     ));
 
-    crate::platform::enable_interrupts();
+    enable_interrupts();
     println!("Init Done");
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
     loop {
-        crate::platform::enable_interrupts_and_halt();
+        enable_interrupts_and_halt();
     }
 }
 pub extern "C" fn kernel_main(ctx: usize) {
-    crate::memory::heap::enable_mimalloc();
+    enable_mimalloc();
     resize_bitmap_for_ram(boot_usable_bytes()).expect(&alloc::format!(
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
     ));
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(crate::platform::processor_count(), 1_000_000);
+    GlobalAsyncExecutor::global().init(processor_count(), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let kernel_image_base = boot_info().kernel_image_base;
@@ -158,7 +169,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         "kernel".to_string(),
         Path::from_string(""),
         VirtAddr::new(kernel_image_base),
-        crate::memory::paging::kernel_address_space_root(),
+        kernel_address_space_root(),
         KERNEL_RANGE_TRACKER.clone(),
     );
     program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
@@ -175,9 +186,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
-        crate::registry::init()
-            .await
-            .expect("Failed to init registry");
+        init_registry().await.expect("Failed to init registry");
         install_prepacked_drivers()
             .await
             .expect("failed to install prepacked drivers");
@@ -205,7 +214,7 @@ fn kernel_pe_info() -> PeInfo {
                 .iter()
                 .position(|byte| *byte == 0)
                 .unwrap_or(section.name.len());
-            let name = core::str::from_utf8(&section.name[..name_len])
+            let name = from_utf8(&section.name[..name_len])
                 .unwrap_or("unknown")
                 .to_string();
 
@@ -253,11 +262,11 @@ fn kernel_pe_info() -> PeInfo {
 }
 #[inline(never)]
 fn halt_loop() -> ! {
-    crate::platform::halt()
+    halt()
 }
 
 fn current_cpu_owns_panic() -> bool {
-    let current_cpu = crate::platform::current_logical_id() as u32;
+    let current_cpu = current_logical_id() as u32;
     PANIC_OWNER.call_once(|| current_cpu);
     PANIC_OWNER.get().is_some_and(|owner| *owner == current_cpu)
 }
@@ -272,11 +281,9 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
         halt_loop()
     }
 
-    crate::platform::disable_interrupts();
+    disable_interrupts();
     unsafe {
-        crate::memory::paging::switch_address_space_root(
-            crate::memory::paging::kernel_address_space_root(),
-        );
+        switch_address_space_root(kernel_address_space_root());
     }
     let backtrace = if let Some(state) = PANIC_STATE.get() {
         Backtrace::from_state(
@@ -292,10 +299,7 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
 
     println!("=== KERNEL PANIC [{}] ===", mod_name);
-    println!(
-        "is in interrupt: {:#?}",
-        crate::platform::current_is_in_interrupt()
-    );
+    println!("is in interrupt: {:#?}", current_is_in_interrupt());
     println!("{}", info);
     println!("Panic-site backtrace:");
     for trace in backtrace.iter() {
@@ -335,8 +339,8 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
     //     match task {
     //         Some(task) => {
-    //             let stack_size = task.stack_size.load(core::sync::atomic::Ordering::Acquire);
-    //             let guard_page = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
+    //             let stack_size = task.stack_size.load(Ordering::Acquire);
+    //             let guard_page = task.guard_page.load(Ordering::Acquire);
 
     //             println!(
     //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
@@ -348,15 +352,12 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     //         }
     //     }
     // }
-    crate::platform::broadcast_panic_stop();
+    broadcast_panic_stop();
 
     halt_loop()
 }
 
-pub fn exception_panic(
-    message: alloc::string::String,
-    state: &crate::scheduling::state::State,
-) -> ! {
+pub fn exception_panic(message: String, state: &State) -> ! {
     if !current_cpu_owns_panic() {
         halt_loop()
     }
@@ -374,12 +375,12 @@ pub extern "C" fn trigger_stack_overflow() {
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn trigger_triple_fault() -> ! {
-    crate::platform::disable_interrupts();
-    crate::platform::fatal_reset()
+    disable_interrupts();
+    fatal_reset()
 }
 
 pub fn trigger_breakpoint() {
-    crate::platform::breakpoint();
+    breakpoint();
 }
 
 pub fn test_full_heap() {
@@ -413,7 +414,7 @@ pub fn boot_info() -> &'static ActiveBootInfo {
         panic!("BOOT_INFO not initialized");
     }
 
-    unsafe { &*core::ptr::addr_of!(BOOT_INFO) }
+    unsafe { &*addr_of!(BOOT_INFO) }
 }
 
 pub(crate) fn take_framebuffer() -> Option<FrameBuffer> {
@@ -424,13 +425,7 @@ pub(crate) fn take_framebuffer() -> Option<FrameBuffer> {
         return None;
     }
 
-    unsafe {
-        Some(
-            core::ptr::addr_of_mut!(BOOT_FRAMEBUFFER)
-                .read()
-                .assume_init(),
-        )
-    }
+    unsafe { Some(addr_of_mut!(BOOT_FRAMEBUFFER).read().assume_init()) }
 }
 
 fn reclaim_kernel_stub() {
@@ -493,7 +488,7 @@ pub fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
 
 #[derive(Clone)]
 pub struct BootPkg {
-    pub name: alloc::string::String,
+    pub name: String,
     pub toml: Vec<u8>,
     pub image: Vec<u8>,
 }
@@ -640,7 +635,7 @@ pub fn test_kernel_tls_runtime() {
         .get_current_task(current_cpu_id())
         .expect("kernel TLS self-test requires a scheduled task");
     assert!(
-        current.is_kernel_mode.load(Ordering::Acquire),
+        current.is_kernel_mode(),
         "kernel TLS self-test requires a scheduled kernel task"
     );
 

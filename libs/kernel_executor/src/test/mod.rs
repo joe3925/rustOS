@@ -95,6 +95,10 @@ impl ExecutorPlatform for ThreadPoolPlatform {
     fn current_executor_context(&self) -> Option<CurrentExecutorContext> {
         EXECUTOR_CONTEXT.with(std::cell::Cell::get)
     }
+
+    fn in_interrupt_context(&self) -> bool {
+        false
+    }
 }
 
 static THREAD_POOL_PLATFORM: ThreadPoolPlatform = ThreadPoolPlatform::new();

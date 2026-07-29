@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use kernel_executor::platform::{self, CurrentExecutorContext, ExecutorPlatform, Job};
 use spin::Once;
 
+use crate::platform::{current_is_in_interrupt, current_percpu, swap_executor_context};
 use crate::static_handlers::{print, task_yield};
 use crate::sync_platform::{BoundedThreadPool, ThreadPool};
 
@@ -86,7 +87,7 @@ impl ExecutorPlatform for KernelExecutorPlatform {
     ) -> Option<CurrentExecutorContext> {
         let new_task = context.map_or(0, |value| value.task_id as u64);
         let new_domain = context.map_or(0, |value| value.domain_id);
-        let (old_task, old_domain) = crate::platform::swap_executor_context(new_task, new_domain);
+        let (old_task, old_domain) = swap_executor_context(new_task, new_domain);
         (old_domain != 0).then_some(CurrentExecutorContext {
             task_id: old_task as usize,
             domain_id: old_domain,
@@ -95,12 +96,16 @@ impl ExecutorPlatform for KernelExecutorPlatform {
 
     fn current_executor_context(&self) -> Option<CurrentExecutorContext> {
         use core::sync::atomic::Ordering;
-        let per_cpu = crate::platform::current_percpu();
+        let per_cpu = current_percpu();
         let domain_id = per_cpu.executor_domain_id.load(Ordering::Acquire);
         (domain_id != 0).then_some(CurrentExecutorContext {
             task_id: per_cpu.executor_task_id.load(Ordering::Acquire) as usize,
             domain_id,
         })
+    }
+
+    fn in_interrupt_context(&self) -> bool {
+        current_is_in_interrupt()
     }
 }
 

@@ -101,6 +101,7 @@ pub const fn standard_interfaces(class: ObjectTag) -> InterfaceMask {
         ObjectTag::Module => OBSERVE_BIT | DESTROY_BIT,
         ObjectTag::Device => OBSERVE_BIT | SUBMIT_BIT | CONFIGURE_BIT,
         ObjectTag::IoBufferBacking => OBSERVE_BIT | SUBMIT_BIT | DESTROY_BIT,
+        ObjectTag::ExecutorDomain => OBSERVE_BIT | SUBMIT_BIT | CONFIGURE_BIT | DESTROY_BIT,
         ObjectTag::Generic => {
             OBSERVE_BIT | SUBMIT_BIT | CONSUME_BIT | WAIT_BIT | CONFIGURE_BIT | DESTROY_BIT
         }

@@ -1,7 +1,7 @@
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::platform::Platform;
 use crate::wait_queue::WaitQueue;

@@ -7,10 +7,10 @@ use core::task::{Context, Poll, Waker};
 use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
+use crate::runtime::runtime::submit_global_to_executor_domain;
 use crate::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
 
-use super::super::runtime::submit_global;
 use super::super::runtime::JoinStorage;
 use super::super::task::{
     STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED,
@@ -178,6 +178,10 @@ impl TaskSlot {
         self.init_internal::<F, T>(domain_id, allocation, poll_joinable::<F, T>);
     }
 
+    pub fn executor_domain_id(&self) -> Option<ExecutorDomainId> {
+        unsafe { *self.domain_id.get() }
+    }
+
     pub unsafe fn init_detached<F>(&self, domain_id: ExecutorDomainId, allocation: FutureAllocation)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -279,7 +283,7 @@ impl TaskSlot {
                 let slab = get_task_table();
                 slab.increment_ref(shard_idx, local_idx, generation);
                 let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
-                submit_global(slab_task_poll_trampoline, encoded);
+                submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
             }
             false
         }

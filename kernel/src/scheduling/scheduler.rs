@@ -1,11 +1,14 @@
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::InterruptGuard;
+use crate::memory::heap::mimalloc_thread_done;
 use crate::memory::paging::stack::StackSize;
+use crate::memory::paging::switch_address_space_root;
 use crate::platform;
 use crate::scheduling::domain::{
-    DomainMaster, EnqueueReason, RoundRobinDomainAlgorithm, SwitchOutOutcome, TaskSchedBinding,
+    CpuSet, DomainEntry, DomainMaster, EnqueueReason, KERNEL_DOMAIN_ID, RoundRobinDomainAlgorithm,
+    SwitchOutOutcome, TaskSchedBinding, USER_DOMAIN_ID,
 };
-use crate::scheduling::fifo_scheduler::{build_fifo_domain, new_fifo_task_binding};
+use crate::scheduling::fifo_scheduler::build_fifo_domain;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{SchedState, State};
 use crate::scheduling::task::CurrentTask;
@@ -17,13 +20,18 @@ use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
 
-pub fn default_task_sched_binding() -> TaskSchedBinding {
-    new_fifo_task_binding()
+pub(crate) fn kernel_task_sched_binding() -> TaskSchedBinding {
+    TaskSchedBinding::new(KERNEL_DOMAIN_ID, ())
+}
+
+pub(crate) fn user_task_sched_binding() -> TaskSchedBinding {
+    TaskSchedBinding::new(USER_DOMAIN_ID, ())
 }
 
 #[derive(Debug)]
@@ -101,7 +109,17 @@ impl Scheduler {
             all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
             cores: IrqSafeRwLock::new(Vec::new()),
             domains: DomainMaster::new(
-                alloc::vec![build_fifo_domain(platform::processor_count())].into_boxed_slice(),
+                alloc::vec![
+                    DomainEntry::new(
+                        KERNEL_DOMAIN_ID,
+                        build_fifo_domain("kernel", CpuSet::all(), platform::processor_count()),
+                    ),
+                    DomainEntry::new(
+                        USER_DOMAIN_ID,
+                        build_fifo_domain("user", CpuSet::all(), platform::processor_count()),
+                    ),
+                ]
+                .into_boxed_slice(),
                 platform::processor_count(),
             ),
             next_task_id: AtomicU64::new(1),
@@ -224,8 +242,13 @@ impl Scheduler {
         }
 
         let id = self.register_task(task.clone());
-        let domain = self.domains.get(task.domain_id());
-        let target_cpu = domain.enqueue(task, EnqueueReason::New, self.new_task_placement_start());
+        let domain_id = task.domain_id();
+        let target_cpu = self.domains.enqueue(
+            domain_id,
+            task,
+            EnqueueReason::New,
+            self.new_task_placement_start(),
+        );
         self.kick_remote_core(target_cpu);
         id
     }
@@ -264,8 +287,6 @@ impl Scheduler {
         id: u64,
         sched_binding: TaskSchedBinding,
     ) -> Result<(), TaskMigrationError> {
-        let _ = self.domains.get(sched_binding.domain_id());
-
         let Some(task) = self.get_task_by_id(id) else {
             return Err(TaskMigrationError::TaskNotFound(id));
         };
@@ -315,8 +336,12 @@ impl Scheduler {
                         );
                     }
 
-                    let domain = self.domains.get(task.domain_id());
-                    let target_cpu = domain.enqueue(task.clone(), EnqueueReason::Wakeup, hint_cpu);
+                    let target_cpu = self.domains.enqueue(
+                        task.domain_id(),
+                        task.clone(),
+                        EnqueueReason::Wakeup,
+                        hint_cpu,
+                    );
                     self.kick_remote_core(target_cpu);
 
                     return;
@@ -324,9 +349,9 @@ impl Scheduler {
 
                 SchedState::Parking => {
                     spins += 1;
-
+                    // TODO: im not sure about this
                     if spins <= 64 {
-                        core::hint::spin_loop();
+                        spin_loop();
                         continue;
                     }
 
@@ -531,8 +556,8 @@ impl Scheduler {
                 SchedState::Blocked => continue,
                 SchedState::Runnable | SchedState::Running => {
                     if self.commit_pending_migration(&cand, cpu_id, now_cycles) {
-                        let domain = self.domains.get(cand.domain_id());
-                        let target_cpu = domain.enqueue(
+                        let target_cpu = self.domains.enqueue(
+                            cand.domain_id(),
                             cand.clone(),
                             EnqueueReason::Migrated,
                             cand.target_cpu(),
@@ -578,16 +603,19 @@ impl Scheduler {
     ) {
         if outcome == SwitchOutOutcome::StillRunnable && task.has_pending_sched_binding() {
             if self.commit_pending_migration(task, cpu_id, now_cycles) {
-                let domain = self.domains.get(task.domain_id());
-                let target_cpu =
-                    domain.enqueue(task.clone(), EnqueueReason::Migrated, task.target_cpu());
+                let target_cpu = self.domains.enqueue(
+                    task.domain_id(),
+                    task.clone(),
+                    EnqueueReason::Migrated,
+                    task.target_cpu(),
+                );
                 self.kick_remote_core(target_cpu);
                 return;
             }
         }
 
-        let domain = self.domains.get(task.domain_id());
-        domain.on_switch_out(task, cpu_id, now_cycles, outcome);
+        self.domains
+            .on_switch_out(task.domain_id(), task, cpu_id, now_cycles, outcome);
 
         if outcome == SwitchOutOutcome::Terminated {
             self.unregister_task(task);
@@ -599,24 +627,27 @@ impl Scheduler {
             return false;
         };
 
-        let old_domain = self.domains.get(task.domain_id());
-        old_domain.on_switch_out(task, cpu_id, now_cycles, SwitchOutOutcome::Migrated);
+        self.domains.on_switch_out(
+            task.domain_id(),
+            task,
+            cpu_id,
+            now_cycles,
+            SwitchOutOutcome::Migrated,
+        );
         drop(task.replace_sched_binding(new_binding));
         true
     }
 
     #[inline(always)]
     pub fn restore_page_table(&self, task_handle: &TaskHandle) {
-        if task_handle.is_kernel_mode.load(Ordering::Relaxed) {
+        if task_handle.is_kernel_mode() {
             return;
         }
 
         let pid = task_handle.inner.read().parent_pid;
 
         if let Some(program) = PROGRAM_MANAGER.get(pid) {
-            unsafe {
-                crate::memory::paging::switch_address_space_root(program.read().address_space_root)
-            };
+            unsafe { switch_address_space_root(program.read().address_space_root) };
         } else {
             let id = task_handle.task_id();
             let _ = self.delete_task(id);
@@ -625,7 +656,7 @@ impl Scheduler {
 
     #[inline(always)]
     pub fn restore_thread_local_storage(&self, task_handle: &TaskHandle) {
-        let thread_pointer = if task_handle.is_kernel_mode.load(Ordering::Relaxed) {
+        let thread_pointer = if task_handle.is_kernel_mode() {
             task_handle.tls_thread_pointer.load(Ordering::Relaxed)
         } else {
             0
@@ -762,7 +793,7 @@ pub extern "C" fn ipi_eoi_only() {
 }
 
 pub extern "C" fn kernel_task_end() -> ! {
-    crate::memory::heap::mimalloc_thread_done();
+    mimalloc_thread_done();
 
     platform::with_interrupts_disabled(|| {
         let task = SCHEDULER

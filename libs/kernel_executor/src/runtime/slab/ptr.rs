@@ -1,6 +1,6 @@
 use crate::sync::spin_loop;
 
-use super::super::runtime::submit_global;
+use super::super::runtime::submit_global_to_executor_domain;
 use super::slot::NotifyResult;
 use super::task_slab::get_task_table;
 
@@ -71,7 +71,10 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
     loop {
         if slot.try_enqueue() {
             let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
-            submit_global(slab_task_poll_trampoline, encoded);
+            let domain_id = slot
+                .executor_domain_id()
+                .expect("queued slab task has no executor domain");
+            submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
             return;
         }
 

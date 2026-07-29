@@ -1,12 +1,13 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use kernel_executor::global_async::{ExecutorDomainId, KERNEL_NORMAL_EXECUTOR_DOMAIN};
+use kernel_executor::global_async::ExecutorDomainId;
 use kernel_executor::runtime::runtime::try_spawn_to_port_in_executor_domain;
 use kernel_sync::{PortReserveError, mpmc::TryRecvError};
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome};
 
 use crate::sync_platform::{CompletionPort as KernelCompletionPort, CompletionPortPermit};
+use crate::structs::executor_domain::UserExecutorDomain;
 
 use super::io_request::{
     CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable, KernelIoOp,
@@ -16,6 +17,7 @@ use super::io_request::{
 pub struct CompletionQueue {
     pub owner_pid: u64,
     pub bound_executor_domain: ExecutorDomainId,
+    executor_domain: Arc<UserExecutorDomain>,
     pub request_capacity: usize,
     pub completion_capacity: usize,
     pub flags: u64,
@@ -47,11 +49,13 @@ pub enum CompletionQueueError {
     RequestNotFound,
     RequestAlreadyComplete,
     Closed,
+    DomainUnavailable,
 }
 
 impl CompletionQueue {
     pub fn new(
         owner_pid: u64,
+        executor_domain: Arc<UserExecutorDomain>,
         request_capacity: usize,
         completion_capacity: usize,
         flags: u64,
@@ -63,7 +67,8 @@ impl CompletionQueue {
         let completion_chunk_capacity = completion_capacity.div_ceil(4).max(1);
         Ok(Arc::new(Self {
             owner_pid,
-            bound_executor_domain: KERNEL_NORMAL_EXECUTOR_DOMAIN,
+            bound_executor_domain: executor_domain.id(),
+            executor_domain,
             request_capacity,
             completion_capacity,
             flags,
@@ -81,6 +86,9 @@ impl CompletionQueue {
     pub fn enqueue(self: &Arc<Self>, op: KernelIoOp) -> Result<RequestId, CompletionQueueError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(CompletionQueueError::Closed);
+        }
+        if self.executor_domain.is_draining() {
+            return Err(CompletionQueueError::DomainUnavailable);
         }
         let port_permit = self.reserve_completion_slot()?;
 

@@ -1145,7 +1145,7 @@ fn submit_to_executor_domain_executes_work_and_updates_executor_domain_stats() {
     let ctx = Arc::as_ptr(&counter) as usize;
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::Driver,
-        max_queued: jobs * 2,
+        initial_queue_capacity: jobs * 2,
         quantum: 2,
         ..ExecutorDomainConfig::default()
     });
@@ -1188,7 +1188,7 @@ fn hot_domain_can_run_multiple_active_pumps() {
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelNormal,
         max_active: expected_concurrency,
-        max_queued: jobs,
+        initial_queue_capacity: jobs,
         quantum: 1,
         ..ExecutorDomainConfig::default()
     });
@@ -1242,7 +1242,7 @@ fn spawn_in_executor_domain_completes_joinhandle() {
 
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelHigh,
-        max_queued: 128,
+        initial_queue_capacity: 128,
         ..ExecutorDomainConfig::default()
     });
 
@@ -1263,7 +1263,7 @@ fn spawn_detached_in_executor_domain_executes_work() {
 
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelBackground,
-        max_queued: 128,
+        initial_queue_capacity: 128,
         ..ExecutorDomainConfig::default()
     });
     let counter = Arc::new(AtomicUsize::new(0));

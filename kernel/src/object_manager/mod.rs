@@ -20,6 +20,7 @@ use crate::executable::program::{MessageQueue, ProgramHandle};
 use crate::memory::io_buffer::MappedIoBufferBacking;
 use crate::scheduling::task::TaskHandle;
 use crate::structs::completion_queue::CompletionQueue;
+use crate::structs::executor_domain::UserExecutorDomain;
 use crate::structs::io_request::FileObject;
 
 pub mod behavior;
@@ -103,6 +104,7 @@ pub enum ObjectPayload {
     Module(ModuleHandle),
     Device(Arc<DeviceObject>),
     IoBufferBacking(Arc<MappedIoBufferBacking>),
+    ExecutorDomain(Arc<UserExecutorDomain>),
 }
 
 #[derive(Debug)]
@@ -117,6 +119,18 @@ pub struct Object {
 }
 
 impl Object {
+    pub fn user_handle_opened(&self) {
+        if let ObjectPayload::ExecutorDomain(domain) = &self.payload {
+            domain.user_handle_opened();
+        }
+    }
+
+    pub fn user_handle_closed(&self) {
+        if let ObjectPayload::ExecutorDomain(domain) = &self.payload {
+            domain.user_handle_closed();
+        }
+    }
+
     #[inline]
     pub fn new(tag: ObjectTag, payload: ObjectPayload) -> Arc<Self> {
         let id = OBJECT_MANAGER.alloc_id();
@@ -221,6 +235,7 @@ impl Object {
             ObjectPayload::Module(body) => body,
             ObjectPayload::Device(body) => body,
             ObjectPayload::IoBufferBacking(body) => body,
+            ObjectPayload::ExecutorDomain(body) => body,
         }
     }
 
@@ -229,6 +244,10 @@ impl Object {
 
         match &self.payload {
             ObjectPayload::IoBufferBacking(_) => IoRequestOutput::success(0, 0),
+            ObjectPayload::ExecutorDomain(domain) => {
+                domain.begin_draining();
+                IoRequestOutput::success(0, 0)
+            }
             ObjectPayload::Queue(queue) => {
                 queue.write().shutdown();
                 IoRequestOutput::success(0, 0)
@@ -330,6 +349,7 @@ impl ObjectBehavior for SymlinkBody {
 impl_object_behavior!(ObjRef, ObjectTag::Generic);
 impl_object_behavior!(ModuleHandle, ObjectTag::Module);
 impl_object_behavior!(Arc<DeviceObject>, ObjectTag::Device);
+impl_object_behavior!(Arc<UserExecutorDomain>, ObjectTag::ExecutorDomain);
 
 impl ObjectBehavior for Arc<MappedIoBufferBacking> {
     fn class(&self) -> ObjectTag {
@@ -804,7 +824,8 @@ impl ObjectManager {
                 | ObjectTag::File
                 | ObjectTag::Module
                 | ObjectTag::Device
-                | ObjectTag::IoBufferBacking => {
+                | ObjectTag::IoBufferBacking
+                | ObjectTag::ExecutorDomain => {
                     if idx + 1 == comps.len() {
                         return Ok(next);
                     }
@@ -859,7 +880,8 @@ impl ObjectManager {
                 | ObjectTag::File
                 | ObjectTag::Module
                 | ObjectTag::Device
-                | ObjectTag::IoBufferBacking => {
+                | ObjectTag::IoBufferBacking
+                | ObjectTag::ExecutorDomain => {
                     if idx + 1 == comps.len() {
                         return Ok(next);
                     }

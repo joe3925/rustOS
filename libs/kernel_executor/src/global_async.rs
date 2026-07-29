@@ -10,11 +10,11 @@ use crate::round_robin::SchedulerPolicy;
 use alloc::boxed::Box;
 
 pub use crate::domain::{
-    DestroyExecutorDomainError, DestroyExecutorDomainResult, ExecutorAdmissionPolicy,
-    ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
-    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable, ExecutorSubmitError,
-    ExecutorSubmitErrorKind, GlobalExecutorStats, DRIVER_EXECUTOR_DOMAIN,
-    KERNEL_BACKGROUND_EXECUTOR_DOMAIN, KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
+    DestroyExecutorDomainError, DestroyExecutorDomainResult, ExecutorDomain, ExecutorDomainClass,
+    ExecutorDomainConfig, ExecutorDomainId, ExecutorDomainState, ExecutorDomainStats,
+    ExecutorDomainTable, ExecutorSubmitError, ExecutorSubmitErrorKind, GlobalExecutorStats,
+    ReplaceResizePolicyResult, DRIVER_EXECUTOR_DOMAIN, KERNEL_BACKGROUND_EXECUTOR_DOMAIN,
+    KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 
 #[cfg(test)]
@@ -202,6 +202,15 @@ impl GlobalAsyncExecutor {
 
     pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
         self.runtime().domains.get_executor_domain(domain_id)
+    }
+
+    pub fn replace_executor_domain_resize_policy(
+        &self,
+        domain_id: ExecutorDomainId,
+        policy: kernel_types::capacity::ResizePolicyKind,
+    ) -> Option<ReplaceResizePolicyResult> {
+        self.get_executor_domain(domain_id)
+            .map(|domain| domain.replace_resize_policy(policy))
     }
 
     pub fn executor_domain_stats(

@@ -1,5 +1,5 @@
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};

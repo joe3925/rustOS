@@ -7,15 +7,16 @@ use crate::memory::paging::{base_page_size, kernel_stack_max_bytes};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::static_handlers::get_current_cpu_id;
-use crate::util::PANIC_ACTIVE;
-use alloc::fmt;
+use crate::util::{PANIC_ACTIVE, exception_panic};
+use alloc::{fmt, format};
+use core::sync::atomic::Ordering;
 use kernel_types::arch::PageFlags;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
 macro_rules! panic_exception {
     ($state:expr, $($message:tt)*) => {
-        crate::util::exception_panic(alloc::format!($($message)*), $state)
+        exception_panic(format!($($message)*), $state)
     };
 }
 
@@ -39,7 +40,7 @@ pub(crate) fn debug_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn non_maskable_interrupt(stack_frame: &mut State) {
-    if PANIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+    if PANIC_ACTIVE.load(Ordering::Acquire) {
         loop {}
     }
 }
@@ -164,14 +165,10 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
     }
     if !is_protection {
         if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
-            if task
-                .is_kernel_mode
-                .load(core::sync::atomic::Ordering::Relaxed)
-                && !is_user
-            {
-                let gp = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
+            if task.is_kernel_mode() && !is_user {
+                let gp = task.guard_page.load(Ordering::Acquire);
                 if gp != 0 {
-                    let stack_start = task.stack_start.load(core::sync::atomic::Ordering::Relaxed);
+                    let stack_start = task.stack_start.load(Ordering::Relaxed);
                     let max_depth = stack_start.saturating_sub(kernel_stack_max_bytes());
 
                     // Allow growth for faults anywhere within the reserved stack window below stack_start.
@@ -179,10 +176,7 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
                         let page_size = base_page_size();
                         let flags =
                             PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-                        while fault
-                            < task.guard_page.load(core::sync::atomic::Ordering::Acquire)
-                                + page_size
-                        {
+                        while fault < task.guard_page.load(Ordering::Acquire) + page_size {
                             match task.grow_stack(flags) {
                                 Ok(true) => {}
                                 Ok(false) => {
@@ -195,10 +189,7 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
                                 }
                             }
                         }
-                        if fault
-                            >= task.guard_page.load(core::sync::atomic::Ordering::Acquire)
-                                + page_size
-                        {
+                        if fault >= task.guard_page.load(Ordering::Acquire) + page_size {
                             return;
                         }
                     }

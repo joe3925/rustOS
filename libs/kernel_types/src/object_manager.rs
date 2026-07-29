@@ -25,4 +25,5 @@ pub enum ObjectTag {
     Module,
     Device,
     IoBufferBacking,
+    ExecutorDomain,
 }

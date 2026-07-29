@@ -39,6 +39,9 @@ If there is a * it must be completed before user space is started
 1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 
 2. [x] * Change the registry from inline proto to a .proto file
 
+## Executor (EXE)
+1. [ ] Figure out emergency interrupt queue exhaustion.
+
 ## Error handling (ERH) (all around messy and I need to refactor it, not sure in what direction I want to take it yet)
 1. [x] * Figure out how error handling should be refactored
 2. [x] Stop using format_args its gonna be none pretty much all the time.  

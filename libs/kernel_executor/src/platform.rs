@@ -28,6 +28,7 @@ pub trait ExecutorPlatform: Send + Sync {
         context: Option<CurrentExecutorContext>,
     ) -> Option<CurrentExecutorContext>;
     fn current_executor_context(&self) -> Option<CurrentExecutorContext>;
+    fn in_interrupt_context(&self) -> bool;
 }
 pub static PLATFORM: Once<&'static dyn ExecutorPlatform> = Once::new();
 
@@ -44,6 +45,12 @@ pub fn platform() -> &'static dyn ExecutorPlatform {
 
 pub fn current_executor_context() -> Option<CurrentExecutorContext> {
     platform().current_executor_context()
+}
+
+pub fn in_interrupt_context() -> bool {
+    PLATFORM
+        .get()
+        .is_some_and(|platform| platform.in_interrupt_context())
 }
 
 pub struct CurrentExecutorContextGuard {

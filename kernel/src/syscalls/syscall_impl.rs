@@ -20,12 +20,27 @@ use alloc::vec::Vec;
 use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::dma::IoBufferError;
 use kernel_types::fs::{OpenFlags, Path};
+use kernel_types::executor::{
+    USER_EXECUTOR_ABI_VERSION, USER_EXECUTOR_PROFILE_GENERAL, USER_EXECUTOR_RESIZE_FIXED,
+    USER_EXECUTOR_RESIZE_GEOMETRIC, USER_EXECUTOR_RESIZE_LINEAR, USER_EXECUTOR_UPDATE_ALL,
+    USER_EXECUTOR_UPDATE_MAX_ACTIVE, USER_EXECUTOR_UPDATE_RESIZE_POLICY,
+    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
+    UserExecutorResizePolicy,
+};
 use kernel_types::object_manager::ObjectTag;
+use kernel_types::capacity::{
+    GeometricResizePolicy, LinearResizePolicy, ResizePolicyKind,
+};
+use kernel_executor::global_async::{
+    ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainState, GlobalAsyncExecutor,
+    ReplaceResizePolicyResult,
+};
 
 use crate::object_manager::{
     AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
     TaskQueueRef,
 };
+use crate::structs::executor_domain::UserExecutorDomain;
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let process_dir = alloc::format!("\\Process\\{}", pid);
@@ -427,6 +442,116 @@ pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u
     publish_io_buffer_backing(caller_pid, &caller, backing)
 }
 
+fn resolve_executor_domain(
+    handle: UserHandle,
+    caller_pid: u64,
+    caller: &ProgramHandle,
+    operation: ObjectOperation,
+) -> Result<Arc<UserExecutorDomain>, u64> {
+    let entry = caller.read().resolve_handle_entry(handle).ok_or_else(|| {
+        make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )
+    })?;
+    if !entry
+        .object
+        .behavior()
+        .matches(entry.interface, operation)
+    {
+        return Err(make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        ));
+    }
+    let domain = match &entry.object.payload {
+        ObjectPayload::ExecutorDomain(domain) => domain.clone(),
+        _ => {
+            return Err(make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                handle as u32,
+            ));
+        }
+    };
+    if domain.owner_pid() != caller_pid {
+        return Err(make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        ));
+    }
+    Ok(domain)
+}
+
+fn decode_resize_policy(raw: UserExecutorResizePolicy) -> Result<ResizePolicyKind, u64> {
+    let maximum_capacity = (raw.maximum_capacity != 0).then_some(raw.maximum_capacity);
+    let policy = match raw.kind {
+        USER_EXECUTOR_RESIZE_FIXED => ResizePolicyKind::Fixed,
+        USER_EXECUTOR_RESIZE_LINEAR => ResizePolicyKind::Linear(LinearResizePolicy {
+            minimum_capacity: raw.minimum_capacity,
+            grow_by: raw.grow_by_or_factor,
+            shrink_by: raw.shrink_by,
+            shrink_trigger_percent: raw.shrink_trigger_percent.try_into().map_err(|_| {
+                make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
+            })?,
+            maximum_capacity,
+        }),
+        USER_EXECUTOR_RESIZE_GEOMETRIC => {
+            ResizePolicyKind::Geometric(GeometricResizePolicy {
+                minimum_capacity: raw.minimum_capacity,
+                growth_factor: raw.grow_by_or_factor,
+                shrink_trigger_percent: raw.shrink_trigger_percent.try_into().map_err(|_| {
+                    make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
+                })?,
+                shrink_target_percent: raw.shrink_target_percent.try_into().map_err(|_| {
+                    make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
+                })?,
+                maximum_capacity,
+            })
+        }
+        _ => {
+            return Err(make_err(
+                ErrClass::Common,
+                CommonErr::InvalidPtr as u16,
+                raw.kind,
+            ));
+        }
+    };
+    policy
+        .validate()
+        .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))
+}
+
+fn encode_resize_policy(policy: ResizePolicyKind) -> UserExecutorResizePolicy {
+    match policy {
+        ResizePolicyKind::Fixed => UserExecutorResizePolicy {
+            kind: USER_EXECUTOR_RESIZE_FIXED,
+            ..UserExecutorResizePolicy::default()
+        },
+        ResizePolicyKind::Linear(policy) => UserExecutorResizePolicy {
+            kind: USER_EXECUTOR_RESIZE_LINEAR,
+            shrink_trigger_percent: policy.shrink_trigger_percent as u32,
+            minimum_capacity: policy.minimum_capacity,
+            grow_by_or_factor: policy.grow_by,
+            shrink_by: policy.shrink_by,
+            maximum_capacity: policy.maximum_capacity.unwrap_or(0),
+            ..UserExecutorResizePolicy::default()
+        },
+        ResizePolicyKind::Geometric(policy) => UserExecutorResizePolicy {
+            kind: USER_EXECUTOR_RESIZE_GEOMETRIC,
+            shrink_trigger_percent: policy.shrink_trigger_percent as u32,
+            shrink_target_percent: policy.shrink_target_percent as u32,
+            minimum_capacity: policy.minimum_capacity,
+            grow_by_or_factor: policy.growth_factor,
+            maximum_capacity: policy.maximum_capacity.unwrap_or(0),
+            ..UserExecutorResizePolicy::default()
+        },
+    }
+}
+
 fn publish_io_buffer_backing(
     caller_pid: u64,
     caller: &ProgramHandle,
@@ -756,6 +881,9 @@ fn map_cq_error(err: CompletionQueueError) -> u64 {
         CompletionQueueError::Closed => {
             make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 2)
         }
+        CompletionQueueError::DomainUnavailable => {
+            make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 3)
+        }
     }
 }
 
@@ -876,7 +1004,163 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     caller.read().create_user_handle_for_object(obj)
 }
 
+pub(crate) fn sys_executor_domain_create(
+    config_ptr: *const UserExecutorDomainCreate,
+) -> UserHandle {
+    if config_ptr.is_null()
+        || !user_ptr_ok(config_ptr, core::mem::size_of::<UserExecutorDomainCreate>())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let config = unsafe { *config_ptr };
+    if config.version != USER_EXECUTOR_ABI_VERSION
+        || config.profile != USER_EXECUTOR_PROFILE_GENERAL
+        || config.initial_queue_capacity == 0
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let resize_policy = match decode_resize_policy(config.resize_policy) {
+        Ok(policy) => policy,
+        Err(err) => return err,
+    };
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let cpu_count = platform::processor_count();
+    let domain_id =
+        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+            class: ExecutorDomainClass::ProcessIo,
+            max_active: if config.max_active_tasks == 0 {
+                usize::MAX
+            } else {
+                config.max_active_tasks
+            },
+            initial_queue_capacity: config.initial_queue_capacity,
+            interrupt_fallback_capacity: Some(cpu_count.max(1).saturating_mul(4)),
+            quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
+            weight: ExecutorDomainClass::ProcessIo.default_weight(),
+            resize_policy,
+            future_arena: Default::default(),
+        });
+    let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) else {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    };
+    let user_domain = UserExecutorDomain::new(caller_pid, domain_id, domain);
+    let object = Object::new(
+        ObjectTag::ExecutorDomain,
+        ObjectPayload::ExecutorDomain(user_domain),
+    );
+    caller.read().create_user_handle_for_object(object)
+}
+
+pub(crate) fn sys_executor_domain_configure(
+    handle: UserHandle,
+    update_ptr: *const UserExecutorDomainUpdate,
+) -> u64 {
+    if update_ptr.is_null()
+        || !user_ptr_ok(update_ptr, core::mem::size_of::<UserExecutorDomainUpdate>())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let update = unsafe { *update_ptr };
+    if update.version != USER_EXECUTOR_ABI_VERSION
+        || update.fields == 0
+        || update.fields & !USER_EXECUTOR_UPDATE_ALL != 0
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, update.fields);
+    }
+    let replacement = if update.fields & USER_EXECUTOR_UPDATE_RESIZE_POLICY != 0 {
+        match decode_resize_policy(update.resize_policy) {
+            Ok(policy) => Some(policy),
+            Err(err) => return err,
+        }
+    } else {
+        None
+    };
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let domain = match resolve_executor_domain(
+        handle,
+        caller_pid,
+        &caller,
+        ObjectOperation::Configure,
+    ) {
+        Ok(domain) => domain,
+        Err(err) => return err,
+    };
+    if domain.is_draining() {
+        return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
+    }
+    let max_active = (update.fields & USER_EXECUTOR_UPDATE_MAX_ACTIVE != 0).then_some(
+        if update.max_active_tasks == 0 {
+            usize::MAX
+        } else {
+            update.max_active_tasks
+        },
+    );
+    match domain.update_config(replacement, max_active) {
+        ReplaceResizePolicyResult::Changed => {}
+        ReplaceResizePolicyResult::RetryLater => {
+            return make_err(ErrClass::Common, CommonErr::BufferTooSmall as u16, 0);
+        }
+        ReplaceResizePolicyResult::Rejected => {
+            return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+        }
+    }
+    0
+}
+
+pub(crate) fn sys_executor_domain_query(
+    handle: UserHandle,
+    info_ptr: *mut UserExecutorDomainInfo,
+) -> u64 {
+    if info_ptr.is_null()
+        || !user_ptr_ok(info_ptr, core::mem::size_of::<UserExecutorDomainInfo>())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let domain =
+        match resolve_executor_domain(handle, caller_pid, &caller, ObjectOperation::Observe) {
+            Ok(domain) => domain,
+            Err(err) => return err,
+        };
+    let stats = domain.stats();
+    let info = UserExecutorDomainInfo {
+        version: USER_EXECUTOR_ABI_VERSION,
+        profile: USER_EXECUTOR_PROFILE_GENERAL,
+        state: match stats.state {
+            ExecutorDomainState::Active => 0,
+            ExecutorDomainState::Draining => 1,
+            ExecutorDomainState::Dead => 2,
+        },
+        resize_policy_kind: encode_resize_policy(stats.resize_policy).kind,
+        max_active_tasks: (stats.max_active != usize::MAX)
+            .then_some(stats.max_active)
+            .unwrap_or(0),
+        initial_queue_capacity: stats.initial_queue_capacity,
+        queue_capacity: stats.queue_capacity,
+        queue_minimum_capacity: stats.queue_minimum_capacity,
+        queue_maximum_capacity: stats.queue_maximum_capacity.unwrap_or(0),
+        queued_tasks: stats.queued_count,
+        active_tasks: stats.active_count,
+        live_tasks: stats.live_task_count,
+        live_futures: stats.live_future_count,
+        live_future_bytes: stats.live_future_bytes,
+        resize_policy: encode_resize_policy(stats.resize_policy),
+    };
+    unsafe { info_ptr.write(info) };
+    0
+}
+
 pub(crate) fn sys_completion_queue_create(
+    executor_domain_handle: UserHandle,
     request_capacity: usize,
     completion_capacity: usize,
     flags: u64,
@@ -891,9 +1175,30 @@ pub(crate) fn sys_completion_queue_create(
     }
 
     ensure_process_object(caller_pid, &caller);
+    let executor_domain = match resolve_executor_domain(
+        executor_domain_handle,
+        caller_pid,
+        &caller,
+        ObjectOperation::Submit,
+    ) {
+        Ok(domain) if !domain.is_draining() => domain,
+        Ok(_) => {
+            return make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                executor_domain_handle as u32,
+            );
+        }
+        Err(err) => return err,
+    };
 
-    let queue = match CompletionQueue::new(caller_pid, request_capacity, completion_capacity, flags)
-    {
+    let queue = match CompletionQueue::new(
+        caller_pid,
+        executor_domain,
+        request_capacity,
+        completion_capacity,
+        flags,
+    ) {
         Ok(queue) => queue,
         Err(err) => return map_cq_error(err),
     };
@@ -1451,6 +1756,7 @@ fn object_tag_from_raw(raw: u32) -> Option<ObjectTag> {
         8 => Some(ObjectTag::Module),
         9 => Some(ObjectTag::Device),
         10 => Some(ObjectTag::IoBufferBacking),
+        11 => Some(ObjectTag::ExecutorDomain),
         _ => None,
     }
 }
@@ -1544,7 +1850,7 @@ pub(crate) fn sys_object_close(handle: UserHandle) -> u64 {
         Ok(current) => current,
         Err(err) => return err,
     };
-    if caller.read().close_user_handle(handle) {
+    if caller.read().close_user_handle(handle).is_some() {
         0
     } else {
         make_err(
@@ -1708,6 +2014,6 @@ pub(crate) fn sys_message_complete(delivery_handle: UserHandle, status: u64, res
             delivery_handle as u32,
         );
     }
-    caller.read().close_user_handle(delivery_handle);
+    let _ = caller.read().close_user_handle(delivery_handle);
     0
 }
