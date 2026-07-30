@@ -46,6 +46,7 @@ pub trait CpuPlatform: Platform {
     fn init_current_cpu_local_state(logical_id: u32);
     fn current_percpu() -> &'static Self::PerCpuState;
     fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64);
+    fn current_executor_context() -> (u64, u64);
     fn start_secondary_cpus() -> bool;
     fn halt() -> !;
     fn broadcast_panic_stop();
@@ -275,6 +276,10 @@ pub fn current_percpu() -> &'static <ActivePlatform as CpuPlatform>::PerCpuState
 
 pub fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
     <ActivePlatform as CpuPlatform>::swap_executor_context(task_id, domain_id)
+}
+
+pub fn current_executor_context() -> (u64, u64) {
+    <ActivePlatform as CpuPlatform>::current_executor_context()
 }
 
 pub fn serial_write_bytes(bytes: &[u8]) {

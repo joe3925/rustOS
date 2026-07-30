@@ -128,12 +128,11 @@ impl CpuPlatform for X86Platform {
     }
 
     fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
-        use core::sync::atomic::Ordering;
-        let per_cpu = Self::current_percpu();
-        (
-            per_cpu.executor_task_id.swap(task_id, Ordering::AcqRel),
-            per_cpu.executor_domain_id.swap(domain_id, Ordering::AcqRel),
-        )
+        super::scheduling::tls::swap_executor_context(task_id, domain_id)
+    }
+
+    fn current_executor_context() -> (u64, u64) {
+        super::scheduling::tls::current_executor_context()
     }
 
     fn start_secondary_cpus() -> bool {

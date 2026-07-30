@@ -304,7 +304,6 @@ fn run_topology(
         launch: Some(launch.id.clone()),
         host: None,
     };
-    std::env::set_var("RUSTOS_QEMU_MEMORY", "2G");
     std::env::set_var("RUSTOS_QEMU_SMP", cpus.to_string());
     std::env::set_var("RUSTOS_QEMU_SERIAL", "stdio");
     let args = qemu_args(root, launch, firmware, boot_image, disk, &qemu_options)?;
