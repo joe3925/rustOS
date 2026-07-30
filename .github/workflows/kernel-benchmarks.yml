@@ -28,7 +28,7 @@ jobs:
         run: |
           qemu-system-x86_64 --version
           sgdisk --version
-          mkfs.vfat --version
+          dpkg-query --show --showformat='dosfstools ${Version}\n' dosfstools
           rustc --version
           cargo --version
 
