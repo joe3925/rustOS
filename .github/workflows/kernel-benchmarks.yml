@@ -30,6 +30,8 @@ jobs:
           sgdisk --version
           dpkg-query --show --showformat='dosfstools ${Version}\n' dosfstools
           clang --version
+          gh --version
+          jq --version
           rustc --version
           cargo --version
 
@@ -81,11 +83,22 @@ jobs:
           BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           mkdir -p target/bench/baselines
+          encoded_branch="$(jq -rn --arg value "$BENCH_BRANCH" '$value | @uri')"
+
+          list_runs() {
+            local status="$1"
+            local query="repos/${GITHUB_REPOSITORY}/actions/workflows/kernel-benchmarks.yml/runs?branch=${encoded_branch}&status=${status}&per_page=20"
+            gh api "$query"
+          }
 
           download_baseline() {
             local kind="$1"
             local status="$2"
             local output="target/bench/${kind}-results.json"
+            local candidates="target/bench/baselines/${kind}-candidates.txt"
+
+            list_runs "$status" |
+              jq -r '.workflow_runs[].id' > "$candidates"
 
             while read -r run_id; do
               local run_dir="target/bench/baselines/${kind}-${run_id}"
@@ -108,15 +121,7 @@ jobs:
                 echo "${kind}_run_id=$run_id" >> "$GITHUB_OUTPUT"
                 return
               fi
-            done < <(
-              gh run list \
-                --workflow kernel-benchmarks.yml \
-                --branch "$BENCH_BRANCH" \
-                --status "$status" \
-                --limit 20 \
-                --json databaseId \
-                --jq '.[].databaseId'
-            )
+            done < "$candidates"
 
             echo "${kind}_available=false" >> "$GITHUB_OUTPUT"
           }
@@ -124,6 +129,10 @@ jobs:
           download_baseline accepted success
 
           echo "regression_available=false" >> "$GITHUB_OUTPUT"
+          regression_candidates="target/bench/baselines/regression-candidates.txt"
+          list_runs completed |
+            jq -r '.workflow_runs[] | [.id, .conclusion] | @tsv' \
+              > "$regression_candidates"
           while read -r run_id conclusion; do
             run_dir="target/bench/baselines/regression-${run_id}"
             mkdir -p "$run_dir"
@@ -144,15 +153,7 @@ jobs:
               fi
               break
             fi
-          done < <(
-            gh run list \
-              --workflow kernel-benchmarks.yml \
-              --branch "$BENCH_BRANCH" \
-              --status completed \
-              --limit 20 \
-              --json databaseId,conclusion \
-              --jq '.[] | [.databaseId, .conclusion] | @tsv'
-          )
+          done < "$regression_candidates"
 
       - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
         env:
@@ -236,7 +237,7 @@ jobs:
             {
               echo "## Last accepted run"
               echo
-              echo "No successful run with a compatible benchmark report was found."
+              echo "No prior successful workflow with the required benchmark artifacts was found."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
