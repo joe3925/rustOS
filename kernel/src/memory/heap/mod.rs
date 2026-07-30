@@ -33,10 +33,12 @@ pub fn mimalloc_heap_start() -> usize {
 #[cfg(feature = "allocator-mimalloc")]
 pub const MIMALLOC_META_HEAP_SIZE: u64 = 64 * 1024 * 1024;
 #[cfg(feature = "allocator-mimalloc")]
+const MIMALLOC_ARENA_ALIGNMENT: usize = 2 * 1024 * 1024;
+#[cfg(feature = "allocator-mimalloc")]
 pub fn mimalloc_arena_start() -> usize {
     align_up_usize(
         mimalloc_heap_start() + MIMALLOC_META_HEAP_SIZE as usize,
-        1024 * 1024 * 1024,
+        MIMALLOC_ARENA_ALIGNMENT,
     )
 }
 #[cfg(feature = "allocator-mimalloc")]

@@ -632,6 +632,7 @@ struct MetricSamples {
     values: Vec<f64>,
     unit: u64,
     direction: u64,
+    regression_threshold_percent: Option<f64>,
 }
 
 fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
@@ -657,10 +658,11 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     let mut markdown = String::from(
         "# Kernel benchmark comparison\n\n\
          Performance changes are informational and do not fail the workflow.\n\n\
-         | CPUs | Suite | Case | Metric | Base median | Head median | Change |\n\
-         |---:|---|---|---|---:|---:|---:|\n",
+         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | Threshold | Result |\n\
+         |---:|---|---|---|---:|---:|---:|---:|---|\n",
     );
 
+    let mut regressions = Vec::new();
     for (key, base_samples) in &base_metrics {
         let Some(head_samples) = head_metrics.get(key) else {
             continue;
@@ -672,9 +674,35 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
         } else {
             (head_median - base_median) * 100.0 / base_median
         };
+        let threshold = head_samples.regression_threshold_percent;
+        let regression = match head_samples.direction {
+            1 => relative,
+            2 => -relative,
+            _ => 0.0,
+        };
+        let result = match threshold {
+            Some(limit) if regression > limit => {
+                regressions.push((key.clone(), regression, limit));
+                "🔴 regression"
+            }
+            Some(limit) if regression < -limit => "🟢 improvement",
+            Some(_) => "within threshold",
+            None => "informational",
+        };
+        let threshold = threshold
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "—".to_string());
         markdown.push_str(&format!(
-            "| {} | `{}` | `{}` | `{}` | {:.3} | {:.3} | {:+.2}% |\n",
-            key.cpus, key.suite, key.case, key.metric, base_median, head_median, relative,
+            "| {} | `{}` | `{}` | `{}` | {:.3} | {:.3} | {:+.2}% | {} | {} |\n",
+            key.cpus,
+            key.suite,
+            key.case,
+            key.metric,
+            base_median,
+            head_median,
+            relative,
+            threshold,
+            result,
         ));
     }
 
@@ -685,7 +713,23 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     fs::write(&output_path, markdown)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
     println!("benchmark comparison: {}", output_path.display());
-    Ok(())
+    for (key, regression, threshold) in &regressions {
+        annotate_error(
+            "Performance regression",
+            &format!(
+                "{} vCPUs {}/{}/{} regressed by {:.2}% (threshold {:.2}%)",
+                key.cpus, key.suite, key.case, key.metric, regression, threshold
+            ),
+        );
+    }
+    if regressions.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} benchmark metric(s) exceeded their regression threshold",
+            regressions.len()
+        ))
+    }
 }
 
 fn resolve(root: &Path, path: &Path) -> PathBuf {
@@ -732,14 +776,21 @@ fn collect_metrics(report: &BenchReport) -> Result<BTreeMap<MetricKey, MetricSam
                 .get("direction")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| "measurement missing numeric `direction`".to_string())?;
+            let regression_threshold_percent = event
+                .payload
+                .get("regression_threshold_percent")
+                .and_then(Value::as_f64);
             let samples = metrics.entry(key).or_insert_with(MetricSamples::default);
             if !samples.values.is_empty()
-                && (samples.unit != unit || samples.direction != direction)
+                && (samples.unit != unit
+                    || samples.direction != direction
+                    || samples.regression_threshold_percent != regression_threshold_percent)
             {
                 return Err("measurement metadata changed within a metric".to_string());
             }
             samples.unit = unit;
             samples.direction = direction;
+            samples.regression_threshold_percent = regression_threshold_percent;
             samples.values.push(value);
         }
     }

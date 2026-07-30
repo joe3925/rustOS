@@ -19,7 +19,7 @@ use spin::Mutex;
 use crate::structs::stopwatch::Stopwatch;
 
 use super::{
-    bench_case_end, bench_case_fail, bench_case_start, bench_measure,
+    bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_threshold,
     capture::bench_c_drive_io_async,
 };
 
@@ -100,12 +100,13 @@ async fn executor_correctness(handle: BenchRunHandle) -> bool {
             ),
         );
     }
-    bench_measure(
+    bench_measure_with_threshold(
         handle,
         "duration".to_string(),
         elapsed as f64,
         BenchMetricUnit::Nanoseconds,
-        BenchMetricDirection::Informational,
+        BenchMetricDirection::LowerIsBetter,
+        Some(3.0),
     );
     bench_measure(
         handle,
@@ -141,19 +142,21 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
             return false;
         }
 
-        bench_measure(
+        bench_measure_with_threshold(
             handle,
             "duration".to_string(),
             elapsed as f64,
             BenchMetricUnit::Nanoseconds,
             BenchMetricDirection::LowerIsBetter,
+            Some(3.0),
         );
-        bench_measure(
+        bench_measure_with_threshold(
             handle,
             "throughput".to_string(),
             task_count as f64 * 1_000_000_000.0 / elapsed as f64,
             BenchMetricUnit::OperationsPerSecond,
             BenchMetricDirection::HigherIsBetter,
+            Some(3.0),
         );
     }
 
@@ -224,19 +227,34 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
             return BenchSuiteStatus::Failed;
         }
 
-        // The retained workload is migrated first as a single end-to-end case.
-        // Its per-size measurements will move behind a reporter in the same
-        // module without coupling the capture runtime to filesystem code.
-        let timer = Stopwatch::start();
-        bench_c_drive_io_async(true).await;
-        let elapsed = timer.elapsed_nanos();
-        bench_measure(
-            handle,
-            "duration".to_string(),
-            elapsed as f64,
-            BenchMetricUnit::Nanoseconds,
-            BenchMetricDirection::LowerIsBetter,
-        );
+        let Some(results) = bench_c_drive_io_async(true).await else {
+            bench_case_fail(handle, "C drive workload failed".to_string());
+            bench_case_end(handle);
+            return BenchSuiteStatus::Failed;
+        };
+        for result in results.sizes {
+            let size = alloc::format!("{}k", result.size_bytes / 1024);
+            for value in result.write_ns_per_op {
+                bench_measure_with_threshold(
+                    handle,
+                    alloc::format!("write_ns_per_op.{size}"),
+                    value as f64,
+                    BenchMetricUnit::Nanoseconds,
+                    BenchMetricDirection::LowerIsBetter,
+                    Some(3.0),
+                );
+            }
+            for value in result.read_ns_per_op {
+                bench_measure_with_threshold(
+                    handle,
+                    alloc::format!("read_ns_per_op.{size}"),
+                    value as f64,
+                    BenchMetricUnit::Nanoseconds,
+                    BenchMetricDirection::LowerIsBetter,
+                    Some(3.0),
+                );
+            }
+        }
         bench_case_end(handle);
         BenchSuiteStatus::Passed
     }

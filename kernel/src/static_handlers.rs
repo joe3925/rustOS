@@ -751,14 +751,18 @@ pub extern "C" fn bench_kernel_measure(
     value: f64,
     unit: BenchMetricUnit,
     direction: BenchMetricDirection,
+    regression_threshold_percent: f64,
 ) -> bool {
+    let threshold = regression_threshold_percent.is_finite().then_some(regression_threshold_percent);
     #[cfg(feature = "kernel-bench")]
     {
-        crate::benchmarking::bench_measure(handle, metric, value, unit, direction)
+        crate::benchmarking::bench_measure_with_threshold(
+            handle, metric, value, unit, direction, threshold,
+        )
     }
     #[cfg(not(feature = "kernel-bench"))]
     {
-        let _ = (handle, metric, value, unit, direction);
+        let _ = (handle, metric, value, unit, direction, threshold);
         false
     }
 }

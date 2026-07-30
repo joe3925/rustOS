@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: kernel-bench-${{ github.event.pull_request.number || github.ref }}
@@ -69,34 +70,40 @@ jobs:
           cleanup
           trap - EXIT
 
-      - name: Prepare base worktree
-        if: github.event_name == 'pull_request'
-        run: git worktree add "$RUNNER_TEMP/rustos-base" "${{ github.event.pull_request.base.sha }}"
-
-      - name: Detect benchmark-capable base
-        if: github.event_name == 'pull_request'
-        id: base
+      - name: Download last successful benchmark
+        id: baseline
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          if grep -q 'kernel-bench' "$RUNNER_TEMP/rustos-base/kernel/Cargo.toml"; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
+          run_id="$(
+            gh run list \
+              --workflow kernel-benchmarks.yml \
+              --branch "$BENCH_BRANCH" \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty'
+          )"
+          if [[ -z "$run_id" ]]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "Base commit predates the benchmark runner; base comparison is skipped." >> "$GITHUB_STEP_SUMMARY"
+            echo "No successful benchmark baseline exists yet for \`$BENCH_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
-      - name: Benchmark base at 1, 2, and 4 vCPUs
-        if: github.event_name == 'pull_request' && steps.base.outputs.available == 'true'
-        working-directory: ${{ runner.temp }}/rustos-base
-        env:
-          RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
-          RUSTOS_DISK_FORMAT: raw
-        run: |
-          cargo run --release -p xtask -- bench \
-            --cpus 1,2,4 \
-            --tag ci \
-            --boot-timeout-secs 120 \
-            --output "$GITHUB_WORKSPACE/target/bench/base/results.json"
+          gh run download "$run_id" \
+            --name kernel-benchmarks \
+            --dir target/bench/previous
+          result="$(find target/bench/previous -path '*/head/results.json' -print -quit)"
+          if [[ -n "$result" ]]; then
+            cp "$result" target/bench/previous-results.json
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "Comparing against successful workflow run $run_id." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Successful workflow run $run_id has no compatible benchmark report." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
         env:
@@ -109,14 +116,18 @@ jobs:
             --boot-timeout-secs 120 \
             --output target/bench/head/results.json
 
-      - name: Compare base and proposed commit
-        if: github.event_name == 'pull_request' && steps.base.outputs.available == 'true'
+      - name: Compare with last successful benchmark
+        if: steps.baseline.outputs.available == 'true'
+        shell: bash
         run: |
+          set +e
           cargo run --release -p xtask -- bench compare \
-            --base target/bench/base/results.json \
+            --base target/bench/previous-results.json \
             --head target/bench/head/results.json \
             --output target/bench/comparison.md
+          status=$?
           cat target/bench/comparison.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Upload benchmark results
         if: always()

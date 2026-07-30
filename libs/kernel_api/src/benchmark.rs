@@ -114,6 +114,35 @@ impl SuiteContext {
         unit: BenchMetricUnit,
         direction: BenchMetricDirection,
     ) -> bool {
-        unsafe { bench_kernel_measure(self.handle, metric.into(), value, unit, direction) }
+        unsafe {
+            bench_kernel_measure(
+                self.handle,
+                metric.into(),
+                value,
+                unit,
+                direction,
+                f64::NAN,
+            )
+        }
+    }
+
+    pub fn measure_with_threshold(
+        &self,
+        metric: impl Into<String>,
+        value: f64,
+        unit: BenchMetricUnit,
+        direction: BenchMetricDirection,
+        regression_threshold_percent: f64,
+    ) -> bool {
+        unsafe {
+            bench_kernel_measure(
+                self.handle,
+                metric.into(),
+                value,
+                unit,
+                direction,
+                regression_threshold_percent,
+            )
+        }
     }
 }

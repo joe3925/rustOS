@@ -2741,7 +2741,7 @@ pub fn used_memory() -> usize {
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
-const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 10 * 1024 * 1024;
+const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 64 * 1024 * 1024;
 const DISK_BENCH_IOBUFFER_CREATE_OPS: u64 = 1_000_000;
 
 const DISK_BENCH_SIZES: &[usize] = &[
@@ -2833,18 +2833,28 @@ fn fill_disk_bench_pattern(buf: &mut [u8]) {
 
 pub fn bench_c_drive_io(write_through: bool) {
     spawn_detached(async move {
-        bench_c_drive_io_async(write_through).await;
+        let _ = bench_c_drive_io_async(write_through).await;
     });
 }
 
-pub async fn bench_c_drive_io_async(write_through: bool) {
+pub struct CDriveSizeResult {
+    pub size_bytes: usize,
+    pub write_ns_per_op: Vec<u64>,
+    pub read_ns_per_op: Vec<u64>,
+}
+
+pub struct CDriveBenchResult {
+    pub sizes: Vec<CDriveSizeResult>,
+}
+
+pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchResult> {
     let mut dir_path = Path::from_string(DISK_BENCH_DIR);
     if let Err(e) = File::make_dir(&dir_path).await {
         println!(
             "[disk-bench] failed to create bench dir {}: {:?}",
             DISK_BENCH_DIR, e
         );
-        return;
+        return None;
     }
 
     dir_path.push(DISK_BENCH_FILE);
@@ -2869,7 +2879,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 "[disk-bench] failed to open {} for read/write: {:?}",
                 DISK_BENCH_FILE, e
             );
-            return;
+            return None;
         }
     };
 
@@ -2881,7 +2891,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 bench_len, e
             );
             let _ = file.close().await;
-            return;
+            return None;
         }
 
         if let Err(e) = file.flush().await {
@@ -2890,7 +2900,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                 e
             );
             let _ = file.close().await;
-            return;
+            return None;
         }
     }
 
@@ -2906,7 +2916,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         Err(e) => {
             println!("[disk-bench] failed to create I/O backing: {:?}", e);
             let _ = file.close().await;
-            return;
+            return None;
         }
     };
 
@@ -2939,7 +2949,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
             Err(e) => {
                 println!("[disk-bench] I/O buffer creation benchmark failed: {:?}", e);
                 let _ = file.close().await;
-                return;
+                return None;
             }
         };
         black_box(&io_buffer);
@@ -2965,6 +2975,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
     let mut sizes = Vec::new();
     let mut write_ns_per_op = Vec::new();
     let mut read_ns_per_op = Vec::new();
+    let mut results = Vec::with_capacity(DISK_BENCH_SIZES.len());
 
     for &size in DISK_BENCH_SIZES {
         let mut write_bytes = 0u64;
@@ -2974,6 +2985,8 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         let mut read_bytes = 0u64;
         let mut read_ops = 0u64;
         let mut read_ns = 0u128;
+        let mut write_samples = Vec::with_capacity(passes);
+        let mut read_samples = Vec::with_capacity(passes);
 
         if !write_through {
             let mut offset = 0u64;
@@ -2990,7 +3003,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     Err(e) => {
                         println!("[disk-bench] warm buffer lease failed: {:?}", e);
                         let _ = file.close().await;
-                        return;
+                        return None;
                     }
                 };
                 edit.try_as_mut_slice()
@@ -3003,7 +3016,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     Err(e) => {
                         println!("[disk-bench] warm write lease failed: {:?}", e);
                         let _ = file.close().await;
-                        return;
+                        return None;
                     }
                 };
 
@@ -3013,7 +3026,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                         size, offset, e
                     );
                     let _ = file.close().await;
-                    return;
+                    return None;
                 }
 
                 offset += len as u64;
@@ -3022,6 +3035,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         }
 
         for _ in 0..passes {
+            let write_ns_before = write_ns;
             let mut offset = 0u64;
             let mut ops = 0u64;
 
@@ -3036,7 +3050,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     Err(e) => {
                         println!("[disk-bench] write buffer lease failed: {:?}", e);
                         let _ = file.close().await;
-                        return;
+                        return None;
                     }
                 };
                 edit.try_as_mut_slice()
@@ -3049,7 +3063,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     Err(e) => {
                         println!("[disk-bench] write lease failed: {:?}", e);
                         let _ = file.close().await;
-                        return;
+                        return None;
                     }
                 };
 
@@ -3062,7 +3076,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                         size, offset, e
                     );
                     let _ = file.close().await;
-                    return;
+                    return None;
                 }
 
                 offset += len as u64;
@@ -3071,6 +3085,9 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
 
             write_bytes += offset;
             write_ops += ops;
+            write_samples.push(
+                (write_ns.saturating_sub(write_ns_before) / ops.max(1) as u128) as u64,
+            );
 
             if let Err(e) = file.flush().await {
                 println!(
@@ -3078,9 +3095,10 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     size, e
                 );
                 let _ = file.close().await;
-                return;
+                return None;
             }
 
+            let read_ns_before = read_ns;
             let mut offset = 0u64;
             let mut ops = 0u64;
             let mut checksum = 0u64;
@@ -3094,7 +3112,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                     Err(e) => {
                         println!("[disk-bench] read lease failed: {:?}", e);
                         let _ = file.close().await;
-                        return;
+                        return None;
                     }
                 };
 
@@ -3107,7 +3125,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
                         size, offset, e
                     );
                     let _ = file.close().await;
-                    return;
+                    return None;
                 }
 
                 let inspect = io_backing
@@ -3126,6 +3144,8 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
 
             read_bytes += offset;
             read_ops += ops;
+            read_samples
+                .push((read_ns.saturating_sub(read_ns_before) / ops.max(1) as u128) as u64);
         }
 
         let wr_ns_op = if write_ops == 0 {
@@ -3166,6 +3186,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         sizes.push(size as u64);
         write_ns_per_op.push(wr_ns_op);
         read_ns_per_op.push(rd_ns_op);
+        results.push(CDriveSizeResult {
+            size_bytes: size,
+            write_ns_per_op: write_samples,
+            read_ns_per_op: read_samples,
+        });
     }
 
     if let Some((intercept, slope)) = lin_regress_overhead(&sizes, &write_ns_per_op) {
@@ -3183,4 +3208,5 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
     }
 
     let _ = file.close().await;
+    Some(CDriveBenchResult { sizes: results })
 }

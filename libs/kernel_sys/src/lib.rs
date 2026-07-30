@@ -247,6 +247,7 @@ unsafe extern "C" {
         value: f64,
         unit: BenchMetricUnit,
         direction: BenchMetricDirection,
+        regression_threshold_percent: f64,
     ) -> bool;
 
     pub fn bench_kernel_submit_rip_sample(

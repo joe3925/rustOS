@@ -18,8 +18,9 @@ pub use capture::{
 
 #[cfg(feature = "kernel-bench")]
 pub use runner::{
-    bench_case_end, bench_case_fail, bench_case_start, bench_measure, register_builtin_suites,
-    register_suite, run_configured_suites, run_selected_suites,
+    bench_case_end, bench_case_fail, bench_case_start, bench_measure,
+    bench_measure_with_threshold, register_builtin_suites, register_suite, run_configured_suites,
+    run_selected_suites,
 };
 
 #[cfg(feature = "kernel-bench")]
