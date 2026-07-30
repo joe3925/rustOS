@@ -29,6 +29,7 @@ jobs:
           qemu-system-x86_64 --version
           sgdisk --version
           dpkg-query --show --showformat='dosfstools ${Version}\n' dosfstools
+          clang --version
           rustc --version
           cargo --version
 
