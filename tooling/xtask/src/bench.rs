@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
@@ -149,6 +149,7 @@ struct TopologyRun {
     complete: bool,
     events: Vec<ProtocolEvent>,
     serial_log: PathBuf,
+    panic: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -209,7 +210,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
             format: seed_disk.format.clone(),
         };
         let serial_log = bench_dir.join(format!("{cpus}cpu.serial.log"));
-        runs.push(run_topology(
+        let topology = run_topology(
             root,
             &platform,
             &launch,
@@ -220,7 +221,14 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
             cpus,
             options.timeout,
             serial_log,
-        )?);
+        );
+        if let Err(err) = fs::remove_file(&disk.path) {
+            eprintln!(
+                "warning: failed to remove temporary benchmark disk {}: {err}",
+                disk.path.display()
+            );
+        }
+        runs.push(topology?);
     }
 
     let report = BenchReport {
@@ -291,7 +299,7 @@ fn run_topology(
         .take()
         .ok_or_else(|| "failed to capture QEMU serial output".to_string())?;
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
+    let reader_thread = thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             if sender.send(line).is_err() {
                 break;
@@ -304,25 +312,30 @@ fn run_topology(
     let mut serial = String::new();
     let mut complete = false;
     let mut status = "incomplete".to_string();
+    let mut panic_lines = Vec::new();
+    let mut panic_seen_at = None;
 
     loop {
         while let Ok(line) = receiver.try_recv() {
             let line = line.map_err(|err| format!("failed reading QEMU serial output: {err}"))?;
             println!("{line}");
-            serial.push_str(&line);
-            serial.push('\n');
-            if let Some(event) = parse_event(&line)? {
-                if event.kind == "run_end" {
-                    complete = true;
-                    status = event
-                        .payload
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("failed")
-                        .to_string();
-                }
-                events.push(event);
+            record_serial_line(
+                &line,
+                &mut serial,
+                &mut events,
+                &mut complete,
+                &mut status,
+                &mut panic_lines,
+                &mut panic_seen_at,
+            )?;
+        }
+
+        if panic_seen_at.is_some_and(|seen| seen.elapsed() >= Duration::from_secs(1)) {
+            if let Err(err) = child.kill() {
+                eprintln!("warning: failed to stop QEMU after kernel panic: {err}");
             }
+            status = "panicked".to_string();
+            break;
         }
 
         if child
@@ -340,25 +353,29 @@ fn run_topology(
         thread::sleep(Duration::from_millis(20));
     }
     let _ = child.wait();
+    reader_thread
+        .join()
+        .map_err(|_| "QEMU serial reader thread panicked".to_string())?;
     while let Ok(line) = receiver.try_recv() {
         let line = line.map_err(|err| format!("failed reading QEMU serial output: {err}"))?;
-        serial.push_str(&line);
-        serial.push('\n');
-        if let Some(event) = parse_event(&line)? {
-            if event.kind == "run_end" {
-                complete = true;
-                status = event
-                    .payload
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("failed")
-                    .to_string();
-            }
-            events.push(event);
-        }
+        record_serial_line(
+            &line,
+            &mut serial,
+            &mut events,
+            &mut complete,
+            &mut status,
+            &mut panic_lines,
+            &mut panic_seen_at,
+        )?;
     }
     fs::write(&serial_log, serial)
         .map_err(|err| format!("failed to write {}: {err}", serial_log.display()))?;
+
+    let panic = (!panic_lines.is_empty()).then(|| panic_lines.join("\n"));
+    if let Some(details) = &panic {
+        report_panic(cpus, details);
+        status = "panicked".to_string();
+    }
 
     Ok(TopologyRun {
         cpus,
@@ -366,7 +383,86 @@ fn run_topology(
         complete,
         events,
         serial_log,
+        panic,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_serial_line(
+    line: &str,
+    serial: &mut String,
+    events: &mut Vec<ProtocolEvent>,
+    complete: &mut bool,
+    status: &mut String,
+    panic_lines: &mut Vec<String>,
+    panic_seen_at: &mut Option<Instant>,
+) -> Result<(), String> {
+    serial.push_str(line);
+    serial.push('\n');
+
+    if is_panic_start(line) {
+        panic_seen_at.get_or_insert_with(Instant::now);
+    }
+    if panic_seen_at.is_some() && panic_lines.len() < 256 {
+        panic_lines.push(line.to_string());
+    }
+
+    if let Some(event) = parse_event(line)? {
+        if event.kind == "run_end" {
+            *complete = true;
+            *status = event
+                .payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+                .to_string();
+        }
+        events.push(event);
+    }
+    Ok(())
+}
+
+fn is_panic_start(line: &str) -> bool {
+    line.contains("=== KERNEL PANIC [")
+        || line.contains("kernel_stub panic:")
+        || line.contains("panicked at ")
+}
+
+fn report_panic(cpus: usize, details: &str) {
+    eprintln!();
+    eprintln!("===== KERNEL PANIC ({cpus} vCPU(s)) =====");
+    eprintln!("{details}");
+    eprintln!("===== END KERNEL PANIC =====");
+
+    let annotation = details
+        .lines()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    eprintln!("::error title=Kernel panic ({cpus} vCPUs)::{annotation}");
+
+    let Some(summary_path) = std::env::var_os("GITHUB_STEP_SUMMARY") else {
+        return;
+    };
+    match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&summary_path)
+    {
+        Ok(mut summary) => {
+            let _ = writeln!(
+                summary,
+                "## Kernel panic ({cpus} vCPU(s))\n\n```text\n{details}\n```\n"
+            );
+        }
+        Err(err) => eprintln!(
+            "warning: failed to open GitHub step summary {}: {err}",
+            Path::new(&summary_path).display()
+        ),
+    }
 }
 
 fn parse_event(line: &str) -> Result<Option<ProtocolEvent>, String> {
