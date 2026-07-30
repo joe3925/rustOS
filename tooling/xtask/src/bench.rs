@@ -730,7 +730,7 @@ struct MetricSamples {
     boot_medians: Vec<f64>,
     unit: u64,
     direction: u64,
-    regression_threshold_percent: Option<f64>,
+    tolerance_percent: Option<f64>,
 }
 
 fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
@@ -755,11 +755,12 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     let head_metrics = collect_metrics(&head)?;
     let mut markdown = format!(
         "## {}\n\n\
-         Metrics exceeding their registered regression threshold fail this comparison. \
-         Repeated suites use paired boot medians and a 100,000-resample 99.5% bootstrap confidence interval; \
-         single-pair suites apply their practical threshold directly. MAD reports boot-to-boot variability. \
+         Tolerance is the largest literal percentage slowdown considered practically unchanged. \
+         A regression requires the entire 99% confidence interval to exceed that tolerance; a variance warning means such a regression remains possible. \
+         Repeated suites independently resample baseline and current boot medians with 100,000 bootstrap draws; \
+         single-pair suites apply their tolerance directly. MAD reports boot-to-boot variability. \
          Positive and negative changes are interpreted according to whether higher or lower values are better.\n\n\
-         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | 99.5% CI | Boot MAD (previous → current) | Threshold | Result |\n\
+         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | 99% CI | Boot MAD (previous → current) | Tolerance | Result |\n\
          |---:|---|---|---|---:|---:|---:|---:|---:|---:|---|\n",
         options.title
     );
@@ -790,27 +791,20 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
                     "missing from current run",
                 )
             };
-            let threshold = samples
-                .regression_threshold_percent
+            let tolerance = samples
+                .tolerance_percent
                 .map(|value| format!("{value:.2}%"))
                 .unwrap_or_else(|| "—".to_string());
             markdown.push_str(&format!(
                 "| {} | `{}` | `{}` | `{}` | {} | {} | — | — | — | {} | {} |\n",
-                key.cpus, key.suite, key.case, key.metric, previous, current, threshold, result,
+                key.cpus, key.suite, key.case, key.metric, previous, current, tolerance, result,
             ));
             continue;
         };
         let base_median = median(&base_samples.boot_medians);
         let head_median = median(&head_samples.boot_medians);
-        let relative = paired_change(&base_samples.boot_medians, &head_samples.boot_medians)
-            .unwrap_or_else(|| {
-                if base_median == 0.0 {
-                    0.0
-                } else {
-                    (head_median - base_median) * 100.0 / base_median
-                }
-            });
-        let threshold = head_samples.regression_threshold_percent;
+        let relative = relative_change(base_median, head_median).unwrap_or(0.0);
+        let tolerance = head_samples.tolerance_percent;
         let regression = match head_samples.direction {
             1 => relative,
             2 => -relative,
@@ -820,7 +814,7 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
         let confidence_text = if let Some(confidence) = confidence {
             format!("{:+.2}% to {:+.2}%", confidence.lower, confidence.upper)
         } else if base_samples.boot_medians.len() == 1 && head_samples.boot_medians.len() == 1 {
-            "single paired boot".to_string()
+            "single boot per image".to_string()
         } else {
             "—".to_string()
         };
@@ -834,35 +828,45 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
             2 => -interval.upper,
             _ => 0.0,
         });
-        let improvement_confidence_upper =
-            confidence.map(|interval| match head_samples.direction {
-                1 => interval.upper,
-                2 => -interval.lower,
-                _ => 0.0,
-            });
+        let regression_confidence_upper = confidence.map(|interval| match head_samples.direction {
+            1 => interval.upper,
+            2 => -interval.lower,
+            _ => 0.0,
+        });
         let direct_single_boot =
             base_samples.boot_medians.len() == 1 && head_samples.boot_medians.len() == 1;
-        let result = match threshold {
+        let result = match tolerance {
             Some(limit)
-                if regression > limit
-                    && (direct_single_boot
-                        || regression_confidence_lower.is_some_and(|lower| lower > limit)) =>
+                if (direct_single_boot && regression > limit)
+                    || regression_confidence_lower.is_some_and(|lower| lower > limit) =>
             {
                 regressions.push((key.clone(), regression, limit));
                 "🔴 regression"
             }
-            Some(limit) if regression > limit => "🟡 variance warning",
             Some(limit)
-                if regression < -limit
-                    && (direct_single_boot
-                        || improvement_confidence_upper.is_some_and(|upper| upper < -limit)) =>
+                if (direct_single_boot && regression > limit)
+                    || regression_confidence_upper.is_some_and(|upper| upper > limit) =>
+            {
+                "🟡 possible regression (variance)"
+            }
+            Some(limit)
+                if (direct_single_boot && regression < -limit)
+                    || regression_confidence_upper.is_some_and(|upper| upper < -limit) =>
             {
                 "🟢 improvement"
             }
-            Some(_) => "within threshold",
+            Some(limit)
+                if confidence.is_some()
+                    && regression_confidence_lower.is_some_and(|lower| lower >= -limit)
+                    && regression_confidence_upper.is_some_and(|upper| upper <= limit) =>
+            {
+                "statistically stable"
+            }
+            Some(_) if confidence.is_none() && !direct_single_boot => "insufficient boots",
+            Some(_) => "inconclusive",
             None => "informational",
         };
-        let threshold = threshold
+        let tolerance = tolerance
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "—".to_string());
         markdown.push_str(&format!(
@@ -876,7 +880,7 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
             relative,
             confidence_text,
             mad_text,
-            threshold,
+            tolerance,
             result,
         ));
     }
@@ -889,12 +893,12 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
     println!("benchmark comparison: {}", output_path.display());
     if options.annotations {
-        for (key, regression, threshold) in &regressions {
+        for (key, regression, tolerance) in &regressions {
             annotate_error(
                 "Performance regression",
                 &format!(
-                    "{} vCPUs {}/{}/{} regressed by {:.2}% (threshold {:.2}%)",
-                    key.cpus, key.suite, key.case, key.metric, regression, threshold
+                    "{} vCPUs {}/{}/{} regressed by {:.2}% (tolerance {:.2}%)",
+                    key.cpus, key.suite, key.case, key.metric, regression, tolerance
                 ),
             );
         }
@@ -903,7 +907,7 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{} benchmark metric(s) exceeded their regression threshold",
+            "{} benchmark metric(s) exceeded their tolerance",
             regressions.len()
         ))
     }
@@ -1000,9 +1004,12 @@ fn collect_metrics(report: &BenchReport) -> Result<BTreeMap<MetricKey, MetricSam
                 .get("direction")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| "measurement missing numeric `direction`".to_string())?;
-            let regression_threshold_percent = event
+            // Keep accepting the legacy field so an old boot image can serve as the transition
+            // baseline. New kernels emit only `tolerance_percent`.
+            let tolerance_percent = event
                 .payload
-                .get("regression_threshold_percent")
+                .get("tolerance_percent")
+                .or_else(|| event.payload.get("regression_threshold_percent"))
                 .and_then(Value::as_f64);
             let samples = metrics
                 .entry(key.clone())
@@ -1010,13 +1017,13 @@ fn collect_metrics(report: &BenchReport) -> Result<BTreeMap<MetricKey, MetricSam
             if !samples.values.is_empty()
                 && (samples.unit != unit
                     || samples.direction != direction
-                    || samples.regression_threshold_percent != regression_threshold_percent)
+                    || samples.tolerance_percent != tolerance_percent)
             {
                 return Err("measurement metadata changed within a metric".to_string());
             }
             samples.unit = unit;
             samples.direction = direction;
-            samples.regression_threshold_percent = regression_threshold_percent;
+            samples.tolerance_percent = tolerance_percent;
             samples.values.push(value);
             boot_values.entry(key).or_default().push(value);
         }
@@ -1036,46 +1043,49 @@ struct ChangeInterval {
 }
 
 fn bootstrap_change_interval(base: &MetricSamples, head: &MetricSamples) -> Option<ChangeInterval> {
-    const MIN_BOOT_SAMPLES: usize = 6;
+    // Independent boots add evidence; resamples only make the estimated interval less granular.
+    // Ten boots per image is the recommended minimum for a 99% interval.
+    const MIN_BOOT_SAMPLES: usize = 10;
+    // More resamples stabilize the reported tail endpoints but cost comparator CPU time.
+    // 50,000–200,000 is a useful range at 99%; 100,000 is a balanced default.
     const RESAMPLES: usize = 100_000;
-    if base.boot_medians.len() < MIN_BOOT_SAMPLES
-        || head.boot_medians.len() < MIN_BOOT_SAMPLES
-        || base.boot_medians.len() != head.boot_medians.len()
-    {
+    if base.boot_medians.len() < MIN_BOOT_SAMPLES || head.boot_medians.len() < MIN_BOOT_SAMPLES {
         return None;
     }
 
     let mut random = XorShift64::new(0x6a09_e667_f3bc_c909);
-    let paired_logs = paired_log_ratios(&base.boot_medians, &head.boot_medians)?;
-    let mut resample = Vec::with_capacity(paired_logs.len());
+    let mut base_resample = Vec::with_capacity(base.boot_medians.len());
+    let mut head_resample = Vec::with_capacity(head.boot_medians.len());
     let mut changes = Vec::with_capacity(RESAMPLES);
     for _ in 0..RESAMPLES {
-        resample.clear();
-        for _ in 0..paired_logs.len() {
-            resample.push(paired_logs[random.index(paired_logs.len())]);
+        base_resample.clear();
+        head_resample.clear();
+        for _ in 0..base.boot_medians.len() {
+            base_resample.push(base.boot_medians[random.index(base.boot_medians.len())]);
         }
-        changes.push(median(&resample).exp().mul_add(100.0, -100.0));
+        for _ in 0..head.boot_medians.len() {
+            head_resample.push(head.boot_medians[random.index(head.boot_medians.len())]);
+        }
+        changes.push(relative_change(
+            median(&base_resample),
+            median(&head_resample),
+        )?);
     }
     changes.sort_by(f64::total_cmp);
+    // Raising the confidence level widens this interval: false regression alarms
+    // become less likely, while more borderline changes become variance warnings.
+    // 99% is a useful default for a noisy CI host when each image has 10+ boots.
     Some(ChangeInterval {
-        lower: percentile(&changes, 0.0025),
-        upper: percentile(&changes, 0.9975),
+        lower: percentile(&changes, 0.005),
+        upper: percentile(&changes, 0.995),
     })
 }
 
-fn paired_change(base: &[f64], head: &[f64]) -> Option<f64> {
-    let logs = paired_log_ratios(base, head)?;
-    Some(median(&logs).exp().mul_add(100.0, -100.0))
-}
-
-fn paired_log_ratios(base: &[f64], head: &[f64]) -> Option<Vec<f64>> {
-    if base.is_empty() || base.len() != head.len() {
+fn relative_change(base: f64, head: f64) -> Option<f64> {
+    if !base.is_finite() || !head.is_finite() || base <= 0.0 || head <= 0.0 {
         return None;
     }
-    base.iter()
-        .zip(head)
-        .map(|(base, head)| (*base > 0.0 && *head > 0.0).then(|| (head / base).ln()))
-        .collect()
+    Some((head / base).mul_add(100.0, -100.0))
 }
 
 struct XorShift64(u64);

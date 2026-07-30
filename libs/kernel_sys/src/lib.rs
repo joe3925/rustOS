@@ -209,7 +209,7 @@ unsafe extern "C" {
     pub fn pnp_remove_symlink(link_path: String) -> Result<(), DriverErrorKind>;
 
     pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit)
-    -> Arc<DeviceObject>;
+        -> Arc<DeviceObject>;
 
     pub fn pnp_create_control_device_and_link(
         name: String,
@@ -247,7 +247,7 @@ unsafe extern "C" {
         value: f64,
         unit: BenchMetricUnit,
         direction: BenchMetricDirection,
-        regression_threshold_percent: f64,
+        tolerance_percent: f64,
     ) -> bool;
 
     pub fn bench_kernel_submit_rip_sample(

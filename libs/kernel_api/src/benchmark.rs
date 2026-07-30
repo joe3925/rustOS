@@ -115,24 +115,22 @@ impl SuiteContext {
         direction: BenchMetricDirection,
     ) -> bool {
         unsafe {
-            bench_kernel_measure(
-                self.handle,
-                metric.into(),
-                value,
-                unit,
-                direction,
-                f64::NAN,
-            )
+            bench_kernel_measure(self.handle, metric.into(), value, unit, direction, f64::NAN)
         }
     }
 
-    pub fn measure_with_threshold(
+    /// Records a metric with the largest percentage regression considered acceptable.
+    ///
+    /// Smaller tolerances catch subtler regressions but need more independent boots to avoid
+    /// noisy warnings. Stable microbenchmarks commonly use 2–5%; end-to-end I/O and scheduler
+    /// benchmarks commonly need 5–10%.
+    pub fn measure_with_tolerance(
         &self,
         metric: impl Into<String>,
         value: f64,
         unit: BenchMetricUnit,
         direction: BenchMetricDirection,
-        regression_threshold_percent: f64,
+        tolerance_percent: f64,
     ) -> bool {
         unsafe {
             bench_kernel_measure(
@@ -141,7 +139,7 @@ impl SuiteContext {
                 value,
                 unit,
                 direction,
-                regression_threshold_percent,
+                tolerance_percent,
             )
         }
     }

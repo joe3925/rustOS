@@ -19,15 +19,29 @@ use spin::Mutex;
 use crate::structs::stopwatch::Stopwatch;
 
 use super::{
-    bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_threshold,
+    bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_tolerance,
     capture::bench_c_drive_io_async,
 };
 
+/// Independent boots dominate confidence. More boots narrow uncertainty but increase CI time.
+/// Ten is the practical minimum for xtask's 99% model; 8–12 is the recommended range.
+const INDEPENDENT_BOOTS: u16 = 10;
 const CORRECTNESS_TASKS_PER_CPU: usize = 2_048;
+/// Trials within a boot smooth brief jitter but are not independent evidence. Raising this makes
+/// each boot slower; 10–30 is generally useful.
 const CORRECTNESS_TRIALS: usize = 15;
 const QUEUE_TASKS_PER_CPU: usize = 4_096;
 const QUEUE_TRIALS: usize = 15;
-const DISK_REGRESSION_THRESHOLD_PERCENT: f64 = 8.0;
+/// Executor correctness includes allocation and scheduling noise. 5–10% is recommended.
+const CORRECTNESS_TOLERANCE_PERCENT: f64 = 8.0;
+/// Queue duration is the most direct executor timing and is relatively stable. 2–5% is
+/// recommended; lowering it detects smaller slowdowns but demands a quieter host.
+const QUEUE_DURATION_TOLERANCE_PERCENT: f64 = 3.0;
+/// Throughput is derived from duration and tends to amplify jitter. 5–10% is recommended.
+const QUEUE_THROUGHPUT_TOLERANCE_PERCENT: f64 = 8.0;
+/// Largest disk slowdown treated as practically unchanged. Lower values catch smaller changes but
+/// warn more often; 5–10% is recommended for end-to-end virtual-disk benchmarks.
+const DISK_TOLERANCE_PERCENT: f64 = 8.0;
 
 struct YieldOnce(bool);
 
@@ -57,14 +71,14 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
             vec!["ci".to_string(), "executor".to_string()],
             executor_suite,
         )
-        .with_independent_boots(6),
+        .with_independent_boots(INDEPENDENT_BOOTS),
         BenchSuiteDescriptor::new(
             "io.c-drive",
             "End-to-end C drive read/write workload",
             vec!["ci".to_string(), "io".to_string()],
             c_drive_suite,
         )
-        .with_independent_boots(6),
+        .with_independent_boots(INDEPENDENT_BOOTS),
     ]
 }
 
@@ -113,13 +127,13 @@ async fn executor_correctness(handle: BenchRunHandle) -> bool {
             bench_case_end(handle);
             return false;
         }
-        bench_measure_with_threshold(
+        bench_measure_with_tolerance(
             handle,
             "duration".to_string(),
             elapsed as f64,
             BenchMetricUnit::Nanoseconds,
             BenchMetricDirection::LowerIsBetter,
-            Some(8.0),
+            Some(CORRECTNESS_TOLERANCE_PERCENT),
         );
     }
     bench_measure(
@@ -156,21 +170,21 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
             return false;
         }
 
-        bench_measure_with_threshold(
+        bench_measure_with_tolerance(
             handle,
             "duration".to_string(),
             elapsed as f64,
             BenchMetricUnit::Nanoseconds,
             BenchMetricDirection::LowerIsBetter,
-            Some(3.0),
+            Some(QUEUE_DURATION_TOLERANCE_PERCENT),
         );
-        bench_measure_with_threshold(
+        bench_measure_with_tolerance(
             handle,
             "throughput".to_string(),
             task_count as f64 * 1_000_000_000.0 / elapsed as f64,
             BenchMetricUnit::OperationsPerSecond,
             BenchMetricDirection::HigherIsBetter,
-            Some(8.0),
+            Some(QUEUE_THROUGHPUT_TOLERANCE_PERCENT),
         );
     }
 
@@ -249,23 +263,23 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
         for result in results.sizes {
             let size = alloc::format!("{}k", result.size_bytes / 1024);
             for value in result.write_ns_per_op {
-                bench_measure_with_threshold(
+                bench_measure_with_tolerance(
                     handle,
                     alloc::format!("write_ns_per_op.{size}"),
                     value as f64,
                     BenchMetricUnit::Nanoseconds,
                     BenchMetricDirection::LowerIsBetter,
-                    Some(DISK_REGRESSION_THRESHOLD_PERCENT),
+                    Some(DISK_TOLERANCE_PERCENT),
                 );
             }
             for value in result.read_ns_per_op {
-                bench_measure_with_threshold(
+                bench_measure_with_tolerance(
                     handle,
                     alloc::format!("read_ns_per_op.{size}"),
                     value as f64,
                     BenchMetricUnit::Nanoseconds,
                     BenchMetricDirection::LowerIsBetter,
-                    Some(DISK_REGRESSION_THRESHOLD_PERCENT),
+                    Some(DISK_TOLERANCE_PERCENT),
                 );
             }
         }
