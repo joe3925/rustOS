@@ -195,9 +195,13 @@ pub extern "C" fn kernel_main(ctx: usize) {
             .init_from_registry()
             .await
             .expect("failed to initialize PnP from the registry");
-        // bench_async_vs_sync_call_latency_async().await;
 
-        // benchmark_async_async().await;
+        #[cfg(feature = "kernel-bench")]
+        {
+            crate::benchmarking::register_builtin_suites();
+            let passed = crate::benchmarking::run_configured_suites().await;
+            crate::benchmarking::exit_benchmark_vm(passed);
+        }
     });
     println!("");
 }

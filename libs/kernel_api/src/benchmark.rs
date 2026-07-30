@@ -1,7 +1,9 @@
+use alloc::string::String;
 use kernel_sys::{
-    bench_kernel_span_begin, bench_kernel_submit_rip_sample, bench_kernel_window_create,
-    bench_kernel_window_destroy, bench_kernel_window_persist, bench_kernel_window_start,
-    bench_kernel_window_stop, BenchSpanGuard,
+    bench_kernel_case_end, bench_kernel_case_fail, bench_kernel_case_start, bench_kernel_measure,
+    bench_kernel_span_begin, bench_kernel_submit_rip_sample, bench_kernel_suite_register,
+    bench_kernel_window_create, bench_kernel_window_destroy, bench_kernel_window_persist,
+    bench_kernel_window_start, bench_kernel_window_stop, BenchSpanGuard,
 };
 use kernel_types::{
     async_ffi::AbiFuture,
@@ -75,4 +77,43 @@ pub fn submit_rip_sample_current_core(rip: u64, stack: &[u64]) {
 #[inline]
 pub fn span(tag: BenchTag, object_id: BenchObjectId) -> BenchSpanGuard {
     unsafe { bench_kernel_span_begin(tag, object_id) }
+}
+
+/// Registers a suite with the post-boot benchmark runner.
+pub fn register_suite(descriptor: BenchSuiteDescriptor) -> bool {
+    unsafe { bench_kernel_suite_register(descriptor) }
+}
+
+/// Driver-facing reporter passed to a registered suite callback.
+#[derive(Clone, Copy, Debug)]
+pub struct SuiteContext {
+    handle: BenchRunHandle,
+}
+
+impl SuiteContext {
+    pub const fn new(handle: BenchRunHandle) -> Self {
+        Self { handle }
+    }
+
+    pub fn start_case(&self, name: impl Into<String>) -> bool {
+        unsafe { bench_kernel_case_start(self.handle, name.into()) }
+    }
+
+    pub fn end_case(&self) -> bool {
+        unsafe { bench_kernel_case_end(self.handle) }
+    }
+
+    pub fn fail(&self, reason: impl Into<String>) -> bool {
+        unsafe { bench_kernel_case_fail(self.handle, reason.into()) }
+    }
+
+    pub fn measure(
+        &self,
+        metric: impl Into<String>,
+        value: f64,
+        unit: BenchMetricUnit,
+        direction: BenchMetricDirection,
+    ) -> bool {
+        unsafe { bench_kernel_measure(self.handle, metric.into(), value, unit, direction) }
+    }
 }

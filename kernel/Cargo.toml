@@ -12,6 +12,7 @@ path = "src/main.rs"
 [features]
 default = ["allocator-mimalloc"]
 allocator-mimalloc = []
+kernel-bench = []
 
 [dependencies]
 spin = "0.10.0"

@@ -1,0 +1,95 @@
+name: Kernel benchmarks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out proposed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Install QEMU and FAT tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86 ovmf dosfstools mtools
+
+      - name: Create C drive seed image
+        shell: bash
+        run: |
+          truncate -s 2G "$RUNNER_TEMP/rustos-ci-seed.img"
+          mkfs.vfat -F 32 "$RUNNER_TEMP/rustos-ci-seed.img"
+          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system
+          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system/registry
+          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system/toml
+          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system/mod
+
+      - name: Prepare base worktree
+        if: github.event_name == 'pull_request'
+        run: git worktree add "$RUNNER_TEMP/rustos-base" "${{ github.event.pull_request.base.sha }}"
+
+      - name: Detect benchmark-capable base
+        if: github.event_name == 'pull_request'
+        id: base
+        shell: bash
+        run: |
+          if grep -q 'kernel-bench' "$RUNNER_TEMP/rustos-base/kernel/Cargo.toml"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Base commit predates the benchmark runner; base comparison is skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Benchmark base at 1, 2, and 4 vCPUs
+        if: github.event_name == 'pull_request' && steps.base.outputs.available == 'true'
+        working-directory: ${{ runner.temp }}/rustos-base
+        env:
+          RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
+          RUSTOS_DISK_FORMAT: raw
+        run: |
+          cargo run --release -p xtask -- bench \
+            --cpus 1,2,4 \
+            --tag ci \
+            --output "$GITHUB_WORKSPACE/target/bench/base/results.json"
+
+      - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
+        env:
+          RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
+          RUSTOS_DISK_FORMAT: raw
+        run: |
+          cargo run --release -p xtask -- bench \
+            --cpus 1,2,4 \
+            --tag ci \
+            --output target/bench/head/results.json
+
+      - name: Compare base and proposed commit
+        if: github.event_name == 'pull_request' && steps.base.outputs.available == 'true'
+        run: |
+          cargo run --release -p xtask -- bench compare \
+            --base target/bench/base/results.json \
+            --head target/bench/head/results.json \
+            --output target/bench/comparison.md
+          cat target/bench/comparison.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-benchmarks
+          path: target/bench
+          retention-days: 14

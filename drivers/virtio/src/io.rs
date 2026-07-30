@@ -7,21 +7,15 @@ use crate::outstanding::{
 use crate::{
     check_blk_status, drain_queue_completions, map_request_buffer, wait_completion_hybrid,
 };
-use alloc::format;
 use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
-use core::sync::atomic::{AtomicPtr, Ordering};
-use kernel_api::benchmark::{
-    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
-    BenchSweepResult,
-};
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::dma::IoBuffer;
 use kernel_api::dma::dma::IoBufferAccess;
 use kernel_api::error::{
-    DriverErrorKind, ErrorKind, KernelError, ResultErrorContext, error, error_with_message,
+    DriverErrorKind, KernelError, ResultErrorContext, error, error_with_message,
 };
-use kernel_api::kernel_types::dma::{FromDevice, IoBufferDmaSegment, ToDevice};
+use kernel_api::kernel_types::dma::IoBufferDmaSegment;
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
 use kernel_api::pnp::DriverStep;
 use kernel_api::request::{DeviceControl, Flush, Read, Write};

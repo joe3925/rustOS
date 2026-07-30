@@ -50,7 +50,8 @@ use kernel_types::{
     ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
     async_ffi::{AbiFuture, FutureExt},
     benchmark::{
-        BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
+        BenchCoreId, BenchMetricDirection, BenchMetricUnit, BenchObjectId, BenchRunHandle,
+        BenchSpanId, BenchSuiteDescriptor, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::{
@@ -689,6 +690,77 @@ pub extern "C" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> AbiF
         }
     }
     .into_abi()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bench_kernel_suite_register(descriptor: BenchSuiteDescriptor) -> bool {
+    #[cfg(feature = "kernel-bench")]
+    {
+        crate::benchmarking::register_suite(descriptor)
+    }
+    #[cfg(not(feature = "kernel-bench"))]
+    {
+        let _ = descriptor;
+        false
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bench_kernel_case_start(handle: BenchRunHandle, case: String) -> bool {
+    #[cfg(feature = "kernel-bench")]
+    {
+        crate::benchmarking::bench_case_start(handle, case)
+    }
+    #[cfg(not(feature = "kernel-bench"))]
+    {
+        let _ = (handle, case);
+        false
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bench_kernel_case_end(handle: BenchRunHandle) -> bool {
+    #[cfg(feature = "kernel-bench")]
+    {
+        crate::benchmarking::bench_case_end(handle)
+    }
+    #[cfg(not(feature = "kernel-bench"))]
+    {
+        let _ = handle;
+        false
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bench_kernel_case_fail(handle: BenchRunHandle, reason: String) -> bool {
+    #[cfg(feature = "kernel-bench")]
+    {
+        crate::benchmarking::bench_case_fail(handle, reason)
+    }
+    #[cfg(not(feature = "kernel-bench"))]
+    {
+        let _ = (handle, reason);
+        false
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bench_kernel_measure(
+    handle: BenchRunHandle,
+    metric: String,
+    value: f64,
+    unit: BenchMetricUnit,
+    direction: BenchMetricDirection,
+) -> bool {
+    #[cfg(feature = "kernel-bench")]
+    {
+        crate::benchmarking::bench_measure(handle, metric, value, unit, direction)
+    }
+    #[cfg(not(feature = "kernel-bench"))]
+    {
+        let _ = (handle, metric, value, unit, direction);
+        false
+    }
 }
 
 #[unsafe(no_mangle)]
