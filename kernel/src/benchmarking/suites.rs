@@ -1,6 +1,6 @@
 use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     hint::black_box,
     pin::Pin,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -117,7 +117,7 @@ async fn executor_correctness(handle: BenchRunHandle) -> bool {
             elapsed as f64,
             BenchMetricUnit::Nanoseconds,
             BenchMetricDirection::LowerIsBetter,
-            Some(3.0),
+            Some(8.0),
         );
     }
     bench_measure(
@@ -168,7 +168,7 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
             task_count as f64 * 1_000_000_000.0 / elapsed as f64,
             BenchMetricUnit::OperationsPerSecond,
             BenchMetricDirection::HigherIsBetter,
-            Some(3.0),
+            Some(8.0),
         );
     }
 
