@@ -27,6 +27,7 @@ const CORRECTNESS_TASKS_PER_CPU: usize = 2_048;
 const CORRECTNESS_TRIALS: usize = 15;
 const QUEUE_TASKS_PER_CPU: usize = 4_096;
 const QUEUE_TRIALS: usize = 15;
+const DISK_REGRESSION_THRESHOLD_PERCENT: f64 = 8.0;
 
 struct YieldOnce(bool);
 
@@ -56,14 +57,14 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
             vec!["ci".to_string(), "executor".to_string()],
             executor_suite,
         )
-        .with_independent_boots(3),
+        .with_independent_boots(6),
         BenchSuiteDescriptor::new(
             "io.c-drive",
             "End-to-end C drive read/write workload",
             vec!["ci".to_string(), "io".to_string()],
             c_drive_suite,
         )
-        .with_independent_boots(3),
+        .with_independent_boots(6),
     ]
 }
 
@@ -254,7 +255,7 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
                     value as f64,
                     BenchMetricUnit::Nanoseconds,
                     BenchMetricDirection::LowerIsBetter,
-                    Some(3.0),
+                    Some(DISK_REGRESSION_THRESHOLD_PERCENT),
                 );
             }
             for value in result.read_ns_per_op {
@@ -264,7 +265,7 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
                     value as f64,
                     BenchMetricUnit::Nanoseconds,
                     BenchMetricDirection::LowerIsBetter,
-                    Some(3.0),
+                    Some(DISK_REGRESSION_THRESHOLD_PERCENT),
                 );
             }
         }

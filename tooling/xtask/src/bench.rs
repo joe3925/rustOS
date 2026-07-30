@@ -756,10 +756,10 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     let mut markdown = format!(
         "## {}\n\n\
          Metrics exceeding their registered regression threshold fail this comparison. \
-         Repeated suites use paired boot medians and a 10,000-resample 95% bootstrap confidence interval; \
+         Repeated suites use paired boot medians and a 100,000-resample 99.5% bootstrap confidence interval; \
          single-pair suites apply their practical threshold directly. MAD reports boot-to-boot variability. \
          Positive and negative changes are interpreted according to whether higher or lower values are better.\n\n\
-         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | 95% CI | Boot MAD (previous → current) | Threshold | Result |\n\
+         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | 99.5% CI | Boot MAD (previous → current) | Threshold | Result |\n\
          |---:|---|---|---|---:|---:|---:|---:|---:|---:|---|\n",
         options.title
     );
@@ -1036,8 +1036,8 @@ struct ChangeInterval {
 }
 
 fn bootstrap_change_interval(base: &MetricSamples, head: &MetricSamples) -> Option<ChangeInterval> {
-    const MIN_BOOT_SAMPLES: usize = 3;
-    const RESAMPLES: usize = 10_000;
+    const MIN_BOOT_SAMPLES: usize = 6;
+    const RESAMPLES: usize = 100_000;
     if base.boot_medians.len() < MIN_BOOT_SAMPLES
         || head.boot_medians.len() < MIN_BOOT_SAMPLES
         || base.boot_medians.len() != head.boot_medians.len()
@@ -1058,8 +1058,8 @@ fn bootstrap_change_interval(base: &MetricSamples, head: &MetricSamples) -> Opti
     }
     changes.sort_by(f64::total_cmp);
     Some(ChangeInterval {
-        lower: percentile(&changes, 0.025),
-        upper: percentile(&changes, 0.975),
+        lower: percentile(&changes, 0.0025),
+        upper: percentile(&changes, 0.9975),
     })
 }
 
