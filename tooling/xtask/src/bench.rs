@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -15,8 +15,8 @@ use std::{
 };
 
 use crate::{
-    assert_exists, build_platform, config, find_firmware, find_qemu, qemu_args, system_disk,
-    QemuOptions, SystemDisk,
+    QemuOptions, SystemDisk, assert_exists, build_platform, config, find_firmware, find_qemu,
+    qemu_args, system_disk,
 };
 
 const PROTOCOL_PREFIX: &str = "RUSTOS_BENCH\t";
@@ -486,11 +486,7 @@ fn report_panic(cpus: usize, details: &str) {
     eprintln!("{details}");
     eprintln!("===== END KERNEL PANIC =====");
 
-    let annotation = details
-        .lines()
-        .take(8)
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let annotation = details.lines().take(8).collect::<Vec<_>>().join(" | ");
     annotate_error(&format!("Kernel panic ({cpus} vCPUs)"), &annotation);
 
     let Some(summary_path) = std::env::var_os("GITHUB_STEP_SUMMARY") else {
@@ -524,9 +520,9 @@ fn annotate_error(title: &str, message: &str) {
 
     let escape = |value: &str| {
         value
-        .replace('%', "%25")
-        .replace('\r', "%0D")
-        .replace('\n', "%0A")
+            .replace('%', "%25")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A")
     };
     eprintln!("::error title={}::{}", escape(title), escape(message));
 }
@@ -657,14 +653,43 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     let head_metrics = collect_metrics(&head)?;
     let mut markdown = String::from(
         "# Kernel benchmark comparison\n\n\
-         Performance changes are informational and do not fail the workflow.\n\n\
+         Metrics exceeding their registered regression threshold fail the workflow. \
+         The sign of a change is independent of whether higher or lower values are better.\n\n\
          | CPUs | Suite | Case | Metric | Previous median | Current median | Change | Threshold | Result |\n\
          |---:|---|---|---|---:|---:|---:|---:|---|\n",
     );
 
     let mut regressions = Vec::new();
-    for (key, base_samples) in &base_metrics {
-        let Some(head_samples) = head_metrics.get(key) else {
+    let keys = base_metrics
+        .keys()
+        .chain(head_metrics.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in keys {
+        let base_samples = base_metrics.get(&key);
+        let head_samples = head_metrics.get(&key);
+        let (Some(base_samples), Some(head_samples)) = (base_samples, head_samples) else {
+            let samples = head_samples
+                .or(base_samples)
+                .expect("metric key has samples");
+            let median = median(&samples.values);
+            let (previous, current, result) = if head_samples.is_some() {
+                ("—".to_string(), format!("{median:.3}"), "new metric")
+            } else {
+                (
+                    format!("{median:.3}"),
+                    "—".to_string(),
+                    "missing from current run",
+                )
+            };
+            let threshold = samples
+                .regression_threshold_percent
+                .map(|value| format!("{value:.2}%"))
+                .unwrap_or_else(|| "—".to_string());
+            markdown.push_str(&format!(
+                "| {} | `{}` | `{}` | `{}` | {} | {} | — | {} | {} |\n",
+                key.cpus, key.suite, key.case, key.metric, previous, current, threshold, result,
+            ));
             continue;
         };
         let base_median = median(&base_samples.values);

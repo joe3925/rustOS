@@ -2741,7 +2741,7 @@ pub fn used_memory() -> usize {
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
-const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 64 * 1024 * 1024;
+const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 128 * 1024 * 1024;
 const DISK_BENCH_IOBUFFER_CREATE_OPS: u64 = 1_000_000;
 
 const DISK_BENCH_SIZES: &[usize] = &[

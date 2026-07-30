@@ -24,8 +24,9 @@ use super::{
 };
 
 const CORRECTNESS_TASKS_PER_CPU: usize = 2_048;
+const CORRECTNESS_TRIALS: usize = 15;
 const QUEUE_TASKS_PER_CPU: usize = 4_096;
-const QUEUE_TRIALS: usize = 8;
+const QUEUE_TRIALS: usize = 15;
 
 struct YieldOnce(bool);
 
@@ -88,26 +89,36 @@ async fn executor_correctness(handle: BenchRunHandle) -> bool {
         sum.wrapping_add(value.wrapping_mul(0x9e37_79b9_7f4a_7c15))
     });
 
-    let timer = Stopwatch::start();
-    let actual = run_task_batch(task_count, correctness_value).await;
-    let elapsed = timer.elapsed_nanos();
+    if run_task_batch(task_count, correctness_value).await != expected {
+        bench_case_fail(handle, "executor warm-up checksum mismatch".to_string());
+        bench_case_end(handle);
+        return false;
+    }
 
-    if actual != expected {
-        bench_case_fail(
+    for _ in 0..CORRECTNESS_TRIALS {
+        let timer = Stopwatch::start();
+        let actual = run_task_batch(task_count, correctness_value).await;
+        let elapsed = timer.elapsed_nanos();
+
+        if actual != expected {
+            bench_case_fail(
+                handle,
+                alloc::format!(
+                    "executor checksum mismatch: expected={expected:#x}, actual={actual:#x}"
+                ),
+            );
+            bench_case_end(handle);
+            return false;
+        }
+        bench_measure_with_threshold(
             handle,
-            alloc::format!(
-                "executor checksum mismatch: expected={expected:#x}, actual={actual:#x}"
-            ),
+            "duration".to_string(),
+            elapsed as f64,
+            BenchMetricUnit::Nanoseconds,
+            BenchMetricDirection::LowerIsBetter,
+            Some(3.0),
         );
     }
-    bench_measure_with_threshold(
-        handle,
-        "duration".to_string(),
-        elapsed as f64,
-        BenchMetricUnit::Nanoseconds,
-        BenchMetricDirection::LowerIsBetter,
-        Some(3.0),
-    );
     bench_measure(
         handle,
         "tasks".to_string(),
@@ -116,7 +127,7 @@ async fn executor_correctness(handle: BenchRunHandle) -> bool {
         BenchMetricDirection::Informational,
     );
     bench_case_end(handle);
-    actual == expected
+    true
 }
 
 async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
