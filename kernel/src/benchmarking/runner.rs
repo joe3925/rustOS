@@ -115,21 +115,20 @@ pub fn bench_measure(
     unit: BenchMetricUnit,
     direction: BenchMetricDirection,
 ) -> bool {
-    bench_measure_with_threshold(handle, metric, value, unit, direction, None)
+    bench_measure_with_tolerance(handle, metric, value, unit, direction, None)
 }
 
-pub fn bench_measure_with_threshold(
+pub fn bench_measure_with_tolerance(
     handle: BenchRunHandle,
     metric: String,
     value: f64,
     unit: BenchMetricUnit,
     direction: BenchMetricDirection,
-    regression_threshold_percent: Option<f64>,
+    tolerance_percent: Option<f64>,
 ) -> bool {
     if !valid_identifier(&metric)
         || !value.is_finite()
-        || regression_threshold_percent
-            .is_some_and(|threshold| !threshold.is_finite() || threshold < 0.0)
+        || tolerance_percent.is_some_and(|tolerance| !tolerance.is_finite() || tolerance < 0.0)
     {
         return false;
     }
@@ -161,7 +160,7 @@ pub fn bench_measure_with_threshold(
             "value": value,
             "unit": unit as u32,
             "direction": direction as u32,
-            "regression_threshold_percent": regression_threshold_percent,
+            "tolerance_percent": tolerance_percent,
         }),
     );
     true

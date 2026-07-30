@@ -285,6 +285,11 @@ impl BenchSuiteDescriptor {
         }
     }
 
+    /// Sets how many fresh kernel boots contribute independent observations.
+    ///
+    /// More boots make confidence intervals more trustworthy but increase execution time almost
+    /// linearly. Eight to twelve boots is a useful range for high-confidence CI comparisons; one
+    /// is appropriate only for correctness checks or informational metrics.
     pub fn with_independent_boots(mut self, boots: u16) -> Self {
         self.independent_boots = boots.max(1);
         self

@@ -2739,6 +2739,9 @@ pub fn used_memory() -> usize {
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
+/// Traffic generated for each block size in one boot. Raising this adds passes and smooths
+/// within-boot jitter, but cannot replace independent boots. 30–80 MiB (3–8 current passes) is a
+/// useful range.
 const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 50 * 1024 * 1024;
 const DISK_BENCH_IOBUFFER_CREATE_OPS: u64 = 1_000_000;
 

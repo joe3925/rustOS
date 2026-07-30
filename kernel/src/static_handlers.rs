@@ -16,12 +16,12 @@ use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
     benchmarking::{
-        BenchSpanGuard, BenchWindow, bench_log_span_end, bench_span_guard, bench_submit_rip_sample,
+        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
     },
     console::CONSOLE,
     drivers::{
-        ACPI::ACPIImpl,
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
+        ACPI::ACPIImpl,
     },
     file_system::{
         file::{self, File},
@@ -47,7 +47,6 @@ use alloc::{
 };
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::{
-    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
     async_ffi::{AbiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchMetricDirection, BenchMetricUnit, BenchObjectId, BenchRunHandle,
@@ -67,6 +66,7 @@ use kernel_types::{
     pnp::{DeviceIds, DeviceRelationType},
     runtime::BlockOnThreadState,
     status::{Data, PageMapError},
+    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
 
@@ -751,18 +751,18 @@ pub extern "C" fn bench_kernel_measure(
     value: f64,
     unit: BenchMetricUnit,
     direction: BenchMetricDirection,
-    regression_threshold_percent: f64,
+    tolerance_percent: f64,
 ) -> bool {
-    let threshold = regression_threshold_percent.is_finite().then_some(regression_threshold_percent);
+    let tolerance = tolerance_percent.is_finite().then_some(tolerance_percent);
     #[cfg(feature = "kernel-bench")]
     {
-        crate::benchmarking::bench_measure_with_threshold(
-            handle, metric, value, unit, direction, threshold,
+        crate::benchmarking::bench_measure_with_tolerance(
+            handle, metric, value, unit, direction, tolerance,
         )
     }
     #[cfg(not(feature = "kernel-bench"))]
     {
-        let _ = (handle, metric, value, unit, direction, threshold);
+        let _ = (handle, metric, value, unit, direction, tolerance);
         false
     }
 }
