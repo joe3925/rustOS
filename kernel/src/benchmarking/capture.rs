@@ -10,9 +10,9 @@ use crate::profiling::backtrace::{Backtrace, BacktraceStatus, MAX_BACKTRACE_DEPT
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
-use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_archive_for_path};
+use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
 use crate::structs::stopwatch::Stopwatch;
-use crate::util::{TOTAL_TIME, boot_info};
+use crate::util::{boot_info, TOTAL_TIME};
 use crate::{platform, print, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -28,21 +28,21 @@ use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{
-    JoinAll, block_on, spawn_blocking, spawn_blocking_many, spawn_detached,
-    spawn_join_owned as spawn,
+    block_on, spawn_blocking, spawn_blocking_many, spawn_detached, spawn_join_owned as spawn,
+    JoinAll,
 };
-use kernel_types::Message;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
-    BENCH_SAMPLE_PROTO_SCHEMA_VERSION, BenchDroppedSampleCounterProto, BenchOverflowPolicy,
-    BenchSampleChunkProto, BenchSampleProto, BenchWindowConfig,
+    BenchDroppedSampleCounterProto, BenchOverflowPolicy, BenchSampleChunkProto, BenchSampleProto,
+    BenchWindowConfig, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
 };
 use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::error::KernelError;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::DeviceControl;
-use serde_json::{Value, json};
+use kernel_types::Message;
+use serde_json::{json, Value};
 use spin::{Mutex, Once};
 
 const MAX_CALLCHAIN_DEPTH: usize = MAX_BACKTRACE_DEPTH;
@@ -2282,24 +2282,22 @@ impl BenchWindow {
                 let interval = secs;
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
-                spawn_blocking(move || {
-                    loop {
-                        platform::wait_duration(interval);
+                spawn_blocking(move || loop {
+                    platform::wait_duration(interval);
 
-                        if !BENCH_ENABLED {
-                            return;
-                        }
-
-                        {
-                            let inner = this_arc.inner.lock();
-                            if !inner.running {
-                                break;
-                            }
-                        }
-
-                        let moved = Arc::clone(&this_arc);
-                        block_on(moved.persist());
+                    if !BENCH_ENABLED {
+                        return;
                     }
+
+                    {
+                        let inner = this_arc.inner.lock();
+                        if !inner.running {
+                            break;
+                        }
+                    }
+
+                    let moved = Arc::clone(&this_arc);
+                    block_on(moved.persist());
                 });
             }
         }
@@ -3085,9 +3083,8 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
 
             write_bytes += offset;
             write_ops += ops;
-            write_samples.push(
-                (write_ns.saturating_sub(write_ns_before) / ops.max(1) as u128) as u64,
-            );
+            write_samples
+                .push((write_ns.saturating_sub(write_ns_before) / ops.max(1) as u128) as u64);
 
             if let Err(e) = file.flush().await {
                 println!(
@@ -3144,8 +3141,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
 
             read_bytes += offset;
             read_ops += ops;
-            read_samples
-                .push((read_ns.saturating_sub(read_ns_before) / ops.max(1) as u128) as u64);
+            read_samples.push((read_ns.saturating_sub(read_ns_before) / ops.max(1) as u128) as u64);
         }
 
         let wr_ns_op = if write_ops == 0 {

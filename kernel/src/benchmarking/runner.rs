@@ -5,13 +5,13 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel_types::benchmark::{
-    BENCH_SUITE_ABI_VERSION, BenchMetricDirection, BenchMetricUnit, BenchRunHandle,
-    BenchSuiteDescriptor, BenchSuiteStatus,
+    BenchMetricDirection, BenchMetricUnit, BenchRunHandle, BenchSuiteDescriptor, BenchSuiteStatus,
+    BENCH_SUITE_ABI_VERSION,
 };
 use serde_json::json;
 use spin::{Mutex, Once};
 
-use super::suites;
+use super::{boot_state, suites};
 use crate::println;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -195,11 +195,17 @@ fn matches_selection(descriptor: &BenchSuiteDescriptor, names: &[String], tags: 
             .any(|tag| descriptor.tags.iter().any(|candidate| candidate == tag))
 }
 
-pub async fn run_selected_suites(names: &[String], tags: &[String]) -> bool {
+async fn run_selected_suites_for_repetition(
+    names: &[String],
+    tags: &[String],
+    repetition: usize,
+    persist_repetition: bool,
+) -> bool {
     let selected: Vec<BenchSuiteDescriptor> = suites()
         .lock()
         .values()
         .filter(|suite| matches_selection(suite, names, tags))
+        .filter(|suite| usize::from(suite.independent_boots) >= repetition)
         .cloned()
         .collect();
 
@@ -208,6 +214,11 @@ pub async fn run_selected_suites(names: &[String], tags: &[String]) -> bool {
         json!({
             "suite_count": selected.len(),
             "cpu_count": crate::platform::processor_count(),
+            "repetition": repetition,
+            "suites": selected.iter().map(|suite| json!({
+                "name": suite.name,
+                "independent_boots": suite.independent_boots,
+            })).collect::<Vec<_>>(),
         }),
     );
 
@@ -240,11 +251,19 @@ pub async fn run_selected_suites(names: &[String], tags: &[String]) -> bool {
         );
     }
 
+    if persist_repetition {
+        passed &= boot_state::persist_next_repetition(repetition).await;
+    }
+
     emit(
         "run_end",
         json!({ "status": if passed { "passed" } else { "failed" } }),
     );
     passed
+}
+
+pub async fn run_selected_suites(names: &[String], tags: &[String]) -> bool {
+    run_selected_suites_for_repetition(names, tags, 1, false).await
 }
 
 pub async fn run_configured_suites() -> bool {
@@ -260,5 +279,6 @@ pub async fn run_configured_suites() -> bool {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    run_selected_suites(&names, &tags).await
+    let repetition = boot_state::current_repetition().await;
+    run_selected_suites_for_repetition(&names, &tags, repetition, true).await
 }

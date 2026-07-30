@@ -16,8 +16,8 @@ use std::{
 };
 
 use crate::{
-    QemuOptions, SystemDisk, assert_exists, build_platform, config, find_firmware, find_qemu,
-    qemu_args, system_disk,
+    assert_exists, build_platform, config, find_firmware, find_qemu, qemu_args, system_disk,
+    QemuOptions, SystemDisk,
 };
 
 const PROTOCOL_PREFIX: &str = "RUSTOS_BENCH\t";
@@ -37,7 +37,6 @@ pub struct BenchOptions {
     suites: Vec<String>,
     tags: Vec<String>,
     output: PathBuf,
-    repetitions: usize,
     boot_image: Option<PathBuf>,
     export_boot_image: Option<PathBuf>,
     prepare_only: bool,
@@ -88,7 +87,6 @@ impl BenchOptions {
         let mut suites = Vec::new();
         let mut tags = Vec::new();
         let mut output = PathBuf::from("target/bench/results.json");
-        let mut repetitions = 1;
         let mut boot_image = None;
         let mut export_boot_image = None;
         let mut prepare_only = false;
@@ -122,15 +120,6 @@ impl BenchOptions {
                 "--suite" => suites.push(next_value(&mut args, "--suite")?),
                 "--tag" => tags.push(next_value(&mut args, "--tag")?),
                 "--output" => output = PathBuf::from(next_value(&mut args, "--output")?),
-                "--repetitions" => {
-                    let value = next_value(&mut args, "--repetitions")?;
-                    repetitions = value
-                        .parse()
-                        .map_err(|_| format!("invalid repetition count `{value}`"))?;
-                    if repetitions == 0 {
-                        return Err("--repetitions must be positive".to_string());
-                    }
-                }
                 "--boot-image" => {
                     boot_image = Some(PathBuf::from(next_value(&mut args, "--boot-image")?))
                 }
@@ -172,7 +161,6 @@ impl BenchOptions {
             suites,
             tags,
             output,
-            repetitions,
             boot_image,
             export_boot_image,
             prepare_only,
@@ -268,23 +256,25 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
 
     let mut runs = Vec::new();
     for cpus in options.cpus {
-        for repetition in 1..=options.repetitions {
-            println!(
-                "==> benchmarking with {cpus} vCPU(s), repetition {repetition}/{}",
-                options.repetitions
-            );
-            let disk_path = bench_dir.join(format!("system-{cpus}cpu-repetition-{repetition}.img"));
-            fs::copy(&seed_disk.path, &disk_path).map_err(|err| {
-                format!(
-                    "failed to clone benchmark disk {} to {}: {err}",
-                    seed_disk.path.display(),
-                    disk_path.display()
-                )
-            })?;
-            let disk = SystemDisk {
-                path: disk_path,
-                format: seed_disk.format.clone(),
-            };
+        let disk_path = bench_dir.join(format!("system-{cpus}cpu.img"));
+        fs::copy(&seed_disk.path, &disk_path).map_err(|err| {
+            format!(
+                "failed to clone benchmark disk {} to {}: {err}",
+                seed_disk.path.display(),
+                disk_path.display()
+            )
+        })?;
+        let disk = SystemDisk {
+            path: disk_path,
+            format: seed_disk.format.clone(),
+        };
+        let mut repetition = 1;
+        let mut suite_boots = Vec::<(String, usize)>::new();
+        loop {
+            if repetition > 1 && !suite_boots.iter().any(|(_, boots)| *boots >= repetition) {
+                break;
+            }
+            println!("==> benchmarking with {cpus} vCPU(s), repetition {repetition}");
             let serial_log =
                 bench_dir.join(format!("{cpus}cpu-repetition-{repetition}.serial.log"));
             let topology = run_topology(
@@ -300,13 +290,30 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                 options.timeout,
                 serial_log,
             );
-            if let Err(err) = fs::remove_file(&disk.path) {
-                eprintln!(
-                    "warning: failed to remove temporary benchmark disk {}: {err}",
-                    disk.path.display()
-                );
+            let topology = match topology {
+                Ok(topology) => topology,
+                Err(error) => {
+                    let _ = fs::remove_file(&disk.path);
+                    return Err(error);
+                }
+            };
+            if repetition == 1 {
+                suite_boots = match suite_boot_plan(&topology) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        let _ = fs::remove_file(&disk.path);
+                        return Err(error);
+                    }
+                };
             }
-            runs.push(topology?);
+            runs.push(topology);
+            repetition += 1;
+        }
+        if let Err(err) = fs::remove_file(&disk.path) {
+            eprintln!(
+                "warning: failed to remove temporary benchmark disk {}: {err}",
+                disk.path.display()
+            );
         }
     }
 
@@ -493,6 +500,34 @@ fn run_topology(
         serial_log,
         panic,
     })
+}
+
+fn suite_boot_plan(run: &TopologyRun) -> Result<Vec<(String, usize)>, String> {
+    let Some(event) = run.events.iter().find(|event| event.kind == "run_start") else {
+        return Err("benchmark run did not emit run_start metadata".to_string());
+    };
+    let Some(suites) = event.payload.get("suites").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    suites
+        .iter()
+        .map(|suite| {
+            let name = suite
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "suite catalog entry missing `name`".to_string())?;
+            let boots = suite
+                .get("independent_boots")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!("suite catalog entry `{name}` missing `independent_boots`")
+                })?;
+            Ok((
+                name.to_string(),
+                usize::try_from(boots).unwrap_or(usize::MAX).max(1),
+            ))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

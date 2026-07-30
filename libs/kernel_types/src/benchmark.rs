@@ -215,7 +215,7 @@ impl Default for BenchWindowConfig {
 pub struct BenchWindowHandle(pub u32);
 
 /// ABI version for dynamically registered benchmark suites.
-pub const BENCH_SUITE_ABI_VERSION: u32 = 1;
+pub const BENCH_SUITE_ABI_VERSION: u32 = 2;
 
 /// Opaque handle for the suite invocation currently owned by the kernel runner.
 #[repr(transparent)]
@@ -264,6 +264,7 @@ pub struct BenchSuiteDescriptor {
     pub name: String,
     pub description: String,
     pub tags: Vec<String>,
+    pub independent_boots: u16,
     pub callback: BenchSuiteCallback,
 }
 
@@ -279,7 +280,13 @@ impl BenchSuiteDescriptor {
             name: name.into(),
             description: description.into(),
             tags,
+            independent_boots: 1,
             callback,
         }
+    }
+
+    pub fn with_independent_boots(mut self, boots: u16) -> Self {
+        self.independent_boots = boots.max(1);
+        self
     }
 }

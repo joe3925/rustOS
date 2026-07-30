@@ -1,8 +1,5 @@
 use serde::Deserialize;
-use std::{
-    env, fs,
-    path::PathBuf,
-};
+use std::{env, fs, path::PathBuf};
 
 #[derive(Deserialize)]
 struct PackageManifest {

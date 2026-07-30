@@ -1,6 +1,6 @@
 use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
-    future::{Future, poll_fn},
+    future::{poll_fn, Future},
     hint::black_box,
     pin::Pin,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -55,7 +55,8 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
             "Executor correctness and queue-pressure stress",
             vec!["ci".to_string(), "executor".to_string()],
             executor_suite,
-        ),
+        )
+        .with_independent_boots(3),
         BenchSuiteDescriptor::new(
             "io.c-drive",
             "End-to-end C drive read/write workload",

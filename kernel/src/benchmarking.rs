@@ -4,6 +4,8 @@
 //! live in separate modules. The capture implementation remains the owner of
 //! low-overhead span and sampling hooks used by drivers.
 
+#[cfg(feature = "kernel-bench")]
+mod boot_state;
 mod capture;
 #[cfg(feature = "kernel-bench")]
 mod runner;
@@ -11,16 +13,15 @@ mod runner;
 mod suites;
 
 pub use capture::{
-    BENCH_ENABLED, BenchSpanGuard, BenchWindow, bench_log_span_end, bench_span_guard,
-    bench_submit_interrupt_sample_current_core, bench_submit_rip_sample,
-    bench_submit_rip_sample_current_core, used_memory,
+    bench_log_span_end, bench_span_guard, bench_submit_interrupt_sample_current_core,
+    bench_submit_rip_sample, bench_submit_rip_sample_current_core, used_memory, BenchSpanGuard,
+    BenchWindow, BENCH_ENABLED,
 };
 
 #[cfg(feature = "kernel-bench")]
 pub use runner::{
-    bench_case_end, bench_case_fail, bench_case_start, bench_measure,
-    bench_measure_with_threshold, register_builtin_suites, register_suite, run_configured_suites,
-    run_selected_suites,
+    bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_threshold,
+    register_builtin_suites, register_suite, run_configured_suites, run_selected_suites,
 };
 
 #[cfg(feature = "kernel-bench")]
