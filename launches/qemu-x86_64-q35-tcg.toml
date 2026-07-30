@@ -35,7 +35,7 @@ lldb_metadata_args = [
 
 [defaults]
 memory = "12G"
-cpus = "1"
+cpus = "3"
 
 [capabilities]
 debug = true

@@ -1,12 +1,4 @@
-use crate::benchmarking::async_chain;
-use crate::benchmarking::async_spawn_wake_chain;
-use crate::benchmarking::bench_async_vs_sync_call_latency_async;
-use crate::benchmarking::bench_runtime_executor_async;
 use crate::benchmarking::used_memory;
-use crate::benchmarking::yield_once;
-
-use crate::benchmarking::BenchWindow;
-use crate::benchmarking::bench_c_drive_io;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::profiling::backtrace::Backtrace;
 use crate::static_handlers::print;
@@ -18,7 +10,6 @@ use alloc::{
 };
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
-use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::{
     dma::{FromDevice, IoBuffer, ToDevice},
     error::{ErrorKind, FileErrorKind, KernelError},
@@ -30,7 +21,6 @@ use crate::file_system::file_provider::provider;
 use kernel_executor::runtime::runtime::{JoinAll, spawn_join_owned as spawn};
 
 use crate::{
-    benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
     file_system::file_provider::{self, ProviderKind, install_file_provider},
     memory::paging::used_bytes,
     platform::wait_duration,
@@ -419,43 +409,15 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
         "boot time: {:.3}s, Used memory: {:.2} MiB, Used heap: {:.2} MiB",
         secs, used_mib, heap_mib
     );
-    // spawn_blocking(|| loop {});
-    // spawn_blocking(|| loop {});
-    // spawn_blocking(|| loop {});
-    //
-    spawn_detached(async move {
-        //loop {
-        // let window = BenchWindow::new(BenchWindowConfig {
-        //     name: "drive".to_string(),
-        //     folder: "C:\\system\\logs".to_string(),
-        //     log_samples: true,
-        //     log_spans: false,
-        //     log_mem_on_persist: false,
-        //     export_debug_metadata: true,
-        //     end_on_drop: false,
-        //     timeout_ms: None,
-        //     auto_persist_secs: None,
-        //     sample_reserve: 4000000,
-        //     span_reserve: 0,
-        //     overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
-        //     sample_capacity: None,
-        //     sample_chunk_capacity: None,
-        //     max_unwind_depth: None,
-        //     disable_per_core: true,
-        // });
-        // bench_async_vs_sync_call_latency_async().await;
-        // bench_runtime_executor_async().await;
-        //window.start();
-        loop {
-            bench_c_drive_io_async(true).await;
-        }
-        //window.stop_and_persist().await;
-        //test_full_heap_parallel();
-        //}
-        // loop {
-        //     bench_c_drive_io_async().await;
-        // }
+    #[cfg(feature = "kernel-bench")]
+    spawn_detached(async {
+        crate::benchmarking::register_builtin_suites();
+        let passed = crate::benchmarking::run_configured_suites().await;
+        crate::benchmarking::exit_benchmark_vm(passed);
     });
+    // spawn_blocking(|| loop {});
+    // spawn_blocking(|| loop {});
+    // spawn_blocking(|| loop {});
     Ok(())
 }
 pub(crate) fn file_parser(path: &str) -> Vec<&str> {

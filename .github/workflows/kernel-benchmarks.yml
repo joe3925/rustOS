@@ -1,0 +1,258 @@
+name: Kernel benchmarks
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: kernel-bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: [self-hosted, linux, x64, rustos-bench]
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out proposed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Verify benchmark host
+        run: |
+          qemu-system-x86_64 --version
+          sgdisk --version
+          dpkg-query --show --showformat='dosfstools ${Version}\n' dosfstools
+          clang --version
+          gh --version
+          jq --version
+          rustc --version
+          cargo --version
+
+      - name: Create C drive seed image
+        shell: bash
+        run: |
+          image="$RUNNER_TEMP/rustos-ci-seed.img"
+          mount_dir="$RUNNER_TEMP/rustos-ci-mount"
+          loop_device=""
+
+          cleanup() {
+            if mountpoint -q "$mount_dir"; then
+              sudo umount "$mount_dir"
+            fi
+            if [[ -n "$loop_device" ]]; then
+              sudo losetup --detach "$loop_device"
+            fi
+          }
+          trap cleanup EXIT
+
+          truncate -s 2G "$image"
+          sgdisk --new=1:2048:0 --typecode=1:0700 --change-name=1:rustOS "$image"
+
+          loop_device="$(sudo losetup --find --show --partscan "$image")"
+          partition="${loop_device}p1"
+          for _ in {1..10}; do
+            [[ -b "$partition" ]] && break
+            sleep 0.2
+          done
+          [[ -b "$partition" ]]
+
+          sudo mkfs.vfat -F 32 -n RUSTOS "$partition"
+          mkdir -p "$mount_dir"
+          sudo mount "$partition" "$mount_dir"
+          sudo mkdir -p \
+            "$mount_dir/system/registry" \
+            "$mount_dir/system/toml" \
+            "$mount_dir/system/mod"
+          sync
+
+          cleanup
+          trap - EXIT
+
+      - name: Download benchmark baselines
+        id: baselines
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          mkdir -p target/bench/baselines
+          encoded_branch="$(jq -rn --arg value "$BENCH_BRANCH" '$value | @uri')"
+
+          list_runs() {
+            local status="$1"
+            local query="repos/${GITHUB_REPOSITORY}/actions/workflows/kernel-benchmarks.yml/runs?branch=${encoded_branch}&status=${status}&per_page=20"
+            gh api "$query"
+          }
+
+          download_baseline() {
+            local kind="$1"
+            local status="$2"
+            local output="target/bench/${kind}-results.json"
+            local candidates="target/bench/baselines/${kind}-candidates.txt"
+
+            list_runs "$status" |
+              jq -r '.workflow_runs[].id' > "$candidates"
+
+            while read -r run_id; do
+              local run_dir="target/bench/baselines/${kind}-${run_id}"
+              mkdir -p "$run_dir"
+              if ! gh run download "$run_id" \
+                --name kernel-benchmarks \
+                --dir "$run_dir"; then
+                continue
+              fi
+
+              local result
+              result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
+              local boot_image
+              boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
+              if [[ -n "$result" && -n "$boot_image" ]]; then
+                cp "$result" "$output"
+                cp "$boot_image" "target/bench/${kind}-boot.img"
+                printf -v "${kind}_run_id" '%s' "$run_id"
+                echo "${kind}_available=true" >> "$GITHUB_OUTPUT"
+                echo "${kind}_run_id=$run_id" >> "$GITHUB_OUTPUT"
+                return
+              fi
+            done < "$candidates"
+
+            echo "${kind}_available=false" >> "$GITHUB_OUTPUT"
+          }
+
+          download_baseline accepted success
+
+          echo "regression_available=false" >> "$GITHUB_OUTPUT"
+          regression_candidates="target/bench/baselines/regression-candidates.txt"
+          list_runs completed |
+            jq -r '.workflow_runs[] | [.id, .conclusion] | @tsv' \
+              > "$regression_candidates"
+          while read -r run_id conclusion; do
+            run_dir="target/bench/baselines/regression-${run_id}"
+            mkdir -p "$run_dir"
+            if ! gh run download "$run_id" \
+              --name kernel-benchmarks \
+              --dir "$run_dir"; then
+              continue
+            fi
+            result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
+            boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
+            if [[ -n "$result" && -n "$boot_image" ]] &&
+              jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+              if [[ "$run_id" != "${accepted_run_id:-}" && "$conclusion" == "failure" ]]; then
+                cp "$result" target/bench/regression-results.json
+                cp "$boot_image" target/bench/regression-boot.img
+                echo "regression_available=true" >> "$GITHUB_OUTPUT"
+                echo "regression_run_id=$run_id" >> "$GITHUB_OUTPUT"
+              fi
+              break
+            fi
+          done < "$regression_candidates"
+
+      - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
+        env:
+          RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
+          RUSTOS_DISK_FORMAT: raw
+          ACCEPTED_AVAILABLE: ${{ steps.baselines.outputs.accepted_available }}
+          REGRESSION_AVAILABLE: ${{ steps.baselines.outputs.regression_available }}
+        run: |
+          cargo run --release -p xtask -- bench \
+            --tag ci \
+            --prepare-only \
+            --export-boot-image target/bench/head/boot.img
+
+          run_variant() {
+            local variant="$1"
+            local boot_image="$2"
+            mkdir -p "target/bench/${variant}"
+            cargo run --release -p xtask -- bench \
+              --cpus 1,2,4 \
+              --boot-image "$boot_image" \
+              --boot-timeout-secs 120 \
+              --output "target/bench/${variant}/results.json"
+          }
+
+          if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+            run_variant accepted target/bench/accepted-boot.img
+          fi
+          run_variant head target/bench/head/boot.img
+          if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
+            run_variant regression target/bench/regression-boot.img
+          fi
+
+      - name: Compare benchmark results
+        shell: bash
+        env:
+          REGRESSION_AVAILABLE: ${{ steps.baselines.outputs.regression_available }}
+          REGRESSION_RUN_ID: ${{ steps.baselines.outputs.regression_run_id }}
+          ACCEPTED_AVAILABLE: ${{ steps.baselines.outputs.accepted_available }}
+          ACCEPTED_RUN_ID: ${{ steps.baselines.outputs.accepted_run_id }}
+        run: |
+          set +e
+          status=0
+
+          {
+            echo "# Kernel benchmark results"
+            echo
+            echo "Current commit: \`${GITHUB_SHA}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
+            annotation_arg=()
+            if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+              annotation_arg=(--no-annotations)
+            fi
+            cargo run --release -p xtask -- bench compare \
+              --base target/bench/regression/results.json \
+              --head target/bench/head/results.json \
+              --output target/bench/comparison-regression.md \
+              --title "Unresolved regression (\`$REGRESSION_RUN_ID\`)" \
+              "${annotation_arg[@]}"
+            regression_status=$?
+            cat target/bench/comparison-regression.md >> "$GITHUB_STEP_SUMMARY"
+            if (( regression_status != 0 )); then
+              status=1
+            fi
+          fi
+
+          if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+            cargo run --release -p xtask -- bench compare \
+              --base target/bench/accepted/results.json \
+              --head target/bench/head/results.json \
+              --output target/bench/comparison-accepted.md \
+              --title "Last accepted run (\`$ACCEPTED_RUN_ID\`)"
+            accepted_status=$?
+            cat target/bench/comparison-accepted.md >> "$GITHUB_STEP_SUMMARY"
+            if (( accepted_status != 0 )); then
+              status=1
+            fi
+          else
+            {
+              echo "## Last accepted run"
+              echo
+              echo "No prior successful workflow with the required benchmark artifacts was found."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$status"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-benchmarks
+          path: |
+            target/bench/**/*.json
+            target/bench/**/*.md
+            target/bench/**/*.log
+            target/bench/head/boot.img
+          if-no-files-found: warn
+          retention-days: 14

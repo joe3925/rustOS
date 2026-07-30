@@ -12,7 +12,8 @@ use core::ptr::NonNull;
 use core::time::Duration;
 use kernel_types::async_ffi::AbiFuture;
 use kernel_types::benchmark::{
-    BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
+    BenchCoreId, BenchMetricDirection, BenchMetricUnit, BenchObjectId, BenchRunHandle, BenchSpanId,
+    BenchSuiteDescriptor, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
 use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::{
@@ -236,6 +237,18 @@ unsafe extern "C" {
     pub fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool;
     pub fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool;
     pub fn bench_kernel_window_persist(handle: BenchWindowHandle) -> AbiFuture<bool>;
+    pub fn bench_kernel_suite_register(descriptor: BenchSuiteDescriptor) -> bool;
+    pub fn bench_kernel_case_start(handle: BenchRunHandle, case: String) -> bool;
+    pub fn bench_kernel_case_end(handle: BenchRunHandle) -> bool;
+    pub fn bench_kernel_case_fail(handle: BenchRunHandle, reason: String) -> bool;
+    pub fn bench_kernel_measure(
+        handle: BenchRunHandle,
+        metric: String,
+        value: f64,
+        unit: BenchMetricUnit,
+        direction: BenchMetricDirection,
+        regression_threshold_percent: f64,
+    ) -> bool;
 
     pub fn bench_kernel_submit_rip_sample(
         core: BenchCoreId,

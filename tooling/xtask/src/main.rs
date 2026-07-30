@@ -1,4 +1,5 @@
 mod artifacts;
+mod bench;
 mod config;
 mod driver;
 
@@ -39,7 +40,14 @@ fn try_main() -> Result<(), String> {
                 .as_deref()
                 .ok_or_else(|| "build requires --platform NAME|FILE".to_string())?;
             let plan = config::load_platform(&root, platform)?;
-            build_platform(&root, &plan, options.release, options.offline).map(|_| ())
+            build_platform(
+                &root,
+                &plan,
+                options.release,
+                options.offline,
+                &options.kernel_features,
+            )
+            .map(|_| ())
         }
         CliCommand::Qemu(options) => {
             let platform = options
@@ -56,6 +64,7 @@ fn try_main() -> Result<(), String> {
             let host = config::load_host(&root, host_selector)?;
             run_qemu(&root, &plan, &launch, &host, options)
         }
+        CliCommand::Bench(command) => bench::execute(&root, command),
     }
 }
 
@@ -66,12 +75,14 @@ struct Cli {
 enum CliCommand {
     Build(BuildOptions),
     Qemu(QemuOptions),
+    Bench(bench::BenchCommand),
 }
 
 struct BuildOptions {
     release: bool,
     offline: bool,
     platform: Option<String>,
+    kernel_features: Vec<String>,
 }
 
 struct QemuOptions {
@@ -103,6 +114,7 @@ impl Cli {
                 let mut release = false;
                 let mut offline = false;
                 let mut platform = None;
+                let mut kernel_features = Vec::new();
 
                 while let Some(arg) = args.next() {
                     match arg.as_str() {
@@ -112,6 +124,11 @@ impl Cli {
                         "--platform" => {
                             platform = Some(args.next().ok_or_else(|| {
                                 "--platform requires a name or TOML path".to_string()
+                            })?);
+                        }
+                        "--kernel-feature" => {
+                            kernel_features.push(args.next().ok_or_else(|| {
+                                "--kernel-feature requires a feature name".to_string()
                             })?);
                         }
                         "-h" | "--help" => return Err(usage()),
@@ -126,6 +143,7 @@ impl Cli {
                         release,
                         offline,
                         platform,
+                        kernel_features,
                     }),
                 })
             }
@@ -199,6 +217,12 @@ impl Cli {
                     command: CliCommand::Qemu(options),
                 })
             }
+            Some("bench") => {
+                args.next();
+                bench::parse(args).map(|command| Self {
+                    command: CliCommand::Bench(command),
+                })
+            }
             Some("-h" | "--help") => Err(usage()),
             Some(other) => Err(format!("unknown command `{other}`\n\n{}", usage())),
             None => Err(usage()),
@@ -209,8 +233,10 @@ impl Cli {
 fn usage() -> String {
     [
         "usage:",
-        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline]",
+        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
+        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
+        "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "",
         "environment:",
         "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",
@@ -275,13 +301,14 @@ fn build_platform(
     plan: &BuildPlan,
     release: bool,
     offline: bool,
+    kernel_features: &[String],
 ) -> Result<BootArtifact, String> {
     let output = artifact_root(root, plan, release);
     fs::create_dir_all(&output)
         .map_err(|err| format!("failed to create {}: {err}", output.display()))?;
 
     println!("==> building kernel");
-    let kernel_artifact = build_kernel(root, plan, release)?;
+    let kernel_artifact = build_kernel(root, plan, release, kernel_features)?;
 
     println!("==> generating kernel SDK");
     let sdk = create_kernel_sdk(root, plan, release)?;
@@ -327,7 +354,12 @@ fn artifact_root(root: &Path, plan: &BuildPlan, release: bool) -> PathBuf {
         .join(profile(release))
 }
 
-fn build_kernel(root: &Path, plan: &BuildPlan, release: bool) -> Result<KernelArtifact, String> {
+fn build_kernel(
+    root: &Path,
+    plan: &BuildPlan,
+    release: bool,
+    extra_features: &[String],
+) -> Result<KernelArtifact, String> {
     let (package_id, package_name) = driver::cargo_package_identity(&plan.kernel.manifest)?;
     if package_name != plan.kernel.package {
         return Err(format!(
@@ -357,8 +389,14 @@ fn build_kernel(root: &Path, plan: &BuildPlan, release: bool) -> Result<KernelAr
     if plan.kernel.no_default_features {
         kernel.arg("--no-default-features");
     }
-    if !plan.kernel.features.is_empty() {
-        kernel.arg("--features").arg(plan.kernel.features.join(","));
+    let mut features = plan.kernel.features.clone();
+    for feature in extra_features {
+        if !features.contains(feature) {
+            features.push(feature.clone());
+        }
+    }
+    if !features.is_empty() {
+        kernel.arg("--features").arg(features.join(","));
     }
     if release {
         kernel.arg("--release");

@@ -46,13 +46,11 @@ pub struct KernelFpuGuard {
 
 impl KernelFpuGuard {
     #[inline(always)]
-    pub fn new() -> Self {
+    pub fn try_new() -> Option<Self> {
         let cpu_id = platform::current_cpu_id();
         let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
             {
-                let mut guard = task.inner.try_write().expect(
-                    "Failed to acquire task lock for saving FPU state in interrupt handler",
-                );
+                let mut guard = task.inner.try_write()?;
                 guard.save_fpu_state();
             }
 
@@ -61,7 +59,13 @@ impl KernelFpuGuard {
             None
         };
 
-        Self { saved_task }
+        Some(Self { saved_task })
+    }
+
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::try_new()
+            .expect("Failed to acquire task lock for saving FPU state in interrupt handler")
     }
 }
 

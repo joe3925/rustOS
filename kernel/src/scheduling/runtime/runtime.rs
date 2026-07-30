@@ -3,7 +3,10 @@ use alloc::sync::Arc;
 use kernel_executor::platform::{self, CurrentExecutorContext, ExecutorPlatform, Job};
 use spin::Once;
 
-use crate::platform::{current_is_in_interrupt, current_percpu, swap_executor_context};
+use crate::platform::{
+    current_executor_context as platform_current_executor_context, current_is_in_interrupt,
+    swap_executor_context,
+};
 use crate::static_handlers::{print, task_yield};
 use crate::sync_platform::{BoundedThreadPool, ThreadPool};
 
@@ -95,11 +98,9 @@ impl ExecutorPlatform for KernelExecutorPlatform {
     }
 
     fn current_executor_context(&self) -> Option<CurrentExecutorContext> {
-        use core::sync::atomic::Ordering;
-        let per_cpu = current_percpu();
-        let domain_id = per_cpu.executor_domain_id.load(Ordering::Acquire);
+        let (task_id, domain_id) = platform_current_executor_context();
         (domain_id != 0).then_some(CurrentExecutorContext {
-            task_id: per_cpu.executor_task_id.load(Ordering::Acquire) as usize,
+            task_id: task_id as usize,
             domain_id,
         })
     }

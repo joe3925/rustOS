@@ -18,6 +18,11 @@ static KERNEL_TLS_LAYOUT: Once<Option<KernelTlsLayout>> = Once::new();
 
 static BLOCK_ON_THREAD_STATE: Mutex<Option<Arc<BlockOnThreadState>>> = Mutex::new(None);
 
+#[thread_local]
+static mut EXECUTOR_TASK_ID: u64 = 0;
+#[thread_local]
+static mut EXECUTOR_DOMAIN_ID: u64 = 0;
+
 #[derive(Clone, Copy, Debug)]
 struct KernelTlsLayout {
     template_start: usize,
@@ -117,6 +122,21 @@ pub fn current_block_on_thread_state() -> Arc<BlockOnThreadState> {
         .as_ref()
         .cloned()
         .expect("kernel block_on state is not initialized for the current thread")
+}
+
+#[inline(always)]
+pub fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
+    unsafe {
+        let previous = (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID);
+        EXECUTOR_TASK_ID = task_id;
+        EXECUTOR_DOMAIN_ID = domain_id;
+        previous
+    }
+}
+
+#[inline(always)]
+pub fn current_executor_context() -> (u64, u64) {
+    unsafe { (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID) }
 }
 
 fn kernel_tls_layout() -> Option<&'static KernelTlsLayout> {

@@ -131,6 +131,11 @@ export! {
     bench_kernel_window_start,
     bench_kernel_window_destroy,
     bench_kernel_window_create,
+    bench_kernel_suite_register,
+    bench_kernel_case_start,
+    bench_kernel_case_end,
+    bench_kernel_case_fail,
+    bench_kernel_measure,
 
     kernel_platform_cpu_ids,
     kernel_irq_compose_msi_message,
