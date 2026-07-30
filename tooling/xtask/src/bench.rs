@@ -6,7 +6,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +20,8 @@ use crate::{
 };
 
 const PROTOCOL_PREFIX: &str = "RUSTOS_BENCH\t";
+const MAX_ACTION_ANNOTATIONS: usize = 3;
+static ACTION_ANNOTATIONS: AtomicUsize = AtomicUsize::new(0);
 
 pub enum BenchCommand {
     Run(BenchOptions),
@@ -49,10 +54,14 @@ where
 }
 
 pub fn execute(root: &Path, command: BenchCommand) -> Result<(), String> {
-    match command {
+    let result = match command {
         BenchCommand::Run(options) => run(root, options),
         BenchCommand::Compare(options) => compare(root, options),
+    };
+    if let Err(err) = &result {
+        annotate_error("Benchmark command failed", err);
     }
+    result
 }
 
 impl BenchOptions {
@@ -375,6 +384,21 @@ fn run_topology(
     if let Some(details) = &panic {
         report_panic(cpus, details);
         status = "panicked".to_string();
+    } else if status == "timeout" {
+        annotate_error(
+            &format!("Benchmark timed out ({cpus} vCPUs)"),
+            &format!("QEMU did not finish within {} seconds", timeout.as_secs()),
+        );
+    } else if complete && status != "passed" {
+        annotate_error(
+            &format!("Benchmark failed ({cpus} vCPUs)"),
+            &format!("The benchmark runner reported terminal status `{status}`"),
+        );
+    } else if !complete {
+        annotate_error(
+            &format!("Incomplete benchmark ({cpus} vCPUs)"),
+            "QEMU exited without emitting a benchmark run_end event",
+        );
     }
 
     Ok(TopologyRun {
@@ -403,7 +427,7 @@ fn record_serial_line(
     if is_panic_start(line) {
         panic_seen_at.get_or_insert_with(Instant::now);
     }
-    if panic_seen_at.is_some() && panic_lines.len() < 256 {
+    if panic_seen_at.is_some() {
         panic_lines.push(line.to_string());
     }
 
@@ -438,11 +462,8 @@ fn report_panic(cpus: usize, details: &str) {
         .lines()
         .take(8)
         .collect::<Vec<_>>()
-        .join(" | ")
-        .replace('%', "%25")
-        .replace('\r', "%0D")
-        .replace('\n', "%0A");
-    eprintln!("::error title=Kernel panic ({cpus} vCPUs)::{annotation}");
+        .join(" | ");
+    annotate_error(&format!("Kernel panic ({cpus} vCPUs)"), &annotation);
 
     let Some(summary_path) = std::env::var_os("GITHUB_STEP_SUMMARY") else {
         return;
@@ -463,6 +484,53 @@ fn report_panic(cpus: usize, details: &str) {
             Path::new(&summary_path).display()
         ),
     }
+}
+
+fn annotate_error(title: &str, message: &str) {
+    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") {
+        return;
+    }
+    if !reserve_action_annotation() {
+        return;
+    }
+
+    let escape = |value: &str| {
+        value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+    };
+    eprintln!("::error title={}::{}", escape(title), escape(message));
+}
+
+fn reserve_action_annotation() -> bool {
+    let counter_path = std::env::var_os("RUNNER_TEMP")
+        .map(PathBuf::from)
+        .map(|dir| dir.join("rustos-bench-annotation-count"));
+    let persisted = counter_path
+        .as_deref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|count| count.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    ACTION_ANNOTATIONS.fetch_max(persisted, Ordering::Relaxed);
+
+    let Ok(previous) =
+        ACTION_ANNOTATIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < MAX_ACTION_ANNOTATIONS).then_some(count + 1)
+        })
+    else {
+        return false;
+    };
+
+    if let Some(path) = counter_path {
+        if let Err(err) = fs::write(&path, (previous + 1).to_string()) {
+            eprintln!(
+                "warning: failed to persist annotation count {}: {err}",
+                path.display()
+            );
+        }
+    }
+    true
 }
 
 fn parse_event(line: &str) -> Result<Option<ProtocolEvent>, String> {
