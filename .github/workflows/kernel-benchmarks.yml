@@ -24,20 +24,50 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
-      - name: Install QEMU and FAT tooling
+      - name: Install QEMU and disk tooling
         run: |
           sudo apt-get update
-          sudo apt-get install --yes qemu-system-x86 ovmf dosfstools mtools
+          sudo apt-get install --yes qemu-system-x86 ovmf dosfstools gdisk
 
       - name: Create C drive seed image
         shell: bash
         run: |
-          truncate -s 2G "$RUNNER_TEMP/rustos-ci-seed.img"
-          mkfs.vfat -F 32 "$RUNNER_TEMP/rustos-ci-seed.img"
-          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system
-          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system/registry
-          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system/toml
-          mmd -i "$RUNNER_TEMP/rustos-ci-seed.img" ::/system/mod
+          image="$RUNNER_TEMP/rustos-ci-seed.img"
+          mount_dir="$RUNNER_TEMP/rustos-ci-mount"
+          loop_device=""
+
+          cleanup() {
+            if mountpoint -q "$mount_dir"; then
+              sudo umount "$mount_dir"
+            fi
+            if [[ -n "$loop_device" ]]; then
+              sudo losetup --detach "$loop_device"
+            fi
+          }
+          trap cleanup EXIT
+
+          truncate -s 2G "$image"
+          sgdisk --new=1:2048:0 --typecode=1:0700 --change-name=1:rustOS "$image"
+
+          loop_device="$(sudo losetup --find --show --partscan "$image")"
+          partition="${loop_device}p1"
+          for _ in {1..10}; do
+            [[ -b "$partition" ]] && break
+            sleep 0.2
+          done
+          [[ -b "$partition" ]]
+
+          sudo mkfs.vfat -F 32 -n RUSTOS "$partition"
+          mkdir -p "$mount_dir"
+          sudo mount "$partition" "$mount_dir"
+          sudo mkdir -p \
+            "$mount_dir/system/registry" \
+            "$mount_dir/system/toml" \
+            "$mount_dir/system/mod"
+          sync
+
+          cleanup
+          trap - EXIT
 
       - name: Prepare base worktree
         if: github.event_name == 'pull_request'
