@@ -721,9 +721,9 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     let mut markdown = format!(
         "## {}\n\n\
          Metrics exceeding their registered regression threshold fail this comparison. \
-         Changes use paired boot medians and a 10,000-resample 95% bootstrap confidence interval; \
-         MAD reports boot-to-boot variability. Positive and negative changes are interpreted according \
-         to whether higher or lower values are better.\n\n\
+         Repeated suites use paired boot medians and a 10,000-resample 95% bootstrap confidence interval; \
+         single-pair suites apply their practical threshold directly. MAD reports boot-to-boot variability. \
+         Positive and negative changes are interpreted according to whether higher or lower values are better.\n\n\
          | CPUs | Suite | Case | Metric | Previous median | Current median | Change | 95% CI | Boot MAD (previous → current) | Threshold | Result |\n\
          |---:|---|---|---|---:|---:|---:|---:|---:|---:|---|\n",
         options.title
@@ -784,6 +784,8 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
         let confidence = bootstrap_change_interval(base_samples, head_samples);
         let confidence_text = if let Some(confidence) = confidence {
             format!("{:+.2}% to {:+.2}%", confidence.lower, confidence.upper)
+        } else if base_samples.boot_medians.len() == 1 && head_samples.boot_medians.len() == 1 {
+            "single paired boot".to_string()
         } else {
             "—".to_string()
         };
@@ -803,10 +805,13 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
                 2 => -interval.lower,
                 _ => 0.0,
             });
+        let direct_single_boot =
+            base_samples.boot_medians.len() == 1 && head_samples.boot_medians.len() == 1;
         let result = match threshold {
             Some(limit)
                 if regression > limit
-                    && regression_confidence_lower.is_some_and(|lower| lower > limit) =>
+                    && (direct_single_boot
+                        || regression_confidence_lower.is_some_and(|lower| lower > limit)) =>
             {
                 regressions.push((key.clone(), regression, limit));
                 "🔴 regression"
@@ -814,7 +819,8 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
             Some(limit) if regression > limit => "🟡 variance warning",
             Some(limit)
                 if regression < -limit
-                    && improvement_confidence_upper.is_some_and(|upper| upper < -limit) =>
+                    && (direct_single_boot
+                        || improvement_confidence_upper.is_some_and(|upper| upper < -limit)) =>
             {
                 "🟢 improvement"
             }
@@ -995,7 +1001,7 @@ struct ChangeInterval {
 }
 
 fn bootstrap_change_interval(base: &MetricSamples, head: &MetricSamples) -> Option<ChangeInterval> {
-    const MIN_BOOT_SAMPLES: usize = 5;
+    const MIN_BOOT_SAMPLES: usize = 3;
     const RESAMPLES: usize = 10_000;
     if base.boot_medians.len() < MIN_BOOT_SAMPLES
         || head.boot_medians.len() < MIN_BOOT_SAMPLES

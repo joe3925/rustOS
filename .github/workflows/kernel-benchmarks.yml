@@ -95,11 +95,14 @@ jobs:
 
               local result
               result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
-              local boot_image
-              boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
-              if [[ -n "$result" && -n "$boot_image" ]]; then
+              local runtime_image
+              local c_drive_image
+              runtime_image="$(find "$run_dir" -path '*/head/runtime-boot.img' -print -quit)"
+              c_drive_image="$(find "$run_dir" -path '*/head/c-drive-boot.img' -print -quit)"
+              if [[ -n "$result" && -n "$runtime_image" && -n "$c_drive_image" ]]; then
                 cp "$result" "$output"
-                cp "$boot_image" "target/bench/${kind}-boot.img"
+                cp "$runtime_image" "target/bench/${kind}-runtime-boot.img"
+                cp "$c_drive_image" "target/bench/${kind}-c-drive-boot.img"
                 printf -v "${kind}_run_id" '%s' "$run_id"
                 echo "${kind}_available=true" >> "$GITHUB_OUTPUT"
                 echo "${kind}_run_id=$run_id" >> "$GITHUB_OUTPUT"
@@ -130,12 +133,14 @@ jobs:
               continue
             fi
             result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
-            boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
-            if [[ -n "$result" && -n "$boot_image" ]] &&
+            runtime_image="$(find "$run_dir" -path '*/head/runtime-boot.img' -print -quit)"
+            c_drive_image="$(find "$run_dir" -path '*/head/c-drive-boot.img' -print -quit)"
+            if [[ -n "$result" && -n "$runtime_image" && -n "$c_drive_image" ]] &&
               jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
               if [[ "$run_id" != "${accepted_run_id:-}" && "$conclusion" == "failure" ]]; then
                 cp "$result" target/bench/regression-results.json
-                cp "$boot_image" target/bench/regression-boot.img
+                cp "$runtime_image" target/bench/regression-runtime-boot.img
+                cp "$c_drive_image" target/bench/regression-c-drive-boot.img
                 echo "regression_available=true" >> "$GITHUB_OUTPUT"
                 echo "regression_run_id=$run_id" >> "$GITHUB_OUTPUT"
               fi
@@ -159,41 +164,55 @@ jobs:
           REGRESSION_AVAILABLE: ${{ steps.baselines.outputs.regression_available }}
         run: |
           cargo run --release -p xtask -- bench \
-            --tag ci \
+            --suite executor.runtime \
             --prepare-only \
-            --export-boot-image target/bench/head/boot.img
+            --export-boot-image target/bench/head/runtime-boot.img
+
+          cargo run --release -p xtask -- bench \
+            --suite io.c-drive \
+            --prepare-only \
+            --export-boot-image target/bench/head/c-drive-boot.img
 
           run_variant() {
             local variant="$1"
-            local boot_image="$2"
-            local repetition="$3"
-            mkdir -p "target/bench/${variant}/pair-${repetition}"
+            local suite="$2"
+            local boot_image="$3"
+            local repetition="$4"
+            mkdir -p "target/bench/${variant}/${suite}/pair-${repetition}"
             cargo run --release -p xtask -- bench \
               --cpus 1,2,4 \
               --boot-image "$boot_image" \
               --boot-timeout-secs 120 \
-              --output "target/bench/${variant}/pair-${repetition}/results.json"
+              --output "target/bench/${variant}/${suite}/pair-${repetition}/results.json"
           }
 
-          for repetition in 1 2 3 4 5; do
+          for repetition in 1 2 3; do
             if (( repetition % 2 == 1 )); then
               if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
-                run_variant accepted target/bench/accepted-boot.img "$repetition"
+                run_variant accepted runtime target/bench/accepted-runtime-boot.img "$repetition"
               fi
-              run_variant head target/bench/head/boot.img "$repetition"
+              run_variant head runtime target/bench/head/runtime-boot.img "$repetition"
               if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
-                run_variant regression target/bench/regression-boot.img "$repetition"
+                run_variant regression runtime target/bench/regression-runtime-boot.img "$repetition"
               fi
             else
               if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
-                run_variant regression target/bench/regression-boot.img "$repetition"
+                run_variant regression runtime target/bench/regression-runtime-boot.img "$repetition"
               fi
-              run_variant head target/bench/head/boot.img "$repetition"
+              run_variant head runtime target/bench/head/runtime-boot.img "$repetition"
               if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
-                run_variant accepted target/bench/accepted-boot.img "$repetition"
+                run_variant accepted runtime target/bench/accepted-runtime-boot.img "$repetition"
               fi
             fi
           done
+
+          if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+            run_variant accepted c-drive target/bench/accepted-c-drive-boot.img 1
+          fi
+          run_variant head c-drive target/bench/head/c-drive-boot.img 1
+          if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
+            run_variant regression c-drive target/bench/regression-c-drive-boot.img 1
+          fi
 
           merge_reports() {
             local variant="$1"
@@ -204,7 +223,7 @@ jobs:
                 protocol_version: .[0].protocol_version,
                 runs: (map(.runs) | add)
               }' \
-              target/bench/"$variant"/pair-*/results.json > "$output"
+              target/bench/"$variant"/*/pair-*/results.json > "$output"
           }
 
           merge_reports head target/bench/head/results.json
@@ -282,6 +301,7 @@ jobs:
             target/bench/**/*.json
             target/bench/**/*.md
             target/bench/**/*.log
-            target/bench/head/boot.img
+            target/bench/head/runtime-boot.img
+            target/bench/head/c-drive-boot.img
           if-no-files-found: warn
           retention-days: 14
