@@ -70,40 +70,43 @@ jobs:
           cleanup
           trap - EXIT
 
-      - name: Download last successful benchmark
+      - name: Download previous benchmark
         id: baseline
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          run_id="$(
+          mkdir -p target/bench/previous
+
+          while read -r run_id; do
+            run_dir="target/bench/previous/$run_id"
+            mkdir -p "$run_dir"
+            if ! gh run download "$run_id" \
+              --name kernel-benchmarks \
+              --dir "$run_dir"; then
+              continue
+            fi
+
+            result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
+            if [[ -n "$result" ]]; then
+              cp "$result" target/bench/previous-results.json
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              echo "Comparing against previous workflow run $run_id." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done < <(
             gh run list \
               --workflow kernel-benchmarks.yml \
               --branch "$BENCH_BRANCH" \
-              --status success \
-              --limit 1 \
+              --status completed \
+              --limit 20 \
               --json databaseId \
-              --jq '.[0].databaseId // empty'
-          )"
-          if [[ -z "$run_id" ]]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "No successful benchmark baseline exists yet for \`$BENCH_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+              --jq '.[].databaseId'
+          )
 
-          gh run download "$run_id" \
-            --name kernel-benchmarks \
-            --dir target/bench/previous
-          result="$(find target/bench/previous -path '*/head/results.json' -print -quit)"
-          if [[ -n "$result" ]]; then
-            cp "$result" target/bench/previous-results.json
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "Comparing against successful workflow run $run_id." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "Successful workflow run $run_id has no compatible benchmark report." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "No previous completed benchmark with a compatible report exists yet for \`$BENCH_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
         env:
@@ -116,7 +119,7 @@ jobs:
             --boot-timeout-secs 120 \
             --output target/bench/head/results.json
 
-      - name: Compare with last successful benchmark
+      - name: Compare with previous benchmark
         if: steps.baseline.outputs.available == 'true'
         shell: bash
         run: |
