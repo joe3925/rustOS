@@ -20,7 +20,7 @@ args = [
     "-display", "none",
     "-no-reboot",
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-device", "amd-iommu,dma-remap=on,dma-translation=on",
+    "-device", "amd-iommu,dma-remap=on",
     "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",
     "-serial", "{primary_serial}",
     "-drive", "file={boot_image},format=raw",
