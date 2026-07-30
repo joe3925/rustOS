@@ -1,6 +1,6 @@
 use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
-    future::{Future, poll_fn},
+    future::{poll_fn, Future},
     hint::black_box,
     pin::Pin,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -62,7 +62,8 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
             "End-to-end C drive read/write workload",
             vec!["ci".to_string(), "io".to_string()],
             c_drive_suite,
-        ),
+        )
+        .with_independent_boots(3),
     ]
 }
 
