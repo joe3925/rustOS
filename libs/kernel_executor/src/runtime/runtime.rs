@@ -7,20 +7,16 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
 
-pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
+pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
 use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
-use crate::platform::{platform, Job};
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::platform::{Job, platform};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, Ordering};
 
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
 use super::slab::{get_task_table, slab_task_poll_trampoline};
-
-pub(crate) fn submit_global(trampoline: extern "C" fn(usize), ctx: usize) {
-    GlobalAsyncExecutor::global().submit(trampoline, ctx);
-}
 
 pub(crate) fn submit_global_to_executor_domain(
     domain_id: ExecutorDomainId,

@@ -26,9 +26,7 @@ fn wait_until(mut pred: impl FnMut() -> bool) {
 
 mod bounded_mpmc;
 mod bounded_wait_queue;
-mod channel;
 mod completion_port;
 mod mpmc;
-mod sleep_mutex;
 mod thread_pool;
 mod wait_queue;

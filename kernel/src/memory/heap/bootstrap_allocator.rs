@@ -6,18 +6,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::memory::paging::heap_range_start;
 use crate::platform::with_interrupts_disabled;
 
-#[cfg(feature = "allocator-buddy")]
-use crate::memory::heap::HEAP_SIZE;
-
-#[cfg(feature = "allocator-mimalloc")]
 use crate::memory::heap::BOOTSTRAP_HEAP_SIZE;
 
-pub struct BuddyLocked {
+pub struct BootstrapAllocator {
     inner: LockedHeap<32>,
     init: AtomicBool,
 }
 
-impl BuddyLocked {
+impl BootstrapAllocator {
     pub const fn new() -> Self {
         Self {
             inner: LockedHeap::<32>::empty(),
@@ -30,10 +26,7 @@ impl BuddyLocked {
         if !self.init.load(Ordering::Acquire) {
             with_interrupts_disabled(|| {
                 if !self.init.load(Ordering::Acquire) {
-                    #[cfg(feature = "allocator-mimalloc")]
                     let size = BOOTSTRAP_HEAP_SIZE as usize;
-                    #[cfg(feature = "allocator-buddy")]
-                    let size = HEAP_SIZE as usize;
 
                     self.inner
                         .lock()
@@ -52,7 +45,7 @@ impl BuddyLocked {
     }
 }
 
-unsafe impl GlobalAlloc for BuddyLocked {
+unsafe impl GlobalAlloc for BootstrapAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.ensure_init();
         with_interrupts_disabled(|| self.inner.lock().alloc(layout))

@@ -1,24 +1,16 @@
-use crate::platform::{platform, Job};
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::platform::{Job, platform};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Once;
 
-#[cfg(test)]
-use crate::round_robin::SchedulerPolicy;
-#[cfg(test)]
-use alloc::boxed::Box;
-
 pub use crate::domain::{
-    DestroyExecutorDomainError, DestroyExecutorDomainResult, ExecutorDomain, ExecutorDomainClass,
-    ExecutorDomainConfig, ExecutorDomainId, ExecutorDomainState, ExecutorDomainStats,
-    ExecutorDomainTable, ExecutorSubmitError, ExecutorSubmitErrorKind, GlobalExecutorStats,
-    ReplaceResizePolicyResult, DRIVER_EXECUTOR_DOMAIN, KERNEL_BACKGROUND_EXECUTOR_DOMAIN,
-    KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
+    DRIVER_EXECUTOR_DOMAIN, DestroyExecutorDomainError, DestroyExecutorDomainResult,
+    ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
+    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable, ExecutorSubmitError,
+    ExecutorSubmitErrorKind, GlobalExecutorStats, KERNEL_BACKGROUND_EXECUTOR_DOMAIN,
+    KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN, ReplaceResizePolicyResult,
 };
-
-#[cfg(test)]
-pub use crate::round_robin::{SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler};
 
 pub type Trampoline = extern "C" fn(usize);
 
@@ -242,9 +234,6 @@ impl GlobalAsyncExecutor {
 
         runtime.run_queue.len()
     }
-
-    #[cfg(test)]
-    pub(crate) fn replace_scheduler_for_tests(&self, _scheduler: Box<dyn SchedulerPolicy>) {}
 
     #[inline]
     fn schedule_domain_if_needed(

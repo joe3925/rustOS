@@ -2,7 +2,6 @@ extern crate std;
 
 mod blocking;
 mod executor;
-mod round_robin;
 mod runtime;
 
 use crate::platform::{CurrentExecutorContext, ExecutorPlatform, Job};

@@ -1,5 +1,5 @@
 pub mod allocator;
-pub mod buddylocked;
+pub mod bootstrap_allocator;
 #[cfg(feature = "allocator-mimalloc")]
 pub mod mimalloc;
 
@@ -22,8 +22,6 @@ use crate::memory::paging::{align_up_to_base_page, heap_range_end, heap_range_st
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::arch::{PageFlags, VirtAddr};
 
-#[cfg(feature = "allocator-buddy")]
-pub const HEAP_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 pub const BOOTSTRAP_HEAP_SIZE: u64 = 64 * 1024 * 1024;
 
 #[cfg(feature = "allocator-mimalloc")]
@@ -78,8 +76,6 @@ pub fn heap_capacity_bytes() -> u64 {
     cfg_if::cfg_if! {
         if #[cfg(feature = "allocator-mimalloc")] {
             mimalloc_heap_reserved_bytes() as u64
-        } else if #[cfg(feature = "allocator-buddy")] {
-            HEAP_SIZE
         } else {
             0
         }
@@ -120,14 +116,6 @@ pub(crate) fn init_heap() {
                     Ordering::Release,
                 );
                 upfront_heap_size
-            } else if #[cfg(feature = "allocator-buddy")] {
-                let size = align_up_to_base_page(HEAP_SIZE)
-                    .expect("invalid platform base page size");
-                assert!(
-                    size <= heap_limit - heap_start.as_u64(),
-                    "buddy heap exceeds platform heap range"
-                );
-                size
             } else {
                 0
             }

@@ -83,19 +83,12 @@ impl Platform for KernelPlatform {
 
 pub type WaitQueue = kernel_sync::WaitQueue<KernelPlatform>;
 pub type BoundedWaitQueue = kernel_sync::BoundedWaitQueue<KernelPlatform>;
-pub type Condvar = kernel_sync::Condvar<KernelPlatform>;
-pub type SleepMutex<T> = kernel_sync::SleepMutex<KernelPlatform, T>;
-pub type SleepMutexGuard<'a, T> = kernel_sync::SleepMutexGuard<'a, KernelPlatform, T>;
-
 pub type MpmcSender<T> = kernel_sync::mpmc::Sender<KernelPlatform, T>;
 pub type MpmcReceiver<T> = kernel_sync::mpmc::Receiver<KernelPlatform, T>;
 pub type BoundedMpmcSender<T> = kernel_sync::bounded_mpmc::BoundedSender<KernelPlatform, T>;
 pub type BoundedMpmcReceiver<T> = kernel_sync::bounded_mpmc::BoundedReceiver<KernelPlatform, T>;
 pub type CompletionPort<T> = kernel_sync::CompletionPort<KernelPlatform, T>;
 pub type CompletionPortPermit<T> = kernel_sync::PortPermit<KernelPlatform, T>;
-pub type ChannelSender<T> = kernel_sync::channel::Sender<KernelPlatform, T>;
-pub type ChannelReceiver<T> = kernel_sync::channel::Receiver<KernelPlatform, T>;
-
 pub type ThreadPool = kernel_sync::thread_pool::ThreadPool<KernelPlatform>;
 pub type BoundedThreadPool = kernel_sync::thread_pool::BoundedThreadPool<KernelPlatform>;
 
@@ -110,9 +103,4 @@ pub fn bounded_mpmc_channel<T>(
     max_consumers: usize,
 ) -> (BoundedMpmcSender<T>, BoundedMpmcReceiver<T>) {
     kernel_sync::bounded_mpmc::bounded_mpmc_channel::<KernelPlatform, T>(capacity, max_consumers)
-}
-
-#[inline]
-pub fn channel<T>() -> (ChannelSender<T>, ChannelReceiver<T>) {
-    kernel_sync::channel::channel::<KernelPlatform, T>()
 }

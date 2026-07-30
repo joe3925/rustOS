@@ -809,10 +809,6 @@ macro_rules! define_device_ops {
             fn register_op(&mut self);
         }
 
-        pub trait DeviceOpHandlerRegistration<Op, H> {
-            fn set_op_handler(&mut self, handler: H, depth: u32);
-        }
-
         impl DeviceOps {
             pub const fn empty() -> Self {
                 Self {
@@ -829,21 +825,6 @@ macro_rules! define_device_ops {
                 <Self as DeviceOpRegistration<Op, T>>::register_op(self);
             }
 
-            #[inline]
-            pub fn set_handler<Op, H>(&mut self, handler: H)
-            where
-                Self: DeviceOpHandlerRegistration<Op, H>,
-            {
-                <Self as DeviceOpHandlerRegistration<Op, H>>::set_op_handler(self, handler, 0);
-            }
-
-            #[inline]
-            pub fn set_handler_with_depth<Op, H>(&mut self, handler: H, depth: u32)
-            where
-                Self: DeviceOpHandlerRegistration<Op, H>,
-            {
-                <Self as DeviceOpHandlerRegistration<Op, H>>::set_op_handler(self, handler, depth);
-            }
         }
 
         impl Default for DeviceOps {
@@ -860,13 +841,6 @@ macro_rules! define_device_ops {
                 #[inline]
                 fn register_op(&mut self) {
                     self.$field.set_with_depth(T::handler, T::DEPTH);
-                }
-            }
-
-            impl DeviceOpHandlerRegistration<$op, $handler> for DeviceOps {
-                #[inline]
-                fn set_op_handler(&mut self, handler: $handler, depth: u32) {
-                    self.$field.set_with_depth(handler, depth);
                 }
             }
         )+

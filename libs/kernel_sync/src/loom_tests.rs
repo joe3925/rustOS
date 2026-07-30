@@ -1,16 +1,15 @@
 use alloc::string::String;
 
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
-use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use loom::sync::Arc;
+use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use loom::thread;
 
-use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedSendError};
+use crate::bounded_mpmc::{BoundedSendError, bounded_mpmc_channel};
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue};
 use crate::completion_port::CompletionPort;
-use crate::mpmc::{mpmc_channel, SendError as MpmcSendError, TryRecvError};
+use crate::mpmc::{SendError as MpmcSendError, TryRecvError, mpmc_channel};
 use crate::platform::{Platform, ThreadEntry};
-use crate::sleep_mutex::SleepMutex;
 use crate::sync::model;
 use crate::wait_queue::WaitQueue;
 
@@ -167,32 +166,6 @@ fn wait_queue_dequeue_and_clear_preserve_length() {
         assert_eq!(claimed, 1);
         assert_eq!(queue.len(), 0);
         assert_eq!(task.inner.waiting_on.load(Ordering::Acquire), 0);
-    });
-}
-
-#[test]
-fn sleep_mutex_allows_only_one_mutator() {
-    model(|| {
-        let mutex = Arc::new(SleepMutex::<ModelPlatform, usize>::new(0));
-        let left = mutex.clone();
-        let a = thread::spawn(move || loop {
-            if let Some(mut guard) = left.try_lock() {
-                *guard += 1;
-                break;
-            }
-            thread::yield_now();
-        });
-        let right = mutex.clone();
-        let b = thread::spawn(move || loop {
-            if let Some(mut guard) = right.try_lock() {
-                *guard += 1;
-                break;
-            }
-            thread::yield_now();
-        });
-        a.join().unwrap();
-        b.join().unwrap();
-        assert_eq!(*mutex.try_lock().expect("mutex left locked"), 2);
     });
 }
 

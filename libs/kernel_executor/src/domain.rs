@@ -1419,12 +1419,8 @@ impl ExecutorDomainTable {
         work_item: WorkItem,
     ) -> Result<DomainSubmitOutcome, ExecutorSubmitError> {
         let domain = self.resolve_submit_domain(domain_id, work_item)?;
-        let became_runnable = domain.try_submit_work(domain_id, work_item)?;
-
-        Ok(DomainSubmitOutcome {
-            domain_id,
-            became_runnable,
-        })
+        domain.try_submit_work(domain_id, work_item)?;
+        Ok(DomainSubmitOutcome { domain_id })
     }
 
     pub fn domain_count(&self) -> usize {
@@ -1451,7 +1447,6 @@ impl ExecutorDomainTable {
 #[derive(Debug)]
 pub(crate) struct DomainSubmitOutcome {
     pub(crate) domain_id: ExecutorDomainId,
-    pub(crate) became_runnable: bool,
 }
 
 #[cfg(all(test, not(any(loom, feature = "loom"))))]

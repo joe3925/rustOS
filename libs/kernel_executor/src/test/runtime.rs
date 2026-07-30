@@ -1,6 +1,6 @@
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::future::Future;
-use core::mem::{align_of, size_of, ManuallyDrop};
+use core::mem::{ManuallyDrop, align_of, size_of};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -10,13 +10,12 @@ use std::time::{Duration, Instant};
 
 use crate::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId, ExecutorSubmitErrorKind,
-    GlobalAsyncExecutor, SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler,
-    KERNEL_NORMAL_EXECUTOR_DOMAIN,
+    GlobalAsyncExecutor, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 use crate::runtime::abi_spawn::kernel_spawn_abi_internal;
 use crate::runtime::runtime::{
-    block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
-    spawn_join_owned_in_executor_domain as spawn_in_executor_domain, JoinAll,
+    JoinAll, block_on, spawn_detached, spawn_detached_in_executor_domain,
+    spawn_join_owned as spawn, spawn_join_owned_in_executor_domain as spawn_in_executor_domain,
 };
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
@@ -1282,26 +1281,6 @@ fn spawn_detached_in_executor_domain_executes_work() {
             .executor_domain_stats(domain_id)
             .is_some_and(|stats| stats.completed >= 1)
     });
-}
-
-#[test]
-fn executor_runs_with_simple_round_robin_scheduler_policy() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
-
-    GlobalAsyncExecutor::global()
-        .replace_scheduler_for_tests(Box::new(SimpleRoundRobinScheduler::new()));
-
-    let counter = Arc::new(AtomicUsize::new(0));
-    let ctx = Arc::as_ptr(&counter) as usize;
-    GlobalAsyncExecutor::global().submit(increment_counter, ctx);
-
-    super::wait_until(Duration::from_secs(10), || {
-        counter.load(Ordering::Acquire) == 1
-    });
-
-    GlobalAsyncExecutor::global()
-        .replace_scheduler_for_tests(Box::new(WeightedDeficitRoundRobinScheduler::new()));
 }
 
 // This test covers the global executor handoff where work is submitted by jobs

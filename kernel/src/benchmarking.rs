@@ -157,7 +157,7 @@ fn bench_frame_kind(ip: u64) -> u32 {
 }
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-pub const BENCH_ENABLED: bool = true;
+pub const BENCH_ENABLED: bool = false;
 
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
@@ -2731,8 +2731,6 @@ pub fn used_memory() -> usize {
             let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
                 .load(core::sync::atomic::Ordering::Relaxed);
             used_non_arena + used_arena
-        } else if #[cfg(feature = "allocator-buddy")] {
-            crate::memory::heap::HEAP_SIZE as usize - crate::memory::heap::ALLOCATOR.free_memory()
         } else {
             0
         }

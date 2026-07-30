@@ -102,17 +102,6 @@ macro_rules! define_pnp_ops {
                 <Self as PnpOpHandlerRegistration<Op, H>>::set_pnp_op_handler(self, handler, 0);
             }
 
-            #[inline]
-            pub fn register_with_depth<Op, H>(&mut self, handler: H, depth: u32)
-            where
-                Self: PnpOpHandlerRegistration<Op, H>,
-            {
-                <Self as PnpOpHandlerRegistration<Op, H>>::set_pnp_op_handler(
-                    self,
-                    handler,
-                    depth,
-                );
-            }
         }
 
         impl Default for PnpOps {
