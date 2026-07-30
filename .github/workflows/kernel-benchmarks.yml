@@ -70,30 +70,76 @@ jobs:
           cleanup
           trap - EXIT
 
-      - name: Download previous benchmark
-        id: baseline
+      - name: Download benchmark baselines
+        id: baselines
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          mkdir -p target/bench/previous
+          mkdir -p target/bench/baselines
 
-          while read -r run_id; do
-            run_dir="target/bench/previous/$run_id"
+          download_baseline() {
+            local kind="$1"
+            local status="$2"
+            local output="target/bench/${kind}-results.json"
+
+            while read -r run_id; do
+              local run_dir="target/bench/baselines/${kind}-${run_id}"
+              mkdir -p "$run_dir"
+              if ! gh run download "$run_id" \
+                --name kernel-benchmarks \
+                --dir "$run_dir"; then
+                continue
+              fi
+
+              local result
+              result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
+              local boot_image
+              boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
+              if [[ -n "$result" && -n "$boot_image" ]]; then
+                cp "$result" "$output"
+                cp "$boot_image" "target/bench/${kind}-boot.img"
+                printf -v "${kind}_run_id" '%s' "$run_id"
+                echo "${kind}_available=true" >> "$GITHUB_OUTPUT"
+                echo "${kind}_run_id=$run_id" >> "$GITHUB_OUTPUT"
+                return
+              fi
+            done < <(
+              gh run list \
+                --workflow kernel-benchmarks.yml \
+                --branch "$BENCH_BRANCH" \
+                --status "$status" \
+                --limit 20 \
+                --json databaseId \
+                --jq '.[].databaseId'
+            )
+
+            echo "${kind}_available=false" >> "$GITHUB_OUTPUT"
+          }
+
+          download_baseline accepted success
+
+          echo "regression_available=false" >> "$GITHUB_OUTPUT"
+          while read -r run_id conclusion; do
+            run_dir="target/bench/baselines/regression-${run_id}"
             mkdir -p "$run_dir"
             if ! gh run download "$run_id" \
               --name kernel-benchmarks \
               --dir "$run_dir"; then
               continue
             fi
-
             result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
-            if [[ -n "$result" ]]; then
-              cp "$result" target/bench/previous-results.json
-              echo "available=true" >> "$GITHUB_OUTPUT"
-              echo "Comparing against previous workflow run $run_id." >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+            boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
+            if [[ -n "$result" && -n "$boot_image" ]] &&
+              jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+              if [[ "$run_id" != "${accepted_run_id:-}" && "$conclusion" == "failure" ]]; then
+                cp "$result" target/bench/regression-results.json
+                cp "$boot_image" target/bench/regression-boot.img
+                echo "regression_available=true" >> "$GITHUB_OUTPUT"
+                echo "regression_run_id=$run_id" >> "$GITHUB_OUTPUT"
+              fi
+              break
             fi
           done < <(
             gh run list \
@@ -101,35 +147,130 @@ jobs:
               --branch "$BENCH_BRANCH" \
               --status completed \
               --limit 20 \
-              --json databaseId \
-              --jq '.[].databaseId'
+              --json databaseId,conclusion \
+              --jq '.[] | [.databaseId, .conclusion] | @tsv'
           )
-
-          echo "available=false" >> "$GITHUB_OUTPUT"
-          echo "No previous completed benchmark with a compatible report exists yet for \`$BENCH_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
         env:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
+          ACCEPTED_AVAILABLE: ${{ steps.baselines.outputs.accepted_available }}
+          REGRESSION_AVAILABLE: ${{ steps.baselines.outputs.regression_available }}
         run: |
           cargo run --release -p xtask -- bench \
-            --cpus 1,2,4 \
             --tag ci \
-            --boot-timeout-secs 120 \
-            --output target/bench/head/results.json
+            --prepare-only \
+            --export-boot-image target/bench/head/boot.img
 
-      - name: Compare with previous benchmark
-        if: steps.baseline.outputs.available == 'true'
+          run_variant() {
+            local variant="$1"
+            local boot_image="$2"
+            local repetition="$3"
+            mkdir -p "target/bench/${variant}/pair-${repetition}"
+            cargo run --release -p xtask -- bench \
+              --cpus 1,2,4 \
+              --boot-image "$boot_image" \
+              --boot-timeout-secs 120 \
+              --output "target/bench/${variant}/pair-${repetition}/results.json"
+          }
+
+          for repetition in 1 2 3 4 5; do
+            if (( repetition % 2 == 1 )); then
+              if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+                run_variant accepted target/bench/accepted-boot.img "$repetition"
+              fi
+              run_variant head target/bench/head/boot.img "$repetition"
+              if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
+                run_variant regression target/bench/regression-boot.img "$repetition"
+              fi
+            else
+              if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
+                run_variant regression target/bench/regression-boot.img "$repetition"
+              fi
+              run_variant head target/bench/head/boot.img "$repetition"
+              if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+                run_variant accepted target/bench/accepted-boot.img "$repetition"
+              fi
+            fi
+          done
+
+          merge_reports() {
+            local variant="$1"
+            local output="$2"
+            jq -s \
+              '{
+                schema: .[0].schema,
+                protocol_version: .[0].protocol_version,
+                runs: (map(.runs) | add)
+              }' \
+              target/bench/"$variant"/pair-*/results.json > "$output"
+          }
+
+          merge_reports head target/bench/head/results.json
+          if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+            merge_reports accepted target/bench/paired-accepted-results.json
+          fi
+          if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
+            merge_reports regression target/bench/paired-regression-results.json
+          fi
+
+      - name: Compare benchmark results
         shell: bash
+        env:
+          REGRESSION_AVAILABLE: ${{ steps.baselines.outputs.regression_available }}
+          REGRESSION_RUN_ID: ${{ steps.baselines.outputs.regression_run_id }}
+          ACCEPTED_AVAILABLE: ${{ steps.baselines.outputs.accepted_available }}
+          ACCEPTED_RUN_ID: ${{ steps.baselines.outputs.accepted_run_id }}
         run: |
           set +e
-          cargo run --release -p xtask -- bench compare \
-            --base target/bench/previous-results.json \
-            --head target/bench/head/results.json \
-            --output target/bench/comparison.md
-          status=$?
-          cat target/bench/comparison.md >> "$GITHUB_STEP_SUMMARY"
+          status=0
+
+          {
+            echo "# Kernel benchmark results"
+            echo
+            echo "Current commit: \`${GITHUB_SHA}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
+            annotation_arg=()
+            if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+              annotation_arg=(--no-annotations)
+            fi
+            cargo run --release -p xtask -- bench compare \
+              --base target/bench/paired-regression-results.json \
+              --head target/bench/head/results.json \
+              --output target/bench/comparison-regression.md \
+              --title "Unresolved regression (\`$REGRESSION_RUN_ID\`)" \
+              "${annotation_arg[@]}"
+            regression_status=$?
+            cat target/bench/comparison-regression.md >> "$GITHUB_STEP_SUMMARY"
+            if (( regression_status != 0 )); then
+              status=1
+            fi
+          fi
+
+          if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
+            cargo run --release -p xtask -- bench compare \
+              --base target/bench/paired-accepted-results.json \
+              --head target/bench/head/results.json \
+              --output target/bench/comparison-accepted.md \
+              --title "Last accepted run (\`$ACCEPTED_RUN_ID\`)"
+            accepted_status=$?
+            cat target/bench/comparison-accepted.md >> "$GITHUB_STEP_SUMMARY"
+            if (( accepted_status != 0 )); then
+              status=1
+            fi
+          else
+            {
+              echo "## Last accepted run"
+              echo
+              echo "No successful run with a compatible benchmark report was found."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           exit "$status"
 
       - name: Upload benchmark results
@@ -141,5 +282,6 @@ jobs:
             target/bench/**/*.json
             target/bench/**/*.md
             target/bench/**/*.log
+            target/bench/head/boot.img
           if-no-files-found: warn
           retention-days: 14

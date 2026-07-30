@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Write},
@@ -36,6 +37,10 @@ pub struct BenchOptions {
     suites: Vec<String>,
     tags: Vec<String>,
     output: PathBuf,
+    repetitions: usize,
+    boot_image: Option<PathBuf>,
+    export_boot_image: Option<PathBuf>,
+    prepare_only: bool,
     boot_timeout: Duration,
     timeout: Duration,
     offline: bool,
@@ -55,12 +60,18 @@ where
 }
 
 pub fn execute(root: &Path, command: BenchCommand) -> Result<(), String> {
+    let annotations = match &command {
+        BenchCommand::Run(_) => true,
+        BenchCommand::Compare(options) => options.annotations,
+    };
     let result = match command {
         BenchCommand::Run(options) => run(root, options),
         BenchCommand::Compare(options) => compare(root, options),
     };
-    if let Err(err) = &result {
-        annotate_error("Benchmark command failed", err);
+    if annotations {
+        if let Err(err) = &result {
+            annotate_error("Benchmark command failed", err);
+        }
     }
     result
 }
@@ -77,6 +88,10 @@ impl BenchOptions {
         let mut suites = Vec::new();
         let mut tags = Vec::new();
         let mut output = PathBuf::from("target/bench/results.json");
+        let mut repetitions = 1;
+        let mut boot_image = None;
+        let mut export_boot_image = None;
+        let mut prepare_only = false;
         let mut boot_timeout = Duration::from_secs(2 * 60);
         let mut timeout = Duration::from_secs(15 * 60);
         let mut offline = false;
@@ -107,6 +122,23 @@ impl BenchOptions {
                 "--suite" => suites.push(next_value(&mut args, "--suite")?),
                 "--tag" => tags.push(next_value(&mut args, "--tag")?),
                 "--output" => output = PathBuf::from(next_value(&mut args, "--output")?),
+                "--repetitions" => {
+                    let value = next_value(&mut args, "--repetitions")?;
+                    repetitions = value
+                        .parse()
+                        .map_err(|_| format!("invalid repetition count `{value}`"))?;
+                    if repetitions == 0 {
+                        return Err("--repetitions must be positive".to_string());
+                    }
+                }
+                "--boot-image" => {
+                    boot_image = Some(PathBuf::from(next_value(&mut args, "--boot-image")?))
+                }
+                "--export-boot-image" => {
+                    export_boot_image =
+                        Some(PathBuf::from(next_value(&mut args, "--export-boot-image")?))
+                }
+                "--prepare-only" => prepare_only = true,
                 "--boot-timeout-secs" => {
                     let value = next_value(&mut args, "--boot-timeout-secs")?;
                     boot_timeout = Duration::from_secs(
@@ -140,6 +172,10 @@ impl BenchOptions {
             suites,
             tags,
             output,
+            repetitions,
+            boot_image,
+            export_boot_image,
+            prepare_only,
             boot_timeout,
             timeout,
             offline,
@@ -186,22 +222,38 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         options.host.as_deref().unwrap_or(std::env::consts::OS),
     )?;
 
-    std::env::set_var("RUSTOS_BENCH_SUITES", options.suites.join(","));
-    std::env::set_var("RUSTOS_BENCH_TAGS", options.tags.join(","));
-    build_platform(
-        root,
-        &platform,
-        true,
-        options.offline,
-        &["kernel-bench".to_string()],
-    )?;
-
-    let artifacts = crate::load_artifact_manifest(root, &platform, true)?;
+    let boot_image = if let Some(path) = &options.boot_image {
+        resolve(root, path)
+    } else {
+        std::env::set_var("RUSTOS_BENCH_SUITES", options.suites.join(","));
+        std::env::set_var("RUSTOS_BENCH_TAGS", options.tags.join(","));
+        build_platform(
+            root,
+            &platform,
+            true,
+            options.offline,
+            &["kernel-bench".to_string()],
+        )?;
+        crate::load_artifact_manifest(root, &platform, true)?.boot_image
+    };
     let qemu = find_qemu(&launch, &host)?;
     let firmware = find_firmware(&launch, &host, &qemu)?;
     let seed_disk = system_disk(root)?;
-    assert_exists(&artifacts.boot_image, "boot image")?;
+    assert_exists(&boot_image, "boot image")?;
     assert_exists(&seed_disk.path, "system disk")?;
+
+    if let Some(export) = &options.export_boot_image {
+        let export = resolve(root, export);
+        if let Some(parent) = export.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+        fs::copy(&boot_image, &export)
+            .map_err(|err| format!("failed to export boot image to {}: {err}", export.display()))?;
+    }
+    if options.prepare_only {
+        return Ok(());
+    }
 
     let output = if options.output.is_absolute() {
         options.output.clone()
@@ -216,40 +268,46 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
 
     let mut runs = Vec::new();
     for cpus in options.cpus {
-        println!("==> benchmarking with {cpus} vCPU(s)");
-        let disk_path = bench_dir.join(format!("system-{cpus}cpu.img"));
-        fs::copy(&seed_disk.path, &disk_path).map_err(|err| {
-            format!(
-                "failed to clone benchmark disk {} to {}: {err}",
-                seed_disk.path.display(),
-                disk_path.display()
-            )
-        })?;
-        let disk = SystemDisk {
-            path: disk_path,
-            format: seed_disk.format.clone(),
-        };
-        let serial_log = bench_dir.join(format!("{cpus}cpu.serial.log"));
-        let topology = run_topology(
-            root,
-            &platform,
-            &launch,
-            &qemu,
-            &firmware,
-            &artifacts.boot_image,
-            &disk,
-            cpus,
-            options.boot_timeout,
-            options.timeout,
-            serial_log,
-        );
-        if let Err(err) = fs::remove_file(&disk.path) {
-            eprintln!(
-                "warning: failed to remove temporary benchmark disk {}: {err}",
-                disk.path.display()
+        for repetition in 1..=options.repetitions {
+            println!(
+                "==> benchmarking with {cpus} vCPU(s), repetition {repetition}/{}",
+                options.repetitions
             );
+            let disk_path = bench_dir.join(format!("system-{cpus}cpu-repetition-{repetition}.img"));
+            fs::copy(&seed_disk.path, &disk_path).map_err(|err| {
+                format!(
+                    "failed to clone benchmark disk {} to {}: {err}",
+                    seed_disk.path.display(),
+                    disk_path.display()
+                )
+            })?;
+            let disk = SystemDisk {
+                path: disk_path,
+                format: seed_disk.format.clone(),
+            };
+            let serial_log =
+                bench_dir.join(format!("{cpus}cpu-repetition-{repetition}.serial.log"));
+            let topology = run_topology(
+                root,
+                &platform,
+                &launch,
+                &qemu,
+                &firmware,
+                &boot_image,
+                &disk,
+                cpus,
+                options.boot_timeout,
+                options.timeout,
+                serial_log,
+            );
+            if let Err(err) = fs::remove_file(&disk.path) {
+                eprintln!(
+                    "warning: failed to remove temporary benchmark disk {}: {err}",
+                    disk.path.display()
+                );
+            }
+            runs.push(topology?);
         }
-        runs.push(topology?);
     }
 
     let report = BenchReport {
@@ -588,6 +646,8 @@ pub struct CompareOptions {
     base: PathBuf,
     head: PathBuf,
     output: PathBuf,
+    title: String,
+    annotations: bool,
 }
 
 impl CompareOptions {
@@ -598,12 +658,16 @@ impl CompareOptions {
         let mut base = None;
         let mut head = None;
         let mut output = PathBuf::from("target/bench/comparison.md");
+        let mut title = "Kernel benchmark comparison".to_string();
+        let mut annotations = true;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--base" => base = Some(PathBuf::from(next_value(&mut args, "--base")?)),
                 "--head" => head = Some(PathBuf::from(next_value(&mut args, "--head")?)),
                 "--output" => output = PathBuf::from(next_value(&mut args, "--output")?),
+                "--title" => title = next_value(&mut args, "--title")?,
+                "--no-annotations" => annotations = false,
                 other => return Err(format!("unknown bench compare argument `{other}`")),
             }
         }
@@ -611,6 +675,8 @@ impl CompareOptions {
             base: base.ok_or_else(|| "bench compare requires --base".to_string())?,
             head: head.ok_or_else(|| "bench compare requires --head".to_string())?,
             output,
+            title,
+            annotations,
         })
     }
 }
@@ -626,6 +692,7 @@ struct MetricKey {
 #[derive(Default)]
 struct MetricSamples {
     values: Vec<f64>,
+    boot_medians: Vec<f64>,
     unit: u64,
     direction: u64,
     regression_threshold_percent: Option<f64>,
@@ -651,20 +718,26 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
 
     let base_metrics = collect_metrics(&base)?;
     let head_metrics = collect_metrics(&head)?;
-    let mut markdown = String::from(
-        "# Kernel benchmark comparison\n\n\
-         Metrics exceeding their registered regression threshold fail the workflow. \
-         The sign of a change is independent of whether higher or lower values are better.\n\n\
-         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | Threshold | Result |\n\
-         |---:|---|---|---|---:|---:|---:|---:|---|\n",
+    let mut markdown = format!(
+        "## {}\n\n\
+         Metrics exceeding their registered regression threshold fail this comparison. \
+         Changes use paired boot medians and a 10,000-resample 95% bootstrap confidence interval; \
+         MAD reports boot-to-boot variability. Positive and negative changes are interpreted according \
+         to whether higher or lower values are better.\n\n\
+         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | 95% CI | Boot MAD (previous → current) | Threshold | Result |\n\
+         |---:|---|---|---|---:|---:|---:|---:|---:|---:|---|\n",
+        options.title
     );
 
     let mut regressions = Vec::new();
-    let keys = base_metrics
+    let mut keys = base_metrics
         .keys()
         .chain(head_metrics.keys())
         .cloned()
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    keys.sort_by(compare_metric_keys);
     for key in keys {
         let base_samples = base_metrics.get(&key);
         let head_samples = head_metrics.get(&key);
@@ -687,30 +760,64 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
                 .map(|value| format!("{value:.2}%"))
                 .unwrap_or_else(|| "—".to_string());
             markdown.push_str(&format!(
-                "| {} | `{}` | `{}` | `{}` | {} | {} | — | {} | {} |\n",
+                "| {} | `{}` | `{}` | `{}` | {} | {} | — | — | — | {} | {} |\n",
                 key.cpus, key.suite, key.case, key.metric, previous, current, threshold, result,
             ));
             continue;
         };
-        let base_median = median(&base_samples.values);
-        let head_median = median(&head_samples.values);
-        let relative = if base_median == 0.0 {
-            0.0
-        } else {
-            (head_median - base_median) * 100.0 / base_median
-        };
+        let base_median = median(&base_samples.boot_medians);
+        let head_median = median(&head_samples.boot_medians);
+        let relative = paired_change(&base_samples.boot_medians, &head_samples.boot_medians)
+            .unwrap_or_else(|| {
+                if base_median == 0.0 {
+                    0.0
+                } else {
+                    (head_median - base_median) * 100.0 / base_median
+                }
+            });
         let threshold = head_samples.regression_threshold_percent;
         let regression = match head_samples.direction {
             1 => relative,
             2 => -relative,
             _ => 0.0,
         };
+        let confidence = bootstrap_change_interval(base_samples, head_samples);
+        let confidence_text = if let Some(confidence) = confidence {
+            format!("{:+.2}% to {:+.2}%", confidence.lower, confidence.upper)
+        } else {
+            "—".to_string()
+        };
+        let mad_text = format!(
+            "{:.2}% → {:.2}%",
+            relative_mad(&base_samples.boot_medians),
+            relative_mad(&head_samples.boot_medians)
+        );
+        let regression_confidence_lower = confidence.map(|interval| match head_samples.direction {
+            1 => interval.lower,
+            2 => -interval.upper,
+            _ => 0.0,
+        });
+        let improvement_confidence_upper =
+            confidence.map(|interval| match head_samples.direction {
+                1 => interval.upper,
+                2 => -interval.lower,
+                _ => 0.0,
+            });
         let result = match threshold {
-            Some(limit) if regression > limit => {
+            Some(limit)
+                if regression > limit
+                    && regression_confidence_lower.is_some_and(|lower| lower > limit) =>
+            {
                 regressions.push((key.clone(), regression, limit));
                 "🔴 regression"
             }
-            Some(limit) if regression < -limit => "🟢 improvement",
+            Some(limit) if regression > limit => "🟡 variance warning",
+            Some(limit)
+                if regression < -limit
+                    && improvement_confidence_upper.is_some_and(|upper| upper < -limit) =>
+            {
+                "🟢 improvement"
+            }
             Some(_) => "within threshold",
             None => "informational",
         };
@@ -718,7 +825,7 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "—".to_string());
         markdown.push_str(&format!(
-            "| {} | `{}` | `{}` | `{}` | {:.3} | {:.3} | {:+.2}% | {} | {} |\n",
+            "| {} | `{}` | `{}` | `{}` | {:.3} | {:.3} | {:+.2}% | {} | {} | {} | {} |\n",
             key.cpus,
             key.suite,
             key.case,
@@ -726,6 +833,8 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
             base_median,
             head_median,
             relative,
+            confidence_text,
+            mad_text,
             threshold,
             result,
         ));
@@ -738,14 +847,16 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     fs::write(&output_path, markdown)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
     println!("benchmark comparison: {}", output_path.display());
-    for (key, regression, threshold) in &regressions {
-        annotate_error(
-            "Performance regression",
-            &format!(
-                "{} vCPUs {}/{}/{} regressed by {:.2}% (threshold {:.2}%)",
-                key.cpus, key.suite, key.case, key.metric, regression, threshold
-            ),
-        );
+    if options.annotations {
+        for (key, regression, threshold) in &regressions {
+            annotate_error(
+                "Performance regression",
+                &format!(
+                    "{} vCPUs {}/{}/{} regressed by {:.2}% (threshold {:.2}%)",
+                    key.cpus, key.suite, key.case, key.metric, regression, threshold
+                ),
+            );
+        }
     }
     if regressions.is_empty() {
         Ok(())
@@ -755,6 +866,52 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
             regressions.len()
         ))
     }
+}
+
+fn compare_metric_keys(left: &MetricKey, right: &MetricKey) -> CmpOrdering {
+    left.cpus
+        .cmp(&right.cpus)
+        .then_with(|| left.suite.cmp(&right.suite))
+        .then_with(|| left.case.cmp(&right.case))
+        .then_with(|| natural_cmp(&left.metric, &right.metric))
+}
+
+fn natural_cmp(left: &str, right: &str) -> CmpOrdering {
+    let mut left = left.as_bytes();
+    let mut right = right.as_bytes();
+    while !left.is_empty() && !right.is_empty() {
+        let left_digits = left[0].is_ascii_digit();
+        let right_digits = right[0].is_ascii_digit();
+        if left_digits && right_digits {
+            let left_len = left.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            let right_len = right
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            let left_number = left[..left_len].iter().fold(0u64, |value, byte| {
+                value.saturating_mul(10) + u64::from(byte - b'0')
+            });
+            let right_number = right[..right_len].iter().fold(0u64, |value, byte| {
+                value.saturating_mul(10) + u64::from(byte - b'0')
+            });
+            match left_number.cmp(&right_number) {
+                CmpOrdering::Equal => {
+                    left = &left[left_len..];
+                    right = &right[right_len..];
+                }
+                ordering => return ordering,
+            }
+        } else {
+            match left[0].cmp(&right[0]) {
+                CmpOrdering::Equal => {
+                    left = &left[1..];
+                    right = &right[1..];
+                }
+                ordering => return ordering,
+            }
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 fn resolve(root: &Path, path: &Path) -> PathBuf {
@@ -768,6 +925,7 @@ fn resolve(root: &Path, path: &Path) -> PathBuf {
 fn collect_metrics(report: &BenchReport) -> Result<BTreeMap<MetricKey, MetricSamples>, String> {
     let mut metrics = BTreeMap::new();
     for run in &report.runs {
+        let mut boot_values = BTreeMap::<MetricKey, Vec<f64>>::new();
         for event in &run.events {
             if event.kind != "measurement" {
                 continue;
@@ -805,7 +963,9 @@ fn collect_metrics(report: &BenchReport) -> Result<BTreeMap<MetricKey, MetricSam
                 .payload
                 .get("regression_threshold_percent")
                 .and_then(Value::as_f64);
-            let samples = metrics.entry(key).or_insert_with(MetricSamples::default);
+            let samples = metrics
+                .entry(key.clone())
+                .or_insert_with(MetricSamples::default);
             if !samples.values.is_empty()
                 && (samples.unit != unit
                     || samples.direction != direction
@@ -817,9 +977,99 @@ fn collect_metrics(report: &BenchReport) -> Result<BTreeMap<MetricKey, MetricSam
             samples.direction = direction;
             samples.regression_threshold_percent = regression_threshold_percent;
             samples.values.push(value);
+            boot_values.entry(key).or_default().push(value);
+        }
+        for (key, values) in boot_values {
+            if let Some(samples) = metrics.get_mut(&key) {
+                samples.boot_medians.push(median(&values));
+            }
         }
     }
     Ok(metrics)
+}
+
+#[derive(Clone, Copy)]
+struct ChangeInterval {
+    lower: f64,
+    upper: f64,
+}
+
+fn bootstrap_change_interval(base: &MetricSamples, head: &MetricSamples) -> Option<ChangeInterval> {
+    const MIN_BOOT_SAMPLES: usize = 5;
+    const RESAMPLES: usize = 10_000;
+    if base.boot_medians.len() < MIN_BOOT_SAMPLES
+        || head.boot_medians.len() < MIN_BOOT_SAMPLES
+        || base.boot_medians.len() != head.boot_medians.len()
+    {
+        return None;
+    }
+
+    let mut random = XorShift64::new(0x6a09_e667_f3bc_c909);
+    let paired_logs = paired_log_ratios(&base.boot_medians, &head.boot_medians)?;
+    let mut resample = Vec::with_capacity(paired_logs.len());
+    let mut changes = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        resample.clear();
+        for _ in 0..paired_logs.len() {
+            resample.push(paired_logs[random.index(paired_logs.len())]);
+        }
+        changes.push(median(&resample).exp().mul_add(100.0, -100.0));
+    }
+    changes.sort_by(f64::total_cmp);
+    Some(ChangeInterval {
+        lower: percentile(&changes, 0.025),
+        upper: percentile(&changes, 0.975),
+    })
+}
+
+fn paired_change(base: &[f64], head: &[f64]) -> Option<f64> {
+    let logs = paired_log_ratios(base, head)?;
+    Some(median(&logs).exp().mul_add(100.0, -100.0))
+}
+
+fn paired_log_ratios(base: &[f64], head: &[f64]) -> Option<Vec<f64>> {
+    if base.is_empty() || base.len() != head.len() {
+        return None;
+    }
+    base.iter()
+        .zip(head)
+        .map(|(base, head)| (*base > 0.0 && *head > 0.0).then(|| (head / base).ln()))
+        .collect()
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn index(&mut self, upper: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 as usize % upper
+    }
+}
+
+fn relative_mad(values: &[f64]) -> f64 {
+    let center = median(values);
+    if center == 0.0 {
+        return 0.0;
+    }
+    let deviations = values
+        .iter()
+        .map(|value| (value - center).abs())
+        .collect::<Vec<_>>();
+    median(&deviations) * 100.0 / center.abs()
+}
+
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    if sorted_values.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted_values.len() - 1) as f64 * percentile).round() as usize;
+    sorted_values[index]
 }
 
 fn median(values: &[f64]) -> f64 {
