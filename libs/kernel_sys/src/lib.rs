@@ -10,15 +10,17 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::time::Duration;
-use kernel_types::async_ffi::FfiFuture;
+use kernel_types::async_ffi::AbiFuture;
 use kernel_types::benchmark::{
-    BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
+    BenchCoreId, BenchMetricDirection, BenchMetricUnit, BenchObjectId, BenchRunHandle, BenchSpanId,
+    BenchSuiteDescriptor, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
 use kernel_types::dma::IoBufferBacking;
 use kernel_types::dma::{
     DeviceMmuPlatformDeviceIdentity, DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError,
     DmaMappedBuffer, DmaMappingStrategy, DmaPciDeviceIdentity,
 };
+use kernel_types::error::{DriverErrorKind, ErrorBacktrace, KernelError};
 use kernel_types::irq::{
     DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult, MsiMessage,
     MsiRequest,
@@ -33,9 +35,7 @@ use kernel_types::fdt::FdtHeader;
 use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
-use kernel_types::status::{
-    Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError, TaskError,
-};
+use kernel_types::status::{Data, PageMapError, TaskError};
 use kernel_types::{
     ClassEventCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
 };
@@ -57,6 +57,8 @@ unsafe extern "C" {
     pub fn elapsed(s: &Stopwatch) -> Duration;
     pub fn kernel_cycle_counter() -> u64;
     pub fn kernel_cycle_counter_frequency_hz() -> u64;
+    pub fn kernel_capture_error_backtrace(output: &mut ErrorBacktrace);
+    pub fn kernel_resolve_error_context_module(instruction_pointer: usize) -> Option<String>;
     // Tasking
     pub fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
@@ -83,7 +85,7 @@ unsafe extern "C" {
     pub fn irq_handle_set_user_ctx(h: &IrqHandle, v: usize);
     pub fn irq_handle_get_user_ctx(h: &IrqHandle) -> usize;
 
-    pub fn irq_handle_wait_ffi(h: &IrqHandle, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
+    pub fn irq_handle_wait_abi(h: &IrqHandle, meta: IrqMeta) -> AbiFuture<IrqWaitResult>;
     pub fn kernel_irq_alloc_vector() -> i32;
     pub fn kernel_irq_free_vector(vector: u8) -> bool;
     pub fn kernel_irq_compose_msi_message(request: &MsiRequest, out: &mut MsiMessage) -> bool;
@@ -97,14 +99,14 @@ unsafe extern "C" {
     pub fn kernel_dma_register_pci_pdo(
         pdo: &Arc<DeviceObject>,
         identity: DmaPciDeviceIdentity,
-    ) -> DriverStatus;
+    ) -> Result<(), DriverErrorKind>;
     pub fn kernel_dma_register_platform_pdo(
         pdo: &Arc<DeviceObject>,
         identity: DeviceMmuPlatformDeviceIdentity,
-    ) -> DriverStatus;
+    ) -> Result<(), DriverErrorKind>;
     pub fn kernel_dma_open_device_handle(
         device: &Arc<DeviceObject>,
-    ) -> Result<DmaDeviceHandle, DriverStatus>;
+    ) -> Result<DmaDeviceHandle, DriverErrorKind>;
     pub fn kernel_dma_query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState>;
     pub fn kernel_dma_map_buffer<'regions, 'frames>(
         device: &Arc<DeviceObject>,
@@ -141,24 +143,24 @@ unsafe extern "C" {
     pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     pub fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     // Registry (async FFI)
-    pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
-    pub fn reg_set_value(key_path: &str, name: &str, data: Data)
-    -> FfiFuture<Result<(), RegError>>;
-    pub fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>>;
-    pub fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>>;
-    pub fn reg_delete_value(key_path: &str, name: &str) -> FfiFuture<Result<bool, RegError>>;
-    pub fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>>;
-    pub fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>>;
-    pub fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>>;
+    pub fn reg_get_value(key_path: &str, name: &str) -> AbiFuture<Option<Data>>;
+    pub fn reg_set_value(
+        key_path: &str,
+        name: &str,
+        data: Data,
+    ) -> AbiFuture<Result<(), KernelError>>;
+    pub fn reg_create_key(path: &str) -> AbiFuture<Result<(), KernelError>>;
+    pub fn reg_delete_key(path: &str) -> AbiFuture<Result<bool, KernelError>>;
+    pub fn reg_delete_value(key_path: &str, name: &str) -> AbiFuture<Result<bool, KernelError>>;
+    pub fn reg_list_keys(base_path: &str) -> AbiFuture<Result<Vec<String>, KernelError>>;
+    pub fn reg_list_values(base_path: &str) -> AbiFuture<Result<Vec<String>, KernelError>>;
+    pub fn switch_to_vfs_async() -> AbiFuture<Result<(), KernelError>>;
 
     // File System (async FFI)
-    pub fn file_open(path: &Path, flags: &[OpenFlags]) -> FfiFuture<Result<File, FileStatus>>;
-    pub fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>>;
-    pub fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>>;
-    pub fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>>;
-    pub fn file_read(file: &File) -> FfiFuture<Result<Vec<u8>, FileStatus>>;
-    pub fn file_write(file: &mut File, data: &[u8]) -> FfiFuture<Result<(), FileStatus>>;
-    pub fn file_delete(file: &mut File) -> FfiFuture<Result<(), FileStatus>>;
+    pub fn file_open(path: &Path, flags: &[OpenFlags]) -> AbiFuture<Result<File, KernelError>>;
+    pub fn fs_list_dir(path: &Path) -> AbiFuture<Result<Vec<String>, KernelError>>;
+    pub fn fs_remove_dir(path: &Path) -> AbiFuture<Result<(), KernelError>>;
+    pub fn fs_make_dir(path: &Path) -> AbiFuture<Result<(), KernelError>>;
     pub fn vfs_notify_label_published(
         label_ptr: *const u8,
         label_len: usize,
@@ -191,8 +193,12 @@ unsafe extern "C" {
         init: DeviceInit,
     ) -> (Arc<DevNode>, Arc<DeviceObject>);
 
-    pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>>;
+    pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> AbiFuture<Result<(), KernelError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
+    pub fn pnp_set_preferred_function_driver(
+        instance_path: &str,
+        driver_name: &str,
+    ) -> AbiFuture<Result<(), KernelError>>;
 
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> Result<(), OmError>;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> Result<(), OmError>;
@@ -200,7 +206,7 @@ unsafe extern "C" {
         instance_path: String,
         link_path: String,
     ) -> Result<(), kernel_types::object_manager::OmError>;
-    pub fn pnp_remove_symlink(link_path: String) -> DriverStatus;
+    pub fn pnp_remove_symlink(link_path: String) -> Result<(), DriverErrorKind>;
 
     pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit)
     -> Arc<DeviceObject>;
@@ -220,7 +226,7 @@ unsafe extern "C" {
     pub fn pnp_invalidate_device_relations(
         device: &Arc<DeviceObject>,
         relation: DeviceRelationType,
-    ) -> FfiFuture<DriverStatus>;
+    ) -> AbiFuture<Result<(), KernelError>>;
 
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
     pub fn kernel_platform_cpu_ids() -> Vec<u8>;
@@ -230,7 +236,19 @@ unsafe extern "C" {
     pub fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool;
     pub fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool;
     pub fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool;
-    pub fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool>;
+    pub fn bench_kernel_window_persist(handle: BenchWindowHandle) -> AbiFuture<bool>;
+    pub fn bench_kernel_suite_register(descriptor: BenchSuiteDescriptor) -> bool;
+    pub fn bench_kernel_case_start(handle: BenchRunHandle, case: String) -> bool;
+    pub fn bench_kernel_case_end(handle: BenchRunHandle) -> bool;
+    pub fn bench_kernel_case_fail(handle: BenchRunHandle, reason: String) -> bool;
+    pub fn bench_kernel_measure(
+        handle: BenchRunHandle,
+        metric: String,
+        value: f64,
+        unit: BenchMetricUnit,
+        direction: BenchMetricDirection,
+        regression_threshold_percent: f64,
+    ) -> bool;
 
     pub fn bench_kernel_submit_rip_sample(
         core: BenchCoreId,
@@ -242,11 +260,11 @@ unsafe extern "C" {
     pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
 
     // Async Runtime (global)
-    pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
-    pub fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()>;
+    pub fn kernel_spawn_abi(fut: AbiFuture<()>);
+    pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()>;
     pub fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usize);
-    pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
-    pub fn kernel_block_on_ffi(fut: FfiFuture<()>);
+    pub fn kernel_spawn_detached_abi(fut: AbiFuture<()>);
+    pub fn kernel_block_on_abi(fut: AbiFuture<()>);
     pub fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState>;
     pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize);
 
@@ -301,9 +319,9 @@ impl acpi::AcpiHandler for KernelAcpiHandler {
 #[repr(C)]
 #[derive(Debug)]
 pub struct BenchSpanGuard {
-    span_id: BenchSpanId,
     tag: BenchTag,
     object_id: BenchObjectId,
+    span_id: BenchSpanId,
     enabled: bool,
 }
 

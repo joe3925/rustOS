@@ -1,26 +1,16 @@
 [
   {
-    "label": "LLDB Rust Kernel EFI",
+    "label": "LLDB Rust Kernel",
     "adapter": "CodeLLDB",
     "request": "launch",
-    "program": "$ZED_WORKTREE_ROOT/target/debug/kernel.efi",
+    "program": "$ZED_WORKTREE_ROOT/target/rustos/x86_64-uefi/debug/kernel/kernel.exe",
     "cwd": "$ZED_WORKTREE_ROOT",
-    "build": "debug kernel qemu",
-    "initCommands": [
-      "settings set target.debug-file-search-paths \"drivers/target/x86_64-rustos-driver/debug/deps\"",
+    "build": "debug x86_64 Q35 (TCG)",
+
+    "processCreateCommands": [
+      "command source \"$ZED_WORKTREE_ROOT/target/rustos/debug.lldb\""
     ],
-    "processCreateCommands": ["gdb-remote localhost:1234"],
-    "postRunCommands": [
-      "target modules load --file \"kernel.efi\" --slide 0",
 
-      "target modules add \"target/debug/kernel.exe\"",
-      "target modules load --file \"kernel.exe\" --slide 0",
-
-      "command script import \".zed/lldb/rustos_meta.py\"",
-      "rustos-meta-connect 127.0.0.1 4322 \"drivers/target/x86_64-rustos-driver/debug/deps\"",
-
-      "process continue",
-    ],
-    "sourceLanguages": ["rust"],
-  },
+    "sourceLanguages": ["rust"]
+  }
 ]

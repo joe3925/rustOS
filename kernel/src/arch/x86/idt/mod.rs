@@ -1,8 +1,8 @@
 use core::arch::naked_asm;
 
 use spin::Once;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 use super::drivers::interrupt_index::InterruptIndex;
 use super::drivers::timer_driver::timer_interrupt_entry;
@@ -15,7 +15,7 @@ use super::memory::paging::tlb::tlb_flush_entry;
 use super::scheduling::{ipi_entry, yield_interrupt_entry};
 use crate::scheduling::scheduler::KernelFpuGuard;
 
-use crate::idt::{irq_dispatch, InterruptGuard};
+use crate::idt::{InterruptGuard, irq_dispatch};
 
 pub type InterruptFrame = InterruptStackFrame;
 

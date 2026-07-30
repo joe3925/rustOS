@@ -1,23 +1,23 @@
-use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use crate::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use crate::future_arena::FutureAllocation;
+use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
+use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
+use crate::runtime::runtime::submit_global_to_executor_domain;
+use crate::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
 
-use super::super::runtime::submit_global;
+use super::super::runtime::JoinStorage;
 use super::super::task::{
     STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED,
 };
-use super::ptr::{
-    encode_joinable_slab_ptr, encode_slab_ptr, joinable_slab_poll_trampoline, slab_poll_trampoline,
-};
-use super::storage::{drop_inline, FutureStorage};
-use super::task_slab::get_task_slab;
-use super::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
+use super::ptr::{encode_slab_task_ptr, slab_task_poll_trampoline};
+use super::storage::drop_inline;
+use super::task_slab::get_task_table;
 
 const CW_NONE: u8 = 0;
 const CW_UPDATING: u8 = 1;
@@ -31,256 +31,6 @@ pub enum NotifyResult {
     Completed,
 }
 
-pub(super) trait SlabSlot: Sized {
-    fn new() -> Self;
-    fn gen_ref(&self) -> &AtomicU32;
-    fn state(&self) -> &AtomicU8;
-    fn cached_waker_state(&self) -> &AtomicU8;
-    fn cached_waker(&self) -> &UnsafeCell<MaybeUninit<Waker>>;
-    fn create_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker;
-    fn prepare_for_allocation(&self);
-    fn release_last_ref(&self);
-
-    #[inline]
-    fn reset_cached_waker(&self) {
-        self.cached_waker_state().store(CW_NONE, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn drop_cached_waker_if_set(&self) {
-        let s = self.cached_waker_state().load(Ordering::Acquire);
-        if s == CW_SET {
-            unsafe {
-                core::ptr::drop_in_place((*self.cached_waker().get()).as_mut_ptr());
-            }
-        }
-        self.cached_waker_state().store(CW_NONE, Ordering::Release);
-    }
-
-    fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        loop {
-            let s = self.cached_waker_state().load(Ordering::Acquire);
-            if s == CW_SET {
-                return unsafe { (*self.cached_waker().get()).assume_init_ref().clone() };
-            }
-            if s == CW_UPDATING {
-                spin_loop();
-                continue;
-            }
-            if self
-                .cached_waker_state()
-                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-
-            let w = Self::create_waker(shard_idx, local_idx, generation);
-            unsafe {
-                (*self.cached_waker().get()).write(w.clone());
-            }
-            self.cached_waker_state().store(CW_SET, Ordering::Release);
-            return w;
-        }
-    }
-
-    #[inline]
-    fn is_completed(&self) -> bool {
-        self.state().load(Ordering::Acquire) == STATE_COMPLETED
-    }
-
-    #[inline]
-    fn try_enqueue(&self) -> bool {
-        self.state()
-            .compare_exchange(
-                STATE_IDLE,
-                STATE_QUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    #[inline]
-    fn try_notify_result(&self) -> NotifyResult {
-        match self.state().compare_exchange(
-            STATE_POLLING,
-            STATE_NOTIFIED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => NotifyResult::Notified,
-            Err(STATE_IDLE) => NotifyResult::IdleRace,
-            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
-            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
-            Err(STATE_COMPLETED) => NotifyResult::Completed,
-            Err(_) => NotifyResult::IdleRace,
-        }
-    }
-}
-
-#[repr(C, align(64))]
-pub struct TaskSlot {
-    pub(super) gen_ref: AtomicU32,
-    pub(super) state: AtomicU8,
-    pub(super) cached_waker_state: AtomicU8,
-    pub(super) _pad: [u8; 2],
-    pub(super) cached_waker: UnsafeCell<MaybeUninit<Waker>>,
-    pub(super) future: UnsafeCell<Option<FutureStorage>>,
-}
-
-unsafe impl Sync for TaskSlot {}
-
-impl TaskSlot {
-    pub(super) fn new() -> Self {
-        Self {
-            gen_ref: AtomicU32::new(0),
-            state: AtomicU8::new(STATE_IDLE),
-            cached_waker_state: AtomicU8::new(CW_NONE),
-            _pad: [0; 2],
-            cached_waker: UnsafeCell::new(MaybeUninit::uninit()),
-            future: UnsafeCell::new(None),
-        }
-    }
-
-    #[inline]
-    pub fn init(&self, future: impl Future<Output = ()> + Send + 'static) {
-        unsafe { *self.future.get() = Some(FutureStorage::new(future)) };
-        self.state.store(STATE_QUEUED, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        <Self as SlabSlot>::get_cached_waker(self, shard_idx, local_idx, generation)
-    }
-
-    pub fn poll_once(
-        &self,
-        waker: &Waker,
-        shard_idx: usize,
-        local_idx: usize,
-        generation: u32,
-    ) -> bool {
-        let prev = self.state.compare_exchange(
-            STATE_QUEUED,
-            STATE_POLLING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if prev.is_err() {
-            return false;
-        }
-
-        let mut cx = Context::from_waker(waker);
-
-        let future_ref = unsafe { &mut *self.future.get() };
-
-        let poll_res = {
-            let Some(fut) = future_ref.as_mut() else {
-                self.state.store(STATE_COMPLETED, Ordering::Release);
-                return true;
-            };
-            fut.poll(&mut cx)
-        };
-
-        if let Poll::Ready(()) = poll_res {
-            unsafe { *self.future.get() = None };
-            self.state.store(STATE_COMPLETED, Ordering::Release);
-            return true;
-        }
-
-        let prev = self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_IDLE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if let Err(STATE_NOTIFIED) = prev {
-            self.state.store(STATE_QUEUED, Ordering::Release);
-            let slab = get_task_slab();
-            slab.increment_ref(shard_idx, local_idx, generation);
-            let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-            submit_global(slab_poll_trampoline, encoded);
-        }
-
-        false
-    }
-
-    #[inline]
-    pub fn is_completed(&self) -> bool {
-        <Self as SlabSlot>::is_completed(self)
-    }
-
-    #[inline]
-    pub fn try_enqueue(&self) -> bool {
-        <Self as SlabSlot>::try_enqueue(self)
-    }
-
-    #[inline]
-    pub fn try_notify_result(&self) -> NotifyResult {
-        <Self as SlabSlot>::try_notify_result(self)
-    }
-
-    #[inline]
-    pub fn try_start_inline_poll(&self) -> bool {
-        self.state
-            .compare_exchange(
-                STATE_IDLE,
-                STATE_POLLING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-}
-
-impl SlabSlot for TaskSlot {
-    fn new() -> Self {
-        TaskSlot::new()
-    }
-
-    #[inline]
-    fn gen_ref(&self) -> &AtomicU32 {
-        &self.gen_ref
-    }
-
-    #[inline]
-    fn state(&self) -> &AtomicU8 {
-        &self.state
-    }
-
-    #[inline]
-    fn cached_waker_state(&self) -> &AtomicU8 {
-        &self.cached_waker_state
-    }
-
-    #[inline]
-    fn cached_waker(&self) -> &UnsafeCell<MaybeUninit<Waker>> {
-        &self.cached_waker
-    }
-
-    #[inline]
-    fn create_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        super::super::waker::create_slab_waker(shard_idx, local_idx, generation)
-    }
-
-    #[inline]
-    fn prepare_for_allocation(&self) {
-        self.state.store(STATE_IDLE, Ordering::Relaxed);
-        <Self as SlabSlot>::reset_cached_waker(self);
-        unsafe { *self.future.get() = None };
-    }
-
-    #[inline]
-    fn release_last_ref(&self) {
-        unsafe { *self.future.get() = None };
-        <Self as SlabSlot>::drop_cached_waker_if_set(self);
-        self.state.store(STATE_IDLE, Ordering::Release);
-    }
-}
-
 pub(super) const WAKER_NONE: u8 = 0;
 pub(super) const WAKER_UPDATING: u8 = 1;
 pub(super) const WAKER_SET: u8 = 2;
@@ -292,119 +42,166 @@ enum JoinWakeStep {
     NoWaker,
 }
 
-#[repr(C, align(8))]
-pub(super) struct JoinableStorage {
-    data: MaybeUninit<[u8; JOINABLE_STORAGE_SIZE]>,
-}
-
-impl JoinableStorage {
-    const fn new() -> Self {
-        Self {
-            data: MaybeUninit::uninit(),
-        }
-    }
-
-    #[inline]
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr() as *mut u8
-    }
-}
-
-type JoinablePollFn = for<'cx> unsafe fn(&JoinableSlot, &mut Context<'cx>) -> bool;
-type JoinableDropFn = unsafe fn(*mut u8);
+type TaskPollFn = for<'cx> unsafe fn(&TaskSlot, &mut Context<'cx>) -> bool;
+type TaskDropFn = unsafe fn(*mut u8);
+type TaskCancelFn = unsafe fn(&TaskSlot, usize);
+const CONTROL_ABORT_REQUESTED: u8 = 1;
+pub(crate) const RESULT_ABANDONED: usize = 0;
+pub(crate) const RESULT_CLAIMED: usize = usize::MAX;
 
 #[inline]
-fn read_poll_fn(c: &UnsafeCell<Option<JoinablePollFn>>) -> Option<JoinablePollFn> {
+fn read_poll_fn(c: &UnsafeCell<Option<TaskPollFn>>) -> Option<TaskPollFn> {
     unsafe { *c.get() }
 }
 
 #[inline]
-fn write_poll_fn(c: &UnsafeCell<Option<JoinablePollFn>>, v: Option<JoinablePollFn>) {
+fn write_poll_fn(c: &UnsafeCell<Option<TaskPollFn>>, v: Option<TaskPollFn>) {
     unsafe { *c.get() = v }
 }
 
 #[inline]
-fn read_drop_fn(c: &UnsafeCell<Option<JoinableDropFn>>) -> Option<JoinableDropFn> {
+fn read_drop_fn(c: &UnsafeCell<Option<TaskDropFn>>) -> Option<TaskDropFn> {
     unsafe { *c.get() }
 }
 
 #[inline]
-fn write_drop_fn(c: &UnsafeCell<Option<JoinableDropFn>>, v: Option<JoinableDropFn>) {
+fn write_drop_fn(c: &UnsafeCell<Option<TaskDropFn>>, v: Option<TaskDropFn>) {
     unsafe { *c.get() = v }
 }
 
 #[repr(C, align(64))]
-pub struct JoinableSlot {
+pub struct TaskSlot {
     pub(super) gen_ref: AtomicU32,
     pub(super) state: AtomicU8,
+    pub(super) control: AtomicU8,
     pub(super) waker_state: AtomicU8,
     pub(super) cached_waker_state: AtomicU8,
     pub(super) _pad: u8,
-    pub(super) poll_fn: UnsafeCell<Option<JoinablePollFn>>,
-    pub(super) drop_fn: UnsafeCell<Option<JoinableDropFn>>,
-    pub(super) result_drop_fn: UnsafeCell<Option<JoinableDropFn>>,
+    pub(super) domain_id: UnsafeCell<Option<ExecutorDomainId>>,
+    pub(super) future: UnsafeCell<Option<FutureAllocation>>,
+    pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
+    pub(super) drop_fn: UnsafeCell<Option<TaskDropFn>>,
+    pub(super) cancel_fn: UnsafeCell<Option<TaskCancelFn>>,
+    pub(crate) result_ptr: AtomicUsize,
     pub(super) join_waker: UnsafeCell<MaybeUninit<Waker>>,
     pub(super) cached_waker: UnsafeCell<MaybeUninit<Waker>>,
-    pub(super) buffer: UnsafeCell<JoinableStorage>,
 }
 
-unsafe impl Sync for JoinableSlot {}
+unsafe impl Sync for TaskSlot {}
 
-impl JoinableSlot {
+impl TaskSlot {
     pub(super) fn new() -> Self {
         Self {
             gen_ref: AtomicU32::new(0),
             state: AtomicU8::new(STATE_IDLE),
+            control: AtomicU8::new(0),
             waker_state: AtomicU8::new(WAKER_NONE),
             cached_waker_state: AtomicU8::new(CW_NONE),
             _pad: 0,
+            domain_id: UnsafeCell::new(None),
+            future: UnsafeCell::new(None),
             poll_fn: UnsafeCell::new(None),
             drop_fn: UnsafeCell::new(None),
-            result_drop_fn: UnsafeCell::new(None),
+            cancel_fn: UnsafeCell::new(None),
+            result_ptr: AtomicUsize::new(RESULT_ABANDONED),
             join_waker: UnsafeCell::new(MaybeUninit::uninit()),
             cached_waker: UnsafeCell::new(MaybeUninit::uninit()),
-            buffer: UnsafeCell::new(JoinableStorage::new()),
         }
     }
 
-    pub unsafe fn init_joinable<F, T>(&self, future: F)
-    where
+    #[inline]
+    pub(super) fn prepare_for_allocation(&self) {
+        self.state.store(STATE_IDLE, Ordering::Relaxed);
+        self.control.store(0, Ordering::Relaxed);
+        self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
+        self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
+        write_poll_fn(&self.poll_fn, None);
+        write_drop_fn(&self.drop_fn, None);
+        unsafe { *self.cancel_fn.get() = None };
+        self.result_ptr.store(RESULT_ABANDONED, Ordering::Relaxed);
+        unsafe {
+            *self.domain_id.get() = None;
+            *self.future.get() = None;
+        }
+    }
+
+    #[inline]
+    pub(super) fn release_last_ref(&self) {
+        if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
+            unsafe {
+                if let Some(allocation) = (&mut *self.future.get()).take() {
+                    drop_fn(allocation.ptr.as_ptr());
+                    release_future_allocation(allocation);
+                }
+            };
+        }
+        write_drop_fn(&self.drop_fn, None);
+        unsafe { *self.cancel_fn.get() = None };
+
+        let cws = self.cached_waker_state.load(Ordering::Acquire);
+        if cws == CW_SET {
+            unsafe {
+                core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
+            }
+        }
+        self.cached_waker_state.store(CW_NONE, Ordering::Release);
+
+        let ws = self.waker_state.load(Ordering::Acquire);
+        if ws == WAKER_SET {
+            unsafe {
+                core::ptr::drop_in_place((*self.join_waker.get()).as_mut_ptr());
+            }
+        }
+        self.waker_state.store(WAKER_NONE, Ordering::Release);
+
+        write_poll_fn(&self.poll_fn, None);
+        self.result_ptr.store(RESULT_ABANDONED, Ordering::Release);
+        self.state.store(STATE_IDLE, Ordering::Release);
+        if let Some(domain_id) = unsafe { (&mut *self.domain_id.get()).take() } {
+            if let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) {
+                domain.release_task();
+            }
+        }
+    }
+
+    pub unsafe fn init_joinable<F, T>(
+        &self,
+        domain_id: ExecutorDomainId,
+        allocation: FutureAllocation,
+        result_ptr: *mut JoinStorage<T>,
+    ) where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let size = core::mem::size_of::<F>();
-        let align = core::mem::align_of::<F>();
+        self.result_ptr
+            .store(result_ptr as usize, Ordering::Release);
+        self.init_internal::<F, T>(domain_id, allocation, poll_joinable::<F, T>);
+    }
 
-        let result_size = core::mem::size_of::<T>();
-        let result_align = core::mem::align_of::<T>();
-        // TODO: temp fix because the result is written to a fixed size buffer
-        if result_size > JOINABLE_STORAGE_SIZE || result_align > INLINE_FUTURE_ALIGN {
-            panic!(
-                "Joinable task result type {} (size {}, align {}) exceeds slab limits (max size {}, max align {})",
-                core::any::type_name::<T>(),
-                result_size,
-                result_align,
-                JOINABLE_STORAGE_SIZE,
-                INLINE_FUTURE_ALIGN
-            );
-        }
+    pub fn executor_domain_id(&self) -> Option<ExecutorDomainId> {
+        unsafe { *self.domain_id.get() }
+    }
 
-        let buf_ptr = (*self.buffer.get()).as_mut_ptr();
+    pub unsafe fn init_detached<F>(&self, domain_id: ExecutorDomainId, allocation: FutureAllocation)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.init_internal::<F, ()>(domain_id, allocation, poll_detached::<F>);
+    }
 
-        if size <= JOINABLE_STORAGE_SIZE && align <= INLINE_FUTURE_ALIGN {
-            let ptr = buf_ptr as *mut F;
-            core::ptr::write(ptr, future);
-            write_poll_fn(&self.poll_fn, Some(poll_and_store_inline::<F, T>));
-            write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
-        } else {
-            let boxed: Pin<Box<dyn Future<Output = T> + Send + 'static>> = Box::pin(future);
-            let ptr = buf_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
-            core::ptr::write(ptr, Some(boxed));
-            write_poll_fn(&self.poll_fn, Some(poll_and_store_boxed::<T>));
-            write_drop_fn(&self.drop_fn, Some(drop_boxed_future::<T>));
-        }
-
-        write_drop_fn(&self.result_drop_fn, Some(drop_inline::<T>));
+    unsafe fn init_internal<F, T>(
+        &self,
+        domain_id: ExecutorDomainId,
+        allocation: FutureAllocation,
+        poll_fn: TaskPollFn,
+    ) where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        *self.domain_id.get() = Some(domain_id);
+        *self.future.get() = Some(allocation);
+        write_poll_fn(&self.poll_fn, Some(poll_fn));
+        write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
 
         self.waker_state.store(WAKER_NONE, Ordering::Release);
         self.cached_waker_state.store(CW_NONE, Ordering::Release);
@@ -412,7 +209,7 @@ impl JoinableSlot {
         self.state.store(STATE_QUEUED, Ordering::Release);
     }
 
-    pub fn poll_once_joinable(
+    pub fn poll_once(
         &self,
         waker: &Waker,
         shard_idx: usize,
@@ -437,6 +234,24 @@ impl JoinableSlot {
             return true;
         };
 
+        let domain_id =
+            unsafe { *self.domain_id.get() }.expect("task domain missing while polling");
+        let _context_guard = CurrentExecutorContextGuard::enter(CurrentExecutorContext {
+            task_id: encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation),
+            domain_id: domain_id.raw(),
+        });
+        if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
+            if let Some(cancel) = unsafe { *self.cancel_fn.get() } {
+                unsafe {
+                    cancel(
+                        self,
+                        encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation),
+                    )
+                };
+                self.state.store(STATE_COMPLETED, Ordering::Release);
+                return true;
+            }
+        }
         let is_ready = unsafe { poll_fn(self, &mut cx) };
 
         if is_ready {
@@ -445,6 +260,18 @@ impl JoinableSlot {
             self.wake_join_handle();
             true
         } else {
+            if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
+                if let Some(cancel) = unsafe { *self.cancel_fn.get() } {
+                    unsafe {
+                        cancel(
+                            self,
+                            encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation),
+                        )
+                    };
+                    self.state.store(STATE_COMPLETED, Ordering::Release);
+                    return true;
+                }
+            }
             let prev = self.state.compare_exchange(
                 STATE_POLLING,
                 STATE_IDLE,
@@ -453,24 +280,33 @@ impl JoinableSlot {
             );
             if let Err(STATE_NOTIFIED) = prev {
                 self.state.store(STATE_QUEUED, Ordering::Release);
-                let slab = get_task_slab();
-                slab.increment_joinable_ref(shard_idx, local_idx, generation);
-                let encoded =
-                    encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-                submit_global(joinable_slab_poll_trampoline, encoded);
+                let slab = get_task_table();
+                slab.increment_ref(shard_idx, local_idx, generation);
+                let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
+                submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
             }
             false
         }
     }
 
-    pub unsafe fn take_result<T>(&self) -> T {
-        debug_assert!(self.state.load(Ordering::Acquire) == STATE_COMPLETED);
+    pub unsafe fn init_abortable<F>(
+        &self,
+        domain_id: ExecutorDomainId,
+        allocation: FutureAllocation,
+    ) where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.init_detached::<F>(domain_id, allocation);
+        *self.cancel_fn.get() = Some(cancel_future::<F>);
+    }
 
-        let ptr = (*self.buffer.get()).as_mut_ptr() as *mut T;
-        let result = core::ptr::read(ptr);
-
-        write_drop_fn(&self.drop_fn, None);
-        result
+    pub fn request_abort(&self) -> bool {
+        if self.state.load(Ordering::Acquire) == STATE_COMPLETED {
+            return false;
+        }
+        self.control
+            .fetch_or(CONTROL_ABORT_REQUESTED, Ordering::AcqRel);
+        true
     }
 
     pub fn set_join_waker(&self, waker: &Waker) {
@@ -589,143 +425,159 @@ impl JoinableSlot {
             }
         }
     }
+
     pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        <Self as SlabSlot>::get_cached_waker(self, shard_idx, local_idx, generation)
+        loop {
+            let s = self.cached_waker_state.load(Ordering::Acquire);
+            if s == CW_SET {
+                return unsafe { (*self.cached_waker.get()).assume_init_ref().clone() };
+            }
+            if s == CW_UPDATING {
+                spin_loop();
+                continue;
+            }
+            if self
+                .cached_waker_state
+                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+
+            let w = super::super::waker::create_slab_task_waker(shard_idx, local_idx, generation);
+            unsafe {
+                (*self.cached_waker.get()).write(w.clone());
+            }
+            self.cached_waker_state.store(CW_SET, Ordering::Release);
+            return w;
+        }
     }
 
     #[inline]
     pub fn is_completed(&self) -> bool {
-        <Self as SlabSlot>::is_completed(self)
+        self.state.load(Ordering::Acquire) == STATE_COMPLETED
     }
 
     #[inline]
     pub fn try_enqueue(&self) -> bool {
-        <Self as SlabSlot>::try_enqueue(self)
+        self.state
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     #[inline]
     pub fn try_notify_result(&self) -> NotifyResult {
-        <Self as SlabSlot>::try_notify_result(self)
+        match self.state.compare_exchange(
+            STATE_POLLING,
+            STATE_NOTIFIED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => NotifyResult::Notified,
+            Err(STATE_IDLE) => NotifyResult::IdleRace,
+            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
+            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
+            Err(STATE_COMPLETED) => NotifyResult::Completed,
+            Err(_) => NotifyResult::IdleRace,
+        }
+    }
+
+    #[inline]
+    pub fn try_start_inline_poll(&self) -> bool {
+        self.state
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_POLLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
-impl SlabSlot for JoinableSlot {
-    fn new() -> Self {
-        JoinableSlot::new()
-    }
-
-    #[inline]
-    fn gen_ref(&self) -> &AtomicU32 {
-        &self.gen_ref
-    }
-
-    #[inline]
-    fn state(&self) -> &AtomicU8 {
-        &self.state
-    }
-
-    #[inline]
-    fn cached_waker_state(&self) -> &AtomicU8 {
-        &self.cached_waker_state
-    }
-
-    #[inline]
-    fn cached_waker(&self) -> &UnsafeCell<MaybeUninit<Waker>> {
-        &self.cached_waker
-    }
-
-    #[inline]
-    fn create_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        super::super::waker::create_joinable_slab_waker(shard_idx, local_idx, generation)
-    }
-
-    #[inline]
-    fn prepare_for_allocation(&self) {
-        self.state.store(STATE_IDLE, Ordering::Relaxed);
-        self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
-        <Self as SlabSlot>::reset_cached_waker(self);
-        write_poll_fn(&self.poll_fn, None);
-        write_drop_fn(&self.drop_fn, None);
-        write_drop_fn(&self.result_drop_fn, None);
-    }
-
-    #[inline]
-    fn release_last_ref(&self) {
-        if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
-            unsafe { drop_fn((*self.buffer.get()).as_mut_ptr()) };
-        }
-        write_drop_fn(&self.drop_fn, None);
-
-        <Self as SlabSlot>::drop_cached_waker_if_set(self);
-
-        let ws = self.waker_state.load(Ordering::Acquire);
-        if ws == WAKER_SET {
-            unsafe {
-                core::ptr::drop_in_place((*self.join_waker.get()).as_mut_ptr());
-            }
-        }
-        self.waker_state.store(WAKER_NONE, Ordering::Release);
-
-        write_poll_fn(&self.poll_fn, None);
-        write_drop_fn(&self.result_drop_fn, None);
-        self.state.store(STATE_IDLE, Ordering::Release);
-    }
-}
-
-unsafe fn poll_and_store_inline<F, T>(slot: &JoinableSlot, cx: &mut Context<'_>) -> bool
+unsafe fn poll_joinable<F, T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
     F: Future<Output = T>,
     T: Send + 'static,
 {
-    let buffer_ptr = (*slot.buffer.get()).as_mut_ptr();
-    let future = &mut *(buffer_ptr as *mut F);
-    let poll_res = Pin::new_unchecked(future).poll(cx);
+    let allocation = (&mut *slot.future.get())
+        .as_mut()
+        .expect("task future allocation missing");
+    let future = &mut *(allocation.ptr.as_ptr() as *mut F);
+    let poll_res = Pin::new_unchecked(&mut *future).poll(cx);
 
     match poll_res {
         Poll::Ready(result) => {
-            core::ptr::drop_in_place(buffer_ptr as *mut F);
-            let result_ptr = buffer_ptr as *mut T;
-            core::ptr::write(result_ptr, result);
-
-            let result_drop = read_drop_fn(&slot.result_drop_fn);
-            write_drop_fn(&slot.drop_fn, result_drop);
-
+            core::ptr::drop_in_place(future);
+            let allocation = (&mut *slot.future.get())
+                .take()
+                .expect("task future allocation missing on completion");
+            release_future_allocation(allocation);
+            loop {
+                let ptr = slot.result_ptr.load(Ordering::Acquire);
+                if ptr == RESULT_ABANDONED {
+                    drop(result);
+                    break;
+                }
+                if ptr == RESULT_CLAIMED {
+                    panic!("join result storage claimed twice");
+                }
+                if slot
+                    .result_ptr
+                    .compare_exchange(ptr, RESULT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    (*(ptr as *mut JoinStorage<T>)).write(result);
+                    break;
+                }
+            }
             true
         }
         Poll::Pending => false,
     }
 }
 
-unsafe fn poll_and_store_boxed<T>(slot: &JoinableSlot, cx: &mut Context<'_>) -> bool
+unsafe fn poll_detached<F>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
-    T: Send + 'static,
+    F: Future<Output = ()>,
 {
-    let buffer_ptr = (*slot.buffer.get()).as_mut_ptr();
-    let boxed_ptr = buffer_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
-
-    let poll_res = if let Some(fut) = (*boxed_ptr).as_mut() {
-        fut.as_mut().poll(cx)
-    } else {
-        return true;
-    };
-
-    match poll_res {
-        Poll::Ready(result) => {
-            *boxed_ptr = None;
-
-            let result_ptr = buffer_ptr as *mut T;
-            core::ptr::write(result_ptr, result);
-
-            let result_drop = read_drop_fn(&slot.result_drop_fn);
-            write_drop_fn(&slot.drop_fn, result_drop);
-
+    let allocation = (&mut *slot.future.get())
+        .as_mut()
+        .expect("task future allocation missing");
+    let future = &mut *(allocation.ptr.as_ptr() as *mut F);
+    match Pin::new_unchecked(&mut *future).poll(cx) {
+        Poll::Ready(()) => {
+            core::ptr::drop_in_place(future);
+            let allocation = (&mut *slot.future.get())
+                .take()
+                .expect("task future allocation missing on completion");
+            release_future_allocation(allocation);
             true
         }
         Poll::Pending => false,
     }
 }
 
-unsafe fn drop_boxed_future<T>(ptr: *mut u8) {
-    let boxed_ptr = ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
-    core::ptr::drop_in_place(boxed_ptr);
+unsafe fn release_future_allocation(allocation: FutureAllocation) {
+    let domain_id = allocation.owner_domain;
+    let domain = GlobalAsyncExecutor::global()
+        .get_executor_domain(domain_id)
+        .expect("future owner domain disappeared while allocation was live");
+    assert!(domain.future_arena().release(allocation));
+    domain.maybe_finish_draining();
+}
+
+unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) {
+    if let Some(allocation) = (&mut *slot.future.get()).take() {
+        core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
+        release_future_allocation(allocation);
+    }
+    write_poll_fn(&slot.poll_fn, None);
+    write_drop_fn(&slot.drop_fn, None);
+    *slot.cancel_fn.get() = None;
 }

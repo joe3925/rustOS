@@ -1,0 +1,37 @@
+schema = 1
+id = "qemu-aarch64-virt-tcg"
+provider = "qemu"
+executable = "qemu-system-aarch64"
+compatible_platforms = ["aarch64-uefi"]
+supported_hosts = ["windows", "macos", "linux"]
+firmware_files = [
+    "edk2-aarch64-code.fd",
+    "edk2-arm-code.fd",
+    "QEMU_EFI.fd",
+    "QEMU_EFI-pflash.raw",
+]
+args = [
+    "-m", "{memory}",
+    "-cpu", "cortex-a72",
+    "-machine", "virt,gic-version=3",
+    "-accel", "tcg",
+    "-smp", "{cpus}",
+    "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",
+    "-serial", "{primary_serial}",
+    "-display", "none",
+    "-drive", "file={boot_image},format=raw",
+    "-drive", "file={system_disk},if=none,format={system_disk_format},id=sysdisk",
+    "-device", "virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off",
+]
+debug_args = [
+    "-S",
+    "-gdb", "tcp::{gdb_port}",
+]
+
+[defaults]
+memory = "12G"
+cpus = "1"
+
+[capabilities]
+debug = true
+lldb_metadata = false

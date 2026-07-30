@@ -10,7 +10,6 @@ pub struct PlatformFile {
     pub drivers: DriversFile,
     pub stub: StubFile,
     pub bootloader: BootloaderFile,
-    pub runner: RunnerFile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +19,10 @@ pub struct KernelFile {
     pub binary: String,
     pub target: PathBuf,
     pub import_library_machine: String,
+    #[serde(default)]
+    pub no_default_features: bool,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,23 +70,6 @@ pub struct BootloaderFile {
     pub output: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct RunnerFile {
-    pub provider: String,
-    pub executable: String,
-    #[serde(default)]
-    pub executable_fallbacks: Vec<PathBuf>,
-    #[serde(default)]
-    pub firmware_candidates: Vec<PathBuf>,
-    #[serde(default)]
-    pub firmware_files_from_qemu: Vec<PathBuf>,
-    pub machine: String,
-    pub cpu: String,
-    pub default_memory: String,
-    pub iommu: String,
-    pub iommu_whpx: String,
-}
-
 #[derive(Debug)]
 pub struct BuildPlan {
     pub id: String,
@@ -91,7 +77,6 @@ pub struct BuildPlan {
     pub drivers: DriversPlan,
     pub stub: StubPlan,
     pub bootloader: BootloaderPlan,
-    pub runner: RunnerPlan,
 }
 
 #[derive(Debug)]
@@ -101,6 +86,8 @@ pub struct KernelPlan {
     pub binary: String,
     pub target: PathBuf,
     pub import_library_machine: String,
+    pub no_default_features: bool,
+    pub features: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -139,54 +126,85 @@ pub struct BootloaderPlan {
     pub output: PathBuf,
 }
 
-#[derive(Debug)]
-pub struct RunnerPlan {
-    pub executable: String,
-    pub executable_fallbacks: Vec<PathBuf>,
-    pub firmware_candidates: Vec<PathBuf>,
-    pub firmware_files_from_qemu: Vec<PathBuf>,
-    pub machine: String,
-    pub cpu: String,
-    pub default_memory: String,
-    pub iommu: String,
-    pub iommu_whpx: String,
+#[derive(Debug, Deserialize)]
+struct LaunchFile {
+    schema: u32,
+    id: String,
+    provider: String,
+    executable: String,
+    compatible_platforms: Vec<String>,
+    supported_hosts: Vec<String>,
+    #[serde(default)]
+    supported_host_arches: Vec<String>,
+    firmware_files: Vec<PathBuf>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    debug_args: Vec<String>,
+    #[serde(default)]
+    lldb_metadata_args: Vec<String>,
+    defaults: LaunchDefaults,
+    capabilities: LaunchCapabilities,
 }
 
-pub fn load(root: &Path, selector: &str) -> Result<BuildPlan, String> {
-    let requested = Path::new(selector);
-    let platform_file = if requested.extension().and_then(|value| value.to_str()) == Some("toml")
-        || requested.components().count() > 1
-    {
-        if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            root.join(requested)
-        }
-    } else {
-        root.join("platforms").join(format!("{selector}.toml"))
-    };
-    let platform_file = canonical_file(&platform_file, "platform manifest")?;
-    let base = platform_file.parent().ok_or_else(|| {
-        format!(
-            "platform manifest has no parent: {}",
-            platform_file.display()
-        )
-    })?;
-    let source = fs::read_to_string(&platform_file)
-        .map_err(|err| format!("failed to read {}: {err}", platform_file.display()))?;
-    let parsed: PlatformFile = toml::from_str(&source)
-        .map_err(|err| format!("failed to parse {}: {err}", platform_file.display()))?;
+#[derive(Debug, Deserialize)]
+pub struct LaunchDefaults {
+    pub memory: String,
+    pub cpus: String,
+}
 
-    if parsed.schema != 1 {
-        return Err(format!(
-            "unsupported platform schema {} in {}; expected 1",
-            parsed.schema,
-            platform_file.display()
-        ));
-    }
-    if parsed.id.trim().is_empty() {
-        return Err("platform id cannot be empty".to_string());
-    }
+#[derive(Debug, Deserialize)]
+pub struct LaunchCapabilities {
+    pub debug: bool,
+    pub lldb_metadata: bool,
+}
+
+#[derive(Debug)]
+pub struct LaunchPlan {
+    pub id: String,
+    pub executable: String,
+    pub compatible_platforms: Vec<String>,
+    pub supported_hosts: Vec<String>,
+    pub supported_host_arches: Vec<String>,
+    pub firmware_files: Vec<PathBuf>,
+    pub args: Vec<String>,
+    pub debug_args: Vec<String>,
+    pub lldb_metadata_args: Vec<String>,
+    pub defaults: LaunchDefaults,
+    pub capabilities: LaunchCapabilities,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostFile {
+    schema: u32,
+    id: String,
+    os: String,
+    qemu: QemuHostFile,
+}
+
+#[derive(Debug, Deserialize)]
+struct QemuHostFile {
+    #[serde(default)]
+    executable_patterns: Vec<PathBuf>,
+    #[serde(default)]
+    data_directories: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct HostPlan {
+    pub id: String,
+    pub os: String,
+    pub executable_patterns: Vec<PathBuf>,
+    pub data_directories: Vec<PathBuf>,
+}
+
+pub fn load_platform(root: &Path, selector: &str) -> Result<BuildPlan, String> {
+    let platform_file = resolve_manifest(root, "platforms", selector)?;
+    let base = manifest_parent(&platform_file)?;
+    let parsed: PlatformFile = parse_manifest(&platform_file)?;
+
+    require_schema(parsed.schema, &platform_file)?;
+    require_id(&parsed.id, &platform_file)?;
     if parsed.bootloader.provider != "local" {
         return Err(format!(
             "unsupported bootloader provider `{}`; only `local` is implemented",
@@ -197,12 +215,6 @@ pub fn load(root: &Path, selector: &str) -> Result<BuildPlan, String> {
         return Err(format!(
             "unsupported firmware `{}`; only `uefi` is implemented",
             parsed.bootloader.firmware
-        ));
-    }
-    if parsed.runner.provider != "qemu" {
-        return Err(format!(
-            "unsupported runner `{}`; only `qemu` is implemented",
-            parsed.runner.provider
         ));
     }
 
@@ -256,6 +268,8 @@ pub fn load(root: &Path, selector: &str) -> Result<BuildPlan, String> {
             binary: parsed.kernel.binary,
             target: kernel_target,
             import_library_machine: parsed.kernel.import_library_machine,
+            no_default_features: parsed.kernel.no_default_features,
+            features: parsed.kernel.features,
         },
         drivers: DriversPlan {
             target: driver_target,
@@ -271,28 +285,118 @@ pub fn load(root: &Path, selector: &str) -> Result<BuildPlan, String> {
         bootloader: BootloaderPlan {
             output: parsed.bootloader.output,
         },
-        runner: RunnerPlan {
-            executable: parsed.runner.executable,
-            executable_fallbacks: parsed
-                .runner
-                .executable_fallbacks
-                .into_iter()
-                .map(|path| resolve_candidate(base, path))
-                .collect(),
-            firmware_candidates: parsed
-                .runner
-                .firmware_candidates
-                .into_iter()
-                .map(|path| resolve_candidate(base, path))
-                .collect(),
-            firmware_files_from_qemu: parsed.runner.firmware_files_from_qemu,
-            machine: parsed.runner.machine,
-            cpu: parsed.runner.cpu,
-            default_memory: parsed.runner.default_memory,
-            iommu: parsed.runner.iommu,
-            iommu_whpx: parsed.runner.iommu_whpx,
-        },
     })
+}
+
+pub fn load_launch(root: &Path, selector: &str) -> Result<LaunchPlan, String> {
+    let path = resolve_manifest(root, "launches", selector)?;
+    let parsed: LaunchFile = parse_manifest(&path)?;
+    require_schema(parsed.schema, &path)?;
+    require_id(&parsed.id, &path)?;
+    if parsed.provider != "qemu" {
+        return Err(format!(
+            "unsupported launch provider `{}` in {}; only `qemu` is implemented",
+            parsed.provider,
+            path.display()
+        ));
+    }
+    if parsed.compatible_platforms.is_empty() {
+        return Err(format!(
+            "launch must declare at least one compatible platform: {}",
+            path.display()
+        ));
+    }
+    if parsed.supported_hosts.is_empty() {
+        return Err(format!(
+            "launch must declare at least one supported host: {}",
+            path.display()
+        ));
+    }
+
+    Ok(LaunchPlan {
+        id: parsed.id,
+        executable: parsed.executable,
+        compatible_platforms: parsed.compatible_platforms,
+        supported_hosts: parsed.supported_hosts,
+        supported_host_arches: parsed.supported_host_arches,
+        firmware_files: parsed.firmware_files,
+        args: parsed.args,
+        debug_args: parsed.debug_args,
+        lldb_metadata_args: parsed.lldb_metadata_args,
+        defaults: parsed.defaults,
+        capabilities: parsed.capabilities,
+    })
+}
+
+pub fn load_host(root: &Path, selector: &str) -> Result<HostPlan, String> {
+    let path = resolve_manifest(root, "hosts", selector)?;
+    let base = manifest_parent(&path)?;
+    let parsed: HostFile = parse_manifest(&path)?;
+    require_schema(parsed.schema, &path)?;
+    require_id(&parsed.id, &path)?;
+
+    Ok(HostPlan {
+        id: parsed.id,
+        os: parsed.os,
+        executable_patterns: parsed
+            .qemu
+            .executable_patterns
+            .into_iter()
+            .map(|path| resolve_candidate(base, path))
+            .collect(),
+        data_directories: parsed
+            .qemu
+            .data_directories
+            .into_iter()
+            .map(|path| resolve_candidate(base, path))
+            .collect(),
+    })
+}
+
+fn resolve_manifest(root: &Path, directory: &str, selector: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(selector);
+    let path = if requested.extension().and_then(|value| value.to_str()) == Some("toml")
+        || requested.components().count() > 1
+    {
+        if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        }
+    } else {
+        root.join(directory).join(format!("{selector}.toml"))
+    };
+    canonical_file(&path, &format!("{directory} manifest"))
+}
+
+fn parse_manifest<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    toml::from_str(&source).map_err(|err| format!("failed to parse {}: {err}", path.display()))
+}
+
+fn manifest_parent(path: &Path) -> Result<&Path, String> {
+    path.parent()
+        .ok_or_else(|| format!("manifest has no parent: {}", path.display()))
+}
+
+fn require_schema(schema: u32, path: &Path) -> Result<(), String> {
+    if schema == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported schema {schema} in {}; expected 1",
+            path.display()
+        ))
+    }
+}
+
+fn require_id(id: &str, path: &Path) -> Result<(), String> {
+    if id.trim().is_empty() {
+        Err(format!("id cannot be empty in {}", path.display()))
+    } else {
+        Ok(())
+    }
 }
 
 fn resolve_candidate(base: &Path, path: PathBuf) -> PathBuf {
@@ -313,7 +417,8 @@ fn canonical_file(path: &Path, what: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootPackageFile, BootPackageSourceFile};
+    use super::{load_host, load_launch, load_platform, BootPackageFile, BootPackageSourceFile};
+    use std::path::Path;
 
     #[test]
     fn parses_all_boot_package_source_kinds() {
@@ -339,5 +444,33 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(git.source, BootPackageSourceFile::GitCargo { .. }));
+    }
+
+    #[test]
+    fn loads_repository_configuration_layers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let platform = load_platform(root, "x86_64-uefi").unwrap();
+        let tcg = load_launch(root, "qemu-x86_64-q35-tcg").unwrap();
+        let whpx = load_launch(root, "qemu-x86_64-q35-whpx").unwrap();
+        let aarch64 = load_platform(root, "aarch64-uefi").unwrap();
+        let aarch64_tcg = load_launch(root, "qemu-aarch64-virt-tcg").unwrap();
+        let aarch64_hvf = load_launch(root, "qemu-aarch64-virt-hvf").unwrap();
+        let aarch64_kvm = load_launch(root, "qemu-aarch64-virt-kvm").unwrap();
+        let windows = load_host(root, "windows").unwrap();
+
+        assert_eq!(platform.id, "x86_64-uefi");
+        assert!(tcg.capabilities.debug);
+        assert!(!whpx.capabilities.debug);
+        assert_eq!(aarch64.id, "aarch64-uefi");
+        assert!(aarch64.kernel.no_default_features);
+        assert_eq!(aarch64.kernel.features, ["allocator-mimalloc"]);
+        assert!(aarch64_tcg.capabilities.debug);
+        assert!(!aarch64_hvf.capabilities.debug);
+        assert!(!aarch64_kvm.capabilities.debug);
+        assert_eq!(windows.id, "windows");
+        assert_eq!(windows.os, "windows");
     }
 }

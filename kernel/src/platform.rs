@@ -12,6 +12,7 @@ use crate::memory::paging::types::UserVmLayout;
 use acpi::AcpiTables;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{MsiMessage, MsiRequest};
+use kernel_types::memory::Module;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
@@ -34,6 +35,8 @@ pub trait Platform {
 }
 
 pub trait CpuPlatform: Platform {
+    type PerCpuState: Send + Sync + 'static;
+
     const MAX_CPUS: usize;
 
     fn current_cpu_id() -> usize;
@@ -41,9 +44,20 @@ pub trait CpuPlatform: Platform {
     fn cpu_topology_ids() -> Vec<u8>;
     fn processor_count() -> usize;
     fn init_current_cpu_local_state(logical_id: u32);
+    fn current_percpu() -> &'static Self::PerCpuState;
+    fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64);
+    fn current_executor_context() -> (u64, u64);
     fn start_secondary_cpus() -> bool;
     fn halt() -> !;
     fn broadcast_panic_stop();
+}
+
+pub trait ConsolePlatform: Platform {
+    fn serial_write_bytes(bytes: &[u8]);
+}
+
+pub trait DebugTransportPlatform: Platform {
+    fn init_debug_metadata_transport();
 }
 
 pub trait InterruptPlatform: CpuPlatform {
@@ -141,6 +155,7 @@ pub trait PagingPlatform: AddressSpacePlatform {
     ) -> Result<Option<PhysAddr>, PageMapError>;
 
     fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping>;
+    fn resolve_mapping_in_root(root: Self::Root, virt: VirtAddr) -> Option<ResolvedMapping>;
 
     fn local_flush_tlb_all();
     fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64);
@@ -196,6 +211,22 @@ pub trait TaskPlatform: CpuPlatform {
     fn request_task_yield();
 }
 
+pub trait UnwindPlatform: TaskPlatform {
+    type UnwindContext;
+
+    fn begin_current_unwind() -> crate::profiling::backtrace::UnwindStart<Self::UnwindContext>;
+
+    fn begin_unwind(
+        state: &Self::TaskContext,
+    ) -> crate::profiling::backtrace::UnwindStart<Self::UnwindContext>;
+
+    fn unwind_next(
+        context: &mut Self::UnwindContext,
+        module: Option<&Module>,
+        stack_bounds: crate::profiling::backtrace::StackBounds,
+    ) -> crate::profiling::backtrace::UnwindStep;
+}
+
 pub trait DebugPlatform: Platform {
     fn breakpoint();
     fn fatal_reset() -> !;
@@ -205,6 +236,15 @@ pub const MAX_CPUS: usize = <ActivePlatform as CpuPlatform>::MAX_CPUS;
 
 pub fn user_vm_layout() -> UserVmLayout {
     <ActivePlatform as PagingPlatform>::user_virtual_layout()
+}
+
+pub fn resolve_mapping_in_root(
+    root: <ActivePlatform as AddressSpacePlatform>::Root,
+    virt: VirtAddr,
+) -> Option<ResolvedMapping> {
+    <ActivePlatform as InterruptPlatform>::with_interrupts_disabled(|| {
+        <ActivePlatform as PagingPlatform>::resolve_mapping_in_root(root, virt)
+    })
 }
 pub fn current_cpu_id() -> usize {
     <ActivePlatform as CpuPlatform>::current_cpu_id()
@@ -228,6 +268,26 @@ pub fn init_boot_processor() {
 
 pub fn init_current_cpu_local_state(logical_id: u32) {
     <ActivePlatform as CpuPlatform>::init_current_cpu_local_state(logical_id);
+}
+
+pub fn current_percpu() -> &'static <ActivePlatform as CpuPlatform>::PerCpuState {
+    <ActivePlatform as CpuPlatform>::current_percpu()
+}
+
+pub fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
+    <ActivePlatform as CpuPlatform>::swap_executor_context(task_id, domain_id)
+}
+
+pub fn current_executor_context() -> (u64, u64) {
+    <ActivePlatform as CpuPlatform>::current_executor_context()
+}
+
+pub fn serial_write_bytes(bytes: &[u8]) {
+    <ActivePlatform as ConsolePlatform>::serial_write_bytes(bytes);
+}
+
+pub fn init_debug_metadata_transport() {
+    <ActivePlatform as DebugTransportPlatform>::init_debug_metadata_transport();
 }
 
 pub fn start_secondary_cpus() -> bool {

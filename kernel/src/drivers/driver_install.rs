@@ -1,12 +1,16 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::pnp::{BootType, DriverRole};
-use kernel_types::status::{Data, DriverError, FileStatus, RegError};
-use toml::de::{DeInteger, DeTable};
+use kernel_types::{
+    error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError, ResultErrorContext},
+    status::Data,
+};
 use toml::Spanned;
+use toml::de::{DeInteger, DeTable};
 
 use crate::alloc::string::ToString;
+use crate::error::error_with_message;
 use crate::{file_system::file::File, registry::reg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,12 +63,25 @@ fn inner<T>(s: &Spanned<T>) -> &T {
     s.get_ref()
 }
 
-pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
+async fn ensure_directory(path: &Path) -> Result<(), KernelError> {
+    match File::make_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::File(FileErrorKind::AlreadyExists) => Ok(()),
+        Err(error) => Err(error.with_context(format!("creating directory `{path:?}`"))),
+    }
+}
+
+pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, KernelError> {
     let f = File::open(path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     let mut bytes = alloc::vec![0u8; f.size as usize];
     let n = f.read(&mut bytes).await?;
     bytes.truncate(n);
-    let src = core::str::from_utf8(&bytes).map_err(|_| FileStatus::InternalError)?;
+    let src = core::str::from_utf8(&bytes).map_err(|_| {
+        error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("driver manifest is not valid UTF-8"),
+        )
+    })?;
 
     let (tbl_span, _errs) = DeTable::parse_recoverable(src);
     let tbl: &DeTable = inner(&tbl_span);
@@ -73,13 +90,23 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
         .get("image")
         .and_then(|v| inner(v).as_str())
         .map(|s| s.to_string())
-        .ok_or(FileStatus::BadPath)?;
+        .ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!("driver manifest is missing `image`"),
+            )
+        })?;
 
     let start = tbl
         .get("start")
         .and_then(|v| inner(v).as_str())
         .and_then(BootType::from_str)
-        .ok_or(FileStatus::BadPath)?;
+        .ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!("driver manifest has an invalid `start` value"),
+            )
+        })?;
 
     let has_filter_tbl = tbl
         .get("filter")
@@ -92,7 +119,12 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
     } else {
         explicit_role
             .and_then(DriverRole::from_str)
-            .ok_or(FileStatus::BadPath)?
+            .ok_or_else(|| {
+                error_with_message(
+                    DriverErrorKind::InvalidParameter,
+                    format_args!("driver manifest has an invalid `role`"),
+                )
+            })?
     };
 
     let valid_start_role = matches!(
@@ -104,7 +136,10 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
             )
     );
     if !valid_start_role {
-        return Err(FileStatus::BadPath);
+        return Err(error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("filter table requires the filter role"),
+        ));
     }
 
     let hwids = tbl
@@ -130,7 +165,12 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
                 .get("position")
                 .and_then(|v| inner(v).as_str())
                 .and_then(FilterPosition::from_str)
-                .ok_or(FileStatus::BadPath)?;
+                .ok_or_else(|| {
+                    error_with_message(
+                        DriverErrorKind::InvalidParameter,
+                        format_args!("filter target is missing"),
+                    )
+                })?;
 
             let order = ftbl
                 .get("order")
@@ -145,10 +185,13 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
             } else if let Some(s) = ftbl.get("driver").and_then(|v| inner(v).as_str()) {
                 FilterTarget::Driver(s.to_string())
             } else {
-                return Err(FileStatus::BadPath);
+                return Err(error_with_message(
+                    DriverErrorKind::InvalidParameter,
+                    format_args!("filter target kind is invalid"),
+                ));
             };
 
-            Ok::<FilterSpec, FileStatus>(FilterSpec {
+            Ok::<FilterSpec, KernelError>(FilterSpec {
                 position,
                 order,
                 target: tgt,
@@ -157,7 +200,10 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
         .transpose()?;
 
     if role == DriverRole::Filter && filter.is_none() {
-        return Err(FileStatus::BadPath);
+        return Err(error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("driver manifest has incompatible fields"),
+        ));
     }
 
     let reg_writes: Vec<RegWrite> = tbl
@@ -226,7 +272,7 @@ fn escape_key(s: &str) -> alloc::string::String {
     }
     out
 }
-async fn ensure_class_key(cls: &str) -> Result<(), RegError> {
+async fn ensure_class_key(cls: &str) -> Result<(), KernelError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
 
     if reg::get_key(&class_key).await.is_none() {
@@ -243,7 +289,7 @@ async fn reg_add_filter_index(
     pos: FilterPosition,
     order: u32,
     service: &str,
-) -> Result<(), RegError> {
+) -> Result<(), KernelError> {
     let (kind, id) = match tgt {
         FilterTarget::Hwid(s) => ("hwid", s.as_str()),
         FilterTarget::Class(s) => ("class", s.as_str()),
@@ -273,7 +319,7 @@ async fn reg_append_class_filter(
     class: &str,
     pos: FilterPosition,
     service: &str,
-) -> Result<(), RegError> {
+) -> Result<(), KernelError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
     if reg::get_key(&class_key).await.is_none() {
         reg::create_key(class_key.clone()).await?;
@@ -301,7 +347,7 @@ async fn reg_append_class_filter(
     .await
 }
 
-async fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegError> {
+async fn reg_append_class_member(class: &str, service: &str) -> Result<(), KernelError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
     if reg::get_key(&class_key).await.is_none() {
         reg::create_key(class_key.clone()).await?;
@@ -313,8 +359,8 @@ async fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegEr
     }
 
     if let Some(k) = reg::get_key(&members_key).await {
-        for (_k, v) in k.values {
-            if let Data::Str(s) = v {
+        for name in k.values.keys() {
+            if let Some(Data::Str(s)) = reg::get_value(&members_key, name).await {
                 if s == service {
                     return Ok(());
                 }
@@ -339,10 +385,10 @@ fn service_name_from_image(image: &str) -> &str {
     image.rsplit_once('.').map(|(n, _)| n).unwrap_or(image)
 }
 
-pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
+pub async fn install_driver_toml(toml_path: Path) -> Result<(), KernelError> {
     let driver = parse_driver_toml(&toml_path)
         .await
-        .map_err(|_| DriverError::TomlParse)?;
+        .with_context(|| format!("parsing driver manifest `{toml_path:?}`"))?;
     let driver_name = service_name_from_image(&driver.image);
 
     let key_path = alloc::format!("SYSTEM/CurrentControlSet/Services/{}/", driver_name);
@@ -351,12 +397,17 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
         Path::from_string(&alloc::format!("C:/system/toml/{}.toml", driver_name));
     let img_target_path = Path::from_string(&alloc::format!("C:/system/mod/{}", driver.image));
 
-    let toml_dir = toml_path.parent().ok_or(DriverError::NoParent)?;
+    let toml_dir = toml_path.parent().ok_or_else(|| {
+        error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!("driver manifest path has no parent"),
+        )
+    })?;
     let img_src_full = toml_dir.clone().join(&driver.image);
 
-    let _ = File::make_dir(&Path::from_string("C:/system")).await;
-    let _ = File::make_dir(&Path::from_string("C:/system/toml")).await;
-    let _ = File::make_dir(&Path::from_string("C:/system/mod")).await;
+    ensure_directory(&Path::from_string("C:/system")).await?;
+    ensure_directory(&Path::from_string("C:/system/toml")).await?;
+    ensure_directory(&Path::from_string("C:/system/mod")).await?;
 
     let img_src = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     img_src.move_no_copy(&img_target_path).await?;
@@ -397,7 +448,9 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
                     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
                     reg::set_value(&class_key, "Class", Data::Str(driver_name.to_string())).await?;
                     if reg::get_value(&class_key, "Version").await.is_none() {
-                        let _ = reg::set_value(&class_key, "Version", Data::U32(1)).await;
+                        reg::set_value(&class_key, "Version", Data::U32(1))
+                            .await
+                            .with_context(|| format!("setting class version for `{class_key}`"))?;
                     }
                     if reg::get_value(&class_key, "Description").await.is_none() {
                         let _ =
@@ -416,7 +469,12 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
         }
 
         DriverRole::Filter => {
-            let f = driver.filter.as_ref().ok_or(DriverError::TomlParse)?;
+            let f = driver.filter.as_ref().ok_or_else(|| {
+                error_with_message(
+                    DriverErrorKind::InvalidParameter,
+                    format_args!("filter driver is missing its filter table"),
+                )
+            })?;
             let flt_key = alloc::format!("{}/Filter", key_path.trim_end_matches('/'));
             reg::create_key(flt_key.clone()).await?;
             let pos_s = match f.position {
@@ -460,19 +518,23 @@ pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
     Ok(())
 }
 
-pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
+pub async fn install_prepacked_drivers() -> Result<(), KernelError> {
     let driver_root: &str = "C:/INSTALL/DRIVERS";
 
     let packages = File::list_dir(&Path::from_string(driver_root))
         .await
-        .map_err(DriverError::File)?;
+        .with_context(|| format!("listing prepacked driver directory `{driver_root}`"))?;
 
     for pkg in packages {
         let pkg_path = alloc::format!("{driver_root}/{pkg}");
 
         let entries = match File::list_dir(&Path::from_string(&pkg_path)).await {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(error) => {
+                return Err(
+                    error.with_context(format!("listing prepacked driver package `{pkg_path}`"))
+                );
+            }
         };
 
         let mut toml_name: Option<String> = None;
@@ -489,30 +551,9 @@ pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
         };
 
         let toml_path = Path::from_string(&alloc::format!("{pkg_path}/{toml_name}"));
-        let _ = install_driver_toml(toml_path).await;
-        // match install_driver_toml(&toml_path).await {
-        //     Ok(_) => {
-        //         println!("Installed {}", toml_path);
-        //     }
-        //     Err(DriverError::Registry(RegError::KeyAlreadyExists)) => {
-        //         println!(
-        //             "Couldn't install driver {} failed with error: {:#?}",
-        //             toml_path,
-        //             DriverError::Registry(RegError::KeyAlreadyExists)
-        //         );
-        //     }
-        //     Err(DriverError::Registry(e)) => {
-        //         return Err(DriverError::Registry(e));
-        //     }
-        //     Err(e) => {
-        //         println!(
-        //             "Couldn't install driver {} failed with error: {:#?}",
-        //             toml_path, e
-        //         );
-        //     }
-        // }
+        install_driver_toml(toml_path.clone())
+            .await
+            .with_context(|| format!("installing prepacked driver `{toml_path:?}`"))?;
     }
-    PNP_MANAGER.recheck_all_devices().await;
-
     Ok(())
 }

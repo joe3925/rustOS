@@ -12,7 +12,6 @@ mod dma_region;
 mod io;
 mod outstanding;
 mod pci;
-//mod temp_benchmark;
 mod virtqueue;
 use kernel_api::device::open_protocol_to_next_lower;
 use kernel_api::device::publish_stack_protocol;
@@ -31,7 +30,7 @@ use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU64;
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
@@ -39,6 +38,9 @@ use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::dma::dma::IoBufferAccess;
 use kernel_api::dma::dma::ToDevice;
+use kernel_api::error::{
+    DriverErrorKind, KernelError, ResultErrorContext, error, error_with_message,
+};
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
@@ -67,7 +69,6 @@ use kernel_api::pnp::{
 };
 use kernel_api::request::DeviceControl;
 use kernel_api::runtime::{KernelStopwatch, cycle_counter, spawn_detached};
-use kernel_api::status::DriverStatus;
 use kernel_api::util::panic_common;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::{Mutex, RwLock};
@@ -78,7 +79,7 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 const PIC_BASE_VECTOR: u8 = 0x20;
 
 const COMPLETION_POLL_MIN_NS: u64 = 2_000;
-const COMPLETION_POLL_MAX_NS: u64 = 500_000;
+const COMPLETION_POLL_MAX_NS: u64 = 550_000;
 const COMPLETION_FIT_MIN_SAMPLES: u64 = 32;
 const COMPLETION_FIT_FALLBACK_BASE_NS: u64 = 5_000;
 const COMPLETION_FIT_FALLBACK_NS_PER_KIB: u64 = 1_250;
@@ -173,35 +174,12 @@ pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
     }
 
     let ns = ((pred_num + (pred_den / 2)) / pred_den) as u64;
-    // if (byte_len == 1024) {
-    //     println!("1024 bytes: ns {}", ns)
-    // }
     if ns > COMPLETION_POLL_MAX_NS {
         None
     } else {
         Some(ns.max(COMPLETION_POLL_MIN_NS) as usize)
     }
 }
-#[inline]
-fn duration_to_cycle_counter_ticks(duration: Duration, frequency_hz: u64) -> u64 {
-    if unlikely(frequency_hz == 0) {
-        cold_path();
-        return 0;
-    }
-
-    let nanos = duration.as_nanos();
-    if unlikely(nanos == 0) {
-        cold_path();
-        return 0;
-    }
-
-    let cycles = nanos
-        .saturating_mul(frequency_hz as u128)
-        .saturating_add(999_999_999)
-        / 1_000_000_000;
-    cycles.min(u64::MAX as u128) as u64
-}
-
 pub(crate) async fn wait_completion_hybrid<F>(
     qs: &QueueState,
     completion: F,
@@ -255,36 +233,32 @@ where
     record_completion_fit_sample(byte_len, elapsed_ns);
     result
 }
-// Request helpers
 #[inline(always)]
-pub(crate) fn complete_req<K>(_req: &mut K, status: DriverStatus) -> DriverStep {
-    DriverStep::complete(status)
-}
-#[inline(always)]
-fn continue_req<K>(_req: &mut K) -> DriverStep {
-    DriverStep::Continue
+fn continue_req<K>(_req: &mut K) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Continue)
 }
 
-pub(crate) fn virtio_device_error(message: &'static str) -> DriverStatus {
-    DriverStatus::DeviceError {
-        message: message.into(),
-    }
-}
-
-pub(crate) fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
+pub(crate) fn check_blk_status(operation: &str, status: u8) -> Result<(), KernelError> {
     match status {
-        VIRTIO_BLK_S_OK => DriverStatus::Success,
-        // TODO: FIX THIS IMPORTANT
-        VIRTIO_BLK_S_IOERR => todo!(),
-        VIRTIO_BLK_S_UNSUPP => todo!(),
-        other => todo!(),
+        VIRTIO_BLK_S_OK => Ok(()),
+        VIRTIO_BLK_S_IOERR => Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("virtio-blk {operation}: I/O error"),
+        )),
+        VIRTIO_BLK_S_UNSUPP => Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("virtio-blk {operation}: unsupported operation"),
+        )),
+        other => Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("virtio-blk {operation}: unknown status {other}"),
+        )),
     }
 }
-
 pub(crate) fn map_request_buffer<'buffer, D>(
     device: &Arc<DeviceObject>,
     buffer: IoBuffer<'buffer, 'buffer, D>,
-) -> Result<IoBuffer<'buffer, 'buffer, D>, DriverStatus>
+) -> Result<IoBuffer<'buffer, 'buffer, D>, DriverErrorKind>
 where
     D: IoBufferAccess,
 {
@@ -293,7 +267,7 @@ where
     }
 
     map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
-        .map_err(|_| DriverStatus::InsufficientResources)
+        .map_err(|_| DriverErrorKind::InsufficientResources)
 }
 
 #[cfg(not(test))]
@@ -303,15 +277,17 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(
+    driver: &Arc<DriverObject>,
+) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, virtio_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn virtio_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp_vt = PnpOps::new();
     pnp_vt.start_device.set(virtio_pnp_start);
     pnp_vt.init_complete.set(virtio_init_complete);
@@ -322,7 +298,7 @@ pub extern "C" fn virtio_device_add(
     *dev_init = init;
     dev_init.set_dev_ext_from(DevExt::new());
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 extern "C" fn virtio_isr(
@@ -367,7 +343,7 @@ async fn setup_msix_via_pci(
     vector: u8,
     platform_cpu_id: u8,
     table_index: u16,
-) -> Result<(), DriverStatus> {
+) -> Result<(), KernelError> {
     let setup = MsiRequest::pci_msix(
         vector,
         MsiTarget::platform_cpu(platform_cpu_id as u32),
@@ -375,21 +351,22 @@ async fn setup_msix_via_pci(
     );
 
     let mut req = DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup);
-    let status = send_next_lower(dev.clone(), &mut req).await;
-
-    if status == DriverStatus::Success {
-        Ok(())
-    } else {
-        Err(status)
-    }
+    send_next_lower(dev.clone(), &mut req)
+        .await
+        .map(|_| ())
+        .with_context(|| {
+            alloc::format!(
+                "configuring virtio MSI-X vector {vector} on CPU {platform_cpu_id} at table index {table_index}"
+            )
+        })
 }
 #[request_handler]
 async fn virtio_pnp_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
-    DriverStep::Continue
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Continue)
 }
 
 #[request_handler]
@@ -397,12 +374,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut InitComplete,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let proto = match open_protocol_to_next_lower::<PciProtocol>(dev) {
         Ok(p) => p,
         Err(e) => {
             println!("virtio-blk: no PCI protocol on parent");
-            return complete_req(req, e);
+            return Err(error(e)).with_context(|| "opening the lower PCI protocol for virtio-blk");
         }
     };
 
@@ -423,7 +400,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
 
     if mapped_bars.is_empty() {
         println!("virtio-blk: no memory BARs found");
-        return complete_req(req, virtio_device_error("virtio-blk: no memory BARs found"));
+        return Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("virtio-blk: no memory BARs found"),
+        ));
     }
 
     let gsi = (proto.get_gsi)(&proto.provider());
@@ -436,10 +416,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unsafe { unmap_mmio_region(va, sz) };
             }
-            return complete_req(
-                req,
-                virtio_device_error("virtio-blk: no PCI config space resource"),
-            );
+            return Err(error_with_message(
+                DriverErrorKind::DeviceError,
+                format_args!("virtio-blk: no PCI config space resource"),
+            ));
         }
     };
 
@@ -450,10 +430,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unsafe { unmap_mmio_region(va, sz) };
             }
-            return complete_req(
-                req,
-                virtio_device_error("virtio-blk: failed to map PCI config space"),
-            );
+            return Err(error_with_message(
+                DriverErrorKind::DeviceError,
+                format_args!(
+                    "virtio-blk: failed to map PCI config space at {cfg_phys:#x} for {cfg_len} bytes"
+                ),
+            ));
         }
     };
 
@@ -465,10 +447,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unsafe { unmap_mmio_region(va, sz) };
             }
-            return complete_req(
-                req,
-                virtio_device_error("virtio-blk: failed to parse virtio PCI capabilities"),
-            );
+            return Err(error_with_message(
+                DriverErrorKind::DeviceError,
+                format_args!("virtio-blk: failed to parse virtio PCI capabilities"),
+            ));
         }
     };
 
@@ -484,13 +466,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unsafe { unmap_mmio_region(va, sz) };
             }
-            todo!("fix this");
-            // return complete_req(
-            //     req,
-            //     virtio_device_error(alloc::format!(
-            //         "virtio-blk: device init / feature negotiation failed: {message}"
-            //     )),
-            // );
+            return Err(error_with_message(
+                DriverErrorKind::DeviceError,
+                format_args!("virtio-blk: device init / feature negotiation failed: {message}"),
+            ));
         }
     };
 
@@ -515,13 +494,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unsafe { unmap_mmio_region(va, sz) };
         }
-        todo!("");
-        // return complete_req(
-        //     req,
-        //     virtio_device_error(alloc::format!(
-        //         "virtio-blk: no queues created; requested {target_queue_count}"
-        //     )),
-        // );
+        return Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("virtio-blk: no queues created; requested {target_queue_count}"),
+        ));
     }
 
     let actual_queue_count = virtqueues.len();
@@ -678,20 +654,22 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                return complete_req(req, DriverStatus::InsufficientResources);
+                return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
+                    alloc::format!("allocating descriptor storage for virtio queue {i}")
+                });
             }
         };
 
-        let (irq_handle, msix_vector, msix_table_index) = if use_msix && i < msix_allocations.len()
+        let (irq_handle, msix_vector) = if use_msix && i < msix_allocations.len()
         {
             match msix_allocations[i].take() {
-                Some((vec, handle, table_idx)) => (Some(handle), Some(vec), Some(table_idx)),
-                None => (None, None, None),
+                Some((vec, handle, _table_idx)) => (Some(handle), Some(vec)),
+                None => (None, None),
             }
         } else if i == 0 && !use_msix {
-            (line_irq_handle.clone(), None, None)
+            (line_irq_handle.clone(), None)
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         let vq_capacity = vq.size as usize;
@@ -723,13 +701,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                todo!("");
-                // return complete_req(
-                //     req,
-                //     virtio_device_error(alloc::format!(
-                //         "virtio-blk: failed to create completion slots for queue {i}"
-                //     )),
-                // );
+                return Err(error_with_message(
+                    DriverErrorKind::DeviceError,
+                    format_args!(
+                        "virtio-blk: failed to create {vq_capacity} completion slots for queue {i}"
+                    ),
+                ));
             }
         };
 
@@ -760,7 +737,11 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                return complete_req(req, DriverStatus::InsufficientResources);
+                return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
+                    alloc::format!(
+                        "allocating {vq_capacity} outstanding read slots for virtio queue {i}"
+                    )
+                });
             }
         };
 
@@ -791,7 +772,11 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                return complete_req(req, DriverStatus::InsufficientResources);
+                return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
+                    alloc::format!(
+                        "allocating {vq_capacity} outstanding write slots for virtio queue {i}"
+                    )
+                });
             }
         };
 
@@ -822,7 +807,11 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                return complete_req(req, DriverStatus::InsufficientResources);
+                return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
+                    alloc::format!(
+                        "allocating {vq_capacity} submitted-completion slots for virtio queue {i}"
+                    )
+                });
             }
         };
 
@@ -833,9 +822,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             arena,
             irq_handle: UnsafeCell::new(irq_handle),
             msix_vector,
-            msix_table_index,
-            submitting_tasks: AtomicU32::new(0),
-            use_indirect: init_result.indirect_desc_supported,
             completion_slots,
             read_ops,
             write_ops,
@@ -877,22 +863,11 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unsafe { unmap_mmio_region(va, sz) };
         }
-        todo!("");
-        // return complete_req(
-        //     req,
-        //     virtio_device_error(alloc::format!(
-        //         "virtio-blk: device status bad after DRIVER_OK: status={status:#x}"
-        //     )),
-        // );
+        return Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("virtio-blk: device status bad after DRIVER_OK: status={status:#x}"),
+        ));
     }
-
-    let msix_pba = match msix_cap {
-        Some(cap) if use_msix => mapped_bars
-            .iter()
-            .find(|(idx, _, _)| *idx == cap.pba_bar as u32)
-            .map(|(_, va, _)| VirtAddr::new(va.as_u64() + cap.pba_offset as u64)),
-        _ => None,
-    };
 
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
     let bar_list: Vec<(u32, VirtAddr, u64)> = mapped_bars.iter().copied().collect();
@@ -902,17 +877,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             common_cfg: caps.common_cfg,
             notify_base: caps.notify_base,
             notify_off_multiplier: caps.notify_off_multiplier,
-            isr_cfg: caps.isr_cfg,
-            device_cfg: caps.device_cfg,
             queues: queue_states,
             queue_count: final_queue_count,
             queue_strategy: QueueSelectionStrategy::RoundRobin,
             rr_counter: AtomicUsize::new(0),
             capacity: init_result.capacity,
             mapped_bars: Mutex::new(bar_list),
-            msix_pba,
-            indirect_desc_enabled: init_result.indirect_desc_supported,
-            flush_supported: init_result.flush_supported,
         })
     });
 
@@ -931,7 +901,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         }
     }
 
-    complete_req(req, DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -939,7 +909,7 @@ async fn virtio_pnp_remove<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut RemoveDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if let Ok(dx) = dev.try_devext::<DevExt>() {
         if let Some(inner) = dx.inner.get().cloned() {
             unsafe { blk::reset_device(inner.common_cfg) };
@@ -972,7 +942,7 @@ async fn virtio_pnp_remove<'req, 'data, 'b>(
         }
     }
 
-    complete_req(req, DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -980,11 +950,11 @@ async fn virtio_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let relation = req.relation;
     if relation == DeviceRelationType::BusRelations {
         create_child_pdo(&dev);
-        return complete_req(req, DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
     continue_req(req)
 }
@@ -1045,41 +1015,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
 
 /// Tracks concurrent submitters on a queue so only the last one kicks.
 /// Notify happens automatically in Drop — no manual finish call required.
-pub(crate) struct SubmitTasksGuard<'a> {
-    counter: &'a AtomicU32,
-    vq: &'a Virtqueue,
-    notify_base: VirtAddr,
-    notify_off_multiplier: u32,
-    force_notify: bool,
-}
-impl<'a> SubmitTasksGuard<'a> {
-    #[inline]
-    fn new(
-        counter: &'a AtomicU32,
-        vq: &'a Virtqueue,
-        notify_base: VirtAddr,
-        notify_off_multiplier: u32,
-        force_notify: bool,
-    ) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self {
-            counter,
-            vq,
-            notify_base,
-            notify_off_multiplier,
-            force_notify,
-        }
-    }
-}
-impl<'a> Drop for SubmitTasksGuard<'a> {
-    fn drop(&mut self) {
-        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
-        if likely(self.force_notify || prev == 1) {
-            unsafe { self.vq.notify(self.notify_base, self.notify_off_multiplier) };
-        }
-    }
-}
-
 pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
     if likely(!qs.has_pending_used()) {
         return 0;
@@ -1136,21 +1071,23 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
     }
 }
 
-pub(crate) const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
-
 #[request_handler]
 pub async fn virtio_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if let Some(dn) = _dev.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
-            register_protocol::<DiskInfoProtocol>(_dev, &VIRTIO_DISK_INFO_VTABLE);
-            publish_stack_protocol::<DiskInfoProtocol>(&dn);
+            register_protocol::<DiskInfoProtocol>(_dev, &VIRTIO_DISK_INFO_VTABLE)
+                .map_err(error)
+                .with_context(|| "registering the virtio disk-info protocol")?;
+            publish_stack_protocol::<DiskInfoProtocol>(&dn)
+                .map_err(error)
+                .with_context(|| "publishing the virtio disk-info protocol")?;
         }
     }
-    complete_req(req, DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -1158,31 +1095,28 @@ pub async fn virtio_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryId,
-) -> DriverStep {
-    let status = {
-        match req.id_type {
-            QueryIdType::HardwareIds | QueryIdType::CompatibleIds => {
-                req.ids.push("VirtIO\\Disk".into());
-                req.ids.push("GenDisk".into());
-            }
-            QueryIdType::DeviceId => {
-                req.ids.push("VirtIO\\Disk".into());
-            }
-            QueryIdType::InstanceId => {
-                req.ids.push(
-                    pdo.dev_node
-                        .get()
-                        .unwrap()
-                        .upgrade()
-                        .unwrap()
-                        .instance_path
-                        .clone(),
-                );
-            }
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    match req.id_type {
+        QueryIdType::HardwareIds | QueryIdType::CompatibleIds => {
+            req.ids.push("VirtIO\\Disk".into());
+            req.ids.push("GenDisk".into());
         }
-        DriverStatus::Success
-    };
-    complete_req(req, status)
+        QueryIdType::DeviceId => {
+            req.ids.push("VirtIO\\Disk".into());
+        }
+        QueryIdType::InstanceId => {
+            req.ids.push(
+                pdo.dev_node
+                    .get()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .instance_path
+                    .clone(),
+            );
+        }
+    }
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -1190,31 +1124,37 @@ pub async fn virtio_pdo_register_dma_backing<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut RegisterDmaBacking<'data>,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(cdx) => cdx,
-        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+        Err(_) => {
+            return Err(error(DriverErrorKind::NoSuchDevice))
+                .with_context(|| "registering DMA backing for a virtio PDO without child state");
+        }
     };
 
     let parent = match cdx.parent_device.upgrade() {
         Some(parent) => parent,
-        None => return complete_req(req, DriverStatus::NoSuchDevice),
+        None => {
+            return Err(error(DriverErrorKind::NoSuchDevice)).with_context(
+                || "registering DMA backing after the virtio controller was removed",
+            );
+        }
     };
 
     let backing = req.backing;
 
-    let status = match map_persistent_contiguous_backing(&parent, backing) {
-        Ok(()) => DriverStatus::Success,
-        Err(_) => DriverStatus::InsufficientResources,
-    };
-
-    complete_req(req, status)
+    map_persistent_contiguous_backing(&parent, backing)
+        .map_err(|_| error(DriverErrorKind::InsufficientResources))
+        .with_context(|| "mapping persistent contiguous DMA backing for virtio-blk")?;
+    Ok(DriverStep::Complete)
 }
 
-extern "C" fn virtio_disk_info(device: &Arc<DeviceObject>) -> Result<DiskInfo, DriverStatus> {
+extern "C" fn virtio_disk_info(device: &Arc<DeviceObject>) -> Result<DiskInfo, KernelError> {
     let ext = device
         .try_devext::<ChildExt>()
-        .map_err(|_| DriverStatus::NoSuchDevice)?;
+        .map_err(|_| error(DriverErrorKind::NoSuchDevice))
+        .with_context(|| "querying disk geometry from a virtio PDO without child state")?;
     Ok(ext.disk_info)
 }
 const VIRTIO_DISK_INFO_VTABLE: DiskInfoProtocolVTable = DiskInfoProtocolVTable {

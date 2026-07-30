@@ -1,17 +1,17 @@
-use crate::async_ffi::FfiFuture;
+use crate::async_ffi::AbiFuture;
 use crate::device::DeviceObject;
 use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
 use crate::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate,
-    FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite,
-    FsZeroRange, Read, Write,
+    FsDelete, FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek,
+    FsSetLen, FsWrite, FsZeroRange, Read, Write,
 };
-use crate::status::DriverStatus;
 use crate::{
-    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
-    EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
-    EvtIoDeviceControl, EvtIoFlush, EvtIoFlushDirty, EvtIoFlushOwner, EvtIoRead, EvtIoWrite,
+    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsDelete, EvtFsFlush, EvtFsGetInfo, EvtFsOpen,
+    EvtFsRead, EvtFsReadDir, EvtFsRemoveDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite,
+    EvtFsZeroRange, EvtIoDeviceControl, EvtIoFlush, EvtIoFlushDirty, EvtIoFlushOwner, EvtIoRead,
+    EvtIoWrite,
 };
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -19,7 +19,6 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr;
-use core::ptr::NonNull;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU64;
@@ -258,11 +257,16 @@ unsafe impl<T: Send> Sync for BoundedTreiberStack<T> {}
 
 impl<T> BoundedTreiberStack<T> {
     pub fn new(capacity: usize) -> Self {
+        Self::try_new(capacity).expect("failed to allocate BoundedTreiberStack")
+    }
+
+    pub fn try_new(capacity: usize) -> Result<Self, alloc::collections::TryReserveError> {
         if capacity >= NULL_INDEX as usize {
             panic!("BoundedTreiberStack capacity too large");
         }
 
-        let mut nodes = Vec::with_capacity(capacity);
+        let mut nodes = Vec::new();
+        nodes.try_reserve_exact(capacity)?;
 
         let mut i = 0usize;
         while i < capacity {
@@ -282,12 +286,12 @@ impl<T> BoundedTreiberStack<T> {
 
         let free = if capacity == 0 { NULL_INDEX } else { 0 };
 
-        Self {
+        Ok(Self {
             head: AtomicU64::new(Self::pack(NULL_INDEX, 0)),
             free: AtomicU64::new(Self::pack(free, 0)),
             nodes,
             len: AtomicUsize::new(0),
-        }
+        })
     }
 
     #[inline]
@@ -610,7 +614,7 @@ pub trait DeviceRead {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Read<'io>,
-    ) -> FfiFuture<DriverStep>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceWrite {
@@ -619,7 +623,7 @@ pub trait DeviceWrite {
     extern "C" fn handler<'a, 'io>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Write<'io>,
-    ) -> FfiFuture<DriverStep>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceFlush {
@@ -628,7 +632,7 @@ pub trait DeviceFlush {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut Flush,
-    ) -> FfiFuture<DriverStep>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceFlushDirty {
@@ -637,7 +641,7 @@ pub trait DeviceFlushDirty {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut FlushDirty,
-    ) -> FfiFuture<DriverStep>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceFlushOwner {
@@ -646,7 +650,7 @@ pub trait DeviceFlushOwner {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut FlushOwner,
-    ) -> FfiFuture<DriverStep>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 pub trait DeviceControlHandler {
@@ -655,7 +659,7 @@ pub trait DeviceControlHandler {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         req: &'a mut DeviceControl<'data>,
-    ) -> FfiFuture<DriverStep>;
+    ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
 }
 
 #[repr(C)]
@@ -711,7 +715,7 @@ macro_rules! define_fs_io_operations {
                 extern "C" fn $method<'a, 'data>(
                     dev: &'a Arc<DeviceObject>,
                     req: &'a mut FsRequest<'data, $op>,
-                ) -> FfiFuture<DriverStep>;
+                ) -> AbiFuture<Result<DriverStep, crate::error::KernelError>>;
             )+
         }
 
@@ -805,10 +809,6 @@ macro_rules! define_device_ops {
             fn register_op(&mut self);
         }
 
-        pub trait DeviceOpHandlerRegistration<Op, H> {
-            fn set_op_handler(&mut self, handler: H, depth: u32);
-        }
-
         impl DeviceOps {
             pub const fn empty() -> Self {
                 Self {
@@ -825,21 +825,6 @@ macro_rules! define_device_ops {
                 <Self as DeviceOpRegistration<Op, T>>::register_op(self);
             }
 
-            #[inline]
-            pub fn set_handler<Op, H>(&mut self, handler: H)
-            where
-                Self: DeviceOpHandlerRegistration<Op, H>,
-            {
-                <Self as DeviceOpHandlerRegistration<Op, H>>::set_op_handler(self, handler, 0);
-            }
-
-            #[inline]
-            pub fn set_handler_with_depth<Op, H>(&mut self, handler: H, depth: u32)
-            where
-                Self: DeviceOpHandlerRegistration<Op, H>,
-            {
-                <Self as DeviceOpHandlerRegistration<Op, H>>::set_op_handler(self, handler, depth);
-            }
         }
 
         impl Default for DeviceOps {
@@ -856,13 +841,6 @@ macro_rules! define_device_ops {
                 #[inline]
                 fn register_op(&mut self) {
                     self.$field.set_with_depth(T::handler, T::DEPTH);
-                }
-            }
-
-            impl DeviceOpHandlerRegistration<$op, $handler> for DeviceOps {
-                #[inline]
-                fn set_op_handler(&mut self, handler: $handler, depth: u32) {
-                    self.$field.set_with_depth(handler, depth);
                 }
             }
         )+

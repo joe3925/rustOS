@@ -1,10 +1,15 @@
+use crate::future_arena::{FutureArena, FutureArenaConfig};
 use crate::global_async::{CacheAligned, WorkItem};
-use crate::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::{Arc, RwLock};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
+use kernel_types::capacity::{
+    Growable, OccupancyHint, PolicyOutcome, ResizeContext, ResizeError, ResizeEvent, ResizePolicy,
+    ResizePolicyKind,
+};
 use kernel_types::io::BoundedTreiberStack;
 
 const BUILTIN_GENERATION: u32 = 1;
@@ -23,6 +28,7 @@ const DOMAIN_CHUNK_SIZE: usize = 1 << DOMAIN_CHUNK_BITS;
 const DOMAIN_CHUNK_MASK: usize = DOMAIN_CHUNK_SIZE - 1;
 const MAX_DOMAIN_CHUNKS: usize = 64;
 const MAX_DOMAIN_SLOTS: usize = DOMAIN_CHUNK_SIZE * MAX_DOMAIN_CHUNKS;
+const IRQ_FALLBACK_ITEMS_PER_SHARD: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
@@ -35,6 +41,10 @@ impl ExecutorDomainId {
 
     pub const fn raw(self) -> u64 {
         self.0
+    }
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 
     pub const fn slot(self) -> u32 {
@@ -121,41 +131,55 @@ impl ExecutorDomainState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ExecutorAdmissionPolicy {
-    RejectWhenFull = 0,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorDomainConfig {
     pub class: ExecutorDomainClass,
     pub max_active: usize,
-    pub max_queued: usize,
+    pub initial_queue_capacity: usize,
+    /// Preallocated interrupt-only queue capacity. `None` disables the fallback.
+    pub interrupt_fallback_capacity: Option<usize>,
     pub quantum: usize,
     pub weight: usize,
-    pub admission_policy: ExecutorAdmissionPolicy,
+    pub resize_policy: ResizePolicyKind,
+    pub future_arena: FutureArenaConfig,
 }
 
 impl ExecutorDomainConfig {
-    pub fn for_class(class: ExecutorDomainClass, cpu_count: usize, max_queued: usize) -> Self {
+    pub fn for_class(
+        class: ExecutorDomainClass,
+        cpu_count: usize,
+        initial_queue_capacity: usize,
+    ) -> Self {
         Self {
             class,
             max_active: class.default_max_active(cpu_count),
-            max_queued,
+            initial_queue_capacity,
+            interrupt_fallback_capacity: Some(
+                cpu_count
+                    .max(1)
+                    .saturating_mul(IRQ_FALLBACK_ITEMS_PER_SHARD),
+            ),
             quantum: class.default_quantum(),
             weight: class.default_weight(),
-            admission_policy: ExecutorAdmissionPolicy::RejectWhenFull,
+            resize_policy: ResizePolicyKind::default(),
+            future_arena: FutureArenaConfig::default(),
         }
     }
 
-    pub fn kernel_normal(cpu_count: usize, max_queued: usize) -> Self {
-        Self::for_class(ExecutorDomainClass::KernelNormal, cpu_count, max_queued)
+    pub fn kernel_normal(cpu_count: usize, initial_queue_capacity: usize) -> Self {
+        Self::for_class(
+            ExecutorDomainClass::KernelNormal,
+            cpu_count,
+            initial_queue_capacity,
+        )
     }
 
     fn normalized(mut self) -> Self {
         self.max_active = self.max_active.max(1);
-        self.max_queued = self.max_queued.max(1);
+        self.initial_queue_capacity = self.initial_queue_capacity.max(1);
+        if self.resize_policy.validate().is_err() {
+            self.resize_policy = ResizePolicyKind::Fixed;
+        }
         self.quantum = self.quantum.max(1);
         self.weight = self.weight.max(1);
         self
@@ -176,6 +200,9 @@ pub enum ExecutorSubmitErrorKind {
     DomainDraining,
     DomainDead,
     DomainFull,
+    RetryLater,
+    OutOfMemory,
+    DomainCannotContinue,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -224,9 +251,16 @@ pub struct ExecutorDomainStats {
     pub state: ExecutorDomainState,
     pub queued_count: usize,
     pub active_count: usize,
+    pub live_task_count: usize,
+    pub live_future_count: usize,
+    pub live_future_bytes: usize,
     pub max_active: usize,
-    pub max_queued: usize,
-    pub admission_policy: ExecutorAdmissionPolicy,
+    pub initial_queue_capacity: usize,
+    pub interrupt_fallback_capacity: Option<usize>,
+    pub queue_minimum_capacity: usize,
+    pub queue_capacity: usize,
+    pub queue_maximum_capacity: Option<usize>,
+    pub resize_policy: ResizePolicyKind,
     pub quantum: usize,
     pub weight: usize,
     pub deficit: usize,
@@ -251,79 +285,142 @@ pub struct GlobalExecutorStats {
 }
 
 struct ShardedQueues {
-    queues: Vec<BoundedTreiberStack<WorkItem>>,
-    enqueue_hint: CacheAligned,
+    queues: RwLock<Vec<BoundedTreiberStack<WorkItem>>>,
+    interrupt_fallback: Option<BoundedTreiberStack<WorkItem>>,
+    prefer_interrupt_fallback: AtomicBool,
+    minimum_capacity: usize,
+    maximum_capacity: Option<usize>,
+    published_capacity: CacheAligned,
     pump_hint: CacheAligned,
     work_count: CacheAligned,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplaceResizePolicyResult {
+    Changed,
+    Rejected,
+    RetryLater,
+}
+
 impl ShardedQueues {
-    fn new(shards: usize, max_work_items: usize) -> Self {
-        let max_work_items = max_work_items.max(1);
-        let shards = shards.max(1).min(max_work_items);
-        let base = max_work_items / shards;
-        let rem = max_work_items % shards;
-
-        let mut queues = Vec::with_capacity(shards);
-
-        let mut i = 0usize;
-        while i < shards {
-            let cap = base + usize::from(i < rem);
-            queues.push(BoundedTreiberStack::new(cap));
-            i += 1;
+    fn new(
+        initial_capacity: usize,
+        shards: usize,
+        interrupt_fallback_capacity: Option<usize>,
+    ) -> Self {
+        let initial_capacity = initial_capacity.max(1);
+        let shard_count = shards.clamp(1, initial_capacity);
+        let base = initial_capacity / shard_count;
+        let remainder = initial_capacity % shard_count;
+        let mut queues = Vec::with_capacity(shard_count);
+        for index in 0..shard_count {
+            queues.push(BoundedTreiberStack::new(
+                base + usize::from(index < remainder),
+            ));
         }
-
         Self {
-            queues,
-            enqueue_hint: CacheAligned(AtomicUsize::new(0)),
+            queues: RwLock::new(queues),
+            interrupt_fallback: interrupt_fallback_capacity
+                .filter(|capacity| *capacity != 0)
+                .map(BoundedTreiberStack::new),
+            prefer_interrupt_fallback: AtomicBool::new(true),
+            minimum_capacity: 1,
+            maximum_capacity: None,
+            published_capacity: CacheAligned(AtomicUsize::new(initial_capacity)),
             pump_hint: CacheAligned(AtomicUsize::new(0)),
             work_count: CacheAligned(AtomicUsize::new(0)),
         }
     }
 
     fn shard_count(&self) -> usize {
-        self.queues.len()
+        self.queues.read().len()
     }
 
-    fn try_push(&self, mut item: WorkItem) -> Result<(), WorkItem> {
-        let shards = self.shard_count();
-        let start = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed) % shards;
-
-        let mut offset = 0usize;
-        while offset < shards {
-            let idx = (start + offset) % shards;
-
-            match self.queues[idx].try_push(item) {
+    fn try_push<F>(
+        &self,
+        item: WorkItem,
+        in_interrupt: bool,
+        may_insert: F,
+    ) -> Result<(), QueuePushError>
+    where
+        F: FnOnce() -> bool,
+    {
+        if !may_insert() {
+            return Err(QueuePushError::Unavailable);
+        }
+        let queues = if in_interrupt {
+            let Some(queues) = self.queues.try_read() else {
+                return self
+                    .interrupt_fallback
+                    .as_ref()
+                    .ok_or(QueuePushError::Contended)?
+                    .try_push(item)
+                    .map(|()| {
+                        self.work_count.0.fetch_add(1, Ordering::Release);
+                    })
+                    .map_err(|_| QueuePushError::Contended);
+            };
+            queues
+        } else {
+            self.queues.read()
+        };
+        let shard_count = queues.len();
+        let start = self.pump_hint.0.fetch_add(1, Ordering::Relaxed) % shard_count;
+        let mut item = item;
+        for offset in 0..shard_count {
+            match queues[(start + offset) % shard_count].try_push(item) {
                 Ok(()) => {
                     self.work_count.0.fetch_add(1, Ordering::Release);
                     return Ok(());
                 }
-                Err(returned) => {
-                    item = returned;
-                }
+                Err(returned) => item = returned,
             }
-
-            offset += 1;
         }
-
-        Err(item)
+        Err(QueuePushError::Full)
     }
 
-    fn pop_round_robin(&self, start_idx: usize) -> Option<(WorkItem, usize)> {
-        let shards = self.shard_count();
-
-        let mut offset = 0usize;
-        while offset < shards {
-            let idx = (start_idx + offset) % shards;
-
-            if let Some(item) = self.queues[idx].pop() {
-                self.work_count.0.fetch_sub(1, Ordering::AcqRel);
-                return Some((item, idx));
+    fn pop_round_robin(&self, start_idx: usize, in_interrupt: bool) -> Option<(WorkItem, usize)> {
+        let prefer_interrupt = self
+            .prefer_interrupt_fallback
+            .fetch_xor(true, Ordering::Relaxed);
+        if prefer_interrupt {
+            if let Some(item) = self.pop_interrupt_fallback() {
+                return Some((item, start_idx));
             }
-
-            offset += 1;
         }
+        if let Some(item) = self.pop_primary_round_robin(start_idx, in_interrupt) {
+            return Some(item);
+        }
+        if !prefer_interrupt {
+            return self.pop_interrupt_fallback().map(|item| (item, start_idx));
+        }
+        None
+    }
 
+    fn pop_interrupt_fallback(&self) -> Option<WorkItem> {
+        let item = self.interrupt_fallback.as_ref()?.pop()?;
+        self.work_count.0.fetch_sub(1, Ordering::AcqRel);
+        Some(item)
+    }
+
+    fn pop_primary_round_robin(
+        &self,
+        start_idx: usize,
+        in_interrupt: bool,
+    ) -> Option<(WorkItem, usize)> {
+        let queues = if in_interrupt {
+            self.queues.try_read()?
+        } else {
+            self.queues.read()
+        };
+        let shard_count = queues.len();
+        for offset in 0..shard_count {
+            let index = (start_idx + offset) % shard_count;
+            if let Some(item) = queues[index].pop() {
+                self.work_count.0.fetch_sub(1, Ordering::AcqRel);
+                return Some((item, index));
+            }
+        }
         None
     }
 
@@ -337,15 +434,100 @@ impl ShardedQueues {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueuePushError {
+    Full,
+    Contended,
+    Unavailable,
+}
+
+impl Growable for ShardedQueues {
+    fn occupancy_hint(&self) -> OccupancyHint {
+        OccupancyHint::new(
+            self.work_count.0.load(Ordering::Acquire),
+            self.published_capacity.0.load(Ordering::Acquire),
+        )
+    }
+
+    fn minimum_capacity(&self) -> usize {
+        self.minimum_capacity
+    }
+
+    fn maximum_capacity(&self) -> Option<usize> {
+        self.maximum_capacity
+    }
+
+    fn allocation_granularity(&self) -> usize {
+        1
+    }
+
+    fn try_grow(&self, minimum_capacity: usize) -> Result<usize, ResizeError> {
+        let mut queues = self.queues.try_write().ok_or(ResizeError::Contended)?;
+        let current: usize = queues.iter().map(BoundedTreiberStack::capacity).sum();
+        if minimum_capacity <= current {
+            return Ok(current);
+        }
+        if self
+            .maximum_capacity
+            .is_some_and(|max| minimum_capacity > max)
+        {
+            return Err(ResizeError::MaximumCapacityReached);
+        }
+        queues
+            .try_reserve_exact(1)
+            .map_err(|_| ResizeError::OutOfMemory)?;
+        let additional = minimum_capacity - current;
+        let queue =
+            BoundedTreiberStack::try_new(additional).map_err(|_| ResizeError::OutOfMemory)?;
+        queues.push(queue);
+        self.published_capacity
+            .0
+            .store(minimum_capacity, Ordering::Release);
+        Ok(minimum_capacity)
+    }
+
+    fn try_shrink(&self, requested_capacity: usize) -> Result<usize, ResizeError> {
+        let published = self.published_capacity.0.load(Ordering::Acquire);
+        let requested_capacity = requested_capacity.max(self.minimum_capacity);
+        if requested_capacity >= published {
+            return Ok(0);
+        }
+        let mut queues = self.queues.try_write().ok_or(ResizeError::Contended)?;
+        let old: usize = queues.iter().map(BoundedTreiberStack::capacity).sum();
+        let used: usize = queues.iter().map(BoundedTreiberStack::len).sum();
+        let target = requested_capacity.max(self.minimum_capacity).max(used);
+        if target >= old {
+            return Ok(0);
+        }
+        let mut capacity = old;
+        let mut index = queues.len();
+        while index != 0 && capacity > target {
+            index -= 1;
+            let chunk_capacity = queues[index].capacity();
+            if queues[index].is_empty()
+                && capacity.saturating_sub(chunk_capacity) >= target
+                && capacity.saturating_sub(chunk_capacity) >= self.minimum_capacity
+            {
+                queues.remove(index);
+                capacity -= chunk_capacity;
+            }
+        }
+        self.published_capacity.0.store(capacity, Ordering::Release);
+        Ok(old - capacity)
+    }
+}
+
 pub struct ExecutorDomain {
     id: ExecutorDomainId,
     generation: u32,
     class: ExecutorDomainClass,
-    admission_policy: ExecutorAdmissionPolicy,
+    resize_policy: RwLock<ResizePolicyKind>,
     queues: ShardedQueues,
+    future_arena: FutureArena,
+    live_task_count: CacheAligned,
 
     state: AtomicU8,
-    max_queued: usize,
+    initial_queue_capacity: usize,
 
     scheduled_count: CacheAligned,
 
@@ -373,11 +555,17 @@ impl ExecutorDomain {
             id,
             generation: id.generation(),
             class: config.class,
-            admission_policy: config.admission_policy,
-            queues: ShardedQueues::new(shards, config.max_queued),
+            resize_policy: RwLock::new(config.resize_policy),
+            queues: ShardedQueues::new(
+                config.initial_queue_capacity,
+                shards,
+                config.interrupt_fallback_capacity,
+            ),
+            future_arena: FutureArena::new(id, config.future_arena),
+            live_task_count: CacheAligned(AtomicUsize::new(0)),
 
             state: AtomicU8::new(ExecutorDomainState::Active as u8),
-            max_queued: config.max_queued,
+            initial_queue_capacity: config.initial_queue_capacity,
 
             scheduled_count: CacheAligned(AtomicUsize::new(0)),
 
@@ -436,12 +624,35 @@ impl ExecutorDomain {
         self.max_active.0.load(Ordering::Acquire).max(1)
     }
 
+    pub fn set_max_active(&self, max_active: usize) {
+        self.max_active
+            .0
+            .store(max_active.max(1), Ordering::Release);
+    }
+
     pub fn queued_count(&self) -> usize {
         self.queued_count.0.load(Ordering::Acquire)
     }
 
     pub fn active_count(&self) -> usize {
         self.active_count.0.load(Ordering::Acquire)
+    }
+
+    pub fn future_arena(&self) -> &FutureArena {
+        &self.future_arena
+    }
+
+    pub fn live_task_count(&self) -> usize {
+        self.live_task_count.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn retain_task(&self) {
+        self.live_task_count.0.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn release_task(&self) {
+        self.live_task_count.0.fetch_sub(1, Ordering::AcqRel);
+        self.maybe_finish_draining();
     }
 
     pub fn has_queued_work(&self) -> bool {
@@ -513,58 +724,143 @@ impl ExecutorDomain {
             }
         }
 
-        let previous_queued =
-            match self
-                .queued_count
-                .0
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                    (queued < self.max_queued).then_some(queued + 1)
-                }) {
-                Ok(previous) => previous,
-                Err(_) => {
-                    return Err(self.reject_submit(
-                        ExecutorSubmitErrorKind::DomainFull,
-                        domain_id,
-                        work_item,
-                    ));
-                }
+        let in_interrupt = crate::platform::in_interrupt_context();
+        let policy = if in_interrupt {
+            let Some(policy) = self.resize_policy.try_read() else {
+                return Err(self.reject_submit(
+                    ExecutorSubmitErrorKind::RetryLater,
+                    domain_id,
+                    work_item,
+                ));
             };
-
-        if self.state() != ExecutorDomainState::Active {
-            self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
-
-            return Err(self.reject_submit(
-                match self.state() {
-                    ExecutorDomainState::Active => ExecutorSubmitErrorKind::DomainFull,
-                    ExecutorDomainState::Draining => ExecutorSubmitErrorKind::DomainDraining,
-                    ExecutorDomainState::Dead => ExecutorSubmitErrorKind::DomainDead,
-                },
-                domain_id,
-                work_item,
-            ));
+            policy
+        } else {
+            self.resize_policy.read()
+        };
+        let previous_queued = self.queued_count();
+        match self.queues.try_push(work_item, in_interrupt, || {
+            self.state() == ExecutorDomainState::Active
+        }) {
+            Ok(()) => {}
+            Err(QueuePushError::Unavailable) => {
+                return Err(self.reject_submit(
+                    match self.state() {
+                        ExecutorDomainState::Active => ExecutorSubmitErrorKind::RetryLater,
+                        ExecutorDomainState::Draining => ExecutorSubmitErrorKind::DomainDraining,
+                        ExecutorDomainState::Dead => ExecutorSubmitErrorKind::DomainDead,
+                    },
+                    domain_id,
+                    work_item,
+                ));
+            }
+            Err(QueuePushError::Contended) => {
+                return Err(self.reject_submit(
+                    ExecutorSubmitErrorKind::RetryLater,
+                    domain_id,
+                    work_item,
+                ));
+            }
+            Err(QueuePushError::Full) => {
+                let context = ResizeContext {
+                    occupancy: self.queues.occupancy_hint(),
+                    in_interrupt_context: in_interrupt,
+                    event: ResizeEvent::CapacityReached,
+                };
+                let outcome = policy.on_capacity_reached(&self.queues, context);
+                let failure = match outcome {
+                    PolicyOutcome::Resized => {
+                        match self.queues.try_push(work_item, in_interrupt, || {
+                            self.state() == ExecutorDomainState::Active
+                        }) {
+                            Ok(()) => None,
+                            Err(QueuePushError::Contended) => {
+                                Some(ExecutorSubmitErrorKind::RetryLater)
+                            }
+                            Err(QueuePushError::Full) => Some(ExecutorSubmitErrorKind::DomainFull),
+                            Err(QueuePushError::Unavailable) => {
+                                Some(ExecutorSubmitErrorKind::DomainDraining)
+                            }
+                        }
+                    }
+                    PolicyOutcome::RetryLater => Some(ExecutorSubmitErrorKind::RetryLater),
+                    PolicyOutcome::OutOfMemory => Some(ExecutorSubmitErrorKind::OutOfMemory),
+                    PolicyOutcome::OwnerCannotContinue => {
+                        self.move_to_draining();
+                        Some(ExecutorSubmitErrorKind::DomainCannotContinue)
+                    }
+                    PolicyOutcome::NoChange | PolicyOutcome::Reject => {
+                        Some(ExecutorSubmitErrorKind::DomainFull)
+                    }
+                };
+                if let Some(kind) = failure {
+                    return Err(self.reject_submit(kind, domain_id, work_item));
+                }
+            }
         }
 
-        if let Err(work_item) = self.queues.try_push(work_item) {
-            self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
-            return Err(self.reject_submit(
-                ExecutorSubmitErrorKind::DomainFull,
-                domain_id,
-                work_item,
-            ));
-        }
-
+        self.queued_count.0.fetch_add(1, Ordering::AcqRel);
+        let _ = policy.on_insert(
+            &self.queues,
+            ResizeContext {
+                occupancy: self.queues.occupancy_hint(),
+                in_interrupt_context: in_interrupt,
+                event: ResizeEvent::Inserted,
+            },
+        );
         self.submitted.0.fetch_add(1, Ordering::Relaxed);
         Ok(previous_queued == 0)
     }
 
     pub(crate) fn pop_work(&self, cursor: usize) -> Option<(WorkItem, usize)> {
-        let item = self.queues.pop_round_robin(cursor)?;
+        let in_interrupt = crate::platform::in_interrupt_context();
+        let policy = if in_interrupt {
+            self.resize_policy.try_read()?
+        } else {
+            self.resize_policy.read()
+        };
+        let item = self.queues.pop_round_robin(cursor, in_interrupt)?;
         self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
+        let _ = policy.on_remove(
+            &self.queues,
+            ResizeContext {
+                occupancy: self.queues.occupancy_hint(),
+                in_interrupt_context: in_interrupt,
+                event: ResizeEvent::Removed,
+            },
+        );
         Some(item)
     }
 
     pub(crate) fn next_pump_hint(&self) -> usize {
         self.queues.next_pump_hint()
+    }
+
+    pub fn resize_policy(&self) -> ResizePolicyKind {
+        *self.resize_policy.read()
+    }
+
+    pub fn replace_resize_policy(
+        &self,
+        replacement: ResizePolicyKind,
+    ) -> ReplaceResizePolicyResult {
+        let Some(mut current) = self.resize_policy.try_write() else {
+            return ReplaceResizePolicyResult::RetryLater;
+        };
+        let context = ResizeContext {
+            occupancy: self.queues.occupancy_hint(),
+            in_interrupt_context: crate::platform::in_interrupt_context(),
+            event: ResizeEvent::PolicyReplacement,
+        };
+        match current.on_policy_change(&self.queues, context, &replacement) {
+            PolicyOutcome::NoChange | PolicyOutcome::Resized => {
+                *current = replacement;
+                ReplaceResizePolicyResult::Changed
+            }
+            PolicyOutcome::RetryLater => ReplaceResizePolicyResult::RetryLater,
+            PolicyOutcome::Reject
+            | PolicyOutcome::OutOfMemory
+            | PolicyOutcome::OwnerCannotContinue => ReplaceResizePolicyResult::Rejected,
+        }
     }
 
     pub(crate) fn shard_count(&self) -> usize {
@@ -650,12 +946,16 @@ impl ExecutorDomain {
         if self.state() == ExecutorDomainState::Draining
             && self.queued_count() == 0
             && self.active_count() == 0
+            && self.live_task_count() == 0
+            && self.future_arena.live_futures() == 0
         {
             self.move_to_dead();
         }
     }
 
     pub fn stats(&self) -> ExecutorDomainStats {
+        let occupancy = self.queues.occupancy_hint();
+        let resize_policy = *self.resize_policy.read();
         ExecutorDomainStats {
             domain_id: self.id,
             generation: self.generation,
@@ -663,9 +963,20 @@ impl ExecutorDomain {
             state: self.state(),
             queued_count: self.queued_count(),
             active_count: self.active_count(),
+            live_task_count: self.live_task_count(),
+            live_future_count: self.future_arena.live_futures(),
+            live_future_bytes: self.future_arena.live_bytes(),
             max_active: self.max_active(),
-            max_queued: self.max_queued,
-            admission_policy: self.admission_policy,
+            initial_queue_capacity: self.initial_queue_capacity,
+            interrupt_fallback_capacity: self
+                .queues
+                .interrupt_fallback
+                .as_ref()
+                .map(BoundedTreiberStack::capacity),
+            queue_minimum_capacity: resize_policy.minimum_capacity(),
+            queue_capacity: occupancy.capacity,
+            queue_maximum_capacity: resize_policy.maximum_capacity(),
+            resize_policy,
             quantum: self.quantum(),
             weight: self.weight(),
             deficit: self.deficit.0.load(Ordering::Acquire),
@@ -970,7 +1281,11 @@ impl ExecutorDomainTable {
             return Err(DestroyExecutorDomainError::InvalidDomain);
         };
 
-        if domain.queued_count() == 0 && domain.active_count() == 0 {
+        if domain.queued_count() == 0
+            && domain.active_count() == 0
+            && domain.live_task_count() == 0
+            && domain.future_arena().live_futures() == 0
+        {
             domain.move_to_dead();
 
             if slot
@@ -1104,12 +1419,8 @@ impl ExecutorDomainTable {
         work_item: WorkItem,
     ) -> Result<DomainSubmitOutcome, ExecutorSubmitError> {
         let domain = self.resolve_submit_domain(domain_id, work_item)?;
-        let became_runnable = domain.try_submit_work(domain_id, work_item)?;
-
-        Ok(DomainSubmitOutcome {
-            domain_id,
-            became_runnable,
-        })
+        domain.try_submit_work(domain_id, work_item)?;
+        Ok(DomainSubmitOutcome { domain_id })
     }
 
     pub fn domain_count(&self) -> usize {
@@ -1136,5 +1447,100 @@ impl ExecutorDomainTable {
 #[derive(Debug)]
 pub(crate) struct DomainSubmitOutcome {
     pub(crate) domain_id: ExecutorDomainId,
-    pub(crate) became_runnable: bool,
+}
+
+#[cfg(all(test, not(any(loom, feature = "loom"))))]
+mod resize_queue_tests {
+    use super::{Ordering, QueuePushError, ShardedQueues};
+    use crate::global_async::WorkItem;
+
+    extern "C" fn noop(_: usize) {}
+
+    #[test]
+    fn interrupt_push_uses_fallback_only_while_chunk_list_is_write_locked() {
+        let queues = ShardedQueues::new(4, 2, Some(8));
+        let _write = queues.queues.write();
+        let item = WorkItem {
+            trampoline: noop,
+            ctx: 42,
+        };
+
+        assert_eq!(queues.try_push(item, true, || true), Ok(()));
+        let (popped, _) = queues
+            .pop_round_robin(0, true)
+            .expect("fallback item was not visible");
+        assert_eq!(popped.ctx, 42);
+
+        let rejected = queues.try_push(item, true, || false);
+        assert_eq!(rejected, Err(QueuePushError::Unavailable));
+    }
+
+    #[test]
+    fn disabled_interrupt_fallback_reports_contention() {
+        let queues = ShardedQueues::new(4, 2, None);
+        let _write = queues.queues.write();
+        let item = WorkItem {
+            trampoline: noop,
+            ctx: 42,
+        };
+
+        assert_eq!(
+            queues.try_push(item, true, || true),
+            Err(QueuePushError::Contended)
+        );
+    }
+
+    #[test]
+    fn pop_alternates_interrupt_fallback_and_primary_queue() {
+        let queues = ShardedQueues::new(4, 1, Some(4));
+
+        assert_eq!(
+            queues.try_push(
+                WorkItem {
+                    trampoline: noop,
+                    ctx: 1,
+                },
+                false,
+                || true,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            queues.try_push(
+                WorkItem {
+                    trampoline: noop,
+                    ctx: 2,
+                },
+                false,
+                || true,
+            ),
+            Ok(())
+        );
+
+        let fallback = queues.interrupt_fallback.as_ref().unwrap();
+        fallback
+            .try_push(WorkItem {
+                trampoline: noop,
+                ctx: 101,
+            })
+            .unwrap();
+        fallback
+            .try_push(WorkItem {
+                trampoline: noop,
+                ctx: 102,
+            })
+            .unwrap();
+        queues.work_count.0.fetch_add(2, Ordering::Release);
+
+        let popped = [
+            queues.pop_round_robin(0, false).unwrap().0.ctx,
+            queues.pop_round_robin(0, false).unwrap().0.ctx,
+            queues.pop_round_robin(0, false).unwrap().0.ctx,
+            queues.pop_round_robin(0, false).unwrap().0.ctx,
+        ];
+        assert!(popped[0] >= 100);
+        assert!(popped[1] < 100);
+        assert!(popped[2] >= 100);
+        assert!(popped[3] < 100);
+    }
 }

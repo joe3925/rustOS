@@ -23,105 +23,6 @@ pub struct BenchObjectId(pub u64);
 /// Static tag used to categorize spans.
 pub type BenchTag = &'static str;
 
-/// Result of a full benchmark sweep across multiple inflight levels.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, kernel_macros::RequestPayload)]
-pub struct BenchSweepResult {
-    /// Number of levels actually tested
-    pub used: u32,
-    /// Padding for alignment
-    pub _pad: u32,
-    /// Results for each level (up to BENCH_MAX_LEVELS)
-    pub levels: [BenchLevelResult; BENCH_MAX_LEVELS],
-}
-/// Maximum number of inflight levels supported by the benchmark sweep.
-/// Covers power-of-two levels: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
-pub const BENCH_MAX_LEVELS: usize = 11;
-
-/// Result for a single inflight level benchmark.
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug, kernel_macros::RequestPayload)]
-pub struct BenchLevelResult {
-    /// Inflight level tested
-    pub inflight: u32,
-    /// Number of requests completed
-    pub request_count: u32,
-    /// Total wall-clock cycles for the entire run at this inflight level
-    pub total_time_cycles: u64,
-    /// Total cycles across all requests
-    pub total_cycles: u64,
-    /// Average cycles per request
-    pub avg_cycles: u64,
-    /// Maximum cycles for any single request
-    pub max_cycles: u64,
-    /// Minimum cycles for any single request (0 if no samples)
-    pub min_cycles: u64,
-    /// Median (p50) latency in cycles
-    pub p50_cycles: u64,
-    /// 99th percentile latency in cycles
-    pub p99_cycles: u64,
-    /// 99.9th percentile latency in cycles
-    pub p999_cycles: u64,
-    /// CPU idle percentage during this level (0.0 - 100.0)
-    pub idle_pct: f64,
-}
-
-impl Default for BenchSweepResult {
-    fn default() -> Self {
-        Self {
-            used: 0,
-            _pad: 0,
-            levels: [BenchLevelResult::default(); BENCH_MAX_LEVELS],
-        }
-    }
-}
-#[repr(C)]
-#[derive(Clone, Copy, Debug, kernel_macros::RequestPayload)]
-pub struct BenchSweepParams {
-    pub version: u32,
-    pub flags: u32,
-    pub total_bytes: u64,
-    pub request_size: u32,
-    pub start_sector: u64,
-    pub max_inflight: u16, // 0 = auto
-    pub _reserved0: u16,
-    pub _reserved1: u32,
-}
-
-impl Default for BenchSweepParams {
-    fn default() -> Self {
-        Self {
-            version: BENCH_PARAMS_VERSION_1,
-            flags: BENCH_FLAG_IRQ | BENCH_FLAG_POLL | BENCH_FLAG_REQUEST,
-            total_bytes: 1024 * 1024 * 1024,
-            request_size: 64 * 1024,
-            start_sector: 0,
-            max_inflight: 0,
-            _reserved0: 0,
-            _reserved1: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, kernel_macros::RequestPayload)]
-pub struct BenchSweepBothResult {
-    pub params_used: BenchSweepParams,
-    pub irq: BenchSweepResult,
-    pub poll: BenchSweepResult,
-    pub request: BenchSweepResult,
-    pub queue_count: u16,
-    pub queue0_size: u16,
-    pub indirect_enabled: u8,
-    pub msix_enabled: u8,
-    pub _pad0: u16,
-}
-pub const BENCH_PARAMS_VERSION_1: u32 = 1;
-
-pub const BENCH_FLAG_IRQ: u32 = 1 << 0; // allow irq waits
-pub const BENCH_FLAG_POLL: u32 = 1 << 1; // pure polling (no waits)
-pub const BENCH_FLAG_REQUEST: u32 = 1 << 2; // route through request dispatch + PDO read
-
 pub const BENCH_SAMPLE_PROTO_SCHEMA_VERSION: u32 = 2;
 
 #[repr(u32)]
@@ -312,3 +213,80 @@ impl Default for BenchWindowConfig {
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BenchWindowHandle(pub u32);
+
+/// ABI version for dynamically registered benchmark suites.
+pub const BENCH_SUITE_ABI_VERSION: u32 = 2;
+
+/// Opaque handle for the suite invocation currently owned by the kernel runner.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BenchRunHandle(pub u32);
+
+/// Whether a metric should increase or decrease when performance improves.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchMetricDirection {
+    Informational = 0,
+    LowerIsBetter = 1,
+    HigherIsBetter = 2,
+}
+
+/// Unit attached to every raw measurement emitted by a suite.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchMetricUnit {
+    Nanoseconds = 0,
+    Cycles = 1,
+    Bytes = 2,
+    BytesPerSecond = 3,
+    OperationsPerSecond = 4,
+    Count = 5,
+    Ratio = 6,
+}
+
+/// Completion state returned by an asynchronous suite callback.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchSuiteStatus {
+    Passed = 0,
+    Failed = 1,
+    Skipped = 2,
+}
+
+pub type BenchSuiteCallback =
+    extern "C" fn(BenchRunHandle) -> crate::async_ffi::AbiFuture<BenchSuiteStatus>;
+
+/// Owned metadata copied into the kernel suite registry.
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct BenchSuiteDescriptor {
+    pub abi_version: u32,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub independent_boots: u16,
+    pub callback: BenchSuiteCallback,
+}
+
+impl BenchSuiteDescriptor {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        tags: Vec<String>,
+        callback: BenchSuiteCallback,
+    ) -> Self {
+        Self {
+            abi_version: BENCH_SUITE_ABI_VERSION,
+            name: name.into(),
+            description: description.into(),
+            tags,
+            independent_boots: 1,
+            callback,
+        }
+    }
+
+    pub fn with_independent_boots(mut self, boots: u16) -> Self {
+        self.independent_boots = boots.max(1);
+        self
+    }
+}

@@ -1,8 +1,12 @@
 use alloc::sync::Arc;
 
-use kernel_executor::platform::{self, ExecutorPlatform, Job};
+use kernel_executor::platform::{self, CurrentExecutorContext, ExecutorPlatform, Job};
 use spin::Once;
 
+use crate::platform::{
+    current_executor_context as platform_current_executor_context, current_is_in_interrupt,
+    swap_executor_context,
+};
 use crate::static_handlers::{print, task_yield};
 use crate::sync_platform::{BoundedThreadPool, ThreadPool};
 
@@ -78,6 +82,31 @@ impl ExecutorPlatform for KernelExecutorPlatform {
 
     fn print(&self, string: &str) {
         print(string);
+    }
+
+    fn swap_executor_context(
+        &self,
+        context: Option<CurrentExecutorContext>,
+    ) -> Option<CurrentExecutorContext> {
+        let new_task = context.map_or(0, |value| value.task_id as u64);
+        let new_domain = context.map_or(0, |value| value.domain_id);
+        let (old_task, old_domain) = swap_executor_context(new_task, new_domain);
+        (old_domain != 0).then_some(CurrentExecutorContext {
+            task_id: old_task as usize,
+            domain_id: old_domain,
+        })
+    }
+
+    fn current_executor_context(&self) -> Option<CurrentExecutorContext> {
+        let (task_id, domain_id) = platform_current_executor_context();
+        (domain_id != 0).then_some(CurrentExecutorContext {
+            task_id: task_id as usize,
+            domain_id,
+        })
+    }
+
+    fn in_interrupt_context(&self) -> bool {
+        current_is_in_interrupt()
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::alloc::string::ToString;
+use crate::error::{kernel_capture_error_backtrace, kernel_resolve_error_context_module};
 use crate::export;
 use crate::function;
 use crate::get_rva;
@@ -9,6 +10,7 @@ use crate::util::random_number;
 use crate::vec;
 use alloc::string::String;
 use alloc::vec::Vec;
+use kernel_executor::runtime::abi_future::{kernel_abi_future_allocate, kernel_abi_future_free};
 use kernel_executor::runtime::runtime::try_steal_blocking_one;
 
 export! {
@@ -47,6 +49,11 @@ export! {
 
     kernel_alloc,
     kernel_free,
+    kernel_abi_future_allocate,
+    kernel_abi_future_free,
+
+    kernel_capture_error_backtrace,
+    kernel_resolve_error_context_module,
 
     kernel_dma_base_page_size,
     kernel_dma_register_pci_pdo,
@@ -71,7 +78,7 @@ export! {
     irq_handle_is_closed,
     irq_handle_set_user_ctx,
     irq_handle_get_user_ctx,
-    irq_handle_wait_ffi,
+    irq_handle_wait_abi,
 
     file_open,
     fs_list_dir,
@@ -81,6 +88,7 @@ export! {
     pnp_create_pdo,
     pnp_bind_and_start,
     pnp_get_device_target,
+    pnp_set_preferred_function_driver,
     pnp_queue_dpc,
     pnp_create_child_devnode_and_pdo_with_init,
     pnp_create_symlink,
@@ -107,11 +115,11 @@ export! {
     reg_list_keys,
     reg_list_values,
 
-    kernel_spawn_ffi,
-    kernel_spawn_joinable_ffi,
+    kernel_spawn_abi,
+    kernel_spawn_joinable_abi,
     kernel_async_submit,
-    kernel_spawn_detached_ffi,
-    kernel_block_on_ffi,
+    kernel_spawn_detached_abi,
+    kernel_block_on_abi,
     kernel_block_on_thread_state,
     kernel_spawn_blocking_raw,
 
@@ -123,6 +131,11 @@ export! {
     bench_kernel_window_start,
     bench_kernel_window_destroy,
     bench_kernel_window_create,
+    bench_kernel_suite_register,
+    bench_kernel_case_start,
+    bench_kernel_case_end,
+    bench_kernel_case_fail,
+    bench_kernel_measure,
 
     kernel_platform_cpu_ids,
     kernel_irq_compose_msi_message,

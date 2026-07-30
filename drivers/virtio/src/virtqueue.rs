@@ -3,7 +3,6 @@ use core::hint::{cold_path, likely, unlikely};
 use core::sync::atomic::{AtomicU16, Ordering};
 use kernel_api::device::DeviceObject;
 use kernel_api::memory::{PhysAddr, VirtAddr};
-use kernel_api::println;
 
 use crate::dma_region::ContiguousDmaRegion;
 use crate::pci;
@@ -228,38 +227,6 @@ impl Virtqueue {
                 }
             }
             prev = idx;
-        }
-
-        let avail_base = self.avail_va().as_u64() as *mut u16;
-        let avail_idx_ptr = unsafe { avail_base.add(1) } as *const core::sync::atomic::AtomicU16;
-        let avail_idx = unsafe { (*avail_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
-        let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
-        unsafe {
-            core::ptr::write_volatile(ring_entry, head);
-            let avail_idx_ptr_mut = avail_base.add(1) as *mut core::sync::atomic::AtomicU16;
-            (*avail_idx_ptr_mut).store(
-                avail_idx.wrapping_add(1),
-                core::sync::atomic::Ordering::Release,
-            );
-        }
-
-        Some(head)
-    }
-
-    /// Push a single indirect descriptor table into the virtqueue.
-    /// Returns the head descriptor index.
-    pub(crate) unsafe fn push_indirect(
-        &mut self,
-        table_phys: PhysAddr,
-        table_len: u32,
-    ) -> Option<u16> {
-        let head = self.alloc_desc()?;
-        let desc = self.desc_ptr(head);
-        unsafe {
-            (*desc).addr = table_phys.as_u64();
-            (*desc).len = table_len;
-            (*desc).flags = VRING_DESC_F_INDIRECT;
-            (*desc).next = 0;
         }
 
         let avail_base = self.avail_va().as_u64() as *mut u16;

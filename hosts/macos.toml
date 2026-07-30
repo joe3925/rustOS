@@ -1,0 +1,16 @@
+schema = 1
+id = "macos"
+os = "macos"
+
+[qemu]
+executable_patterns = [
+    "/opt/homebrew/bin/{executable}",
+    "/usr/local/bin/{executable}",
+    "/opt/local/bin/{executable}",
+]
+data_directories = [
+    "../qemu",
+    "/opt/homebrew/share/qemu",
+    "/usr/local/share/qemu",
+    "/opt/local/share/qemu",
+]

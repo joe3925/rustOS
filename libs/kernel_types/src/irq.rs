@@ -4,7 +4,7 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::Waker;
 
 use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -178,18 +178,6 @@ pub fn set_irq_interrupt_control(
 }
 
 #[inline(always)]
-fn in_interrupt_context() -> bool {
-    let query = IRQ_CONTEXT_QUERY.load(Ordering::Acquire);
-
-    if query == 0 {
-        return false;
-    }
-
-    let query: IrqContextQuery = unsafe { core::mem::transmute(query) };
-    query()
-}
-
-#[inline(always)]
 fn interrupts_enabled() -> bool {
     let enabled = IRQ_INTERRUPTS_ENABLED.load(Ordering::Acquire);
 
@@ -223,19 +211,6 @@ fn interrupts_enable() {
 
     let enable: IrqInterruptsSet = unsafe { core::mem::transmute(enable) };
     enable();
-}
-
-#[inline(always)]
-fn interrupts_enable_and_hlt() {
-    let enable_and_hlt = IRQ_INTERRUPTS_ENABLE_AND_HLT.load(Ordering::Acquire);
-
-    if enable_and_hlt == 0 {
-        core::hint::spin_loop();
-        return;
-    }
-
-    let enable_and_hlt: IrqInterruptsSet = unsafe { core::mem::transmute(enable_and_hlt) };
-    enable_and_hlt();
 }
 
 #[repr(C)]
@@ -734,7 +709,7 @@ impl WaiterPtr {
 
     pub unsafe fn from_raw(ptr: *mut Waiter) -> Self {
         Self {
-            ptr: NonNull::new_unchecked(ptr),
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
         }
     }
 
@@ -743,7 +718,7 @@ impl WaiterPtr {
     }
 
     pub unsafe fn as_ref<'a>(self) -> &'a Waiter {
-        self.ptr.as_ref()
+        unsafe { self.ptr.as_ref() }
     }
 
     pub fn ptr_eq(self, other: WaiterPtr) -> bool {

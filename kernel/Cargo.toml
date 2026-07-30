@@ -12,18 +12,14 @@ path = "src/main.rs"
 [features]
 default = ["allocator-mimalloc"]
 allocator-mimalloc = []
-allocator-buddy = []
+kernel-bench = []
 
 [dependencies]
 spin = "0.10.0"
 bitflags = "2.6.0"
-strum = { version = "0.24", default-features = false, features = ["derive"] }
-strum_macros = "0.24"
-embedded-crc32c = "0.1"
 async-lock = { version = "3.4.0", default-features = false }
 rand_xoshiro = { version = "0.7.0", default-features = false }
 rand_core = "0.9.0"
-crc-any = "2.0.0"
 embedded-graphics = "0.8.1"
 acpi = "5.2.0"
 
@@ -37,21 +33,13 @@ goblin = { version = "0.10.0", features = [
     "te",
 ], default-features = false }
 hashbrown = "0.15.4"
-bincode = { version = "2.0.1", default-features = false, features = [
-    "alloc",
-    "derive",
-] }
 serde_json = { version = "1.0.140", default-features = false, features = [
     "alloc",
 ] }
 buddy_system_allocator = "0.11.0"
 toml = { version = "0.9.5", default-features = false, features = ["parse"] }
 libm = { version = "0.2", default-features = false }
-kernel_types = { path = "../libs/kernel_types", default-features = false, features = [
-    "async-ffi-slab",
-    "async-ffi-slab-slots-512",
-    "async-ffi-slab-slot-bytes-64k",
-] }
+kernel_types = { path = "../libs/kernel_types", default-features = false }
 kernel_abi = { path = "../libs/kernel_abi" }
 kernel_routing = { path = "../libs/kernel_routing", default-features = false, features = [
     "kernel_link",
@@ -62,17 +50,14 @@ crossbeam-queue = { version = "0.3.12", default-features = false, features = [
 kernel_executor = { path = "../libs/kernel_executor" }
 kernel_macros = { path = "../libs/kernel_macros" }
 kernel_sync = { path = "../libs/kernel_sync", default-features = false }
-crossbeam-epoch = { version = "0.9", default-features = false, features = [
-    "alloc",
-] }
 cfg-if = "1.0.4"
 prost = { version = "0.14.3", default-features = false, features = ["derive"] }
+registry_format = { path = "../libs/registry_format" }
 
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "=0.15.2"
 pic8259 = "0.10.1"
-pc-keyboard = "0.7.0"
 raw-cpuid = "11.5.0"
 
 
@@ -85,7 +70,7 @@ unused_must_use = "deny"
 
 [build-dependencies]
 cc = "1.2"
-implib = "0.4"
+kernel_abi = { path = "../libs/kernel_abi" }
 [profile.dev]
 opt-level = 3
 lto = true

@@ -30,17 +30,21 @@ impl<T> QueueSlot<T> {
 
     #[inline]
     unsafe fn write_value(&self, value: T) {
-        (*self.value.get()).write(value);
+        unsafe {
+            (*self.value.get()).write(value);
+        }
     }
 
     #[inline]
     unsafe fn read_value(&self) -> T {
-        (*self.value.get()).assume_init_read()
+        unsafe { (*self.value.get()).assume_init_read() }
     }
 
     #[inline]
     unsafe fn drop_value(&self) {
-        (*self.value.get()).assume_init_drop();
+        unsafe {
+            (*self.value.get()).assume_init_drop();
+        }
     }
 }
 

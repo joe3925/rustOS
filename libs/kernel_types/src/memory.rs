@@ -98,6 +98,7 @@ pub struct Module {
     pub image_path: Path,
     pub parent_pid: u64,
     pub image_base: VirtAddr,
-    pub symbols: Vec<(String, usize)>,
+    pub image_size: u64,
+    pub exports: Vec<(String, usize)>,
     pub pe_info: Option<PeInfo>,
 }

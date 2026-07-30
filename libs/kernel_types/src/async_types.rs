@@ -4,10 +4,9 @@ use core::cell::UnsafeCell;
 use core::future::Future;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 

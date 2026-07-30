@@ -1,7 +1,4 @@
-use alloc::vec::Vec;
-use core::mem::MaybeUninit;
-use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region};
-use kernel_api::pnp::{ResourceKind, ResourceDescriptor};
+use kernel_api::memory::VirtAddr;
 
 /// Volatile reads/writes that remain defined on unaligned PCI/virtio registers.
 #[repr(C, packed)]
@@ -24,41 +21,6 @@ pub struct VirtioPciCaps {
     pub notify_off_multiplier: u32,
     pub isr_cfg: VirtAddr,
     pub device_cfg: VirtAddr,
-}
-
-/// A parsed resource entry from the PCI RSRC blob.
-#[derive(Clone, Copy)]
-pub struct PciResource {
-    pub kind: u32,
-    pub index: u32,
-    pub start: u64,
-    pub length: u64,
-}
-
-
-
-/// Find the PCI configuration space physical address from the resource blob.
-
-
-
-
-/// Virtio PCI capability structure layout (from PCI config space).
-/// cfg_type values:
-///   1 = Common configuration
-///   2 = Notifications
-///   3 = ISR status
-///   4 = Device-specific configuration
-///   5 = PCI configuration access
-#[repr(C)]
-struct VirtioPciCap {
-    cap_vndr: u8, // 0x09 for virtio
-    cap_next: u8,
-    cap_len: u8,
-    cfg_type: u8,
-    bar: u8,
-    _padding: [u8; 3],
-    offset: u32,
-    length: u32,
 }
 
 /// Walk the PCI capability list in config space (mapped via BAR 0 or ECAM)
@@ -158,10 +120,6 @@ pub unsafe fn common_write_u32(common: VirtAddr, offset: usize, val: u32) {
     unsafe { write_volatile_unaligned::<u32>((common.as_u64() as *mut u8).add(offset), val) }
 }
 
-pub unsafe fn common_read_u64(common: VirtAddr, offset: usize) -> u64 {
-    unsafe { read_volatile_unaligned::<u64>((common.as_u64() as *const u8).add(offset)) }
-}
-
 pub unsafe fn common_write_u64(common: VirtAddr, offset: usize, val: u64) {
     unsafe { write_volatile_unaligned::<u64>((common.as_u64() as *mut u8).add(offset), val) }
 }
@@ -171,7 +129,6 @@ pub const COMMON_DEVICE_FEATURE_SELECT: usize = 0x00;
 pub const COMMON_DEVICE_FEATURE: usize = 0x04;
 pub const COMMON_DRIVER_FEATURE_SELECT: usize = 0x08;
 pub const COMMON_DRIVER_FEATURE: usize = 0x0C;
-pub const COMMON_NUM_QUEUES: usize = 0x12;
 pub const COMMON_DEVICE_STATUS: usize = 0x14;
 pub const COMMON_QUEUE_SELECT: usize = 0x16;
 pub const COMMON_QUEUE_SIZE: usize = 0x18;

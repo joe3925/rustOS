@@ -1,8 +1,8 @@
+use crate::error::DriverErrorKind;
 use crate::fs::Path;
 use crate::io::DeviceOps;
 use crate::memory::Module;
 use crate::pnp::{BootType, DeviceIds, DriverRole, PnpOps};
-use crate::status::DriverStatus;
 use crate::{EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload};
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -380,17 +380,17 @@ impl<P: Protocol> ProtocolHandle<P> {
     }
 
     #[inline]
-    pub fn validate(&self) -> Result<(), DriverStatus> {
+    pub fn validate(&self) -> Result<(), DriverErrorKind> {
         if self.provider.is_removed() {
-            return Err(DriverStatus::NoSuchDevice);
+            return Err(DriverErrorKind::NoSuchDevice);
         }
 
         if self.provider.generation() != self.provider_generation {
-            return Err(DriverStatus::NoSuchDevice);
+            return Err(DriverErrorKind::NoSuchDevice);
         }
 
         if self.provider.protocol_generation() != self.protocol_generation {
-            return Err(DriverStatus::NoSuchDevice);
+            return Err(DriverErrorKind::NoSuchDevice);
         }
 
         Ok(())
@@ -409,21 +409,21 @@ impl<P: Protocol> Deref for ProtocolHandle<P> {
 pub fn register_protocol<P: Protocol>(
     device: &Arc<DeviceObject>,
     vtable: &'static P::VTable,
-) -> DriverStatus {
+) -> Result<(), DriverErrorKind> {
     if device.is_removed() {
-        return DriverStatus::NoSuchDevice;
+        return Err(DriverErrorKind::NoSuchDevice);
     }
 
     if device.register_protocol::<P>(vtable) {
-        DriverStatus::Success
+        Ok(())
     } else {
-        DriverStatus::InvalidParameter
+        Err(DriverErrorKind::InvalidParameter)
     }
 }
 
 pub fn open_protocol_to_next_lower<P: Protocol>(
     device: &Arc<DeviceObject>,
-) -> Result<ProtocolHandle<P>, DriverStatus> {
+) -> Result<ProtocolHandle<P>, DriverErrorKind> {
     let mut current = device.lower_device.read().clone();
 
     while let Some(dev) = current {
@@ -434,12 +434,12 @@ pub fn open_protocol_to_next_lower<P: Protocol>(
         current = dev.lower_device.read().clone();
     }
 
-    Err(DriverStatus::NotImplemented)
+    Err(DriverErrorKind::NotImplemented)
 }
 
 pub fn open_protocol_at_stack_top<P: Protocol>(
     node: &Arc<DevNode>,
-) -> Result<ProtocolHandle<P>, DriverStatus> {
+) -> Result<ProtocolHandle<P>, DriverErrorKind> {
     let top = {
         let stack = node.stack.read();
 
@@ -448,7 +448,7 @@ pub fn open_protocol_at_stack_top<P: Protocol>(
             .and_then(|stack| stack.get_top_device_object())
     }
     .or_else(|| node.pdo.read().clone())
-    .ok_or(DriverStatus::NoSuchDevice)?;
+    .ok_or(DriverErrorKind::NoSuchDevice)?;
 
     let mut current = Some(top);
 
@@ -460,7 +460,7 @@ pub fn open_protocol_at_stack_top<P: Protocol>(
         current = dev.lower_device.read().clone();
     }
 
-    Err(DriverStatus::NotImplemented)
+    Err(DriverErrorKind::NotImplemented)
 }
 
 fn try_open_protocol_on_device<P: Protocol>(
@@ -791,27 +791,27 @@ impl DevExtBox {
 
 impl<P: Protocol> ProtocolHandle<P> {
     #[inline]
-    pub fn open_next_lower(&self) -> Result<ProtocolHandle<P>, DriverStatus> {
+    pub fn open_next_lower(&self) -> Result<ProtocolHandle<P>, DriverErrorKind> {
         open_protocol_to_next_lower::<P>(&self.provider)
     }
 }
 
-pub fn publish_stack_protocol<P: Protocol>(node: &Arc<DevNode>) -> DriverStatus {
+pub fn publish_stack_protocol<P: Protocol>(node: &Arc<DevNode>) -> Result<(), DriverErrorKind> {
     let mut stack = node.stack.write();
 
     let Some(stack) = stack.as_mut() else {
-        return DriverStatus::NoSuchDevice;
+        return Err(DriverErrorKind::NoSuchDevice);
     };
 
     if stack.publish_protocol::<P>() {
-        DriverStatus::Success
+        Ok(())
     } else {
-        DriverStatus::InvalidParameter
+        Err(DriverErrorKind::InvalidParameter)
     }
 }
 
 pub fn open_public_protocol<P: Protocol>(
     node: &Arc<DevNode>,
-) -> Result<ProtocolHandle<P>, DriverStatus> {
+) -> Result<ProtocolHandle<P>, DriverErrorKind> {
     open_protocol_at_stack_top::<P>(node)
 }

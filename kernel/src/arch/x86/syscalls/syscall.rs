@@ -4,6 +4,9 @@ use super::super::gdt::PER_CPU_GDT;
 use crate::executable::program::{Message, UserHandle};
 use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
+use kernel_types::executor::{
+    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
+};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
 use x86_64::VirtAddr;
@@ -118,9 +121,27 @@ make_wrapper!(wrap_create, sys_create_task, usize);
 make_wrapper!(
     wrap_completion_queue_create,
     sys_completion_queue_create,
+    UserHandle,
     usize,
     usize,
     u64
+);
+make_wrapper!(
+    wrap_executor_domain_create,
+    sys_executor_domain_create,
+    *const UserExecutorDomainCreate
+);
+make_wrapper!(
+    wrap_executor_domain_configure,
+    sys_executor_domain_configure,
+    UserHandle,
+    *const UserExecutorDomainUpdate
+);
+make_wrapper!(
+    wrap_executor_domain_query,
+    sys_executor_domain_query,
+    UserHandle,
+    *mut UserExecutorDomainInfo
 );
 make_wrapper!(wrap_io_enqueue, sys_io_enqueue, UserHandle, *const UserIoOp);
 make_wrapper!(
@@ -154,6 +175,39 @@ make_wrapper!(wrap_mq_route_clear, sys_rule_clear, *const UserRoutingRule);
 make_wrapper!(wrap_mq_peek, sys_mq_peek, UserHandle, *mut Message);
 make_wrapper!(wrap_get_default_mq_handle, sys_get_default_mq_handle,);
 make_wrapper!(wrap_create_mq, sys_create_mq,);
+make_wrapper!(
+    wrap_object_acquire,
+    sys_object_acquire,
+    u64,
+    usize,
+    u32,
+    u64
+);
+make_wrapper!(wrap_object_close, sys_object_close, UserHandle);
+make_wrapper!(wrap_object_duplicate, sys_object_duplicate, UserHandle, u64);
+make_wrapper!(
+    wrap_io_buffer_register,
+    sys_io_buffer_register,
+    u64,
+    usize,
+    u32
+);
+make_wrapper!(
+    wrap_symlink_create,
+    sys_symlink_create,
+    u64,
+    usize,
+    UserHandle,
+    u64
+);
+make_wrapper!(wrap_symlink_withdraw, sys_symlink_withdraw, UserHandle);
+make_wrapper!(
+    wrap_message_complete,
+    sys_message_complete,
+    UserHandle,
+    u64,
+    u64
+);
 
 const SYSCALL_TABLE: &[Handler] = &[
     wrap_print,                   // 0
@@ -172,6 +226,16 @@ const SYSCALL_TABLE: &[Handler] = &[
     wrap_mq_peek,                 // 13
     wrap_get_default_mq_handle,   // 14
     wrap_create_mq,               // 15
+    wrap_object_acquire,          // 16
+    wrap_object_close,            // 17
+    wrap_symlink_create,          // 18
+    wrap_symlink_withdraw,        // 19
+    wrap_message_complete,        // 20
+    wrap_object_duplicate,        // 21
+    wrap_io_buffer_register,      // 22
+    wrap_executor_domain_create,  // 23
+    wrap_executor_domain_configure, // 24
+    wrap_executor_domain_query,   // 25
 ];
 
 #[unsafe(no_mangle)]

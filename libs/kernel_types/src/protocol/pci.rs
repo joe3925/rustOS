@@ -1,6 +1,6 @@
-use alloc::sync::Arc;
 use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
 use crate::pci::{Bar, MsixInfo};
+use alloc::sync::Arc;
 
 #[repr(C)]
 pub struct PciProtocolVTable {

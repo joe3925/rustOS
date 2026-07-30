@@ -1,6 +1,7 @@
 use crate::scheduling::domain::{
-    CpuSet, DomainId, DomainOps, EnqueueReason, SchedulerClass, SwitchOutOutcome, TaskSchedBinding,
+    CpuSet, DomainOps, EnqueueReason, SchedulerClass, SwitchOutOutcome,
 };
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::SchedState;
 use crate::scheduling::task::TaskHandle;
 use alloc::boxed::Box;
@@ -9,7 +10,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Mutex;
 
-pub const FIFO_DOMAIN_ID: DomainId = DomainId(0);
 pub const RUNQ_CAP: usize = 4096;
 const BALANCE_INTERVAL_TICKS: usize = 150;
 
@@ -49,27 +49,21 @@ impl FifoCpuState {
     }
 }
 
-pub fn new_fifo_task_binding() -> TaskSchedBinding {
-    TaskSchedBinding::new(FIFO_DOMAIN_ID, ())
-}
-
-pub fn build_fifo_domain(cpu_count: usize) -> Box<dyn DomainOps> {
+pub fn build_fifo_domain(name: &'static str, cpus: CpuSet, cpu_count: usize) -> Box<dyn DomainOps> {
     let mut per_cpu = Vec::with_capacity(cpu_count);
     for _ in 0..cpu_count {
         per_cpu.push(Some(FifoCpuState::new()));
     }
 
     Box::new(FifoDomain::new(
-        FIFO_DOMAIN_ID,
-        "fifo",
-        CpuSet::all(),
+        name,
+        cpus,
         FifoClass::new(),
         per_cpu.into_boxed_slice(),
     ))
 }
 
 pub struct FifoDomain {
-    id: DomainId,
     name: &'static str,
     cpus: CpuSet,
     class: FifoClass,
@@ -78,14 +72,12 @@ pub struct FifoDomain {
 
 impl FifoDomain {
     fn new(
-        id: DomainId,
         name: &'static str,
         cpus: CpuSet,
         class: FifoClass,
         per_cpu: Box<[Option<FifoCpuState>]>,
     ) -> Self {
         Self {
-            id,
             name,
             cpus,
             class,
@@ -175,40 +167,42 @@ fn pop_queued_task(cpu: &FifoCpuState, inbound_drain: InboundDrain) -> Option<Ta
 }
 
 fn steal_youngest_runnable(src_cpu_id: usize, src_cpu: &FifoCpuState) -> Option<TaskHandle> {
-    crate::scheduling::scheduler::SCHEDULER.with_core_sched_lock(src_cpu_id, || loop {
-        let len = src_cpu.run_queue.len();
+    SCHEDULER.with_core_sched_lock(src_cpu_id, || {
+        loop {
+            let len = src_cpu.run_queue.len();
 
-        if len == 0 {
-            return None;
-        }
+            if len == 0 {
+                return None;
+            }
 
-        let mut rotated = 0usize;
+            let mut rotated = 0usize;
 
-        while rotated + 1 < len {
+            while rotated + 1 < len {
+                let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
+                    return None;
+                };
+
+                if src_cpu.run_queue.try_push(task).is_err() {
+                    panic!("run queue rotation overflow on cpu {}", src_cpu_id);
+                }
+
+                rotated += 1;
+            }
+
             let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
                 return None;
             };
 
-            if src_cpu.run_queue.try_push(task).is_err() {
-                panic!("run queue rotation overflow on cpu {}", src_cpu_id);
-            }
+            src_cpu.load.fetch_sub(1, Ordering::Release);
 
-            rotated += 1;
-        }
-
-        let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
-            return None;
-        };
-
-        src_cpu.load.fetch_sub(1, Ordering::Release);
-
-        match task.sched_state() {
-            SchedState::Terminated => {
-                crate::scheduling::scheduler::SCHEDULER.unregister_task_from_domain(&task);
-            }
-            SchedState::Parking | SchedState::Blocked => {}
-            SchedState::Runnable | SchedState::Running => {
-                return Some(task);
+            match task.sched_state() {
+                SchedState::Terminated => {
+                    SCHEDULER.unregister_task_from_domain(&task);
+                }
+                SchedState::Parking | SchedState::Blocked => {}
+                SchedState::Runnable | SchedState::Running => {
+                    return Some(task);
+                }
             }
         }
     })?
@@ -248,7 +242,7 @@ impl SchedulerClass for FifoClass {
         const HINT_CPU_BONUS: isize = 40;
         const NEW_TASK_IDLE_BONUS: isize = 80;
 
-        let n = crate::scheduling::scheduler::SCHEDULER.num_cores();
+        let n = SCHEDULER.num_cores();
 
         if matches!(
             reason,
@@ -276,7 +270,7 @@ impl SchedulerClass for FifoClass {
             };
 
             let load = cpu.load.load(Ordering::Acquire);
-            let idle = crate::scheduling::scheduler::SCHEDULER.cpu_is_idle(cpu_id);
+            let idle = SCHEDULER.cpu_is_idle(cpu_id);
 
             let mut score = load as isize * LOAD_WEIGHT;
 
@@ -345,7 +339,7 @@ impl SchedulerClass for FifoClass {
     fn effective_load(&self, cpu_id: usize, cpu: &Self::CpuState) -> usize {
         let queue_load = cpu.load.load(Ordering::Acquire);
 
-        if crate::scheduling::scheduler::SCHEDULER.cpu_is_idle(cpu_id) {
+        if SCHEDULER.cpu_is_idle(cpu_id) {
             queue_load
         } else {
             queue_load.saturating_add(1)
@@ -377,7 +371,7 @@ impl SchedulerClass for FifoClass {
 
         self.last_balance_tick.store(now_tick, Ordering::Relaxed);
 
-        let n = crate::scheduling::scheduler::SCHEDULER.num_cores();
+        let n = SCHEDULER.num_cores();
         if n < 2 {
             return;
         }
@@ -451,17 +445,12 @@ impl SchedulerClass for FifoClass {
 
             task.set_target_cpu(min_idx);
             push_runqueue_or_panic(min_idx, min_cpu, task);
-            crate::scheduling::scheduler::SCHEDULER.kick_remote_core(min_idx);
+            SCHEDULER.kick_remote_core(min_idx);
         }
     }
 }
 
 impl DomainOps for FifoDomain {
-    #[inline(always)]
-    fn id(&self) -> DomainId {
-        self.id
-    }
-
     #[inline(always)]
     fn name(&self) -> &'static str {
         self.name

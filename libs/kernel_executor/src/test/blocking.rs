@@ -7,7 +7,9 @@ use std::sync::{Condvar, Mutex};
 use std::task::Wake;
 use std::time::Duration;
 
-use crate::runtime::runtime::{block_on, spawn, spawn_blocking, spawn_blocking_many, JoinAll};
+use crate::runtime::runtime::{
+    block_on, spawn_blocking, spawn_blocking_many, spawn_join_owned as spawn, JoinAll,
+};
 
 struct DropMarker {
     drops: Arc<AtomicUsize>,

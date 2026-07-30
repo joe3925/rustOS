@@ -1,4 +1,4 @@
-use crate::memory::heap::buddylocked::BuddyLocked;
+use crate::memory::heap::bootstrap_allocator::BootstrapAllocator;
 use crate::memory::paging::frame_alloc::total_usable_bytes;
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
@@ -7,7 +7,6 @@ use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
-use crate::util::trigger_triple_fault;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::sync::Arc;
@@ -21,7 +20,7 @@ cfg_if::cfg_if! {
         use crate::memory::heap::mimalloc;
 
         pub struct KernelAllocator {
-            bootstrap: BuddyLocked,
+            bootstrap: BootstrapAllocator,
             mimalloc_enabled: AtomicBool,
             enable_lock: spin::Mutex<()>,
         }
@@ -29,7 +28,7 @@ cfg_if::cfg_if! {
         impl KernelAllocator {
             pub const fn new() -> Self {
                 Self {
-                    bootstrap: BuddyLocked::new(),
+                    bootstrap: BootstrapAllocator::new(),
                     mimalloc_enabled: AtomicBool::new(false),
                     enable_lock: spin::Mutex::new(()),
                 }
@@ -135,46 +134,8 @@ cfg_if::cfg_if! {
             }
         }
 
-    } else if #[cfg(feature = "allocator-buddy")] {
-        pub struct KernelAllocator {
-            inner: BuddyLocked,
-        }
-
-        impl KernelAllocator {
-            pub const fn new() -> Self {
-                Self {
-                    inner: BuddyLocked::new(),
-                }
-            }
-
-            pub fn enable_mimalloc(&self) {
-                // No-op for buddy allocator
-            }
-
-            pub fn mimalloc_thread_done(&self) {
-                // No-op
-            }
-
-            pub fn free_memory(&self) -> usize {
-                self.inner.free_memory()
-            }
-        }
-
-        unsafe impl GlobalAlloc for KernelAllocator {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                self.inner.alloc(layout)
-            }
-
-            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                self.inner.alloc_zeroed(layout)
-            }
-
-            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                self.inner.dealloc(ptr, layout)
-            }
-        }
     } else {
-        compile_error!("Must enable either 'allocator-mimalloc' or 'allocator-buddy' feature.");
+        compile_error!("The kernel requires the 'allocator-mimalloc' feature.");
     }
 }
 
@@ -398,27 +359,6 @@ cfg_if::cfg_if! {
                 alloc_ms,
                 realloc_ms,
                 dealloc_ms
-            );
-        }
-    } else if #[cfg(feature = "allocator-buddy")] {
-        fn reset_parallel_heap_test_stats() {}
-
-        fn force_heap_collection() {}
-
-        fn print_parallel_heap_test_result(
-            num_threads: usize,
-            elapsed_ms: u128,
-            push_max_ms: usize,
-            push_total_ms: usize,
-            verify_ms: usize,
-        ) {
-            println!(
-                "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify main {} ms)",
-                num_threads,
-                elapsed_ms,
-                push_max_ms,
-                push_total_ms,
-                verify_ms,
             );
         }
     }

@@ -16,7 +16,6 @@ use kernel_api::{
         pnp_create_child_devnode_and_pdo_with_init,
     },
     request_handler,
-    status::DriverStatus,
 };
 
 static MOD_NAME: &str = env!("CARGO_PKG_NAME");
@@ -28,20 +27,20 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, root_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn root_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp = PnpOps::new();
     pnp.start_device.set(root_start);
     pnp.query_device_relations.set(root_query_devrels);
     dev_init.pnp_ops = Some(pnp);
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -49,8 +48,8 @@ pub async fn root_start(
     _device: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &mut StartDevice,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -58,13 +57,13 @@ pub async fn root_query_devrels(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if req.relation != DeviceRelationType::BusRelations {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let Some(root_dn) = device.dev_node.get().and_then(|dn| dn.upgrade()) else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     if get_rsdp().is_some() {
@@ -75,7 +74,7 @@ pub async fn root_query_devrels(
         ensure_device_tree_node(&root_dn);
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 fn child_exists(parent: &Arc<DevNode>, instance_path: &str) -> bool {

@@ -1,16 +1,16 @@
 use alloc::sync::Arc;
 
-use crate::async_ffi::{FfiFuture, FutureExt};
+use crate::async_ffi::{AbiFuture, FutureExt};
 use crate::device::DeviceObject;
-use crate::pnp::{BootType, DriverStep, PnpOp, PnpOps, StartDevice};
-use crate::status::DriverStatus;
+use crate::error::KernelError;
+use crate::pnp::{BootType, DriverStep, PnpOp, PnpOps, StartDevice, UnhandledBehavior};
 
 extern "C" fn start_device_handler(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _request: &mut StartDevice,
-) -> FfiFuture<DriverStep> {
-    async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Complete) }.into_abi()
 }
 
 #[test]
@@ -20,26 +20,26 @@ fn boot_type_parses_kernel_driver_start_modes() {
     assert_eq!(BootType::from_str("demand"), Some(BootType::Demand));
     assert_eq!(BootType::from_str("disabled"), Some(BootType::Disabled));
     assert_eq!(BootType::from_str("manual"), None);
-    assert_eq!(BootType::Demand.as_u32(), 2);
+    assert_eq!(BootType::Demand.as_u32(), 1);
 }
 
 #[test]
 fn pnp_minor_defaults_distinguish_optional_queries_from_lifecycle_ops() {
     assert_eq!(
-        PnpOp::StartDevice.default_status_for_unhandled(),
-        DriverStatus::Success
+        PnpOp::StartDevice.unhandled_behavior(),
+        UnhandledBehavior::Complete
     );
     assert_eq!(
-        PnpOp::RemoveDevice.default_status_for_unhandled(),
-        DriverStatus::Success
+        PnpOp::RemoveDevice.unhandled_behavior(),
+        UnhandledBehavior::Complete
     );
     assert_eq!(
-        PnpOp::QueryId.default_status_for_unhandled(),
-        DriverStatus::NotImplemented
+        PnpOp::QueryId.unhandled_behavior(),
+        UnhandledBehavior::Error(crate::error::DriverErrorKind::NotImplemented)
     );
     assert_eq!(
-        PnpOp::QueryResources.default_status_for_unhandled(),
-        DriverStatus::NotImplemented
+        PnpOp::QueryResources.unhandled_behavior(),
+        UnhandledBehavior::Error(crate::error::DriverErrorKind::NotImplemented)
     );
 }
 

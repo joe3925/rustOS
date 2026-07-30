@@ -2,10 +2,10 @@ use alloc::{string::String, vec::Vec};
 use async_lock::{Mutex, MutexGuard};
 use kernel_types::{
     bench_archive::{
-        BenchArchiveFormat, BenchArchiveRecordKind, BenchArchiveRecordMeta, BENCH_ARCHIVE_FORMAT,
+        BENCH_ARCHIVE_FORMAT, BenchArchiveFormat, BenchArchiveRecordKind, BenchArchiveRecordMeta,
     },
+    error::{FileErrorKind, KernelError},
     fs::{OpenFlags, Path},
-    status::FileStatus,
 };
 
 use crate::file_system::file::File;
@@ -99,7 +99,7 @@ impl BenchArchive {
         }
     }
 
-    async fn open_file(&self) -> Result<File, FileStatus> {
+    async fn open_file(&self) -> Result<File, KernelError> {
         let parent = File::remove_file_from_path(&self.path);
         let _ = File::make_dir(&Path::from_string(parent)).await;
 
@@ -138,7 +138,7 @@ impl BenchArchivePersist<'_> {
     pub async fn append_records(
         &mut self,
         records: &[BenchArchiveRecord],
-    ) -> Result<(), FileStatus> {
+    ) -> Result<(), KernelError> {
         if records.is_empty() {
             return Ok(());
         }
@@ -161,10 +161,10 @@ impl BenchArchivePersist<'_> {
         &mut self,
         file: &mut File,
         record: &BenchArchiveRecord,
-    ) -> Result<(), FileStatus> {
+    ) -> Result<(), KernelError> {
         let path_bytes = record.path.as_bytes();
         if path_bytes.len() > u32::MAX as usize {
-            return Err(FileStatus::BadPath);
+            return Err(crate::error::error(FileErrorKind::BadPath));
         }
 
         let sequence = self.state.next_record_sequence;
@@ -188,12 +188,12 @@ impl BenchArchivePersist<'_> {
     }
 }
 
-async fn append_exact(file: &mut File, bytes: &[u8]) -> Result<(), FileStatus> {
+async fn append_exact(file: &mut File, bytes: &[u8]) -> Result<(), KernelError> {
     let written = file.append(bytes).await?;
     if written == bytes.len() {
         Ok(())
     } else {
-        Err(FileStatus::FileTooLarge)
+        Err(crate::error::error(FileErrorKind::FileTooLarge))
     }
 }
 

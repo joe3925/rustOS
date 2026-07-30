@@ -1,6 +1,7 @@
 use crate::executable::program::{
-    Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
+    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
 };
+use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::{base_page_size, kernel_space_base};
 use crate::platform;
@@ -8,7 +9,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
 use crate::structs::io_request::{
-    FileObject, IoOpcode, KernelIoOp, RequestId, UserIoCompletion, UserIoOp,
+    FileObject, IoOpcode, KernelIoOp, MessageDelivery, RequestId, UserIoCompletion, UserIoOp,
 };
 use crate::{format, print};
 use crate::{scheduling::task::TaskHandle, util::generate_guid};
@@ -16,20 +17,41 @@ use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use kernel_types::arch::{PhysAddr, VirtAddr};
+use kernel_types::dma::IoBufferError;
 use kernel_types::fs::{OpenFlags, Path};
+use kernel_types::executor::{
+    USER_EXECUTOR_ABI_VERSION, USER_EXECUTOR_PROFILE_GENERAL, USER_EXECUTOR_RESIZE_FIXED,
+    USER_EXECUTOR_RESIZE_GEOMETRIC, USER_EXECUTOR_RESIZE_LINEAR, USER_EXECUTOR_UPDATE_ALL,
+    USER_EXECUTOR_UPDATE_MAX_ACTIVE, USER_EXECUTOR_UPDATE_RESIZE_POLICY,
+    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
+    UserExecutorResizePolicy,
+};
 use kernel_types::object_manager::ObjectTag;
+use kernel_types::capacity::{
+    GeometricResizePolicy, LinearResizePolicy, ResizePolicyKind,
+};
+use kernel_executor::global_async::{
+    ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainState, GlobalAsyncExecutor,
+    ReplaceResizePolicyResult,
+};
 
-use crate::object_manager::{Object, ObjectPayload, TaskQueueRef, OBJECT_MANAGER};
+use crate::object_manager::{
+    AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
+    TaskQueueRef,
+};
+use crate::structs::executor_domain::UserExecutorDomain;
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
-    let path = alloc::format!("\\Process\\{}", pid);
+    let process_dir = alloc::format!("\\Process\\{}", pid);
+    let path = alloc::format!("{}\\Program", process_dir);
     if let Ok(o) = OBJECT_MANAGER.open(path.clone()) {
         return o.clone();
     }
-    let _ = OBJECT_MANAGER.mkdir_p("\\Process");
+    let _ = OBJECT_MANAGER.mkdir_p(process_dir);
     let obj = Object::with_name(
         ObjectTag::Program,
-        pid.to_string(),
+        "Program".to_string(),
         ObjectPayload::Program(prog.clone()),
     );
     let _ = OBJECT_MANAGER.link(path.clone(), &obj);
@@ -61,14 +83,14 @@ fn ensure_default_queue_object(
     pid: u64,
     prog: &ProgramHandle,
 ) -> (alloc::sync::Arc<Object>, TaskQueueRef) {
-    let path = alloc::format!("\\Process\\{}\\DefaultQueue", pid);
+    let path = alloc::format!("\\Process\\{}\\Resources\\Queues\\Default", pid);
     if let Ok(o) = OBJECT_MANAGER.open(path.clone()) {
         if let ObjectPayload::Queue(q) = &o.payload {
             return (o.clone(), q.clone());
         }
     }
-    let proc_dir = alloc::format!("\\Process\\{}", pid);
-    let _ = OBJECT_MANAGER.mkdir_p(proc_dir.clone());
+    let queue_dir = alloc::format!("\\Process\\{}\\Resources\\Queues", pid);
+    let _ = OBJECT_MANAGER.mkdir_p(queue_dir);
     let q = prog.read().default_queue.clone();
     let obj = Object::with_name(
         ObjectTag::Queue,
@@ -81,7 +103,7 @@ fn ensure_default_queue_object(
 
 fn ensure_thread_object(pid: u64, th: &TaskHandle) -> alloc::sync::Arc<Object> {
     let tid = th.task_id();
-    let dir = alloc::format!("\\Process\\{}\\Threads", pid);
+    let dir = alloc::format!("\\Process\\{}\\Resources\\Threads", pid);
     let path = alloc::format!("{}\\{}", dir, tid);
     if let Ok(o) = OBJECT_MANAGER.open(path.clone()) {
         return o.clone();
@@ -245,8 +267,9 @@ fn current_process() -> Result<(u64, ProgramHandle), u64> {
 fn resolve_completion_queue(
     handle: UserHandle,
     caller_pid: u64,
+    caller: &ProgramHandle,
 ) -> Result<Arc<CompletionQueue>, u64> {
-    let obj = OBJECT_MANAGER.open_by_id(handle).ok_or_else(|| {
+    let obj = caller.read().resolve_handle(handle).ok_or_else(|| {
         make_err(
             ErrClass::Common,
             CommonErr::InvalidHandle as u16,
@@ -276,8 +299,8 @@ fn resolve_completion_queue(
     Ok(queue)
 }
 
-fn resolve_file_object(handle: UserHandle) -> Result<Arc<FileObject>, u64> {
-    let obj = OBJECT_MANAGER.open_by_id(handle).ok_or_else(|| {
+fn resolve_file_object(handle: UserHandle, caller: &ProgramHandle) -> Result<Arc<FileObject>, u64> {
+    let obj = caller.read().resolve_handle(handle).ok_or_else(|| {
         make_err(
             ErrClass::Common,
             CommonErr::InvalidHandle as u16,
@@ -295,6 +318,264 @@ fn resolve_file_object(handle: UserHandle) -> Result<Arc<FileObject>, u64> {
     }
 }
 
+fn resolve_io_buffer_backing(
+    caller: &ProgramHandle,
+    handle: UserHandle,
+) -> Result<Arc<MappedIoBufferBacking>, u64> {
+    let entry = caller.read().resolve_handle_entry(handle).ok_or_else(|| {
+        make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )
+    })?;
+    if !entry
+        .object
+        .behavior()
+        .matches(entry.interface, ObjectOperation::Submit)
+    {
+        return Err(make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        ));
+    }
+    match &entry.object.payload {
+        ObjectPayload::IoBufferBacking(backing) => Ok(backing.clone()),
+        _ => Err(make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )),
+    }
+}
+
+fn map_io_buffer_error(error: IoBufferError) -> u64 {
+    match error {
+        IoBufferError::AllocationFailed
+        | IoBufferError::LeaseCapacityExceeded { .. }
+        | IoBufferError::DmaRecordCapacityExceeded { .. }
+        | IoBufferError::PageCapacityExceeded { .. }
+        | IoBufferError::ExtentCapacityExceeded { .. }
+        | IoBufferError::SegmentCapacityExceeded { .. } => {
+            make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0)
+        }
+        IoBufferError::LeaseConflict { .. } | IoBufferError::ActiveLeases => {
+            make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0)
+        }
+        IoBufferError::TranslationFailed { .. } | IoBufferError::PhysicalDescriptionMissing => {
+            make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0)
+        }
+        IoBufferError::InvalidBackingKind => {
+            make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0)
+        }
+        _ => make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    }
+}
+
+pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u32) -> u64 {
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(error) => return error,
+    };
+    let access = match UserBufferAccess::from_raw(access) {
+        Some(access) => access,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, access),
+    };
+    if length == 0 || !user_ptr_ok(user_address as *const u8, length) {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+
+    let page_size = base_page_size();
+    let first_page = user_address - user_address % page_size;
+    let end = match user_address.checked_add(length as u64) {
+        Some(end) => end,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    };
+    let mapped_end = match crate::memory::paging::align_up_to_base_page(end) {
+        Some(end) => end,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    };
+    let page_count = ((mapped_end - first_page) / page_size) as usize;
+    let mut physical_pages = Vec::new();
+    if physical_pages.try_reserve_exact(page_count).is_err() {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    }
+
+    let user_pin = {
+        let program = caller.read();
+        let mut user_memory = program.user_memory.lock();
+        for index in 0..page_count {
+            let virt = VirtAddr::new(first_page + index as u64 * page_size);
+            let Some(mapping) =
+                crate::platform::resolve_mapping_in_root(program.address_space_root, virt)
+            else {
+                return make_err(ErrClass::Memory, MemErr::MapFailed as u16, index as u32);
+            };
+            if !mapping.user_accessible
+                || (access == UserBufferAccess::ReadWrite && !mapping.writable)
+            {
+                return make_err(
+                    ErrClass::Common,
+                    CommonErr::AccessDenied as u16,
+                    index as u32,
+                );
+            }
+            physical_pages.push(PhysAddr::new(mapping.phys_addr.as_u64() & !(page_size - 1)));
+        }
+        match user_memory.pin(first_page, mapped_end) {
+            Ok(pin) => pin,
+            Err(()) => return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0),
+        }
+    };
+
+    let backing = match MappedIoBufferBacking::new(
+        physical_pages,
+        (user_address - first_page) as usize,
+        length,
+        access,
+        user_pin,
+    ) {
+        Ok(backing) => Arc::new(backing),
+        Err(error) => return map_io_buffer_error(error),
+    };
+    publish_io_buffer_backing(caller_pid, &caller, backing)
+}
+
+fn resolve_executor_domain(
+    handle: UserHandle,
+    caller_pid: u64,
+    caller: &ProgramHandle,
+    operation: ObjectOperation,
+) -> Result<Arc<UserExecutorDomain>, u64> {
+    let entry = caller.read().resolve_handle_entry(handle).ok_or_else(|| {
+        make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )
+    })?;
+    if !entry
+        .object
+        .behavior()
+        .matches(entry.interface, operation)
+    {
+        return Err(make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        ));
+    }
+    let domain = match &entry.object.payload {
+        ObjectPayload::ExecutorDomain(domain) => domain.clone(),
+        _ => {
+            return Err(make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                handle as u32,
+            ));
+        }
+    };
+    if domain.owner_pid() != caller_pid {
+        return Err(make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        ));
+    }
+    Ok(domain)
+}
+
+fn decode_resize_policy(raw: UserExecutorResizePolicy) -> Result<ResizePolicyKind, u64> {
+    let maximum_capacity = (raw.maximum_capacity != 0).then_some(raw.maximum_capacity);
+    let policy = match raw.kind {
+        USER_EXECUTOR_RESIZE_FIXED => ResizePolicyKind::Fixed,
+        USER_EXECUTOR_RESIZE_LINEAR => ResizePolicyKind::Linear(LinearResizePolicy {
+            minimum_capacity: raw.minimum_capacity,
+            grow_by: raw.grow_by_or_factor,
+            shrink_by: raw.shrink_by,
+            shrink_trigger_percent: raw.shrink_trigger_percent.try_into().map_err(|_| {
+                make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
+            })?,
+            maximum_capacity,
+        }),
+        USER_EXECUTOR_RESIZE_GEOMETRIC => {
+            ResizePolicyKind::Geometric(GeometricResizePolicy {
+                minimum_capacity: raw.minimum_capacity,
+                growth_factor: raw.grow_by_or_factor,
+                shrink_trigger_percent: raw.shrink_trigger_percent.try_into().map_err(|_| {
+                    make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
+                })?,
+                shrink_target_percent: raw.shrink_target_percent.try_into().map_err(|_| {
+                    make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
+                })?,
+                maximum_capacity,
+            })
+        }
+        _ => {
+            return Err(make_err(
+                ErrClass::Common,
+                CommonErr::InvalidPtr as u16,
+                raw.kind,
+            ));
+        }
+    };
+    policy
+        .validate()
+        .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))
+}
+
+fn encode_resize_policy(policy: ResizePolicyKind) -> UserExecutorResizePolicy {
+    match policy {
+        ResizePolicyKind::Fixed => UserExecutorResizePolicy {
+            kind: USER_EXECUTOR_RESIZE_FIXED,
+            ..UserExecutorResizePolicy::default()
+        },
+        ResizePolicyKind::Linear(policy) => UserExecutorResizePolicy {
+            kind: USER_EXECUTOR_RESIZE_LINEAR,
+            shrink_trigger_percent: policy.shrink_trigger_percent as u32,
+            minimum_capacity: policy.minimum_capacity,
+            grow_by_or_factor: policy.grow_by,
+            shrink_by: policy.shrink_by,
+            maximum_capacity: policy.maximum_capacity.unwrap_or(0),
+            ..UserExecutorResizePolicy::default()
+        },
+        ResizePolicyKind::Geometric(policy) => UserExecutorResizePolicy {
+            kind: USER_EXECUTOR_RESIZE_GEOMETRIC,
+            shrink_trigger_percent: policy.shrink_trigger_percent as u32,
+            shrink_target_percent: policy.shrink_target_percent as u32,
+            minimum_capacity: policy.minimum_capacity,
+            grow_by_or_factor: policy.growth_factor,
+            maximum_capacity: policy.maximum_capacity.unwrap_or(0),
+            ..UserExecutorResizePolicy::default()
+        },
+    }
+}
+
+fn publish_io_buffer_backing(
+    caller_pid: u64,
+    caller: &ProgramHandle,
+    backing: Arc<MappedIoBufferBacking>,
+) -> u64 {
+    let directory = alloc::format!("\\Process\\{}\\Resources\\IoBufferBackings", caller_pid);
+    if OBJECT_MANAGER.mkdir_p(directory.clone()).is_err() {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    }
+    let name = guid_to_string(&generate_guid());
+    let object = Object::with_name(
+        ObjectTag::IoBufferBacking,
+        name.clone(),
+        ObjectPayload::IoBufferBacking(backing),
+    );
+    if OBJECT_MANAGER
+        .link(alloc::format!("{}\\{}", directory, name), &object)
+        .is_err()
+    {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    }
+    caller.read().create_user_handle_for_object(object)
+}
+
 fn resolve_message_queue(
     handle: UserHandle,
     caller_pid: u64,
@@ -304,7 +585,7 @@ fn resolve_message_queue(
         return Ok(ensure_default_queue_object(caller_pid, caller).1);
     }
 
-    let obj = OBJECT_MANAGER.open_by_id(handle).ok_or_else(|| {
+    let obj = caller.read().resolve_handle(handle).ok_or_else(|| {
         make_err(
             ErrClass::Message,
             MsgErr::TargetHandleInvalid as u16,
@@ -408,22 +689,29 @@ fn build_kernel_io_op(
             })
         }
         IoOpcode::FileRead => {
-            let length = op.length as usize;
-            validate_user_buffer(op.buffer, length)?;
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_from_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
             Ok(KernelIoOp::FileRead {
-                owner: caller.clone(),
-                file: resolve_file_object(op.target_handle)?,
-                buffer: op.buffer,
-                length,
+                file: resolve_file_object(op.target_handle, caller)?,
+                buffer,
                 offset: op.offset,
                 user_token: op.user_token,
             })
         }
         IoOpcode::FileWrite => {
-            let data = copy_user_bytes(op.buffer, op.length as usize)?;
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_to_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
             Ok(KernelIoOp::FileWrite {
-                file: resolve_file_object(op.target_handle)?,
-                data,
+                file: resolve_file_object(op.target_handle, caller)?,
+                buffer,
                 offset: op.offset,
                 user_token: op.user_token,
             })
@@ -431,7 +719,7 @@ fn build_kernel_io_op(
         IoOpcode::FileDelete => {
             if op.target_handle != 0 {
                 return Ok(KernelIoOp::FileDeleteHandle {
-                    file: resolve_file_object(op.target_handle)?,
+                    file: resolve_file_object(op.target_handle, caller)?,
                     user_token: op.user_token,
                 });
             }
@@ -471,13 +759,96 @@ fn build_kernel_io_op(
             })
         }
         IoOpcode::MqReceive => {
-            let length = op.length as usize;
-            validate_user_buffer(op.buffer, length)?;
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_from_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
             Ok(KernelIoOp::MqReceive {
-                owner: caller.clone(),
                 queue: resolve_message_queue(op.target_handle, caller_pid, caller)?,
-                buffer: op.buffer,
-                length,
+                buffer,
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::ObjectDestroy => {
+            let entry = caller
+                .read()
+                .resolve_handle_entry(op.target_handle)
+                .ok_or_else(|| {
+                    make_err(
+                        ErrClass::Common,
+                        CommonErr::InvalidHandle as u16,
+                        op.target_handle as u32,
+                    )
+                })?;
+            if !entry
+                .object
+                .behavior()
+                .matches(entry.interface, ObjectOperation::Destroy)
+            {
+                return Err(make_err(
+                    ErrClass::Common,
+                    CommonErr::AccessDenied as u16,
+                    op.target_handle as u32,
+                ));
+            }
+            Ok(KernelIoOp::ObjectDestroy {
+                object: entry.object,
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::MessageSendAwait => {
+            let length = usize::try_from(op.length)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            if length < core::mem::size_of::<Message>() {
+                return Err(make_err(
+                    ErrClass::Common,
+                    CommonErr::BufferTooSmall as u16,
+                    length as u32,
+                ));
+            }
+            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
+            let buffer = backing
+                .create_to_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?;
+            let entry = caller
+                .read()
+                .resolve_handle_entry(op.target_handle)
+                .ok_or_else(|| {
+                    make_err(
+                        ErrClass::Message,
+                        MsgErr::TargetHandleInvalid as u16,
+                        op.target_handle as u32,
+                    )
+                })?;
+            if !entry
+                .object
+                .behavior()
+                .matches(entry.interface, ObjectOperation::Message)
+            {
+                return Err(make_err(
+                    ErrClass::Common,
+                    CommonErr::AccessDenied as u16,
+                    op.target_handle as u32,
+                ));
+            }
+            let target = match &entry.object.payload {
+                ObjectPayload::Program(program) => program.clone(),
+                _ => {
+                    return Err(make_err(
+                        ErrClass::Message,
+                        MsgErr::UnsupportedTargetType as u16,
+                        0,
+                    ));
+                }
+            };
+            let sender_object = ensure_process_object(caller_pid, caller);
+            let sender = target.read().create_user_handle_for_object(sender_object);
+            Ok(KernelIoOp::MessageSendAwait {
+                target,
+                buffer,
+                sender,
                 user_token: op.user_token,
             })
         }
@@ -507,6 +878,12 @@ fn map_cq_error(err: CompletionQueueError) -> u64 {
         CompletionQueueError::RequestAlreadyComplete => {
             make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 1)
         }
+        CompletionQueueError::Closed => {
+            make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 2)
+        }
+        CompletionQueueError::DomainUnavailable => {
+            make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 3)
+        }
     }
 }
 
@@ -531,7 +908,18 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
         .read()
         .parent_pid;
 
-    let obj = match OBJECT_MANAGER.open_by_id(task_handle) {
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(program) => program,
+        None => {
+            return make_err(
+                ErrClass::Program,
+                ProgErr::NotFound as u16,
+                caller_pid as u32,
+            );
+        }
+    };
+
+    let obj = match caller.read().resolve_handle(task_handle) {
         Some(o) => o,
         None => {
             return make_err(
@@ -551,10 +939,20 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
             );
         }
     };
-    let _ = th.inner.read().parent_pid != caller_pid;
+    if th.inner.read().parent_pid != caller_pid {
+        return make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            task_handle as u32,
+        );
+    }
     let tid = th.task_id();
     match SCHEDULER.delete_task(tid) {
-        Ok(_) => 0,
+        Ok(_) => {
+            let _ = OBJECT_MANAGER.unlink_object(&obj);
+            obj.mark_dead();
+            0
+        }
         Err(_) => make_err(ErrClass::TaskClass, TaskErr::NotFound as u16, tid as u32),
     }
 }
@@ -603,10 +1001,166 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     SCHEDULER.add_task(task.clone());
 
     let obj = ensure_thread_object(caller_pid, &task);
-    obj.id
+    caller.read().create_user_handle_for_object(obj)
+}
+
+pub(crate) fn sys_executor_domain_create(
+    config_ptr: *const UserExecutorDomainCreate,
+) -> UserHandle {
+    if config_ptr.is_null()
+        || !user_ptr_ok(config_ptr, core::mem::size_of::<UserExecutorDomainCreate>())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let config = unsafe { *config_ptr };
+    if config.version != USER_EXECUTOR_ABI_VERSION
+        || config.profile != USER_EXECUTOR_PROFILE_GENERAL
+        || config.initial_queue_capacity == 0
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let resize_policy = match decode_resize_policy(config.resize_policy) {
+        Ok(policy) => policy,
+        Err(err) => return err,
+    };
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let cpu_count = platform::processor_count();
+    let domain_id =
+        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+            class: ExecutorDomainClass::ProcessIo,
+            max_active: if config.max_active_tasks == 0 {
+                usize::MAX
+            } else {
+                config.max_active_tasks
+            },
+            initial_queue_capacity: config.initial_queue_capacity,
+            interrupt_fallback_capacity: Some(cpu_count.max(1).saturating_mul(4)),
+            quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
+            weight: ExecutorDomainClass::ProcessIo.default_weight(),
+            resize_policy,
+            future_arena: Default::default(),
+        });
+    let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) else {
+        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
+    };
+    let user_domain = UserExecutorDomain::new(caller_pid, domain_id, domain);
+    let object = Object::new(
+        ObjectTag::ExecutorDomain,
+        ObjectPayload::ExecutorDomain(user_domain),
+    );
+    caller.read().create_user_handle_for_object(object)
+}
+
+pub(crate) fn sys_executor_domain_configure(
+    handle: UserHandle,
+    update_ptr: *const UserExecutorDomainUpdate,
+) -> u64 {
+    if update_ptr.is_null()
+        || !user_ptr_ok(update_ptr, core::mem::size_of::<UserExecutorDomainUpdate>())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let update = unsafe { *update_ptr };
+    if update.version != USER_EXECUTOR_ABI_VERSION
+        || update.fields == 0
+        || update.fields & !USER_EXECUTOR_UPDATE_ALL != 0
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, update.fields);
+    }
+    let replacement = if update.fields & USER_EXECUTOR_UPDATE_RESIZE_POLICY != 0 {
+        match decode_resize_policy(update.resize_policy) {
+            Ok(policy) => Some(policy),
+            Err(err) => return err,
+        }
+    } else {
+        None
+    };
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let domain = match resolve_executor_domain(
+        handle,
+        caller_pid,
+        &caller,
+        ObjectOperation::Configure,
+    ) {
+        Ok(domain) => domain,
+        Err(err) => return err,
+    };
+    if domain.is_draining() {
+        return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
+    }
+    let max_active = (update.fields & USER_EXECUTOR_UPDATE_MAX_ACTIVE != 0).then_some(
+        if update.max_active_tasks == 0 {
+            usize::MAX
+        } else {
+            update.max_active_tasks
+        },
+    );
+    match domain.update_config(replacement, max_active) {
+        ReplaceResizePolicyResult::Changed => {}
+        ReplaceResizePolicyResult::RetryLater => {
+            return make_err(ErrClass::Common, CommonErr::BufferTooSmall as u16, 0);
+        }
+        ReplaceResizePolicyResult::Rejected => {
+            return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+        }
+    }
+    0
+}
+
+pub(crate) fn sys_executor_domain_query(
+    handle: UserHandle,
+    info_ptr: *mut UserExecutorDomainInfo,
+) -> u64 {
+    if info_ptr.is_null()
+        || !user_ptr_ok(info_ptr, core::mem::size_of::<UserExecutorDomainInfo>())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let domain =
+        match resolve_executor_domain(handle, caller_pid, &caller, ObjectOperation::Observe) {
+            Ok(domain) => domain,
+            Err(err) => return err,
+        };
+    let stats = domain.stats();
+    let info = UserExecutorDomainInfo {
+        version: USER_EXECUTOR_ABI_VERSION,
+        profile: USER_EXECUTOR_PROFILE_GENERAL,
+        state: match stats.state {
+            ExecutorDomainState::Active => 0,
+            ExecutorDomainState::Draining => 1,
+            ExecutorDomainState::Dead => 2,
+        },
+        resize_policy_kind: encode_resize_policy(stats.resize_policy).kind,
+        max_active_tasks: (stats.max_active != usize::MAX)
+            .then_some(stats.max_active)
+            .unwrap_or(0),
+        initial_queue_capacity: stats.initial_queue_capacity,
+        queue_capacity: stats.queue_capacity,
+        queue_minimum_capacity: stats.queue_minimum_capacity,
+        queue_maximum_capacity: stats.queue_maximum_capacity.unwrap_or(0),
+        queued_tasks: stats.queued_count,
+        active_tasks: stats.active_count,
+        live_tasks: stats.live_task_count,
+        live_futures: stats.live_future_count,
+        live_future_bytes: stats.live_future_bytes,
+        resize_policy: encode_resize_policy(stats.resize_policy),
+    };
+    unsafe { info_ptr.write(info) };
+    0
 }
 
 pub(crate) fn sys_completion_queue_create(
+    executor_domain_handle: UserHandle,
     request_capacity: usize,
     completion_capacity: usize,
     flags: u64,
@@ -621,14 +1175,35 @@ pub(crate) fn sys_completion_queue_create(
     }
 
     ensure_process_object(caller_pid, &caller);
+    let executor_domain = match resolve_executor_domain(
+        executor_domain_handle,
+        caller_pid,
+        &caller,
+        ObjectOperation::Submit,
+    ) {
+        Ok(domain) if !domain.is_draining() => domain,
+        Ok(_) => {
+            return make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                executor_domain_handle as u32,
+            );
+        }
+        Err(err) => return err,
+    };
 
-    let queue = match CompletionQueue::new(caller_pid, request_capacity, completion_capacity, flags)
-    {
+    let queue = match CompletionQueue::new(
+        caller_pid,
+        executor_domain,
+        request_capacity,
+        completion_capacity,
+        flags,
+    ) {
         Ok(queue) => queue,
         Err(err) => return map_cq_error(err),
     };
 
-    let dir = alloc::format!("\\Process\\{}\\CompletionQueues", caller_pid);
+    let dir = alloc::format!("\\Process\\{}\\Resources\\CompletionQueues", caller_pid);
     if OBJECT_MANAGER.mkdir_p(dir.clone()).is_err() {
         return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
     }
@@ -659,7 +1234,7 @@ pub(crate) fn sys_io_enqueue(completion_queue_handle: UserHandle, op_ptr: *const
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -704,7 +1279,7 @@ pub(crate) fn sys_io_enqueue_many(
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -760,11 +1335,11 @@ pub(crate) fn sys_completion_poll(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
 
-    let (caller_pid, _) = match current_process() {
+    let (caller_pid, caller) = match current_process() {
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -791,11 +1366,11 @@ pub(crate) fn sys_completion_wait(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
 
-    let (caller_pid, _) = match current_process() {
+    let (caller_pid, caller) = match current_process() {
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -805,11 +1380,11 @@ pub(crate) fn sys_completion_wait(
 }
 
 pub(crate) fn sys_io_cancel(completion_queue_handle: UserHandle, request_id: RequestId) -> u64 {
-    let (caller_pid, _) = match current_process() {
+    let (caller_pid, caller) = match current_process() {
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -822,8 +1397,11 @@ pub(crate) fn sys_get_thread() -> UserHandle {
         .get_current_task(platform::current_cpu_id())
         .unwrap();
     let caller_pid = task.inner.read().parent_pid;
+    let Some(caller) = PROGRAM_MANAGER.get(caller_pid) else {
+        return 0;
+    };
     let obj = ensure_thread_object(caller_pid, &task);
-    obj.id
+    caller.read().create_user_handle_for_object(obj)
 }
 
 pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u64 {
@@ -848,20 +1426,22 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
             );
         }
     };
-    let sender_obj = ensure_process_object(sender_pid, &sender_prog);
-    msg.sender = Some(sender_obj.id);
-
-    let tgt = match OBJECT_MANAGER.open_by_id(target) {
+    let tgt = match sender_prog.read().resolve_handle(target) {
         Some(o) => o,
         None => return make_err(ErrClass::Message, MsgErr::TargetHandleInvalid as u16, 0),
     };
 
     match &tgt.payload {
         ObjectPayload::Program(ph) => {
+            let sender_obj = ensure_process_object(sender_pid, &sender_prog);
+            msg.sender = Some(ph.read().create_user_handle_for_object(sender_obj));
             ph.write().receive_message(msg.clone());
             0
         }
         ObjectPayload::Queue(qh) => {
+            // A bare queue has no owning process metadata yet, so sender
+            // authority cannot be installed into its receiver here.
+            msg.sender = None;
             qh.write().push_message(msg.clone());
             0
         }
@@ -912,7 +1492,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
             action: RoutingAction::Allow,
         },
         2 => {
-            let obj = match OBJECT_MANAGER.open_by_id(rule_u.queue_handle) {
+            let obj = match caller.read().resolve_handle(rule_u.queue_handle) {
                 Some(o) => o,
                 None => return make_err(ErrClass::Route, RouteErr::InvalidHandle as u16, 0),
             };
@@ -932,7 +1512,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
         }
         3 => {
             let qh_opt = if rule_u.queue_handle != 0 {
-                let o = match OBJECT_MANAGER.open_by_id(rule_u.queue_handle) {
+                let o = match caller.read().resolve_handle(rule_u.queue_handle) {
                     Some(o) => o,
                     None => return make_err(ErrClass::Route, RouteErr::InvalidHandle as u16, 0),
                 };
@@ -951,7 +1531,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
             };
 
             let th = {
-                let o = match OBJECT_MANAGER.open_by_id(rule_u.thread_handle) {
+                let o = match caller.read().resolve_handle(rule_u.thread_handle) {
                     Some(o) => o,
                     None => return make_err(ErrClass::Route, RouteErr::InvalidHandle as u16, 0),
                 };
@@ -1043,7 +1623,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
     let qref = if qh == 0 {
         ensure_default_queue_object(caller_pid, &prog).1
     } else {
-        let o = match OBJECT_MANAGER.open_by_id(qh) {
+        let o = match prog.read().resolve_handle(qh) {
             Some(o) => o,
             None => return make_err(ErrClass::Message, MsgErr::TargetHandleInvalid as u16, 0),
         };
@@ -1075,7 +1655,7 @@ pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
         None => return 0,
     };
     let (obj, _q) = ensure_default_queue_object(caller_pid, &prog);
-    obj.id
+    prog.read().create_user_handle_for_object(obj)
 }
 
 pub(crate) fn sys_create_mq() -> UserHandle {
@@ -1090,7 +1670,7 @@ pub(crate) fn sys_create_mq() -> UserHandle {
         None => return 0,
     };
 
-    let dir = alloc::format!("\\Process\\{}\\Queues", caller_pid);
+    let dir = alloc::format!("\\Process\\{}\\Resources\\Queues", caller_pid);
     let _ = OBJECT_MANAGER.mkdirp(dir.clone());
 
     let name = guid_to_string(&generate_guid());
@@ -1099,7 +1679,7 @@ pub(crate) fn sys_create_mq() -> UserHandle {
     ));
     let obj = Object::with_name(ObjectTag::Queue, name.clone(), ObjectPayload::Queue(qh));
     let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", dir, name), &obj);
-    obj.id
+    prog.read().create_user_handle_for_object(obj)
 }
 
 pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
@@ -1123,8 +1703,9 @@ pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
     let target_arc = if target_prog == 0 {
         caller.clone()
     } else {
-        match OBJECT_MANAGER
-            .open_by_id(target_prog)
+        match caller
+            .read()
+            .resolve_handle(target_prog)
             .and_then(|o| match &o.payload {
                 ObjectPayload::Program(ph) => Some(ph.clone()),
                 _ => None,
@@ -1160,4 +1741,279 @@ pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
         *va.as_mut_ptr::<u8>().add(bytes.len()) = 0;
     }
     va.as_u64()
+}
+
+fn object_tag_from_raw(raw: u32) -> Option<ObjectTag> {
+    match raw {
+        0 => Some(ObjectTag::Directory),
+        1 => Some(ObjectTag::Symlink),
+        2 => Some(ObjectTag::Generic),
+        3 => Some(ObjectTag::Program),
+        4 => Some(ObjectTag::Thread),
+        5 => Some(ObjectTag::Queue),
+        6 => Some(ObjectTag::CompletionQueue),
+        7 => Some(ObjectTag::File),
+        8 => Some(ObjectTag::Module),
+        9 => Some(ObjectTag::Device),
+        10 => Some(ObjectTag::IoBufferBacking),
+        11 => Some(ObjectTag::ExecutorDomain),
+        _ => None,
+    }
+}
+
+pub(crate) fn sys_object_acquire(
+    path_ptr: u64,
+    path_len: usize,
+    expected_tag: u32,
+    interface_bits: u64,
+) -> UserHandle {
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let path = match copy_user_string(path_ptr, path_len) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let normalized = path.replace('/', "\\").to_ascii_lowercase();
+    if !(normalized == "\\process"
+        || normalized.starts_with("\\process\\")
+        || normalized == "\\links"
+        || normalized.starts_with("\\links\\"))
+    {
+        return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+    }
+
+    let (object, available) = if normalized.starts_with("\\links\\") {
+        match OBJECT_MANAGER.namespace_entry(&path) {
+            Ok(entry) => match &entry.payload {
+                ObjectPayload::Symlink(link) => (link.target.clone(), link.exposed),
+                _ => {
+                    return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
+                }
+            },
+            Err(_) => {
+                return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
+            }
+        }
+    } else {
+        match OBJECT_MANAGER.open(&path) {
+            Ok(object) => {
+                let available = object.behavior().supported_interfaces();
+                (object, available)
+            }
+            Err(_) => {
+                return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
+            }
+        }
+    };
+    let Some(tag) = object_tag_from_raw(expected_tag) else {
+        return make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            expected_tag,
+        );
+    };
+    if object.tag != tag || !object.is_alive() {
+        return make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            expected_tag,
+        );
+    }
+    if normalized.starts_with("\\process\\") {
+        let owner_prefix = alloc::format!("\\process\\{}\\", caller_pid);
+        if !normalized.starts_with(&owner_prefix) && object.tag != ObjectTag::Program {
+            return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+        }
+    }
+
+    let requested = InterfaceMask::from_raw(tag, interface_bits);
+    if interface_bits == 0 || !available.contains(requested) {
+        return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+    }
+    if OBJECT_MANAGER
+        .policy()
+        .authorize(AccessContext { caller_pid }, object.behavior(), requested)
+        .is_err()
+    {
+        return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+    }
+
+    caller
+        .read()
+        .create_user_handle_with_interface(object, requested)
+}
+
+pub(crate) fn sys_object_close(handle: UserHandle) -> u64 {
+    let (_, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    if caller.read().close_user_handle(handle).is_some() {
+        0
+    } else {
+        make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )
+    }
+}
+
+pub(crate) fn sys_object_duplicate(handle: UserHandle, interface_bits: u64) -> UserHandle {
+    if interface_bits == 0 {
+        return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+    }
+    let (_, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let tag = match caller.read().resolve_handle(handle) {
+        Some(object) => object.tag,
+        None => {
+            return make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                handle as u32,
+            );
+        }
+    };
+    let duplicated = caller
+        .read()
+        .duplicate_user_handle(handle, InterfaceMask::from_raw(tag, interface_bits));
+    if duplicated == 0 {
+        make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        )
+    } else {
+        duplicated
+    }
+}
+
+pub(crate) fn sys_symlink_create(
+    name_ptr: u64,
+    name_len: usize,
+    target_handle: UserHandle,
+    exposed_bits: u64,
+) -> UserHandle {
+    let (_, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let relative = match copy_user_string(name_ptr, name_len) {
+        Ok(name) => name,
+        Err(err) => return err,
+    };
+    if relative.is_empty()
+        || relative.starts_with(['\\', '/'])
+        || relative
+            .split(['\\', '/'])
+            .any(|component| component == "..")
+    {
+        return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+    }
+
+    let entry = match caller.read().resolve_handle_entry(target_handle) {
+        Some(entry) => entry,
+        None => {
+            return make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                target_handle as u32,
+            );
+        }
+    };
+    let exposed = InterfaceMask::from_raw(entry.object.tag, exposed_bits);
+    if exposed_bits == 0 || !entry.interface.contains(exposed) {
+        return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+    }
+
+    let path = alloc::format!("\\Links\\Applications\\{}", relative);
+    let control = match OBJECT_MANAGER.symlink_object(&path, entry.object, exposed, true) {
+        Ok(control) => control,
+        Err(_) => return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0),
+    };
+    caller.read().create_user_handle_with_interface(
+        control,
+        InterfaceMask::from_raw(
+            ObjectTag::Symlink,
+            crate::object_manager::behavior::DESTROY_BIT,
+        ),
+    )
+}
+
+pub(crate) fn sys_symlink_withdraw(control_handle: UserHandle) -> u64 {
+    let (_, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let entry = match caller.read().resolve_handle_entry(control_handle) {
+        Some(entry) => entry,
+        None => {
+            return make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                control_handle as u32,
+            );
+        }
+    };
+    let required = InterfaceMask::from_raw(
+        ObjectTag::Symlink,
+        crate::object_manager::behavior::DESTROY_BIT,
+    );
+    if entry.object.tag != ObjectTag::Symlink || !entry.interface.contains(required) {
+        return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+    }
+    match OBJECT_MANAGER.unlink_object(&entry.object) {
+        Ok(()) => 0,
+        Err(_) => make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            control_handle as u32,
+        ),
+    }
+}
+
+pub(crate) fn sys_message_complete(delivery_handle: UserHandle, status: u64, result: u64) -> u64 {
+    let (_, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let delivery = {
+        let program = caller.read();
+        let Some(entry) = program.resolve_handle_entry(delivery_handle) else {
+            return make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                delivery_handle as u32,
+            );
+        };
+        if !entry
+            .object
+            .behavior()
+            .matches(entry.interface, ObjectOperation::Configure)
+        {
+            return make_err(ErrClass::Common, CommonErr::AccessDenied as u16, 0);
+        }
+        let Some(delivery) = entry.object.downcast_arc::<MessageDelivery>() else {
+            return make_err(ErrClass::Message, MsgErr::UnsupportedTargetType as u16, 0);
+        };
+        delivery
+    };
+    if !delivery.complete(crate::structs::io_request::IoRequestOutput {
+        status,
+        result,
+        extra: 0,
+    }) {
+        return make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            delivery_handle as u32,
+        );
+    }
+    let _ = caller.read().close_user_handle(delivery_handle);
+    0
 }

@@ -1,0 +1,16 @@
+schema = 1
+id = "windows"
+os = "windows"
+
+[qemu]
+executable_patterns = [
+    "C:/Program Files/qemu/{executable}w.exe",
+    "C:/Program Files/qemu/{executable}.exe",
+    "C:/Program Files (x86)/qemu/{executable}w.exe",
+    "C:/Program Files (x86)/qemu/{executable}.exe",
+]
+data_directories = [
+    "../qemu",
+    "C:/Program Files/qemu",
+    "C:/Program Files (x86)/qemu",
+]

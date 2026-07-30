@@ -22,7 +22,6 @@ use kernel_api::{
         pnp_create_child_devnode_and_pdo_with_init,
     },
     request_handler,
-    status::DriverStatus,
 };
 
 pub mod i8042;
@@ -46,15 +45,15 @@ pub struct Ps2ChildExt {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, ps2_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn ps2_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp = PnpOps::new();
     pnp.start_device.set(ps2_start);
     pnp.query_device_relations.set(ps2_query_devrels);
@@ -65,7 +64,7 @@ pub extern "C" fn ps2_device_add(
         have_kbd: AtomicBool::new(false),
         have_mouse: AtomicBool::new(false),
     });
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -73,7 +72,7 @@ pub async fn ps2_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if let Ok(ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
@@ -81,9 +80,9 @@ pub async fn ps2_start<'req, 'data, 'b>(
             ext.have_mouse.store(have_mouse, Ordering::Release);
         }
     } else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     }
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 #[request_handler]
@@ -91,24 +90,24 @@ pub async fn ps2_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     use kernel_api::pnp::DeviceRelationType;
     let relation = req.relation;
     if relation != DeviceRelationType::BusRelations {
-        return DriverStep::complete(DriverStatus::NotImplemented);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
     }
 
     let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
         }
     };
 
     let ext = match device.try_devext::<DevExt>() {
         Ok(g) => g,
         Err(_) => {
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
         }
     };
 
@@ -135,7 +134,7 @@ pub async fn ps2_query_devrels<'req, 'data, 'b>(
         );
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 fn make_child_pdo(
@@ -181,10 +180,10 @@ async fn ps2_child_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryId,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice)),
     };
 
     match req.id_type {
@@ -227,7 +226,7 @@ async fn ps2_child_query_id<'req, 'data, 'b>(
             );
         }
     }
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -235,6 +234,6 @@ async fn ps2_child_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Complete)
 }

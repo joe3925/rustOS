@@ -9,7 +9,7 @@ use std::process::exit;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-use crate::runtime::runtime::{block_on, spawn, JoinAll};
+use crate::runtime::runtime::{block_on, spawn_join_owned as spawn, JoinAll};
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener as TokioTcpListener;

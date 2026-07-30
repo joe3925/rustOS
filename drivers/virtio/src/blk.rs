@@ -19,7 +19,6 @@ pub const VIRTIO_STATUS_FAILED: u8 = 128;
 
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
-pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
 
 #[repr(C)]
 pub struct VirtioBlkReqHeader {
@@ -32,9 +31,6 @@ pub const VIRTIO_BLK_S_OK: u8 = 0;
 pub const VIRTIO_BLK_S_IOERR: u8 = 1;
 pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
-pub const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
-pub const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
-pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 /// Mandatory for modern virtio-pci devices.
 pub const VIRTIO_F_VERSION_1: u64 = 1u64 << 32;
@@ -57,12 +53,6 @@ pub struct DeviceInitResult {
     pub capacity: u64,
     /// Number of request queues supported by device (1 if MQ not supported).
     pub num_queues: u16,
-    /// Whether multiqueue feature was successfully negotiated.
-    pub mq_negotiated: bool,
-    /// Whether indirect descriptors were successfully negotiated.
-    pub indirect_desc_supported: bool,
-    /// Whether device cache flush requests were successfully negotiated.
-    pub flush_supported: bool,
 }
 
 /// Negotiate features and read device configuration.
@@ -118,15 +108,20 @@ pub(crate) unsafe fn init_device(
         };
         return Err("device does not advertise VIRTIO_F_ACCESS_PLATFORM");
     }
+    if unlikely(!indirect_supported) {
+        cold_path();
+        unsafe {
+            pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
+        };
+        return Err("device does not advertise VIRTIO_F_INDIRECT_DESC");
+    }
 
     // Negotiate VERSION_1 and other supported features
     let mut supported_features = VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM;
     if mq_supported {
         supported_features |= VIRTIO_BLK_F_MQ;
     }
-    if indirect_supported {
-        supported_features |= VIRTIO_F_INDIRECT_DESC;
-    }
+    supported_features |= VIRTIO_F_INDIRECT_DESC;
     if flush_supported {
         supported_features |= VIRTIO_BLK_F_FLUSH;
     }
@@ -168,9 +163,6 @@ pub(crate) unsafe fn init_device(
 
     // Check if features were actually negotiated
     let mq_negotiated = mq_supported && (driver_features & VIRTIO_BLK_F_MQ) != 0;
-    let indirect_negotiated = indirect_supported && (driver_features & VIRTIO_F_INDIRECT_DESC) != 0;
-    let flush_negotiated = flush_supported && (driver_features & VIRTIO_BLK_F_FLUSH) != 0;
-
     let capacity = unsafe {
         core::ptr::read_volatile(
             (device_cfg.as_u64() as *const u8).add(DEVCFG_CAPACITY) as *const u64
@@ -192,9 +184,6 @@ pub(crate) unsafe fn init_device(
     Ok(DeviceInitResult {
         capacity,
         num_queues,
-        mq_negotiated,
-        indirect_desc_supported: indirect_negotiated,
-        flush_supported: flush_negotiated,
     })
 }
 
@@ -305,7 +294,6 @@ impl BlkIoSlots {
             desc_count += 1;
 
             let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
-            let mut segment_count = 0usize;
             let mut segment_bytes = 0u64;
 
             for seg in data_segments {
@@ -326,7 +314,6 @@ impl BlkIoSlots {
                 (*table_ptr.add(desc_count)).next = (desc_count + 1) as u16;
 
                 desc_count += 1;
-                segment_count += 1;
                 segment_bytes = segment_bytes.saturating_add(seg.byte_len as u64);
             }
 
@@ -343,7 +330,7 @@ impl BlkIoSlots {
             desc_count += 1;
 
             let total_table_len = (desc_count * core::mem::size_of::<VirtqDesc>()) as u32;
-            unsafe { vq.push_allocated_indirect(head, indirect_phys, total_table_len) };
+            vq.push_allocated_indirect(head, indirect_phys, total_table_len);
         }
 
         Ok(head)

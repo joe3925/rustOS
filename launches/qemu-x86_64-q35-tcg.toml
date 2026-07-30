@@ -1,0 +1,42 @@
+schema = 1
+id = "qemu-x86_64-q35-tcg"
+provider = "qemu"
+executable = "qemu-system-x86_64"
+compatible_platforms = ["x86_64-uefi"]
+supported_hosts = ["windows", "macos", "linux"]
+firmware_files = [
+    "OVMF_X64.fd",
+    "OVMF_CODE.fd",
+    "edk2-x86_64-code.fd",
+    "edk2-x86_64-secure-code.fd",
+]
+args = [
+    "-m", "{memory}",
+    "-cpu", "qemu64,+apic,+acpi",
+    "-machine", "q35",
+    "-accel", "tcg",
+    "-smp", "{cpus}",
+    "-device", "amd-iommu,dma-remap=on,dma-translation=on",
+    "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",
+    "-serial", "{primary_serial}",
+    "-vga", "std",
+    "-drive", "file={boot_image},format=raw",
+    "-drive", "file={system_disk},if=none,format={system_disk_format},id=sysdisk",
+    "-device", "virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off,iommu_platform=on",
+]
+debug_args = [
+    "-S",
+    "-gdb", "tcp::{gdb_port}",
+]
+lldb_metadata_args = [
+    "-chardev", "socket,id=rustos_meta,host=127.0.0.1,port={meta_port},server=on,wait=off,nodelay=on",
+    "-serial", "chardev:rustos_meta",
+]
+
+[defaults]
+memory = "12G"
+cpus = "3"
+
+[capabilities]
+debug = true
+lldb_metadata = true

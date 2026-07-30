@@ -1,0 +1,56 @@
+schema = 1
+id = "aarch64-uefi"
+
+[kernel]
+manifest = "../kernel/Cargo.toml"
+package = "kernel"
+binary = "kernel"
+target = "../aarch64-rustos-kernel.json"
+import_library_machine = "ARM64"
+no_default_features = true
+features = ["allocator-mimalloc"]
+
+[drivers]
+target = "../drivers/aarch64-rustos-driver.json"
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/root/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/devicetree/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/acpi/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/pci/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/disk/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/partmgr/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/volmgr/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/mountmgr/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/fat32/Cargo.toml" }
+
+[[drivers.boot_packages]]
+source = { kind = "local-cargo", manifest = "../drivers/virtio/Cargo.toml" }
+
+[stub]
+manifest = "../boot/kernel_stub/Cargo.toml"
+package = "kernel_stub"
+binary = "kernel_stub"
+target = "aarch64-unknown-none"
+rustflags = "-C link-arg=-no-pie -C relocation-model=static -C code-model=large"
+
+[bootloader]
+provider = "local"
+firmware = "uefi"
+output = "boot.img"

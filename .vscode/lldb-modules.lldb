@@ -1,5 +1,5 @@
 # kernel
-target modules load --file kernel.efi .text 0xFFFF850000000000
+target modules load --file kernel.efi .text 0xFFFF800000000000
 
 # acpi.dll
 target modules add "${workspaceRoot}\\target\\DRIVERS\\acpi\\acpi.dll"

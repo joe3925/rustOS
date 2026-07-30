@@ -289,8 +289,17 @@ fn resolve_files(
         name,
         configuration: configuration.to_path_buf(),
         binary: binary.to_path_buf(),
+        debug_info: find_pdb(binary),
         source: provenance,
     })
+}
+
+fn find_pdb(binary: &Path) -> Option<PathBuf> {
+    let filename = binary.with_extension("pdb").file_name()?.to_owned();
+    let parent = binary.parent()?;
+    [parent.join(&filename), parent.join("deps").join(filename)]
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 pub fn cargo_artifact(

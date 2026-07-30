@@ -1,12 +1,13 @@
 use core::cmp::min;
-use core::hint::{cold_path, likely, unlikely};
+use core::hint::{cold_path, unlikely};
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, IoKind, Read, ReadIoBuffer, Seek, SeekFrom, Write, WriteIoBuffer};
+use kernel_api::error::{DriverErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::{
     kernel_types::{
-        async_ffi::{FfiFuture, FutureExt},
+        async_ffi::{AbiFuture, FutureExt},
         dma::{
             FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
             IoBufferBackingScratch, ToDevice,
@@ -16,10 +17,32 @@ use kernel_api::{
     pnp::io,
     println,
     request::{Read as ReadRequest, Write as WriteRequest},
-    status::DriverStatus,
 };
 
 use crate::volume::{METADATA_OWNER_ID, VolCtrlDevExt};
+
+#[derive(Clone, Debug)]
+pub struct FatIoError(pub KernelError);
+
+impl fatfs::IoError for FatIoError {
+    fn is_interrupted(&self) -> bool {
+        false
+    }
+
+    fn new_unexpected_eof_error() -> Self {
+        Self(
+            error(DriverErrorKind::DeviceError)
+                .with_context("unexpected end of the FAT32 block device"),
+        )
+    }
+
+    fn new_write_zero_error() -> Self {
+        Self(
+            error(DriverErrorKind::DeviceError)
+                .with_context("the FAT32 block device completed a zero-length write"),
+        )
+    }
+}
 
 pub struct BlockDev {
     volume: IoTarget,
@@ -31,21 +54,8 @@ pub struct BlockDev {
     io_scratch: Option<IoBufferBackingScratch>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BlkError {
-    InvalidInput,
-    Io,
-    Driver(DriverStatus),
-}
-
-impl From<DriverStatus> for BlkError {
-    fn from(v: DriverStatus) -> Self {
-        Self::Driver(v)
-    }
-}
-
 impl IoBase for BlockDev {
-    type Error = ();
+    type Error = FatIoError;
 }
 
 impl BlockDev {
@@ -87,7 +97,7 @@ impl BlockDev {
         offset: u64,
         dst: &mut [u8],
         _kind: IoKind,
-    ) -> Result<(), DriverStatus> {
+    ) -> Result<(), KernelError> {
         let volume = self.volume.clone();
         let len = dst.len();
         let scratch = self.take_io_scratch();
@@ -101,7 +111,9 @@ impl BlockDev {
             Err(_) => {
                 cold_path();
                 self.restore_io_scratch(IoBufferBackingScratch::new());
-                return Err(DriverStatus::InsufficientResources);
+                return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
+                    alloc::format!("creating FAT32 read backing at offset {offset} for {len} bytes")
+                });
             }
         };
 
@@ -110,41 +122,39 @@ impl BlockDev {
             Err(_) => {
                 cold_path();
                 self.restore_io_scratch(IoBufferBackingScratch::new());
-                return Err(DriverStatus::InvalidParameter);
+                return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                    alloc::format!(
+                        "creating FAT32 read I/O buffer at offset {offset} for {len} bytes"
+                    )
+                });
             }
         };
 
         let mut req = ReadRequest::new(offset, len, false, Some(buffer));
 
-        let status = io::send_down_stack(volume, &mut req).await;
+        let result = io::send_down_stack(volume, &mut req).await;
 
         drop(req);
 
         self.restore_io_scratch(backing.into_scratch());
 
-        if likely(status == DriverStatus::Success) {
-            Ok(())
-        } else {
-            cold_path();
-            println!("Read Error: {:#?}", status);
-            Err(status)
-        }
+        result.map(|_| ()).with_context(|| {
+            alloc::format!("reading FAT32 volume at offset {offset} for {len} bytes")
+        })
     }
 
     async fn send_read_iobuffer<'buffer>(
         &mut self,
         offset: u64,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> Result<usize, DriverStatus> {
+    ) -> Result<usize, KernelError> {
         let len = buffer.len();
         let mut req = ReadRequest::new(offset, len, false, Some(buffer));
-        let status = io::send_down_stack(self.volume.clone(), &mut req).await;
+        let result = io::send_down_stack(self.volume.clone(), &mut req).await;
         let completed = req.len;
-        if status == DriverStatus::Success {
-            Ok(completed)
-        } else {
-            Err(status)
-        }
+        result.map(|_| completed).with_context(|| {
+            alloc::format!("reading FAT32 I/O buffer at offset {offset} for {len} bytes")
+        })
     }
 
     async fn send_write_immut(
@@ -152,7 +162,7 @@ impl BlockDev {
         offset: u64,
         src: &[u8],
         _kind: IoKind,
-    ) -> Result<(), DriverStatus> {
+    ) -> Result<(), KernelError> {
         let no_buffer = false;
 
         let volume = self.volume.clone();
@@ -169,7 +179,11 @@ impl BlockDev {
             Err(_) => {
                 cold_path();
                 self.restore_io_scratch(IoBufferBackingScratch::new());
-                return Err(DriverStatus::InsufficientResources);
+                return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
+                    alloc::format!(
+                        "creating FAT32 write backing at offset {offset} for {len} bytes"
+                    )
+                });
             }
         };
 
@@ -178,7 +192,11 @@ impl BlockDev {
             Err(_) => {
                 cold_path();
                 self.restore_io_scratch(IoBufferBackingScratch::new());
-                return Err(DriverStatus::InvalidParameter);
+                return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                    alloc::format!(
+                        "creating FAT32 write I/O buffer at offset {offset} for {len} bytes"
+                    )
+                });
             }
         };
 
@@ -190,26 +208,22 @@ impl BlockDev {
             Some(buffer),
         );
 
-        let status = io::send_down_stack(volume, &mut req).await;
+        let result = io::send_down_stack(volume, &mut req).await;
 
         drop(req);
 
         self.restore_io_scratch(backing.into_scratch());
 
-        if likely(status == DriverStatus::Success) {
-            Ok(())
-        } else {
-            cold_path();
-            println!("Write Error: {:#?}", status);
-            Err(status)
-        }
+        result.map(|_| ()).with_context(|| {
+            alloc::format!("writing FAT32 volume at offset {offset} for {len} bytes")
+        })
     }
 
     async fn send_write_iobuffer<'buffer>(
         &mut self,
         offset: u64,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
-    ) -> Result<usize, DriverStatus> {
+    ) -> Result<usize, KernelError> {
         let len = buffer.len();
         let mut req = WriteRequest::new(
             offset,
@@ -218,16 +232,14 @@ impl BlockDev {
             self.current_owner.load(Ordering::Acquire),
             Some(buffer),
         );
-        let status = io::send_down_stack(self.volume.clone(), &mut req).await;
+        let result = io::send_down_stack(self.volume.clone(), &mut req).await;
         let completed = req.len;
-        if status == DriverStatus::Success {
-            Ok(completed)
-        } else {
-            Err(status)
-        }
+        result.map(|_| completed).with_context(|| {
+            alloc::format!("writing FAT32 I/O buffer at offset {offset} for {len} bytes")
+        })
     }
 
-    async fn read_bytes(&mut self, dst: &mut [u8], kind: IoKind) -> Result<usize, DriverStatus> {
+    async fn read_bytes(&mut self, dst: &mut [u8], kind: IoKind) -> Result<usize, KernelError> {
         if unlikely(dst.is_empty()) {
             cold_path();
             return Ok(0);
@@ -246,7 +258,7 @@ impl BlockDev {
         Ok(len)
     }
 
-    async fn write_bytes(&mut self, src: &[u8], kind: IoKind) -> Result<usize, DriverStatus> {
+    async fn write_bytes(&mut self, src: &[u8], kind: IoKind) -> Result<usize, KernelError> {
         if unlikely(src.is_empty()) {
             cold_path();
             return Ok(0);
@@ -276,8 +288,8 @@ impl Read for BlockDev {
         &'a mut self,
         buf: &'a mut [u8],
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
-        async move { self.read_bytes(buf, kind).await.map_err(|_| ()) }.into_ffi()
+    ) -> AbiFuture<Result<usize, Self::Error>> {
+        async move { self.read_bytes(buf, kind).await.map_err(FatIoError) }.into_abi()
     }
 }
 
@@ -286,12 +298,18 @@ impl Write for BlockDev {
         &'a mut self,
         buf: &'a [u8],
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
-        async move { self.write_bytes(buf, kind).await.map_err(|_| ()) }.into_ffi()
+    ) -> AbiFuture<Result<usize, Self::Error>> {
+        async move {
+            self.write_bytes(buf, kind)
+                .into_abi()
+                .await
+                .map_err(FatIoError)
+        }
+        .into_abi()
     }
 
-    fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move { Ok(()) }.into_ffi()
+    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
+        async move { Ok(()) }.into_abi()
     }
 }
 
@@ -300,7 +318,7 @@ impl ReadIoBuffer for BlockDev {
         &'a mut self,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
+    ) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             if buffer.is_empty() {
                 return Ok(0);
@@ -313,17 +331,25 @@ impl ReadIoBuffer for BlockDev {
             let buffer = if len == buffer.len() {
                 buffer
             } else {
-                buffer.split_at(len).map_err(|_| ())?.0
+                buffer
+                    .split_at(len)
+                    .map_err(|_| {
+                        FatIoError(
+                            error(DriverErrorKind::InvalidParameter)
+                                .with_context("splitting a FAT32 read I/O buffer"),
+                        )
+                    })?
+                    .0
             };
             let read = self
                 .send_read_iobuffer(self.pos, buffer)
                 .await
-                .map_err(|_| ())?;
+                .map_err(FatIoError)?;
             self.pos += read as u64;
             let _ = kind;
             Ok(read)
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 
@@ -332,7 +358,7 @@ impl WriteIoBuffer for BlockDev {
         &'a mut self,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         kind: IoKind,
-    ) -> FfiFuture<Result<usize, Self::Error>> {
+    ) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             if buffer.is_empty() {
                 return Ok(0);
@@ -345,17 +371,25 @@ impl WriteIoBuffer for BlockDev {
             let buffer = if len == buffer.len() {
                 buffer
             } else {
-                buffer.split_at(len).map_err(|_| ())?.0
+                buffer
+                    .split_at(len)
+                    .map_err(|_| {
+                        FatIoError(
+                            error(DriverErrorKind::InvalidParameter)
+                                .with_context("splitting a FAT32 write I/O buffer"),
+                        )
+                    })?
+                    .0
             };
             let written = self
                 .send_write_iobuffer(self.pos, buffer)
                 .await
-                .map_err(|_| ())?;
+                .map_err(FatIoError)?;
             self.pos += written as u64;
             let _ = kind;
             Ok(written)
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 
@@ -388,7 +422,10 @@ impl Seek for BlockDev {
                 let base = cap as i128 + off as i128;
                 if unlikely(base < 0) {
                     cold_path();
-                    return Err(());
+                    return Err(FatIoError(
+                        error(DriverErrorKind::InvalidParameter)
+                            .with_context("seeking before the start of a FAT32 volume"),
+                    ));
                 }
                 base as u64
             }
@@ -396,7 +433,10 @@ impl Seek for BlockDev {
                 let base = self.pos as i128 + off as i128;
                 if unlikely(base < 0) {
                     cold_path();
-                    return Err(());
+                    return Err(FatIoError(
+                        error(DriverErrorKind::InvalidParameter)
+                            .with_context("seeking before the current FAT32 position"),
+                    ));
                 }
                 base as u64
             }
@@ -404,7 +444,11 @@ impl Seek for BlockDev {
 
         if unlikely(new > cap) {
             cold_path();
-            return Err(());
+            return Err(FatIoError(
+                error(DriverErrorKind::InvalidParameter).with_context(alloc::format!(
+                    "seeking to FAT32 offset {new} beyond capacity {cap}"
+                )),
+            ));
         }
 
         self.pos = new;

@@ -48,7 +48,9 @@ use kernel_api::pnp::{
 };
 use kernel_api::request::{DeviceControl, Read, Write};
 use kernel_api::request_handler;
-use kernel_api::status::DriverStatus;
+use kernel_api::error::{
+    error, DriverErrorKind, ErrorKind, KernelError, ResultErrorContext,
+};
 use kernel_api::util::wait_duration;
 
 use dev_ext::{ControllerState, DevExt, Ports};
@@ -75,12 +77,8 @@ const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 10000;
 
-fn complete_req<K>(_req: &mut K, status: DriverStatus) -> DriverStep {
-    DriverStep::complete(status)
-}
-
-fn continue_req<K>(_req: &mut K) -> DriverStep {
-    DriverStep::Continue
+fn continue_req<K>(_req: &mut K) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Continue)
 }
 
 #[derive(Clone, Copy)]
@@ -276,36 +274,85 @@ pub struct ChildExt {
 
 struct IdePdoIo;
 
+#[derive(Clone, Copy)]
+struct IdeIoValidationError {
+    kind: DriverErrorKind,
+    offset: u64,
+    len: usize,
+    reason: &'static str,
+}
+
+impl IdeIoValidationError {
+    const fn new(
+        kind: DriverErrorKind,
+        offset: u64,
+        len: usize,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            kind,
+            offset,
+            len,
+            reason,
+        }
+    }
+}
+
 #[inline]
-fn ide_lba_sectors(offset: u64, len: usize) -> Result<Option<(u32, u32)>, DriverStatus> {
+fn ide_lba_sectors(
+    offset: u64,
+    len: usize,
+) -> Result<Option<(u32, u32)>, IdeIoValidationError> {
     if len == 0 {
         return Ok(None);
     }
 
     if (offset & 0x1ff) != 0 || (len & 0x1ff) != 0 {
-        return Err(DriverStatus::InvalidParameter);
+        return Err(IdeIoValidationError::new(
+            DriverErrorKind::InvalidParameter,
+            offset,
+            len,
+            "offset or length is not 512-byte aligned",
+        ));
     }
 
     let sector_count = len >> 9;
     if sector_count == 0 || sector_count > u32::MAX as usize {
-        return Err(DriverStatus::InvalidParameter);
+        return Err(IdeIoValidationError::new(
+            DriverErrorKind::InvalidParameter,
+            offset,
+            len,
+            "sector count does not fit in u32",
+        ));
     }
 
     let lba = offset >> 9;
     let sectors = sector_count as u32;
 
     let Some(end_lba) = lba.checked_add(sectors as u64) else {
-        return Err(DriverStatus::InvalidParameter);
+        return Err(IdeIoValidationError::new(
+            DriverErrorKind::InvalidParameter,
+            offset,
+            len,
+            "LBA range overflowed",
+        ));
     };
 
     if end_lba > (1u64 << 28) {
-        return Err(DriverStatus::InvalidParameter);
+        return Err(IdeIoValidationError::new(
+            DriverErrorKind::InvalidParameter,
+            offset,
+            len,
+            "LBA range exceeds IDE LBA28",
+        ));
     }
 
     Ok(Some((lba as u32, sectors)))
 }
 
-fn validate_ide_read_chain<'data>(first: &Read<'data>) -> Result<bool, DriverStatus> {
+fn validate_ide_read_chain<'data>(
+    first: &Read<'data>,
+) -> Result<bool, IdeIoValidationError> {
     let mut any = false;
 
     for read in first.iter() {
@@ -314,15 +361,30 @@ fn validate_ide_read_chain<'data>(first: &Read<'data>) -> Result<bool, DriverSta
         };
 
         if read.no_buffer {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(IdeIoValidationError::new(
+                DriverErrorKind::InvalidParameter,
+                read.offset,
+                read.len,
+                "read requested no buffer",
+            ));
         }
 
         let Some(buffer) = read.buffer.as_ref() else {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(IdeIoValidationError::new(
+                DriverErrorKind::InvalidParameter,
+                read.offset,
+                read.len,
+                "read buffer is missing",
+            ));
         };
 
         if read_buffer_cursor(buffer, read.len).is_none() {
-            return Err(DriverStatus::InsufficientResources);
+            return Err(IdeIoValidationError::new(
+                DriverErrorKind::InsufficientResources,
+                read.offset,
+                read.len,
+                "read buffer cannot be represented as physical runs",
+            ));
         }
 
         any = true;
@@ -331,7 +393,9 @@ fn validate_ide_read_chain<'data>(first: &Read<'data>) -> Result<bool, DriverSta
     Ok(any)
 }
 
-fn validate_ide_write_chain<'data>(first: &Write<'data>) -> Result<bool, DriverStatus> {
+fn validate_ide_write_chain<'data>(
+    first: &Write<'data>,
+) -> Result<bool, IdeIoValidationError> {
     let mut any = false;
 
     for write in first.iter() {
@@ -340,15 +404,30 @@ fn validate_ide_write_chain<'data>(first: &Write<'data>) -> Result<bool, DriverS
         };
 
         if write.no_buffer {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(IdeIoValidationError::new(
+                DriverErrorKind::InvalidParameter,
+                write.offset,
+                write.len,
+                "write requested no buffer",
+            ));
         }
 
         let Some(buffer) = write.buffer.as_ref() else {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(IdeIoValidationError::new(
+                DriverErrorKind::InvalidParameter,
+                write.offset,
+                write.len,
+                "write buffer is missing",
+            ));
         };
 
         if write_buffer_cursor(buffer, write.len).is_none() {
-            return Err(DriverStatus::InsufficientResources);
+            return Err(IdeIoValidationError::new(
+                DriverErrorKind::InsufficientResources,
+                write.offset,
+                write.len,
+                "write buffer cannot be represented as physical runs",
+            ));
         }
 
         any = true;
@@ -362,36 +441,55 @@ impl DeviceRead for IdePdoIo {
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut Read<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
-            Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+            Err(_) => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "reading from an IDE PDO without IDE child state")
+            }
         };
 
         if !cdx.present.load(Ordering::Acquire) {
-            return complete_req(req, DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::NoSuchDevice))
+                .with_context(|| "reading from an IDE disk that is no longer present");
         }
 
         let parent = match cdx.parent_device.upgrade() {
             Some(p) => p,
-            None => return complete_req(req, DriverStatus::NoSuchDevice),
+            None => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "reading from an IDE disk whose controller was removed")
+            }
         };
 
         let dx = match parent.try_devext::<DevExt>() {
             Ok(dx) => dx,
-            Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+            Err(_) => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "reading from an IDE disk whose controller state is missing")
+            }
         };
 
         let any = {
             let r = &*req;
             match validate_ide_read_chain(&r) {
                 Ok(any) => any,
-                Err(status) => return complete_req(req, status),
+                Err(validation) => {
+                    return Err(error(validation.kind)).with_context(|| {
+                        alloc::format!(
+                            "validating IDE read at offset {} with length {}: {}",
+                            validation.offset,
+                            validation.len,
+                            validation.reason
+                        )
+                    })
+                }
             }
         };
 
         if !any {
-            return complete_req(req, DriverStatus::Success);
+            return Ok(DriverStep::Complete);
         }
 
         let dh = cdx.dh.load(Ordering::Acquire);
@@ -399,7 +497,7 @@ impl DeviceRead for IdePdoIo {
 
         let mut ctrl = dx.controller.lock().await;
         let mut chain_index = 0usize;
-        let mut read_status = DriverStatus::Success;
+        let mut read_error: Option<KernelError> = None;
 
         loop {
             let next = {
@@ -416,19 +514,29 @@ impl DeviceRead for IdePdoIo {
                     let (lba, sectors) = match ide_lba_sectors(read.offset, read.len) {
                         Ok(Some(v)) => v,
                         Ok(None) => continue,
-                        Err(status) => {
-                            out = Err(status);
+                        Err(validation) => {
+                            out = Err(validation);
                             break;
                         }
                     };
 
                     let Some(buffer) = read.buffer.as_ref() else {
-                        out = Err(DriverStatus::InvalidParameter);
+                        out = Err(IdeIoValidationError::new(
+                            DriverErrorKind::InvalidParameter,
+                            read.offset,
+                            read.len,
+                            "read buffer disappeared after validation",
+                        ));
                         break;
                     };
 
                     let Some(cursor) = read_buffer_cursor(buffer, read.len) else {
-                        out = Err(DriverStatus::InsufficientResources);
+                        out = Err(IdeIoValidationError::new(
+                            DriverErrorKind::InsufficientResources,
+                            read.offset,
+                            read.len,
+                            "read physical-run mapping disappeared after validation",
+                        ));
                         break;
                     };
 
@@ -441,8 +549,15 @@ impl DeviceRead for IdePdoIo {
 
             let Some((lba, sectors, cursor)) = (match next {
                 Ok(v) => v,
-                Err(status) => {
-                    read_status = status;
+                Err(validation) => {
+                    read_error = Some(error(validation.kind).with_context(
+                        alloc::format!(
+                            "preparing IDE read at offset {} with length {}: {}",
+                            validation.offset,
+                            validation.len,
+                            validation.reason
+                        )
+                    ));
                     break;
                 }
             }) else {
@@ -450,14 +565,21 @@ impl DeviceRead for IdePdoIo {
             };
 
             if !ata_pio_read_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
-                read_status = DriverStatus::Unsuccessful;
+                read_error = Some(error(DriverErrorKind::DeviceError).with_context(
+                    alloc::format!(
+                        "IDE PIO read failed at LBA {lba} for {sectors} sectors"
+                    )
+                ));
                 break;
             }
         }
 
         drop(ctrl);
 
-        complete_req(req, read_status)
+        match read_error {
+            Some(err) => Err(err).with_context(|| "executing an IDE PIO read"),
+            None => Ok(DriverStep::Complete),
+        }
     }
 }
 
@@ -466,36 +588,55 @@ impl DeviceWrite for IdePdoIo {
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut Write<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
-            Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+            Err(_) => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "writing to an IDE PDO without IDE child state")
+            }
         };
 
         if !cdx.present.load(Ordering::Acquire) {
-            return complete_req(req, DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::NoSuchDevice))
+                .with_context(|| "writing to an IDE disk that is no longer present");
         }
 
         let parent = match cdx.parent_device.upgrade() {
             Some(p) => p,
-            None => return complete_req(req, DriverStatus::NoSuchDevice),
+            None => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "writing to an IDE disk whose controller was removed")
+            }
         };
 
         let dx = match parent.try_devext::<DevExt>() {
             Ok(dx) => dx,
-            Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+            Err(_) => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "writing to an IDE disk whose controller state is missing")
+            }
         };
 
         let any = {
             let r = &*req;
             match validate_ide_write_chain(&r) {
                 Ok(any) => any,
-                Err(status) => return complete_req(req, status),
+                Err(validation) => {
+                    return Err(error(validation.kind)).with_context(|| {
+                        alloc::format!(
+                            "validating IDE write at offset {} with length {}: {}",
+                            validation.offset,
+                            validation.len,
+                            validation.reason
+                        )
+                    })
+                }
             }
         };
 
         if !any {
-            return complete_req(req, DriverStatus::Success);
+            return Ok(DriverStep::Complete);
         }
 
         let dh = cdx.dh.load(Ordering::Acquire);
@@ -503,7 +644,7 @@ impl DeviceWrite for IdePdoIo {
 
         let mut ctrl = dx.controller.lock().await;
         let mut chain_index = 0usize;
-        let mut write_status = DriverStatus::Success;
+        let mut write_error: Option<KernelError> = None;
 
         loop {
             let next = {
@@ -520,19 +661,29 @@ impl DeviceWrite for IdePdoIo {
                     let (lba, sectors) = match ide_lba_sectors(write.offset, write.len) {
                         Ok(Some(v)) => v,
                         Ok(None) => continue,
-                        Err(status) => {
-                            out = Err(status);
+                        Err(validation) => {
+                            out = Err(validation);
                             break;
                         }
                     };
 
                     let Some(buffer) = write.buffer.as_ref() else {
-                        out = Err(DriverStatus::InvalidParameter);
+                        out = Err(IdeIoValidationError::new(
+                            DriverErrorKind::InvalidParameter,
+                            write.offset,
+                            write.len,
+                            "write buffer disappeared after validation",
+                        ));
                         break;
                     };
 
                     let Some(cursor) = write_buffer_cursor(buffer, write.len) else {
-                        out = Err(DriverStatus::InsufficientResources);
+                        out = Err(IdeIoValidationError::new(
+                            DriverErrorKind::InsufficientResources,
+                            write.offset,
+                            write.len,
+                            "write physical-run mapping disappeared after validation",
+                        ));
                         break;
                     };
 
@@ -545,8 +696,15 @@ impl DeviceWrite for IdePdoIo {
 
             let Some((lba, sectors, cursor)) = (match next {
                 Ok(v) => v,
-                Err(status) => {
-                    write_status = status;
+                Err(validation) => {
+                    write_error = Some(error(validation.kind).with_context(
+                        alloc::format!(
+                            "preparing IDE write at offset {} with length {}: {}",
+                            validation.offset,
+                            validation.len,
+                            validation.reason
+                        )
+                    ));
                     break;
                 }
             }) else {
@@ -554,14 +712,21 @@ impl DeviceWrite for IdePdoIo {
             };
 
             if !ata_pio_write_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
-                write_status = DriverStatus::Unsuccessful;
+                write_error = Some(error(DriverErrorKind::DeviceError).with_context(
+                    alloc::format!(
+                        "IDE PIO write failed at LBA {lba} for {sectors} sectors"
+                    )
+                ));
                 break;
             }
         }
 
         drop(ctrl);
 
-        complete_req(req, write_status)
+        match write_error {
+            Some(err) => Err(err).with_context(|| "executing an IDE PIO write"),
+            None => Ok(DriverStep::Complete),
+        }
     }
 }
 
@@ -570,24 +735,34 @@ impl DeviceControlHandler for IdePdoIo {
     async fn handler<'req, 'data, 'b>(
         pdo: &Arc<DeviceObject>,
         req: &'b mut DeviceControl<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let cdx = match pdo.try_devext::<ChildExt>() {
             Ok(x) => x,
-            Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+            Err(_) => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "controlling an IDE PDO without IDE child state")
+            }
         };
 
         if !cdx.present.load(Ordering::Acquire) {
-            return complete_req(req, DriverStatus::NoSuchDevice);
+            return Err(error(DriverErrorKind::NoSuchDevice))
+                .with_context(|| "controlling an IDE disk that is no longer present");
         }
 
         let parent: Arc<DeviceObject> = match cdx.parent_device.upgrade() {
             Some(p) => p,
-            None => return complete_req(req, DriverStatus::NoSuchDevice),
+            None => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "controlling an IDE disk whose controller was removed")
+            }
         };
 
         let dx = match parent.try_devext::<DevExt>() {
             Ok(dx) => dx,
-            Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
+            Err(_) => {
+                return Err(error(DriverErrorKind::NoSuchDevice))
+                    .with_context(|| "controlling an IDE disk whose controller state is missing")
+            }
         };
 
         let code = { req.code };
@@ -605,26 +780,28 @@ impl DeviceControlHandler for IdePdoIo {
                 drop(ctrl);
 
                 if ok {
-                    complete_req(req, DriverStatus::Success)
+                    Ok(DriverStep::Complete)
                 } else {
-                    complete_req(req, DriverStatus::Unsuccessful)
+                    Err(error(DriverErrorKind::DeviceError))
+                        .with_context(|| "flushing the IDE disk cache")
                 }
             }
-            _ => complete_req(req, DriverStatus::NotImplemented),
+            _ => Err(error(DriverErrorKind::NotImplemented))
+                .with_context(|| alloc::format!("handling IDE device-control code {code:#010x}")),
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, ide_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn ide_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut vt = PnpOps::new();
 
     vt.init_complete.set(ide_init_complete);
@@ -635,7 +812,7 @@ pub extern "C" fn ide_device_add(
 
     dev_init.set_dev_ext_from(DevExt::new(0x1F0, 0x3F4));
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -643,10 +820,37 @@ async fn ide_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut InitComplete,
-) -> DriverStep {
-    let proto = open_protocol_to_next_lower::<PciProtocol>(dev).ok();
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    let proto = match open_protocol_to_next_lower::<PciProtocol>(dev) {
+        Ok(proto) => Some(proto),
+        Err(DriverErrorKind::NoSuchDevice) => None,
+        Err(error_kind) => {
+            return Err(error(error_kind))
+                .with_context(|| "opening the lower PCI protocol for an IDE controller")
+        }
+    };
 
-    if proto.is_some() || pnp::send_next_lower(dev.clone(), &mut QueryResources { resources: ResourceSet::default() }).await != DriverStatus::NoSuchDevice {
+    let use_pci_resources = if proto.is_some() {
+        true
+    } else {
+        match pnp::send_next_lower(
+            dev.clone(),
+            &mut QueryResources {
+                resources: ResourceSet::default(),
+            },
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(err) if err.kind() == ErrorKind::Driver(DriverErrorKind::NoSuchDevice) => false,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| "querying resources from the next lower IDE device")
+            }
+        }
+    };
+
+    if use_pci_resources {
         let bars = parse_ide_bars(proto.as_ref());
 
         let dx = dev.try_devext::<DevExt>().expect("ide: FDO DevExt missing");
@@ -704,12 +908,12 @@ async fn ide_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let relation = req.relation;
 
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(dev);
-        return complete_req(req, DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
 
     continue_req(req)
@@ -817,12 +1021,16 @@ const DISK_INFO_VTABLE: DiskInfoProtocolVTable = DiskInfoProtocolVTable {
     query: ide_disk_info,
 };
 
-extern "C" fn ide_disk_info(device: &Arc<DeviceObject>) -> Result<DiskInfo, DriverStatus> {
-    let cdx = device.try_devext::<ChildExt>().map_err(|_| DriverStatus::NoSuchDevice)?;
+extern "C" fn ide_disk_info(device: &Arc<DeviceObject>) -> Result<DiskInfo, KernelError> {
+    let cdx = device
+        .try_devext::<ChildExt>()
+        .map_err(|_| error(DriverErrorKind::NoSuchDevice))
+        .with_context(|| "accessing IDE disk protocol state")?;
     if let Some(di) = cdx.disk_info {
         Ok(di)
     } else {
-        Err(DriverStatus::Unsuccessful)
+        Err(error(DriverErrorKind::Unsuccessful))
+            .with_context(|| "querying IDE disk geometry")
     }
 }
 
@@ -1300,7 +1508,7 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryId,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     use QueryIdType::*;
 
     match req.id_type {
@@ -1328,7 +1536,7 @@ pub async fn ide_pdo_query_id<'req, 'data, 'b>(
         }
     }
 
-    complete_req(req, DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -1336,12 +1544,16 @@ pub async fn ide_pdo_start<'req, 'data, 'b>(
     _pdo: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if let Some(dn) = _pdo.dev_node.get() {
         if let Some(dn) = dn.upgrade() {
-            register_protocol::<DiskInfoProtocol>(_pdo, &DISK_INFO_VTABLE);
-            publish_stack_protocol::<DiskInfoProtocol>(&dn);
+            register_protocol::<DiskInfoProtocol>(_pdo, &DISK_INFO_VTABLE)
+                .map_err(error)
+                .with_context(|| "registering the IDE disk-info protocol")?;
+            publish_stack_protocol::<DiskInfoProtocol>(&dn)
+                .map_err(error)
+                .with_context(|| "publishing the IDE disk-info protocol")?;
         }
     }
-    complete_req(req, DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }

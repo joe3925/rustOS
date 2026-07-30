@@ -5,11 +5,13 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const CPU_SET_WORD_BITS: usize = u64::BITS as usize;
-const CPU_SET_WORDS: usize =
-    (crate::platform::MAX_CPUS + CPU_SET_WORD_BITS - 1) / CPU_SET_WORD_BITS;
+const CPU_SET_WORDS: usize = (MAX_CPUS + CPU_SET_WORD_BITS - 1) / CPU_SET_WORD_BITS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainId(pub u16);
+
+pub const KERNEL_DOMAIN_ID: DomainId = DomainId(0);
+pub const USER_DOMAIN_ID: DomainId = DomainId(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnqueueReason {
@@ -89,7 +91,6 @@ impl CpuSet {
 }
 
 pub trait DomainOps: Send + Sync {
-    fn id(&self) -> DomainId;
     fn name(&self) -> &'static str;
     fn contains_cpu(&self, cpu_id: usize) -> bool;
 
@@ -132,7 +133,7 @@ pub trait SchedulerClass: Send + Sync + 'static {
     );
 
     fn pick_next(&self, cpu_id: usize, cpu: &Self::CpuState, now_cycles: u64)
-        -> Option<TaskHandle>;
+    -> Option<TaskHandle>;
 
     fn on_switch_out(
         &self,
@@ -160,7 +161,6 @@ pub trait SchedulerClass: Send + Sync + 'static {
 }
 
 pub struct Domain<C: SchedulerClass> {
-    id: DomainId,
     name: &'static str,
     cpus: CpuSet,
     class: C,
@@ -169,14 +169,12 @@ pub struct Domain<C: SchedulerClass> {
 
 impl<C: SchedulerClass> Domain<C> {
     pub fn new(
-        id: DomainId,
         name: &'static str,
         cpus: CpuSet,
         class: C,
         per_cpu: Box<[Option<C::CpuState>]>,
     ) -> Self {
         Self {
-            id,
             name,
             cpus,
             class,
@@ -195,11 +193,6 @@ impl<C: SchedulerClass> Domain<C> {
 
 impl<C: SchedulerClass> DomainOps for Domain<C> {
     #[inline(always)]
-    fn id(&self) -> DomainId {
-        self.id
-    }
-
-    #[inline(always)]
     fn name(&self) -> &'static str {
         self.name
     }
@@ -210,7 +203,7 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
     }
 
     fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize {
-        task.with_class_state(self.id, |task_state: &C::TaskState| {
+        task.with_class_state(|task_state: &C::TaskState| {
             let cpu_id = self
                 .class
                 .select_cpu(
@@ -242,7 +235,7 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
         now_cycles: u64,
         outcome: SwitchOutOutcome,
     ) {
-        task.with_class_state(self.id, |task_state: &C::TaskState| {
+        task.with_class_state(|task_state: &C::TaskState| {
             self.class.on_switch_out(
                 cpu_id,
                 self.cpu_state(cpu_id),
@@ -271,7 +264,7 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
 pub trait DomainAlgorithm: Send + Sync {
     fn pick_next(
         &self,
-        domains: &[Box<dyn DomainOps>],
+        domains: &[DomainEntry],
         per_cpu_cursor: &[AtomicUsize],
         cpu_id: usize,
         now_cycles: u64,
@@ -283,7 +276,7 @@ pub struct RoundRobinDomainAlgorithm;
 impl DomainAlgorithm for RoundRobinDomainAlgorithm {
     fn pick_next(
         &self,
-        domains: &[Box<dyn DomainOps>],
+        domains: &[DomainEntry],
         per_cpu_cursor: &[AtomicUsize],
         cpu_id: usize,
         now_cycles: u64,
@@ -300,7 +293,7 @@ impl DomainAlgorithm for RoundRobinDomainAlgorithm {
 
         for offset in 0..domains.len() {
             let idx = (start + offset) % domains.len();
-            let domain = &domains[idx];
+            let domain = &domains[idx].ops;
 
             if !domain.contains_cpu(cpu_id) {
                 continue;
@@ -316,11 +309,22 @@ impl DomainAlgorithm for RoundRobinDomainAlgorithm {
     }
 }
 
+pub struct DomainEntry {
+    id: DomainId,
+    ops: Box<dyn DomainOps>,
+}
+
+impl DomainEntry {
+    pub fn new(id: DomainId, ops: Box<dyn DomainOps>) -> Self {
+        Self { id, ops }
+    }
+}
+
 pub struct DomainMaster<A>
 where
     A: DomainAlgorithm,
 {
-    domains: Box<[Box<dyn DomainOps>]>,
+    domains: Box<[DomainEntry]>,
     per_cpu_cursor: Box<[AtomicUsize]>,
     algorithm: A,
 }
@@ -329,7 +333,7 @@ impl<A> DomainMaster<A>
 where
     A: DomainAlgorithm + Default,
 {
-    pub fn new(domains: Box<[Box<dyn DomainOps>]>, cpu_count: usize) -> Self {
+    pub fn new(domains: Box<[DomainEntry]>, cpu_count: usize) -> Self {
         let mut per_cpu_cursor = Vec::with_capacity(cpu_count);
         for _ in 0..cpu_count {
             per_cpu_cursor.push(AtomicUsize::new(0));
@@ -342,12 +346,34 @@ where
         }
     }
 
-    pub fn get(&self, id: DomainId) -> &dyn DomainOps {
+    fn get(&self, id: DomainId) -> &dyn DomainOps {
         self.domains
             .iter()
-            .find(|domain| domain.id() == id)
-            .map(|domain| domain.as_ref())
+            .find(|domain| domain.id == id)
+            .map(|domain| domain.ops.as_ref())
             .unwrap_or_else(|| panic!("unknown scheduler domain {:?}", id))
+    }
+
+    pub fn enqueue(
+        &self,
+        id: DomainId,
+        task: TaskHandle,
+        reason: EnqueueReason,
+        hint_cpu: usize,
+    ) -> usize {
+        self.get(id).enqueue(task, reason, hint_cpu)
+    }
+
+    pub fn on_switch_out(
+        &self,
+        id: DomainId,
+        task: &TaskHandle,
+        cpu_id: usize,
+        now_cycles: u64,
+        outcome: SwitchOutOutcome,
+    ) {
+        self.get(id)
+            .on_switch_out(task, cpu_id, now_cycles, outcome);
     }
 
     pub fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
@@ -357,7 +383,7 @@ where
 
     pub fn maybe_balance(&self, current_tick: usize) {
         for domain in self.domains.iter() {
-            domain.maybe_balance(current_tick);
+            domain.ops.maybe_balance(current_tick);
         }
     }
 }

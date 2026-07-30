@@ -3,10 +3,11 @@ use crate::registry::reg::{get_value, list_keys};
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use kernel_types::device::DriverPackage;
+use kernel_types::error::KernelError;
 use kernel_types::fs::Path;
 use kernel_types::pnp::BootType;
 use kernel_types::pnp::DriverRole;
-use kernel_types::status::{Data, RegError};
+use kernel_types::status::Data;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchClass {
     Exact,
@@ -105,7 +106,7 @@ pub fn escape_key(s: &str) -> String {
     out
 }
 
-pub async fn build_hw_index() -> Result<HwIndex, RegError> {
+pub async fn build_hw_index() -> Result<HwIndex, KernelError> {
     let mut idx = HwIndex::new();
     let services_root = "SYSTEM/CurrentControlSet/Services";
     let service_keys = list_keys(services_root).await?;

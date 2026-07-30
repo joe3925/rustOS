@@ -1,50 +1,55 @@
 use alloc::sync::Arc;
 
-use crate::async_ffi::{FfiFuture, FutureExt};
+use crate::async_ffi::{AbiFuture, FutureExt};
 use crate::device::DeviceObject;
 use crate::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
+use crate::error::{DriverErrorKind, KernelError};
 use crate::io::{
-    DeviceControlHandler, DeviceFlush, DeviceOps, DeviceRead, DeviceWrite, TreiberStack,
+    DeviceControlHandler, DeviceControlOp, DeviceFlush, DeviceFlushOp, DeviceOps, DeviceRead,
+    DeviceReadOp, DeviceWrite, DeviceWriteOp, TreiberStack,
 };
 use crate::pnp::DriverStep;
 use crate::request::{DeviceControl, Flush, IoctlData, Read, Write};
-use crate::status::DriverStatus;
 
 extern "C" fn read_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut Read<'_>,
     len: usize,
-) -> FfiFuture<DriverStep> {
+) -> AbiFuture<Result<DriverStep, KernelError>> {
     async move {
         if len == 4 {
-            DriverStep::complete(DriverStatus::Success)
+            Ok(DriverStep::Complete)
         } else {
-            DriverStep::complete(DriverStatus::InvalidParameter)
+            Err(KernelError::from_parts(
+                DriverErrorKind::InvalidParameter.into(),
+                None,
+                None,
+            ))
         }
     }
-    .into_ffi()
+    .into_abi()
 }
 
 extern "C" fn write_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut Write<'_>,
     _len: usize,
-) -> FfiFuture<DriverStep> {
-    async { DriverStep::Continue }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Continue) }.into_abi()
 }
 
 extern "C" fn device_control_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut DeviceControl<'_>,
-) -> FfiFuture<DriverStep> {
-    async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Complete) }.into_abi()
 }
 
 extern "C" fn flush_handler(
     _dev: &Arc<DeviceObject>,
     _request: &mut Flush,
-) -> FfiFuture<DriverStep> {
-    async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
+) -> AbiFuture<Result<DriverStep, KernelError>> {
+    async { Ok(DriverStep::Complete) }.into_abi()
 }
 
 struct TestRead;
@@ -55,7 +60,7 @@ impl DeviceRead for TestRead {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Read<'data>,
-    ) -> FfiFuture<DriverStep> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         let len = request.len;
         read_handler(dev, request, len)
     }
@@ -67,7 +72,7 @@ impl DeviceWrite for TestWrite {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Write<'data>,
-    ) -> FfiFuture<DriverStep> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         let len = request.len;
         write_handler(dev, request, len)
     }
@@ -79,7 +84,7 @@ impl DeviceFlush for TestFlush {
     extern "C" fn handler<'a>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut Flush,
-    ) -> FfiFuture<DriverStep> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         flush_handler(dev, request)
     }
 }
@@ -90,7 +95,7 @@ impl DeviceControlHandler for TestDeviceControl {
     extern "C" fn handler<'a, 'data>(
         dev: &'a Arc<DeviceObject>,
         request: &'a mut DeviceControl<'data>,
-    ) -> FfiFuture<DriverStep> {
+    ) -> AbiFuture<Result<DriverStep, KernelError>> {
         device_control_handler(dev, request)
     }
 }
@@ -118,10 +123,10 @@ fn device_ops_registers_typed_handlers() {
     let mut ops = DeviceOps::empty();
 
     assert!(ops.read.as_handler().is_none());
-    ops.read.register::<TestRead>();
-    ops.write.register::<TestWrite>();
-    ops.flush.register::<TestFlush>();
-    ops.device_control.register::<TestDeviceControl>();
+    ops.register::<DeviceReadOp, TestRead>();
+    ops.register::<DeviceWriteOp, TestWrite>();
+    ops.register::<DeviceFlushOp, TestFlush>();
+    ops.register::<DeviceControlOp, TestDeviceControl>();
 
     assert_eq!(ops.read.as_handler().unwrap().depth, 1);
     assert_eq!(ops.write.as_handler().unwrap().depth, 0);

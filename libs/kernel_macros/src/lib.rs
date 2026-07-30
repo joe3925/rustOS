@@ -886,15 +886,18 @@ fn validate_function(sig: &syn::Signature) -> syn::Result<()> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 sig,
-                "#[request_handler] function must return DriverStep",
+                "#[request_handler] function must return Result<DriverStep, KernelError>",
             ));
         }
         ReturnType::Type(_, ty) => {
             let type_str = quote::quote!(#ty).to_string();
-            if !type_str.contains("DriverStep") {
+            if !type_str.contains("Result")
+                || !type_str.contains("DriverStep")
+                || !type_str.contains("KernelError")
+            {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "#[request_handler] function must return DriverStep",
+                    "#[request_handler] function must return Result<DriverStep, KernelError>",
                 ));
             }
         }
@@ -916,16 +919,18 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     sig.asyncness = None;
     sig.abi = Some(syn::parse_str("extern \"C\"").expect("Failed to parse C ABI"));
 
-    // Set the return type to FfiFuture<DriverStep>
+    // Set the return type to AbiFuture<Result<DriverStep, KernelError>>.
     sig.output = syn::parse_quote!(
-        -> ::kernel_api::async_ffi::FfiFuture< ::kernel_api::pnp::DriverStep>
+        -> ::kernel_api::async_ffi::AbiFuture<
+            Result<::kernel_api::pnp::DriverStep, ::kernel_api::error::KernelError>
+        >
     );
 
     let original_stmts = &body.stmts;
 
     let new_body = quote! {
         {
-            ::kernel_api::async_ffi::FutureExt::into_ffi(
+            ::kernel_api::async_ffi::FutureExt::into_abi(
                 async move {
                     let _bench_span = {
                         let __obj: u64 = #obj_expr;
@@ -959,14 +964,16 @@ fn transform_impl_function(func: &mut ImplItemFn) -> TokenStream2 {
     sig.asyncness = None;
     sig.abi = Some(syn::parse_str("extern \"C\"").expect("Failed to parse C ABI"));
     sig.output = syn::parse_quote!(
-        -> ::kernel_api::async_ffi::FfiFuture< ::kernel_api::pnp::DriverStep>
+        -> ::kernel_api::async_ffi::AbiFuture<
+            Result<::kernel_api::pnp::DriverStep, ::kernel_api::error::KernelError>
+        >
     );
 
     let original_stmts = &body.stmts;
 
     let new_body = quote! {
         {
-            ::kernel_api::async_ffi::FutureExt::into_ffi(
+            ::kernel_api::async_ffi::FutureExt::into_abi(
                 async move {
                     let _bench_span = {
                         let __obj: u64 = #obj_expr;

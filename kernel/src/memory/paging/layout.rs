@@ -23,6 +23,14 @@ pub fn managed_kernel_range_end() -> VirtAddr {
     kernel_virtual_layout().managed_kernel_range_end
 }
 
+pub fn heap_range_start() -> VirtAddr {
+    kernel_virtual_layout().heap_range_start
+}
+
+pub fn heap_range_end() -> VirtAddr {
+    kernel_virtual_layout().heap_range_end
+}
+
 pub fn mmio_base() -> VirtAddr {
     kernel_virtual_layout().mmio_base
 }

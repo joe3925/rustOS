@@ -1,38 +1,6 @@
-use alloc::boxed::Box;
-use core::marker::PhantomData;
-use core::mem::{ManuallyDrop, forget, transmute_copy};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
-use crate::platform::JobFn;
-use crate::sync::Arc;
-
-use super::slab::{
-    decode_joinable_slab_ptr, decode_slab_ptr, encode_joinable_slab_ptr, encode_slab_ptr,
-    enqueue_joinable_slab_task, enqueue_slab_task, get_task_slab, joinable_slab_poll_trampoline,
-    slab_poll_trampoline,
-};
-use super::task::TaskPoll;
-
-// Bit 0 and 1 are reserved for slab pointers. Use bit 2 to tag Arc-based executor wakers.
-const TASK_WAKER_TAG: usize = 0b100;
-const TASK_WAKER_MASK: usize = !TASK_WAKER_TAG;
-
-#[inline]
-fn is_tagged(ptr: usize) -> bool {
-    ptr & TASK_WAKER_TAG != 0
-}
-
-#[inline]
-fn tag_arc_ptr<T>(arc: Arc<T>) -> *const () {
-    Arc::into_raw(arc)
-        .cast::<()>()
-        .map_addr(|addr| addr | TASK_WAKER_TAG)
-}
-
-#[inline]
-unsafe fn untag_ptr<T>(ptr: *const ()) -> *const T {
-    ptr.map_addr(|addr| addr & TASK_WAKER_MASK).cast::<T>()
-}
+use super::slab::{decode_slab_task_ptr, encode_slab_task_ptr, enqueue_slab_task, get_task_table};
 
 #[inline]
 fn encoded_to_waker_ptr(encoded: usize) -> *const () {
@@ -44,101 +12,6 @@ fn waker_ptr_to_encoded(ptr: *const ()) -> usize {
     ptr.addr()
 }
 
-/// Creates a waker from an Arc<T: TaskPoll>, transferring the Arc's refcount.
-pub fn create_from_task_poll<T: TaskPoll + 'static>(task: Arc<T>) -> Waker {
-    let vtable = vtable_for::<T>();
-    let ptr = tag_arc_ptr(task);
-    unsafe { Waker::from_raw(RawWaker::new(ptr, &vtable.raw)) }
-}
-
-struct TaskWakerVtableHolder<T>(PhantomData<T>);
-
-impl<T: TaskPoll + 'static> TaskWakerVtableHolder<T> {
-    const VTABLE: TaskWakerVtable = TaskWakerVtable {
-        raw: RawWakerVTable::new(
-            clone_waker::<T>,
-            wake::<T>,
-            wake_by_ref::<T>,
-            drop_waker::<T>,
-        ),
-        inline_poll: poll_trampoline_inline::<T>,
-        clone_ctx: clone_ctx::<T>,
-        drop_ctx: drop_ctx::<T>,
-    };
-}
-
-fn vtable_for<T: TaskPoll + 'static>() -> &'static TaskWakerVtable {
-    &TaskWakerVtableHolder::<T>::VTABLE
-}
-
-unsafe fn clone_waker<T: TaskPoll + 'static>(ptr: *const ()) -> RawWaker {
-    Arc::increment_strong_count(untag_ptr::<T>(ptr));
-    RawWaker::new(ptr, &vtable_for::<T>().raw)
-}
-
-unsafe fn wake<T: TaskPoll + 'static>(ptr: *const ()) {
-    let arc = Arc::from_raw(untag_ptr::<T>(ptr));
-    arc.enqueue();
-}
-
-unsafe fn wake_by_ref<T: TaskPoll + 'static>(ptr: *const ()) {
-    let arc = ManuallyDrop::new(Arc::from_raw(untag_ptr::<T>(ptr)));
-    arc.enqueue();
-}
-
-unsafe fn drop_waker<T: TaskPoll + 'static>(ptr: *const ()) {
-    drop(Arc::from_raw(untag_ptr::<T>(ptr)));
-}
-
-unsafe extern "C" fn clone_ctx<T: TaskPoll + 'static>(ptr: *const ()) {
-    Arc::increment_strong_count(untag_ptr::<T>(ptr));
-}
-
-unsafe extern "C" fn drop_ctx<T: TaskPoll + 'static>(ctx: usize) {
-    drop(Arc::from_raw(untag_ptr::<T>(ctx as *const ())));
-}
-
-extern "C" fn wake_waker_trampoline(ctx: usize) {
-    // ctx holds Box<Waker>
-    let w = unsafe { &*(ctx as *const Waker) };
-    w.wake_by_ref();
-}
-
-unsafe extern "C" fn drop_waker_ctx(ctx: usize) {
-    drop(Box::from_raw(ctx as *mut Waker));
-}
-
-extern "C" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
-    // Borrow the continuation's ref without consuming it. run_continuation
-    // will call drop_fn to release the ref after we return.
-    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(untag_ptr::<T>(ctx as *const ())) });
-
-    if arc.is_completed() {
-        return;
-    }
-
-    // Atomically IDLE -> POLLING. If it fails, someone else owns this task, so
-    // treat this as a regular wake to record the notification instead of
-    // dropping it.
-    if !arc.try_start_inline_poll() {
-        arc.enqueue();
-        return;
-    }
-
-    // We are now in POLLING state. poll_once_inline handles the rest
-    // (polling the future, then transitioning to IDLE/COMPLETED/re-enqueue on NOTIFIED).
-    // Clone the Arc so poll_once_inline has its own owned ref.
-    Arc::clone(&arc).poll_once_inline();
-}
-
-#[repr(C)]
-pub struct TaskWakerVtable {
-    pub raw: RawWakerVTable,
-    pub inline_poll: JobFn,
-    pub clone_ctx: unsafe extern "C" fn(*const ()),
-    pub drop_ctx: unsafe extern "C" fn(usize),
-}
-
 static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     slab_clone_waker,
     slab_wake,
@@ -146,11 +19,8 @@ static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     slab_drop_waker,
 );
 
-pub fn create_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-    let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-    // No refcount increment — the slot is kept alive by structural anchor refs
-    // (init_and_enqueue, enqueue_slab_task, poll_once NOTIFIED re-enqueue, etc.).
-    // Waker clone/drop/wake are all refcount-free.
+pub fn create_slab_task_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
+    let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
     unsafe {
         Waker::from_raw(RawWaker::new(
             encoded_to_waker_ptr(encoded),
@@ -160,23 +30,20 @@ pub fn create_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) ->
 }
 
 unsafe fn slab_clone_waker(ptr: *const ()) -> RawWaker {
-    // No refcount change — clones are lightweight borrowed views.
     RawWaker::new(ptr, &SLAB_WAKER_VTABLE)
 }
 
 unsafe fn slab_wake(ptr: *const ()) {
     let encoded = waker_ptr_to_encoded(ptr);
-    if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
+    if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(encoded) {
         enqueue_slab_task(shard_idx, local_idx, generation);
-        // No refcount decrement — enqueue_slab_task manages its own anchor ref.
     }
 }
 
 unsafe fn slab_wake_by_ref(ptr: *const ()) {
     let encoded = waker_ptr_to_encoded(ptr);
-    if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
+    if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(encoded) {
         enqueue_slab_task(shard_idx, local_idx, generation);
-        // Don't decrement ref count - wake_by_ref doesn't consume the waker
     }
 }
 
@@ -184,59 +51,9 @@ unsafe fn slab_drop_waker(_ptr: *const ()) {
     // No-op — slot lifetime is managed by structural anchor refs, not waker clones.
 }
 
+#[allow(dead_code)]
 unsafe extern "C" fn drop_slab_ctx(ctx: usize) {
-    if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(ctx) {
-        get_task_slab().decrement_ref(shard_idx, local_idx, generation);
-    }
-}
-
-// ============================================================================
-// Joinable slab waker - for slab-backed tasks that return a value
-// ============================================================================
-
-static JOINABLE_SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    joinable_slab_clone_waker,
-    joinable_slab_wake,
-    joinable_slab_wake_by_ref,
-    joinable_slab_drop_waker,
-);
-
-/// Creates a waker for a joinable slab task. Waker operations are refcount-free.
-pub fn create_joinable_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-    let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-    unsafe {
-        Waker::from_raw(RawWaker::new(
-            encoded_to_waker_ptr(encoded),
-            &JOINABLE_SLAB_WAKER_VTABLE,
-        ))
-    }
-}
-
-unsafe fn joinable_slab_clone_waker(ptr: *const ()) -> RawWaker {
-    // No refcount change — clones are lightweight borrowed views
-    RawWaker::new(ptr, &JOINABLE_SLAB_WAKER_VTABLE)
-}
-
-unsafe fn joinable_slab_wake(ptr: *const ()) {
-    let encoded = waker_ptr_to_encoded(ptr);
-    if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(encoded) {
-        enqueue_joinable_slab_task(shard_idx, local_idx, generation);
-    }
-}
-
-unsafe fn joinable_slab_wake_by_ref(ptr: *const ()) {
-    let encoded = waker_ptr_to_encoded(ptr);
-    if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(encoded) {
-        enqueue_joinable_slab_task(shard_idx, local_idx, generation);
-    }
-}
-
-unsafe fn joinable_slab_drop_waker(_ptr: *const ()) {
-    // No-op — slot lifetime is managed by structural anchor refs, not waker clones
-}
-
-unsafe extern "C" fn drop_joinable_slab_ctx(ctx: usize) {
-    if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(ctx) {
-        get_task_slab().decrement_joinable_ref(shard_idx, local_idx, generation);
+    if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(ctx) {
+        get_task_table().decrement_ref(shard_idx, local_idx, generation);
     }
 }

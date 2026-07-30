@@ -1,4 +1,5 @@
 mod artifacts;
+mod bench;
 mod config;
 mod driver;
 
@@ -6,7 +7,7 @@ use artifacts::{
     ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel,
     PublishedSdk, StubArtifact,
 };
-use config::BuildPlan;
+use config::{BuildPlan, HostPlan, LaunchPlan};
 use serde::Serialize;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -38,17 +39,32 @@ fn try_main() -> Result<(), String> {
                 .platform
                 .as_deref()
                 .ok_or_else(|| "build requires --platform NAME|FILE".to_string())?;
-            let plan = config::load(&root, platform)?;
-            build_platform(&root, &plan, options.release, options.offline).map(|_| ())
+            let plan = config::load_platform(&root, platform)?;
+            build_platform(
+                &root,
+                &plan,
+                options.release,
+                options.offline,
+                &options.kernel_features,
+            )
+            .map(|_| ())
         }
         CliCommand::Qemu(options) => {
             let platform = options
                 .platform
                 .as_deref()
                 .ok_or_else(|| "qemu requires --platform NAME|FILE".to_string())?;
-            let plan = config::load(&root, platform)?;
-            run_qemu(&root, &plan, options)
+            let launch = options
+                .launch
+                .as_deref()
+                .ok_or_else(|| "qemu requires --launch NAME|FILE".to_string())?;
+            let plan = config::load_platform(&root, platform)?;
+            let launch = config::load_launch(&root, launch)?;
+            let host_selector = options.host.as_deref().unwrap_or(std::env::consts::OS);
+            let host = config::load_host(&root, host_selector)?;
+            run_qemu(&root, &plan, &launch, &host, options)
         }
+        CliCommand::Bench(command) => bench::execute(&root, command),
     }
 }
 
@@ -59,19 +75,20 @@ struct Cli {
 enum CliCommand {
     Build(BuildOptions),
     Qemu(QemuOptions),
+    Bench(bench::BenchCommand),
 }
 
 struct BuildOptions {
     release: bool,
     offline: bool,
     platform: Option<String>,
+    kernel_features: Vec<String>,
 }
 
 struct QemuOptions {
     release: bool,
     debug: bool,
     detach: bool,
-    no_build: bool,
     dry_run: bool,
     console_serial: bool,
     gdb_port: u16,
@@ -79,8 +96,9 @@ struct QemuOptions {
     lldb_meta: bool,
     /// TCP port for the COM2 LLDB metadata socket.
     meta_port: u16,
-    offline: bool,
     platform: Option<String>,
+    launch: Option<String>,
+    host: Option<String>,
 }
 
 impl Cli {
@@ -96,6 +114,7 @@ impl Cli {
                 let mut release = false;
                 let mut offline = false;
                 let mut platform = None;
+                let mut kernel_features = Vec::new();
 
                 while let Some(arg) = args.next() {
                     match arg.as_str() {
@@ -107,9 +126,14 @@ impl Cli {
                                 "--platform requires a name or TOML path".to_string()
                             })?);
                         }
+                        "--kernel-feature" => {
+                            kernel_features.push(args.next().ok_or_else(|| {
+                                "--kernel-feature requires a feature name".to_string()
+                            })?);
+                        }
                         "-h" | "--help" => return Err(usage()),
                         other => {
-                            return Err(format!("unknown build argument `{other}`\n\n{}", usage()))
+                            return Err(format!("unknown build argument `{other}`\n\n{}", usage()));
                         }
                     }
                 }
@@ -119,6 +143,7 @@ impl Cli {
                         release,
                         offline,
                         platform,
+                        kernel_features,
                     }),
                 })
             }
@@ -128,14 +153,14 @@ impl Cli {
                     release: false,
                     debug: false,
                     detach: false,
-                    no_build: false,
                     dry_run: false,
                     console_serial: false,
                     gdb_port: DEFAULT_GDB_PORT,
                     lldb_meta: false,
                     meta_port: DEFAULT_META_PORT,
-                    offline: false,
                     platform: None,
+                    launch: None,
+                    host: None,
                 };
 
                 while let Some(arg) = args.next() {
@@ -143,7 +168,6 @@ impl Cli {
                         "--release" => options.release = true,
                         "--debug" => options.debug = true,
                         "--detach" => options.detach = true,
-                        "--no-build" => options.no_build = true,
                         "--dry-run" => options.dry_run = true,
                         "--console-serial" => options.console_serial = true,
                         "--gdb-port" => {
@@ -163,15 +187,24 @@ impl Cli {
                                 .parse()
                                 .map_err(|_| format!("invalid meta port `{port}`"))?;
                         }
-                        "--offline" => options.offline = true,
                         "--platform" => {
                             options.platform = Some(args.next().ok_or_else(|| {
                                 "--platform requires a name or TOML path".to_string()
                             })?);
                         }
+                        "--launch" => {
+                            options.launch = Some(args.next().ok_or_else(|| {
+                                "--launch requires a name or TOML path".to_string()
+                            })?);
+                        }
+                        "--host" => {
+                            options.host = Some(args.next().ok_or_else(|| {
+                                "--host requires a name or TOML path".to_string()
+                            })?);
+                        }
                         "-h" | "--help" => return Err(usage()),
                         other => {
-                            return Err(format!("unknown qemu argument `{other}`\n\n{}", usage()))
+                            return Err(format!("unknown qemu argument `{other}`\n\n{}", usage()));
                         }
                     }
                 }
@@ -184,6 +217,12 @@ impl Cli {
                     command: CliCommand::Qemu(options),
                 })
             }
+            Some("bench") => {
+                args.next();
+                bench::parse(args).map(|command| Self {
+                    command: CliCommand::Bench(command),
+                })
+            }
             Some("-h" | "--help") => Err(usage()),
             Some(other) => Err(format!("unknown command `{other}`\n\n{}", usage())),
             None => Err(usage()),
@@ -194,19 +233,20 @@ impl Cli {
 fn usage() -> String {
     [
         "usage:",
-        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline]",
-        "  cargo run -p xtask -- qemu --platform NAME|FILE [--debug] [--detach] [--console-serial] [--no-build] [--dry-run] [--release] [--offline] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
+        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
+        "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
+        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
+        "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "",
         "environment:",
-        "  RUSTOS_QEMU       QEMU executable name or path; overrides runner.executable",
+        "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",
         "  RUSTOS_FIRMWARE   direct firmware path; bypasses candidate discovery",
-        "  RUSTOS_FIRMWARE_CANDIDATES path-list overriding runner.firmware_candidates",
-        "  RUSTOS_FIRMWARE_FILES_FROM_QEMU path-list overriding runner.firmware_files_from_qemu",
+        "  RUSTOS_FIRMWARE_CANDIDATES path-list prepended to host firmware discovery",
+        "  RUSTOS_FIRMWARE_FILES_FROM_QEMU path-list overriding launch firmware filenames",
         "  RUSTOS_DISK       path to an existing system disk image",
         "  RUSTOS_DISK_FORMAT disk format for RUSTOS_DISK, e.g. raw or vhdx",
         "                    defaults to rustOS.vhdx on Windows, rustOS.dmg elsewhere",
-        "  RUSTOS_QEMU_ACCEL QEMU accelerator, overrides the default",
-        "  RUSTOS_QEMU_MEMORY QEMU memory size, defaults to 8G",
+        "  RUSTOS_QEMU_MEMORY QEMU memory size, overrides launch defaults",
         "  RUSTOS_QEMU_SMP   QEMU CPU count",
         "  RUSTOS_QEMU_SERIAL QEMU serial backend used unless --console-serial is passed",
         "",
@@ -219,32 +259,30 @@ fn usage() -> String {
     .join("\n")
 }
 
-fn run_qemu(root: &Path, plan: &BuildPlan, options: QemuOptions) -> Result<(), String> {
+fn run_qemu(
+    root: &Path,
+    plan: &BuildPlan,
+    launch: &LaunchPlan,
+    host: &HostPlan,
+    options: QemuOptions,
+) -> Result<(), String> {
     if options.detach && options.console_serial {
         return Err("--console-serial cannot be used with --detach".to_string());
     }
 
-    if !options.no_build {
-        build_platform(root, plan, options.release, options.offline)?;
-    }
-
-    let boot_image = artifact_root(root, plan, options.release)
-        .join("image")
-        .join(&plan.bootloader.output);
-    let qemu = find_qemu(plan)?;
-    let firmware = find_firmware(plan, &qemu)?;
+    validate_launch(plan, launch, host, &options)?;
+    let artifacts = load_artifact_manifest(root, plan, options.release)?;
+    let boot_image = artifacts.boot_image.clone();
+    let qemu = find_qemu(launch, host)?;
+    let firmware = find_firmware(launch, host, &qemu)?;
     let system_disk = system_disk(root)?;
-    let args = qemu_args(
-        root,
-        plan,
-        &qemu,
-        &firmware,
-        &boot_image,
-        &system_disk,
-        &options,
-    )?;
+    let args = qemu_args(root, launch, &firmware, &boot_image, &system_disk, &options)?;
 
     assert_exists(&boot_image, "boot image")?;
+
+    if options.debug {
+        write_lldb_commands(root, &artifacts, &options)?;
+    }
 
     if options.dry_run {
         print_command(&qemu, &args);
@@ -263,13 +301,14 @@ fn build_platform(
     plan: &BuildPlan,
     release: bool,
     offline: bool,
+    kernel_features: &[String],
 ) -> Result<BootArtifact, String> {
     let output = artifact_root(root, plan, release);
     fs::create_dir_all(&output)
         .map_err(|err| format!("failed to create {}: {err}", output.display()))?;
 
     println!("==> building kernel");
-    let kernel_artifact = build_kernel(root, plan, release)?;
+    let kernel_artifact = build_kernel(root, plan, release, kernel_features)?;
 
     println!("==> generating kernel SDK");
     let sdk = create_kernel_sdk(root, plan, release)?;
@@ -279,6 +318,7 @@ fn build_platform(
 
     println!("==> publishing drivers");
     publish_drivers(&output, &mut drivers)?;
+    let debug_search_paths = vec![output.join("drivers")];
 
     println!("==> writing boot package manifest");
     let package_manifest = write_boot_package_manifest(&output, &drivers)?;
@@ -302,6 +342,7 @@ fn build_platform(
         &drivers,
         &stub,
         &boot,
+        &debug_search_paths,
     )?;
 
     Ok(boot)
@@ -313,7 +354,12 @@ fn artifact_root(root: &Path, plan: &BuildPlan, release: bool) -> PathBuf {
         .join(profile(release))
 }
 
-fn build_kernel(root: &Path, plan: &BuildPlan, release: bool) -> Result<KernelArtifact, String> {
+fn build_kernel(
+    root: &Path,
+    plan: &BuildPlan,
+    release: bool,
+    extra_features: &[String],
+) -> Result<KernelArtifact, String> {
     let (package_id, package_name) = driver::cargo_package_identity(&plan.kernel.manifest)?;
     if package_name != plan.kernel.package {
         return Err(format!(
@@ -340,6 +386,18 @@ fn build_kernel(root: &Path, plan: &BuildPlan, release: bool) -> Result<KernelAr
             root.join("target/cargo").join(&plan.id).join("kernel"),
         );
 
+    if plan.kernel.no_default_features {
+        kernel.arg("--no-default-features");
+    }
+    let mut features = plan.kernel.features.clone();
+    for feature in extra_features {
+        if !features.contains(feature) {
+            features.push(feature.clone());
+        }
+    }
+    if !features.is_empty() {
+        kernel.arg("--features").arg(features.join(","));
+    }
     if release {
         kernel.arg("--release");
     }
@@ -353,14 +411,15 @@ fn build_kernel(root: &Path, plan: &BuildPlan, release: bool) -> Result<KernelAr
     let output = artifact_root(root, plan, release).join("kernel");
     let published = output.join("kernel.exe");
     copy_artifact(&kernel_pe, &published, "kernel PE")?;
-    let pdb = kernel_pe.with_extension("pdb");
-    let published_pdb = if pdb.is_file() {
+
+    let published_pdb = if let Some(pdb) = find_pdb(&kernel_pe) {
         let destination = output.join("kernel.pdb");
         copy_artifact(&pdb, &destination, "kernel PDB")?;
         Some(destination)
     } else {
         None
     };
+
     Ok(KernelArtifact {
         pe: published,
         debug_info: published_pdb,
@@ -485,8 +544,12 @@ fn generate_kernel_def(root: &Path, def_path: &Path) -> Result<(), String> {
     let exports_path = root.join("kernel").join("src").join("exports.rs");
     let contents = fs::read_to_string(&exports_path)
         .map_err(|err| format!("failed to read {}: {err}", exports_path.display()))?;
-    let start = contents
+    let export_macro = contents
+        .find("export!")
+        .ok_or_else(|| "missing `export!` macro".to_string())?;
+    let start = contents[export_macro..]
         .find('{')
+        .map(|offset| export_macro + offset)
         .ok_or_else(|| "missing opening `{` in export! macro".to_string())?;
     let end = contents
         .rfind('}')
@@ -551,6 +614,13 @@ fn publish_drivers(
             &configuration,
             "driver configuration",
         )?;
+        package.debug_info = if let Some(pdb) = &package.debug_info {
+            let destination = directory.join(format!("{}.pdb", package.name));
+            copy_artifact(pdb, &destination, "driver PDB")?;
+            Some(destination)
+        } else {
+            None
+        };
         package.binary = binary;
         package.configuration = configuration;
     }
@@ -566,10 +636,11 @@ fn publish_artifact_manifest(
     drivers: &[artifacts::DriverPackageArtifact],
     stub: &StubArtifact,
     boot: &BootArtifact,
+    debug_search_paths: &[PathBuf],
 ) -> Result<(), String> {
     let relative = |path: &Path| path.strip_prefix(output).unwrap_or(path).to_path_buf();
     let manifest = ArtifactManifest {
-        schema: 1,
+        schema: 2,
         platform: plan.id.clone(),
         profile: profile(release).to_string(),
         kernel: PublishedKernel {
@@ -588,9 +659,11 @@ fn publish_artifact_manifest(
             .map(|mut package| {
                 package.configuration = relative(&package.configuration);
                 package.binary = relative(&package.binary);
+                package.debug_info = package.debug_info.as_deref().map(relative);
                 package
             })
             .collect(),
+        debug_search_paths: debug_search_paths.to_vec(),
     };
     let encoded = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("failed to encode artifact manifest: {err}"))?;
@@ -714,7 +787,171 @@ fn copy_artifact(source: &Path, destination: &Path, what: &str) -> Result<(), St
     Ok(())
 }
 
-fn find_qemu(plan: &BuildPlan) -> Result<PathBuf, String> {
+fn find_pdb(binary: &Path) -> Option<PathBuf> {
+    let filename = binary.with_extension("pdb").file_name()?.to_owned();
+    let parent = binary.parent()?;
+    [parent.join(&filename), parent.join("deps").join(filename)]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+struct ResolvedArtifacts {
+    kernel: PathBuf,
+    boot_image: PathBuf,
+    debug_search_paths: Vec<PathBuf>,
+}
+
+fn validate_launch(
+    plan: &BuildPlan,
+    launch: &LaunchPlan,
+    host: &HostPlan,
+    options: &QemuOptions,
+) -> Result<(), String> {
+    if !launch
+        .compatible_platforms
+        .iter()
+        .any(|platform| platform == &plan.id)
+    {
+        return Err(format!(
+            "launch `{}` is not compatible with platform `{}`",
+            launch.id, plan.id
+        ));
+    }
+    if !launch.supported_hosts.iter().any(|name| name == &host.os) {
+        return Err(format!(
+            "launch `{}` does not support host OS `{}` selected by host configuration `{}`",
+            launch.id, host.os, host.id
+        ));
+    }
+    if !launch.supported_host_arches.is_empty()
+        && !launch
+            .supported_host_arches
+            .iter()
+            .any(|arch| arch == std::env::consts::ARCH)
+    {
+        return Err(format!(
+            "launch `{}` does not support host architecture `{}`",
+            launch.id,
+            std::env::consts::ARCH
+        ));
+    }
+    if options.debug && !launch.capabilities.debug {
+        return Err(format!(
+            "launch `{}` does not support debugging; select a debug-capable launch",
+            launch.id
+        ));
+    }
+    if options.lldb_meta && !launch.capabilities.lldb_metadata {
+        return Err(format!(
+            "launch `{}` does not support LLDB metadata",
+            launch.id
+        ));
+    }
+    Ok(())
+}
+
+fn load_artifact_manifest(
+    root: &Path,
+    plan: &BuildPlan,
+    release: bool,
+) -> Result<ResolvedArtifacts, String> {
+    let output = artifact_root(root, plan, release);
+    let path = output.join("artifacts.json");
+    let build_command = format!(
+        "cargo run -p xtask -- build --platform {}{}",
+        plan.id,
+        if release { " --release" } else { "" }
+    );
+    let source = fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "cannot load artifacts for platform `{}` profile `{}` from {}: {err}\nrun: {build_command}",
+            plan.id,
+            profile(release),
+            path.display()
+        )
+    })?;
+    let manifest: ArtifactManifest = serde_json::from_str(&source).map_err(|err| {
+        format!(
+            "failed to parse artifact manifest {}: {err}\nrun: {build_command}",
+            path.display()
+        )
+    })?;
+    if manifest.schema != 2 {
+        return Err(format!(
+            "artifact manifest {} uses schema {}, expected 2\nrun: {build_command}",
+            path.display(),
+            manifest.schema
+        ));
+    }
+    if manifest.platform != plan.id || manifest.profile != profile(release) {
+        return Err(format!(
+            "artifact manifest {} describes platform `{}` profile `{}`, expected `{}` `{}`\nrun: {build_command}",
+            path.display(),
+            manifest.platform,
+            manifest.profile,
+            plan.id,
+            profile(release)
+        ));
+    }
+
+    let resolve = |artifact: &Path| {
+        if artifact.is_absolute() {
+            artifact.to_path_buf()
+        } else {
+            output.join(artifact)
+        }
+    };
+    let kernel = resolve(&manifest.kernel.image);
+    let boot_image = resolve(&manifest.boot_image);
+    let debug_search_paths: Vec<PathBuf> = manifest
+        .debug_search_paths
+        .iter()
+        .map(|path| resolve(path))
+        .collect();
+
+    let mut required = vec![
+        ("kernel image", kernel.clone()),
+        ("boot image", boot_image.clone()),
+        (
+            "kernel definition file",
+            resolve(&manifest.sdk.definition_file),
+        ),
+        (
+            "kernel import library",
+            resolve(&manifest.sdk.import_library),
+        ),
+        ("kernel stub", resolve(&manifest.stub)),
+    ];
+    if let Some(debug) = &manifest.kernel.debug {
+        required.push(("kernel debug information", resolve(debug)));
+    }
+    for package in &manifest.boot_packages {
+        required.push(("driver configuration", resolve(&package.configuration)));
+        required.push(("driver binary", resolve(&package.binary)));
+        if let Some(debug_info) = &package.debug_info {
+            required.push(("driver debug information", resolve(debug_info)));
+        }
+    }
+    for directory in &debug_search_paths {
+        if !directory.is_dir() {
+            return Err(format!(
+                "artifact debug search directory is missing: {}\nrun: {build_command}",
+                directory.display()
+            ));
+        }
+    }
+    for (what, path) in required {
+        assert_exists(&path, what).map_err(|err| format!("{err}\nrun: {build_command}"))?;
+    }
+
+    Ok(ResolvedArtifacts {
+        kernel,
+        boot_image,
+        debug_search_paths,
+    })
+}
+
+fn find_qemu(launch: &LaunchPlan, host: &HostPlan) -> Result<PathBuf, String> {
     if let Some(executable) =
         env::var_os("RUSTOS_QEMU").filter(|value| !value.as_os_str().is_empty())
     {
@@ -723,32 +960,40 @@ fn find_qemu(plan: &BuildPlan) -> Result<PathBuf, String> {
             .ok_or_else(|| format!("RUSTOS_QEMU executable was not found: {executable}"));
     }
 
-    if let Some(path) = find_in_path(&plan.runner.executable) {
+    if let Some(path) = find_in_path(&launch.executable) {
         return Ok(path);
     }
 
-    for path in &plan.runner.executable_fallbacks {
+    for pattern in &host.executable_patterns {
+        let rendered = pattern
+            .to_string_lossy()
+            .replace("{executable}", &launch.executable);
+        let path = PathBuf::from(rendered);
         if path.is_file() {
-            return Ok(path.clone());
+            return Ok(path);
         }
     }
 
     Err(format!(
-        "could not find configured QEMU executable `{}`; set RUSTOS_QEMU",
-        plan.runner.executable
+        "could not find QEMU executable `{}` for launch `{}` on host `{}`; set RUSTOS_QEMU",
+        launch.executable, launch.id, host.id
     ))
 }
 
-fn find_firmware(plan: &BuildPlan, qemu: &Path) -> Result<PathBuf, String> {
+fn find_firmware(launch: &LaunchPlan, host: &HostPlan, qemu: &Path) -> Result<PathBuf, String> {
     if let Some(path) = env_path("RUSTOS_FIRMWARE") {
         return require_file(path, "RUSTOS_FIRMWARE");
     }
 
-    let mut candidates = env_path_list("RUSTOS_FIRMWARE_CANDIDATES")
-        .unwrap_or_else(|| plan.runner.firmware_candidates.clone());
-    let files_from_qemu = env_path_list("RUSTOS_FIRMWARE_FILES_FROM_QEMU")
-        .unwrap_or_else(|| plan.runner.firmware_files_from_qemu.clone());
-    candidates.extend(firmware_paths_from_qemu(qemu, &files_from_qemu));
+    let firmware_files = env_path_list("RUSTOS_FIRMWARE_FILES_FROM_QEMU")
+        .unwrap_or_else(|| launch.firmware_files.clone());
+    let mut candidates = env_path_list("RUSTOS_FIRMWARE_CANDIDATES").unwrap_or_default();
+    for directory in &host.data_directories {
+        for file in &firmware_files {
+            candidates.push(directory.join(file));
+        }
+    }
+    candidates.extend(firmware_paths_from_qemu(qemu, &firmware_files));
 
     candidates
         .into_iter()
@@ -843,90 +1088,58 @@ fn disk_format(path: &Path) -> String {
 
 fn qemu_args(
     root: &Path,
-    plan: &BuildPlan,
-    qemu: &Path,
+    launch: &LaunchPlan,
     firmware: &Path,
     boot_image: &Path,
     system_disk: &SystemDisk,
     options: &QemuOptions,
 ) -> Result<Vec<OsString>, String> {
-    let memory =
-        env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| plan.runner.default_memory.clone());
-    let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
+    let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| launch.defaults.memory.clone());
+    let cpus = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| launch.defaults.cpus.clone());
     let serial = qemu_serial_arg(root, options)?;
-    let accel = qemu_accel(qemu, options);
-    let iommu_device = qemu_iommu_device(plan, &accel);
-    let gdb = format!("tcp::{}", options.gdb_port);
-    let firmware_path = path_string(firmware)?;
-    let boot_image_path = qemu_path_string(root, boot_image)?;
-    let system_disk_path = qemu_path_string(root, &system_disk.path)?;
-    let firmware_drive = drive_arg(&[
-        ("if", "pflash"),
-        ("format", "raw"),
-        ("readonly", "on"),
-        ("file", &firmware_path),
-    ]);
-    let boot_drive = drive_arg(&[("file", &boot_image_path), ("format", "raw")]);
-    let system_drive = drive_arg(&[
-        ("file", &system_disk_path),
-        ("if", "none"),
-        ("format", &system_disk.format),
-        ("id", "sysdisk"),
-    ]);
-
-    let mut args: Vec<OsString> = vec![
-        "-m".into(),
-        memory.into(),
-        "-cpu".into(),
-        plan.runner.cpu.clone().into(),
-        "-machine".into(),
-        plan.runner.machine.clone().into(),
-        "-accel".into(),
-        accel.clone().into(),
-        "-smp".into(),
-        smp.into(),
+    let values = [
+        ("memory", memory),
+        ("cpus", cpus),
+        ("firmware", portable_path(firmware)?),
+        ("boot_image", portable_path(boot_image)?),
+        ("system_disk", portable_path(&system_disk.path)?),
+        ("system_disk_format", system_disk.format.clone()),
+        ("primary_serial", serial),
+        ("gdb_port", options.gdb_port.to_string()),
+        ("meta_port", options.meta_port.to_string()),
     ];
 
+    let mut templates = launch.args.clone();
+
     if options.debug {
-        args.extend(["-S".into(), "-gdb".into(), gdb.into()]);
+        templates.extend(launch.debug_args.iter().cloned());
     }
-
-    args.extend(["-device".into(), iommu_device.into()]);
-
-    if accel == "whpx" {
-        args.extend(["-bios".into(), firmware_path.into()]);
-    } else {
-        args.extend(["-drive".into(), firmware_drive.into()]);
-    }
-
-    args.extend(["-serial".into(), serial.into()]);
 
     if options.lldb_meta {
-        let meta_chardev = format!(
-            "socket,id=rustos_meta,host=127.0.0.1,port={},server=on,wait=off,nodelay=on",
-            options.meta_port
-        );
-        args.extend([
-            "-chardev".into(),
-            meta_chardev.into(),
-            "-serial".into(),
-            "chardev:rustos_meta".into(),
-        ]);
+        templates.extend(launch.lldb_metadata_args.iter().cloned());
     }
 
-    args.extend([
-        "-vga".into(),
-        "std".into(),
-        "-drive".into(),
-        boot_drive.into(),
-        "-drive".into(),
-        system_drive.into(),
-        "-device".into(),
-        "virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off,iommu_platform=on"
-            .into(),
-    ]);
+    templates
+        .iter()
+        .map(|template| render_launch_arg(template, &values).map(OsString::from))
+        .collect()
+}
 
-    Ok(args)
+fn render_launch_arg(template: &str, values: &[(&str, String)]) -> Result<String, String> {
+    let mut rendered = template.to_string();
+    for (name, value) in values {
+        rendered = rendered.replace(&format!("{{{name}}}"), value);
+    }
+    if rendered.contains('{') || rendered.contains('}') {
+        return Err(format!(
+            "launch argument contains an unknown or unmatched placeholder: `{template}`"
+        ));
+    }
+    Ok(rendered)
+}
+
+fn portable_path(path: &Path) -> Result<String, String> {
+    path_string(path).map(|path| path.replace('\\', "/"))
 }
 
 fn qemu_serial_log_path(root: &Path) -> PathBuf {
@@ -943,47 +1156,6 @@ fn qemu_serial_arg(root: &Path, options: &QemuOptions) -> Result<String, String>
     }
 }
 
-fn qemu_accel(qemu: &Path, options: &QemuOptions) -> String {
-    if let Ok(accel) = env::var("RUSTOS_QEMU_ACCEL") {
-        if !accel.is_empty() {
-            return accel;
-        }
-    }
-
-    if cfg!(windows) && !options.debug && qemu_supports_accel(qemu, "whpx") {
-        "whpx".to_string()
-    } else {
-        "tcg".to_string()
-    }
-}
-
-fn qemu_supports_accel(qemu: &Path, accel: &str) -> bool {
-    let output = match Command::new(qemu).args(["-accel", "help"]).output() {
-        Ok(output) => output,
-        Err(_) => return false,
-    };
-
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    text.lines().any(|line| line.trim() == accel)
-}
-
-fn qemu_iommu_device<'a>(plan: &'a BuildPlan, accel: &str) -> &'a str {
-    if accel == "whpx" {
-        &plan.runner.iommu_whpx
-    } else {
-        &plan.runner.iommu
-    }
-}
-
-fn drive_arg(options: &[(&str, &str)]) -> String {
-    options
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 fn path_string(path: &Path) -> Result<String, String> {
     path.to_str()
         .map(str::to_string)
@@ -993,6 +1165,69 @@ fn path_string(path: &Path) -> Result<String, String> {
 fn qemu_path_string(root: &Path, path: &Path) -> Result<String, String> {
     let path = path.strip_prefix(root).unwrap_or(path);
     path_string(path).map(|path| path.replace('\\', "/"))
+}
+
+fn write_lldb_commands(
+    root: &Path,
+    artifacts: &ResolvedArtifacts,
+    options: &QemuOptions,
+) -> Result<(), String> {
+    let driver_dir = artifacts.debug_search_paths.first().ok_or_else(|| {
+        "artifact manifest does not contain a driver debug search path".to_string()
+    })?;
+    let metadata_script = root.join(".zed").join("lldb").join("rustos_meta.py");
+
+    if options.lldb_meta {
+        assert_exists(&metadata_script, "LLDB metadata script")?;
+    }
+
+    let search_paths = artifacts
+        .debug_search_paths
+        .iter()
+        .map(|path| lldb_quote_path(path))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(" ");
+    let mut commands = vec![
+        format!(
+            "settings set target.debug-file-search-paths {}",
+            search_paths
+        ),
+        format!("gdb-remote localhost:{}", options.gdb_port),
+        format!(
+            "target modules load --file {} --slide 0",
+            lldb_quote_path(&artifacts.kernel)?
+        ),
+    ];
+
+    if options.lldb_meta {
+        commands.push(format!(
+            "command script import {}",
+            lldb_quote_path(&metadata_script)?
+        ));
+        commands.push(format!(
+            "rustos-meta-connect 127.0.0.1 {} {}",
+            options.meta_port,
+            lldb_quote_path(&driver_dir)?
+        ));
+    }
+
+    commands.push("process continue".to_string());
+
+    let output = root.join("target").join("rustos").join("debug.lldb");
+    let parent = output
+        .parent()
+        .ok_or_else(|| format!("LLDB command file has no parent: {}", output.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    fs::write(&output, format!("{}\n", commands.join("\n")))
+        .map_err(|err| format!("failed to write {}: {err}", output.display()))?;
+    println!("Wrote LLDB commands to {}", output.display());
+    Ok(())
+}
+
+fn lldb_quote_path(path: &Path) -> Result<String, String> {
+    let path = path_string(path)?.replace('\\', "/").replace('"', "\\\"");
+    Ok(format!("\"{path}\""))
 }
 
 fn spawn_qemu_detached(
@@ -1155,6 +1390,26 @@ fn wait_for_qemu_to_settle(child: &mut Child) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_launch_arg;
+
+    #[test]
+    fn renders_launch_arguments_without_splitting_values() {
+        let values = [("firmware", "C:/Program Files/qemu/OVMF.fd".to_string())];
+        assert_eq!(
+            render_launch_arg("file={firmware},readonly=on", &values).unwrap(),
+            "file=C:/Program Files/qemu/OVMF.fd,readonly=on"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_launch_placeholders() {
+        let error = render_launch_arg("{unknown}", &[]).unwrap_err();
+        assert!(error.contains("unknown"));
+    }
 }
 
 fn print_command(qemu: &Path, args: &[OsString]) {

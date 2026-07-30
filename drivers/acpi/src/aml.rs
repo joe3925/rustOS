@@ -28,7 +28,6 @@ use kernel_api::pnp::ResourceKind;
 use kernel_api::pnp::get_acpi_tables;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::request_handler;
-use kernel_api::status::DriverStatus;
 pub const PAGE_SIZE: usize = 4096;
 #[repr(C)]
 pub struct KernelAmlHandler;
@@ -918,7 +917,7 @@ pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryResources,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ctx_lock = &pext.ctx;
@@ -937,7 +936,7 @@ pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
 
     req.resources = ResourceSet::Encoded(blob);
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -945,7 +944,7 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryId,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ty = req.id_type;
@@ -955,7 +954,6 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
     let (hid_opt, mut cids) = read_ids(&mut guard, &pext.acpi_path);
     drop(guard);
 
-    let mut status = DriverStatus::Success;
     match ty {
         QueryIdType::HardwareIds => {
             if let Some(h) = hid_opt {
@@ -969,19 +967,23 @@ pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
             if let Some(h) = hid_opt {
                 req.ids.push(h);
             } else {
-                status = DriverStatus::NoSuchDevice;
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::NoSuchDevice,
+                ));
             }
         }
         QueryIdType::InstanceId => {
             if let Some(dn) = dev.dev_node.get().unwrap().upgrade() {
                 req.ids.push(dn.instance_path.clone());
             } else {
-                status = DriverStatus::NoSuchDevice;
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::NoSuchDevice,
+                ));
             }
         }
     }
 
-    DriverStep::complete(status)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -989,6 +991,6 @@ pub async fn acpi_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Complete)
 }

@@ -1,7 +1,7 @@
 use crate::device::DevNode;
 use crate::dma::IoBufferBacking;
+use crate::error::{DriverErrorKind, KernelError};
 use crate::io::{HandlerSlot, IoHandler, IoTarget};
-use crate::status::DriverStatus;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -14,17 +14,16 @@ pub struct DeviceIds {
 }
 
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverStep {
     Continue,
-    Complete { status: DriverStatus },
+    Complete,
 }
 
-impl DriverStep {
-    #[inline(always)]
-    pub fn complete(status: DriverStatus) -> Self {
-        DriverStep::Complete { status }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnhandledBehavior {
+    Complete,
+    Error(DriverErrorKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +70,7 @@ macro_rules! define_pnp_ops {
 
         impl PnpOp {
             #[inline]
-            pub fn default_status_for_unhandled(self) -> DriverStatus {
+            pub const fn unhandled_behavior(self) -> UnhandledBehavior {
                 match self {
                     $(Self::$variant => $default,)+
                 }
@@ -103,17 +102,6 @@ macro_rules! define_pnp_ops {
                 <Self as PnpOpHandlerRegistration<Op, H>>::set_pnp_op_handler(self, handler, 0);
             }
 
-            #[inline]
-            pub fn register_with_depth<Op, H>(&mut self, handler: H, depth: u32)
-            where
-                Self: PnpOpHandlerRegistration<Op, H>,
-            {
-                <Self as PnpOpHandlerRegistration<Op, H>>::set_pnp_op_handler(
-                    self,
-                    handler,
-                    depth,
-                );
-            }
         }
 
         impl Default for PnpOps {
@@ -201,63 +189,63 @@ define_pnp_ops! {
         slot: StartDeviceSlot,
         handler: crate::EvtPnpStartDevice,
         variant: StartDevice,
-        default: DriverStatus::Success
+        default: UnhandledBehavior::Complete
     },
     init_complete {
         op: PnpInitCompleteOp,
         slot: InitCompleteSlot,
         handler: crate::EvtPnpInitComplete,
         variant: InitComplete,
-        default: DriverStatus::Success
+        default: UnhandledBehavior::Complete
     },
     query_device_relations {
         op: PnpQueryDeviceRelationsOp,
         slot: QueryDeviceRelationsSlot,
         handler: crate::EvtPnpQueryDeviceRelations,
         variant: QueryDeviceRelations,
-        default: DriverStatus::Success
+        default: UnhandledBehavior::Complete
     },
     query_id {
         op: PnpQueryIdOp,
         slot: QueryIdSlot,
         handler: crate::EvtPnpQueryId,
         variant: QueryId,
-        default: DriverStatus::NotImplemented
+        default: UnhandledBehavior::Error(DriverErrorKind::NotImplemented)
     },
     register_dma_backing {
         op: PnpRegisterDmaBackingOp,
         slot: RegisterDmaBackingSlot,
         handler: crate::EvtPnpRegisterDmaBacking,
         variant: RegisterDmaBacking,
-        default: DriverStatus::NotImplemented
+        default: UnhandledBehavior::Error(DriverErrorKind::NotImplemented)
     },
     query_resources {
         op: PnpQueryResourcesOp,
         slot: QueryResourcesSlot,
         handler: crate::EvtPnpQueryResources,
         variant: QueryResources,
-        default: DriverStatus::NotImplemented
+        default: UnhandledBehavior::Error(DriverErrorKind::NotImplemented)
     },
     surprise_removal {
         op: PnpSurpriseRemovalOp,
         slot: SurpriseRemovalSlot,
         handler: crate::EvtPnpSurpriseRemoval,
         variant: SurpriseRemoval,
-        default: DriverStatus::Success
+        default: UnhandledBehavior::Complete
     },
     remove_device {
         op: PnpRemoveDeviceOp,
         slot: RemoveDeviceSlot,
         handler: crate::EvtPnpRemoveDevice,
         variant: RemoveDevice,
-        default: DriverStatus::Success
+        default: UnhandledBehavior::Complete
     },
     stop_device {
         op: PnpStopDeviceOp,
         slot: StopDeviceSlot,
         handler: crate::EvtPnpStopDevice,
         variant: StopDevice,
-        default: DriverStatus::Success
+        default: UnhandledBehavior::Complete
     }
 }
 
@@ -370,7 +358,7 @@ pub struct ProbeContext {
 pub enum ProbeOutcome {
     Match,
     NoMatch,
-    Error(DriverStatus),
+    Error(KernelError),
 }
 
 #[repr(u32)]

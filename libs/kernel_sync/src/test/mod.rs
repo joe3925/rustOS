@@ -1,5 +1,10 @@
 use std::time::{Duration, Instant};
 
+#[unsafe(no_mangle)]
+extern "C" fn kernel_resolve_error_context_module(_instruction_pointer: usize) -> Option<String> {
+    None
+}
+
 use crate::platform::StdPlatform;
 
 type P = StdPlatform;
@@ -21,8 +26,7 @@ fn wait_until(mut pred: impl FnMut() -> bool) {
 
 mod bounded_mpmc;
 mod bounded_wait_queue;
-mod channel;
+mod completion_port;
 mod mpmc;
-mod sleep_mutex;
 mod thread_pool;
 mod wait_queue;

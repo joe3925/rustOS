@@ -2,8 +2,8 @@ use crate::println;
 use core::sync::atomic::{AtomicU8, Ordering};
 use kernel_types::{
     dma::{FromDevice, IoBuffer, ToDevice},
+    error::{FileErrorKind, KernelError},
     fs::{Path, *},
-    status::{DriverStatus, FileStatus},
 };
 use spin::Lazy;
 
@@ -59,11 +59,11 @@ impl Provider {
         path: &Path,
         flags: &[OpenFlags],
         write_through: bool,
-    ) -> (FsOpenResult, DriverStatus) {
+    ) -> Result<FsOpenResult, KernelError> {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.open_path_sync(&path.to_string(), flags))
-            }
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                BOOTSTRAP_PROVIDER.open_path_sync(&path.to_string(), flags)
+            })),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .open(FsOpenParams {
@@ -76,9 +76,9 @@ impl Provider {
         }
     }
 
-    pub async fn close_handle(self, file_id: u64) -> (FsCloseResult, DriverStatus) {
+    pub async fn close_handle(self, file_id: u64) -> Result<FsCloseResult, KernelError> {
         match self {
-            Provider::Bootstrap => bootstrap(|| BOOTSTRAP_PROVIDER.close_handle_sync(file_id)),
+            Provider::Bootstrap => Ok(bootstrap(|| BOOTSTRAP_PROVIDER.close_handle_sync(file_id))),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .close(FsCloseParams {
@@ -94,11 +94,11 @@ impl Provider {
         file_id: u64,
         offset: i64,
         origin: FsSeekWhence,
-    ) -> (FsSeekResult, DriverStatus) {
+    ) -> Result<FsSeekResult, KernelError> {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.seek_handle_sync(file_id, offset, origin))
-            }
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                BOOTSTRAP_PROVIDER.seek_handle_sync(file_id, offset, origin)
+            })),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .seek(FsSeekParams {
@@ -116,23 +116,20 @@ impl Provider {
         file_id: u64,
         offset: u64,
         mut buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> (FsReadResult, DriverStatus) {
+    ) -> Result<FsReadResult, KernelError> {
         match self {
             Provider::Bootstrap => bootstrap(|| {
                 let mut bytes = alloc::vec![0; buffer.len()];
-                let (result, status) = BOOTSTRAP_PROVIDER.read_at_sync(file_id, offset, &mut bytes);
+                let result = BOOTSTRAP_PROVIDER.read_at_sync(file_id, offset, &mut bytes);
                 if result.error.is_none()
                     && let Err(e) = buffer.copy_from_slice(0, &bytes[..result.bytes_read])
                 {
-                    return (
-                        FsReadResult {
-                            bytes_read: 0,
-                            error: Some(FileStatus::BufferError(e)),
-                        },
-                        DriverStatus::InvalidParameter,
-                    );
+                    return Ok(FsReadResult {
+                        bytes_read: 0,
+                        error: Some(crate::error::error(FileErrorKind::BufferError(e))),
+                    });
                 }
-                (result, status)
+                Ok(result)
             }),
             Provider::Vfs => {
                 VFS_PROVIDER
@@ -152,20 +149,17 @@ impl Provider {
         offset: u64,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         write_through: bool,
-    ) -> (FsWriteResult, DriverStatus) {
+    ) -> Result<FsWriteResult, KernelError> {
         match self {
             Provider::Bootstrap => bootstrap(|| {
                 let mut bytes = alloc::vec![0; buffer.len()];
                 if let Err(e) = buffer.copy_to_slice(0, &mut bytes) {
-                    return (
-                        FsWriteResult {
-                            written: 0,
-                            error: Some(FileStatus::BufferError(e)),
-                        },
-                        DriverStatus::InvalidParameter,
-                    );
+                    return Ok(FsWriteResult {
+                        written: 0,
+                        error: Some(crate::error::error(FileErrorKind::BufferError(e))),
+                    });
                 }
-                BOOTSTRAP_PROVIDER.write_at_sync(file_id, offset, &bytes)
+                Ok(BOOTSTRAP_PROVIDER.write_at_sync(file_id, offset, &bytes))
             }),
             Provider::Vfs => {
                 VFS_PROVIDER
@@ -180,9 +174,9 @@ impl Provider {
         }
     }
 
-    pub async fn flush_handle(self, file_id: u64) -> (FsFlushResult, DriverStatus) {
+    pub async fn flush_handle(self, file_id: u64) -> Result<FsFlushResult, KernelError> {
         match self {
-            Provider::Bootstrap => bootstrap(|| BOOTSTRAP_PROVIDER.flush_handle_sync(file_id)),
+            Provider::Bootstrap => Ok(bootstrap(|| BOOTSTRAP_PROVIDER.flush_handle_sync(file_id))),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .flush(FsFlushParams {
@@ -193,9 +187,9 @@ impl Provider {
         }
     }
 
-    pub async fn get_info(self, file_id: u64) -> (FsGetInfoResult, DriverStatus) {
+    pub async fn get_info(self, file_id: u64) -> Result<FsGetInfoResult, KernelError> {
         match self {
-            Provider::Bootstrap => bootstrap(|| BOOTSTRAP_PROVIDER.get_info_sync(file_id)),
+            Provider::Bootstrap => Ok(bootstrap(|| BOOTSTRAP_PROVIDER.get_info_sync(file_id))),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .get_info(FsGetInfoParams {
@@ -206,11 +200,11 @@ impl Provider {
         }
     }
 
-    pub async fn list_dir_path(self, path: &Path) -> (FsListDirResult, DriverStatus) {
+    pub async fn list_dir_path(self, path: &Path) -> Result<FsListDirResult, KernelError> {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.list_dir_path_sync(&path.to_string()))
-            }
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                BOOTSTRAP_PROVIDER.list_dir_path_sync(&path.to_string())
+            })),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .list_dir(FsListDirParams { path: path.clone() })
@@ -219,11 +213,11 @@ impl Provider {
         }
     }
 
-    pub async fn make_dir_path(self, path: &Path) -> (FsCreateResult, DriverStatus) {
+    pub async fn make_dir_path(self, path: &Path) -> Result<FsCreateResult, KernelError> {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.make_dir_path_sync(&path.to_string()))
-            }
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                BOOTSTRAP_PROVIDER.make_dir_path_sync(&path.to_string())
+            })),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .create(FsCreateParams {
@@ -236,30 +230,27 @@ impl Provider {
         }
     }
 
-    pub async fn remove_dir_path(self, path: &Path) -> (FsCreateResult, DriverStatus) {
+    pub async fn remove_dir_path(self, path: &Path) -> Result<FsRemoveDirResult, KernelError> {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.remove_dir_path_sync(&path.to_string()))
-            }
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                let result = BOOTSTRAP_PROVIDER.remove_dir_path_sync(&path.to_string());
+                FsRemoveDirResult {
+                    error: result.error,
+                }
+            })),
             Provider::Vfs => {
-                // TODO: add a vfs remove dir path path
-                todo!("");
-
-                (
-                    FsCreateResult {
-                        error: Some(FileStatus::UnknownFail),
-                    },
-                    DriverStatus::Success,
-                )
+                VFS_PROVIDER
+                    .remove_dir(FsRemoveDirParams { path: path.clone() })
+                    .await
             }
         }
     }
 
-    pub async fn rename_path(self, src: &Path, dst: &Path) -> (FsRenameResult, DriverStatus) {
+    pub async fn rename_path(self, src: &Path, dst: &Path) -> Result<FsRenameResult, KernelError> {
         match self {
-            Provider::Bootstrap => bootstrap(|| {
+            Provider::Bootstrap => Ok(bootstrap(|| {
                 BOOTSTRAP_PROVIDER.rename_path_sync(&src.to_string(), &dst.to_string())
-            }),
+            })),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .rename(FsRenameParams {
@@ -271,27 +262,27 @@ impl Provider {
         }
     }
 
-    pub async fn delete_path(self, path: &Path) -> (FsCreateResult, DriverStatus) {
+    pub async fn delete_path(self, path: &Path) -> Result<FsDeleteResult, KernelError> {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.delete_path_sync(&path.to_string()))
-            }
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                let result = BOOTSTRAP_PROVIDER.delete_path_sync(&path.to_string());
+                FsDeleteResult {
+                    error: result.error,
+                }
+            })),
             Provider::Vfs => {
-                // TODO: add a vfs delete path
-                todo!("");
-                (
-                    FsCreateResult {
-                        error: Some(FileStatus::UnknownFail),
-                    },
-                    DriverStatus::Success,
-                )
+                VFS_PROVIDER
+                    .delete(FsDeleteParams { path: path.clone() })
+                    .await
             }
         }
     }
 
-    pub async fn set_len(self, file_id: u64, new_size: u64) -> (FsSetLenResult, DriverStatus) {
+    pub async fn set_len(self, file_id: u64, new_size: u64) -> Result<FsSetLenResult, KernelError> {
         match self {
-            Provider::Bootstrap => bootstrap(|| BOOTSTRAP_PROVIDER.set_len_sync(file_id, new_size)),
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                BOOTSTRAP_PROVIDER.set_len_sync(file_id, new_size)
+            })),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .set_len(FsSetLenParams {
@@ -308,21 +299,18 @@ impl Provider {
         file_id: u64,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         write_through: bool,
-    ) -> (FsAppendResult, DriverStatus) {
+    ) -> Result<FsAppendResult, KernelError> {
         match self {
             Provider::Bootstrap => bootstrap(|| {
                 let mut bytes = alloc::vec![0; buffer.len()];
                 if let Err(e) = buffer.copy_to_slice(0, &mut bytes) {
-                    return (
-                        FsAppendResult {
-                            written: 0,
-                            new_size: 0,
-                            error: Some(FileStatus::BufferError(e)),
-                        },
-                        DriverStatus::InvalidParameter,
-                    );
+                    return Ok(FsAppendResult {
+                        written: 0,
+                        new_size: 0,
+                        error: Some(crate::error::error(FileErrorKind::BufferError(e))),
+                    });
                 }
-                BOOTSTRAP_PROVIDER.append_sync(file_id, &bytes)
+                Ok(BOOTSTRAP_PROVIDER.append_sync(file_id, &bytes))
             }),
             Provider::Vfs => {
                 VFS_PROVIDER
@@ -341,11 +329,11 @@ impl Provider {
         file_id: u64,
         offset: u64,
         len: u64,
-    ) -> (FsZeroRangeResult, DriverStatus) {
+    ) -> Result<FsZeroRangeResult, KernelError> {
         match self {
-            Provider::Bootstrap => {
-                bootstrap(|| BOOTSTRAP_PROVIDER.zero_range_sync(file_id, offset, len))
-            }
+            Provider::Bootstrap => Ok(bootstrap(|| {
+                BOOTSTRAP_PROVIDER.zero_range_sync(file_id, offset, len)
+            })),
             Provider::Vfs => {
                 VFS_PROVIDER
                     .zero_range(FsZeroRangeParams {

@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use super::memory::iommu::X86DeviceMmu;
 use super::scheduling::state::{FpuState, State};
-use super::scheduling::{idle_task, task_return_trampoline, TaskEntry};
+use super::scheduling::{TaskEntry, idle_task, task_return_trampoline};
 use crate::drivers::ACPI::ACPIImpl;
 use crate::machine::MachineInfo;
 use crate::machine::MachineInterruptInfo;
@@ -17,7 +17,7 @@ use crate::memory::paging::{
     UnmapFrameDisposition,
 };
 use kernel_types::irq::{
-    MsiMessage, MsiRequest, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
+    MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiMessage, MsiRequest,
 };
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
@@ -32,19 +32,19 @@ use x86_64::structures::paging::{PageSize, Size1GiB, Size2MiB, Size4KiB};
 
 use super::cpu::get_cpu_info;
 use super::drivers::interrupt_index::{
+    APIC, APIC_START_PERIOD, ApicImpl, IpiDest, IpiKind, LocalApic, PICS, TSC_HZ,
     apic_calibrate_ticks_per_ns_via_wait, apic_logical_ids, apic_program_period_ns, calibrate_tsc,
     current_cpu_id as x86_current_cpu_id, current_is_in_interrupt_atomic,
     get_current_logical_id as x86_current_logical_id, init_percpu_gs, send_eoi as x86_send_eoi,
-    wait_duration as x86_wait_duration, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
-    APIC, APIC_START_PERIOD, PICS, TSC_HZ,
+    wait_duration as x86_wait_duration, wait_using_pit_50ms,
 };
 use super::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TIMER_TIME_SCHED};
 use super::gdt::PER_CPU_GDT;
 use super::idt::load_idt;
 use crate::platform::{
-    AddressSpacePlatform, CpuPlatform, DebugPlatform, DeviceMmuPlatform, InterruptPlatform,
-    MachinePlatform, PageTableFrameAllocator, PagingPlatform, PciConfigPlatform, Platform,
-    TaskPlatform, TimerPlatform,
+    AddressSpacePlatform, ConsolePlatform, CpuPlatform, DebugPlatform, DebugTransportPlatform,
+    DeviceMmuPlatform, InterruptPlatform, MachinePlatform, PageTableFrameAllocator, PagingPlatform,
+    PciConfigPlatform, Platform, TaskPlatform, TimerPlatform,
 };
 use crate::println;
 use crate::structs::stopwatch::Stopwatch;
@@ -94,11 +94,13 @@ impl Platform for X86Platform {
         }
         Self::disable_interrupts();
         super::syscalls::syscall::syscall_init();
-        super::debug_meta::init_debug_metadata_transport();
+        <Self as DebugTransportPlatform>::init_debug_metadata_transport();
     }
 }
 
 impl CpuPlatform for X86Platform {
+    type PerCpuState = super::drivers::interrupt_index::PerCpu;
+
     const MAX_CPUS: usize = super::MAX_CPUS;
 
     fn current_cpu_id() -> usize {
@@ -119,6 +121,18 @@ impl CpuPlatform for X86Platform {
 
     fn init_current_cpu_local_state(logical_id: u32) {
         init_percpu_gs(logical_id);
+    }
+
+    fn current_percpu() -> &'static Self::PerCpuState {
+        super::drivers::interrupt_index::current_percpu()
+    }
+
+    fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
+        super::scheduling::tls::swap_executor_context(task_id, domain_id)
+    }
+
+    fn current_executor_context() -> (u64, u64) {
+        super::scheduling::tls::current_executor_context()
     }
 
     fn start_secondary_cpus() -> bool {
@@ -159,6 +173,18 @@ impl CpuPlatform for X86Platform {
                 a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi);
             }
         }
+    }
+}
+
+impl ConsolePlatform for X86Platform {
+    fn serial_write_bytes(bytes: &[u8]) {
+        super::serial::write_bytes(bytes);
+    }
+}
+
+impl DebugTransportPlatform for X86Platform {
+    fn init_debug_metadata_transport() {
+        super::debug_meta::init_debug_metadata_transport();
     }
 }
 
@@ -459,6 +485,18 @@ impl PagingPlatform for X86Platform {
 
     fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping> {
         super::memory::paging::mapper::resolve_mapping(virt)
+    }
+
+    fn resolve_mapping_in_root(root: Self::Root, virt: VirtAddr) -> Option<ResolvedMapping> {
+        let previous = super::memory::paging::address_space::current_root();
+        if previous != root {
+            unsafe { super::memory::paging::address_space::switch_root(root) };
+        }
+        let resolved = super::memory::paging::mapper::resolve_mapping(virt);
+        if previous != root {
+            unsafe { super::memory::paging::address_space::switch_root(previous) };
+        }
+        resolved
     }
 
     fn local_flush_tlb_all() {

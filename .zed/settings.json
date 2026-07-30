@@ -1,26 +1,30 @@
 {
-    "lsp": {
-        "rust-analyzer": {
-            "initialization_options": {
-                "linkedProjects": [
-                    "drivers/Cargo.toml",
-                    "kernel/Cargo.toml",
-                    "libs/kernel_types/Cargo.toml",
-                    "third_party/rust-fatfs/Cargo.toml",
-                    "third_party/rust-fatfs/Cargo.toml",
-                    "third_party/aarch64-bootloader/bootloader/Cargo.toml",
-                    "third_party/aarch64-bootloader/bootloader-api/Cargo.toml",
-                    "libs/kernel_macros/Cargo.toml",
-                    "Cargo.toml",
-                ],
+  "lsp": {
+    "rust-analyzer": {
+      "binary": {
+        "ignore_system_version": true
+      },
+      "initialization_options": {
+        "linkedProjects": [
+          "drivers/Cargo.toml",
+          "kernel/Cargo.toml",
+          "libs/kernel_types/Cargo.toml",
+          "third_party/rust-fatfs/Cargo.toml",
+          "third_party/rust-fatfs/Cargo.toml",
+          "third_party/aarch64-bootloader/bootloader/Cargo.toml",
+          "third_party/aarch64-bootloader/bootloader-api/Cargo.toml",
+          "third_party/aarch64-vmsa/Cargo.toml",
+          "libs/kernel_macros/Cargo.toml",
+          "Cargo.toml",
+        ],
 
                 "cargo": {
                     "target": "x86_64-pc-windows-msvc",
                     "allTargets": false,
-                    "metadataExtraArgs": ["-Zjson-target-spec"],
-                    "extraArgs": ["-Zjson-target-spec"],
+                    //"metadataExtraArgs": ["-Zjson-target-spec"],
+                    //"extraArgs": ["-Zjson-target-spec"],
                     "buildScripts": {
-                        "enable": true,
+                        "enable": false,
                     },
                 },
 
@@ -33,7 +37,7 @@
                 "check": {
                     "allTargets": false,
                     "targets": ["x86_64-pc-windows-msvc"],
-                    "extraArgs": ["-Zjson-target-spec"],
+                    //"extraArgs": ["-Zjson-target-spec"],
                 },
 
                 "diagnostics": {

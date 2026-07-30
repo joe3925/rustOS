@@ -18,6 +18,7 @@ const LSR_THR_EMPTY: u8 = 0x20;
 const LSR_DATA_READY: u8 = 0x01;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 fn init_once() {
     if INITIALIZED
@@ -28,6 +29,14 @@ fn init_once() {
     }
 
     unsafe {
+        // An unimplemented x86 I/O port reads as 0xFF. A real 16550 line
+        // status register cannot have every bit set, so this distinguishes a
+        // configured COM2 device without relying on optional scratch-register
+        // behavior.
+        if Port::<u8>::new(COM2_BASE + UART_LSR).read() == 0xFF {
+            return;
+        }
+
         Port::<u8>::new(COM2_BASE + UART_IER).write(0x00);
         Port::<u8>::new(COM2_BASE + UART_LCR).write(LCR_DLAB);
         Port::<u8>::new(COM2_BASE + UART_DATA).write(0x01); // 115200 baud
@@ -36,6 +45,8 @@ fn init_once() {
         Port::<u8>::new(COM2_BASE + UART_FCR).write(FCR_ENABLE_CLEAR);
         Port::<u8>::new(COM2_BASE + UART_MCR).write(MCR_DTR_RTS_AUX);
     }
+
+    AVAILABLE.store(true, Ordering::Release);
 }
 
 #[inline]
@@ -46,7 +57,9 @@ fn can_transmit() -> bool {
 fn transmit_byte(byte: u8) {
     for _ in 0..100_000_usize {
         if can_transmit() {
-            unsafe { Port::<u8>::new(COM2_BASE + UART_DATA).write(byte); }
+            unsafe {
+                Port::<u8>::new(COM2_BASE + UART_DATA).write(byte);
+            }
             return;
         }
         core::hint::spin_loop();
@@ -55,6 +68,9 @@ fn transmit_byte(byte: u8) {
 
 pub(crate) fn com2_write_bytes(bytes: &[u8]) {
     init_once();
+    if !AVAILABLE.load(Ordering::Acquire) {
+        return;
+    }
     for &byte in bytes {
         if byte == b'\n' {
             transmit_byte(b'\r');
@@ -79,12 +95,15 @@ fn try_rx_byte() -> Option<u8> {
 
 // Host sends this line; kernel responds with ACK then replays the snapshot.
 const HELLO_LINE: &[u8] = b"RUSTOS_META_HELLO version=1\n";
-const HELLO_ACK: &[u8] = b"RUSTOS_META_HELLO_ACK version=1\n";
 
 static HELLO_PROGRESS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static HELLO_DONE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn poll_rx_once() {
+    if !AVAILABLE.load(Ordering::Acquire) {
+        return;
+    }
+
     if HELLO_DONE.load(Ordering::Acquire) {
         return;
     }
@@ -98,8 +117,7 @@ pub(crate) fn poll_rx_once() {
 
             if new_progress == HELLO_LINE.len() {
                 HELLO_DONE.store(true, Ordering::Release);
-                com2_write_bytes(HELLO_ACK);
-                crate::debug_metadata::replay_snapshot();
+                crate::debug_metadata::host_hello_received();
                 return;
             }
         } else {
@@ -110,11 +128,18 @@ pub(crate) fn poll_rx_once() {
 
 pub(crate) fn metadata_sink(bytes: &[u8]) {
     init_once();
+    if !AVAILABLE.load(Ordering::Acquire) {
+        return;
+    }
     poll_rx_once();
-    com2_write_bytes(bytes);
+    if !bytes.is_empty() {
+        com2_write_bytes(bytes);
+    }
 }
 
 pub(crate) fn init_debug_metadata_transport() {
     init_once();
-    crate::debug_metadata::register_sink(metadata_sink);
+    if AVAILABLE.load(Ordering::Acquire) {
+        crate::debug_metadata::register_sink(metadata_sink);
+    }
 }

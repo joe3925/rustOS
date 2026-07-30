@@ -4,35 +4,26 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-struct KernelTarget {
-    mimalloc: Option<MimallocTarget>,
-}
-
 struct MimallocTarget {
-    clang_target: &'static str,
+    clang_target: String,
     flags: &'static [&'static str],
 }
 
-fn kernel_target(target: &str) -> Result<KernelTarget, Box<dyn Error>> {
-    if target.contains("x86_64") {
-        return Ok(KernelTarget {
-            mimalloc: Some(MimallocTarget {
-                clang_target: "x86_64-pc-windows-msvc",
-                flags: &["-mno-red-zone", "-mcmodel=large"],
-            }),
-        });
-    }
-
-    if target.contains("aarch64") {
-        return Ok(KernelTarget { mimalloc: None });
-    }
-
-    Err(format!("unsupported kernel target architecture: {target}").into())
+fn mimalloc_target(arch: &str) -> Result<MimallocTarget, Box<dyn Error>> {
+    let flags: &'static [&'static str] = match arch {
+        "x86_64" => &["-mno-red-zone", "-mcmodel=large"],
+        "aarch64" => &[],
+        _ => return Err(format!("unsupported mimalloc target architecture: {arch}").into()),
+    };
+    Ok(MimallocTarget {
+        clang_target: format!("{arch}-pc-windows-msvc"),
+        flags,
+    })
 }
 
 fn compile_mimalloc(
     manifest_dir: &std::path::Path,
-    target: &str,
+    arch: &str,
     out_dir: &PathBuf,
 ) -> Result<(), Box<dyn Error>> {
     let workspace_dir = manifest_dir
@@ -50,10 +41,7 @@ fn compile_mimalloc(
     println!("cargo:rerun-if-changed={}", include_dir.display());
     println!("cargo:rerun-if-changed={}", src_dir.display());
 
-    let target_config = kernel_target(target)?;
-    let mimalloc_target = target_config
-        .mimalloc
-        .ok_or_else(|| format!("rustOS mimalloc platform is not implemented for {target}"))?;
+    let mimalloc_target = mimalloc_target(arch)?;
 
     let mut build = cc::Build::new();
     let clang_target_flag = format!("--target={}", mimalloc_target.clang_target);
@@ -74,7 +62,6 @@ fn compile_mimalloc(
         .flag("-U_MSC_BUILD")
         .flag("-std=c11")
         .flag("-ffreestanding")
-        .flag("-fno-builtin")
         .flag("-fno-stack-protector")
         .flag("-Wno-unused-parameter")
         .flag("-Wno-unused-function")
@@ -157,13 +144,17 @@ impl MsvcLibTool {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=RUSTOS_BENCH_SUITES");
+    println!("cargo:rerun-if-env-changed=RUSTOS_BENCH_TAGS");
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target = env::var("TARGET").unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
-    emit_kernel_pe_link_args(&target);
+    emit_kernel_pe_link_args(&target_os, &target_arch);
     if env::var_os("CARGO_FEATURE_ALLOCATOR_MIMALLOC").is_some() {
-        compile_mimalloc(&manifest_dir, &target, &out_dir).expect("Failed to compile mimalloc");
+        compile_mimalloc(&manifest_dir, &target_arch, &out_dir)
+            .expect("Failed to compile mimalloc");
     }
 
     println!("cargo:rerun-if-changed=build.rs");
@@ -221,11 +212,15 @@ fn find_tool_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn emit_kernel_pe_link_args(target: &str) {
-    if !target.ends_with("windows-msvc") {
+fn emit_kernel_pe_link_args(target_os: &str, target_arch: &str) {
+    if target_os != "windows" {
         return;
     }
 
+    let layout = kernel_abi::layout::boot_virtual_layout(target_arch).unwrap_or_else(|| {
+        panic!("no kernel image layout for target architecture `{target_arch}`")
+    });
+    let image_base = format!("/BASE:{:#X}", layout.kernel_image_base);
     for arg in [
         "/NOLOGO",
         "/NODEFAULTLIB",
@@ -233,9 +228,9 @@ fn emit_kernel_pe_link_args(target: &str) {
         "/ENTRY:kernel_pe_entry",
         "/FIXED",
         "/DYNAMICBASE:NO",
-        "/BASE:0xFFFF850000000000",
         "/EXPORT:kernel_pe_entry",
     ] {
         println!("cargo:rustc-link-arg-bin=kernel={arg}");
     }
+    println!("cargo:rustc-link-arg-bin=kernel={image_base}");
 }

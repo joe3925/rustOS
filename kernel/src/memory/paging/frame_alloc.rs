@@ -10,12 +10,12 @@ use crate::platform::PageTableFrameAllocator;
 use crate::util::boot_info;
 
 use super::frame_bitmap::{
-    bit_is_set, bitmap_layout_for_physical_coverage, build_memory_bitmap, clear_range,
-    clear_unused_tail_bits, count_set_bits_up_to, first_set_bit_in_range, heap_bitmap,
-    low_reserved_frames, mark_unused_tail_bits_allocated, physical_coverage_for_ram,
+    BitmapResizeError, FrameBitmap, RuntimeFrameBitmap, bit_is_set,
+    bitmap_layout_for_physical_coverage, build_memory_bitmap, clear_range, clear_unused_tail_bits,
+    count_set_bits_up_to, first_set_bit_in_range, heap_bitmap, low_reserved_frames,
+    mark_unused_tail_bits_allocated, physical_coverage_for_ram,
     preserve_reclaimed_free_bits_limited, preserve_set_bits_limited, range_fits_bitmap, set_range,
-    set_range_count_new, usable_region_bytes_below, BitmapResizeError, FrameBitmap,
-    RuntimeFrameBitmap,
+    set_range_count_new, usable_region_bytes_below,
 };
 use super::layout::base_page_size;
 use super::types::MappingSize;

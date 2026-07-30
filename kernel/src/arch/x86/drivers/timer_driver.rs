@@ -45,7 +45,9 @@ pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
-    let _fpu_guard = KernelFpuGuard::new();
+    let Some(_fpu_guard) = KernelFpuGuard::try_new() else {
+        return;
+    };
     // let _nested_interrupts = NestedInterruptEnableGuard::new();
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();

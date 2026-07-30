@@ -7,14 +7,23 @@ use crate::memory::paging::{base_page_size, kernel_stack_max_bytes};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::static_handlers::get_current_cpu_id;
-use crate::util::PANIC_ACTIVE;
-use alloc::fmt;
+use crate::util::{PANIC_ACTIVE, exception_panic};
+use alloc::{fmt, format};
+use core::sync::atomic::Ordering;
 use kernel_types::arch::PageFlags;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
+
+macro_rules! panic_exception {
+    ($state:expr, $($message:tt)*) => {
+        exception_panic(format!($($message)*), $state)
+    };
+}
+
 #[kernel_macros::exception_handler]
 pub(crate) fn divide_by_zero_fault(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: DIVIDE BY ZERO\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -22,7 +31,8 @@ pub(crate) fn divide_by_zero_fault(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn debug_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: DEBUG\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -30,20 +40,29 @@ pub(crate) fn debug_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn non_maskable_interrupt(stack_frame: &mut State) {
-    if PANIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+    if PANIC_ACTIVE.load(Ordering::Acquire) {
         loop {}
     }
 }
 
 #[kernel_macros::exception_handler]
 pub(crate) fn breakpoint_exception(stack_frame: &mut State) {
-    println!("EXCEPTION: BREAKPOINT\n");
-    black_box(0);
+    if cfg!(debug_assertions) {
+        println!("EXCEPTION: BREAKPOINT\n");
+        black_box(0);
+    } else {
+        panic_exception!(
+            stack_frame,
+            "EXCEPTION: BREAKPOINT\n {:#?}",
+            stack_frame.into_interrupt_stack_frame()
+        );
+    }
 }
 
 #[kernel_macros::exception_handler]
 pub(crate) fn overflow_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: OVERFLOW\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -51,7 +70,8 @@ pub(crate) fn overflow_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn bound_range_exceeded_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: BOUND RANGE EXCEEDED\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -59,7 +79,8 @@ pub(crate) fn bound_range_exceeded_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn invalid_opcode_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: INVALID OPCODE\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -67,7 +88,8 @@ pub(crate) fn invalid_opcode_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn device_not_available_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: DEVICE NOT AVAILABLE\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -75,7 +97,8 @@ pub(crate) fn device_not_available_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn double_fault(stack_frame: &mut State, _error_code: u64) -> ! {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: DOUBLE FAULT\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -83,7 +106,8 @@ pub(crate) fn double_fault(stack_frame: &mut State, _error_code: u64) -> ! {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn invalid_tss_exception(stack_frame: &mut State, _error_code: u64) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: INVALID TSS\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -91,7 +115,8 @@ pub(crate) fn invalid_tss_exception(stack_frame: &mut State, _error_code: u64) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn segment_not_present_exception(stack_frame: &mut State, _error_code: u64) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: SEGMENT NOT PRESENT\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -99,13 +124,18 @@ pub(crate) fn segment_not_present_exception(stack_frame: &mut State, _error_code
 
 #[kernel_macros::exception_handler]
 pub(crate) fn stack_segment_fault(stack_frame: &mut State, _error_code: u64) {
-    panic!("EXCEPTION: STACK SEGMENT FAULT\n{:#?}", stack_frame);
+    panic_exception!(
+        stack_frame,
+        "EXCEPTION: STACK SEGMENT FAULT\n{:#?}",
+        stack_frame
+    );
 }
 
 #[kernel_macros::exception_handler]
 pub(crate) fn general_protection_fault(stack_frame: &mut State, error_code: u64) {
     let decoded = decode_gpf_error_code(error_code);
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: GENERAL PROTECTION FAULT\nerror_code=0x{:X}\n{}\n{:#?}",
         error_code,
         decoded,
@@ -135,14 +165,10 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
     }
     if !is_protection {
         if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
-            if task
-                .is_kernel_mode
-                .load(core::sync::atomic::Ordering::Relaxed)
-                && !is_user
-            {
-                let gp = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
+            if task.is_kernel_mode() && !is_user {
+                let gp = task.guard_page.load(Ordering::Acquire);
                 if gp != 0 {
-                    let stack_start = task.stack_start.load(core::sync::atomic::Ordering::Relaxed);
+                    let stack_start = task.stack_start.load(Ordering::Relaxed);
                     let max_depth = stack_start.saturating_sub(kernel_stack_max_bytes());
 
                     // Allow growth for faults anywhere within the reserved stack window below stack_start.
@@ -150,10 +176,7 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
                         let page_size = base_page_size();
                         let flags =
                             PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-                        while fault
-                            < task.guard_page.load(core::sync::atomic::Ordering::Acquire)
-                                + page_size
-                        {
+                        while fault < task.guard_page.load(Ordering::Acquire) + page_size {
                             match task.grow_stack(flags) {
                                 Ok(true) => {}
                                 Ok(false) => {
@@ -166,10 +189,7 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
                                 }
                             }
                         }
-                        if fault
-                            >= task.guard_page.load(core::sync::atomic::Ordering::Acquire)
-                                + page_size
-                        {
+                        if fault >= task.guard_page.load(Ordering::Acquire) + page_size {
                             return;
                         }
                     }
@@ -178,9 +198,13 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
 
                     if fault >= reserved_start && fault < gp {
                         unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
-                        panic!(
+                        panic_exception!(
+                            stack_frame,
                             "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",
-                            error_code, fault, gp, *stack_frame
+                            error_code,
+                            fault,
+                            gp,
+                            *stack_frame
                         );
                     }
                 }
@@ -190,15 +214,19 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
 
     unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
 
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: PAGE FAULT\nerror_code={:?}\ncr2={:#x}\n{:#?}",
-        error_code, fault, stack_frame
+        error_code,
+        fault,
+        stack_frame
     );
 }
 
 #[kernel_macros::exception_handler]
 pub(crate) fn x87_floating_point_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: x87 FLOATING POINT\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -206,7 +234,8 @@ pub(crate) fn x87_floating_point_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn alignment_check_exception(stack_frame: &mut State, _error_code: u64) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: ALIGNMENT CHECK\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -214,7 +243,8 @@ pub(crate) fn alignment_check_exception(stack_frame: &mut State, _error_code: u6
 
 #[kernel_macros::exception_handler]
 pub(crate) fn machine_check_exception(stack_frame: &mut State) -> ! {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: MACHINE CHECK\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -222,7 +252,8 @@ pub(crate) fn machine_check_exception(stack_frame: &mut State) -> ! {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn simd_floating_point_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: SIMD FLOATING POINT\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );
@@ -230,7 +261,8 @@ pub(crate) fn simd_floating_point_exception(stack_frame: &mut State) {
 
 #[kernel_macros::exception_handler]
 pub(crate) fn virtualization_exception(stack_frame: &mut State) {
-    panic!(
+    panic_exception!(
+        stack_frame,
         "EXCEPTION: VIRTUALIZATION\n{:#?}",
         stack_frame.into_interrupt_stack_frame()
     );

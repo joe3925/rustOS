@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package rustos.registry;
+
+message Registry {
+  uint32 schema_version = 1;
+  map<string, Key> root = 2;
+}
+
+message Key {
+  map<string, Value> values = 1;
+  map<string, Key> sub_keys = 2;
+}
+
+message Value {
+  oneof value {
+    uint32 u32 = 1;
+    uint64 u64 = 2;
+    sint32 i32 = 3;
+    sint64 i64 = 4;
+    bool bool = 5;
+    string str = 6;
+  }
+}
+
+message Delta {
+  oneof delta {
+    CreateKey create_key = 1;
+    DeleteKey delete_key = 2;
+    SetValue set_value = 3;
+    DeleteValue delete_value = 4;
+  }
+}
+
+message CreateKey {
+  string path = 1;
+}
+
+message DeleteKey {
+  string path = 1;
+}
+
+message SetValue {
+  string key_path = 1;
+  string name = 2;
+  Value data = 3;
+}
+
+message DeleteValue {
+  string key_path = 1;
+  string name = 2;
+}

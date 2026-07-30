@@ -3,6 +3,7 @@
 use core::{fmt::Debug, ops, slice};
 
 pub mod arch;
+pub mod layout;
 
 pub const RUSTOS_BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_5045;
 pub const RUSTOS_BOOT_INFO_VERSION: u32 = 8;

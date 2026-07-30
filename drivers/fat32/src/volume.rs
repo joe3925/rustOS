@@ -11,20 +11,21 @@ use fatfs::{
     LossyOemCpConverter, NullTimeProvider, RenamedFileState, SeekFrom, Write,
 };
 use kernel_api::device::DeviceObject;
+use kernel_api::error::{DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, io};
 use kernel_api::request::{
-    FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
+    FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate, FsDelete, FsFlush, FsGetInfo, FsOpen,
+    FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
 };
-use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
-        FileAttribute, FsAppendResult, FsCloseResult, FsCreateResult, FsFlushResult,
-        FsGetInfoResult, FsListDirResult, FsOpenResult, FsReadResult, FsRenameResult, FsSeekResult,
-        FsSeekWhence, FsSetLenResult, FsWriteResult, FsZeroRangeResult,
+        FileAttribute, FsAppendResult, FsCloseResult, FsCreateResult, FsDeleteResult,
+        FsFlushResult, FsGetInfoResult, FsListDirResult, FsOpenResult, FsReadResult,
+        FsRemoveDirResult, FsRenameResult, FsSeekResult, FsSeekWhence, FsSetLenResult,
+        FsWriteResult, FsZeroRangeResult,
     },
     println, request_handler,
 };
@@ -152,46 +153,69 @@ impl FileHandleTable {
         }
     }
 
-    fn ctx_mut(&mut self, fs_file_id: u64) -> Result<&mut FileCtx, FileStatus> {
+    fn ctx_mut(&mut self, fs_file_id: u64) -> Result<&mut FileCtx, KernelError> {
         self.slot_mut(fs_file_id)
             .and_then(|slot| slot.ctx.as_mut())
-            .ok_or(FileStatus::PathNotFound)
+            .ok_or_else(|| {
+                error(FileErrorKind::PathNotFound)
+                    .with_context(alloc::format!("looking up FAT32 file handle {fs_file_id}"))
+            })
     }
 
-    fn ctx(&self, fs_file_id: u64) -> Result<&FileCtx, FileStatus> {
-        let (index, generation) = self
-            .index_and_generation(fs_file_id)
-            .ok_or(FileStatus::PathNotFound)?;
+    fn ctx(&self, fs_file_id: u64) -> Result<&FileCtx, KernelError> {
+        let (index, generation) = self.index_and_generation(fs_file_id).ok_or_else(|| {
+            error(FileErrorKind::PathNotFound)
+                .with_context(alloc::format!("decoding FAT32 file handle {fs_file_id}"))
+        })?;
         let slot = &self.slots[index];
         if slot.generation == generation {
-            slot.ctx.as_ref().ok_or(FileStatus::PathNotFound)
+            slot.ctx.as_ref().ok_or_else(|| {
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "accessing closed FAT32 file handle {fs_file_id}"
+                ))
+            })
         } else {
-            Err(FileStatus::PathNotFound)
+            Err(
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "accessing stale FAT32 file handle {fs_file_id}"
+                )),
+            )
         }
     }
 
-    fn insert(&mut self, ctx: FileCtx) -> Result<u64, FileStatus> {
+    fn insert(&mut self, ctx: FileCtx) -> Result<u64, KernelError> {
         let Some(index) = self.free_head else {
             cold_path();
-            return Err(FileStatus::InternalError);
+            return Err(error(FileErrorKind::InternalError))
+                .with_context(|| "allocating a FAT32 file handle");
         };
         self.free_head = self.slots[index].next_free.take();
         self.slots[index].ctx = Some(ctx);
         Ok(self.id_for_slot(index))
     }
 
-    fn remove(&mut self, fs_file_id: u64) -> Result<FileCtx, FileStatus> {
-        let (index, generation) = self
-            .index_and_generation(fs_file_id)
-            .ok_or(FileStatus::PathNotFound)?;
+    fn remove(&mut self, fs_file_id: u64) -> Result<FileCtx, KernelError> {
+        let (index, generation) = self.index_and_generation(fs_file_id).ok_or_else(|| {
+            error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                "closing invalid FAT32 file handle {fs_file_id}"
+            ))
+        })?;
         let slot = &mut self.slots[index];
         if unlikely(slot.generation != generation) {
             cold_path();
-            return Err(FileStatus::PathNotFound);
+            return Err(
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "closing stale FAT32 file handle {fs_file_id}"
+                )),
+            );
         }
         let Some(ctx) = slot.ctx.take() else {
             cold_path();
-            return Err(FileStatus::PathNotFound);
+            return Err(
+                error(FileErrorKind::PathNotFound).with_context(alloc::format!(
+                    "closing already-closed FAT32 file handle {fs_file_id}"
+                )),
+            );
         };
         slot.generation = slot.generation.wrapping_add(1);
         slot.next_free = self.free_head;
@@ -199,11 +223,15 @@ impl FileHandleTable {
         Ok(ctx)
     }
 
-    fn take_cached_state(&mut self, fs_file_id: u64) -> Result<CachedFileState, FileStatus> {
+    fn take_cached_state(&mut self, fs_file_id: u64) -> Result<CachedFileState, KernelError> {
         let ctx = self.ctx_mut(fs_file_id)?;
         if unlikely(ctx.is_dir) {
             cold_path();
-            return Err(FileStatus::AccessDenied);
+            return Err(
+                error(FileErrorKind::AccessDenied).with_context(alloc::format!(
+                    "using directory handle {fs_file_id} as a FAT32 file"
+                )),
+            );
         }
         ctx.cached
             .take()
@@ -214,7 +242,7 @@ impl FileHandleTable {
         &mut self,
         fs_file_id: u64,
         state: CachedFileState,
-    ) -> Result<(), FileStatus> {
+    ) -> Result<(), KernelError> {
         self.ctx_mut(fs_file_id)?.cached = Some(state);
         Ok(())
     }
@@ -234,18 +262,19 @@ impl FileHandleTable {
     }
 }
 
-fn map_fatfs_err(e: &FsError) -> FileStatus {
+fn map_fatfs_err(e: &FsError) -> KernelError {
     match e {
-        fatfs::Error::NotFound => FileStatus::PathNotFound,
-        fatfs::Error::AlreadyExists => FileStatus::FileAlreadyExist,
-        fatfs::Error::InvalidInput => FileStatus::BadPath,
-        fatfs::Error::NotEnoughSpace => FileStatus::NoSpace,
-        fatfs::Error::CorruptedFileSystem => FileStatus::CorruptFilesystem,
-        fatfs::Error::FileTooLarge => FileStatus::FileTooLarge,
+        fatfs::Error::Io(err) => err.0.clone(),
+        fatfs::Error::NotFound => error(FileErrorKind::PathNotFound),
+        fatfs::Error::AlreadyExists => error(FileErrorKind::AlreadyExists),
+        fatfs::Error::InvalidInput => error(FileErrorKind::BadPath),
+        fatfs::Error::NotEnoughSpace => error(FileErrorKind::NoSpace),
+        fatfs::Error::CorruptedFileSystem => error(FileErrorKind::CorruptFilesystem),
+        fatfs::Error::FileTooLarge => error(FileErrorKind::FileTooLarge),
         e => {
             cold_path();
             println!("Mapping {:#?} to UnknownFail", e);
-            FileStatus::UnknownFail
+            error(FileErrorKind::UnknownFailure)
         }
     }
 }
@@ -286,7 +315,7 @@ async fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
 
 async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
     let old_size = file.seek(SeekFrom::End(0)).await?;
-    if new_size as u32 > u32::MAX {
+    if new_size > u32::MAX as u64 {
         return Err(FsError::FileTooLarge);
     }
     if new_size <= old_size {
@@ -315,9 +344,11 @@ async fn write_file_zeros(file: &mut FatFile<'_>, mut len: u64) -> Result<(), Fs
     Ok(())
 }
 
-fn missing_cached_file_state(fs_file_id: u64) -> FileStatus {
+fn missing_cached_file_state(fs_file_id: u64) -> KernelError {
     println!("Missing cached file state for fs_file_id {}", fs_file_id);
-    FileStatus::FileSystemError
+    error(FileErrorKind::FilesystemError).with_context(alloc::format!(
+        "FAT32 file handle {fs_file_id} has no cached file state"
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -330,7 +361,7 @@ enum LowerFlush {
 fn take_cached_file_state(
     vdx: &VolCtrlDevExt,
     fs_file_id: u64,
-) -> Result<CachedFileState, FileStatus> {
+) -> Result<CachedFileState, KernelError> {
     let mut handles = vdx.handles.lock();
     handles.take_cached_state(fs_file_id)
 }
@@ -343,9 +374,16 @@ fn schedule_lower_flush(vdx: &VolCtrlDevExt, fs_file_id: u64, lower_flush: Lower
     }
 }
 
-fn restore_cached_file(vdx: &VolCtrlDevExt, fs_file_id: u64, file: FatFile<'_>) {
+fn restore_cached_file(
+    vdx: &VolCtrlDevExt,
+    fs_file_id: u64,
+    file: FatFile<'_>,
+) -> Result<(), KernelError> {
     let state = file.into_cached_state();
-    let _ = vdx.handles.lock().restore_cached_state(fs_file_id, state);
+    vdx.handles
+        .lock()
+        .restore_cached_state(fs_file_id, state)
+        .with_context(|| alloc::format!("restoring FAT32 file handle {fs_file_id}"))
 }
 
 async fn flush_cached_file(
@@ -353,26 +391,51 @@ async fn flush_cached_file(
     fs_file_id: u64,
     mut file: FatFile<'_>,
     lower_flush: LowerFlush,
-) -> Option<FileStatus> {
-    let err = file.flush().await.err().map(|e| map_fatfs_err(&e));
-    restore_cached_file(vdx, fs_file_id, file);
+) -> Result<Option<KernelError>, KernelError> {
+    let err = match file.flush().await {
+        Ok(()) => None,
+        Err(FatError::Io(err)) => {
+            let restore_error = restore_cached_file(vdx, fs_file_id, file).err();
+            let mut err = err
+                .0
+                .with_context(alloc::format!("flushing FAT32 file handle {fs_file_id}"));
+            if let Some(restore_error) = restore_error {
+                err = err.with_context(alloc::format!(
+                    "also failed to restore the cached file state: {restore_error}"
+                ));
+            }
+            return Err(err);
+        }
+        Err(err) => Some(map_fatfs_err(&err)),
+    };
+    restore_cached_file(vdx, fs_file_id, file)?;
     if likely(err.is_none()) {
         schedule_lower_flush(vdx, fs_file_id, lower_flush);
     } else {
         cold_path();
     }
-    err
+    Ok(err)
 }
 
 pub struct Fat32Fs;
 
-async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
+async fn send_flush_owner(
+    volume_target: IoTarget,
+    owner: u64,
+    should_block: bool,
+) -> Result<(), KernelError> {
     let mut flush_req = FlushOwner {
         owner,
         should_block,
     };
-    let status = io::send_down_stack(volume_target, &mut flush_req).await;
-    status
+    io::send_down_stack(volume_target, &mut flush_req)
+        .await
+        .map(|_| ())
+        .with_context(|| {
+            alloc::format!(
+                "flushing FAT32 owner {owner} through the lower volume (blocking={should_block})"
+            )
+        })
 }
 
 fn capture_fs_context(
@@ -409,20 +472,22 @@ async fn finish_fs_request(
     pending_flush_owner: Arc<AtomicU64>,
     pending_flush_block: Arc<AtomicBool>,
     flush_metadata_after_op: bool,
-) {
+) -> Result<(), KernelError> {
     if unlikely(flush_flag.swap(false, Ordering::AcqRel)) {
         let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
         let should_block = pending_flush_block.swap(false, Ordering::AcqRel);
         if likely(owner != 0) {
-            let _ = send_flush_owner(volume_target.clone(), owner, should_block).await;
+            send_flush_owner(volume_target.clone(), owner, should_block).await?;
         } else {
             cold_path();
         }
     }
 
     if unlikely(flush_metadata_after_op) {
-        let _ = send_flush_owner(volume_target, METADATA_OWNER_ID, true).await;
+        send_flush_owner(volume_target, METADATA_OWNER_ID, true).await?;
     }
+
+    Ok(())
 }
 
 fn set_current_owner(dev: &Arc<DeviceObject>, owner: u64) {
@@ -435,11 +500,11 @@ impl FileSystem for Fat32Fs {
     async fn open<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsOpen>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let mut fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -494,8 +559,7 @@ impl FileSystem for Fat32Fs {
                 }
             };
             payload.result = Some(result_value);
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -503,20 +567,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn close<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsClose>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -538,8 +602,7 @@ impl FileSystem for Fat32Fs {
                 flush_owner_blocking(&vdx, fs_file_id);
             }
             payload.result = Some(FsCloseResult { error: err });
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -547,20 +610,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             true,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn read<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsRead>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -568,8 +631,10 @@ impl FileSystem for Fat32Fs {
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
 
-            let read_res: Result<usize, FileStatus> = match params.buffer.take() {
-                None => Err(FileStatus::NoBuffer),
+            let read_res: Result<usize, KernelError> = match params.buffer.take() {
+                None => Err(error(FileErrorKind::NoBuffer).with_context(alloc::format!(
+                    "reading FAT32 file handle {fs_file_id} without a buffer"
+                ))),
                 Some(buffer) => {
                     let state = take_cached_file_state(&vdx, fs_file_id);
                     match state {
@@ -584,7 +649,7 @@ impl FileSystem for Fat32Fs {
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
                             };
-                            restore_cached_file(&vdx, fs_file_id, file);
+                            restore_cached_file(&vdx, fs_file_id, file)?;
                             res
                         }
                     }
@@ -611,8 +676,7 @@ impl FileSystem for Fat32Fs {
                 },
             };
             payload.result = Some(res);
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -620,20 +684,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn write<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsWrite>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -642,23 +706,23 @@ impl FileSystem for Fat32Fs {
             let offset = params.offset;
             let write_through = params.write_through;
 
-            let write_res: Result<usize, FileStatus> = match params.buffer.take() {
-                None => Err(FileStatus::NoBuffer),
+            let write_res: Result<usize, KernelError> = match params.buffer.take() {
+                None => Err(error(FileErrorKind::NoBuffer).with_context(alloc::format!(
+                    "writing FAT32 file handle {fs_file_id} without a buffer"
+                ))),
                 Some(buffer) => {
                     let state = take_cached_file_state(&vdx, fs_file_id);
                     match state {
                         Err(e) => Err(e),
                         Ok(state) => {
                             let mut file = state.into_file(&*fs);
-                            let seek_res = file.seek(SeekFrom::Start(offset)).await;
-                            let res = if let Err(e) = seek_res {
-                                Err(map_fatfs_err(&e))
-                            } else {
-                                let write_res =
-                                    file.write_iobuffer(buffer, fatfs::IoKind::Data).await;
-                                match write_res {
-                                    Ok(n) => Ok(n),
-                                    Err(e) => Err(map_fatfs_err(&e)),
+                            let res = match file.seek(SeekFrom::Start(offset)).await {
+                                Err(e) => Err(map_fatfs_err(&e)),
+                                Ok(_) => {
+                                    match file.write_iobuffer(buffer, fatfs::IoKind::Data).await {
+                                        Ok(n) => Ok(n),
+                                        Err(e) => Err(map_fatfs_err(&e)),
+                                    }
                                 }
                             };
                             let lower_flush = if write_through && res.is_ok() {
@@ -667,9 +731,9 @@ impl FileSystem for Fat32Fs {
                                 LowerFlush::None
                             };
                             let flush_err = if write_through {
-                                flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
+                                flush_cached_file(&vdx, fs_file_id, file, lower_flush).await?
                             } else {
-                                restore_cached_file(&vdx, fs_file_id, file);
+                                restore_cached_file(&vdx, fs_file_id, file)?;
                                 None
                             };
                             match flush_err {
@@ -703,8 +767,7 @@ impl FileSystem for Fat32Fs {
                 },
             };
             payload.result = Some(res);
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -712,20 +775,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn flush<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsFlush>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -744,14 +807,13 @@ impl FileSystem for Fat32Fs {
                         Err(e) => Some(e),
                         Ok(state) => {
                             let file = state.into_file(&*fs);
-                            flush_cached_file(&vdx, fs_file_id, file, LowerFlush::Blocking).await
+                            flush_cached_file(&vdx, fs_file_id, file, LowerFlush::Blocking).await?
                         }
                     }
                 }
             };
             payload.result = Some(FsFlushResult { error: err });
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -759,20 +821,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             true,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn seek<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsSeek>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (_, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let params = &req.payload.params;
             let (fs_file_id, origin, offset) = (params.fs_file_id, params.origin, params.offset);
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
@@ -802,8 +864,7 @@ impl FileSystem for Fat32Fs {
                 },
             };
             req.payload.result = Some(res);
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -811,19 +872,19 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn create<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsCreate>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let mut fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -836,8 +897,7 @@ impl FileSystem for Fat32Fs {
             };
             flush_owner_blocking(&vdx, METADATA_OWNER_ID);
             payload.result = Some(FsCreateResult { error: err });
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -845,19 +905,91 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
+    }
+
+    #[request_handler]
+    async fn remove_dir<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut FsRequest<'data, FsRemoveDir>,
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let mut fs = fs_arc.lock().await;
+            let path = req.payload.params.path.as_str();
+            let root = fs.root_dir();
+            let result = match root.open_dir(path).await {
+                Ok(dir) => {
+                    drop(dir);
+                    root.remove(path).await
+                }
+                Err(error) => Err(error),
+            };
+            flush_owner_blocking(&vdx, METADATA_OWNER_ID);
+            req.payload.result = Some(FsRemoveDirResult {
+                error: result.err().map(|error| map_fatfs_err(&error)),
+            });
+        }
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await?;
+        Ok(DriverStep::Complete)
+    }
+
+    #[request_handler]
+    async fn delete<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut FsRequest<'data, FsDelete>,
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let mut fs = fs_arc.lock().await;
+            let path = req.payload.params.path.as_str();
+            let root = fs.root_dir();
+            let result = match root.open_file(path).await {
+                Ok(file) => {
+                    drop(file);
+                    root.remove(path).await
+                }
+                Err(error) => Err(error),
+            };
+            flush_owner_blocking(&vdx, METADATA_OWNER_ID);
+            req.payload.result = Some(FsDeleteResult {
+                error: result.err().map(|error| map_fatfs_err(&error)),
+            });
+        }
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn rename<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsRename>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let mut fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -875,8 +1007,7 @@ impl FileSystem for Fat32Fs {
                 }
             };
             payload.result = Some(FsRenameResult { error: err });
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -884,19 +1015,19 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn read_dir<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsReadDir>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         set_current_owner(dev, METADATA_OWNER_ID);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let mut fs = fs_arc.lock().await;
             let payload = &mut req.payload;
             let params = &payload.params;
@@ -913,8 +1044,7 @@ impl FileSystem for Fat32Fs {
                 }
             };
             payload.result = Some(res);
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -922,20 +1052,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn get_info<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsGetInfo>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (_, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let payload = &mut req.payload;
             let params = &payload.params;
@@ -963,8 +1093,7 @@ impl FileSystem for Fat32Fs {
                 },
             };
             payload.result = Some(res);
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -972,20 +1101,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn set_len<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsSetLen>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -1002,7 +1131,7 @@ impl FileSystem for Fat32Fs {
                             .await
                             .err()
                             .map(|e| map_fatfs_err(&e));
-                        restore_cached_file(&vdx, fs_file_id, file);
+                        restore_cached_file(&vdx, fs_file_id, file)?;
                         err
                     }
                 }
@@ -1020,8 +1149,7 @@ impl FileSystem for Fat32Fs {
                 }
             }
             payload.result = Some(FsSetLenResult { error: err });
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -1029,20 +1157,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn append<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsAppend>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -1050,13 +1178,18 @@ impl FileSystem for Fat32Fs {
             let fs_file_id = params.fs_file_id;
             let write_through = params.write_through;
 
-            let append_res: Result<(usize, u64), FileStatus> = match params.buffer.take() {
-                None => Err(FileStatus::NoBuffer),
+            let append_res: Result<(usize, u64), KernelError> = match params.buffer.take() {
+                None => Err(error(FileErrorKind::NoBuffer).with_context(alloc::format!(
+                    "appending to FAT32 file handle {fs_file_id} without a buffer"
+                ))),
                 Some(buffer) => {
                     let start_off = {
                         let handles = vdx.handles.lock();
                         match handles.ctx(fs_file_id) {
-                            Ok(ctx) if ctx.is_dir => Err(FileStatus::AccessDenied),
+                            Ok(ctx) if ctx.is_dir => Err(error(FileErrorKind::AccessDenied)
+                                .with_context(alloc::format!(
+                                    "appending to directory handle {fs_file_id}"
+                                ))),
                             Ok(ctx) => Ok(ctx.size),
                             Err(e) => Err(e),
                         }
@@ -1087,9 +1220,10 @@ impl FileSystem for Fat32Fs {
                                         LowerFlush::None
                                     };
                                     let flush_err = if write_through {
-                                        flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
+                                        flush_cached_file(&vdx, fs_file_id, file, lower_flush)
+                                            .await?
                                     } else {
-                                        restore_cached_file(&vdx, fs_file_id, file);
+                                        restore_cached_file(&vdx, fs_file_id, file)?;
                                         None
                                     };
                                     match flush_err {
@@ -1124,8 +1258,7 @@ impl FileSystem for Fat32Fs {
                 },
             };
             payload.result = Some(res);
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -1133,20 +1266,20 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 
     #[request_handler]
     async fn zero_range<'req, 'data, 'b>(
         dev: &Arc<DeviceObject>,
         req: &'b mut FsRequest<'data, FsZeroRange>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let owner = req.payload.params.fs_file_id;
         set_current_owner(dev, owner);
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
-        let status = {
+        {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
             let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
@@ -1160,30 +1293,49 @@ impl FileSystem for Fat32Fs {
                     Err(e) => Some(e),
                     Ok(state) => {
                         let mut file = state.into_file(&*fs);
-                        let file_len = file.seek(SeekFrom::End(0)).await.unwrap_or(0);
                         let end = offset.saturating_add(len);
-                        let (op_err, lower_flush) = if offset > file_len {
-                            (Some(FileStatus::BadPath), LowerFlush::None)
-                        } else {
-                            let actual_end = end.min(file_len);
-                            let zero_len = actual_end.saturating_sub(offset);
-                            if zero_len == 0 {
-                                (None, LowerFlush::None)
-                            } else {
-                                match file.seek(SeekFrom::Start(offset)).await {
-                                    Ok(_) => match write_file_zeros(&mut file, zero_len).await {
-                                        Ok(()) => (None, LowerFlush::Background),
-                                        Err(e) => (Some(map_fatfs_err(&e)), LowerFlush::None),
-                                    },
-                                    Err(e) => (Some(map_fatfs_err(&e)), LowerFlush::None),
+                        let (op_err, lower_flush) =
+                            match file.seek(SeekFrom::End(0)).await {
+                                Err(err) => (Some(map_fatfs_err(&err)), LowerFlush::None),
+                                Ok(file_len) if offset > file_len => (
+                                    Some(error(FileErrorKind::BadPath).with_context(
+                                        alloc::format!(
+                                            "zeroing FAT32 file handle {fs_file_id} at offset {offset} beyond file length {file_len}"
+                                        ),
+                                    )),
+                                    LowerFlush::None,
+                                ),
+                                Ok(file_len) => {
+                                    let actual_end = end.min(file_len);
+                                    let zero_len = actual_end.saturating_sub(offset);
+                                    if zero_len == 0 {
+                                        (None, LowerFlush::None)
+                                    } else {
+                                        match file.seek(SeekFrom::Start(offset)).await {
+                                            Ok(_) => {
+                                                match write_file_zeros(&mut file, zero_len).await {
+                                                    Ok(()) => {
+                                                        (None, LowerFlush::Background)
+                                                    }
+                                                    Err(e) => (
+                                                        Some(map_fatfs_err(&e)),
+                                                        LowerFlush::None,
+                                                    ),
+                                                }
+                                            }
+                                            Err(e) => (
+                                                Some(map_fatfs_err(&e)),
+                                                LowerFlush::None,
+                                            ),
+                                        }
+                                    }
                                 }
-                            }
-                        };
+                            };
                         let flush_err =
                             if op_err.is_none() && !matches!(lower_flush, LowerFlush::None) {
-                                flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
+                                flush_cached_file(&vdx, fs_file_id, file, lower_flush).await?
                             } else {
-                                restore_cached_file(&vdx, fs_file_id, file);
+                                restore_cached_file(&vdx, fs_file_id, file)?;
                                 None
                             };
                         flush_err.or(op_err)
@@ -1191,8 +1343,7 @@ impl FileSystem for Fat32Fs {
                 }
             };
             payload.result = Some(FsZeroRangeResult { error: err });
-            DriverStatus::Success
-        };
+        }
         finish_fs_request(
             volume_target,
             flush_flag,
@@ -1200,7 +1351,7 @@ impl FileSystem for Fat32Fs {
             pending_flush_block,
             false,
         )
-        .await;
-        DriverStep::complete(status)
+        .await?;
+        Ok(DriverStep::Complete)
     }
 }

@@ -36,7 +36,7 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{DeviceControl, Flush, FlushDirty, Read, Write};
-use kernel_api::status::DriverStatus;
+use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 use kernel_api::{println, request_handler};
 use spin::Once;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -51,15 +51,15 @@ fn panic(info: &PanicInfo) -> ! {
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub unsafe extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, partmgr_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn partmgr_device_add(
     _driver: &Arc<DriverObject>,
     init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     init.set_dev_ext_default::<PartMgrExt>();
 
     let mut pnp = PnpOps::new();
@@ -67,7 +67,7 @@ pub extern "C" fn partmgr_device_add(
     pnp.query_device_relations.set(partmgr_pnp_query_devrels);
     init.pnp_ops = Some(pnp);
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[repr(C)]
@@ -109,7 +109,7 @@ fn validate_partition_read_chain<'io>(
     first: &Read<'io>,
     part_bytes: u64,
     block_size: u64,
-) -> Result<(), DriverStatus> {
+) -> Result<(), DriverErrorKind> {
     for read in first.iter() {
         if read.len == 0 {
             continue;
@@ -117,25 +117,25 @@ fn validate_partition_read_chain<'io>(
 
         if !read.no_buffer {
             let Some(buffer) = read.buffer.as_ref() else {
-                return Err(DriverStatus::InvalidParameter);
+                return Err(DriverErrorKind::InvalidParameter);
             };
 
             if buffer.len() < read.len {
-                return Err(DriverStatus::InvalidParameter);
+                return Err(DriverErrorKind::InvalidParameter);
             }
         }
 
         let end = read
             .offset
             .checked_add(read.len as u64)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
 
         if end > part_bytes {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         if read.offset % block_size != 0 || !(read.len as u64).is_multiple_of(block_size) {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
     }
 
@@ -146,7 +146,7 @@ fn validate_partition_write_chain<'io>(
     first: &Write<'io>,
     part_bytes: u64,
     block_size: u64,
-) -> Result<(), DriverStatus> {
+) -> Result<(), DriverErrorKind> {
     for write in first.iter() {
         if write.len == 0 {
             continue;
@@ -154,48 +154,48 @@ fn validate_partition_write_chain<'io>(
 
         if !write.no_buffer {
             let Some(buffer) = write.buffer.as_ref() else {
-                return Err(DriverStatus::InvalidParameter);
+                return Err(DriverErrorKind::InvalidParameter);
             };
 
             if buffer.len() < write.len {
-                return Err(DriverStatus::InvalidParameter);
+                return Err(DriverErrorKind::InvalidParameter);
             }
         }
 
         let end = write
             .offset
             .checked_add(write.len as u64)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
 
         if end > part_bytes {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
 
         if write.offset % block_size != 0 || !(write.len as u64).is_multiple_of(block_size) {
-            return Err(DriverStatus::InvalidParameter);
+            return Err(DriverErrorKind::InvalidParameter);
         }
     }
 
     Ok(())
 }
 
-fn translate_read_chain<'io>(first: &mut Read<'io>, base: u64) -> Result<(), DriverStatus> {
+fn translate_read_chain<'io>(first: &mut Read<'io>, base: u64) -> Result<(), DriverErrorKind> {
     for read in first.iter_mut() {
         read.offset = read
             .offset
             .checked_add(base)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
     }
 
     Ok(())
 }
 
-fn translate_write_chain<'io>(first: &mut Write<'io>, base: u64) -> Result<(), DriverStatus> {
+fn translate_write_chain<'io>(first: &mut Write<'io>, base: u64) -> Result<(), DriverErrorKind> {
     for write in first.iter_mut() {
         write.offset = write
             .offset
             .checked_add(base)
-            .ok_or(DriverStatus::InvalidParameter)?;
+            .ok_or(DriverErrorKind::InvalidParameter)?;
     }
 
     Ok(())
@@ -206,7 +206,7 @@ impl DeviceRead for PartitionPdoIo {
     async fn handler<'req, 'data, 'b>(
         device: &Arc<DeviceObject>,
         request: &'b mut Read<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = ext::<PartDevExt>(&device);
         let start_lba = *dx.start_lba.get().unwrap();
         let end_lba = *dx.end_lba.get().unwrap();
@@ -215,7 +215,7 @@ impl DeviceRead for PartitionPdoIo {
             Some(v) if *v != 0 => *v as u64,
             _ => {
                 cold_path();
-                return DriverStep::complete(DriverStatus::InvalidParameter);
+                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
             }
         };
 
@@ -223,7 +223,7 @@ impl DeviceRead for PartitionPdoIo {
             Some(bytes) => bytes,
             None => {
                 cold_path();
-                return DriverStep::complete(DriverStatus::InvalidParameter);
+                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
             }
         };
 
@@ -231,28 +231,28 @@ impl DeviceRead for PartitionPdoIo {
             Some(base) => base,
             None => {
                 cold_path();
-                return DriverStep::complete(DriverStatus::InvalidParameter);
+                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
             }
         };
 
         {
             let body = &request;
-            if let Err(status) = validate_partition_read_chain(body, part_bytes, block_size) {
+            if let Err(kind) = validate_partition_read_chain(body, part_bytes, block_size) {
                 cold_path();
-                return DriverStep::complete(status);
+                return Err(error(kind));
             }
         }
 
         {
-            if let Err(status) = translate_read_chain(request, base) {
+            if let Err(kind) = translate_read_chain(request, base) {
                 cold_path();
-                return DriverStep::complete(status);
+                return Err(error(kind));
             }
         }
 
-        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-        DriverStep::complete(status)
+        io::send_to_stack_top(dx.parent.get().unwrap().clone(), request)
+            .await
+            .with_context(|| "forwarding a partition read to the parent disk")
     }
 }
 
@@ -261,7 +261,7 @@ impl DeviceWrite for PartitionPdoIo {
     async fn handler<'req, 'data, 'b>(
         device: &Arc<DeviceObject>,
         request: &'b mut Write<'data>,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = ext::<PartDevExt>(&device);
         let start_lba = *dx.start_lba.get().unwrap();
         let end_lba = *dx.end_lba.get().unwrap();
@@ -270,7 +270,7 @@ impl DeviceWrite for PartitionPdoIo {
             Some(v) if *v != 0 => *v as u64,
             _ => {
                 cold_path();
-                return DriverStep::complete(DriverStatus::InvalidParameter);
+                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
             }
         };
 
@@ -278,7 +278,7 @@ impl DeviceWrite for PartitionPdoIo {
             Some(bytes) => bytes,
             None => {
                 cold_path();
-                return DriverStep::complete(DriverStatus::InvalidParameter);
+                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
             }
         };
 
@@ -286,37 +286,37 @@ impl DeviceWrite for PartitionPdoIo {
             Some(base) => base,
             None => {
                 cold_path();
-                return DriverStep::complete(DriverStatus::InvalidParameter);
+                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
             }
         };
 
         {
             let body = &request;
-            if let Err(status) = validate_partition_write_chain(body, part_bytes, block_size) {
+            if let Err(kind) = validate_partition_write_chain(body, part_bytes, block_size) {
                 cold_path();
-                return DriverStep::complete(status);
+                return Err(error(kind));
             }
         }
 
         {
-            if let Err(status) = translate_write_chain(request, base) {
+            if let Err(kind) = translate_write_chain(request, base) {
                 cold_path();
-                return DriverStep::complete(status);
+                return Err(error(kind));
             }
         }
 
-        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-        DriverStep::complete(status)
+        io::send_to_stack_top(dx.parent.get().unwrap().clone(), request)
+            .await
+            .with_context(|| "forwarding a partition write to the parent disk")
     }
 }
 impl DeviceFlush for PartitionPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(device: &Arc<DeviceObject>, request: &'b mut Flush) -> DriverStep {
+    async fn handler<'req, 'b>(device: &Arc<DeviceObject>, request: &'b mut Flush) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = ext::<PartDevExt>(&device);
-        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-        DriverStep::complete(status)
+        io::send_to_stack_top(dx.parent.get().unwrap().clone(), request)
+            .await
+            .with_context(|| "forwarding a partition flush to the parent disk")
     }
 }
 
@@ -325,11 +325,11 @@ impl DeviceFlushDirty for PartitionPdoIo {
     async fn handler<'req, 'b>(
         device: &Arc<DeviceObject>,
         request: &'b mut FlushDirty,
-    ) -> DriverStep {
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = ext::<PartDevExt>(&device);
-        let status = io::send_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-        DriverStep::complete(status)
+        io::send_to_stack_top(dx.parent.get().unwrap().clone(), request)
+            .await
+            .with_context(|| "forwarding a dirty partition flush to the parent disk")
     }
 }
 
@@ -338,14 +338,19 @@ async fn partmgr_pdo_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
-    if let Some(dn) = dev.dev_node.get() {
-        if let Some(dn) = dn.upgrade() {
-            register_protocol::<PartitionInfoProtocol>(dev, &PARTITION_INFO_VTABLE);
-            publish_stack_protocol::<PartitionInfoProtocol>(&dn);
-        }
-    }
-    DriverStep::Continue
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    let dn = dev
+        .dev_node
+        .get()
+        .and_then(|node| node.upgrade())
+        .ok_or_else(|| error(DriverErrorKind::NoSuchDevice))?;
+    register_protocol::<PartitionInfoProtocol>(dev, &PARTITION_INFO_VTABLE)
+        .map_err(error)
+        .with_context(|| "registering the partition information protocol")?;
+    publish_stack_protocol::<PartitionInfoProtocol>(&dn)
+        .map_err(error)
+        .with_context(|| "publishing the partition information protocol")?;
+    Ok(DriverStep::Continue)
 }
 
 #[request_handler]
@@ -353,32 +358,32 @@ pub async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     request: &'b mut RegisterDmaBacking<'data>,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dx = ext::<PartDevExt>(&device);
 
     let Some(parent) = dx.parent.get() else {
         cold_path();
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
-    let status = pnp::send_to_stack_top(parent.clone(), request).await;
-
-    DriverStep::complete(status)
+    pnp::send_to_stack_top(parent.clone(), request)
+        .await
+        .with_context(|| "registering partition DMA backing with the parent disk")
 }
 #[request_handler]
 pub async fn partmgr_init_complete<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut InitComplete,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let dx = ext::<PartMgrExt>(&dev);
 
     let devnode = dev.dev_node.get().unwrap().upgrade().unwrap();
     let proto = match open_public_protocol::<DiskInfoProtocol>(&devnode) {
         Ok(p) => p,
-        Err(e) => {
+        Err(kind) => {
             cold_path();
-            return DriverStep::complete(e);
+            return Err(error(kind).with_context("opening the disk information protocol"));
         }
     };
 
@@ -386,20 +391,20 @@ pub async fn partmgr_init_complete<'req, 'data, 'b>(
         Ok(di) => di,
         Err(e) => {
             cold_path();
-            return DriverStep::complete(e);
+            return Err(e.with_context("querying disk information"));
         }
     };
 
     dx.disk_info.call_once(|| di);
 
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 async fn read_from_lower_async(
     dev: &Arc<DeviceObject>,
     offset: u64,
     len: usize,
-) -> Result<Box<[u8]>, DriverStatus> {
+) -> Result<Box<[u8]>, KernelError> {
     let mut data = vec![0u8; len];
     let io_buf = IoBufferBacking::new(
         IoBufferBackingDesc::SliceMut(&mut data),
@@ -416,16 +421,14 @@ async fn read_from_lower_async(
                 .expect("io_buf creation for read_from_lower_async failed"),
         ),
     );
-    let status = io::send_next_lower(dev.clone(), &mut child_req).await;
+    let result = io::send_next_lower(dev.clone(), &mut child_req)
+        .await
+        .with_context(|| "reading partition metadata from the lower disk");
 
     drop(child_req);
     drop(io_buf);
-    if likely(status == DriverStatus::Success) {
-        Ok(data.into_boxed_slice())
-    } else {
-        cold_path();
-        Err(status)
-    }
+    result?;
+    Ok(data.into_boxed_slice())
 }
 
 #[request_handler]
@@ -433,10 +436,10 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     request: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let relation = request.relation;
     if relation != DeviceRelationType::BusRelations {
-        return DriverStep::complete(DriverStatus::NotImplemented);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
     }
 
     let pmx = ext::<PartMgrExt>(&device);
@@ -445,38 +448,38 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
         .enumerated
         .swap(true, core::sync::atomic::Ordering::AcqRel)
     {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let di = if let Some(buf) = pmx.disk_info.get() {
         buf
     } else {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     };
 
     let sec_sz_u32 = di.logical_block_size;
     if sec_sz_u32 == 0 {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
     let sec_sz = sec_sz_u32 as usize;
     let hdr_bytes = match read_from_lower_async(&device, sec_sz as u64, sec_sz).await {
         Ok(b) => b,
         Err(st) => {
-            return DriverStep::complete(st);
+            return Err(st);
         }
     };
 
     if hdr_bytes.len() < core::mem::size_of::<GptHeader>() {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let hdr: GptHeader = unsafe { ptr::read_unaligned(hdr_bytes.as_ptr() as *const GptHeader) };
 
     if &hdr.signature != b"EFI PART" {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
     if hdr.partition_entry_size != 128 || hdr.num_partition_entries == 0 {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let total_bytes = (hdr.num_partition_entries as usize) * (hdr.partition_entry_size as usize);
@@ -490,14 +493,14 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
     {
         Ok(b) => b,
         Err(st) => {
-            return DriverStep::complete(st);
+            return Err(st);
         }
     };
 
     let parent_dn = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            return DriverStep::complete(DriverStatus::DeviceNotReady);
+            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::DeviceNotReady));
         }
     };
 
@@ -582,7 +585,7 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
 
         _found_count += 1;
     }
-    DriverStep::Continue
+    Ok(DriverStep::Continue)
 }
 
 #[inline]
@@ -608,12 +611,12 @@ fn guid_to_string(g: &[u8; 16]) -> String {
 
 extern "C" fn part_partition_info(
     device: &Arc<DeviceObject>,
-) -> Result<PartitionInfo, DriverStatus> {
+) -> Result<PartitionInfo, KernelError> {
     let dx = ext::<PartDevExt>(device);
     if let Some(pi) = dx.part.get() {
         Ok(pi.clone())
     } else {
-        Err(DriverStatus::Unsuccessful)
+        Err(error(DriverErrorKind::Unsuccessful))
     }
 }
 const PARTITION_INFO_VTABLE: PartitionInfoProtocolVTable = PartitionInfoProtocolVTable {

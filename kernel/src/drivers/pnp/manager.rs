@@ -1,22 +1,24 @@
 use super::driver_index::{self, HwIndex};
 use crate::drivers::pnp::device::DevNodeExt;
+use crate::error::error_with_message;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::object_manager::{ObjRef, Object, ObjectPayload, OBJECT_MANAGER};
+use crate::object_manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
+use kernel_types::error::{DriverErrorKind, KernelError, ResultErrorContext};
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;
-use kernel_types::status::DriverError;
 
 use crate::println;
-use crate::registry::reg::{get_key, get_value, list_keys};
+use crate::registry::reg::{create_key, get_key, get_value, list_keys, set_value};
 use alloc::string::ToString;
 use alloc::vec;
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_routing::pnp;
+use kernel_types::ClassEventCallback;
 use kernel_types::device::{
-    open_public_protocol, DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack,
-    DriverObject, DriverPackage, DriverRuntime, DriverState, StackLayer,
+    DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
+    DriverRuntime, DriverState, StackLayer,
 };
 use kernel_types::fs::Path;
 use kernel_types::io::IoTarget;
@@ -24,10 +26,38 @@ use kernel_types::pnp::{
     BootType, DeviceEvent, DeviceIds, DeviceRelationType, DriverRole, DriverStep, InitComplete,
     ProbeContext, ProbeOutcome, QueryDeviceRelations, RemoveDevice, StartDevice,
 };
-use kernel_types::protocol::volmgr::VolumeProtocol;
-use kernel_types::status::{Data, DriverStatus, RegError};
-use kernel_types::ClassEventCallback;
+use kernel_types::status::Data;
 use spin::{Mutex, RwLock};
+
+fn device_link_path(path: &str) -> String {
+    let trimmed = path.trim_start_matches(['\\', '/']);
+    let relative = trimmed
+        .strip_prefix("GLOBAL\\")
+        .or_else(|| trimmed.strip_prefix("global\\"))
+        .or_else(|| {
+            trimmed
+                .get(..14)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("Links\\Devices\\"))
+                .map(|_| &trimmed[14..])
+        })
+        .unwrap_or(trimmed);
+    alloc::format!("\\Links\\Devices\\{}", relative)
+}
+
+fn device_link_path_if_public(path: &str) -> String {
+    let trimmed = path.trim_start_matches(['\\', '/']);
+    if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GLOBAL\\"))
+        || trimmed
+            .get(..14)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Links\\Devices\\"))
+    {
+        device_link_path(path)
+    } else {
+        path.to_string()
+    }
+}
 
 #[repr(C)]
 pub struct ClassListener {
@@ -45,6 +75,9 @@ pub struct PnpManager {
 }
 
 impl PnpManager {
+    const BINDINGS_KEY: &'static str = "SYSTEM/CurrentControlSet/Pnp/Bindings";
+    const PREFERRED_FUNCTION_DRIVER: &'static str = "PreferredFunctionDriver";
+
     pub fn new() -> Self {
         Self {
             hw: RwLock::new(Arc::new(HwIndex::new())),
@@ -59,13 +92,13 @@ impl PnpManager {
         self.dev_root.clone()
     }
 
-    pub async fn init_from_registry(&self) -> Result<(), RegError> {
+    pub async fn init_from_registry(&self) -> Result<(), KernelError> {
         self.rebuild_index().await?;
         let boot_packages = self.collect_boot_packages();
 
         for pkg in boot_packages {
             match self.ensure_loaded(&pkg).await {
-                Ok(driver) if self.ensure_driver_entry(&driver) => {}
+                Ok(driver) if self.ensure_driver_entry(&driver).is_ok() => {}
                 Ok(_) => println!("-> initialize boot service {} failed", pkg.name),
                 Err(error) => println!("-> load boot service {} failed: {:?}", pkg.name, error),
             }
@@ -101,14 +134,17 @@ impl PnpManager {
             .collect()
     }
 
-    pub async fn rebuild_index(&self) -> Result<(), RegError> {
+    pub async fn rebuild_index(&self) -> Result<(), KernelError> {
         let hw = driver_index::build_hw_index().await?;
         *self.hw.write() = Arc::new(hw);
         Ok(())
     }
 
     pub async fn recheck_all_devices(&self) {
-        let _ = self.rebuild_index().await;
+        if let Err(error) = self.rebuild_index().await {
+            println!("[MANAGER] Failed to rebuild driver index: {error}");
+            return;
+        }
         let root = self.root();
         self.rebind_tree(&root).await;
         self.rescan_buses_started(&root);
@@ -116,7 +152,10 @@ impl PnpManager {
 
     pub async fn rebind_faulted_and_unbound(&self) {
         if self.hw.read().by_driver.is_empty() {
-            let _ = self.rebuild_index().await;
+            if let Err(error) = self.rebuild_index().await {
+                println!("[MANAGER] Failed to rebuild driver index: {error}");
+                return;
+            }
         }
         let root = self.root();
         self.rebind_tree(&root).await;
@@ -129,7 +168,12 @@ impl PnpManager {
         while let Some(node) = stack.pop() {
             let state = node.get_state();
             if Self::node_needs_function_driver(&node) && Self::can_rebind_state(state) {
-                let _ = self.bind_and_start(&node).await;
+                if let Err(error) = self.bind_and_start(&node).await {
+                    println!(
+                        "[MANAGER] Failed to bind/start `{}`: {}",
+                        node.instance_path, error
+                    );
+                }
             }
 
             for ch in Self::collect_children(&node) {
@@ -235,12 +279,16 @@ impl PnpManager {
         (dev_node, pdo)
     }
 
-    pub async fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
-        let pdo = dn.get_pdo().ok_or(DriverError::NoParent)?;
-        let pdo_status = Self::start_device_object(&pdo).await;
-        if pdo_status != DriverStatus::Success {
+    pub async fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), KernelError> {
+        let pdo = dn.get_pdo().ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::NoSuchDevice,
+                format_args!("device node `{}` has no PDO", dn.instance_path),
+            )
+        })?;
+        if let Err(error) = Self::start_device_object(&pdo).await {
             dn.set_state(DevNodeState::Faulted);
-            return Err(DriverError::ProbeFailed(pdo_status));
+            return Err(error.with_context(format!("starting PDO for `{}`", dn.instance_path)));
         }
         self.bind_device(dn).await?;
         let has_function = dn
@@ -256,26 +304,25 @@ impl PnpManager {
         Ok(())
     }
 
-    async fn start_device_object(device: &Arc<DeviceObject>) -> DriverStatus {
+    async fn start_device_object(device: &Arc<DeviceObject>) -> Result<(), KernelError> {
         if device.is_started() {
-            return DriverStatus::Success;
+            return Ok(());
         }
         let mut start = StartDevice {
             resources: Vec::new(),
         };
-        let status = pnp::send_to_device(device.clone(), &mut start).await;
-        if status != DriverStatus::Success {
-            return status;
-        }
+        pnp::send_to_device(device.clone(), &mut start)
+            .await
+            .with_context(|| "sending StartDevice")?;
         let mut init = InitComplete;
-        let status = pnp::send_to_device(device.clone(), &mut init).await;
-        if status == DriverStatus::Success {
-            device.set_started(true);
-        }
-        status
+        pnp::send_to_device(device.clone(), &mut init)
+            .await
+            .with_context(|| "sending InitComplete")?;
+        device.set_started(true);
+        Ok(())
     }
 
-    async fn bind_device(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
+    async fn bind_device(&self, dn: &Arc<DevNode>) -> Result<(), KernelError> {
         let Some(function_pkg) = self.select_function_package(dn).await? else {
             dn.set_state(DevNodeState::Initialized);
             return Ok(());
@@ -305,12 +352,17 @@ impl PnpManager {
     async fn select_function_package(
         &self,
         dn: &Arc<DevNode>,
-    ) -> Result<Option<Arc<DriverPackage>>, DriverError> {
+    ) -> Result<Option<Arc<DriverPackage>>, KernelError> {
         let ids = Self::all_driver_ids(dn);
         let mut candidates = self.hw.read().matching(&ids, DriverRole::Function);
-        let target = dn.get_pdo().ok_or(DriverError::NoParent)?;
+        let target = dn.get_pdo().ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::NoSuchDevice,
+                format_args!("device node `{}` has no PDO", dn.instance_path),
+            )
+        })?;
 
-        if let Some(hint) = Self::filesystem_hint(dn).await {
+        if let Some(hint) = Self::preferred_function_driver(dn).await {
             if let Some(index) = candidates
                 .iter()
                 .position(|candidate| candidate.pkg.name == hint)
@@ -321,9 +373,7 @@ impl PnpManager {
 
         for candidate in candidates {
             let driver = self.ensure_loaded(&candidate.pkg).await?;
-            if !self.ensure_driver_entry(&driver) {
-                return Err(DriverError::DriverEntryFailed);
-            }
+            self.ensure_driver_entry(&driver)?;
             let callback = *driver.evt_probe_device.read();
             let outcome = match callback {
                 Some(callback) => {
@@ -339,7 +389,7 @@ impl PnpManager {
             match outcome {
                 ProbeOutcome::Match => return Ok(Some(candidate.pkg)),
                 ProbeOutcome::NoMatch => continue,
-                ProbeOutcome::Error(status) => return Err(DriverError::ProbeFailed(status)),
+                ProbeOutcome::Error(error) => return Err(error),
             }
         }
 
@@ -347,9 +397,7 @@ impl PnpManager {
             return Ok(None);
         };
         let driver = self.ensure_loaded(&package).await?;
-        if !self.ensure_driver_entry(&driver) {
-            return Err(DriverError::DriverEntryFailed);
-        }
+        self.ensure_driver_entry(&driver)?;
         let context = ProbeContext {
             devnode: dn.clone(),
             lower_target: target,
@@ -360,37 +408,47 @@ impl PnpManager {
             Some(callback) => match callback(&driver, &context).await {
                 ProbeOutcome::Match => Ok(Some(package)),
                 ProbeOutcome::NoMatch => Ok(None),
-                ProbeOutcome::Error(status) => Err(DriverError::ProbeFailed(status)),
+                ProbeOutcome::Error(error) => Err(error),
             },
             None => Ok(Some(package)),
         }
     }
-    // TODO: this impl is temporary, I plan to change this so that pnp management doesn't know about the volume protocol maybe doesn't even special case the volume device
-    async fn filesystem_hint(dn: &Arc<DevNode>) -> Option<String> {
-        if !dn
-            .class
-            .as_ref()
-            .is_some_and(|class| class.eq_ignore_ascii_case("Volume"))
-        {
-            return None;
-        }
-        let protocol = open_public_protocol::<VolumeProtocol>(dn).ok()?;
-        let info = (protocol.partition_info)(protocol.provider()).ok()?;
-        let guid = info.gpt_entry?.unique_partition_guid;
-        if guid.iter().all(|byte| *byte == 0) {
-            return None;
-        }
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        let mut stable_id = String::from("GPT.");
-        for byte in guid {
-            stable_id.push(HEX[(byte >> 4) as usize] as char);
-            stable_id.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        let key = alloc::format!("SYSTEM/CurrentControlSet/MountMgr/FilesystemHints/{stable_id}");
-        match get_value(&key, "Service").await {
-            Some(Data::Str(service)) if !service.is_empty() => Some(service),
+    fn binding_key(instance_path: &str) -> String {
+        alloc::format!(
+            "{}/{}",
+            Self::BINDINGS_KEY,
+            driver_index::escape_key(instance_path)
+        )
+    }
+
+    async fn preferred_function_driver(dn: &Arc<DevNode>) -> Option<String> {
+        let key = Self::binding_key(&dn.instance_path);
+        match get_value(&key, Self::PREFERRED_FUNCTION_DRIVER).await {
+            Some(Data::Str(driver_name)) if !driver_name.is_empty() => Some(driver_name),
             _ => None,
         }
+    }
+
+    pub async fn set_preferred_function_driver(
+        &self,
+        instance_path: &str,
+        driver_name: &str,
+    ) -> Result<(), KernelError> {
+        for key in [
+            "SYSTEM/CurrentControlSet/Pnp",
+            Self::BINDINGS_KEY,
+            &Self::binding_key(instance_path),
+        ] {
+            if get_key(key).await.is_none() {
+                create_key(key.to_string()).await?;
+            }
+        }
+        set_value(
+            &Self::binding_key(instance_path),
+            Self::PREFERRED_FUNCTION_DRIVER,
+            Data::Str(driver_name.to_string()),
+        )
+        .await
     }
 
     fn hardware_ids(dn: &Arc<DevNode>) -> Vec<&str> {
@@ -409,7 +467,7 @@ impl PnpManager {
     async fn load_stack_layers(
         &self,
         packages: Vec<Arc<DriverPackage>>,
-    ) -> Result<Vec<StackLayer>, DriverError> {
+    ) -> Result<Vec<StackLayer>, KernelError> {
         let mut layers = Vec::with_capacity(packages.len());
 
         for pkg in packages {
@@ -439,7 +497,7 @@ impl PnpManager {
     async fn resolve_class_driver(
         &self,
         class_opt: Option<&str>,
-    ) -> Result<Option<Arc<DriverPackage>>, DriverError> {
+    ) -> Result<Option<Arc<DriverPackage>>, KernelError> {
         let Some(class) = class_opt else {
             return Ok(None);
         };
@@ -495,7 +553,7 @@ impl PnpManager {
         ids: &[&str],
         class_opt: Option<&str>,
         function_service: &str,
-    ) -> Result<(Vec<Arc<DriverPackage>>, Vec<Arc<DriverPackage>>), DriverError> {
+    ) -> Result<(Vec<Arc<DriverPackage>>, Vec<Arc<DriverPackage>>), KernelError> {
         #[derive(Clone)]
         struct Item {
             order: u32,
@@ -700,31 +758,41 @@ impl PnpManager {
     }
 
     #[inline]
-    fn ensure_driver_entry(&self, drv: &Arc<DriverObject>) -> bool {
+    fn ensure_driver_entry(&self, drv: &Arc<DriverObject>) -> Result<(), KernelError> {
         let rt = &drv.runtime;
         match rt.get_state() {
-            DriverState::Started | DriverState::Continue => return true,
-            DriverState::Failed => return false,
+            DriverState::Started | DriverState::Continue => return Ok(()),
+            DriverState::Failed => {
+                return Err(error_with_message(
+                    DriverErrorKind::DeviceError,
+                    format_args!(
+                        "driver `{}` previously failed initialization",
+                        drv.driver_name
+                    ),
+                ));
+            }
             _ => {}
         }
         let m = rt.module.read();
-        if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "DriverEntry") {
-            let entry: unsafe extern "C" fn(&Arc<DriverObject>) -> DriverStatus =
+        if let Some((_, rva)) = m.exports.iter().find(|(s, _)| s == "DriverEntry") {
+            let entry: unsafe extern "C" fn(&Arc<DriverObject>) -> Result<(), KernelError> =
                 unsafe { core::mem::transmute((m.image_base.as_u64() + *rva as u64) as *const ()) };
-            let st = unsafe { entry(drv) };
-            match st {
-                DriverStatus::Success | DriverStatus::ContinueStep => {
+            match unsafe { entry(drv) } {
+                Ok(()) => {
                     rt.set_state(DriverState::Started);
-                    true
+                    Ok(())
                 }
-                _ => {
+                Err(error) => {
                     rt.set_state(DriverState::Failed);
-                    false
+                    Err(error.with_context(format!("initializing driver `{}`", drv.driver_name)))
                 }
             }
         } else {
             rt.set_state(DriverState::Failed);
-            false
+            Err(error_with_message(
+                DriverErrorKind::DeviceError,
+                format_args!("driver `{}` does not export DriverEntry", drv.driver_name),
+            ))
         }
     }
 
@@ -734,22 +802,17 @@ impl PnpManager {
         dn: &Arc<DevNode>,
         below: Option<Arc<DeviceObject>>,
         drv: &Arc<DriverObject>,
-    ) -> Option<Arc<DeviceObject>> {
-        if !self.ensure_driver_entry(drv) {
-            return None;
-        }
+    ) -> Result<Option<Arc<DeviceObject>>, KernelError> {
+        self.ensure_driver_entry(drv)?;
 
         let Some(cb) = *drv.evt_device_add.read() else {
-            return None;
+            return Ok(None);
         };
 
         let mut dev_init = DeviceInit::new();
-        let step = cb(drv, &mut dev_init);
-
-        match step {
-            DriverStep::Complete { status } if status != DriverStatus::Success => return None,
-            DriverStep::Complete { .. } | DriverStep::Continue => {}
-        }
+        let _step = cb(drv, &mut dev_init).map_err(|error| {
+            error.with_context(format!("adding device for driver `{}`", drv.driver_name))
+        })?;
 
         let devobj = DeviceObject::new(dev_init);
         devobj.attach_devnode(dn);
@@ -769,7 +832,7 @@ impl PnpManager {
         );
         let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", stack_dir, leaf), &obj);
 
-        Some(devobj)
+        Ok(Some(devobj))
     }
 
     async fn probe_driver(
@@ -778,8 +841,8 @@ impl PnpManager {
         dn: &Arc<DevNode>,
         lower_target: &Arc<DeviceObject>,
     ) -> ProbeOutcome {
-        if !self.ensure_driver_entry(driver) {
-            return ProbeOutcome::Error(DriverStatus::Unsuccessful);
+        if let Err(error) = self.ensure_driver_entry(driver) {
+            return ProbeOutcome::Error(error);
         }
         let callback = *driver.evt_probe_device.read();
         let Some(callback) = callback else {
@@ -800,7 +863,12 @@ impl PnpManager {
         let stack_dir = alloc::format!("\\Device\\{}\\Stack", dn.instance_path);
         for (driver, device) in attached.iter().rev() {
             let mut remove = RemoveDevice;
-            let _ = pnp::send_to_device(device.clone(), &mut remove).await;
+            if let Err(error) = pnp::send_to_device(device.clone(), &mut remove).await {
+                println!(
+                    "[MANAGER] Rollback remove failed for driver `{}`: {}",
+                    driver.driver_name, error
+                );
+            }
             device.set_started(false);
             DeviceObject::detach(device);
             let leaf = alloc::format!("{}-{:x}", driver.driver_name, Arc::as_ptr(device) as usize);
@@ -849,44 +917,58 @@ impl PnpManager {
             let target = prev_do.as_ref().unwrap();
             match self.probe_driver(&drv, dn, target).await {
                 ProbeOutcome::NoMatch => continue,
-                ProbeOutcome::Error(status) => {
+                ProbeOutcome::Error(error) => {
                     Self::rollback_attached(dn, &attached).await;
-                    Self::finish_start(dn.clone(), status).await;
+                    Self::finish_start(dn.clone(), Err(error)).await;
                     return;
                 }
                 ProbeOutcome::Match => {}
             }
-            if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &drv) {
-                attached.push((drv.clone(), devobj.clone()));
-                let status = Self::start_device_object(&devobj).await;
-                if status != DriverStatus::Success {
+            match self.attach_one_above(dn, prev_do.clone(), &drv) {
+                Ok(Some(devobj)) => {
+                    attached.push((drv.clone(), devobj.clone()));
+                    if let Err(error) = Self::start_device_object(&devobj).await {
+                        Self::rollback_attached(dn, &attached).await;
+                        Self::finish_start(dn.clone(), Err(error)).await;
+                        return;
+                    }
+                    prev_do = Some(devobj.clone());
+                    lower_layers.push(StackLayer {
+                        driver: drv,
+                        devobj: Some(devobj),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
                     Self::rollback_attached(dn, &attached).await;
-                    Self::finish_start(dn.clone(), status).await;
+                    Self::finish_start(dn.clone(), Err(error)).await;
                     return;
                 }
-                prev_do = Some(devobj.clone());
-                lower_layers.push(StackLayer {
-                    driver: drv,
-                    devobj: Some(devobj),
-                });
             }
         }
 
         let mut function_layer: Option<StackLayer> = None;
         if let Some(drv) = function_driver {
-            if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &drv) {
-                attached.push((drv.clone(), devobj.clone()));
-                let status = Self::start_device_object(&devobj).await;
-                if status != DriverStatus::Success {
+            match self.attach_one_above(dn, prev_do.clone(), &drv) {
+                Ok(Some(devobj)) => {
+                    attached.push((drv.clone(), devobj.clone()));
+                    if let Err(error) = Self::start_device_object(&devobj).await {
+                        Self::rollback_attached(dn, &attached).await;
+                        Self::finish_start(dn.clone(), Err(error)).await;
+                        return;
+                    }
+                    prev_do = Some(devobj.clone());
+                    function_layer = Some(StackLayer {
+                        driver: drv,
+                        devobj: Some(devobj),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
                     Self::rollback_attached(dn, &attached).await;
-                    Self::finish_start(dn.clone(), status).await;
+                    Self::finish_start(dn.clone(), Err(error)).await;
                     return;
                 }
-                prev_do = Some(devobj.clone());
-                function_layer = Some(StackLayer {
-                    driver: drv,
-                    devobj: Some(devobj),
-                });
             }
         }
 
@@ -895,26 +977,33 @@ impl PnpManager {
             let target = prev_do.as_ref().unwrap();
             match self.probe_driver(&drv, dn, target).await {
                 ProbeOutcome::NoMatch => continue,
-                ProbeOutcome::Error(status) => {
+                ProbeOutcome::Error(error) => {
                     Self::rollback_attached(dn, &attached).await;
-                    Self::finish_start(dn.clone(), status).await;
+                    Self::finish_start(dn.clone(), Err(error)).await;
                     return;
                 }
                 ProbeOutcome::Match => {}
             }
-            if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &drv) {
-                attached.push((drv.clone(), devobj.clone()));
-                let status = Self::start_device_object(&devobj).await;
-                if status != DriverStatus::Success {
+            match self.attach_one_above(dn, prev_do.clone(), &drv) {
+                Ok(Some(devobj)) => {
+                    attached.push((drv.clone(), devobj.clone()));
+                    if let Err(error) = Self::start_device_object(&devobj).await {
+                        Self::rollback_attached(dn, &attached).await;
+                        Self::finish_start(dn.clone(), Err(error)).await;
+                        return;
+                    }
+                    prev_do = Some(devobj.clone());
+                    upper_layers.push(StackLayer {
+                        driver: drv,
+                        devobj: Some(devobj),
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
                     Self::rollback_attached(dn, &attached).await;
-                    Self::finish_start(dn.clone(), status).await;
+                    Self::finish_start(dn.clone(), Err(error)).await;
                     return;
                 }
-                prev_do = Some(devobj.clone());
-                upper_layers.push(StackLayer {
-                    driver: drv,
-                    devobj: Some(devobj),
-                });
             }
         }
 
@@ -974,21 +1063,21 @@ impl PnpManager {
                     .filter_map(|layer| layer.devobj.clone())
                     .collect::<Vec<_>>()
             };
-            let mut status = DriverStatus::Success;
+            let mut result = Ok(());
             for layer in layers {
-                status = Self::start_device_object(&layer).await;
-                if status != DriverStatus::Success {
+                result = Self::start_device_object(&layer).await;
+                if result.is_err() {
                     break;
                 }
             }
-            Self::finish_start(dn.clone(), status).await;
+            Self::finish_start(dn.clone(), result).await;
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
     }
 
-    async fn finish_start(dev_node: Arc<DevNode>, status: DriverStatus) {
-        if status == DriverStatus::Success {
+    async fn finish_start(dev_node: Arc<DevNode>, result: Result<(), KernelError>) {
+        if result.is_ok() {
             dev_node.set_state(DevNodeState::Started);
             PNP_MANAGER.notify_class_listeners(&dev_node, DeviceEvent::Started);
 
@@ -1002,17 +1091,30 @@ impl PnpManager {
                     relation: DeviceRelationType::BusRelations,
                     devices: Vec::new(),
                 };
-                let status = pnp::send_down_stack(top_device, &mut bus_enum_request).await;
-                Self::process_enumerated_children(&dev_node, status);
+                let result = pnp::send_down_stack(top_device, &mut bus_enum_request).await;
+                Self::process_enumerated_children(&dev_node, result);
             }
         } else {
+            if let Err(error) = result {
+                println!(
+                    "[MANAGER] Failed to start `{}`: {}",
+                    dev_node.instance_path, error
+                );
+            }
             dev_node.set_state(DevNodeState::Stopped);
             PNP_MANAGER.notify_class_listeners(&dev_node, DeviceEvent::Failed);
         }
     }
 
-    fn process_enumerated_children(parent_dev_node: &Arc<DevNode>, status: DriverStatus) {
-        if status != DriverStatus::Success {
+    fn process_enumerated_children(
+        parent_dev_node: &Arc<DevNode>,
+        result: Result<DriverStep, KernelError>,
+    ) {
+        if let Err(error) = result {
+            println!(
+                "[MANAGER] Failed to enumerate children of `{}`: {}",
+                parent_dev_node.instance_path, error
+            );
             return;
         }
 
@@ -1040,7 +1142,7 @@ impl PnpManager {
     async fn ensure_loaded(
         &self,
         pkg: &Arc<DriverPackage>,
-    ) -> Result<Arc<DriverObject>, DriverError> {
+    ) -> Result<Arc<DriverObject>, KernelError> {
         let mut map = self.drivers.write();
 
         if let Some(d) = map.get(&pkg.name).cloned() {
@@ -1050,7 +1152,17 @@ impl PnpManager {
         let module = {
             let pm = PROGRAM_MANAGER.get(0).expect("Kernel terminated").clone();
             let mut prog = pm.write();
-            prog.load_module(pkg.image_path.clone()).await?
+            prog.load_module(pkg.image_path.clone())
+                .await
+                .map_err(|load_error| {
+                    error_with_message(
+                        DriverErrorKind::DeviceError,
+                        format_args!(
+                            "failed to load driver module `{}` from `{:?}`: {load_error:?}",
+                            pkg.name, pkg.image_path
+                        ),
+                    )
+                })?
         };
 
         let _ = OBJECT_MANAGER.mkdir_p("\\Modules");
@@ -1086,7 +1198,7 @@ impl PnpManager {
         &self,
         dev_node: &Arc<DevNode>,
         relation: DeviceRelationType,
-    ) -> DriverStatus {
+    ) -> Result<(), KernelError> {
         let Some(top) = dev_node
             .stack
             .read()
@@ -1094,25 +1206,43 @@ impl PnpManager {
             .and_then(|s| s.get_top_device_object())
             .or_else(|| dev_node.get_pdo())
         else {
-            return DriverStatus::NoSuchDevice;
+            return Err(error_with_message(
+                DriverErrorKind::NoSuchDevice,
+                format_args!(
+                    "device node `{}` has no routable device",
+                    dev_node.instance_path
+                ),
+            ));
         };
 
         let mut req = QueryDeviceRelations {
             relation,
             devices: Vec::new(),
         };
-        let status = pnp::send_down_stack(top, &mut req).await;
-        Self::process_enumerated_children(dev_node, status.clone());
-        status
+        let result = pnp::send_down_stack(top, &mut req).await;
+        match result {
+            Ok(step) => {
+                Self::process_enumerated_children(dev_node, Ok(step));
+                Ok(())
+            }
+            Err(error) => {
+                Self::process_enumerated_children(dev_node, Err(error.clone()));
+                Err(error)
+            }
+        }
     }
 
     pub fn create_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
+        let link_path = device_link_path(&link_path);
+        let target_path = device_link_path_if_public(&target_path);
         OBJECT_MANAGER
             .symlink(&link_path, target_path.to_string(), true)
             .map(|_| ())
     }
 
     pub fn replace_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
+        let link_path = device_link_path(&link_path);
+        let target_path = device_link_path_if_public(&target_path);
         let _ = OBJECT_MANAGER.unlink(&link_path);
         OBJECT_MANAGER
             .symlink(&link_path, target_path.to_string(), true)
@@ -1125,11 +1255,12 @@ impl PnpManager {
         link_path: String,
     ) -> Result<(), OmError> {
         let target = alloc::format!("\\Device\\{}\\Top", instance_path);
+        let link_path = device_link_path(&link_path);
         OBJECT_MANAGER.symlink(&link_path, target, true).map(|_| ())
     }
 
     pub fn remove_symlink(&self, link_path: String) -> Result<(), OmError> {
-        OBJECT_MANAGER.unlink(&link_path)
+        OBJECT_MANAGER.unlink(device_link_path(&link_path))
     }
 
     pub fn resolve_targetio_from_symlink(&self, p: String) -> Option<IoTarget> {
@@ -1140,7 +1271,6 @@ impl PnpManager {
         enum ResolvePath<'a> {
             Borrowed(&'a str),
             Owned(String),
-            Shared(Arc<str>),
         }
 
         impl ResolvePath<'_> {
@@ -1148,12 +1278,16 @@ impl PnpManager {
                 match self {
                     Self::Borrowed(p) => p,
                     Self::Owned(p) => p.as_str(),
-                    Self::Shared(p) => p.as_ref(),
                 }
             }
         }
 
-        let mut p = ResolvePath::Borrowed(p);
+        let public_path = device_link_path_if_public(p);
+        let mut p = if public_path == p {
+            ResolvePath::Borrowed(p)
+        } else {
+            ResolvePath::Owned(public_path)
+        };
         for _ in 0..32 {
             let o = OBJECT_MANAGER.open(p.as_str()).ok()?;
             match &o.payload {
@@ -1161,9 +1295,7 @@ impl PnpManager {
                 ObjectPayload::Directory(_) => {
                     p = ResolvePath::Owned(alloc::format!("{}\\Top", p.as_str()));
                 }
-                ObjectPayload::Symlink(target) => {
-                    p = ResolvePath::Shared(target.target.clone());
-                }
+                ObjectPayload::Symlink(_) => return None,
                 _ => return None,
             }
         }

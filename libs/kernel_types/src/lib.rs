@@ -1,12 +1,10 @@
 #![no_std]
-#![feature(variant_count)]
-#![feature(try_trait_v2)]
 #![feature(const_type_name)]
 #![allow(static_mut_refs)]
 #![feature(generic_const_exprs)]
 #![feature(specialization)]
-#![feature(try_trait_v2_residual)]
 #![feature(lazy_type_alias)]
+#![feature(allocator_api)]
 extern crate alloc;
 extern crate self as kernel_types;
 
@@ -17,10 +15,13 @@ pub mod async_types;
 pub mod bench_archive;
 pub mod benchmark;
 pub mod bounded_mpmc;
+pub mod capacity;
+pub mod completion;
 pub mod device;
 pub mod dma;
+pub mod error;
+pub mod executor;
 pub mod fdt;
-pub mod fixed_slab;
 pub mod fs;
 pub mod io;
 pub mod irq;
@@ -41,7 +42,7 @@ use alloc::sync::Arc;
 pub use kernel_macros::RequestPayload;
 pub use request::{RequestPayload, RequestPayloadInto};
 
-use crate::async_ffi::FfiFuture;
+use crate::async_ffi::AbiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
 use crate::pnp::{
@@ -49,130 +50,183 @@ use crate::pnp::{
     RemoveDevice, StartDevice, StopDevice, SurpriseRemoval,
 };
 use crate::request::{
-    DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsAppend, FsClose, FsCreate, FsFlush,
-    FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, Read,
-    Write,
+    DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsAppend, FsClose, FsCreate, FsDelete,
+    FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek, FsSetLen,
+    FsWrite, FsZeroRange, Read, Write,
 };
-pub type EvtDriverDeviceAdd =
-    extern "C" fn(driver: &Arc<device::DriverObject>, init: &mut device::DeviceInit) -> DriverStep;
+pub type EvtDriverDeviceAdd = extern "C" fn(
+    driver: &Arc<device::DriverObject>,
+    init: &mut device::DeviceInit,
+) -> Result<DriverStep, error::KernelError>;
 pub type EvtDriverProbeDevice = extern "C" fn(
     driver: &Arc<device::DriverObject>,
     context: &pnp::ProbeContext,
-) -> FfiFuture<pnp::ProbeOutcome>;
-pub type EvtDriverUnload =
-    extern "C" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
+) -> AbiFuture<pnp::ProbeOutcome>;
+pub type EvtDriverUnload = extern "C" fn(
+    driver: Arc<device::DriverObject>,
+) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 
 pub type EvtIoRead =
-    for<'a, 'io> extern "C" fn(&'a Arc<DeviceObject>, &'a mut Read<'io>) -> FfiFuture<DriverStep>;
+    for<'a, 'io> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Read<'io>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 
 pub type EvtIoWrite =
-    for<'a, 'io> extern "C" fn(&'a Arc<DeviceObject>, &'a mut Write<'io>) -> FfiFuture<DriverStep>;
-pub type EvtIoDeviceControl = for<'a, 'data> extern "C" fn(
+    for<'a, 'io> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Write<'io>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtIoDeviceControl =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut DeviceControl<'data>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtIoFlush = for<'a> extern "C" fn(
     &'a Arc<DeviceObject>,
-    &'a mut DeviceControl<'data>,
-) -> FfiFuture<DriverStep>;
-pub type EvtIoFlush =
-    for<'a> extern "C" fn(&'a Arc<DeviceObject>, &'a mut Flush) -> FfiFuture<DriverStep>;
+    &'a mut Flush,
+) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 pub type EvtIoFlushDirty =
-    for<'a> extern "C" fn(&'a Arc<DeviceObject>, &'a mut FlushDirty) -> FfiFuture<DriverStep>;
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut FlushDirty,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 pub type EvtIoFlushOwner =
-    for<'a> extern "C" fn(&'a Arc<DeviceObject>, &'a mut FlushOwner) -> FfiFuture<DriverStep>;
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut FlushOwner,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 
-pub type EvtFsOpen = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsOpen>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsClose = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsClose>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsRead = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsRead>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsWrite = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsWrite>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsFlush = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsFlush>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsSeek = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsSeek>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsCreate = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsCreate>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsRename = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsRename>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsReadDir = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsReadDir>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsGetInfo = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsGetInfo>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsSetLen = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsSetLen>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsAppend = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsAppend>,
-) -> FfiFuture<DriverStep>;
-pub type EvtFsZeroRange = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    &'a mut Fs<'data, FsZeroRange>,
-) -> FfiFuture<DriverStep>;
+pub type EvtFsOpen =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsOpen>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsClose =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsClose>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsRead =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsRead>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsWrite =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsWrite>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsFlush =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsFlush>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsSeek =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsSeek>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsCreate =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsCreate>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsRemoveDir =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsRemoveDir>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsDelete =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsDelete>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsRename =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsRename>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsReadDir =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsReadDir>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsGetInfo =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsGetInfo>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsSetLen =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsSetLen>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsAppend =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsAppend>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtFsZeroRange =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        &'a mut Fs<'data, FsZeroRange>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 
-pub type EvtPnpInitComplete = for<'a> extern "C" fn(
+pub type EvtPnpInitComplete =
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut InitComplete,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpStartDevice =
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut StartDevice,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpQueryDeviceRelations =
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut QueryDeviceRelations,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpQueryId = for<'a> extern "C" fn(
     &'a Arc<DeviceObject>,
     PnpOp,
-    &'a mut InitComplete,
-) -> FfiFuture<DriverStep>;
-pub type EvtPnpStartDevice = for<'a> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    PnpOp,
-    &'a mut StartDevice,
-) -> FfiFuture<DriverStep>;
-pub type EvtPnpQueryDeviceRelations = for<'a> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    PnpOp,
-    &'a mut QueryDeviceRelations,
-) -> FfiFuture<DriverStep>;
-pub type EvtPnpQueryId =
-    for<'a> extern "C" fn(&'a Arc<DeviceObject>, PnpOp, &'a mut QueryId) -> FfiFuture<DriverStep>;
-pub type EvtPnpRegisterDmaBacking = for<'a, 'data> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    PnpOp,
-    &'a mut RegisterDmaBacking<'data>,
-) -> FfiFuture<DriverStep>;
-pub type EvtPnpQueryResources = for<'a> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    PnpOp,
-    &'a mut QueryResources,
-) -> FfiFuture<DriverStep>;
-pub type EvtPnpSurpriseRemoval = for<'a> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    PnpOp,
-    &'a mut SurpriseRemoval,
-) -> FfiFuture<DriverStep>;
-pub type EvtPnpRemoveDevice = for<'a> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    PnpOp,
-    &'a mut RemoveDevice,
-) -> FfiFuture<DriverStep>;
-pub type EvtPnpStopDevice = for<'a> extern "C" fn(
-    &'a Arc<DeviceObject>,
-    PnpOp,
-    &'a mut StopDevice,
-) -> FfiFuture<DriverStep>;
+    &'a mut QueryId,
+)
+    -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpRegisterDmaBacking =
+    for<'a, 'data> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut RegisterDmaBacking<'data>,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpQueryResources =
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut QueryResources,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpSurpriseRemoval =
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut SurpriseRemoval,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpRemoveDevice =
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut RemoveDevice,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
+pub type EvtPnpStopDevice =
+    for<'a> extern "C" fn(
+        &'a Arc<DeviceObject>,
+        PnpOp,
+        &'a mut StopDevice,
+    ) -> AbiFuture<Result<DriverStep, error::KernelError>>;
 
 pub type ClassEventCallback =
     extern "C" fn(node: Arc<DevNode>, event: pnp::DeviceEvent, listener_dev: &Arc<DeviceObject>);

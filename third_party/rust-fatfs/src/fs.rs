@@ -702,20 +702,20 @@ pub(crate) struct FsIoAdapter<'a, IO: ReadWriteSeek, TP, OCC> {
     fs: &'a FileSystem<IO, TP, OCC>,
 }
 
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::async_ffi::{AbiFuture, FutureExt};
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
     type Error = IO::Error;
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for FsIoAdapter<'_, IO, TP, OCC> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
-        async move { self.fs.disk.borrow_mut().read(buf, kind).await }.into_ffi()
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
+        async move { self.fs.disk.borrow_mut().read(buf, kind).await }.into_abi()
     }
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for FsIoAdapter<'_, IO, TP, OCC> {
-    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             let size = self.fs.disk.borrow_mut().write(buf, kind).await?;
             if size > 0 {
@@ -723,11 +723,11 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for FsIoAda
             }
             Ok(size)
         }
-        .into_ffi()
+        .into_abi()
     }
 
-    fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move { self.fs.disk.borrow_mut().flush().await }.into_ffi()
+    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
+        async move { self.fs.disk.borrow_mut().flush().await }.into_abi()
     }
 }
 
@@ -826,7 +826,7 @@ impl<B: Send, S: IoBase> IoBase for DiskSlice<B, S> {
 }
 
 impl<B: BorrowMut<S> + Send, S: Read + Seek> Read for DiskSlice<B, S> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8], _kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], _kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             let offset = self.begin + self.offset;
             let read_size = (buf.len() as u64).min(self.size - self.offset) as usize;
@@ -835,12 +835,12 @@ impl<B: BorrowMut<S> + Send, S: Read + Seek> Read for DiskSlice<B, S> {
             self.offset += size as u64;
             Ok(size)
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 
 impl<B: BorrowMut<S> + Send, S: Write + Seek> Write for DiskSlice<B, S> {
-    fn write<'a>(&'a mut self, buf: &'a [u8], _kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], _kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             let offset = self.begin + self.offset;
             let write_size = (buf.len() as u64).min(self.size - self.offset) as usize;
@@ -858,11 +858,11 @@ impl<B: BorrowMut<S> + Send, S: Write + Seek> Write for DiskSlice<B, S> {
             self.offset += write_size as u64;
             Ok(write_size)
         }
-        .into_ffi()
+        .into_abi()
     }
 
-    fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move { Ok(self.inner.borrow_mut().flush().await?) }.into_ffi()
+    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
+        async move { Ok(self.inner.borrow_mut().flush().await?) }.into_abi()
     }
 }
 

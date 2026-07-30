@@ -29,7 +29,6 @@ use kernel_api::{
         pnp_create_child_devnode_and_pdo_with_init,
     },
     request_handler,
-    status::DriverStatus,
 };
 use spin::Once;
 
@@ -56,21 +55,21 @@ pub struct DtPdoExt {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, devicetree_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn devicetree_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp = PnpOps::new();
     pnp.start_device.set(devicetree_start);
     pnp.query_device_relations.set(devicetree_query_devrels);
     dev_init.set_dev_ext_default::<DevTreeExt>();
     dev_init.pnp_ops = Some(pnp);
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -78,30 +77,30 @@ pub async fn devicetree_start<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if has_lower_dt_pdo(device) {
-        return DriverStep::complete(DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
 
     let Ok(ext) = device.try_devext::<DevTreeExt>() else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     if ext.tree.get().is_some() {
-        return DriverStep::complete(DriverStatus::Success);
+        return Ok(DriverStep::Complete);
     }
 
     let Some(blob) = fdt_blob() else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     let tree = match DeviceTree::load(blob) {
         Ok(tree) => tree,
-        Err(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter)),
     };
 
     ext.tree.call_once(|| Arc::new(tree));
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -109,28 +108,28 @@ pub async fn devicetree_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if req.relation != DeviceRelationType::BusRelations {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let Some(parent_dn) = device.dev_node.get().and_then(|dn| dn.upgrade()) else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     let Some((tree, path)) = enumeration_context(device) else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     let Some(node) = tree.find(&path) else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     for child in node.children.iter() {
         create_dt_child(&parent_dn, &tree, &path, node, child);
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 fn has_lower_dt_pdo(device: &Arc<DeviceObject>) -> bool {
@@ -219,9 +218,9 @@ pub async fn dt_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryId,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
     match req.id_type {
         QueryIdType::DeviceId => {
@@ -234,7 +233,7 @@ pub async fn dt_pdo_query_id<'req, 'data, 'b>(
         QueryIdType::InstanceId => req.ids.push(ext.path.clone()),
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -242,14 +241,14 @@ pub async fn dt_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryResources,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     req.resources = ResourceSet::Descriptors(ext.resources.clone());
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -257,26 +256,26 @@ pub async fn dt_pdo_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     _op: PnpOp,
     req: &'b mut QueryDeviceRelations,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     if req.relation != DeviceRelationType::BusRelations {
-        return DriverStep::Continue;
+        return Ok(DriverStep::Continue);
     }
 
     let Ok(ext) = dev.try_devext::<DtPdoExt>() else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
     let Some(parent_dn) = dev.dev_node.get().and_then(|dn| dn.upgrade()) else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
     let Some(node) = ext.tree.find(&ext.path) else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
     };
 
     for child in node.children.iter() {
         create_dt_child(&parent_dn, &ext.tree, &ext.path, node, child);
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -284,8 +283,8 @@ pub async fn dt_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+) -> Result<DriverStep, kernel_api::error::KernelError> {
+    Ok(DriverStep::Complete)
 }
 
 fn child_exists(parent: &Arc<DevNode>, instance_path: &str) -> bool {

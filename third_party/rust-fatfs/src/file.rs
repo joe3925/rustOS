@@ -7,7 +7,7 @@ use crate::fs::{FileSystem, OemCpConverter, ReadWriteSeek};
 use crate::io::{IoBase, Read, ReadIoBuffer, SeekFrom, Write, WriteIoBuffer};
 use crate::time::{Date, DateTime, TimeProvider};
 
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::dma::{FromDevice, IoBuffer, ToDevice};
 
 pub const MAX_FILE_SIZE: u32 = u32::MAX;
@@ -340,7 +340,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> IoBase for File<'
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for File<'_, IO, TP, OCC> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::read");
 
@@ -445,12 +445,12 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for File<'_,
 
             Ok(total_read)
         }
-        .into_ffi()
+        .into_abi()
     }
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for File<'_, IO, TP, OCC> {
-    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::write");
 
@@ -560,11 +560,11 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for File<'_
 
             Ok(total_written)
         }
-        .into_ffi()
+        .into_abi()
     }
 
-    fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move { Self::flush(self).await }.into_ffi()
+    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
+        async move { Self::flush(self).await }.into_abi()
     }
 }
 

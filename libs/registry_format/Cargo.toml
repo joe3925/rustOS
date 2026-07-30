@@ -1,0 +1,12 @@
+[package]
+name = "registry_format"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embedded-crc32c = "0.1"
+prost = { version = "0.14.3", default-features = false, features = ["derive"] }
+
+[build-dependencies]
+prost-build = "0.14.3"
+protoc-bin-vendored = "3"

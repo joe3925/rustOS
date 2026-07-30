@@ -14,29 +14,10 @@ test = false
 [package.metadata.rustos-driver]
 configuration = "src/volmgr.toml"
 
-[profile.dev]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
-
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
-
 [dependencies]
 kernel_api = { workspace = true }
-futures = { version = "0.3", default-features = false, features = [
-    "alloc",
-    "spin",
-] }
 spin = { version = "0.10", default-features = false, features = [
     "mutex",
     "rwlock",
 ] }
 schnellru = { version = "0.2.4", default-features = false }
-crossbeam-queue = { version = "0.3", default-features = false, features = [
-    "alloc",
-] }

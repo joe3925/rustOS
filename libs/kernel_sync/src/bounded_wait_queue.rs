@@ -1,10 +1,12 @@
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::platform::Platform;
+use crate::sync::RwLock;
 
-static NEXT_BOUNDED_WAIT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_BOUNDED_WAIT_QUEUE_ID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
 
 const SLOT_EMPTY: usize = 0;
 const SLOT_RESERVED: usize = 1;
@@ -14,7 +16,7 @@ const SLOT_CLEARING: usize = 4;
 const SLOT_CANCELING: usize = 5;
 
 fn alloc_wait_queue_id() -> u64 {
-    NEXT_BOUNDED_WAIT_QUEUE_ID.fetch_add(1, Ordering::Relaxed)
+    NEXT_BOUNDED_WAIT_QUEUE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub enum BoundedWaitQueueError {
     NoCurrentTask,
     AlreadyQueued,
     Full,
+    AllocationFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +46,7 @@ struct WaitSlot<P: Platform> {
 }
 
 impl<P: Platform> WaitSlot<P> {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             state: AtomicUsize::new(SLOT_EMPTY),
             task_id: AtomicU64::new(0),
@@ -84,7 +87,9 @@ unsafe impl<P: Platform> Sync for WaitSlot<P> {}
 
 pub struct BoundedWaitQueue<P: Platform> {
     id: u64,
-    slots: Vec<WaitSlot<P>>,
+    slots: RwLock<Vec<WaitSlot<P>>>,
+    initial_capacity: usize,
+    slots_per_chunk: usize,
     enqueue_hint: AtomicUsize,
     dequeue_hint: AtomicUsize,
     len: AtomicUsize,
@@ -92,16 +97,22 @@ pub struct BoundedWaitQueue<P: Platform> {
 
 impl<P: Platform> BoundedWaitQueue<P> {
     pub fn new(max_waiters: usize) -> Self {
-        assert!(max_waiters > 0);
+        Self::new_chunked(max_waiters, max_waiters)
+    }
 
-        let mut slots = Vec::with_capacity(max_waiters);
-        for _ in 0..max_waiters {
+    pub fn new_chunked(initial_waiters: usize, slots_per_chunk: usize) -> Self {
+        assert!(initial_waiters > 0);
+        assert!(slots_per_chunk > 0);
+        let mut slots = Vec::with_capacity(initial_waiters);
+        for _ in 0..initial_waiters {
             slots.push(WaitSlot::new());
         }
 
         Self {
             id: alloc_wait_queue_id(),
-            slots,
+            slots: RwLock::new(slots),
+            initial_capacity: initial_waiters,
+            slots_per_chunk,
             enqueue_hint: AtomicUsize::new(0),
             dequeue_hint: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
@@ -115,7 +126,65 @@ impl<P: Platform> BoundedWaitQueue<P> {
 
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.slots.len()
+        self.slots.read().len()
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        let capacity = self.capacity();
+        1 + capacity
+            .saturating_sub(self.initial_capacity)
+            .div_ceil(self.slots_per_chunk)
+    }
+
+    pub fn try_grow(&self) -> Result<usize, BoundedWaitQueueError> {
+        let mut slots = self.slots.write();
+        slots
+            .try_reserve(self.slots_per_chunk)
+            .map_err(|_| BoundedWaitQueueError::AllocationFailed)?;
+        for _ in 0..self.slots_per_chunk {
+            slots.push(WaitSlot::new());
+        }
+        Ok(slots.len())
+    }
+
+    pub fn empty_chunk_count(&self) -> usize {
+        let slots = self.slots.read();
+        slots[self.initial_capacity..]
+            .chunks_exact(self.slots_per_chunk)
+            .filter(|chunk| {
+                chunk
+                    .iter()
+                    .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_EMPTY)
+            })
+            .count()
+    }
+
+    pub fn try_shrink(&self) -> bool {
+        let mut slots = self.slots.write();
+        let growth_slots = slots.len().saturating_sub(self.initial_capacity);
+        if growth_slots < self.slots_per_chunk {
+            return false;
+        }
+
+        let growth_chunks = growth_slots / self.slots_per_chunk;
+        for chunk_index in (0..growth_chunks).rev() {
+            let start = self.initial_capacity + chunk_index * self.slots_per_chunk;
+            let end = start + self.slots_per_chunk;
+            if slots[start..end]
+                .iter()
+                .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_EMPTY)
+            {
+                slots.drain(start..end);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn reclaim_if_underused(&self) {
+        if self.empty_chunk_count() >= 4 {
+            let _ = self.try_shrink();
+        }
     }
 
     pub fn enqueue_current(&self) -> Result<BoundedWaitQueueEnqueue, BoundedWaitQueueError> {
@@ -135,12 +204,13 @@ impl<P: Platform> BoundedWaitQueue<P> {
             return Err(BoundedWaitQueueError::AlreadyQueued);
         }
 
-        let cap = self.slots.len();
+        let slots = self.slots.read();
+        let cap = slots.len();
         let start = self.enqueue_hint.fetch_add(1, Ordering::Relaxed);
 
         for offset in 0..cap {
             let idx = start.wrapping_add(offset) % cap;
-            let slot = &self.slots[idx];
+            let slot = &slots[idx];
 
             if slot
                 .state
@@ -193,16 +263,19 @@ impl<P: Platform> BoundedWaitQueue<P> {
         }
 
         let _ = P::clear_waiting(task, self.id);
-        Err(BoundedWaitQueueError::Full)
+        drop(slots);
+        self.try_grow()?;
+        self.enqueue(task)
     }
 
     fn dequeue_one_for_wake(&self) -> WakeResult<P> {
-        let cap = self.slots.len();
+        let slots = self.slots.read();
+        let cap = slots.len();
         let start = self.dequeue_hint.fetch_add(1, Ordering::Relaxed);
 
         for offset in 0..cap {
             let idx = start.wrapping_add(offset) % cap;
-            let slot = &self.slots[idx];
+            let slot = &slots[idx];
 
             if slot
                 .state
@@ -244,31 +317,36 @@ impl<P: Platform> BoundedWaitQueue<P> {
     }
 
     pub fn dequeue_one(&self) -> Option<P::Task> {
-        match self.dequeue_one_for_wake() {
+        let result = match self.dequeue_one_for_wake() {
             WakeResult::Task(task) => Some(task),
             WakeResult::None | WakeResult::CanceledReserved => None,
-        }
+        };
+        self.reclaim_if_underused();
+        result
     }
 
     pub fn wake_one(&self) -> bool {
-        match self.dequeue_one_for_wake() {
+        let result = match self.dequeue_one_for_wake() {
             WakeResult::None => false,
             WakeResult::CanceledReserved => true,
             WakeResult::Task(task) => {
                 P::unpark(&task);
                 true
             }
-        }
+        };
+        self.reclaim_if_underused();
+        result
     }
 
     pub fn wake_all(&self) -> usize {
-        let cap = self.slots.len();
+        let slots = self.slots.read();
+        let cap = slots.len();
         let start = self.dequeue_hint.fetch_add(cap, Ordering::Relaxed);
         let mut count = 0usize;
 
         for offset in 0..cap {
             let idx = start.wrapping_add(offset) % cap;
-            let slot = &self.slots[idx];
+            let slot = &slots[idx];
 
             if slot
                 .state
@@ -307,6 +385,8 @@ impl<P: Platform> BoundedWaitQueue<P> {
             }
         }
 
+        drop(slots);
+        self.reclaim_if_underused();
         count
     }
 
@@ -330,10 +410,11 @@ impl<P: Platform> BoundedWaitQueue<P> {
         }
 
         let current_id = P::task_id(&current);
-        let cap = self.slots.len();
+        let slots = self.slots.read();
+        let cap = slots.len();
 
         for idx in 0..cap {
-            let slot = &self.slots[idx];
+            let slot = &slots[idx];
 
             if slot.task_id() != current_id {
                 continue;
@@ -359,6 +440,8 @@ impl<P: Platform> BoundedWaitQueue<P> {
                 slot.state.store(SLOT_EMPTY, Ordering::Release);
                 self.len.fetch_sub(1, Ordering::Release);
                 let _ = P::clear_waiting(&current, self.id);
+                drop(slots);
+                self.reclaim_if_underused();
                 return true;
             }
 

@@ -1,5 +1,5 @@
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};
@@ -142,7 +142,7 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
                     continue;
                 }
                 Err(BoundedWaitQueueError::NoCurrentTask) => continue,
-                Err(BoundedWaitQueueError::Full) => {
+                Err(BoundedWaitQueueError::Full | BoundedWaitQueueError::AllocationFailed) => {
                     if let Some(value) = self.inner.queue.try_pop() {
                         return Ok(value);
                     }

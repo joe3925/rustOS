@@ -1,5 +1,3 @@
-#![feature(trusted_random_access)]
-#![feature(ascii_char)]
 #![no_std]
 #![no_main]
 #![allow(unused_parens)]
@@ -7,17 +5,12 @@
 #![allow(unused_variables)]
 #![feature(custom_test_frameworks)]
 #![feature(allocator_api)]
-#![feature(once_cell_get_mut)]
 #![test_runner(crate::test_runner)]
 #![allow(static_mut_refs)]
-#![feature(variant_count)]
 #![allow(improper_ctypes_definitions)]
-#![feature(try_trait_v2)]
 #![feature(const_trait_impl)]
 #![feature(const_option_ops)]
 #![feature(adt_const_params)]
-#![feature(pointer_is_aligned_to)]
-#![feature(linked_list_cursors)]
 #![allow(async_fn_in_trait)]
 #![feature(thread_local)]
 #![feature(specialization)]
@@ -31,6 +24,7 @@ mod console;
 mod crt;
 mod debug_metadata;
 mod drivers;
+mod error;
 mod executable;
 mod exports;
 mod file_system;

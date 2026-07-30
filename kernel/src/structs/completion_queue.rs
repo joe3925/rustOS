@@ -1,35 +1,32 @@
 use alloc::sync::Arc;
-use core::future::Future;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use core::task::{Context, Poll};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use kernel_executor::global_async::{ExecutorDomainId, KERNEL_NORMAL_EXECUTOR_DOMAIN};
-use kernel_executor::runtime::runtime::spawn_detached_in_executor_domain;
-use kernel_sync::bounded_mpmc::BoundedSendError;
-use kernel_sync::mpmc::TryRecvError;
+use kernel_executor::global_async::ExecutorDomainId;
+use kernel_executor::runtime::runtime::try_spawn_to_port_in_executor_domain;
+use kernel_sync::{PortReserveError, mpmc::TryRecvError};
+use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome};
 
-use crate::sync_platform::{
-    bounded_mpmc_channel, BoundedMpmcReceiver as BoundedReceiver,
-    BoundedMpmcSender as BoundedSender,
-};
+use crate::sync_platform::{CompletionPort as KernelCompletionPort, CompletionPortPermit};
+use crate::structs::executor_domain::UserExecutorDomain;
 
 use super::io_request::{
-    CompleteTransition, IoOpcode, IoRequestFuture, IoRequestOutput, IoRequestTable, KernelIoOp,
-    RequestId, RequestTableError, UserIoCompletion, IO_STATUS_CANCELLED,
+    CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable, KernelIoOp,
+    RequestId, RequestTableError, UserIoCompletion,
 };
 
 pub struct CompletionQueue {
     pub owner_pid: u64,
     pub bound_executor_domain: ExecutorDomainId,
+    executor_domain: Arc<UserExecutorDomain>,
     pub request_capacity: usize,
     pub completion_capacity: usize,
     pub flags: u64,
 
     request_table: IoRequestTable,
-    completion_sender: BoundedSender<UserIoCompletion>,
-    completion_receiver: BoundedReceiver<UserIoCompletion>,
-    completion_permits: AtomicUsize,
+    completion_port: Arc<KernelCompletionPort<UserIoCompletion>>,
+    completion_chunk_capacity: usize,
+    resizing_completion_port: AtomicBool,
+    closed: AtomicBool,
 }
 
 impl core::fmt::Debug for CompletionQueue {
@@ -51,11 +48,14 @@ pub enum CompletionQueueError {
     CompletionQueueFull,
     RequestNotFound,
     RequestAlreadyComplete,
+    Closed,
+    DomainUnavailable,
 }
 
 impl CompletionQueue {
     pub fn new(
         owner_pid: u64,
+        executor_domain: Arc<UserExecutorDomain>,
         request_capacity: usize,
         completion_capacity: usize,
         flags: u64,
@@ -64,49 +64,66 @@ impl CompletionQueue {
             return Err(CompletionQueueError::InvalidCapacity);
         }
 
-        let max_waiters = request_capacity.max(1);
-        let (completion_sender, completion_receiver) =
-            bounded_mpmc_channel(completion_capacity, max_waiters);
-
+        let completion_chunk_capacity = completion_capacity.div_ceil(4).max(1);
         Ok(Arc::new(Self {
             owner_pid,
-            bound_executor_domain: KERNEL_NORMAL_EXECUTOR_DOMAIN,
+            bound_executor_domain: executor_domain.id(),
+            executor_domain,
             request_capacity,
             completion_capacity,
             flags,
             request_table: IoRequestTable::new(request_capacity),
-            completion_sender,
-            completion_receiver,
-            completion_permits: AtomicUsize::new(completion_capacity),
+            completion_port: KernelCompletionPort::new(
+                completion_capacity,
+                completion_chunk_capacity,
+            ),
+            completion_chunk_capacity,
+            resizing_completion_port: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }))
     }
 
     pub fn enqueue(self: &Arc<Self>, op: KernelIoOp) -> Result<RequestId, CompletionQueueError> {
-        self.reserve_completion_permit()?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CompletionQueueError::Closed);
+        }
+        if self.executor_domain.is_draining() {
+            return Err(CompletionQueueError::DomainUnavailable);
+        }
+        let port_permit = self.reserve_completion_slot()?;
 
         let request_id = match self.request_table.allocate() {
             Ok(request_id) => request_id,
             Err(RequestTableError::Full) => {
-                self.release_completion_permit();
                 return Err(CompletionQueueError::RequestTableFull);
             }
             Err(_) => {
-                self.release_completion_permit();
                 return Err(CompletionQueueError::RequestTableFull);
             }
         };
 
         let opcode = op.opcode();
         let user_token = op.user_token();
-        let future = IoRequestDriverFuture {
+        let permit = IoCompletionPermit {
             queue: self.clone(),
-            request_id,
+            port_permit: Some(port_permit),
             opcode,
             user_token,
-            inner: op.into_future(),
+            consumed: false,
         };
-
-        spawn_detached_in_executor_domain(self.bound_executor_domain, future);
+        let task = match try_spawn_to_port_in_executor_domain(
+            self.bound_executor_domain,
+            async move { op.execute().await },
+            request_id,
+            permit,
+        ) {
+            Ok(task) => task,
+            Err(_) => {
+                self.request_table.reap_submitted(request_id);
+                return Err(CompletionQueueError::RequestTableFull);
+            }
+        };
+        self.request_table.install_task(request_id, task);
         Ok(request_id)
     }
 
@@ -138,13 +155,18 @@ impl CompletionQueue {
         let mut count = 0usize;
 
         while count < out.len() {
-            let completion = match self.completion_receiver.try_recv() {
-                Ok(completion) => completion,
+            let completion = match self.completion_port.try_recv() {
+                Ok(completion) => match completion.outcome {
+                    TaskOutcome::Completed(completion) => completion,
+                    TaskOutcome::Cancelled => {
+                        unreachable!("mapped I/O permit emitted cancellation")
+                    }
+                },
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             };
 
             self.request_table.reap(completion.request_id);
-            self.release_completion_permit();
+            self.reclaim_completion_capacity();
             out[count] = completion;
             count += 1;
         }
@@ -163,13 +185,18 @@ impl CompletionQueue {
         }
 
         if timeout_ns == u64::MAX {
-            let first = match self.completion_receiver.recv() {
-                Ok(completion) => completion,
+            let first = match self.completion_port.recv() {
+                Ok(completion) => match completion.outcome {
+                    TaskOutcome::Completed(completion) => completion,
+                    TaskOutcome::Cancelled => {
+                        unreachable!("mapped I/O permit emitted cancellation")
+                    }
+                },
                 Err(_) => return 0,
             };
 
             self.request_table.reap(first.request_id);
-            self.release_completion_permit();
+            self.reclaim_completion_capacity();
             out[0] = first;
             return 1 + self.poll_completions(&mut out[1..]);
         }
@@ -198,100 +225,124 @@ impl CompletionQueue {
             })
     }
 
-    fn reserve_completion_permit(&self) -> Result<(), CompletionQueueError> {
-        self.completion_permits
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                (available != 0).then_some(available - 1)
-            })
-            .map(|_| ())
-            .map_err(|_| CompletionQueueError::CompletionQueueFull)
+    pub fn shutdown(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.request_table.cancel_all();
+        }
     }
 
-    fn release_completion_permit(&self) {
-        self.completion_permits.fetch_add(1, Ordering::Release);
+    fn reserve_completion_slot(
+        self: &Arc<Self>,
+    ) -> Result<CompletionPortPermit<UserIoCompletion>, CompletionQueueError> {
+        loop {
+            match self.completion_port.try_reserve() {
+                Ok(permit) => return Ok(permit),
+                Err(PortReserveError::Closed) => return Err(CompletionQueueError::Closed),
+                Err(PortReserveError::Full) => {}
+            }
+
+            if self
+                .resizing_completion_port
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let current = self.completion_port.capacity();
+                let requested = current.div_ceil(2).max(self.completion_chunk_capacity);
+                let additional = requested
+                    .div_ceil(self.completion_chunk_capacity)
+                    .saturating_mul(self.completion_chunk_capacity);
+                let result = self.completion_port.try_grow(additional);
+                self.resizing_completion_port
+                    .store(false, Ordering::Release);
+                result.map_err(|_| CompletionQueueError::CompletionQueueFull)?;
+            } else {
+                core::hint::spin_loop();
+            }
+        }
     }
 
-    fn complete_entry(
-        &self,
-        request_id: RequestId,
-        opcode: IoOpcode,
-        user_token: u64,
-        output: IoRequestOutput,
-    ) {
-        let transition = match self.request_table.complete(request_id) {
-            Ok(transition) => transition,
-            Err(_) => return,
+    fn reclaim_completion_capacity(&self) {
+        let capacity = self.completion_port.capacity();
+        let outstanding = self.completion_port.outstanding();
+        if capacity <= self.completion_capacity || outstanding.saturating_mul(2) > capacity {
+            return;
+        }
+        if self
+            .resizing_completion_port
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let capacity = self.completion_port.capacity();
+        let outstanding = self.completion_port.outstanding();
+        if capacity > self.completion_capacity && outstanding.saturating_mul(2) <= capacity {
+            let lower_bound = self.completion_capacity.max(outstanding);
+            let desired_removal = capacity.div_ceil(4);
+            let removable = desired_removal.min(capacity.saturating_sub(lower_bound))
+                / self.completion_chunk_capacity
+                * self.completion_chunk_capacity;
+            let target = capacity.saturating_sub(removable);
+            // Reclamation is opportunistic. A busy or non-representable chunk
+            // layout is left intact and reconsidered after a later reap.
+            if removable != 0 {
+                let _ = self.completion_port.try_shrink_to(target);
+            }
+        }
+        self.resizing_completion_port
+            .store(false, Ordering::Release);
+    }
+}
+
+struct IoCompletionPermit {
+    queue: Arc<CompletionQueue>,
+    port_permit: Option<CompletionPortPermit<UserIoCompletion>>,
+    opcode: IoOpcode,
+    user_token: u64,
+    consumed: bool,
+}
+
+impl CompletionPermit<IoRequestOutput> for IoCompletionPermit {
+    fn complete(mut self, completion: TaskCompletion<IoRequestOutput>) {
+        self.consumed = true;
+        let output = match completion.outcome {
+            TaskOutcome::Completed(output) => output,
+            TaskOutcome::Cancelled => IoRequestOutput::error(IO_STATUS_CANCELLED),
         };
-
+        let transition = self
+            .queue
+            .request_table
+            .complete(completion.key)
+            .unwrap_or(CompleteTransition::Cancelled);
         let output = match transition {
             CompleteTransition::Normal => output,
             CompleteTransition::Cancelled => IoRequestOutput::error(IO_STATUS_CANCELLED),
         };
-
-        let completion = UserIoCompletion {
-            request_id,
-            user_token,
-            opcode: opcode as u32,
+        let user = UserIoCompletion {
+            request_id: completion.key,
+            user_token: self.user_token,
+            opcode: self.opcode as u32,
             reserved: 0,
             status: output.status,
             result: output.result,
             extra: output.extra,
         };
-
-        match self.completion_sender.try_send(completion) {
-            Ok(()) => {}
-            Err(BoundedSendError::Full(_)) => {
-                panic!("completion queue invariant broken: reserved completion slot was full");
-            }
-            Err(BoundedSendError::Disconnected(_)) => {
-                panic!("completion queue invariant broken: completion receiver disconnected");
-            }
-        }
+        self.port_permit
+            .take()
+            .expect("I/O port permit missing")
+            .complete(TaskCompletion {
+                task: completion.task,
+                key: completion.key,
+                outcome: TaskOutcome::Completed(user),
+            });
     }
 }
 
-struct IoRequestDriverFuture {
-    queue: Arc<CompletionQueue>,
-    request_id: RequestId,
-    opcode: IoOpcode,
-    user_token: u64,
-    inner: IoRequestFuture,
-}
-
-impl Future for IoRequestDriverFuture {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        this.queue
-            .request_table
-            .set_waker(this.request_id, cx.waker());
-
-        match this
-            .queue
-            .request_table
-            .mark_running_or_cancelled(this.request_id)
-        {
-            Ok(CompleteTransition::Normal) => {}
-            Ok(CompleteTransition::Cancelled) => {
-                this.queue.complete_entry(
-                    this.request_id,
-                    this.opcode,
-                    this.user_token,
-                    IoRequestOutput::error(IO_STATUS_CANCELLED),
-                );
-                return Poll::Ready(());
-            }
-            Err(_) => return Poll::Ready(()),
-        }
-
-        match this.inner.as_mut().poll(cx) {
-            Poll::Ready(output) => {
-                this.queue
-                    .complete_entry(this.request_id, this.opcode, this.user_token, output);
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
+impl Drop for IoCompletionPermit {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.port_permit.take();
         }
     }
 }

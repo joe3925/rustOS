@@ -1,12 +1,12 @@
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::platform::Platform;
 use kernel_types::io::TreiberStack;
-static NEXT_WAIT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_WAIT_QUEUE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 fn alloc_wait_queue_id() -> u64 {
-    NEXT_WAIT_QUEUE_ID.fetch_add(1, Ordering::Relaxed)
+    NEXT_WAIT_QUEUE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct WaitQueue<P: Platform> {

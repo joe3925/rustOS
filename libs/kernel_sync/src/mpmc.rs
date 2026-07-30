@@ -1,5 +1,5 @@
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_queue::SegQueue;
 
 use crate::platform::Platform;

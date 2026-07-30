@@ -447,9 +447,8 @@ where
     }
 
     #[inline]
-    unsafe fn page_slice_mut(&self, page: &CachePage) -> &mut [u8] {
-        let ptr = (self.cache_base.as_u64() as usize + Self::page_offset(page.slot)) as *mut u8;
-        unsafe { core::slice::from_raw_parts_mut(ptr, BLOCK_SIZE) }
+    fn page_ptr(&self, page: &CachePage) -> *mut u8 {
+        (self.cache_base.as_u64() as usize + Self::page_offset(page.slot)) as *mut u8
     }
 
     fn create_cache_from_device_buffer_at<'a>(
@@ -926,7 +925,8 @@ where
             cold_path();
             let _data_guard = page.data_lock.write();
             unsafe {
-                self.page_slice_mut(page)[bytes_read..].fill(0);
+                core::slice::from_raw_parts_mut(self.page_ptr(page), BLOCK_SIZE)[bytes_read..]
+                    .fill(0);
             }
         }
 
@@ -1042,7 +1042,8 @@ where
             cold_path();
             let _data_guard = page.data_lock.write();
             unsafe {
-                self.page_slice_mut(page)[bytes_read..].fill(0);
+                core::slice::from_raw_parts_mut(self.page_ptr(page), BLOCK_SIZE)[bytes_read..]
+                    .fill(0);
             }
         }
 
@@ -1205,7 +1206,10 @@ where
             {
                 let _guard = page.data_lock.write();
                 let destination =
-                    unsafe { &mut self.page_slice_mut(&page)[block_off..block_off + take] };
+                    unsafe {
+                        &mut core::slice::from_raw_parts_mut(self.page_ptr(&page), BLOCK_SIZE)
+                            [block_off..block_off + take]
+                    };
                 if let Err(err) = remaining
                     .as_ref()
                     .expect("direct write buffer disappeared")
@@ -1952,7 +1956,16 @@ where
         dirty != 0 && dirty >= self.cfg.dirty_high_watermark_blocks
     }
 
-    async fn background_writeback_loop(&self) {
+    fn report_background_writeback_error(error: &CacheError<B::Error>) {
+        cold_path();
+        // TODO: Find a better policy for asynchronous write-back failures.
+        println!(
+            "[volmgr] background cache write-back failed; affected pages remain dirty: {:?}",
+            error
+        );
+    }
+
+    async fn background_writeback_loop(&self) -> Result<(), CacheError<B::Error>> {
         loop {
             if unlikely(self.closed.load(Ordering::Acquire)) {
                 cold_path();
@@ -1969,11 +1982,7 @@ where
                     Ok(pass) => pass,
                     Err(err) => {
                         cold_path();
-                        println!(
-                            "volmgr: VolumeCache::background_writeback_loop failed: {:?}",
-                            err
-                        );
-                        break;
+                        return Err(err);
                     }
                 };
 
@@ -1983,6 +1992,8 @@ where
                 break;
             }
         }
+
+        Ok(())
     }
 
     fn maybe_start_background_writeback(cache: &Arc<Self>) {
@@ -2000,12 +2011,19 @@ where
         let cache_for_task = Arc::clone(cache);
 
         spawn_detached(async move {
-            cache_for_task.background_writeback_loop().await;
+            let writeback_succeeded = match cache_for_task.background_writeback_loop().await {
+                Ok(()) => true,
+                Err(err) => {
+                    Self::report_background_writeback_error(&err);
+                    false
+                }
+            };
             cache_for_task
                 .background_writeback_active
                 .store(false, Ordering::Release);
 
-            if cache_for_task.should_start_background_writeback()
+            if writeback_succeeded
+                && cache_for_task.should_start_background_writeback()
                 && !cache_for_task
                     .background_writeback_active
                     .swap(true, Ordering::AcqRel)
@@ -2013,7 +2031,9 @@ where
                 let cache_for_followup = Arc::clone(&cache_for_task);
 
                 spawn_detached(async move {
-                    cache_for_followup.background_writeback_loop().await;
+                    if let Err(err) = cache_for_followup.background_writeback_loop().await {
+                        Self::report_background_writeback_error(&err);
+                    }
                     cache_for_followup
                         .background_writeback_active
                         .store(false, Ordering::Release);
@@ -2032,11 +2052,7 @@ where
 
         spawn_detached(async move {
             if let Err(err) = cache.flush_internal_owner_to_backend(owner).await {
-                cold_path();
-                println!(
-                    "volmgr: VolumeCache::flush_owner_background owner {} failed: {:?}",
-                    owner, err
-                );
+                Self::report_background_writeback_error(&err);
             }
         });
     }
@@ -2124,10 +2140,8 @@ where
                 WriteAcquire::Cached(page) => {
                     let bits = Self::granule_mask_for_range(block_off, take)?;
 
-                    while page.writeback_mask.load(Ordering::Acquire) & bits != 0 {
-                        match cache.wait_for_writeback_progress(&FlushFilter::All).await {
-                            WritebackWaitResult::Clean | WritebackWaitResult::NeedsFlush => break,
-                        }
+                    if page.writeback_mask.load(Ordering::Acquire) & bits != 0 {
+                        cache.wait_for_writeback_progress(&FlushFilter::All).await;
                     }
 
                     if !Self::range_covers_whole_granules(block_off, take) {
@@ -2139,7 +2153,10 @@ where
                     {
                         let _guard = page.data_lock.write();
                         let destination = unsafe {
-                            &mut cache.page_slice_mut(&page)[block_off..block_off + take]
+                            &mut core::slice::from_raw_parts_mut(
+                                cache.page_ptr(&page),
+                                BLOCK_SIZE,
+                            )[block_off..block_off + take]
                         };
                         remaining
                             .as_ref()
@@ -2447,7 +2464,9 @@ where
         let cache = Arc::clone(self);
 
         spawn_detached(async move {
-            let _ = cache.flush_internal_all().await;
+            if let Err(err) = cache.flush_internal_all().await {
+                VolumeCache::<B, BLOCK_SIZE, F>::report_background_writeback_error(&err);
+            }
         });
     }
 }

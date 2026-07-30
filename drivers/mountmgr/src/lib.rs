@@ -5,6 +5,7 @@ extern crate alloc;
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
+    format,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -18,6 +19,10 @@ use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY, IOCTL_MOUNTMGR_RESYNC,
     IOCTL_MOUNTMGR_UNMOUNT,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject, open_public_protocol},
+    error::{
+        DriverErrorKind, ErrorKind, FileErrorKind, KernelError, RegistryErrorKind,
+        ResultErrorContext,
+    },
     fs::{FsOpenParams, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
@@ -29,19 +34,19 @@ use kernel_api::{
     pnp::{
         DriverStep, io, pnp_add_class_listener, pnp_create_control_device_and_link,
         pnp_create_device_symlink_top, pnp_create_symlink, pnp_remove_symlink,
+        pnp_set_preferred_function_driver,
     },
     reg::{self, switch_to_vfs_async},
     request::{DeviceControl, Fs, FsOpen, FsPayload},
     request_handler,
     runtime::spawn_detached,
-    status::{Data, DriverStatus, RegError},
+    status::Data,
     util::panic_common,
 };
 use spin::RwLock;
 
 const MOD_NAME: &str = env!("CARGO_PKG_NAME");
 const DRIVE_LETTERS_KEY: &str = "SYSTEM/CurrentControlSet/MountMgr/DriveLetters";
-const HINTS_KEY: &str = "SYSTEM/CurrentControlSet/MountMgr/FilesystemHints";
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -54,7 +59,7 @@ struct MountedVolume {
     instance_path: String,
     stable_id: String,
     stable_link: String,
-    filesystem_service: String,
+    filesystem_driver_name: String,
     assigned_label: Option<String>,
 }
 
@@ -66,38 +71,50 @@ struct MountMgrControl;
 
 impl DeviceControlHandler for MountMgrControl {
     #[request_handler]
-    async fn handler(_device: &Arc<DeviceObject>, request: &mut DeviceControl<'_>) -> DriverStep {
+    async fn handler(
+        _device: &Arc<DeviceObject>,
+        request: &mut DeviceControl<'_>,
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         match request.code {
             IOCTL_MOUNTMGR_QUERY => {
                 request.set_data(IoctlData::from_t::<Vec<u8>>(status_blob()));
-                DriverStep::complete(DriverStatus::Success)
+                Ok(DriverStep::Complete)
             }
             IOCTL_MOUNTMGR_LIST_FS => {
                 request.set_data(IoctlData::from_t::<Vec<u8>>(filesystem_blob()));
-                DriverStep::complete(DriverStatus::Success)
+                Ok(DriverStep::Complete)
             }
             IOCTL_MOUNTMGR_RESYNC => {
                 assign_all_labels().await;
-                DriverStep::complete(DriverStatus::Success)
+                Ok(DriverStep::Complete)
             }
-            IOCTL_MOUNTMGR_UNMOUNT => DriverStep::complete(DriverStatus::NotImplemented),
-            _ => DriverStep::complete(DriverStatus::NotImplemented),
+            IOCTL_MOUNTMGR_UNMOUNT => Err(kernel_api::error::error(
+                kernel_api::error::DriverErrorKind::NotImplemented,
+            )),
+            _ => Err(kernel_api::error::error(
+                kernel_api::error::DriverErrorKind::NotImplemented,
+            )),
         }
     }
 }
 
 extern "C" fn volume_event(node: Arc<DevNode>, event: DeviceEvent, _listener: &Arc<DeviceObject>) {
     spawn_detached(async move {
-        match event {
+        let result: Result<(), KernelError> = match event {
             DeviceEvent::Started => handle_started(node).await,
             DeviceEvent::Stopped | DeviceEvent::Removed => handle_removed(&node.instance_path),
-            DeviceEvent::Created | DeviceEvent::Failed => {}
+            DeviceEvent::Created | DeviceEvent::Failed => Ok(()),
+        };
+        if let Err(error) = result {
+            kernel_api::println!("mountmgr volume event failed: {error}");
         }
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(_driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(
+    _driver: &Arc<DriverObject>,
+) -> Result<(), kernel_api::error::KernelError> {
     let mut init = DeviceInit::new();
     init.ops.register::<DeviceControlOp, MountMgrControl>();
     let control = pnp_create_control_device_and_link(
@@ -106,67 +123,90 @@ pub extern "C" fn DriverEntry(_driver: &Arc<DriverObject>) -> DriverStatus {
         GLOBAL_CTRL_LINK.to_string(),
     );
     pnp_add_class_listener("Volume".to_string(), volume_event, &control);
-    DriverStatus::Success
+    Ok(())
 }
 
-async fn handle_started(node: Arc<DevNode>) {
+async fn handle_started(node: Arc<DevNode>) -> Result<(), KernelError> {
     if MOUNTED.read().contains_key(&node.instance_path) {
-        return;
+        return Ok(());
     }
-    let protocol = match open_public_protocol::<VolumeProtocol>(&node) {
-        Ok(protocol) => protocol,
-        Err(_) => return,
-    };
-    let info = match (protocol.partition_info)(protocol.provider()) {
-        Ok(info) => info,
-        Err(_) => return,
-    };
+    let protocol = open_public_protocol::<VolumeProtocol>(&node).map_err(|kind| {
+        kernel_api::error::error_with_message(
+            kind,
+            format_args!("opening volume protocol for `{}`", node.instance_path),
+        )
+    })?;
+    let info = (protocol.partition_info)(protocol.provider()).with_context(|| {
+        format!(
+            "querying partition information for `{}`",
+            node.instance_path
+        )
+    })?;
     let Some(entry) = info.gpt_entry else {
-        return;
+        return Ok(());
     };
     if entry.unique_partition_guid.iter().all(|byte| *byte == 0) {
-        return;
+        return Ok(());
     }
 
     let stable_id = guid_id(&entry.unique_partition_guid);
     let stable_link = alloc::format!("\\GLOBAL\\Volumes\\{stable_id}");
-    let service = node
+    let driver_name = node
         .stack
         .read()
         .as_ref()
         .and_then(|stack| stack.function.as_ref())
         .map(|layer| layer.driver.driver_name.clone())
         .unwrap_or_default();
-    if service.is_empty() {
-        return;
+    if driver_name.is_empty() {
+        return Err(kernel_api::error::error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("volume `{}` has no function driver", node.instance_path),
+        ));
     }
 
-    let _ = pnp_create_device_symlink_top(node.instance_path.clone(), stable_link.clone());
+    pnp_create_device_symlink_top(node.instance_path.clone(), stable_link.clone()).map_err(
+        |error| {
+            kernel_api::error::error_with_message(
+                DriverErrorKind::DeviceError,
+                format_args!("publishing stable volume link `{stable_link}` failed: {error:?}"),
+            )
+        },
+    )?;
     let mounted = MountedVolume {
         instance_path: node.instance_path.clone(),
         stable_id: stable_id.clone(),
         stable_link: stable_link.clone(),
-        filesystem_service: service.clone(),
+        filesystem_driver_name: driver_name.clone(),
         assigned_label: None,
     };
     MOUNTED.write().insert(node.instance_path.clone(), mounted);
-    write_filesystem_hint(&stable_id, &service).await;
+    pnp_set_preferred_function_driver(&node.instance_path, &driver_name)
+        .await
+        .with_context(|| {
+            format!(
+                "recording preferred function driver for `{}`",
+                node.instance_path
+            )
+        })?;
 
     if VFS_ACTIVE.load(Ordering::Acquire) {
-        let _ = assign_label(&node.instance_path, false).await;
+        assign_label(&node.instance_path, false).await?;
     } else {
         start_boot_probe(node.instance_path.clone(), stable_id, stable_link);
     }
+    Ok(())
 }
 
-fn handle_removed(instance_path: &str) {
+fn handle_removed(instance_path: &str) -> Result<(), KernelError> {
     let Some(volume) = MOUNTED.write().remove(instance_path) else {
-        return;
+        return Ok(());
     };
     if let Some(label) = volume.assigned_label {
-        unpublish_label(&label);
+        unpublish_label(&label)?;
     }
-    let _ = pnp_remove_symlink(volume.stable_link);
+    remove_symlink_if_present(volume.stable_link)?;
+    Ok(())
 }
 
 fn guid_id(guid: &[u8; 16]) -> String {
@@ -179,18 +219,23 @@ fn guid_id(guid: &[u8; 16]) -> String {
     id
 }
 
-async fn write_filesystem_hint(stable_id: &str, service: &str) {
-    let _ = reg::create_key(HINTS_KEY).await;
-    let key = alloc::format!("{HINTS_KEY}/{stable_id}");
-    let _ = reg::create_key(&key).await;
-    let _ = reg::set_value(&key, "Service", Data::Str(service.to_string())).await;
-}
-
 fn start_boot_probe(instance_path: String, stable_id: String, stable_link: String) {
     spawn_detached(async move {
-        let has_boot_tree = fs_check_open(&stable_link, "system/mod").await
-            && fs_check_open(&stable_link, "system/toml").await
-            && fs_check_open(&stable_link, "system/registry").await;
+        let has_boot_tree = match async {
+            Ok::<bool, KernelError>(
+                fs_check_open(&stable_link, "system/mod").await?
+                    && fs_check_open(&stable_link, "system/toml").await?
+                    && fs_check_open(&stable_link, "system/registry").await?,
+            )
+        }
+        .await
+        {
+            Ok(found) => found,
+            Err(error) => {
+                kernel_api::println!("mountmgr boot-volume probe failed: {error}");
+                return;
+            }
+        };
         if !has_boot_tree || VFS_ACTIVE.load(Ordering::Acquire) {
             return;
         }
@@ -205,12 +250,12 @@ fn start_boot_probe(instance_path: String, stable_id: String, stable_link: Strin
                 VFS_ACTIVE.store(true, Ordering::Release);
                 assign_all_labels().await;
             }
-            Err(error) => panic!("VFS transition failed: {error:?}"),
+            Err(error) => panic!("VFS transition failed:\n\n{error}"),
         }
     });
 }
 
-async fn fs_check_open(volume_link: &str, path: &str) -> bool {
+async fn fs_check_open(volume_link: &str, path: &str) -> Result<bool, KernelError> {
     let mut request = Fs::<FsOpen> {
         payload: FsPayload {
             params: FsOpenParams {
@@ -223,42 +268,61 @@ async fn fs_check_open(volume_link: &str, path: &str) -> bool {
         },
     };
     let Some(target) = io::resolve_target(volume_link) else {
-        return false;
+        return Err(kernel_api::error::error_with_message(
+            DriverErrorKind::NoSuchDevice,
+            format_args!("volume target `{volume_link}` could not be resolved"),
+        ));
     };
-    io::send_down_stack(target, &mut request).await == DriverStatus::Success
-        && request
-            .payload
-            .result
-            .as_ref()
-            .is_some_and(|result| result.error.is_none())
+    io::send_down_stack(target, &mut request)
+        .await
+        .with_context(|| format!("probing `{path}` on `{volume_link}`"))?;
+    let result = request.payload.result.ok_or_else(|| {
+        kernel_api::error::error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("filesystem probe for `{path}` completed without a result"),
+        )
+    })?;
+    match result.error {
+        None => Ok(true),
+        Some(error) if matches!(error.kind(), ErrorKind::File(FileErrorKind::PathNotFound)) => {
+            Ok(false)
+        }
+        Some(error) => Err(error.with_context(format!("probing `{path}` on `{volume_link}`"))),
+    }
 }
 
 async fn assign_all_labels() {
     let instances: Vec<_> = MOUNTED.read().keys().cloned().collect();
     for instance in instances {
-        let _ = assign_label(&instance, false).await;
+        if let Err(error) = assign_label(&instance, false).await {
+            kernel_api::println!("mountmgr failed to assign label to `{instance}`: {error}");
+        }
     }
 }
 
-async fn assign_label(instance_path: &str, allow_c: bool) -> Option<String> {
-    let volume = MOUNTED.read().get(instance_path).cloned()?;
+async fn assign_label(instance_path: &str, allow_c: bool) -> Result<Option<String>, KernelError> {
+    let Some(volume) = MOUNTED.read().get(instance_path).cloned() else {
+        return Ok(None);
+    };
     if volume.assigned_label.is_some() {
-        return volume.assigned_label;
+        return Ok(volume.assigned_label);
     }
     let preferred = read_preferred_label(&volume.stable_id).await;
     let label = match preferred {
         Some(label) if !is_label_published(&label) => label,
         _ => {
-            let label = find_free_label(allow_c)?;
-            let _ = write_preferred_label(&volume.stable_id, &label).await;
+            let Some(label) = find_free_label(allow_c) else {
+                return Ok(None);
+            };
+            write_preferred_label(&volume.stable_id, &label).await?;
             label
         }
     };
-    publish_label(&label, &volume.stable_id, &volume.stable_link);
+    publish_label(&label, &volume.stable_id, &volume.stable_link)?;
     if let Some(current) = MOUNTED.write().get_mut(instance_path) {
         current.assigned_label = Some(label.clone());
     }
-    Some(label)
+    Ok(Some(label))
 }
 
 async fn assign_specific_label(
@@ -266,10 +330,10 @@ async fn assign_specific_label(
     instance_path: &str,
     stable_id: &str,
     stable_link: &str,
-) -> Result<(), RegError> {
+) -> Result<(), KernelError> {
     let label = alloc::format!("{}:", letter.to_ascii_uppercase());
     write_preferred_label(stable_id, &label).await?;
-    publish_label(&label, stable_id, stable_link);
+    publish_label(&label, stable_id, stable_link)?;
     if let Some(volume) = MOUNTED.write().get_mut(instance_path) {
         volume.assigned_label = Some(label);
     }
@@ -285,8 +349,8 @@ async fn read_preferred_label(stable_id: &str) -> Option<String> {
         })
 }
 
-async fn write_preferred_label(stable_id: &str, label: &str) -> Result<(), RegError> {
-    let _ = reg::create_key(DRIVE_LETTERS_KEY).await;
+async fn write_preferred_label(stable_id: &str, label: &str) -> Result<(), KernelError> {
+    create_registry_key_if_missing(DRIVE_LETTERS_KEY).await?;
     reg::set_value(DRIVE_LETTERS_KEY, stable_id, Data::Str(label.to_string())).await
 }
 
@@ -305,26 +369,58 @@ fn is_label_published(label: &str) -> bool {
     PUBLISHED_LABELS.read().contains_key(label)
 }
 
-fn publish_label(label: &str, stable_id: &str, stable_link: &str) {
+async fn create_registry_key_if_missing(path: &str) -> Result<(), KernelError> {
+    match reg::create_key(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::Registry(RegistryErrorKind::KeyAlreadyExists) => {
+            Ok(())
+        }
+        Err(error) => Err(error.with_context(format!("creating registry key `{path}`"))),
+    }
+}
+
+fn remove_symlink_if_present(path: String) -> Result<(), KernelError> {
+    match pnp_remove_symlink(path.clone()) {
+        Ok(()) | Err(DriverErrorKind::NoSuchDevice) => Ok(()),
+        Err(kind) => Err(kernel_api::error::error_with_message(
+            kind,
+            format_args!("removing symlink `{path}`"),
+        )),
+    }
+}
+
+fn publish_label(label: &str, stable_id: &str, stable_link: &str) -> Result<(), KernelError> {
     let letter = label.chars().next().unwrap_or('?');
     let plain = alloc::format!("\\GLOBAL\\StorageDevices\\{letter}");
     let colon = alloc::format!("\\GLOBAL\\StorageDevices\\{letter}:");
-    let _ = pnp_remove_symlink(plain.clone());
-    let _ = pnp_remove_symlink(colon.clone());
-    let _ = pnp_create_symlink(plain, stable_link.to_string());
-    let _ = pnp_create_symlink(colon, stable_link.to_string());
+    remove_symlink_if_present(plain.clone())?;
+    remove_symlink_if_present(colon.clone())?;
+    pnp_create_symlink(plain.clone(), stable_link.to_string()).map_err(|error| {
+        kernel_api::error::error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("publishing symlink `{plain}` failed: {error:?}"),
+        )
+    })?;
+    pnp_create_symlink(colon.clone(), stable_link.to_string()).map_err(|error| {
+        kernel_api::error::error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!("publishing symlink `{colon}` failed: {error:?}"),
+        )
+    })?;
     PUBLISHED_LABELS
         .write()
         .insert(label.to_string(), stable_id.to_string());
     notify_label_published(label, stable_link);
+    Ok(())
 }
 
-fn unpublish_label(label: &str) {
+fn unpublish_label(label: &str) -> Result<(), KernelError> {
     let letter = label.chars().next().unwrap_or('?');
-    let _ = pnp_remove_symlink(alloc::format!("\\GLOBAL\\StorageDevices\\{letter}"));
-    let _ = pnp_remove_symlink(alloc::format!("\\GLOBAL\\StorageDevices\\{letter}:"));
+    remove_symlink_if_present(alloc::format!("\\GLOBAL\\StorageDevices\\{letter}"))?;
+    remove_symlink_if_present(alloc::format!("\\GLOBAL\\StorageDevices\\{letter}:"))?;
     PUBLISHED_LABELS.write().remove(label);
     notify_label_unpublished(label);
+    Ok(())
 }
 
 fn status_blob() -> Vec<u8> {
@@ -338,7 +434,7 @@ fn status_blob() -> Vec<u8> {
             "{};{};{};{}",
             volume.instance_path,
             volume.stable_id,
-            volume.filesystem_service,
+            volume.filesystem_driver_name,
             volume.assigned_label.as_deref().unwrap_or("")
         ));
     }
@@ -349,7 +445,7 @@ fn filesystem_blob() -> Vec<u8> {
     let services: BTreeSet<_> = MOUNTED
         .read()
         .values()
-        .map(|volume| volume.filesystem_service.clone())
+        .map(|volume| volume.filesystem_driver_name.clone())
         .collect();
     services
         .into_iter()

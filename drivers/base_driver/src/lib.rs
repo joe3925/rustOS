@@ -9,7 +9,6 @@ use kernel_api::{
     device::{DeviceInit, DeviceObject, DriverObject},
     pnp::{DriverStep, PnpOp, PnpOps, driver_set_evt_device_add},
     println, request_handler,
-    status::DriverStatus,
 };
 
 #[cfg(not(test))]
@@ -18,21 +17,21 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
     println!("BaseBusDriver: DriverEntry called.\n");
     driver_set_evt_device_add(driver, bus_driver_device_add);
-    DriverStatus::Success
+    Ok(())
 }
 
 pub extern "C" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     let mut pnp_ops = PnpOps::new();
     println!("BaseBusDriver: EvtDeviceAdd called.\n");
     pnp_ops.start_device.set(bus_driver_prepare_hardware);
     dev_init_ptr.pnp_ops = Some(pnp_ops);
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }
 
 #[request_handler]
@@ -40,7 +39,7 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     _device: &Arc<DeviceObject>,
     _op: PnpOp,
     _req: &'b mut StartDevice,
-) -> DriverStep {
+) -> Result<DriverStep, kernel_api::error::KernelError> {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
-    DriverStep::complete(DriverStatus::Success)
+    Ok(DriverStep::Complete)
 }

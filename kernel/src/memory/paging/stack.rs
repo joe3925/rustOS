@@ -61,11 +61,7 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
 
     let map_bytes = {
         let bytes = align_up(size.as_bytes(), base_page_size()).ok_or(PageMapError::NoMemory())?;
-        if bytes > max_stack {
-            max_stack
-        } else {
-            bytes
-        }
+        if bytes > max_stack { max_stack } else { bytes }
     };
 
     let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;

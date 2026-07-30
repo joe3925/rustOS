@@ -1,18 +1,21 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
+use crate::error::error;
 use crate::println;
 use alloc::string::ToString;
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
+use kernel_types::error::{
+    DriverErrorKind, ErrorKind, FileErrorKind, KernelError, ResultErrorContext,
+};
 use kernel_types::fs::{Path, *};
 use kernel_types::io::IoTarget;
 use kernel_types::request::{
-    Fs, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsOperation, FsPayload, FsRead,
-    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
+    Fs, FsAppend, FsClose, FsCreate, FsDelete, FsFlush, FsGetInfo, FsOpen, FsOperation, FsPayload,
+    FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange,
 };
-use kernel_types::status::{DriverStatus, FileStatus};
 
 #[derive(Clone, Debug)]
 pub struct MountedVolume {
@@ -77,7 +80,7 @@ impl Vfs {
         }
         drop(map);
         if let Some(tgt) = tgt {
-            // mount_symlink is consumed here — no further clone needed
+            // mount_symlink is consumed here â€” no further clone needed
             self.blocking_write(&self.target_cache)
                 .insert(mount_symlink, tgt);
         }
@@ -89,7 +92,7 @@ impl Vfs {
         }
     }
 
-    pub async fn list_mounted_volumes(&self) -> (Vec<MountedVolume>, DriverStatus) {
+    pub async fn list_mounted_volumes(&self) -> Vec<MountedVolume> {
         let labels = self.label_map.read().await;
         let mut out: Vec<MountedVolume> = Vec::with_capacity(labels.len());
 
@@ -102,22 +105,18 @@ impl Vfs {
             });
         }
 
-        (out, DriverStatus::Success)
+        out
     }
 
     #[inline]
     fn alloc_vh(&self) -> u64 {
         let v = self.next_vh.fetch_add(1, Ordering::AcqRel);
-        if v == 0 {
-            1
-        } else {
-            v
-        }
+        if v == 0 { 1 } else { v }
     }
 
-    fn resolve_path(&self, user_path: Path) -> Result<(String, Path), FileStatus> {
+    fn resolve_path(&self, user_path: Path) -> Result<(String, Path), FileErrorKind> {
         if user_path.symlink.is_none() && user_path.components.is_empty() {
-            return Err(FileStatus::BadPath);
+            return Err(FileErrorKind::BadPath);
         }
 
         // Resolve drive letter to symlink
@@ -136,7 +135,7 @@ impl Vfs {
             return Ok((symlink, fs_path));
         }
 
-        Err(FileStatus::BadPath)
+        Err(FileErrorKind::BadPath)
     }
 
     fn resolve_target(&self, symlink: &str) -> Option<IoTarget> {
@@ -154,7 +153,7 @@ impl Vfs {
         volume_symlink: &str,
         target: Option<IoTarget>,
         params: O::Params<'data>,
-    ) -> Result<O::Result, DriverStatus>
+    ) -> Result<O::Result, KernelError>
     where
         O: FsOperation + 'data,
         Fs<'data, O>: kernel_routing::IoRequest,
@@ -166,683 +165,300 @@ impl Vfs {
                 _marker: PhantomData,
             },
         };
-        let status = {
-            if let Some(tgt) = target {
-                kernel_routing::io::send_down_stack(tgt, &mut request_handle).await
-            } else if let Some(tgt) = PNP_MANAGER.resolve_targetio_from_symlink_ref(volume_symlink)
-            {
-                kernel_routing::io::send_down_stack(tgt, &mut request_handle).await
-            } else {
-                DriverStatus::NoSuchDevice
-            }
+        let target = match target {
+            Some(target) => target,
+            None => PNP_MANAGER
+                .resolve_targetio_from_symlink_ref(volume_symlink)
+                .ok_or_else(|| {
+                    crate::error::error_with_message(
+                        DriverErrorKind::NoSuchDevice,
+                        format_args!("filesystem target `{volume_symlink}` was not found"),
+                    )
+                })?,
         };
-        if status != DriverStatus::Success {
-            println!("Send request failed with status: {}", status);
-            return Err(status);
+        kernel_routing::io::send_down_stack(target, &mut request_handle)
+            .await
+            .with_context(|| format!("forwarding filesystem request to `{volume_symlink}`"))?;
+
+        request_handle.payload.result.take().ok_or_else(|| {
+            crate::error::error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!("filesystem driver for `{volume_symlink}` completed without a result"),
+            )
+        })
+    }
+    async fn handle(&self, file_id: u64) -> Result<VfsHandle, KernelError> {
+        self.handles
+            .read()
+            .await
+            .get(&file_id)
+            .cloned()
+            .ok_or_else(|| error(FileErrorKind::PathNotFound))
+    }
+
+    pub async fn open(&self, p: FsOpenParams) -> Result<FsOpenResult, KernelError> {
+        let (symlink, fs_path) = self.resolve_path(p.path).map_err(error)?;
+        let target = self.resolve_target(&symlink);
+
+        if p.flags.contains(OpenFlags::CreateNew) {
+            let created = self
+                .call_fs::<FsCreate>(
+                    &symlink,
+                    target.clone(),
+                    FsCreateParams {
+                        path: fs_path.clone(),
+                        dir: false,
+                        flags: OpenFlags::CreateNew,
+                    },
+                )
+                .await
+                .with_context(|| format!("creating `{fs_path:?}` with create-new semantics"))?;
+            if let Some(error) = created.error {
+                return Ok(FsOpenResult {
+                    fs_file_id: 0,
+                    is_dir: false,
+                    size: 0,
+                    error: Some(error),
+                });
+            }
         }
 
-        request_handle
-            .payload
-            .result
-            .take()
-            .ok_or(DriverStatus::InvalidParameter)
-    }
-    pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
-        let (symlink, fs_path) = match self.resolve_path(p.path) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    FsOpenResult {
-                        fs_file_id: 0,
-                        is_dir: false,
-                        size: 0,
-                        error: Some(e),
-                    },
-                    DriverStatus::Success,
-                );
-            }
-        };
-
-        let call_open = async |this: &Self,
-                               link: &String,
-                               path: Path,
-                               flags: OpenFlagsMask,
-                               write_through: bool| {
-            let tgt = this.resolve_target(link);
-            let inner = FsOpenParams {
-                flags,
-                write_through,
-                path,
-            };
-            match this.call_fs::<FsOpen>(link, tgt, inner).await {
-                Ok(mut r) => {
-                    if matches!(r.error, Some(FileStatus::Success)) {
-                        r.error = None;
-                    }
-                    (r, DriverStatus::Success)
-                }
-                Err(st) => (
-                    FsOpenResult {
-                        fs_file_id: 0,
-                        is_dir: false,
-                        size: 0,
-                        error: Some(st.into()),
-                    },
-                    st,
-                ),
-            }
-        };
-
-        let has_create_new = p.flags.contains(OpenFlags::CreateNew);
-        let has_create = p.flags.contains(OpenFlags::Create);
-
-        if has_create_new {
-            let creq = FsCreateParams {
-                path: fs_path.clone(),
-                dir: false,
-                flags: OpenFlags::CreateNew,
-            };
-            let tgt = self.resolve_target(&symlink);
-            let cres: FsCreateResult =
-                match self.call_fs::<FsCreate>(&symlink, tgt.clone(), creq).await {
-                    Ok(r) => r,
-                    Err(st) => {
-                        return (
-                            FsOpenResult {
-                                fs_file_id: 0,
-                                is_dir: false,
-                                size: 0,
-                                error: Some(st.into()),
-                            },
-                            st,
-                        );
-                    }
-                };
-            if let Some(e) = cres.error {
-                if e != FileStatus::Success {
-                    return (
-                        FsOpenResult {
-                            fs_file_id: 0,
-                            is_dir: false,
-                            size: 0,
-                            error: Some(e),
-                        },
-                        DriverStatus::Success,
-                    );
-                }
-            }
-
-            let (inner_res, st) =
-                call_open(self, &symlink, fs_path, p.flags, p.write_through).await;
-            if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
-                return (inner_res, st);
-            }
-            let tgt = self.resolve_target(&symlink);
-            let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-            self.handles.write().await.insert(
-                vhid,
-                VfsHandle {
-                    volume_symlink: symlink,
-                    inner_id: inner_res.fs_file_id,
-                    is_dir: inner_res.is_dir,
-                    target: tgt,
-                },
-            );
-            (
-                FsOpenResult {
-                    fs_file_id: vhid,
-                    is_dir: inner_res.is_dir,
-                    size: inner_res.size,
-                    error: None,
-                },
-                DriverStatus::Success,
-            )
-        } else if has_create {
-            let (try_open, st) =
-                call_open(self, &symlink, fs_path.clone(), p.flags, p.write_through).await;
-            if st != DriverStatus::Success {
-                return (try_open, st);
-            }
-            if try_open.error.is_none() {
-                let tgt = self.resolve_target(&symlink);
-                let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-                self.handles.write().await.insert(
-                    vhid,
-                    VfsHandle {
-                        volume_symlink: symlink,
-                        inner_id: try_open.fs_file_id,
-                        is_dir: try_open.is_dir,
-                        target: tgt,
-                    },
-                );
-                return (
-                    FsOpenResult {
-                        fs_file_id: vhid,
-                        is_dir: try_open.is_dir,
-                        size: try_open.size,
-                        error: None,
-                    },
-                    DriverStatus::Success,
-                );
-            }
-            if try_open.error == Some(FileStatus::PathNotFound) {
-                let creq = FsCreateParams {
+        let mut opened = self
+            .call_fs::<FsOpen>(
+                &symlink,
+                target.clone(),
+                FsOpenParams {
                     path: fs_path.clone(),
-                    dir: false,
-                    flags: OpenFlags::Create,
-                };
-                let tgt = self.resolve_target(&symlink);
-                let cres: FsCreateResult =
-                    match self.call_fs::<FsCreate>(&symlink, tgt.clone(), creq).await {
-                        Ok(r) => r,
-                        Err(st) => {
-                            return (
-                                FsOpenResult {
-                                    fs_file_id: 0,
-                                    is_dir: false,
-                                    size: 0,
-                                    error: Some(st.into()),
-                                },
-                                st,
-                            );
-                        }
-                    };
-                if let Some(e) = cres.error {
-                    if e != FileStatus::Success {
-                        return (
-                            FsOpenResult {
-                                fs_file_id: 0,
-                                is_dir: false,
-                                size: 0,
-                                error: Some(e),
-                            },
-                            DriverStatus::Success,
-                        );
-                    }
-                }
-
-                let (inner_res, st2) =
-                    call_open(self, &symlink, fs_path, p.flags, p.write_through).await;
-                if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
-                    return (inner_res, st2);
-                }
-                let tgt = self.resolve_target(&symlink);
-                let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-                self.handles.write().await.insert(
-                    vhid,
-                    VfsHandle {
-                        volume_symlink: symlink,
-                        inner_id: inner_res.fs_file_id,
-                        is_dir: inner_res.is_dir,
-                        target: tgt,
-                    },
-                );
-                return (
-                    FsOpenResult {
-                        fs_file_id: vhid,
-                        is_dir: inner_res.is_dir,
-                        size: inner_res.size,
-                        error: None,
-                    },
-                    DriverStatus::Success,
-                );
-            }
-            (try_open, DriverStatus::Success)
-        } else {
-            // Open, ReadOnly, WriteOnly, ReadWrite - just open
-            let (inner_res, st) =
-                call_open(self, &symlink, fs_path, p.flags, p.write_through).await;
-            if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
-                return (inner_res, st);
-            }
-            let tgt = self.resolve_target(&symlink);
-            let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-            self.handles.write().await.insert(
-                vhid,
-                VfsHandle {
-                    volume_symlink: symlink,
-                    inner_id: inner_res.fs_file_id,
-                    is_dir: inner_res.is_dir,
-                    target: tgt,
+                    flags: p.flags,
+                    write_through: p.write_through,
                 },
-            );
-            (
-                FsOpenResult {
-                    fs_file_id: vhid,
-                    is_dir: inner_res.is_dir,
-                    size: inner_res.size,
-                    error: None,
-                },
-                DriverStatus::Success,
             )
-        }
-    }
+            .await
+            .with_context(|| format!("opening `{fs_path:?}`"))?;
 
-    pub async fn close(&self, p: FsCloseParams) -> (FsCloseResult, DriverStatus) {
-        let Some(h) = self.handles.write().await.remove(&p.fs_file_id) else {
-            return (
-                FsCloseResult {
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
-        };
-
-        let inner = FsCloseParams {
-            fs_file_id: h.inner_id,
-        };
-        let res: Result<FsCloseResult, DriverStatus> = self
-            .call_fs::<FsClose>(&h.volume_symlink, h.target.clone(), inner)
-            .await;
-        match res {
-            Ok(mut r) => {
-                if r.error.is_none() {
-                    r.error = None;
-                }
-                (r, DriverStatus::Success)
+        if p.flags.contains(OpenFlags::Create)
+            && matches!(
+                opened.error.as_ref().map(KernelError::kind),
+                Some(ErrorKind::File(FileErrorKind::PathNotFound))
+            )
+        {
+            let created = self
+                .call_fs::<FsCreate>(
+                    &symlink,
+                    target.clone(),
+                    FsCreateParams {
+                        path: fs_path.clone(),
+                        dir: false,
+                        flags: OpenFlags::Create,
+                    },
+                )
+                .await
+                .with_context(|| format!("creating missing file `{fs_path:?}`"))?;
+            if let Some(error) = created.error {
+                opened.error = Some(error);
+                return Ok(opened);
             }
-            Err(st) => (
-                FsCloseResult {
-                    error: Some(st.into()),
-                },
-                st,
-            ),
+            opened = self
+                .call_fs::<FsOpen>(
+                    &symlink,
+                    target.clone(),
+                    FsOpenParams {
+                        path: fs_path.clone(),
+                        flags: p.flags,
+                        write_through: p.write_through,
+                    },
+                )
+                .await
+                .with_context(|| format!("opening newly created file `{fs_path:?}`"))?;
         }
+
+        if opened.error.is_some() {
+            return Ok(opened);
+        }
+
+        let vfs_id = self.alloc_vh();
+        self.handles.write().await.insert(
+            vfs_id,
+            VfsHandle {
+                volume_symlink: symlink,
+                inner_id: opened.fs_file_id,
+                is_dir: opened.is_dir,
+                target,
+            },
+        );
+        opened.fs_file_id = vfs_id;
+        Ok(opened)
     }
 
-    pub async fn read<'a>(&self, mut p: FsReadParams<'a>) -> (FsReadResult, DriverStatus) {
+    pub async fn close(&self, p: FsCloseParams) -> Result<FsCloseResult, KernelError> {
+        let handle = self
+            .handles
+            .write()
+            .await
+            .remove(&p.fs_file_id)
+            .ok_or_else(|| error(FileErrorKind::PathNotFound))?;
+        self.call_fs::<FsClose>(
+            &handle.volume_symlink,
+            handle.target,
+            FsCloseParams {
+                fs_file_id: handle.inner_id,
+            },
+        )
+        .await
+        .with_context(|| format!("closing VFS handle {}", p.fs_file_id))
+    }
+
+    pub async fn read<'a>(&self, mut p: FsReadParams<'a>) -> Result<FsReadResult, KernelError> {
         if !p
             .buffer
             .as_ref()
             .is_some_and(|buffer| buffer.is_cpu_accessible())
         {
-            return (
-                FsReadResult {
-                    bytes_read: 0,
-                    error: Some(FileStatus::NoBuffer),
-                },
-                DriverStatus::InvalidParameter,
-            );
+            return Ok(FsReadResult {
+                bytes_read: 0,
+                error: Some(error(FileErrorKind::NoBuffer)),
+            });
         }
-
-        let (target, inner_id, symlink_ptr) = {
-            let binding = self.handles.read().await;
-            if let Some(h) = binding.get(&p.fs_file_id) {
-                (
-                    h.target.clone(),
-                    h.inner_id,
-                    h.volume_symlink.as_str() as *const str,
-                )
-            } else {
-                return (
-                    FsReadResult {
-                        bytes_read: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                );
-            }
-        };
-
-        p.fs_file_id = inner_id;
-
-        let symlink: &str = if target.is_some() {
-            ""
-        } else {
-            unsafe { &*symlink_ptr }
-        };
-
-        match self.call_fs::<FsRead>(symlink, target, p).await {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsReadResult {
-                    bytes_read: 0,
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsRead>(&handle.volume_symlink, handle.target, p)
+            .await
+            .with_context(|| format!("reading VFS handle {}", handle.inner_id))
     }
 
-    pub async fn write<'a>(&self, mut p: FsWriteParams<'a>) -> (FsWriteResult, DriverStatus) {
+    pub async fn write<'a>(&self, mut p: FsWriteParams<'a>) -> Result<FsWriteResult, KernelError> {
         if !p
             .buffer
             .as_ref()
             .is_some_and(|buffer| buffer.is_cpu_accessible())
         {
-            return (
-                FsWriteResult {
-                    written: 0,
-                    error: Some(FileStatus::NoBuffer),
-                },
-                DriverStatus::InvalidParameter,
-            );
+            return Ok(FsWriteResult {
+                written: 0,
+                error: Some(error(FileErrorKind::NoBuffer)),
+            });
         }
-
-        let (target, inner_id, symlink_ptr) = {
-            let binding = self.handles.read().await;
-            if let Some(h) = binding.get(&p.fs_file_id) {
-                (
-                    h.target.clone(),
-                    h.inner_id,
-                    h.volume_symlink.as_str() as *const str,
-                )
-            } else {
-                return (
-                    FsWriteResult {
-                        written: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                );
-            }
-        };
-
-        p.fs_file_id = inner_id;
-
-        let symlink: &str = if target.is_some() {
-            ""
-        } else {
-            unsafe { &*symlink_ptr }
-        };
-
-        match self.call_fs::<FsWrite>(symlink, target, p).await {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsWriteResult {
-                    written: 0,
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
-    }
-
-    pub async fn seek(&self, mut p: FsSeekParams) -> (FsSeekResult, DriverStatus) {
-        let (target, inner_id, symlink_ptr) = {
-            let binding = self.handles.read().await;
-            if let Some(h) = binding.get(&p.fs_file_id) {
-                (
-                    h.target.clone(),
-                    h.inner_id,
-                    h.volume_symlink.as_str() as *const str,
-                )
-            } else {
-                return (
-                    FsSeekResult {
-                        pos: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                );
-            }
-        };
-
-        p.fs_file_id = inner_id;
-
-        let symlink: &str = if target.is_some() {
-            ""
-        } else {
-            unsafe { &*symlink_ptr }
-        };
-
-        match self.call_fs::<FsSeek>(symlink, target, p).await {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsSeekResult {
-                    pos: 0,
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
-    }
-
-    pub async fn flush(&self, mut p: FsFlushParams) -> (FsFlushResult, DriverStatus) {
-        let h = {
-            let binding = self.handles.read().await;
-            binding.get(&p.fs_file_id).cloned()
-        };
-        let Some(h) = h else {
-            return (
-                FsFlushResult {
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
-        };
-        p.fs_file_id = h.inner_id;
-        match self
-            .call_fs::<FsFlush>(&h.volume_symlink, h.target.clone(), p)
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsWrite>(&handle.volume_symlink, handle.target, p)
             .await
-        {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsFlushResult {
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+            .with_context(|| format!("writing VFS handle {}", handle.inner_id))
     }
 
-    pub async fn get_info(&self, mut p: FsGetInfoParams) -> (FsGetInfoResult, DriverStatus) {
-        let h = {
-            let binding = self.handles.read().await;
-            binding.get(&p.fs_file_id).cloned()
-        };
-        let Some(h) = h else {
-            return (
-                FsGetInfoResult {
-                    size: 0,
-                    is_dir: false,
-                    attrs: 0,
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
-        };
-        p.fs_file_id = h.inner_id;
-        match self
-            .call_fs::<FsGetInfo>(&h.volume_symlink, h.target.clone(), p)
+    pub async fn seek(&self, mut p: FsSeekParams) -> Result<FsSeekResult, KernelError> {
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsSeek>(&handle.volume_symlink, handle.target, p)
             .await
-        {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsGetInfoResult {
-                    size: 0,
-                    is_dir: false,
-                    attrs: 0,
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+            .with_context(|| format!("seeking VFS handle {}", handle.inner_id))
     }
 
-    pub async fn create(&self, mut p: FsCreateParams) -> (FsCreateResult, DriverStatus) {
-        let (symlink, fs_path) = match self.resolve_path(p.path) {
-            Ok(v) => v,
-            Err(e) => return (FsCreateResult { error: Some(e) }, DriverStatus::Success),
-        };
-        p.path = fs_path;
-        match self
-            .call_fs::<FsCreate>(&symlink, self.resolve_target(&symlink), p)
+    pub async fn flush(&self, mut p: FsFlushParams) -> Result<FsFlushResult, KernelError> {
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsFlush>(&handle.volume_symlink, handle.target, p)
             .await
-        {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsCreateResult {
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+            .with_context(|| format!("flushing VFS handle {}", handle.inner_id))
     }
 
-    pub async fn rename(&self, mut p: FsRenameParams) -> (FsRenameResult, DriverStatus) {
-        let (src_symlink, src_rel) = match self.resolve_path(p.src) {
-            Ok(v) => v,
-            Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
-        };
-        let (dst_symlink, dst_rel) = match self.resolve_path(p.dst) {
-            Ok(v) => v,
-            Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
-        };
-        if src_symlink != dst_symlink {
-            return (
-                FsRenameResult {
-                    error: Some(FileStatus::NoBuffer),
-                },
-                DriverStatus::Success,
-            );
-        }
-        p.src = src_rel;
-        p.dst = dst_rel;
-        match self
-            .call_fs::<FsRename>(&src_symlink, self.resolve_target(&src_symlink), p)
+    pub async fn get_info(&self, mut p: FsGetInfoParams) -> Result<FsGetInfoResult, KernelError> {
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsGetInfo>(&handle.volume_symlink, handle.target, p)
             .await
-        {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsRenameResult {
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+            .with_context(|| format!("querying VFS handle {}", handle.inner_id))
     }
 
-    pub async fn list_dir(&self, mut p: FsListDirParams) -> (FsListDirResult, DriverStatus) {
-        let (symlink, fs_path) = match self.resolve_path(p.path) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    FsListDirResult {
-                        names: None,
-                        error: Some(e),
-                    },
-                    DriverStatus::Success,
-                );
-            }
-        };
-        p.path = fs_path;
-        match self
-            .call_fs::<FsReadDir>(&symlink, self.resolve_target(&symlink), p)
+    pub async fn create(&self, mut p: FsCreateParams) -> Result<FsCreateResult, KernelError> {
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
+        p.path = path.clone();
+        self.call_fs::<FsCreate>(&symlink, self.resolve_target(&symlink), p)
             .await
-        {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsListDirResult {
-                    names: None,
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+            .with_context(|| format!("creating `{path:?}`"))
     }
 
-    pub async fn set_len(&self, mut p: FsSetLenParams) -> (FsSetLenResult, DriverStatus) {
-        let h = {
-            let binding = self.handles.read().await;
-            binding.get(&p.fs_file_id).cloned()
-        };
-        let Some(h) = h else {
-            return (
-                FsSetLenResult {
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
-        };
-        p.fs_file_id = h.inner_id;
-        match self
-            .call_fs::<FsSetLen>(&h.volume_symlink, h.target.clone(), p)
+    pub async fn remove_dir(
+        &self,
+        mut p: FsRemoveDirParams,
+    ) -> Result<FsRemoveDirResult, KernelError> {
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
+        p.path = path.clone();
+        self.call_fs::<FsRemoveDir>(&symlink, self.resolve_target(&symlink), p)
             .await
-        {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsSetLenResult {
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+            .with_context(|| format!("removing directory `{path:?}`"))
     }
-    pub async fn append<'a>(&self, mut p: FsAppendParams<'a>) -> (FsAppendResult, DriverStatus) {
+
+    pub async fn delete(&self, mut p: FsDeleteParams) -> Result<FsDeleteResult, KernelError> {
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
+        p.path = path.clone();
+        self.call_fs::<FsDelete>(&symlink, self.resolve_target(&symlink), p)
+            .await
+            .with_context(|| format!("deleting file `{path:?}`"))
+    }
+
+    pub async fn rename(&self, mut p: FsRenameParams) -> Result<FsRenameResult, KernelError> {
+        let (source_symlink, source) = self.resolve_path(p.src).map_err(error)?;
+        let (destination_symlink, destination) = self.resolve_path(p.dst).map_err(error)?;
+        if source_symlink != destination_symlink {
+            return Ok(FsRenameResult {
+                error: Some(crate::error::error_with_message(
+                    FileErrorKind::BadPath,
+                    format_args!("cross-volume rename is not supported"),
+                )),
+            });
+        }
+        p.src = source.clone();
+        p.dst = destination.clone();
+        self.call_fs::<FsRename>(&source_symlink, self.resolve_target(&source_symlink), p)
+            .await
+            .with_context(|| format!("renaming `{source:?}` to `{destination:?}`"))
+    }
+
+    pub async fn list_dir(&self, mut p: FsListDirParams) -> Result<FsListDirResult, KernelError> {
+        let (symlink, path) = self.resolve_path(p.path).map_err(error)?;
+        p.path = path.clone();
+        self.call_fs::<FsReadDir>(&symlink, self.resolve_target(&symlink), p)
+            .await
+            .with_context(|| format!("listing directory `{path:?}`"))
+    }
+
+    pub async fn set_len(&self, mut p: FsSetLenParams) -> Result<FsSetLenResult, KernelError> {
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsSetLen>(&handle.volume_symlink, handle.target, p)
+            .await
+            .with_context(|| format!("resizing VFS handle {}", handle.inner_id))
+    }
+
+    pub async fn append<'a>(
+        &self,
+        mut p: FsAppendParams<'a>,
+    ) -> Result<FsAppendResult, KernelError> {
         if !p
             .buffer
             .as_ref()
             .is_some_and(|buffer| buffer.is_cpu_accessible())
         {
-            return (
-                FsAppendResult {
-                    written: 0,
-                    new_size: 0,
-                    error: Some(FileStatus::NoBuffer),
-                },
-                DriverStatus::InvalidParameter,
-            );
+            return Ok(FsAppendResult {
+                written: 0,
+                new_size: 0,
+                error: Some(error(FileErrorKind::NoBuffer)),
+            });
         }
-
-        let (target, inner_id, symlink) = {
-            let binding = self.handles.read().await;
-            if let Some(h) = binding.get(&p.fs_file_id) {
-                (h.target.clone(), h.inner_id, h.volume_symlink.clone())
-            } else {
-                return (
-                    FsAppendResult {
-                        written: 0,
-                        new_size: 0,
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                );
-            }
-        };
-
-        p.fs_file_id = inner_id;
-
-        let symlink_ref: &str = if target.is_some() { "" } else { &symlink };
-
-        match self.call_fs::<FsAppend>(symlink_ref, target, p).await {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsAppendResult {
-                    written: 0,
-                    new_size: 0,
-                    error: Some(st.into()),
-                },
-                st,
-            ),
-        }
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsAppend>(&handle.volume_symlink, handle.target, p)
+            .await
+            .with_context(|| format!("appending to VFS handle {}", handle.inner_id))
     }
 
-    pub async fn zero_range(&self, mut p: FsZeroRangeParams) -> (FsZeroRangeResult, DriverStatus) {
-        let h = {
-            let binding = self.handles.read().await;
-            binding.get(&p.fs_file_id).cloned()
-        };
-        let Some(h) = h else {
-            return (
-                FsZeroRangeResult {
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
-        };
-        p.fs_file_id = h.inner_id;
-        match self
-            .call_fs::<FsZeroRange>(&h.volume_symlink, h.target.clone(), p)
+    pub async fn zero_range(
+        &self,
+        mut p: FsZeroRangeParams,
+    ) -> Result<FsZeroRangeResult, KernelError> {
+        let handle = self.handle(p.fs_file_id).await?;
+        p.fs_file_id = handle.inner_id;
+        self.call_fs::<FsZeroRange>(&handle.volume_symlink, handle.target, p)
             .await
-        {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsZeroRangeResult {
-                    error: Some(FileStatus::DriverError(st)),
-                },
-                st,
-            ),
-        }
+            .with_context(|| format!("zeroing range in VFS handle {}", handle.inner_id))
     }
 }

@@ -1,0 +1,73 @@
+use buddy_system_allocator::LockedHeap;
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::memory::paging::heap_range_start;
+use crate::platform::with_interrupts_disabled;
+
+use crate::memory::heap::BOOTSTRAP_HEAP_SIZE;
+
+pub struct BootstrapAllocator {
+    inner: LockedHeap<32>,
+    init: AtomicBool,
+}
+
+impl BootstrapAllocator {
+    pub const fn new() -> Self {
+        Self {
+            inner: LockedHeap::<32>::empty(),
+            init: AtomicBool::new(false),
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn ensure_init(&self) {
+        if !self.init.load(Ordering::Acquire) {
+            with_interrupts_disabled(|| {
+                if !self.init.load(Ordering::Acquire) {
+                    let size = BOOTSTRAP_HEAP_SIZE as usize;
+
+                    self.inner
+                        .lock()
+                        .init(heap_range_start().as_u64() as usize, size);
+                    self.init.store(true, Ordering::Release);
+                }
+            });
+        }
+    }
+
+    pub fn free_memory(&self) -> usize {
+        with_interrupts_disabled(|| {
+            let inner = self.inner.lock();
+            inner.stats_total_bytes() - inner.stats_alloc_actual()
+        })
+    }
+}
+
+unsafe impl GlobalAlloc for BootstrapAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.ensure_init();
+        with_interrupts_disabled(|| self.inner.lock().alloc(layout))
+            .expect("kernel heap overflow")
+            .as_ptr()
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = self.alloc(layout);
+        if !ptr.is_null() {
+            core::ptr::write_bytes(ptr, 0, layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.ensure_init();
+        with_interrupts_disabled(|| {
+            self.inner.lock().dealloc(
+                NonNull::new(ptr).expect("null ptr passed to kernel heap dealloc"),
+                layout,
+            )
+        })
+    }
+}
