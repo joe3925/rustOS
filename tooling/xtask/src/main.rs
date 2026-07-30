@@ -235,7 +235,7 @@ fn usage() -> String {
         "usage:",
         "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
-        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--timeout-secs N]",
+        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "",
         "environment:",

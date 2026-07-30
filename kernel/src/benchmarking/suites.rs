@@ -1,11 +1,12 @@
-use alloc::{string::ToString, vec, vec::Vec};
+use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
-    future::Future,
+    future::{Future, poll_fn},
     hint::black_box,
     pin::Pin,
-    task::{Context, Poll},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
-use kernel_executor::runtime::runtime::{JoinAll, spawn_join_owned};
+use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_types::{
     async_ffi::{AbiFuture, FutureExt},
     benchmark::{
@@ -13,6 +14,7 @@ use kernel_types::{
         BenchSuiteStatus,
     },
 };
+use spin::Mutex;
 
 use crate::structs::stopwatch::Stopwatch;
 
@@ -87,17 +89,7 @@ async fn executor_correctness(handle: BenchRunHandle) -> bool {
     });
 
     let timer = Stopwatch::start();
-    let mut tasks = Vec::with_capacity(task_count);
-    for value in 0..task_count as u64 {
-        tasks.push(spawn_join_owned(async move {
-            yield_once().await;
-            value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        }));
-    }
-    let actual = JoinAll::new(tasks)
-        .await
-        .into_iter()
-        .fold(0u64, u64::wrapping_add);
+    let actual = run_task_batch(task_count, correctness_value).await;
     let elapsed = timer.elapsed_nanos();
 
     if actual != expected {
@@ -170,17 +162,60 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
 }
 
 async fn run_queue_trial(task_count: usize) -> u64 {
-    let mut tasks = Vec::with_capacity(task_count);
+    run_task_batch(task_count, queue_value).await
+}
+
+struct TaskBatch {
+    completed: AtomicUsize,
+    checksum: AtomicU64,
+    waiter: Mutex<Option<Waker>>,
+}
+
+async fn run_task_batch(task_count: usize, operation: fn(u64) -> u64) -> u64 {
+    let batch = Arc::new(TaskBatch {
+        completed: AtomicUsize::new(0),
+        checksum: AtomicU64::new(0),
+        waiter: Mutex::new(None),
+    });
+
     for value in 0..task_count as u64 {
-        tasks.push(spawn_join_owned(async move {
+        let batch = batch.clone();
+        spawn_detached(async move {
             yield_once().await;
-            value.rotate_left(17)
-        }));
+            batch
+                .checksum
+                .fetch_add(operation(value), Ordering::Relaxed);
+            if batch.completed.fetch_add(1, Ordering::AcqRel) + 1 == task_count {
+                if let Some(waiter) = batch.waiter.lock().take() {
+                    waiter.wake();
+                }
+            }
+        });
     }
-    JoinAll::new(tasks)
-        .await
-        .into_iter()
-        .fold(0u64, u64::wrapping_add)
+
+    poll_fn(|cx| {
+        if batch.completed.load(Ordering::Acquire) == task_count {
+            Poll::Ready(())
+        } else {
+            *batch.waiter.lock() = Some(cx.waker().clone());
+            if batch.completed.load(Ordering::Acquire) == task_count {
+                batch.waiter.lock().take();
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    })
+    .await;
+    batch.checksum.load(Ordering::Relaxed)
+}
+
+fn correctness_value(value: u64) -> u64 {
+    value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+fn queue_value(value: u64) -> u64 {
+    value.rotate_left(17)
 }
 
 extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {

@@ -26,7 +26,7 @@ args = [
 
 [defaults]
 memory = "12G"
-cpus = "1"
+cpus = "3"
 
 [capabilities]
 debug = false

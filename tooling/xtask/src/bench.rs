@@ -36,6 +36,7 @@ pub struct BenchOptions {
     suites: Vec<String>,
     tags: Vec<String>,
     output: PathBuf,
+    boot_timeout: Duration,
     timeout: Duration,
     offline: bool,
 }
@@ -76,6 +77,7 @@ impl BenchOptions {
         let mut suites = Vec::new();
         let mut tags = Vec::new();
         let mut output = PathBuf::from("target/bench/results.json");
+        let mut boot_timeout = Duration::from_secs(2 * 60);
         let mut timeout = Duration::from_secs(15 * 60);
         let mut offline = false;
         let mut args = args.into_iter();
@@ -105,6 +107,14 @@ impl BenchOptions {
                 "--suite" => suites.push(next_value(&mut args, "--suite")?),
                 "--tag" => tags.push(next_value(&mut args, "--tag")?),
                 "--output" => output = PathBuf::from(next_value(&mut args, "--output")?),
+                "--boot-timeout-secs" => {
+                    let value = next_value(&mut args, "--boot-timeout-secs")?;
+                    boot_timeout = Duration::from_secs(
+                        value
+                            .parse()
+                            .map_err(|_| format!("invalid boot timeout `{value}`"))?,
+                    );
+                }
                 "--timeout-secs" => {
                     let value = next_value(&mut args, "--timeout-secs")?;
                     timeout = Duration::from_secs(
@@ -130,6 +140,7 @@ impl BenchOptions {
             suites,
             tags,
             output,
+            boot_timeout,
             timeout,
             offline,
         })
@@ -228,6 +239,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
             &artifacts.boot_image,
             &disk,
             cpus,
+            options.boot_timeout,
             options.timeout,
             serial_log,
         );
@@ -275,6 +287,7 @@ fn run_topology(
     boot_image: &Path,
     disk: &SystemDisk,
     cpus: usize,
+    boot_timeout: Duration,
     timeout: Duration,
     serial_log: PathBuf,
 ) -> Result<TopologyRun, String> {
@@ -323,12 +336,13 @@ fn run_topology(
     let mut status = "incomplete".to_string();
     let mut panic_lines = Vec::new();
     let mut panic_seen_at = None;
+    let mut benchmark_started = false;
 
     loop {
         while let Ok(line) = receiver.try_recv() {
             let line = line.map_err(|err| format!("failed reading QEMU serial output: {err}"))?;
             println!("{line}");
-            record_serial_line(
+            benchmark_started |= record_serial_line(
                 &line,
                 &mut serial,
                 &mut events,
@@ -344,6 +358,11 @@ fn run_topology(
                 eprintln!("warning: failed to stop QEMU after kernel panic: {err}");
             }
             status = "panicked".to_string();
+            break;
+        }
+        if !benchmark_started && started.elapsed() >= boot_timeout {
+            let _ = child.kill();
+            status = "boot_timeout".to_string();
             break;
         }
 
@@ -367,7 +386,7 @@ fn run_topology(
         .map_err(|_| "QEMU serial reader thread panicked".to_string())?;
     while let Ok(line) = receiver.try_recv() {
         let line = line.map_err(|err| format!("failed reading QEMU serial output: {err}"))?;
-        record_serial_line(
+        let _ = record_serial_line(
             &line,
             &mut serial,
             &mut events,
@@ -388,6 +407,14 @@ fn run_topology(
         annotate_error(
             &format!("Benchmark timed out ({cpus} vCPUs)"),
             &format!("QEMU did not finish within {} seconds", timeout.as_secs()),
+        );
+    } else if status == "boot_timeout" {
+        annotate_error(
+            &format!("Kernel boot timed out ({cpus} vCPUs)"),
+            &format!(
+                "The kernel did not emit benchmark run_start within {} seconds",
+                boot_timeout.as_secs()
+            ),
         );
     } else if complete && status != "passed" {
         annotate_error(
@@ -420,7 +447,7 @@ fn record_serial_line(
     status: &mut String,
     panic_lines: &mut Vec<String>,
     panic_seen_at: &mut Option<Instant>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     serial.push_str(line);
     serial.push('\n');
 
@@ -431,7 +458,9 @@ fn record_serial_line(
         panic_lines.push(line.to_string());
     }
 
+    let mut run_started = false;
     if let Some(event) = parse_event(line)? {
+        run_started = event.kind == "run_start";
         if event.kind == "run_end" {
             *complete = true;
             *status = event
@@ -443,7 +472,7 @@ fn record_serial_line(
         }
         events.push(event);
     }
-    Ok(())
+    Ok(run_started)
 }
 
 fn is_panic_start(line: &str) -> bool {

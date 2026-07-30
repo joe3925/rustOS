@@ -95,6 +95,7 @@ jobs:
           cargo run --release -p xtask -- bench \
             --cpus 1,2,4 \
             --tag ci \
+            --boot-timeout-secs 120 \
             --output "$GITHUB_WORKSPACE/target/bench/base/results.json"
 
       - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
@@ -105,6 +106,7 @@ jobs:
           cargo run --release -p xtask -- bench \
             --cpus 1,2,4 \
             --tag ci \
+            --boot-timeout-secs 120 \
             --output target/bench/head/results.json
 
       - name: Compare base and proposed commit
