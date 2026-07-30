@@ -2,7 +2,6 @@ name: Kernel benchmarks
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -15,7 +14,7 @@ concurrency:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, rustos-bench]
     timeout-minutes: 120
 
     steps:
@@ -25,10 +24,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
-      - name: Install QEMU and disk tooling
+      - name: Verify benchmark host
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes qemu-system-x86 ovmf dosfstools gdisk
+          qemu-system-x86_64 --version
+          sgdisk --version
+          mkfs.vfat --version
+          rustc --version
+          cargo --version
 
       - name: Create C drive seed image
         shell: bash
