@@ -28,7 +28,7 @@ args = [
     "-device", "virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off,iommu_platform=on",
 ]
 debug_args = []
-lldb_metadata_args = []
+lldb_metadata_args = [ ]
 
 
 [defaults]
