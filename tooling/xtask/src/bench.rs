@@ -756,11 +756,11 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     let mut markdown = format!(
         "## {}\n\n\
          Tolerance is the largest literal percentage slowdown considered practically unchanged. \
-         A regression requires the entire 99% confidence interval to exceed that tolerance; a variance warning means such a regression remains possible. \
+         A regression requires the entire 99% confidence interval to exceed that tolerance; an uncertain result names the direction of the measured change when the interval cannot confirm it. \
          Repeated suites independently resample baseline and current boot medians with 100,000 bootstrap draws; \
          single-pair suites apply their tolerance directly. MAD reports boot-to-boot variability. \
          Positive and negative changes are interpreted according to whether higher or lower values are better.\n\n\
-         | CPUs | Suite | Case | Metric | Previous median | Current median | Change | 99% CI | Boot MAD (previous → current) | Tolerance | Result |\n\
+         | CPUs | Suite | Case | Metric | Baseline median | Current median | Change | 99% CI | Boot MAD (baseline → current) | Tolerance | Result |\n\
          |---:|---|---|---|---:|---:|---:|---:|---:|---:|---|\n",
         options.title
     );
@@ -847,7 +847,11 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
                 if (direct_single_boot && regression > limit)
                     || regression_confidence_upper.is_some_and(|upper| upper > limit) =>
             {
-                "🟡 possible regression (variance)"
+                if regression >= 0.0 {
+                    "🟡 uncertain regression"
+                } else {
+                    "🔵 uncertain improvement (regression possible)"
+                }
             }
             Some(limit)
                 if (direct_single_boot && regression < -limit)
@@ -863,7 +867,9 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
                 "statistically stable"
             }
             Some(_) if confidence.is_none() && !direct_single_boot => "insufficient boots",
-            Some(_) => "inconclusive",
+            Some(_) if regression > 0.0 => "🟡 uncertain regression",
+            Some(_) if regression < 0.0 => "🔵 uncertain improvement",
+            Some(_) => "uncertain change",
             None => "informational",
         };
         let tolerance = tolerance

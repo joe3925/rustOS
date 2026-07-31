@@ -3,6 +3,12 @@ name: Kernel benchmarks
 on:
   push:
   workflow_dispatch:
+    inputs:
+      accept_baseline:
+        description: Accept this commit as the new trusted benchmark baseline
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -75,92 +81,83 @@ jobs:
           cleanup
           trap - EXIT
 
-      - name: Download benchmark baselines
+      - name: Download trusted baseline and previous run
         id: baselines
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           mkdir -p target/bench/baselines
-          encoded_branch="$(jq -rn --arg value "$BENCH_BRANCH" '$value | @uri')"
 
           list_runs() {
-            local status="$1"
-            local query="repos/${GITHUB_REPOSITORY}/actions/workflows/kernel-benchmarks.yml/runs?branch=${encoded_branch}&status=${status}&per_page=20"
+            local branch="$1"
+            local status="$2"
+            local encoded_branch
+            encoded_branch="$(jq -rn --arg value "$branch" '$value | @uri')"
+            local query="repos/${GITHUB_REPOSITORY}/actions/workflows/kernel-benchmarks.yml/runs?branch=${encoded_branch}&status=${status}&per_page=50"
             gh api "$query"
           }
 
-          download_baseline() {
-            local kind="$1"
-            local status="$2"
-            local output="target/bench/${kind}-results.json"
-            local candidates="target/bench/baselines/${kind}-candidates.txt"
+          echo "trusted_available=false" >> "$GITHUB_OUTPUT"
+          trusted_candidates="target/bench/baselines/trusted-candidates.txt"
+          list_runs "$DEFAULT_BRANCH" completed |
+            jq -r '.workflow_runs[].id' > "$trusted_candidates"
+          while read -r run_id; do
+            run_dir="target/bench/baselines/trusted-${run_id}"
+            mkdir -p "$run_dir"
+            if ! gh run download "$run_id" \
+              --name kernel-benchmark-anchor \
+              --dir "$run_dir"; then
+              continue
+            fi
 
-            list_runs "$status" |
-              jq -r '.workflow_runs[].id' > "$candidates"
+            manifest="$run_dir/manifest.json"
+            result="$run_dir/results.json"
+            boot_image="$run_dir/boot.img"
+            if [[ -f "$manifest" && -f "$result" && -f "$boot_image" ]]; then
+              mkdir -p target/bench/anchor
+              cp "$manifest" target/bench/anchor/manifest.json
+              cp "$result" target/bench/anchor/results.json
+              cp "$boot_image" target/bench/anchor/boot.img
+              echo "trusted_available=true" >> "$GITHUB_OUTPUT"
+              echo "trusted_run_id=$(jq -r '.run_id' "$manifest")" >> "$GITHUB_OUTPUT"
+              echo "trusted_commit=$(jq -r '.commit' "$manifest")" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done < "$trusted_candidates"
 
-            while read -r run_id; do
-              local run_dir="target/bench/baselines/${kind}-${run_id}"
-              mkdir -p "$run_dir"
-              if ! gh run download "$run_id" \
-                --name kernel-benchmarks \
-                --dir "$run_dir"; then
-                continue
-              fi
-
-              local result
-              result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
-              local boot_image
-              boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
-              if [[ -n "$result" && -n "$boot_image" ]]; then
-                cp "$result" "$output"
-                cp "$boot_image" "target/bench/${kind}-boot.img"
-                printf -v "${kind}_run_id" '%s' "$run_id"
-                echo "${kind}_available=true" >> "$GITHUB_OUTPUT"
-                echo "${kind}_run_id=$run_id" >> "$GITHUB_OUTPUT"
-                return
-              fi
-            done < "$candidates"
-
-            echo "${kind}_available=false" >> "$GITHUB_OUTPUT"
-          }
-
-          download_baseline accepted success
-
-          echo "regression_available=false" >> "$GITHUB_OUTPUT"
-          regression_candidates="target/bench/baselines/regression-candidates.txt"
-          list_runs completed |
-            jq -r '.workflow_runs[] | [.id, .conclusion] | @tsv' \
-              > "$regression_candidates"
-          while read -r run_id conclusion; do
-            run_dir="target/bench/baselines/regression-${run_id}"
+          echo "previous_available=false" >> "$GITHUB_OUTPUT"
+          previous_candidates="target/bench/baselines/previous-candidates.txt"
+          list_runs "$BENCH_BRANCH" completed |
+            jq -r '.workflow_runs[].id' > "$previous_candidates"
+          while read -r run_id; do
+            run_dir="target/bench/baselines/previous-${run_id}"
             mkdir -p "$run_dir"
             if ! gh run download "$run_id" \
               --name kernel-benchmarks \
               --dir "$run_dir"; then
               continue
             fi
+
             result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
             boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
             if [[ -n "$result" && -n "$boot_image" ]] &&
               jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
-              if [[ "$run_id" != "${accepted_run_id:-}" && "$conclusion" == "failure" ]]; then
-                cp "$result" target/bench/regression-results.json
-                cp "$boot_image" target/bench/regression-boot.img
-                echo "regression_available=true" >> "$GITHUB_OUTPUT"
-                echo "regression_run_id=$run_id" >> "$GITHUB_OUTPUT"
-              fi
+              cp "$boot_image" target/bench/previous-boot.img
+              echo "previous_available=true" >> "$GITHUB_OUTPUT"
+              echo "previous_run_id=$run_id" >> "$GITHUB_OUTPUT"
               break
             fi
-          done < "$regression_candidates"
+          done < "$previous_candidates"
 
       - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
         env:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
-          ACCEPTED_AVAILABLE: ${{ steps.baselines.outputs.accepted_available }}
-          REGRESSION_AVAILABLE: ${{ steps.baselines.outputs.regression_available }}
+          TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available }}
+          PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
         run: |
           cargo run --release -p xtask -- bench \
             --tag ci \
@@ -178,21 +175,23 @@ jobs:
               --output "target/bench/${variant}/results.json"
           }
 
-          if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
-            run_variant accepted target/bench/accepted-boot.img
+          if [[ "$TRUSTED_AVAILABLE" == "true" ]]; then
+            run_variant trusted target/bench/anchor/boot.img
           fi
           run_variant head target/bench/head/boot.img
-          if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
-            run_variant regression target/bench/regression-boot.img
+          if [[ "$PREVIOUS_AVAILABLE" == "true" ]]; then
+            run_variant previous target/bench/previous-boot.img
           fi
 
       - name: Compare benchmark results
         shell: bash
         env:
-          REGRESSION_AVAILABLE: ${{ steps.baselines.outputs.regression_available }}
-          REGRESSION_RUN_ID: ${{ steps.baselines.outputs.regression_run_id }}
-          ACCEPTED_AVAILABLE: ${{ steps.baselines.outputs.accepted_available }}
-          ACCEPTED_RUN_ID: ${{ steps.baselines.outputs.accepted_run_id }}
+          TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available }}
+          TRUSTED_RUN_ID: ${{ steps.baselines.outputs.trusted_run_id }}
+          TRUSTED_COMMIT: ${{ steps.baselines.outputs.trusted_commit }}
+          PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
+          PREVIOUS_RUN_ID: ${{ steps.baselines.outputs.previous_run_id }}
+          ACCEPT_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.accept_baseline }}
         run: |
           set +e
           status=0
@@ -204,45 +203,69 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "$REGRESSION_AVAILABLE" == "true" ]]; then
-            annotation_arg=()
-            if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
-              annotation_arg=(--no-annotations)
-            fi
+          if [[ "$TRUSTED_AVAILABLE" == "true" ]]; then
             cargo run --release -p xtask -- bench compare \
-              --base target/bench/regression/results.json \
+              --base target/bench/trusted/results.json \
               --head target/bench/head/results.json \
-              --output target/bench/comparison-regression.md \
-              --title "Unresolved regression (\`$REGRESSION_RUN_ID\`)" \
-              "${annotation_arg[@]}"
-            regression_status=$?
-            cat target/bench/comparison-regression.md >> "$GITHUB_STEP_SUMMARY"
-            if (( regression_status != 0 )); then
-              status=1
-            fi
-          fi
-
-          if [[ "$ACCEPTED_AVAILABLE" == "true" ]]; then
-            cargo run --release -p xtask -- bench compare \
-              --base target/bench/accepted/results.json \
-              --head target/bench/head/results.json \
-              --output target/bench/comparison-accepted.md \
-              --title "Last accepted run (\`$ACCEPTED_RUN_ID\`)"
-            accepted_status=$?
-            cat target/bench/comparison-accepted.md >> "$GITHUB_STEP_SUMMARY"
-            if (( accepted_status != 0 )); then
+              --output target/bench/comparison-trusted.md \
+              --title "Against trusted baseline (\`$TRUSTED_COMMIT\`, accepted by run \`$TRUSTED_RUN_ID\`)"
+            trusted_status=$?
+            cat target/bench/comparison-trusted.md >> "$GITHUB_STEP_SUMMARY"
+            if (( trusted_status != 0 )); then
               status=1
             fi
           else
             {
-              echo "## Last accepted run"
+              echo "## Against trusted baseline"
               echo
-              echo "No prior successful workflow with the required benchmark artifacts was found."
+              echo "No trusted baseline has been accepted yet. Dispatch this workflow with \`accept_baseline\` enabled to create one."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          if [[ "$PREVIOUS_AVAILABLE" == "true" ]]; then
+            cargo run --release -p xtask -- bench compare \
+              --base target/bench/previous/results.json \
+              --head target/bench/head/results.json \
+              --output target/bench/comparison-previous.md \
+              --title "Against previous run (\`$PREVIOUS_RUN_ID\`, diagnostic only)" \
+              --no-annotations
+            cat target/bench/comparison-previous.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Against previous run"
+              echo
+              echo "No prior compatible benchmark run was found for this branch."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "$ACCEPT_BASELINE" == "true" ]]; then
+            status=0
+          fi
           exit "$status"
+
+      - name: Accept this run as the trusted baseline
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.accept_baseline
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::A trusted benchmark baseline can only be accepted from the default branch ($DEFAULT_BRANCH)."
+            exit 1
+          fi
+          jq -e 'all(.runs[]; .complete and .status == "passed")' \
+            target/bench/head/results.json >/dev/null
+          mkdir -p target/bench/anchor
+          cp target/bench/head/results.json target/bench/anchor/results.json
+          cp target/bench/head/boot.img target/bench/anchor/boot.img
+          jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg commit "$GITHUB_SHA" \
+            --arg accepted_at "$(date --utc --iso-8601=seconds)" \
+            '{schema: 1, run_id: $run_id, commit: $commit, accepted_at: $accepted_at}' \
+            > target/bench/anchor/manifest.json
 
       - name: Upload benchmark results
         if: always()
@@ -256,3 +279,12 @@ jobs:
             target/bench/head/boot.img
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Upload trusted benchmark baseline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-benchmark-anchor
+          path: target/bench/anchor
+          if-no-files-found: ignore
+          retention-days: 90
