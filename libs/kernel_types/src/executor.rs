@@ -1,4 +1,3 @@
-pub const USER_EXECUTOR_ABI_VERSION: u32 = 1;
 pub const USER_EXECUTOR_PROFILE_GENERAL: u32 = 0;
 
 pub const USER_EXECUTOR_RESIZE_FIXED: u32 = 0;
@@ -27,7 +26,6 @@ pub struct UserExecutorResizePolicy {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UserExecutorDomainCreate {
-    pub version: u32,
     pub profile: u32,
     pub initial_queue_capacity: usize,
     /// Zero means unlimited.
@@ -38,7 +36,6 @@ pub struct UserExecutorDomainCreate {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UserExecutorDomainUpdate {
-    pub version: u32,
     pub fields: u32,
     /// Zero means unlimited.
     pub max_active_tasks: usize,
@@ -48,7 +45,6 @@ pub struct UserExecutorDomainUpdate {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UserExecutorDomainInfo {
-    pub version: u32,
     pub profile: u32,
     pub state: u32,
     pub resize_policy_kind: u32,

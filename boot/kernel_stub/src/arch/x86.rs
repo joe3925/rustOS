@@ -12,7 +12,7 @@ use kernel_abi::arch::{
 };
 use kernel_abi::{
     BootInfo, FdtHeader, FrameBuffer, FrameBufferInfo, MemoryRegionKind, Optional, PixelFormat,
-    RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION,
+    RUSTOS_BOOT_INFO_MAGIC,
 };
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::{
@@ -307,7 +307,6 @@ impl BootloaderPlatform for X86Platform {
 
         Ok(BootInfo {
             magic: RUSTOS_BOOT_INFO_MAGIC,
-            version: RUSTOS_BOOT_INFO_VERSION,
             flags: 0,
             rsdp_addr: translate_optional(bootloader_info.rsdp_addr),
             arch_info,

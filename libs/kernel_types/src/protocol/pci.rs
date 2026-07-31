@@ -1,4 +1,4 @@
-use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
+use crate::device::{DeviceObject, Protocol, ProtocolId};
 use crate::pci::{Bar, MsixInfo};
 use alloc::sync::Arc;
 
@@ -14,6 +14,5 @@ pub struct PciProtocolVTable {
 pub enum PciProtocol {}
 unsafe impl Protocol for PciProtocol {
     const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000006);
-    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
     type VTable = PciProtocolVTable;
 }

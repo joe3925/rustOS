@@ -1,5 +1,5 @@
 use crate::executable::program::{
-    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
+    Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
 use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::stack::StackSize;
@@ -17,28 +17,25 @@ use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use kernel_types::arch::{PhysAddr, VirtAddr};
-use kernel_types::dma::IoBufferError;
-use kernel_types::fs::{OpenFlags, Path};
-use kernel_types::executor::{
-    USER_EXECUTOR_ABI_VERSION, USER_EXECUTOR_PROFILE_GENERAL, USER_EXECUTOR_RESIZE_FIXED,
-    USER_EXECUTOR_RESIZE_GEOMETRIC, USER_EXECUTOR_RESIZE_LINEAR, USER_EXECUTOR_UPDATE_ALL,
-    USER_EXECUTOR_UPDATE_MAX_ACTIVE, USER_EXECUTOR_UPDATE_RESIZE_POLICY,
-    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
-    UserExecutorResizePolicy,
-};
-use kernel_types::object_manager::ObjectTag;
-use kernel_types::capacity::{
-    GeometricResizePolicy, LinearResizePolicy, ResizePolicyKind,
-};
 use kernel_executor::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainState, GlobalAsyncExecutor,
     ReplaceResizePolicyResult,
 };
+use kernel_types::arch::{PhysAddr, VirtAddr};
+use kernel_types::capacity::{GeometricResizePolicy, LinearResizePolicy, ResizePolicyKind};
+use kernel_types::dma::IoBufferError;
+use kernel_types::executor::{
+    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
+    UserExecutorResizePolicy, USER_EXECUTOR_PROFILE_GENERAL, USER_EXECUTOR_RESIZE_FIXED,
+    USER_EXECUTOR_RESIZE_GEOMETRIC, USER_EXECUTOR_RESIZE_LINEAR, USER_EXECUTOR_UPDATE_ALL,
+    USER_EXECUTOR_UPDATE_MAX_ACTIVE, USER_EXECUTOR_UPDATE_RESIZE_POLICY,
+};
+use kernel_types::fs::{OpenFlags, Path};
+use kernel_types::object_manager::ObjectTag;
 
 use crate::object_manager::{
-    AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
-    TaskQueueRef,
+    AccessContext, InterfaceMask, Object, ObjectOperation, ObjectPayload, TaskQueueRef,
+    OBJECT_MANAGER,
 };
 use crate::structs::executor_domain::UserExecutorDomain;
 
@@ -455,11 +452,7 @@ fn resolve_executor_domain(
             handle as u32,
         )
     })?;
-    if !entry
-        .object
-        .behavior()
-        .matches(entry.interface, operation)
-    {
+    if !entry.object.behavior().matches(entry.interface, operation) {
         return Err(make_err(
             ErrClass::Common,
             CommonErr::AccessDenied as u16,
@@ -494,24 +487,25 @@ fn decode_resize_policy(raw: UserExecutorResizePolicy) -> Result<ResizePolicyKin
             minimum_capacity: raw.minimum_capacity,
             grow_by: raw.grow_by_or_factor,
             shrink_by: raw.shrink_by,
-            shrink_trigger_percent: raw.shrink_trigger_percent.try_into().map_err(|_| {
-                make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
-            })?,
+            shrink_trigger_percent: raw
+                .shrink_trigger_percent
+                .try_into()
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?,
             maximum_capacity,
         }),
-        USER_EXECUTOR_RESIZE_GEOMETRIC => {
-            ResizePolicyKind::Geometric(GeometricResizePolicy {
-                minimum_capacity: raw.minimum_capacity,
-                growth_factor: raw.grow_by_or_factor,
-                shrink_trigger_percent: raw.shrink_trigger_percent.try_into().map_err(|_| {
-                    make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
-                })?,
-                shrink_target_percent: raw.shrink_target_percent.try_into().map_err(|_| {
-                    make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
-                })?,
-                maximum_capacity,
-            })
-        }
+        USER_EXECUTOR_RESIZE_GEOMETRIC => ResizePolicyKind::Geometric(GeometricResizePolicy {
+            minimum_capacity: raw.minimum_capacity,
+            growth_factor: raw.grow_by_or_factor,
+            shrink_trigger_percent: raw
+                .shrink_trigger_percent
+                .try_into()
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?,
+            shrink_target_percent: raw
+                .shrink_target_percent
+                .try_into()
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?,
+            maximum_capacity,
+        }),
         _ => {
             return Err(make_err(
                 ErrClass::Common,
@@ -1013,10 +1007,7 @@ pub(crate) fn sys_executor_domain_create(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let config = unsafe { *config_ptr };
-    if config.version != USER_EXECUTOR_ABI_VERSION
-        || config.profile != USER_EXECUTOR_PROFILE_GENERAL
-        || config.initial_queue_capacity == 0
-    {
+    if config.profile != USER_EXECUTOR_PROFILE_GENERAL || config.initial_queue_capacity == 0 {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let resize_policy = match decode_resize_policy(config.resize_policy) {
@@ -1028,21 +1019,20 @@ pub(crate) fn sys_executor_domain_create(
         Err(err) => return err,
     };
     let cpu_count = platform::processor_count();
-    let domain_id =
-        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-            class: ExecutorDomainClass::ProcessIo,
-            max_active: if config.max_active_tasks == 0 {
-                usize::MAX
-            } else {
-                config.max_active_tasks
-            },
-            initial_queue_capacity: config.initial_queue_capacity,
-            interrupt_fallback_capacity: Some(cpu_count.max(1).saturating_mul(4)),
-            quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
-            weight: ExecutorDomainClass::ProcessIo.default_weight(),
-            resize_policy,
-            future_arena: Default::default(),
-        });
+    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+        class: ExecutorDomainClass::ProcessIo,
+        max_active: if config.max_active_tasks == 0 {
+            usize::MAX
+        } else {
+            config.max_active_tasks
+        },
+        initial_queue_capacity: config.initial_queue_capacity,
+        interrupt_fallback_capacity: Some(cpu_count.max(1).saturating_mul(4)),
+        quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
+        weight: ExecutorDomainClass::ProcessIo.default_weight(),
+        resize_policy,
+        future_arena: Default::default(),
+    });
     let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) else {
         return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
     };
@@ -1064,11 +1054,12 @@ pub(crate) fn sys_executor_domain_configure(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let update = unsafe { *update_ptr };
-    if update.version != USER_EXECUTOR_ABI_VERSION
-        || update.fields == 0
-        || update.fields & !USER_EXECUTOR_UPDATE_ALL != 0
-    {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, update.fields);
+    if update.fields == 0 || update.fields & !USER_EXECUTOR_UPDATE_ALL != 0 {
+        return make_err(
+            ErrClass::Common,
+            CommonErr::InvalidPtr as u16,
+            update.fields,
+        );
     }
     let replacement = if update.fields & USER_EXECUTOR_UPDATE_RESIZE_POLICY != 0 {
         match decode_resize_policy(update.resize_policy) {
@@ -1082,15 +1073,11 @@ pub(crate) fn sys_executor_domain_configure(
         Ok(current) => current,
         Err(err) => return err,
     };
-    let domain = match resolve_executor_domain(
-        handle,
-        caller_pid,
-        &caller,
-        ObjectOperation::Configure,
-    ) {
-        Ok(domain) => domain,
-        Err(err) => return err,
-    };
+    let domain =
+        match resolve_executor_domain(handle, caller_pid, &caller, ObjectOperation::Configure) {
+            Ok(domain) => domain,
+            Err(err) => return err,
+        };
     if domain.is_draining() {
         return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
     }
@@ -1117,8 +1104,7 @@ pub(crate) fn sys_executor_domain_query(
     handle: UserHandle,
     info_ptr: *mut UserExecutorDomainInfo,
 ) -> u64 {
-    if info_ptr.is_null()
-        || !user_ptr_ok(info_ptr, core::mem::size_of::<UserExecutorDomainInfo>())
+    if info_ptr.is_null() || !user_ptr_ok(info_ptr, core::mem::size_of::<UserExecutorDomainInfo>())
     {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
@@ -1133,7 +1119,6 @@ pub(crate) fn sys_executor_domain_query(
         };
     let stats = domain.stats();
     let info = UserExecutorDomainInfo {
-        version: USER_EXECUTOR_ABI_VERSION,
         profile: USER_EXECUTOR_PROFILE_GENERAL,
         state: match stats.state {
             ExecutorDomainState::Active => 0,

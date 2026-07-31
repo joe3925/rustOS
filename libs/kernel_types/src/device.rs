@@ -8,11 +8,11 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::any::{Any, TypeId, type_name};
+use core::any::{type_name, Any, TypeId};
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use spin::{Once, RwLock};
 
 pub type ModuleHandle = Arc<RwLock<Module>>;
@@ -140,7 +140,6 @@ pub struct StackLayer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicProtocol {
     pub id: ProtocolId,
-    pub major: u16,
 }
 
 #[repr(C)]
@@ -172,9 +171,7 @@ impl DeviceStack {
 
     #[inline]
     pub fn has_public_protocol<P: Protocol>(&self) -> bool {
-        self.public_protocols
-            .iter()
-            .any(|p| p.id == P::ID && p.major == P::VERSION.major)
+        self.public_protocols.iter().any(|p| p.id == P::ID)
     }
 
     #[inline]
@@ -183,10 +180,7 @@ impl DeviceStack {
             return false;
         }
 
-        self.public_protocols.push(PublicProtocol {
-            id: P::ID,
-            major: P::VERSION.major,
-        });
+        self.public_protocols.push(PublicProtocol { id: P::ID });
 
         true
     }
@@ -235,29 +229,9 @@ impl DevNode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProtocolId(pub u128);
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ProtocolVersion {
-    pub major: u16,
-    pub minor: u16,
-}
-
-impl ProtocolVersion {
-    #[inline]
-    pub const fn new(major: u16, minor: u16) -> Self {
-        Self { major, minor }
-    }
-
-    #[inline]
-    pub const fn is_compatible_with(self, required: ProtocolVersion) -> bool {
-        self.major == required.major && self.minor >= required.minor
-    }
-}
-
-/// Safety: for a given `ID` and major version, `VTable` must always be the same ABI layout.
+/// Safety: for a given `ID`, `VTable` must always be the same layout.
 pub unsafe trait Protocol: 'static {
     const ID: ProtocolId;
-    const VERSION: ProtocolVersion;
 
     type VTable: Sync + 'static;
 }
@@ -288,7 +262,6 @@ unsafe impl Sync for ErasedProtocolVtable {}
 #[derive(Debug, Clone, Copy)]
 struct ProtocolEntry {
     id: ProtocolId,
-    version: ProtocolVersion,
     vtable: ErasedProtocolVtable,
     generation: u64,
 }
@@ -297,7 +270,6 @@ struct ProtocolEntry {
 #[derive(Clone, Copy)]
 pub struct ProtocolRef<P: Protocol> {
     vtable: &'static P::VTable,
-    version: ProtocolVersion,
     generation: u64,
     _protocol: PhantomData<P>,
 }
@@ -306,21 +278,6 @@ impl<P: Protocol> ProtocolRef<P> {
     #[inline]
     pub fn vtable(&self) -> &'static P::VTable {
         self.vtable
-    }
-
-    #[inline]
-    pub fn version(&self) -> ProtocolVersion {
-        self.version
-    }
-
-    #[inline]
-    pub fn version_major(&self) -> u16 {
-        self.version.major
-    }
-
-    #[inline]
-    pub fn version_minor(&self) -> u16 {
-        self.version.minor
     }
 
     #[inline]
@@ -341,7 +298,6 @@ impl<P: Protocol> Deref for ProtocolRef<P> {
 pub struct ProtocolHandle<P: Protocol> {
     provider: Arc<DeviceObject>,
     vtable: &'static P::VTable,
-    version: ProtocolVersion,
     provider_generation: u64,
     protocol_generation: u64,
     entry_generation: u64,
@@ -357,21 +313,6 @@ impl<P: Protocol> ProtocolHandle<P> {
     #[inline]
     pub fn vtable(&self) -> &'static P::VTable {
         self.vtable
-    }
-
-    #[inline]
-    pub fn version(&self) -> ProtocolVersion {
-        self.version
-    }
-
-    #[inline]
-    pub fn version_major(&self) -> u16 {
-        self.version.major
-    }
-
-    #[inline]
-    pub fn version_minor(&self) -> u16 {
-        self.version.minor
     }
 
     #[inline]
@@ -470,12 +411,11 @@ fn try_open_protocol_on_device<P: Protocol>(
         return None;
     }
 
-    let protocol = device.find_protocol::<P>(P::VERSION.minor)?;
+    let protocol = device.find_protocol::<P>()?;
 
     Some(ProtocolHandle {
         provider: device.clone(),
         vtable: protocol.vtable(),
-        version: protocol.version(),
         provider_generation: device.generation(),
         protocol_generation: device.protocol_generation(),
         entry_generation: protocol.generation(),
@@ -609,10 +549,7 @@ impl DeviceObject {
     {
         let mut protocols = self.protocols.write();
 
-        if protocols
-            .iter()
-            .any(|entry| entry.id == P::ID && entry.version.major == P::VERSION.major)
-        {
+        if protocols.iter().any(|entry| entry.id == P::ID) {
             return false;
         }
 
@@ -620,7 +557,6 @@ impl DeviceObject {
 
         protocols.push(ProtocolEntry {
             id: P::ID,
-            version: P::VERSION,
             vtable: ErasedProtocolVtable::from_static(vtable),
             generation,
         });
@@ -628,23 +564,20 @@ impl DeviceObject {
         true
     }
 
-    pub fn find_protocol<P>(&self, min_version_minor: u16) -> Option<ProtocolRef<P>>
+    pub fn find_protocol<P>(&self) -> Option<ProtocolRef<P>>
     where
         P: Protocol,
     {
-        let required = ProtocolVersion::new(P::VERSION.major, min_version_minor);
-
         self.protocols
             .read()
             .iter()
             .copied()
-            .find(|entry| entry.id == P::ID && entry.version.is_compatible_with(required))
+            .find(|entry| entry.id == P::ID)
             .map(|entry| {
                 let vtable = unsafe { entry.vtable.as_static::<P::VTable>() };
 
                 ProtocolRef {
                     vtable,
-                    version: entry.version,
                     generation: entry.generation,
                     _protocol: PhantomData,
                 }

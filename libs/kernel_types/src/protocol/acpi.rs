@@ -1,4 +1,4 @@
-use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
+use crate::device::{DeviceObject, Protocol, ProtocolId};
 use crate::error::KernelError;
 use crate::pci::{EcamSegment, PrtEntry};
 use alloc::sync::Arc;
@@ -14,6 +14,5 @@ pub struct AcpiPciProtocolVTable {
 pub enum AcpiPciProtocol {}
 unsafe impl Protocol for AcpiPciProtocol {
     const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000005);
-    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
     type VTable = AcpiPciProtocolVTable;
 }

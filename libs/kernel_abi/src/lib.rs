@@ -6,7 +6,6 @@ pub mod arch;
 pub mod layout;
 
 pub const RUSTOS_BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_5045;
-pub const RUSTOS_BOOT_INFO_VERSION: u32 = 8;
 
 pub const MAX_BOOT_MEMORY_REGIONS: usize = 256;
 pub const MAX_KERNEL_SECTIONS: usize = 96;
@@ -33,7 +32,6 @@ impl BootArchInfo for EmptyArchInfo {
 #[repr(C)]
 pub struct BootInfo<A: BootArchInfo = EmptyArchInfo> {
     pub magic: u64,
-    pub version: u32,
     pub flags: u32,
     pub rsdp_addr: Optional<u64>,
     pub arch_info: A,
@@ -61,7 +59,6 @@ impl<A: BootArchInfo> BootInfo<A> {
     pub const fn empty() -> Self {
         Self {
             magic: RUSTOS_BOOT_INFO_MAGIC,
-            version: RUSTOS_BOOT_INFO_VERSION,
             flags: 0,
             rsdp_addr: Optional::None,
             arch_info: A::EMPTY,

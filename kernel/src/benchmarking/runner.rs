@@ -6,7 +6,6 @@ use alloc::{
 use core::sync::atomic::{AtomicU32, Ordering};
 use kernel_types::benchmark::{
     BenchMetricDirection, BenchMetricUnit, BenchRunHandle, BenchSuiteDescriptor, BenchSuiteStatus,
-    BENCH_SUITE_ABI_VERSION,
 };
 use serde_json::json;
 use spin::{Mutex, Once};
@@ -49,8 +48,7 @@ fn valid_identifier(value: &str) -> bool {
 }
 
 pub fn register_suite(descriptor: BenchSuiteDescriptor) -> bool {
-    if descriptor.abi_version != BENCH_SUITE_ABI_VERSION
-        || !valid_identifier(&descriptor.name)
+    if !valid_identifier(&descriptor.name)
         || descriptor.tags.iter().any(|tag| !valid_identifier(tag))
     {
         return false;

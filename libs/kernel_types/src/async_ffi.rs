@@ -4,8 +4,6 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-pub const ABI_VERSION: u32 = 3;
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct AbiFutureAllocation {
@@ -58,10 +56,6 @@ pub struct AbiFuture<T> {
 unsafe impl<T: Send> Send for AbiFuture<T> {}
 
 impl<T> AbiFuture<T> {
-    pub fn abi_version(&self) -> u32 {
-        ABI_VERSION
-    }
-
     pub fn is_live(&self) -> bool {
         self.live
     }

@@ -1,4 +1,4 @@
-use crate::device::{DeviceObject, Protocol, ProtocolId, ProtocolVersion};
+use crate::device::{DeviceObject, Protocol, ProtocolId};
 use crate::error::KernelError;
 use crate::io::PartitionInfo;
 use alloc::sync::Arc;
@@ -12,7 +12,5 @@ pub enum VolumeProtocol {}
 
 unsafe impl Protocol for VolumeProtocol {
     const ID: ProtocolId = ProtocolId(0x10000000000000000000000000000003);
-    const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
-
     type VTable = VolumeProtocolVTable;
 }

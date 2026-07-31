@@ -54,7 +54,7 @@ use kernel_abi::{
     KernelSymbols, MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
     MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, MemoryRegion, MemoryRegions, Optional,
 };
-use kernel_abi::{RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION};
+use kernel_abi::RUSTOS_BOOT_INFO_MAGIC;
 use lazy_static::lazy_static;
 
 use crate::platform::{ActivePlatform, Platform};
@@ -92,8 +92,8 @@ pub extern "C" fn kernel_pe_entry(boot_info: *const ActiveBootInfo) -> ! {
     }
 
     let boot_info = unsafe { &*boot_info };
-    if boot_info.magic != RUSTOS_BOOT_INFO_MAGIC || boot_info.version != RUSTOS_BOOT_INFO_VERSION {
-        panic!("kernel_pe_entry received an incompatible boot info block");
+    if boot_info.magic != RUSTOS_BOOT_INFO_MAGIC {
+        panic!("kernel_pe_entry received an invalid boot info block");
     }
     unsafe {
         copy_boot_info(boot_info);
@@ -126,7 +126,6 @@ unsafe fn copy_boot_info(src: &ActiveBootInfo) {
 
     BOOT_INFO = ActiveBootInfo {
         magic: src.magic,
-        version: src.version,
         flags: src.flags,
         rsdp_addr: src.rsdp_addr,
         arch_info: src.arch_info,

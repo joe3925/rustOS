@@ -214,9 +214,6 @@ impl Default for BenchWindowConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BenchWindowHandle(pub u32);
 
-/// ABI version for dynamically registered benchmark suites.
-pub const BENCH_SUITE_ABI_VERSION: u32 = 2;
-
 /// Opaque handle for the suite invocation currently owned by the kernel runner.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -260,7 +257,6 @@ pub type BenchSuiteCallback =
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct BenchSuiteDescriptor {
-    pub abi_version: u32,
     pub name: String,
     pub description: String,
     pub tags: Vec<String>,
@@ -276,7 +272,6 @@ impl BenchSuiteDescriptor {
         callback: BenchSuiteCallback,
     ) -> Self {
         Self {
-            abi_version: BENCH_SUITE_ABI_VERSION,
             name: name.into(),
             description: description.into(),
             tags,
