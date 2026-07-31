@@ -4,11 +4,11 @@ on:
   push:
   workflow_dispatch:
     inputs:
-      accept_baseline:
-        description: Accept this commit as the new trusted benchmark baseline
+      accept_run_id:
+        description: Completed benchmark run ID to accept as the trusted baseline (leave blank to run benchmarks)
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   benchmark:
+    if: github.event_name != 'workflow_dispatch' || inputs.accept_run_id == ''
     runs-on: [self-hosted, linux, x64, rustos-bench]
     timeout-minutes: 120
 
@@ -191,7 +192,6 @@ jobs:
           TRUSTED_COMMIT: ${{ steps.baselines.outputs.trusted_commit }}
           PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
           PREVIOUS_RUN_ID: ${{ steps.baselines.outputs.previous_run_id }}
-          ACCEPT_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.accept_baseline }}
         run: |
           set +e
           status=0
@@ -218,7 +218,7 @@ jobs:
             {
               echo "## Against trusted baseline"
               echo
-              echo "No trusted baseline has been accepted yet. Dispatch this workflow with \`accept_baseline\` enabled to create one."
+              echo "No trusted baseline has been accepted yet. Dispatch this workflow with a completed run ID in \`accept_run_id\` to create one."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -240,32 +240,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [[ "$ACCEPT_BASELINE" == "true" ]]; then
-            status=0
-          fi
           exit "$status"
-
-      - name: Accept this run as the trusted baseline
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.accept_baseline
-        shell: bash
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
-            echo "::error::A trusted benchmark baseline can only be accepted from the default branch ($DEFAULT_BRANCH)."
-            exit 1
-          fi
-          jq -e 'all(.runs[]; .complete and .status == "passed")' \
-            target/bench/head/results.json >/dev/null
-          mkdir -p target/bench/anchor
-          cp target/bench/head/results.json target/bench/anchor/results.json
-          cp target/bench/head/boot.img target/bench/anchor/boot.img
-          jq -n \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg commit "$GITHUB_SHA" \
-            --arg accepted_at "$(date --utc --iso-8601=seconds)" \
-            '{schema: 1, run_id: $run_id, commit: $commit, accepted_at: $accepted_at}' \
-            > target/bench/anchor/manifest.json
 
       - name: Upload benchmark results
         if: always()
@@ -287,4 +262,73 @@ jobs:
           name: kernel-benchmark-anchor
           path: target/bench/anchor
           if-no-files-found: ignore
+          retention-days: 90
+
+  accept-baseline:
+    if: github.event_name == 'workflow_dispatch' && inputs.accept_run_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Validate and stage selected benchmark run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPT_RUN_ID: ${{ inputs.accept_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ACCEPT_RUN_ID}")"
+          source_branch="$(jq -r '.head_branch' <<< "$run_json")"
+          source_commit="$(jq -r '.head_sha' <<< "$run_json")"
+          source_status="$(jq -r '.status' <<< "$run_json")"
+          source_workflow="$(jq -r '.path' <<< "$run_json")"
+
+          if [[ "$source_workflow" != ".github/workflows/kernel-benchmarks.yml" ]]; then
+            echo "::error::Run $ACCEPT_RUN_ID is not a Kernel benchmarks workflow run."
+            exit 1
+          fi
+          if [[ "$source_branch" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::Only a benchmark from the default branch ($DEFAULT_BRANCH) can become the trusted baseline."
+            exit 1
+          fi
+          if [[ "$source_status" != "completed" ]]; then
+            echo "::error::Benchmark run $ACCEPT_RUN_ID has not completed."
+            exit 1
+          fi
+
+          mkdir -p selected-run target/bench/anchor
+          gh run download "$ACCEPT_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name kernel-benchmarks \
+            --dir selected-run
+
+          result="$(find selected-run -path '*/head/results.json' -print -quit)"
+          boot_image="$(find selected-run -path '*/head/boot.img' -print -quit)"
+          if [[ -z "$result" || -z "$boot_image" ]]; then
+            echo "::error::Run $ACCEPT_RUN_ID does not contain a complete kernel benchmark artifact."
+            exit 1
+          fi
+          jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null
+
+          cp "$result" target/bench/anchor/results.json
+          cp "$boot_image" target/bench/anchor/boot.img
+          jq -n \
+            --arg run_id "$ACCEPT_RUN_ID" \
+            --arg commit "$source_commit" \
+            --arg accepted_by_run "$GITHUB_RUN_ID" \
+            --arg accepted_at "$(date --utc --iso-8601=seconds)" \
+            '{
+              schema: 1,
+              run_id: $run_id,
+              commit: $commit,
+              accepted_by_run: $accepted_by_run,
+              accepted_at: $accepted_at
+            }' > target/bench/anchor/manifest.json
+
+      - name: Publish trusted benchmark baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-benchmark-anchor
+          path: target/bench/anchor
+          if-no-files-found: error
           retention-days: 90
