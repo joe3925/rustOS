@@ -1,6 +1,6 @@
 use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     hint::black_box,
     pin::Pin,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -248,8 +248,7 @@ fn correctness_value(value: u64) -> u64 {
 fn queue_value(value: u64) -> u64 {
     value.rotate_left(17)
 }
-
-extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {
+ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {
     async move {
         if !bench_case_start(handle, "read-write".to_string()) {
             return BenchSuiteStatus::Failed;

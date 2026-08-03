@@ -3,9 +3,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kernel_executor::global_async::{
     DestroyExecutorDomainError, ExecutorDomain, ExecutorDomainId, ExecutorDomainStats,
-    GlobalAsyncExecutor, ReplaceResizePolicyResult,
+    GlobalAsyncExecutor,
 };
-use kernel_types::capacity::ResizePolicyKind;
 use spin::Mutex;
 
 pub struct UserExecutorDomain {
@@ -46,22 +45,11 @@ impl UserExecutorDomain {
         self.domain.stats()
     }
 
-    pub fn update_config(
-        &self,
-        policy: Option<ResizePolicyKind>,
-        max_active: Option<usize>,
-    ) -> ReplaceResizePolicyResult {
+    pub fn update_config(&self, max_active: Option<usize>) {
         let _guard = self.config_lock.lock();
-        if let Some(policy) = policy {
-            let result = self.domain.replace_resize_policy(policy);
-            if result != ReplaceResizePolicyResult::Changed {
-                return result;
-            }
-        }
         if let Some(max_active) = max_active {
             self.domain.set_max_active(max_active);
         }
-        ReplaceResizePolicyResult::Changed
     }
 
     pub fn user_handle_opened(&self) {

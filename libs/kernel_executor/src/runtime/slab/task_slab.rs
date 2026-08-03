@@ -112,7 +112,7 @@ impl TaskTable {
             if refs == 0 || refs == REF_MASK {
                 return false;
             }
-            match slot.gen_ref.compare_exchange_weak(
+            match slot.gen_ref.compare_exchange(
                 current,
                 pack_gen_ref(expected_gen, refs + 1),
                 Ordering::AcqRel,
@@ -142,7 +142,7 @@ impl TaskTable {
             if refs == 0 {
                 return;
             }
-            match slot.gen_ref.compare_exchange_weak(
+            match slot.gen_ref.compare_exchange(
                 current,
                 pack_gen_ref(expected_gen, refs - 1),
                 Ordering::AcqRel,

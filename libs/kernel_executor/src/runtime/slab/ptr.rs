@@ -1,7 +1,5 @@
-use crate::sync::spin_loop;
-
 use super::super::runtime::submit_global_to_executor_domain;
-use super::slot::NotifyResult;
+use super::slot::WakeAction;
 use super::task_slab::get_task_table;
 
 const PTR_SHARD_BITS: usize = 3;
@@ -68,24 +66,16 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         return;
     };
 
-    loop {
-        if slot.try_enqueue() {
+    match slot.record_wake() {
+        WakeAction::Enqueue => {
             let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
             let domain_id = slot
                 .executor_domain_id()
                 .expect("queued slab task has no executor domain");
-            submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
-            return;
+            submit_global_to_executor_domain(domain_id, encoded);
         }
-
-        match slot.try_notify_result() {
-            NotifyResult::Notified | NotifyResult::AlreadyQueued | NotifyResult::Completed => {
-                slab.decrement_ref(shard_idx, local_idx, generation);
-                return;
-            }
-            NotifyResult::IdleRace => {
-                spin_loop();
-            }
+        WakeAction::Represented | WakeAction::Completed => {
+            slab.decrement_ref(shard_idx, local_idx, generation);
         }
     }
 }

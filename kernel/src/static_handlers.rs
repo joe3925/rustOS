@@ -3,7 +3,6 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
-use kernel_executor::global_async::GlobalAsyncExecutor;
 use kernel_executor::runtime::runtime::{
     block_on as kernel_block_on, spawn_blocking as kernel_spawn_blocking,
     spawn_detached as kernel_spawn_detached, spawn_join_owned as kernel_spawn,
@@ -629,11 +628,6 @@ pub extern "C" fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ct
     kernel_spawn_blocking(move || {
         (trampoline)(ctx);
     });
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usize) {
-    GlobalAsyncExecutor::global().submit(trampoline, ctx);
 }
 
 static BENCH_WINDOWS: Once<Mutex<BTreeMap<u32, BenchWindow>>> = Once::new();

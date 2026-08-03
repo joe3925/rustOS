@@ -13,7 +13,6 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-const TEST_MAX_WORK_ITEMS: usize = 2_000_000;
 const EXECUTOR_MAX_SHARDS: usize = 32;
 
 struct ThreadPoolPlatform {
@@ -119,8 +118,7 @@ fn stress_task_count(multiplier: usize) -> usize {
 
 pub(crate) fn init_threaded_runtime() {
     init_test_platform();
-    crate::global_async::GlobalAsyncExecutor::global()
-        .init(test_shard_count(), TEST_MAX_WORK_ITEMS);
+    crate::global_async::GlobalAsyncExecutor::global().init(test_shard_count(), 1024);
 }
 
 pub(crate) fn wait_until<F>(timeout: Duration, mut done: F)

@@ -330,7 +330,8 @@ mod tests {
             runs_for_task.fetch_add(1, Ordering::AcqRel);
             321usize
         }));
-        let header = &task.header as *const SharedTaskHeader<usize>;
+        let result_owner = task.clone();
+        let header = &result_owner.header as *const SharedTaskHeader<usize>;
 
         run_same_blocking_task_twice(task, header);
 

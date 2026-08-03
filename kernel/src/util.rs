@@ -142,7 +142,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         boot_usable_bytes()
     ));
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(processor_count(), 1_000_000);
+    GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let kernel_image_base = boot_info().kernel_image_base;

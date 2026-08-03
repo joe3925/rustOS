@@ -15,7 +15,7 @@ use super::super::runtime::JoinStorage;
 use super::super::task::{
     STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED,
 };
-use super::ptr::{encode_slab_task_ptr, slab_task_poll_trampoline};
+use super::ptr::encode_slab_task_ptr;
 use super::storage::drop_inline;
 use super::task_slab::get_task_table;
 
@@ -24,10 +24,9 @@ const CW_UPDATING: u8 = 1;
 const CW_SET: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NotifyResult {
-    Notified,
-    AlreadyQueued,
-    IdleRace,
+pub enum WakeAction {
+    Enqueue,
+    Represented,
     Completed,
 }
 
@@ -77,6 +76,7 @@ pub struct TaskSlot {
     pub(super) waker_state: AtomicU8,
     pub(super) cached_waker_state: AtomicU8,
     pub(super) _pad: u8,
+    pub(crate) ready_next: AtomicUsize,
     pub(super) domain_id: UnsafeCell<Option<ExecutorDomainId>>,
     pub(super) future: UnsafeCell<Option<FutureAllocation>>,
     pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
@@ -98,6 +98,7 @@ impl TaskSlot {
             waker_state: AtomicU8::new(WAKER_NONE),
             cached_waker_state: AtomicU8::new(CW_NONE),
             _pad: 0,
+            ready_next: AtomicUsize::new(0),
             domain_id: UnsafeCell::new(None),
             future: UnsafeCell::new(None),
             poll_fn: UnsafeCell::new(None),
@@ -115,6 +116,7 @@ impl TaskSlot {
         self.control.store(0, Ordering::Relaxed);
         self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
         self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
+        self.ready_next.store(0, Ordering::Relaxed);
         write_poll_fn(&self.poll_fn, None);
         write_drop_fn(&self.drop_fn, None);
         unsafe { *self.cancel_fn.get() = None };
@@ -157,6 +159,7 @@ impl TaskSlot {
         write_poll_fn(&self.poll_fn, None);
         self.result_ptr.store(RESULT_ABANDONED, Ordering::Release);
         self.state.store(STATE_IDLE, Ordering::Release);
+        self.ready_next.store(0, Ordering::Relaxed);
         if let Some(domain_id) = unsafe { (&mut *self.domain_id.get()).take() } {
             if let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) {
                 domain.release_task();
@@ -283,7 +286,7 @@ impl TaskSlot {
                 let slab = get_task_table();
                 slab.increment_ref(shard_idx, local_idx, generation);
                 let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
-                submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
+                submit_global_to_executor_domain(domain_id, encoded);
             }
             false
         }
@@ -459,31 +462,26 @@ impl TaskSlot {
     }
 
     #[inline]
-    pub fn try_enqueue(&self) -> bool {
-        self.state
-            .compare_exchange(
-                STATE_IDLE,
-                STATE_QUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
+    pub fn record_wake(&self) -> WakeAction {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let (next, action) = match state {
+                STATE_IDLE => (STATE_QUEUED, WakeAction::Enqueue),
+                STATE_POLLING => (STATE_NOTIFIED, WakeAction::Represented),
+                STATE_QUEUED | STATE_NOTIFIED => return WakeAction::Represented,
+                STATE_COMPLETED => return WakeAction::Completed,
+                _ => unreachable!("invalid slab task state"),
+            };
 
-    #[inline]
-    pub fn try_notify_result(&self) -> NotifyResult {
-        match self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_NOTIFIED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => NotifyResult::Notified,
-            Err(STATE_IDLE) => NotifyResult::IdleRace,
-            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
-            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
-            Err(STATE_COMPLETED) => NotifyResult::Completed,
-            Err(_) => NotifyResult::IdleRace,
+            // Never wait for a poller to finish: a failed strong CAS returns
+            // a state that another CPU changed, and we dispatch from that.
+            match self
+                .state
+                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return action,
+                Err(actual) => state = actual,
+            }
         }
     }
 

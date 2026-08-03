@@ -7,23 +7,19 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
 
-pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
+pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 
 use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
-use crate::platform::{Job, platform};
-use crate::sync::Arc;
+use crate::platform::{platform, Job};
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Arc;
 
+use super::slab::get_task_table;
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
-use super::slab::{get_task_table, slab_task_poll_trampoline};
 
-pub(crate) fn submit_global_to_executor_domain(
-    domain_id: ExecutorDomainId,
-    trampoline: extern "C" fn(usize),
-    ctx: usize,
-) {
-    GlobalAsyncExecutor::global().submit_to_executor_domain(domain_id, trampoline, ctx);
+pub(crate) fn submit_global_to_executor_domain(domain_id: ExecutorDomainId, ctx: usize) {
+    GlobalAsyncExecutor::global().enqueue_task_to_executor_domain(domain_id, ctx);
 }
 
 pub(crate) fn submit_blocking(trampoline: extern "C" fn(usize), ctx: usize) {
@@ -155,6 +151,10 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    assert!(
+        !crate::platform::in_interrupt_context(),
+        "attempted to spawn a task from interrupt context"
+    );
     let domain = GlobalAsyncExecutor::global()
         .get_executor_domain(domain_id)
         .expect("invalid executor domain");
@@ -185,7 +185,7 @@ where
     slab.increment_ref(shard_idx, local_idx, generation);
 
     let encoded = slot_handle.encoded_ptr();
-    submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
+    submit_global_to_executor_domain(domain_id, encoded);
 
     JoinHandle {
         shard_idx: shard_idx as u8,
@@ -360,6 +360,10 @@ pub fn spawn_detached_in_executor_domain<F>(domain_id: ExecutorDomainId, future:
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    assert!(
+        !crate::platform::in_interrupt_context(),
+        "attempted to spawn a task from interrupt context"
+    );
     let domain = GlobalAsyncExecutor::global()
         .get_executor_domain(domain_id)
         .expect("invalid executor domain");
@@ -388,7 +392,7 @@ where
     slab.increment_ref(shard_idx, local_idx, generation);
 
     let encoded = slot_handle.encoded_ptr();
-    submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, encoded);
+    submit_global_to_executor_domain(domain_id, encoded);
 }
 
 unsafe fn release_unpublished_future<F>(
@@ -528,6 +532,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnToPortError {
     InvalidDomain,
+    InterruptContext,
     FutureAllocationFailed,
     TaskAllocationFailed,
 }
@@ -543,6 +548,9 @@ where
     P: CompletionPermit<T>,
     T: Send + 'static,
 {
+    if crate::platform::in_interrupt_context() {
+        return Err(SpawnToPortError::InterruptContext);
+    }
     let domain = GlobalAsyncExecutor::global()
         .get_executor_domain(domain_id)
         .ok_or(SpawnToPortError::InvalidDomain)?;
@@ -584,7 +592,7 @@ where
     unsafe { slot.init_abortable::<PortFuture<F, P, T>>(domain_id, allocation) };
     domain.retain_task();
     slab.increment_ref(shard, local, generation);
-    submit_global_to_executor_domain(domain_id, slab_task_poll_trampoline, handle.encoded_ptr());
+    submit_global_to_executor_domain(domain_id, handle.encoded_ptr());
     Ok(token)
 }
 

@@ -168,10 +168,149 @@ mod threaded {
 
 #[cfg(any(loom, feature = "loom"))]
 mod loom {
-    use super::super::slot::{NotifyResult, TaskSlot, WAKER_SET, WAKER_TAKEN, WAKER_UPDATING};
+    use super::super::slot::{TaskSlot, WakeAction, WAKER_SET, WAKER_TAKEN, WAKER_UPDATING};
     use crate::sync::exhaustive_model;
     use core::mem::ManuallyDrop;
     use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    const MODEL_ID_BITS: u32 = 2;
+    const MODEL_ID_MASK: u64 = (1 << MODEL_ID_BITS) - 1;
+
+    struct ReadyNode {
+        next: crate::sync::atomic::AtomicUsize,
+    }
+
+    fn model_push(head: &crate::sync::atomic::AtomicU64, node: &ReadyNode, id: usize) {
+        let mut current = head.load(crate::sync::atomic::Ordering::Acquire);
+        loop {
+            node.next.store(
+                (current & MODEL_ID_MASK) as usize,
+                crate::sync::atomic::Ordering::Relaxed,
+            );
+            let tag = (current >> MODEL_ID_BITS).wrapping_add(1);
+            let replacement = (tag << MODEL_ID_BITS) | id as u64;
+            match head.compare_exchange(
+                current,
+                replacement,
+                crate::sync::atomic::Ordering::Release,
+                crate::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn model_pop(
+        head: &crate::sync::atomic::AtomicU64,
+        first: &ReadyNode,
+        second: &ReadyNode,
+    ) -> Option<usize> {
+        let mut current = head.load(crate::sync::atomic::Ordering::Acquire);
+        loop {
+            let id = (current & MODEL_ID_MASK) as usize;
+            if id == 0 {
+                return None;
+            }
+            let node = if id == 1 { first } else { second };
+            let next = node.next.load(crate::sync::atomic::Ordering::Acquire);
+            let tag = (current >> MODEL_ID_BITS).wrapping_add(1);
+            let replacement = (tag << MODEL_ID_BITS) | next as u64;
+            match head.compare_exchange(
+                current,
+                replacement,
+                crate::sync::atomic::Ordering::AcqRel,
+                crate::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(id),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[test]
+    fn loom_intrusive_ready_stack_publishes_each_task_once() {
+        exhaustive_model(|| {
+            let head = crate::sync::Arc::new(crate::sync::atomic::AtomicU64::new(0));
+            let first = crate::sync::Arc::new(ReadyNode {
+                next: crate::sync::atomic::AtomicUsize::new(0),
+            });
+            let second = crate::sync::Arc::new(ReadyNode {
+                next: crate::sync::atomic::AtomicUsize::new(0),
+            });
+
+            let head_a = head.clone();
+            let first_a = first.clone();
+            let producer_a = loom::thread::spawn(move || model_push(&head_a, &first_a, 1));
+            let head_b = head.clone();
+            let second_b = second.clone();
+            let producer_b = loom::thread::spawn(move || model_push(&head_b, &second_b, 2));
+
+            producer_a.join().expect("first producer panicked");
+            producer_b.join().expect("second producer panicked");
+
+            let a = model_pop(&head, &first, &second).expect("first task missing");
+            let b = model_pop(&head, &first, &second).expect("second task missing");
+            assert_eq!((1usize << a) | (1usize << b), (1 << 1) | (1 << 2));
+            assert!(model_pop(&head, &first, &second).is_none());
+        });
+    }
+
+    #[test]
+    fn loom_sharded_ready_heads_preserve_cross_shard_work() {
+        exhaustive_model(|| {
+            let heads = crate::sync::Arc::new([
+                crate::sync::atomic::AtomicU64::new(0),
+                crate::sync::atomic::AtomicU64::new(0),
+            ]);
+            let first = crate::sync::Arc::new(ReadyNode {
+                next: crate::sync::atomic::AtomicUsize::new(0),
+            });
+            let second = crate::sync::Arc::new(ReadyNode {
+                next: crate::sync::atomic::AtomicUsize::new(0),
+            });
+            let seen = crate::sync::Arc::new(crate::sync::atomic::AtomicUsize::new(0));
+
+            let heads_a = heads.clone();
+            let first_a = first.clone();
+            let producer_a = loom::thread::spawn(move || model_push(&heads_a[0], &first_a, 1));
+            let heads_b = heads.clone();
+            let second_b = second.clone();
+            let producer_b = loom::thread::spawn(move || model_push(&heads_b[1], &second_b, 2));
+
+            let consumer_heads = heads.clone();
+            let consumer_first = first.clone();
+            let consumer_second = second.clone();
+            let consumer_seen = seen.clone();
+            let consumer = loom::thread::spawn(move || {
+                for head in consumer_heads.iter() {
+                    if let Some(id) = model_pop(head, &consumer_first, &consumer_second) {
+                        let bit = 1usize << id;
+                        let previous =
+                            consumer_seen.fetch_or(bit, crate::sync::atomic::Ordering::AcqRel);
+                        assert_eq!(previous & bit, 0);
+                    }
+                }
+            });
+
+            producer_a.join().expect("first producer panicked");
+            producer_b.join().expect("second producer panicked");
+            consumer.join().expect("consumer panicked");
+
+            for head in heads.iter() {
+                if let Some(id) = model_pop(head, &first, &second) {
+                    let bit = 1usize << id;
+                    let previous = seen.fetch_or(bit, crate::sync::atomic::Ordering::AcqRel);
+                    assert_eq!(previous & bit, 0);
+                }
+            }
+
+            assert_eq!(
+                seen.load(crate::sync::atomic::Ordering::Acquire),
+                (1usize << 1) | (1usize << 2)
+            );
+        });
+    }
 
     struct ModelWakeCounter {
         wakes: crate::sync::atomic::AtomicUsize,
@@ -320,9 +459,8 @@ mod loom {
         });
     }
 
-    // Models the detached slab task wake-vs-pending-poll race. The caller's
-    // IdleRace retry must convert a just-idled task into QUEUED instead of
-    // losing the wake.
+    // Models the detached slab task wake-vs-pending-poll race. The wake must
+    // either enqueue an idle task or leave a notification for the poller.
     #[test]
     fn loom_task_slot_notify_idle_race_requeues() {
         exhaustive_model(|| {
@@ -350,26 +488,19 @@ mod loom {
             });
 
             let notify_slot = slot.clone();
-            let notifier = loom::thread::spawn(move || loop {
-                match notify_slot.try_notify_result() {
-                    NotifyResult::Notified
-                    | NotifyResult::AlreadyQueued
-                    | NotifyResult::Completed => return,
-                    NotifyResult::IdleRace => {
-                        if notify_slot.try_enqueue() {
-                            return;
-                        }
-                    }
-                }
-            });
+            let notifier = loom::thread::spawn(move || notify_slot.record_wake());
 
             poller.join().expect("poller thread panicked");
-            notifier.join().expect("notifier thread panicked");
+            let action = notifier.join().expect("notifier thread panicked");
 
             assert_eq!(
                 slot.state.load(crate::sync::atomic::Ordering::Acquire),
                 crate::runtime::task::STATE_QUEUED
             );
+            assert!(matches!(
+                action,
+                WakeAction::Enqueue | WakeAction::Represented
+            ));
         });
     }
 }

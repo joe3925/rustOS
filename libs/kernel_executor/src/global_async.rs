@@ -1,28 +1,18 @@
-use crate::platform::{Job, platform};
-use crate::sync::Arc;
+use crate::platform::{platform, Job};
 use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::Arc;
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Once;
 
 pub use crate::domain::{
-    DRIVER_EXECUTOR_DOMAIN, DestroyExecutorDomainError, DestroyExecutorDomainResult,
-    ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
-    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable, ExecutorSubmitError,
-    ExecutorSubmitErrorKind, GlobalExecutorStats, KERNEL_BACKGROUND_EXECUTOR_DOMAIN,
-    KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN, ReplaceResizePolicyResult,
+    DestroyExecutorDomainError, DestroyExecutorDomainResult, ExecutorDomain, ExecutorDomainClass,
+    ExecutorDomainConfig, ExecutorDomainId, ExecutorDomainState, ExecutorDomainStats,
+    ExecutorDomainTable, GlobalExecutorStats, DRIVER_EXECUTOR_DOMAIN,
+    KERNEL_BACKGROUND_EXECUTOR_DOMAIN, KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
-
-pub type Trampoline = extern "C" fn(usize);
 
 #[repr(align(64))]
 pub(crate) struct CacheAligned(pub(crate) AtomicUsize);
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct WorkItem {
-    pub trampoline: Trampoline,
-    pub ctx: usize,
-}
 
 const MAX_SHARDS: usize = 32;
 
@@ -65,10 +55,10 @@ struct ExecutorRuntime {
 }
 
 impl ExecutorRuntime {
-    fn new(shards: usize, max_work_items: usize) -> Self {
+    fn new(cpu_count: usize) -> Self {
         Self {
-            domains: ExecutorDomainTable::new(shards, max_work_items),
-            run_queue: DomainRunQueue::new(max_work_items),
+            domains: ExecutorDomainTable::new(cpu_count),
+            run_queue: DomainRunQueue::new(crate::runtime::slab::MAX_TASK_SLOTS),
         }
     }
 }
@@ -78,7 +68,6 @@ pub struct GlobalAsyncExecutor {
     active_pumps: CacheAligned,
     max_pumps: CacheAligned,
     total_submissions: CacheAligned,
-    total_rejections: CacheAligned,
     total_pump_runs: CacheAligned,
     run_tick: CacheAligned,
 }
@@ -92,18 +81,17 @@ impl GlobalAsyncExecutor {
             active_pumps: CacheAligned(AtomicUsize::new(0)),
             max_pumps: CacheAligned(AtomicUsize::new(1)),
             total_submissions: CacheAligned(AtomicUsize::new(0)),
-            total_rejections: CacheAligned(AtomicUsize::new(0)),
             total_pump_runs: CacheAligned(AtomicUsize::new(0)),
             run_tick: CacheAligned(AtomicUsize::new(0)),
         })
     }
 
-    pub fn init(&self, shards: usize, max_work_items: usize) {
+    pub fn init(&self, shards: usize, initial_task_capacity: usize) {
         let shards = shards.clamp(1, MAX_SHARDS);
-        let max_work_items = max_work_items.max(1);
 
-        self.runtime
-            .call_once(|| ExecutorRuntime::new(shards, max_work_items));
+        crate::runtime::slab::init_task_table_with(|config| config.capacity(initial_task_capacity));
+
+        self.runtime.call_once(|| ExecutorRuntime::new(shards));
 
         self.max_pumps.0.store(shards, Ordering::Release);
 
@@ -122,67 +110,30 @@ impl GlobalAsyncExecutor {
             .expect("global async executor not initialized")
     }
 
-    #[inline]
-    pub fn submit(&self, trampoline: Trampoline, ctx: usize) {
-        self.try_submit(trampoline, ctx)
-            .expect("failed to submit to executor pool")
-    }
-
-    #[inline]
-    pub fn try_submit(&self, trampoline: Trampoline, ctx: usize) -> Result<(), WorkItem> {
-        self.try_submit_to_executor_domain(KERNEL_NORMAL_EXECUTOR_DOMAIN, trampoline, ctx)
-            .map_err(ExecutorSubmitError::into_work_item)
-    }
-
-    #[inline]
-    pub fn submit_to_executor_domain(
+    pub(crate) fn enqueue_task_to_executor_domain(
         &self,
         domain_id: ExecutorDomainId,
-        trampoline: Trampoline,
-        ctx: usize,
+        task_id: usize,
     ) {
-        self.try_submit_to_executor_domain(domain_id, trampoline, ctx)
-            .expect("failed to submit to executor domain")
-    }
-
-    pub fn try_submit_to_executor_domain(
-        &self,
-        domain_id: ExecutorDomainId,
-        trampoline: Trampoline,
-        ctx: usize,
-    ) -> Result<(), ExecutorSubmitError> {
-        let work_item = WorkItem { trampoline, ctx };
-
-        let runtime = self.runtime.get().ok_or_else(|| {
-            ExecutorSubmitError::new(
-                ExecutorSubmitErrorKind::ExecutorUninitialized,
-                domain_id,
-                work_item,
-            )
-        })?;
-
-        let outcome = match runtime
+        let runtime = self.runtime();
+        let domain = runtime
             .domains
-            .submit_to_executor_domain(domain_id, work_item)
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.total_rejections.0.fetch_add(1, Ordering::Relaxed);
-                return Err(error);
-            }
-        };
-
+            .get_executor_domain(domain_id)
+            .expect("invalid executor domain for task wake");
+        assert!(
+            domain.enqueue_task(task_id),
+            "failed to enqueue executor task"
+        );
         self.total_submissions.0.fetch_add(1, Ordering::Relaxed);
-
-        if let Some(domain) = runtime.domains.get_executor_domain(outcome.domain_id) {
-            self.schedule_domain_if_needed(runtime, outcome.domain_id, &domain);
-        }
-
-        Ok(())
+        self.schedule_domain_if_needed(runtime, domain_id, &domain);
     }
 
     pub fn create_executor_domain(&self, config: ExecutorDomainConfig) -> ExecutorDomainId {
         self.runtime().domains.create_executor_domain(config)
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.max_pumps.0.load(Ordering::Acquire)
     }
 
     pub fn destroy_executor_domain(
@@ -194,15 +145,6 @@ impl GlobalAsyncExecutor {
 
     pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
         self.runtime().domains.get_executor_domain(domain_id)
-    }
-
-    pub fn replace_executor_domain_resize_policy(
-        &self,
-        domain_id: ExecutorDomainId,
-        policy: kernel_types::capacity::ResizePolicyKind,
-    ) -> Option<ReplaceResizePolicyResult> {
-        self.get_executor_domain(domain_id)
-            .map(|domain| domain.replace_resize_policy(policy))
     }
 
     pub fn executor_domain_stats(
@@ -222,7 +164,6 @@ impl GlobalAsyncExecutor {
             runnable_executor_domain_count: runtime.run_queue.len(),
             domain_count: runtime.domains.domain_count(),
             total_submissions: self.total_submissions.0.load(Ordering::Relaxed),
-            total_rejections: self.total_rejections.0.load(Ordering::Relaxed),
             total_pump_runs: self.total_pump_runs.0.load(Ordering::Relaxed),
         }
     }
@@ -336,21 +277,16 @@ impl GlobalAsyncExecutor {
     }
 
     fn run_domain_batch(&self, domain: &ExecutorDomain, budget: usize) -> usize {
-        let shard_count = domain.shard_count();
-        let mut cursor = domain.next_pump_hint() % shard_count;
         let mut ran = 0usize;
         let budget = budget.max(1);
 
         while ran < budget {
-            let item = match domain.pop_work(cursor) {
-                Some((x, idx)) => {
-                    cursor = (idx + 1) % shard_count;
-                    x
-                }
+            let task_id = match domain.pop_task() {
+                Some(task_id) => task_id,
                 None => break,
             };
 
-            (item.trampoline)(item.ctx);
+            crate::runtime::slab::slab_task_poll_trampoline(task_id);
             domain.record_completed();
             ran += 1;
         }

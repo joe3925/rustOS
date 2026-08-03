@@ -117,7 +117,6 @@ export! {
 
     kernel_spawn_abi,
     kernel_spawn_joinable_abi,
-    kernel_async_submit,
     kernel_spawn_detached_abi,
     kernel_block_on_abi,
     kernel_block_on_thread_state,

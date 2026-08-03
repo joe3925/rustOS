@@ -1,21 +1,18 @@
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::future::Future;
-use core::mem::{ManuallyDrop, align_of, size_of};
+use core::mem::{align_of, size_of, ManuallyDrop};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::sync::{Condvar, Mutex};
 use std::task::Wake;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::global_async::{
-    ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId, ExecutorSubmitErrorKind,
-    GlobalAsyncExecutor, KERNEL_NORMAL_EXECUTOR_DOMAIN,
-};
+use crate::global_async::{ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor};
 use crate::runtime::abi_spawn::kernel_spawn_abi_internal;
 use crate::runtime::runtime::{
-    JoinAll, block_on, spawn_detached, spawn_detached_in_executor_domain,
-    spawn_join_owned as spawn, spawn_join_owned_in_executor_domain as spawn_in_executor_domain,
+    block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
+    spawn_join_owned_in_executor_domain as spawn_in_executor_domain, JoinAll,
 };
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
@@ -317,52 +314,6 @@ impl<T> Future for LargeControlledFuture<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll(cx)
-    }
-}
-
-struct RecursiveSubmitState {
-    remaining_submissions: AtomicUsize,
-    completed: AtomicUsize,
-}
-
-struct DomainConcurrencyState {
-    running: AtomicUsize,
-    max_running: AtomicUsize,
-    completed: AtomicUsize,
-    release: AtomicBool,
-}
-
-extern "C" fn increment_counter(ctx: usize) {
-    let counter = unsafe { &*(ctx as *const AtomicUsize) };
-    counter.fetch_add(1, Ordering::AcqRel);
-}
-
-extern "C" fn blocking_domain_counter(ctx: usize) {
-    let state = unsafe { &*(ctx as *const DomainConcurrencyState) };
-    let running = state.running.fetch_add(1, Ordering::AcqRel) + 1;
-    state.max_running.fetch_max(running, Ordering::AcqRel);
-
-    while !state.release.load(Ordering::Acquire) {
-        std::thread::yield_now();
-    }
-
-    state.running.fetch_sub(1, Ordering::AcqRel);
-    state.completed.fetch_add(1, Ordering::AcqRel);
-}
-
-extern "C" fn recursive_submit_counter(ctx: usize) {
-    let state = unsafe { &*(ctx as *const RecursiveSubmitState) };
-    state.completed.fetch_add(1, Ordering::AcqRel);
-
-    let should_submit_more = state
-        .remaining_submissions
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-            (remaining > 0).then(|| remaining - 1)
-        })
-        .is_ok();
-
-    if should_submit_more {
-        GlobalAsyncExecutor::global().submit(recursive_submit_counter, ctx);
     }
 }
 
@@ -1087,153 +1038,6 @@ fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
     assert_eq!(after.live_task_count, 0);
 }
 
-// This test exists to hit GlobalAsyncExecutor directly, without going through
-// spawn. It fills the sharded work queues with many raw jobs and verifies the
-// configured core-count shard pump drains them all.
-#[test]
-fn raw_global_executor_jobs_drain_under_queue_pressure() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
-
-    let jobs = super::stress_task_count(2_048);
-    let counter = Arc::new(AtomicUsize::new(0));
-    let ctx = Arc::as_ptr(&counter) as usize;
-
-    for _ in 0..jobs {
-        GlobalAsyncExecutor::global()
-            .try_submit(increment_counter, ctx)
-            .expect("raw global executor queue unexpectedly full");
-    }
-
-    super::wait_until(Duration::from_secs(10), || {
-        counter.load(Ordering::Acquire) == jobs
-    });
-}
-
-#[test]
-fn compatibility_submit_routes_through_kernel_normal_domain() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
-
-    let before = GlobalAsyncExecutor::global()
-        .executor_domain_stats(KERNEL_NORMAL_EXECUTOR_DOMAIN)
-        .expect("kernel normal domain missing");
-    let counter = Arc::new(AtomicUsize::new(0));
-    let ctx = Arc::as_ptr(&counter) as usize;
-
-    GlobalAsyncExecutor::global().submit(increment_counter, ctx);
-
-    super::wait_until(Duration::from_secs(10), || {
-        counter.load(Ordering::Acquire) == 1
-    });
-
-    let after = GlobalAsyncExecutor::global()
-        .executor_domain_stats(KERNEL_NORMAL_EXECUTOR_DOMAIN)
-        .expect("kernel normal domain missing");
-    assert!(after.submitted >= before.submitted + 1);
-    assert!(after.completed >= before.completed + 1);
-}
-
-#[test]
-fn submit_to_executor_domain_executes_work_and_updates_executor_domain_stats() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
-
-    let jobs = super::stress_task_count(16);
-    let counter = Arc::new(AtomicUsize::new(0));
-    let ctx = Arc::as_ptr(&counter) as usize;
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::Driver,
-        initial_queue_capacity: jobs * 2,
-        quantum: 2,
-        ..ExecutorDomainConfig::default()
-    });
-
-    for _ in 0..jobs {
-        GlobalAsyncExecutor::global().submit_to_executor_domain(domain_id, increment_counter, ctx);
-    }
-
-    super::wait_until(Duration::from_secs(10), || {
-        counter.load(Ordering::Acquire) == jobs
-    });
-
-    let stats = GlobalAsyncExecutor::global()
-        .executor_domain_stats(domain_id)
-        .expect("custom domain missing");
-    assert_eq!(stats.class, ExecutorDomainClass::Driver);
-    assert!(stats.submitted >= jobs);
-    assert!(stats.completed >= jobs);
-    assert_eq!(stats.queued_count, 0);
-}
-
-#[test]
-fn hot_domain_can_run_multiple_active_pumps() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
-
-    if super::test_shard_count() < 2 {
-        return;
-    }
-
-    let jobs = 4;
-    let expected_concurrency = 2;
-    let state = Arc::new(DomainConcurrencyState {
-        running: AtomicUsize::new(0),
-        max_running: AtomicUsize::new(0),
-        completed: AtomicUsize::new(0),
-        release: AtomicBool::new(false),
-    });
-    let ctx = Arc::as_ptr(&state) as usize;
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::KernelNormal,
-        max_active: expected_concurrency,
-        initial_queue_capacity: jobs,
-        quantum: 1,
-        ..ExecutorDomainConfig::default()
-    });
-
-    for _ in 0..jobs {
-        GlobalAsyncExecutor::global().submit_to_executor_domain(
-            domain_id,
-            blocking_domain_counter,
-            ctx,
-        );
-    }
-
-    let start = Instant::now();
-    while state.max_running.load(Ordering::Acquire) < expected_concurrency
-        && start.elapsed() < Duration::from_secs(2)
-    {
-        std::thread::yield_now();
-    }
-
-    state.release.store(true, Ordering::Release);
-
-    super::wait_until(Duration::from_secs(10), || {
-        state.completed.load(Ordering::Acquire) == jobs
-    });
-
-    assert!(
-        state.max_running.load(Ordering::Acquire) >= expected_concurrency,
-        "hot domain never exceeded single-pump execution"
-    );
-}
-
-#[test]
-fn invalid_domain_submission_fails_without_panicking() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
-
-    let counter = Arc::new(AtomicUsize::new(0));
-    let invalid = ExecutorDomainId::from_parts(0x00FF_FFFF, 1);
-    let err = GlobalAsyncExecutor::global()
-        .try_submit_to_executor_domain(invalid, increment_counter, Arc::as_ptr(&counter) as usize)
-        .expect_err("invalid domain unexpectedly accepted work");
-
-    assert_eq!(err.kind, ExecutorSubmitErrorKind::InvalidDomain);
-    assert_eq!(counter.load(Ordering::Acquire), 0);
-}
-
 #[test]
 fn spawn_in_executor_domain_completes_joinhandle() {
     let _guard = super::global_runtime_lock();
@@ -1241,7 +1045,6 @@ fn spawn_in_executor_domain_completes_joinhandle() {
 
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelHigh,
-        initial_queue_capacity: 128,
         ..ExecutorDomainConfig::default()
     });
 
@@ -1262,7 +1065,6 @@ fn spawn_detached_in_executor_domain_executes_work() {
 
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelBackground,
-        initial_queue_capacity: 128,
         ..ExecutorDomainConfig::default()
     });
     let counter = Arc::new(AtomicUsize::new(0));
@@ -1280,31 +1082,5 @@ fn spawn_detached_in_executor_domain_executes_work() {
         GlobalAsyncExecutor::global()
             .executor_domain_stats(domain_id)
             .is_some_and(|stats| stats.completed >= 1)
-    });
-}
-
-// This test covers the global executor handoff where work is submitted by jobs
-// that are already running on pump threads. Those recursive submissions must not
-// be stranded when the current pump drains its local view of the queues.
-#[test]
-fn global_executor_drains_work_submitted_by_running_jobs() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
-
-    let initial_jobs = super::stress_task_count(32);
-    let recursive_jobs = super::stress_task_count(32);
-    let expected = initial_jobs + recursive_jobs;
-    let state = Arc::new(RecursiveSubmitState {
-        remaining_submissions: AtomicUsize::new(recursive_jobs),
-        completed: AtomicUsize::new(0),
-    });
-    let ctx = Arc::as_ptr(&state) as usize;
-
-    for _ in 0..initial_jobs {
-        GlobalAsyncExecutor::global().submit(recursive_submit_counter, ctx);
-    }
-
-    super::wait_until(Duration::from_secs(10), || {
-        state.completed.load(Ordering::Acquire) == expected
     });
 }

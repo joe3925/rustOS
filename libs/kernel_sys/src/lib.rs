@@ -262,7 +262,6 @@ unsafe extern "C" {
     // Async Runtime (global)
     pub fn kernel_spawn_abi(fut: AbiFuture<()>);
     pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()>;
-    pub fn kernel_async_submit(trampoline: extern "C" fn(usize), ctx: usize);
     pub fn kernel_spawn_detached_abi(fut: AbiFuture<()>);
     pub fn kernel_block_on_abi(fut: AbiFuture<()>);
     pub fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState>;

@@ -19,16 +19,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_executor::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainState, GlobalAsyncExecutor,
-    ReplaceResizePolicyResult,
 };
 use kernel_types::arch::{PhysAddr, VirtAddr};
-use kernel_types::capacity::{GeometricResizePolicy, LinearResizePolicy, ResizePolicyKind};
 use kernel_types::dma::IoBufferError;
 use kernel_types::executor::{
-    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
-    UserExecutorResizePolicy, USER_EXECUTOR_PROFILE_GENERAL, USER_EXECUTOR_RESIZE_FIXED,
-    USER_EXECUTOR_RESIZE_GEOMETRIC, USER_EXECUTOR_RESIZE_LINEAR, USER_EXECUTOR_UPDATE_ALL,
-    USER_EXECUTOR_UPDATE_MAX_ACTIVE, USER_EXECUTOR_UPDATE_RESIZE_POLICY,
+    USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainInfo,
+    UserExecutorDomainUpdate,
 };
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
@@ -477,73 +473,6 @@ fn resolve_executor_domain(
         ));
     }
     Ok(domain)
-}
-
-fn decode_resize_policy(raw: UserExecutorResizePolicy) -> Result<ResizePolicyKind, u64> {
-    let maximum_capacity = (raw.maximum_capacity != 0).then_some(raw.maximum_capacity);
-    let policy = match raw.kind {
-        USER_EXECUTOR_RESIZE_FIXED => ResizePolicyKind::Fixed,
-        USER_EXECUTOR_RESIZE_LINEAR => ResizePolicyKind::Linear(LinearResizePolicy {
-            minimum_capacity: raw.minimum_capacity,
-            grow_by: raw.grow_by_or_factor,
-            shrink_by: raw.shrink_by,
-            shrink_trigger_percent: raw
-                .shrink_trigger_percent
-                .try_into()
-                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?,
-            maximum_capacity,
-        }),
-        USER_EXECUTOR_RESIZE_GEOMETRIC => ResizePolicyKind::Geometric(GeometricResizePolicy {
-            minimum_capacity: raw.minimum_capacity,
-            growth_factor: raw.grow_by_or_factor,
-            shrink_trigger_percent: raw
-                .shrink_trigger_percent
-                .try_into()
-                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?,
-            shrink_target_percent: raw
-                .shrink_target_percent
-                .try_into()
-                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?,
-            maximum_capacity,
-        }),
-        _ => {
-            return Err(make_err(
-                ErrClass::Common,
-                CommonErr::InvalidPtr as u16,
-                raw.kind,
-            ));
-        }
-    };
-    policy
-        .validate()
-        .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))
-}
-
-fn encode_resize_policy(policy: ResizePolicyKind) -> UserExecutorResizePolicy {
-    match policy {
-        ResizePolicyKind::Fixed => UserExecutorResizePolicy {
-            kind: USER_EXECUTOR_RESIZE_FIXED,
-            ..UserExecutorResizePolicy::default()
-        },
-        ResizePolicyKind::Linear(policy) => UserExecutorResizePolicy {
-            kind: USER_EXECUTOR_RESIZE_LINEAR,
-            shrink_trigger_percent: policy.shrink_trigger_percent as u32,
-            minimum_capacity: policy.minimum_capacity,
-            grow_by_or_factor: policy.grow_by,
-            shrink_by: policy.shrink_by,
-            maximum_capacity: policy.maximum_capacity.unwrap_or(0),
-            ..UserExecutorResizePolicy::default()
-        },
-        ResizePolicyKind::Geometric(policy) => UserExecutorResizePolicy {
-            kind: USER_EXECUTOR_RESIZE_GEOMETRIC,
-            shrink_trigger_percent: policy.shrink_trigger_percent as u32,
-            shrink_target_percent: policy.shrink_target_percent as u32,
-            minimum_capacity: policy.minimum_capacity,
-            grow_by_or_factor: policy.growth_factor,
-            maximum_capacity: policy.maximum_capacity.unwrap_or(0),
-            ..UserExecutorResizePolicy::default()
-        },
-    }
 }
 
 fn publish_io_buffer_backing(
@@ -1007,18 +936,10 @@ pub(crate) fn sys_executor_domain_create(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let config = unsafe { *config_ptr };
-    if config.profile != USER_EXECUTOR_PROFILE_GENERAL || config.initial_queue_capacity == 0 {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-    }
-    let resize_policy = match decode_resize_policy(config.resize_policy) {
-        Ok(policy) => policy,
-        Err(err) => return err,
-    };
     let (caller_pid, caller) = match current_process() {
         Ok(current) => current,
         Err(err) => return err,
     };
-    let cpu_count = platform::processor_count();
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::ProcessIo,
         max_active: if config.max_active_tasks == 0 {
@@ -1026,12 +947,14 @@ pub(crate) fn sys_executor_domain_create(
         } else {
             config.max_active_tasks
         },
-        initial_queue_capacity: config.initial_queue_capacity,
-        interrupt_fallback_capacity: Some(cpu_count.max(1).saturating_mul(4)),
         quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
         weight: ExecutorDomainClass::ProcessIo.default_weight(),
-        resize_policy,
         future_arena: Default::default(),
+        ready_shards: if config.ready_shards == 0 {
+            GlobalAsyncExecutor::global().worker_count()
+        } else {
+            config.ready_shards
+        },
     });
     let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) else {
         return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
@@ -1054,21 +977,13 @@ pub(crate) fn sys_executor_domain_configure(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let update = unsafe { *update_ptr };
-    if update.fields == 0 || update.fields & !USER_EXECUTOR_UPDATE_ALL != 0 {
+    if update.fields != USER_EXECUTOR_UPDATE_MAX_ACTIVE {
         return make_err(
             ErrClass::Common,
             CommonErr::InvalidPtr as u16,
             update.fields,
         );
     }
-    let replacement = if update.fields & USER_EXECUTOR_UPDATE_RESIZE_POLICY != 0 {
-        match decode_resize_policy(update.resize_policy) {
-            Ok(policy) => Some(policy),
-            Err(err) => return err,
-        }
-    } else {
-        None
-    };
     let (caller_pid, caller) = match current_process() {
         Ok(current) => current,
         Err(err) => return err,
@@ -1088,15 +1003,7 @@ pub(crate) fn sys_executor_domain_configure(
             update.max_active_tasks
         },
     );
-    match domain.update_config(replacement, max_active) {
-        ReplaceResizePolicyResult::Changed => {}
-        ReplaceResizePolicyResult::RetryLater => {
-            return make_err(ErrClass::Common, CommonErr::BufferTooSmall as u16, 0);
-        }
-        ReplaceResizePolicyResult::Rejected => {
-            return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-        }
-    }
+    domain.update_config(max_active);
     0
 }
 
@@ -1119,26 +1026,20 @@ pub(crate) fn sys_executor_domain_query(
         };
     let stats = domain.stats();
     let info = UserExecutorDomainInfo {
-        profile: USER_EXECUTOR_PROFILE_GENERAL,
         state: match stats.state {
             ExecutorDomainState::Active => 0,
             ExecutorDomainState::Draining => 1,
             ExecutorDomainState::Dead => 2,
         },
-        resize_policy_kind: encode_resize_policy(stats.resize_policy).kind,
         max_active_tasks: (stats.max_active != usize::MAX)
             .then_some(stats.max_active)
             .unwrap_or(0),
-        initial_queue_capacity: stats.initial_queue_capacity,
-        queue_capacity: stats.queue_capacity,
-        queue_minimum_capacity: stats.queue_minimum_capacity,
-        queue_maximum_capacity: stats.queue_maximum_capacity.unwrap_or(0),
         queued_tasks: stats.queued_count,
         active_tasks: stats.active_count,
         live_tasks: stats.live_task_count,
         live_futures: stats.live_future_count,
         live_future_bytes: stats.live_future_bytes,
-        resize_policy: encode_resize_policy(stats.resize_policy),
+        ready_shards: stats.ready_shards,
     };
     unsafe { info_ptr.write(info) };
     0
