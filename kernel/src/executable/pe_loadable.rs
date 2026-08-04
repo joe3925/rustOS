@@ -289,62 +289,58 @@ impl PELoader {
         self.patch_imports(program)
     }
 
-    pub async fn dll_load(&mut self, program: &mut Program) -> Result<ModuleHandle, LoadError> {
+    pub(crate) fn map_dll_unpatched(
+        &mut self,
+        program: &mut Program,
+    ) -> Result<ModuleHandle, LoadError> {
         if !self.pe.is_lib {
             return Err(LoadError::NotDLL);
         }
-
         if !self.pe.is_64 {
             return Err(LoadError::Not64Bit);
         }
 
         let new_address_space_root = program.address_space_root;
         let old_address_space_root = crate::memory::paging::current_address_space_root();
-
         let were_enabled = platform::interrupts_enabled();
         if were_enabled {
             platform::disable_interrupts();
         }
-
         unsafe {
             crate::memory::paging::switch_address_space_root(new_address_space_root);
         }
-
-        let map_result = self.map_into_program(program);
-
+        let result = self.map_into_program(program).map(|(handle, _, _)| handle);
         unsafe {
             crate::memory::paging::switch_address_space_root(old_address_space_root);
         }
-
         if were_enabled {
             platform::enable_interrupts();
         }
+        result
+    }
 
-        let (handle, _exports, _image_size) = map_result?;
-
+    pub(crate) fn patch_mapped_dll(&mut self, program: &mut Program) -> Result<(), LoadError> {
         let old_address_space_root = crate::memory::paging::current_address_space_root();
-
         let were_enabled = platform::interrupts_enabled();
         if were_enabled {
             platform::disable_interrupts();
         }
-
         unsafe {
-            crate::memory::paging::switch_address_space_root(new_address_space_root);
+            crate::memory::paging::switch_address_space_root(program.address_space_root);
         }
-
-        let patch_result = self.patch_imports_sync(program);
-
+        let result = self.patch_imports_sync(program);
         unsafe {
             crate::memory::paging::switch_address_space_root(old_address_space_root);
         }
-
         if were_enabled {
             platform::enable_interrupts();
         }
+        result
+    }
 
-        patch_result?;
-
+    pub async fn dll_load(&mut self, program: &mut Program) -> Result<ModuleHandle, LoadError> {
+        let handle = self.map_dll_unpatched(program)?;
+        self.patch_mapped_dll(program)?;
         Ok(handle)
     }
 

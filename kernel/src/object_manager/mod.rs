@@ -8,8 +8,13 @@ use core::{
     hash::{BuildHasherDefault, Hasher},
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
-use kernel_types::object_manager::ObjectTag;
+use kernel_executor::global_async::ExecutorDomainState;
+use kernel_types::executor::UserExecutorDomainInfo;
 use kernel_types::object_manager::OmError;
+use kernel_types::object_manager::{
+    ObjectInformationClass, ObjectTag, UserDeviceInfo, UserIoBufferBackingInfo, UserModuleInfo,
+    UserObjectBasicInfo, UserProgramInfo, UserQueueInfo,
+};
 
 use hashbrown::HashMap;
 use kernel_types::device::{DeviceObject, ModuleHandle};
@@ -26,8 +31,16 @@ use crate::structs::io_request::FileObject;
 pub mod behavior;
 pub use behavior::{
     AccessContext, AccessPolicy, CapabilityAccessPolicy, InterfaceMask, ObjectBehavior,
-    ObjectOperation,
+    ObjectOperation, ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, ObjectQueryInfo,
 };
+
+unsafe impl ObjectQueryInfo for UserObjectBasicInfo {}
+unsafe impl ObjectQueryInfo for UserModuleInfo {}
+unsafe impl ObjectQueryInfo for UserExecutorDomainInfo {}
+unsafe impl ObjectQueryInfo for UserProgramInfo {}
+unsafe impl ObjectQueryInfo for UserQueueInfo {}
+unsafe impl ObjectQueryInfo for UserIoBufferBackingInfo {}
+unsafe impl ObjectQueryInfo for UserDeviceInfo {}
 
 const OBJECT_ALIVE: u8 = 0;
 const OBJECT_DEAD: u8 = 1;
@@ -273,10 +286,20 @@ impl Object {
                     Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
                 }
             }
+            ObjectPayload::Module(module) => {
+                let parent_pid = module.read().parent_pid;
+                let Some(program) = crate::executable::program::PROGRAM_MANAGER.get(parent_pid)
+                else {
+                    return IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER);
+                };
+                match program.write().unload_module(module) {
+                    Ok(()) => IoRequestOutput::success(0, 0),
+                    Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
+                }
+            }
             ObjectPayload::Directory(_)
             | ObjectPayload::Symlink(_)
             | ObjectPayload::Generic(_)
-            | ObjectPayload::Module(_)
             | ObjectPayload::Device(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
         }
     }
@@ -347,9 +370,99 @@ impl ObjectBehavior for SymlinkBody {
 }
 
 impl_object_behavior!(ObjRef, ObjectTag::Generic);
-impl_object_behavior!(ModuleHandle, ObjectTag::Module);
-impl_object_behavior!(Arc<DeviceObject>, ObjectTag::Device);
-impl_object_behavior!(Arc<UserExecutorDomain>, ObjectTag::ExecutorDomain);
+
+impl ObjectBehavior for ModuleHandle {
+    fn class(&self) -> ObjectTag {
+        ObjectTag::Module
+    }
+
+    fn supported_interfaces(&self) -> InterfaceMask {
+        behavior::standard_interfaces(ObjectTag::Module)
+    }
+
+    fn required_interface(&self, operation: ObjectOperation) -> Option<InterfaceMask> {
+        Some(behavior::interface_for_operation(
+            ObjectTag::Module,
+            operation,
+        ))
+    }
+
+    fn query(
+        &self,
+        context: ObjectQueryContext,
+        information_class: u32,
+        output: &mut ObjectQueryBuffer,
+    ) -> Result<(), ObjectQueryError> {
+        if information_class != ObjectInformationClass::Module as u32 {
+            return Err(ObjectQueryError::UnsupportedClass);
+        }
+        let program = crate::executable::program::PROGRAM_MANAGER
+            .get(context.caller_pid)
+            .ok_or(ObjectQueryError::InvalidObject)?;
+        if !program
+            .read()
+            .modules
+            .read()
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, self))
+        {
+            return Err(ObjectQueryError::InvalidObject);
+        }
+        let module = self.read();
+        output.write(&UserModuleInfo {
+            image_base: module.image_base.as_u64(),
+            image_size: module.image_size,
+        })
+    }
+}
+
+impl ObjectBehavior for Arc<UserExecutorDomain> {
+    fn class(&self) -> ObjectTag {
+        ObjectTag::ExecutorDomain
+    }
+
+    fn supported_interfaces(&self) -> InterfaceMask {
+        behavior::standard_interfaces(ObjectTag::ExecutorDomain)
+    }
+
+    fn required_interface(&self, operation: ObjectOperation) -> Option<InterfaceMask> {
+        Some(behavior::interface_for_operation(
+            ObjectTag::ExecutorDomain,
+            operation,
+        ))
+    }
+
+    fn query(
+        &self,
+        _context: ObjectQueryContext,
+        information_class: u32,
+        output: &mut ObjectQueryBuffer,
+    ) -> Result<(), ObjectQueryError> {
+        if information_class != ObjectInformationClass::ExecutorDomain as u32 {
+            return Err(ObjectQueryError::UnsupportedClass);
+        }
+        let stats = self.stats();
+        output.write(&UserExecutorDomainInfo {
+            state: match stats.state {
+                ExecutorDomainState::Active => 0,
+                ExecutorDomainState::Draining => 1,
+                ExecutorDomainState::Dead => 2,
+            },
+            reserved: 0,
+            max_active_tasks: if stats.max_active == usize::MAX {
+                0
+            } else {
+                stats.max_active as u64
+            },
+            queued_tasks: stats.queued_count as u64,
+            active_tasks: stats.active_count as u64,
+            live_tasks: stats.live_task_count as u64,
+            live_futures: stats.live_future_count as u64,
+            live_future_bytes: stats.live_future_bytes as u64,
+            ready_shards: stats.ready_shards as u64,
+        })
+    }
+}
 
 impl ObjectBehavior for Arc<MappedIoBufferBacking> {
     fn class(&self) -> ObjectTag {
@@ -366,6 +479,22 @@ impl ObjectBehavior for Arc<MappedIoBufferBacking> {
             operation,
         ))
     }
+
+    fn query(
+        &self,
+        _context: ObjectQueryContext,
+        information_class: u32,
+        output: &mut ObjectQueryBuffer,
+    ) -> Result<(), ObjectQueryError> {
+        if information_class != ObjectInformationClass::IoBufferBacking as u32 {
+            return Err(ObjectQueryError::UnsupportedClass);
+        }
+        output.write(&UserIoBufferBackingInfo {
+            length: self.len() as u64,
+            access: self.access() as u32,
+            reserved: 0,
+        })
+    }
 }
 
 impl ObjectBehavior for TaskQueueRef {
@@ -380,6 +509,22 @@ impl ObjectBehavior for TaskQueueRef {
             ObjectTag::Queue,
             operation,
         ))
+    }
+
+    fn query(
+        &self,
+        _context: ObjectQueryContext,
+        information_class: u32,
+        output: &mut ObjectQueryBuffer,
+    ) -> Result<(), ObjectQueryError> {
+        if information_class != ObjectInformationClass::Queue as u32 {
+            return Err(ObjectQueryError::UnsupportedClass);
+        }
+        output.write(&UserQueueInfo {
+            queued_messages: self.len() as u64,
+            closed: self.is_closed() as u32,
+            reserved: 0,
+        })
     }
 }
 
@@ -425,6 +570,60 @@ impl ObjectBehavior for ProgramHandle {
             ObjectTag::Program,
             operation,
         ))
+    }
+
+    fn query(
+        &self,
+        _context: ObjectQueryContext,
+        information_class: u32,
+        output: &mut ObjectQueryBuffer,
+    ) -> Result<(), ObjectQueryError> {
+        if information_class != ObjectInformationClass::Program as u32 {
+            return Err(ObjectQueryError::UnsupportedClass);
+        }
+        let program = self.read();
+        output.write(&UserProgramInfo {
+            pid: program.pid,
+            image_base: program.image_base.as_u64(),
+            managed_threads: program.managed_threads.lock().len() as u64,
+            loaded_modules: program.modules.read().len() as u64,
+        })
+    }
+}
+
+impl ObjectBehavior for Arc<DeviceObject> {
+    fn class(&self) -> ObjectTag {
+        ObjectTag::Device
+    }
+
+    fn supported_interfaces(&self) -> InterfaceMask {
+        behavior::standard_interfaces(ObjectTag::Device)
+    }
+
+    fn required_interface(&self, operation: ObjectOperation) -> Option<InterfaceMask> {
+        Some(behavior::interface_for_operation(
+            ObjectTag::Device,
+            operation,
+        ))
+    }
+
+    fn query(
+        &self,
+        _context: ObjectQueryContext,
+        information_class: u32,
+        output: &mut ObjectQueryBuffer,
+    ) -> Result<(), ObjectQueryError> {
+        if information_class != ObjectInformationClass::Device as u32 {
+            return Err(ObjectQueryError::UnsupportedClass);
+        }
+        output.write(&UserDeviceInfo {
+            generation: self.generation(),
+            protocol_generation: self.protocol_generation(),
+            dispatch_tickets: self.dispatch_tickets.load(Ordering::Acquire),
+            started: self.is_started() as u32,
+            removed: self.is_removed() as u32,
+            reserved: 0,
+        })
     }
 }
 

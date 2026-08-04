@@ -6,9 +6,7 @@ use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
-use kernel_types::executor::{
-    UserExecutorDomainCreate, UserExecutorDomainInfo, UserExecutorDomainUpdate,
-};
+use kernel_types::executor::{UserExecutorDomainCreate, UserExecutorDomainUpdate};
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
@@ -138,10 +136,12 @@ make_wrapper!(
     *const UserExecutorDomainUpdate
 );
 make_wrapper!(
-    wrap_executor_domain_query,
-    sys_executor_domain_query,
+    wrap_object_query,
+    sys_object_query,
     UserHandle,
-    *mut UserExecutorDomainInfo
+    u32,
+    *mut u8,
+    usize
 );
 make_wrapper!(wrap_io_enqueue, sys_io_enqueue, UserHandle, *const UserIoOp);
 make_wrapper!(
@@ -208,34 +208,33 @@ make_wrapper!(
     u64,
     u64
 );
-
 const SYSCALL_TABLE: &[Handler] = &[
-    wrap_print,                     // 0
-    wrap_destroy,                   // 1
-    wrap_create,                    // 2
-    wrap_completion_queue_create,   // 3
-    wrap_io_enqueue,                // 4
-    wrap_io_enqueue_many,           // 5
-    wrap_completion_poll,           // 6
-    wrap_completion_wait,           // 7
-    wrap_io_cancel,                 // 8
-    wrap_get_thread,                // 9
-    wrap_mq_request,                // 10
-    wrap_mq_route_add,              // 11
-    wrap_mq_route_clear,            // 12
-    wrap_mq_peek_removed,           // 13 (reserved; mq_peek removed)
-    wrap_get_default_mq_handle,     // 14
-    wrap_create_mq,                 // 15
-    wrap_object_acquire,            // 16
-    wrap_object_close,              // 17
-    wrap_symlink_create,            // 18
-    wrap_symlink_withdraw,          // 19
-    wrap_message_complete,          // 20
-    wrap_object_duplicate,          // 21
-    wrap_io_buffer_register,        // 22
-    wrap_executor_domain_create,    // 23
-    wrap_executor_domain_configure, // 24
-    wrap_executor_domain_query,     // 25
+    wrap_print,
+    wrap_destroy,
+    wrap_create,
+    wrap_completion_queue_create,
+    wrap_io_enqueue,
+    wrap_io_enqueue_many,
+    wrap_completion_poll,
+    wrap_completion_wait,
+    wrap_io_cancel,
+    wrap_get_thread,
+    wrap_mq_request,
+    wrap_mq_route_add,
+    wrap_mq_route_clear,
+    wrap_mq_peek_removed,
+    wrap_get_default_mq_handle,
+    wrap_create_mq,
+    wrap_object_acquire,
+    wrap_object_close,
+    wrap_symlink_create,
+    wrap_symlink_withdraw,
+    wrap_message_complete,
+    wrap_object_duplicate,
+    wrap_io_buffer_register,
+    wrap_executor_domain_create,
+    wrap_executor_domain_configure,
+    wrap_object_query,
 ];
 
 #[unsafe(no_mangle)]

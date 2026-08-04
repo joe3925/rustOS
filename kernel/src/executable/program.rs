@@ -119,6 +119,10 @@ impl MessageQueue {
     pub fn is_closed(&self) -> bool {
         self.queue.is_closed()
     }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
 }
 #[derive(Debug)]
 struct HandleSlot {
@@ -493,30 +497,65 @@ impl Program {
         Ok(())
     }
     pub async fn load_module(&mut self, root_path: Path) -> Result<ModuleHandle, LoadError> {
+        self.load_module_with_search_dirs(root_path, Vec::new())
+            .await
+    }
+
+    pub async fn load_module_with_search_dirs(
+        &mut self,
+        root_path: Path,
+        search_dirs: Vec<Path>,
+    ) -> Result<ModuleHandle, LoadError> {
         let mut queue = Vec::new();
         queue.push(root_path);
-
-        let mut last_handle = None;
+        let mut mapped = Vec::new();
+        let mut mapped_handles = Vec::new();
+        let mut root_handle = None;
 
         while let Some(path) = queue.pop() {
-            let mut loader = PELoader::new(&path).await.ok_or(LoadError::NoFile)?;
-            let handle = loader.dll_load(self).await?;
-
-            last_handle = Some(handle.clone());
+            if let Some(name) = path.file_name() {
+                if self.has_module(name) {
+                    if root_handle.is_none() {
+                        root_handle = self
+                            .modules
+                            .read()
+                            .iter()
+                            .find(|module| {
+                                strip_ext(&module.read().title)
+                                    .eq_ignore_ascii_case(strip_ext(name))
+                            })
+                            .cloned();
+                    }
+                    continue;
+                }
+            }
+            let Some(mut loader) = PELoader::new(&path).await else {
+                self.rollback_module_load(&mapped_handles);
+                return Err(LoadError::NoFile);
+            };
+            let handle = match loader.map_dll_unpatched(self) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.rollback_module_load(&mapped_handles);
+                    return Err(error);
+                }
+            };
+            if root_handle.is_none() {
+                root_handle = Some(handle.clone());
+            }
+            mapped_handles.push(handle);
 
             for dll in loader.list_import_dlls() {
                 if self.has_module(&dll) {
                     continue;
                 }
 
-                let search_dirs = [
-                    self.working_dir.clone(),
+                let mut found = false;
+                for dir in search_dirs.iter().cloned().chain([
+                    self.image_path.parent().unwrap_or(self.working_dir.clone()),
                     Path::from_string(r"C:\bin\mod"),
                     Path::from_string(r"C:\system"),
-                ];
-
-                let mut found = false;
-                for dir in &search_dirs {
+                ]) {
                     let candidate = dir.clone().join(&dll);
                     if PELoader::new(&candidate).await.is_some() {
                         queue.push(candidate);
@@ -526,12 +565,49 @@ impl Program {
                 }
 
                 if !found {
+                    self.rollback_module_load(&mapped_handles);
                     return Err(LoadError::NoFile);
                 }
             }
+            mapped.push(loader);
         }
 
-        last_handle.ok_or(LoadError::NotDLL)
+        for loader in &mut mapped {
+            if let Err(error) = loader.patch_mapped_dll(self) {
+                self.rollback_module_load(&mapped_handles);
+                return Err(error);
+            }
+        }
+
+        root_handle.ok_or(LoadError::NotDLL)
+    }
+
+    fn rollback_module_load(&mut self, modules: &[ModuleHandle]) {
+        for module in modules.iter().rev() {
+            let _ = self.unload_module(module);
+        }
+    }
+
+    pub fn unload_module(&mut self, target: &ModuleHandle) -> Result<(), LoadError> {
+        let index = self
+            .modules
+            .read()
+            .iter()
+            .position(|module| Arc::ptr_eq(module, target))
+            .ok_or(LoadError::NoFile)?;
+        let (base, size) = {
+            let module = target.read();
+            (module.image_base, module.image_size)
+        };
+        self.modules.write().remove(index);
+        unsafe { self.tracker.dealloc(base.as_u64(), size) };
+        let old_root = crate::memory::paging::current_address_space_root();
+        platform::with_interrupts_disabled(|| unsafe {
+            crate::memory::paging::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::unmap_range_unchecked(base.into(), size);
+            crate::memory::paging::switch_address_space_root(old_root);
+        });
+        Ok(())
     }
 
     pub fn kill(&mut self) -> Result<(), LoadError> {

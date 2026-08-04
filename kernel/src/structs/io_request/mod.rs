@@ -9,6 +9,7 @@ use kernel_types::completion::TaskToken;
 use kernel_types::dma::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
+use kernel_types::object_manager::ObjectTag;
 use spin::{Mutex, RwLock};
 
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
@@ -46,6 +47,7 @@ pub enum IoOpcode {
     MqReceive = 7,
     ObjectDestroy = 8,
     MessageSendAwait = 9,
+    ModuleLoad = 10,
 
     SocketRecv = 64,
     SocketSend = 65,
@@ -66,6 +68,7 @@ impl IoOpcode {
             7 => Some(Self::MqReceive),
             8 => Some(Self::ObjectDestroy),
             9 => Some(Self::MessageSendAwait),
+            10 => Some(Self::ModuleLoad),
             64 => Some(Self::SocketRecv),
             65 => Some(Self::SocketSend),
             66 => Some(Self::TimerWait),
@@ -114,6 +117,13 @@ pub struct UserIoOp {
     pub offset: u64,
     pub extra0: u64,
     pub extra1: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UserPathDescriptor {
+    pub address: u64,
+    pub length: u64,
 }
 
 #[repr(C)]
@@ -309,6 +319,12 @@ pub enum KernelIoOp {
         sender: UserHandle,
         user_token: u64,
     },
+    ModuleLoad {
+        owner: ProgramHandle,
+        path: Path,
+        search_dirs: Vec<Path>,
+        user_token: u64,
+    },
 }
 
 impl KernelIoOp {
@@ -324,6 +340,7 @@ impl KernelIoOp {
             Self::MqReceive { .. } => IoOpcode::MqReceive,
             Self::ObjectDestroy { .. } => IoOpcode::ObjectDestroy,
             Self::MessageSendAwait { .. } => IoOpcode::MessageSendAwait,
+            Self::ModuleLoad { .. } => IoOpcode::ModuleLoad,
         }
     }
 
@@ -339,7 +356,9 @@ impl KernelIoOp {
             | Self::ChangeDirectory { user_token, .. }
             | Self::MqReceive { user_token, .. }
             | Self::ObjectDestroy { user_token, .. } => *user_token,
-            Self::MessageSendAwait { user_token, .. } => *user_token,
+            Self::MessageSendAwait { user_token, .. } | Self::ModuleLoad { user_token, .. } => {
+                *user_token
+            }
         }
     }
 
@@ -410,6 +429,12 @@ impl KernelIoOp {
                     Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
                 }
             }
+            Self::ModuleLoad {
+                owner,
+                path,
+                search_dirs,
+                ..
+            } => run_module_load(owner, path, search_dirs).await,
         }
     }
 }
@@ -1000,4 +1025,28 @@ async fn run_change_directory(owner: ProgramHandle, path: Path) -> IoRequestOutp
 
     owner.write().working_dir = path;
     IoRequestOutput::success(0, 0)
+}
+
+async fn run_module_load(
+    owner: ProgramHandle,
+    path: Path,
+    search_dirs: Vec<Path>,
+) -> IoRequestOutput {
+    let module = {
+        let mut program = owner.write();
+        match program
+            .load_module_with_search_dirs(path, search_dirs)
+            .await
+        {
+            Ok(module) => module,
+            Err(_) => return IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
+        }
+    };
+    let object = Object::new(ObjectTag::Module, ObjectPayload::Module(module));
+    let handle = owner.read().create_user_handle_for_object(object);
+    if handle == 0 {
+        IoRequestOutput::error(IO_STATUS_NO_MEMORY)
+    } else {
+        IoRequestOutput::success(handle, 0)
+    }
 }

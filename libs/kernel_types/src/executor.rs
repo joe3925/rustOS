@@ -22,11 +22,12 @@ pub struct UserExecutorDomainUpdate {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UserExecutorDomainInfo {
     pub state: u32,
-    pub max_active_tasks: usize,
-    pub queued_tasks: usize,
-    pub active_tasks: usize,
-    pub live_tasks: usize,
-    pub live_futures: usize,
-    pub live_future_bytes: usize,
-    pub ready_shards: usize,
+    pub reserved: u32,
+    pub max_active_tasks: u64,
+    pub queued_tasks: u64,
+    pub active_tasks: u64,
+    pub live_tasks: u64,
+    pub live_futures: u64,
+    pub live_future_bytes: u64,
+    pub ready_shards: u64,
 }

@@ -10,6 +10,7 @@ use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
 use crate::structs::io_request::{
     FileObject, IoOpcode, KernelIoOp, MessageDelivery, RequestId, UserIoCompletion, UserIoOp,
+    UserPathDescriptor,
 };
 use crate::{format, print};
 use crate::{scheduling::task::TaskHandle, util::generate_guid};
@@ -18,20 +19,19 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_executor::global_async::{
-    ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainState, GlobalAsyncExecutor,
+    ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor,
 };
 use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::dma::IoBufferError;
 use kernel_types::executor::{
-    USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainInfo,
-    UserExecutorDomainUpdate,
+    USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainUpdate,
 };
 use kernel_types::fs::{OpenFlags, Path};
-use kernel_types::object_manager::ObjectTag;
+use kernel_types::object_manager::{ObjectInformationClass, ObjectTag, UserObjectBasicInfo};
 
 use crate::object_manager::{
     AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
-    TaskQueueRef,
+    ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, TaskQueueRef,
 };
 use crate::structs::executor_domain::UserExecutorDomain;
 
@@ -583,6 +583,35 @@ fn validate_user_buffer(addr: u64, len: usize) -> Result<(), u64> {
     Ok(())
 }
 
+fn copy_user_path_descriptors(addr: u64, count: usize) -> Result<Vec<String>, u64> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = count
+        .checked_mul(core::mem::size_of::<UserPathDescriptor>())
+        .ok_or_else(|| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+    validate_user_buffer(addr, bytes)?;
+    let mut paths = Vec::new();
+    paths
+        .try_reserve(count)
+        .map_err(|_| make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0))?;
+    for index in 0..count {
+        let descriptor = unsafe {
+            (addr as *const UserPathDescriptor)
+                .add(index)
+                .read_unaligned()
+        };
+        let length = usize::try_from(descriptor.length)
+            .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+        let path = copy_user_string(descriptor.address, length)?;
+        if path.is_empty() {
+            return Err(make_err(ErrClass::File, FileErr::PathInvalid as u16, 0));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
 fn build_kernel_io_op(
     caller_pid: u64,
     caller: &ProgramHandle,
@@ -608,6 +637,28 @@ fn build_kernel_io_op(
                 owner: caller.clone(),
                 path: resolve_with_working_dir(caller, &path),
                 flags: open_flags_from_bits(op.flags),
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::ModuleLoad => {
+            if op.flags != 0 || op.target_handle != 0 {
+                return Err(make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0));
+            }
+            let path = copy_user_string(op.buffer, op.length as usize)?;
+            if path.is_empty() {
+                return Err(make_err(ErrClass::File, FileErr::PathInvalid as u16, 0));
+            }
+            let count = usize::try_from(op.extra1)
+                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+            let dirs = copy_user_path_descriptors(op.extra0, count)?;
+            let search_dirs = dirs
+                .iter()
+                .map(|dir| resolve_with_working_dir(caller, dir))
+                .collect();
+            Ok(KernelIoOp::ModuleLoad {
+                owner: caller.clone(),
+                path: resolve_with_working_dir(caller, &path),
+                search_dirs,
                 user_token: op.user_token,
             })
         }
@@ -1007,42 +1058,85 @@ pub(crate) fn sys_executor_domain_configure(
     0
 }
 
-pub(crate) fn sys_executor_domain_query(
-    handle: UserHandle,
-    info_ptr: *mut UserExecutorDomainInfo,
-) -> u64 {
-    if info_ptr.is_null() || !user_ptr_ok(info_ptr, core::mem::size_of::<UserExecutorDomainInfo>())
-    {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+fn write_object_info(output: *mut u8, output_len: usize, value: &[u8]) -> u64 {
+    let required = value.len();
+    if output.is_null() || output_len < required {
+        return make_err(
+            ErrClass::Common,
+            CommonErr::BufferTooSmall as u16,
+            required as u32,
+        );
     }
+    if !user_ptr_ok(output, required) {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 2);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(value.as_ptr(), output, required);
+    }
+    0
+}
+
+pub(crate) fn sys_object_query(
+    handle: UserHandle,
+    information_class: u32,
+    output: *mut u8,
+    output_len: usize,
+) -> u64 {
     let (caller_pid, caller) = match current_process() {
         Ok(current) => current,
         Err(err) => return err,
     };
-    let domain =
-        match resolve_executor_domain(handle, caller_pid, &caller, ObjectOperation::Observe) {
-            Ok(domain) => domain,
-            Err(err) => return err,
-        };
-    let stats = domain.stats();
-    let info = UserExecutorDomainInfo {
-        state: match stats.state {
-            ExecutorDomainState::Active => 0,
-            ExecutorDomainState::Draining => 1,
-            ExecutorDomainState::Dead => 2,
-        },
-        max_active_tasks: (stats.max_active != usize::MAX)
-            .then_some(stats.max_active)
-            .unwrap_or(0),
-        queued_tasks: stats.queued_count,
-        active_tasks: stats.active_count,
-        live_tasks: stats.live_task_count,
-        live_futures: stats.live_future_count,
-        live_future_bytes: stats.live_future_bytes,
-        ready_shards: stats.ready_shards,
+    let entry = match caller.read().resolve_handle_entry(handle) {
+        Some(entry) => entry,
+        None => {
+            return make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                handle as u32,
+            );
+        }
     };
-    unsafe { info_ptr.write(info) };
-    0
+    if !entry
+        .object
+        .behavior()
+        .matches(entry.interface, ObjectOperation::Observe)
+    {
+        return make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        );
+    }
+
+    let mut query = ObjectQueryBuffer::new();
+    let result = if information_class == ObjectInformationClass::Basic as u32 {
+        query.write(&UserObjectBasicInfo {
+            object_type: entry.object.tag as u32,
+            reserved: 0,
+            granted_interfaces: entry.interface.bits(),
+            supported_interfaces: entry.object.behavior().supported_interfaces().bits(),
+        })
+    } else {
+        entry.object.behavior().query(
+            ObjectQueryContext { caller_pid },
+            information_class,
+            &mut query,
+        )
+    };
+
+    match result {
+        Ok(()) => write_object_info(output, output_len, query.as_bytes()),
+        Err(ObjectQueryError::UnsupportedClass) => make_err(
+            ErrClass::Common,
+            CommonErr::NotImplemented as u16,
+            information_class,
+        ),
+        Err(ObjectQueryError::InvalidObject | ObjectQueryError::ResultTooLarge) => make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        ),
+    }
 }
 
 pub(crate) fn sys_completion_queue_create(

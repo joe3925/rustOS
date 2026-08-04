@@ -44,6 +44,61 @@ pub struct AccessContext {
     pub caller_pid: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectQueryContext {
+    pub caller_pid: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectQueryError {
+    UnsupportedClass,
+    InvalidObject,
+    ResultTooLarge,
+}
+
+pub const MAX_OBJECT_QUERY_SIZE: usize = 128;
+
+/// An ABI value whose initialized representation contains no padding bytes.
+///
+/// # Safety
+/// Implementors must be `Copy` and have no uninitialized padding because the
+/// complete value representation is copied into a user-visible query buffer.
+pub unsafe trait ObjectQueryInfo: Copy {}
+
+pub struct ObjectQueryBuffer {
+    bytes: [u8; MAX_OBJECT_QUERY_SIZE],
+    len: usize,
+}
+
+impl ObjectQueryBuffer {
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; MAX_OBJECT_QUERY_SIZE],
+            len: 0,
+        }
+    }
+
+    pub fn write<T: ObjectQueryInfo>(&mut self, value: &T) -> Result<(), ObjectQueryError> {
+        let len = core::mem::size_of::<T>();
+        if len > self.bytes.len() {
+            return Err(ObjectQueryError::ResultTooLarge);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (value as *const T).cast::<u8>(),
+                self.bytes.as_mut_ptr(),
+                len,
+            );
+        }
+        self.len = len;
+        Ok(())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 pub trait AccessPolicy: Send + Sync {
     fn authorize(
         &self,
@@ -74,6 +129,15 @@ pub trait ObjectBehavior: Send + Sync {
     fn class(&self) -> ObjectTag;
     fn supported_interfaces(&self) -> InterfaceMask;
     fn required_interface(&self, operation: ObjectOperation) -> Option<InterfaceMask>;
+
+    fn query(
+        &self,
+        _context: ObjectQueryContext,
+        _information_class: u32,
+        _output: &mut ObjectQueryBuffer,
+    ) -> Result<(), ObjectQueryError> {
+        Err(ObjectQueryError::UnsupportedClass)
+    }
 
     fn matches(&self, granted: InterfaceMask, operation: ObjectOperation) -> bool {
         self.required_interface(operation)

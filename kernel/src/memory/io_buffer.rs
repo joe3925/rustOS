@@ -195,6 +195,14 @@ impl MappedIoBufferBacking {
         }
         OwnedIoBuffer::new(self.clone(), offset, len, true)
     }
+
+    pub fn len(&self) -> usize {
+        self.backing.len()
+    }
+
+    pub fn access(&self) -> UserBufferAccess {
+        self.access
+    }
 }
 
 impl Drop for MappedIoBufferBacking {
