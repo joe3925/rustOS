@@ -1,5 +1,5 @@
 use crate::executable::program::{
-    Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
+    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
 };
 use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::stack::StackSize;
@@ -30,8 +30,8 @@ use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
 
 use crate::object_manager::{
-    AccessContext, InterfaceMask, Object, ObjectOperation, ObjectPayload, TaskQueueRef,
-    OBJECT_MANAGER,
+    AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
+    TaskQueueRef,
 };
 use crate::structs::executor_domain::UserExecutorDomain;
 
@@ -1328,7 +1328,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
             // A bare queue has no owning process metadata yet, so sender
             // authority cannot be installed into its receiver here.
             msg.sender = None;
-            qh.write().push_message(msg.clone());
+            qh.push_message(msg.clone());
             0
         }
         _ => make_err(ErrClass::Message, MsgErr::UnsupportedTargetType as u16, 0),
@@ -1484,49 +1484,8 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     0
 }
 
-pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
-    if msg_ptr.is_null() || !user_ptr(msg_ptr) {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-    }
-
-    let caller_pid = SCHEDULER
-        .get_current_task(platform::current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
-    let prog = match PROGRAM_MANAGER.get(caller_pid) {
-        Some(p) => p,
-        None => {
-            return make_err(
-                ErrClass::Program,
-                ProgErr::NotFound as u16,
-                caller_pid as u32,
-            );
-        }
-    };
-
-    let qref = if qh == 0 {
-        ensure_default_queue_object(caller_pid, &prog).1
-    } else {
-        let o = match prog.read().resolve_handle(qh) {
-            Some(o) => o,
-            None => return make_err(ErrClass::Message, MsgErr::TargetHandleInvalid as u16, 0),
-        };
-        match &o.payload {
-            ObjectPayload::Queue(q) => q.clone(),
-            _ => return make_err(ErrClass::Message, MsgErr::TargetHandleInvalid as u16, 0),
-        }
-    };
-
-    let q = qref.write();
-    match q.peek_message() {
-        Some(m) => unsafe {
-            core::ptr::write_unaligned(msg_ptr, m.clone());
-            0
-        },
-        None => make_err(ErrClass::Message, MsgErr::TargetResolveFailed as u16, 0),
-    }
+pub(crate) fn sys_mq_peek_removed() -> u64 {
+    make_err(ErrClass::Common, CommonErr::NotImplemented as u16, 0)
 }
 
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
@@ -1560,9 +1519,7 @@ pub(crate) fn sys_create_mq() -> UserHandle {
     let _ = OBJECT_MANAGER.mkdirp(dir.clone());
 
     let name = guid_to_string(&generate_guid());
-    let qh: TaskQueueRef = alloc::sync::Arc::new(spin::RwLock::new(
-        crate::executable::program::MessageQueue::new(),
-    ));
+    let qh: TaskQueueRef = alloc::sync::Arc::new(crate::executable::program::MessageQueue::new());
     let obj = Object::with_name(ObjectTag::Queue, name.clone(), ObjectPayload::Queue(qh));
     let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", dir, name), &obj);
     prog.read().create_user_handle_for_object(obj)

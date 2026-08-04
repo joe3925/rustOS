@@ -7,6 +7,7 @@ use core::task::{Context, Poll, Waker};
 use crate::executable::program::{Message, ProgramHandle, QueueHandle};
 use crate::object_manager::behavior::CONFIGURE_BIT;
 use crate::object_manager::{InterfaceMask, Object, ObjectPayload};
+use kernel_sync::{AsyncRecvError, WaitRegistration};
 use kernel_types::object_manager::ObjectTag;
 use spin::Mutex;
 
@@ -121,6 +122,7 @@ impl Drop for MessageSendFuture {
 pub(crate) struct MqReceiveFuture {
     pub queue: QueueHandle,
     pub buffer: Option<OwnedIoBuffer<FromDevice>>,
+    pub registration: WaitRegistration,
 }
 
 impl Future for MqReceiveFuture {
@@ -128,16 +130,13 @@ impl Future for MqReceiveFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut queue = this.queue.write();
-
-        let Some(message) = queue.try_pop_message() else {
-            if queue.is_closed() {
+        let message = match this.queue.poll_message(&this.registration, cx) {
+            Poll::Ready(Ok(message)) => message,
+            Poll::Ready(Err(AsyncRecvError::Closed)) => {
                 return Poll::Ready(IoRequestOutput::error(IO_STATUS_CANCELLED));
             }
-            queue.register_waker(cx.waker());
-            return Poll::Pending;
+            Poll::Ready(Err(AsyncRecvError::Empty)) | Poll::Pending => return Poll::Pending,
         };
-        drop(queue);
 
         let message_size = core::mem::size_of::<Message>();
         if this

@@ -13,9 +13,9 @@ mod runner;
 mod suites;
 
 pub use capture::{
-    bench_log_span_end, bench_span_guard, bench_submit_interrupt_sample_current_core,
-    bench_submit_rip_sample, bench_submit_rip_sample_current_core, used_memory, BenchSpanGuard,
-    BenchWindow, BENCH_ENABLED,
+    BENCH_ENABLED, BenchSpanGuard, BenchWindow, bench_c_drive_io_async, bench_log_span_end,
+    bench_span_guard, bench_submit_interrupt_sample_current_core, bench_submit_rip_sample,
+    bench_submit_rip_sample_current_core, used_memory,
 };
 
 #[cfg(feature = "kernel-bench")]

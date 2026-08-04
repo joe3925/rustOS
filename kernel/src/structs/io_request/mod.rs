@@ -372,6 +372,7 @@ impl KernelIoOp {
                 MqReceiveFuture {
                     queue,
                     buffer: Some(buffer),
+                    registration: kernel_sync::WaitRegistration::new(),
                 }
                 .await
             }

@@ -1,12 +1,13 @@
 use crate::platform::user_vm_layout;
 use alloc::{
-    collections::{btree_map::BTreeMap, vec_deque::VecDeque},
+    collections::btree_map::BTreeMap,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
-use core::task::Waker;
+use core::task::{Context, Poll};
+use kernel_sync::{AsyncMpmcQueue, AsyncRecvError, WaitRegistration};
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::status::LoadError::NoSuchSymbol;
 use kernel_types::{device::ModuleHandle, fs::Path, memory::PeInfo, status::PageMapError};
@@ -32,7 +33,7 @@ use kernel_types::status::LoadError;
 
 type ObjectRef = Arc<Object>;
 pub type ProgramHandle = Arc<RwLock<Program>>;
-pub type QueueHandle = Arc<RwLock<MessageQueue>>;
+pub type QueueHandle = Arc<MessageQueue>;
 pub type UserHandle = u64;
 
 const INITIAL_HANDLE_CAPACITY: usize = 128;
@@ -74,16 +75,14 @@ fn guid_to_string(g: &[u8; 16]) -> String {
 }
 
 pub struct MessageQueue {
-    queue: VecDeque<Message>,
-    waiters: Vec<Waker>,
-    closed: bool,
+    queue: AsyncMpmcQueue<Message>,
 }
 
 impl core::fmt::Debug for MessageQueue {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MessageQueue")
             .field("queued", &self.queue.len())
-            .field("waiters", &self.waiters.len())
+            .field("closed", &self.queue.is_closed())
             .finish()
     }
 }
@@ -91,53 +90,34 @@ impl core::fmt::Debug for MessageQueue {
 impl MessageQueue {
     pub fn new() -> Self {
         Self {
-            queue: VecDeque::new(),
-            waiters: Vec::new(),
-            closed: false,
+            queue: AsyncMpmcQueue::new(),
         }
     }
 
-    pub fn push_message(&mut self, msg: Message) {
-        if self.closed {
-            return;
-        }
-        self.queue.push_back(msg);
-        self.wake_waiters();
+    pub fn push_message(&self, msg: Message) {
+        // Preserve the existing closed-queue behavior: messages sent after
+        // shutdown are discarded rather than reported to the sender.
+        let _ = self.queue.push(msg);
     }
 
-    pub fn try_pop_message(&mut self) -> Option<Message> {
-        self.queue.pop_front()
+    pub fn try_pop_message(&self) -> Option<Message> {
+        self.queue.try_pop().ok()
     }
 
-    pub fn peek_message(&self) -> Option<&Message> {
-        self.queue.front()
+    pub fn poll_message(
+        &self,
+        registration: &WaitRegistration,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Message, AsyncRecvError>> {
+        self.queue.poll_pop(registration, cx)
     }
 
-    pub fn register_waker(&mut self, waker: &Waker) {
-        if self
-            .waiters
-            .iter()
-            .all(|existing| !existing.will_wake(waker))
-        {
-            self.waiters.push(waker.clone());
-        }
-    }
-
-    pub fn wake_waiters(&mut self) {
-        let waiters = core::mem::take(&mut self.waiters);
-        for waiter in waiters {
-            waiter.wake();
-        }
-    }
-
-    pub fn shutdown(&mut self) {
-        self.closed = true;
-        self.queue.clear();
-        self.wake_waiters();
+    pub fn shutdown(&self) {
+        self.queue.shutdown();
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed
+        self.queue.is_closed()
     }
 }
 #[derive(Debug)]
@@ -389,7 +369,7 @@ impl Program {
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
             working_dir,
-            default_queue: Arc::new(RwLock::new(MessageQueue::new())),
+            default_queue: Arc::new(MessageQueue::new()),
             user_memory: Arc::new(UserMemoryPins::new()),
             extra_queues: Mutex::new(BTreeMap::new()),
             routing_rules: Mutex::new(Vec::new()),
@@ -668,7 +648,7 @@ impl Program {
     }
 
     pub fn new_mq(&self) -> ObjectRef {
-        let qh = Arc::new(RwLock::new(MessageQueue::new()));
+        let qh = Arc::new(MessageQueue::new());
         let base = alloc::format!("\\Process\\{}\\Resources\\Queues", self.pid);
         let _ = OBJECT_MANAGER.mkdir_p("\\Process");
         let _ = OBJECT_MANAGER.mkdir_p(alloc::format!("\\Process\\{}", self.pid));
@@ -721,18 +701,18 @@ impl Program {
             Some(RoutingAction::Block) => {}
 
             Some(RoutingAction::Allow) | None => {
-                self.default_queue.write().push_message(msg);
+                self.default_queue.push_message(msg);
             }
 
             Some(RoutingAction::Reroute(qh)) => {
-                qh.write().push_message(msg);
+                qh.push_message(msg);
             }
 
             Some(RoutingAction::Callback(th, qh_opt)) => {
                 if let Some(qh) = qh_opt {
-                    qh.write().push_message(msg);
+                    qh.push_message(msg);
                 } else {
-                    self.default_queue.write().push_message(msg);
+                    self.default_queue.push_message(msg);
                 }
 
                 let task = th;

@@ -1,4 +1,4 @@
-use crate::benchmarking::used_memory;
+use crate::benchmarking::{bench_c_drive_io_async, used_memory};
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::profiling::backtrace::Backtrace;
 use crate::static_handlers::print;
@@ -414,6 +414,10 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
         crate::benchmarking::register_builtin_suites();
         let passed = crate::benchmarking::run_configured_suites().await;
         crate::benchmarking::exit_benchmark_vm(passed);
+    });
+    spawn_detached(async {
+        bench_c_drive_io_async(true).await;
+        trigger_triple_fault();
     });
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});

@@ -32,7 +32,7 @@ pub use behavior::{
 const OBJECT_ALIVE: u8 = 0;
 const OBJECT_DEAD: u8 = 1;
 
-pub type TaskQueueRef = Arc<RwLock<MessageQueue>>;
+pub type TaskQueueRef = Arc<MessageQueue>;
 pub type ObjRef = Arc<dyn Any + Send + Sync>;
 
 #[derive(Default)]
@@ -249,7 +249,7 @@ impl Object {
                 IoRequestOutput::success(0, 0)
             }
             ObjectPayload::Queue(queue) => {
-                queue.write().shutdown();
+                queue.shutdown();
                 IoRequestOutput::success(0, 0)
             }
             ObjectPayload::CompletionQueue(queue) => {

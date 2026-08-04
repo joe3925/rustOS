@@ -1,17 +1,38 @@
 use alloc::string::String;
 
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
-use loom::sync::Arc;
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use loom::sync::Arc;
 use loom::thread;
 
-use crate::bounded_mpmc::{BoundedSendError, bounded_mpmc_channel};
+use crate::async_mpmc::AsyncMpmcQueue;
+use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedSendError};
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue};
 use crate::completion_port::CompletionPort;
-use crate::mpmc::{SendError as MpmcSendError, TryRecvError, mpmc_channel};
+use crate::mpmc::{mpmc_channel, SendError as MpmcSendError, TryRecvError};
 use crate::platform::{Platform, ThreadEntry};
 use crate::sync::model;
 use crate::wait_queue::WaitQueue;
+
+#[test]
+fn async_mpmc_enqueue_racing_shutdown_is_drained_or_rejected() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(1);
+    builder.max_branches = 20_000;
+    builder.check(|| {
+        let queue = Arc::new(AsyncMpmcQueue::new());
+        let producer_queue = queue.clone();
+        let producer = thread::spawn(move || producer_queue.push(7));
+        let shutdown_queue = queue.clone();
+        let shutdown = thread::spawn(move || shutdown_queue.shutdown());
+
+        let result = producer.join().unwrap();
+        shutdown.join().unwrap();
+        assert!(queue.is_closed());
+        assert!(queue.is_empty());
+        assert!(matches!(result, Ok(()) | Err(7)));
+    });
+}
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_resolve_error_context_module(_instruction_pointer: usize) -> Option<String> {
