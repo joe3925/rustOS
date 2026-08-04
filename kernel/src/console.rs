@@ -632,3 +632,33 @@ pub(crate) fn _print(args: fmt::Arguments) {
         }
     }
 }
+
+pub(crate) fn _print_atomic(message: &str) {
+    crate::platform::serial_write_bytes(message.as_bytes());
+    if (FRAMEBUFFER_CONSOLE) {
+        if PRINT_QUEUE_FULL_PANIC.load(Ordering::Acquire) {
+            let _ = try_flush_print_queue();
+            return;
+        }
+
+        if let Some(mut c) = CONSOLE.try_lock() {
+            c.flush_queued_prints();
+            let _ = c.write_str(message);
+            c.flush_pending();
+            c.flush_queued_prints();
+            return;
+        }
+
+        queue_print(format_args!("{}", message));
+
+        let mut tries = 0usize;
+        while tries < PRINT_FLUSH_TRIES {
+            if try_flush_print_queue() {
+                return;
+            }
+
+            core::hint::spin_loop();
+            tries += 1;
+        }
+    }
+}

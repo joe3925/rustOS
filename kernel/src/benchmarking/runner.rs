@@ -11,7 +11,6 @@ use serde_json::json;
 use spin::{Mutex, Once};
 
 use super::{boot_state, suites};
-use crate::println;
 
 const PROTOCOL_VERSION: u32 = 1;
 
@@ -36,7 +35,13 @@ fn runs() -> &'static Mutex<BTreeMap<u32, RunState>> {
 }
 
 fn emit(kind: &str, payload: serde_json::Value) {
-    println!("RUSTOS_BENCH\t{}\t{}\t{}", PROTOCOL_VERSION, kind, payload);
+    let record = alloc::format!(
+        "RUSTOS_BENCH\t{}\t{}\t{}\n",
+        PROTOCOL_VERSION,
+        kind,
+        payload
+    );
+    crate::console::_print_atomic(&record);
 }
 
 fn valid_identifier(value: &str) -> bool {
