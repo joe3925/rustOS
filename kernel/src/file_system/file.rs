@@ -415,6 +415,7 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
         let passed = crate::benchmarking::run_configured_suites().await;
         crate::benchmarking::exit_benchmark_vm(passed);
     });
+    #[cfg(not(feature = "kernel-bench"))]
     spawn_detached(async {
         bench_c_drive_io_async(true).await;
         trigger_triple_fault();
