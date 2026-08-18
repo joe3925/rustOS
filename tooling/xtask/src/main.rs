@@ -328,7 +328,15 @@ fn build_platform(
 
     println!("==> creating UEFI boot image");
     let image_path = output.join("image").join(&plan.bootloader.output);
-    let image = rustos_boot_image::create_uefi_image(&stub.executable, &image_path)?;
+    let image = rustos_boot_image::create_uefi_image(rustos_boot_image::ImageRequest {
+        workspace_root: root,
+        platform_id: &plan.id,
+        stub: &stub.executable,
+        output: &image_path,
+        release,
+        offline,
+        bootloader: &plan.bootloader.spec,
+    })?;
 
     let boot = BootArtifact { image };
 

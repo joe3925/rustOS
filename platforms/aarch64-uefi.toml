@@ -51,6 +51,10 @@ target = "aarch64-unknown-none"
 rustflags = "-C link-arg=-no-pie -C relocation-model=static -C code-model=large"
 
 [bootloader]
-provider = "local"
+provider = "rustos-aarch64"
 firmware = "uefi"
 output = "boot.img"
+config_path = "/EFI/BOOT/boot.cfg"
+payload_path = "/kernel_stub"
+framebuffer_width = "1280"
+framebuffer_height = "720"

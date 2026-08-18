@@ -65,9 +65,9 @@ pub struct StubFile {
 
 #[derive(Debug, Deserialize)]
 pub struct BootloaderFile {
-    pub provider: String,
-    pub firmware: String,
     pub output: PathBuf,
+    #[serde(flatten)]
+    pub spec: rustos_boot_image::BootloaderSpec,
 }
 
 #[derive(Debug)]
@@ -124,6 +124,7 @@ pub struct StubPlan {
 #[derive(Debug)]
 pub struct BootloaderPlan {
     pub output: PathBuf,
+    pub spec: rustos_boot_image::BootloaderSpec,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,19 +206,6 @@ pub fn load_platform(root: &Path, selector: &str) -> Result<BuildPlan, String> {
 
     require_schema(parsed.schema, &platform_file)?;
     require_id(&parsed.id, &platform_file)?;
-    if parsed.bootloader.provider != "local" {
-        return Err(format!(
-            "unsupported bootloader provider `{}`; only `local` is implemented",
-            parsed.bootloader.provider
-        ));
-    }
-    if parsed.bootloader.firmware != "uefi" {
-        return Err(format!(
-            "unsupported firmware `{}`; only `uefi` is implemented",
-            parsed.bootloader.firmware
-        ));
-    }
-
     let kernel_manifest = canonical_file(&base.join(parsed.kernel.manifest), "kernel manifest")?;
     let kernel_target = canonical_file(&base.join(parsed.kernel.target), "kernel target")?;
     let driver_target = canonical_file(&base.join(parsed.drivers.target), "driver target")?;
@@ -284,6 +272,7 @@ pub fn load_platform(root: &Path, selector: &str) -> Result<BuildPlan, String> {
         },
         bootloader: BootloaderPlan {
             output: parsed.bootloader.output,
+            spec: parsed.bootloader.spec,
         },
     })
 }
