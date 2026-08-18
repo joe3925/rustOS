@@ -3,13 +3,16 @@ todo list because I have been forgetting stuff I need to complete
 If there is a * it must be completed before user space is started 
 
 # Kernel
+## Bootloader (BLO)
+1. [ ] move away from bootloader with our own x86_64 bootloader
+2. [ ] * Finish aarch64 bootloader. 
+
 ## AArch64 (AA64)
 1. [ ] * Finish aarch64-vmsa crate.
-2. [ ] * Finish aarch64 bootloader.
-3. [ ] * Make debug.json platform independent, find a way for xtask to be able to pass info to it.
-4. [ ] * Expand xtask for aarch64 boot. 
-5. [ ] * Impl the platform traits for kernel_types, kernel_api, kernel_stub, and the kernel
-6. [ ] * Test everything.
+2. [ ] * Make debug.json platform independent, find a way for xtask to be able to pass info to it.
+3. [ ] * Expand xtask for aarch64 boot. 
+4. [ ] * Impl the platform traits for kernel_types, kernel_api, kernel_stub, and the kernel
+5. [ ] * Test everything.
 
 ## Drivers (DRI) - Complete last
 1. [ ] Add a nvme driver.
@@ -55,7 +58,7 @@ If there is a * it must be completed before user space is started
 
 ## Actions (ACT)
 1. [x] The benchmarks in the github actions are depend on the compute of the github container. This means we can detect regressions if github is under load assuming they don't guarntee some amount of compute for there containers. Determine if github provides compute guarntees and if they don't maybe find a diffrent service. 
-2. Actions were moved to a host computer but we still need some way for stable io and performance.
+2. [ ] Actions were moved to a host computer but we still need some way for stable io and performance.
 
 # User Space 
 ## User Space DLL (USD)

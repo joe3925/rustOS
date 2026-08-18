@@ -103,8 +103,6 @@ pub struct BootByteSlice {
     len: usize,
 }
 
-// `BootByteSlice` is immutable handoff metadata. Its constructors only expose
-// shared byte ranges, and consumers must validate the range before reading it.
 unsafe impl Sync for BootByteSlice {}
 
 impl BootByteSlice {
@@ -127,8 +125,6 @@ impl BootByteSlice {
         self.len == 0
     }
 
-    /// # Safety
-    /// The descriptor must point to `len` readable bytes.
     pub unsafe fn as_slice<'a>(&self) -> &'a [u8] {
         slice::from_raw_parts(self.ptr, self.len)
     }
@@ -189,9 +185,6 @@ impl BootPackages {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
-
-    /// # Safety
-    /// The descriptor must point to `len` initialized `BootPackage` values.
     pub unsafe fn as_slice<'a>(&self) -> &'a [BootPackage] {
         slice::from_raw_parts(self.ptr, self.len)
     }
@@ -220,11 +213,6 @@ pub struct MemoryRegions {
 }
 
 impl MemoryRegions {
-    /// # Safety
-    ///
-    /// `ptr` must reference `len` initialized `MemoryRegion` values for the
-    /// entire lifetime of this handoff object and must be exclusively borrowed
-    /// whenever the returned value is mutably dereferenced.
     pub const unsafe fn from_raw_parts(ptr: *mut MemoryRegion, len: usize) -> Self {
         Self { ptr, len }
     }
@@ -346,9 +334,6 @@ pub struct FrameBuffer {
 }
 
 impl FrameBuffer {
-    /// # Safety
-    /// `buffer_start` must identify an exclusively owned writable framebuffer
-    /// of at least `info.byte_len` bytes for every borrow produced from it.
     pub const unsafe fn new(buffer_start: u64, info: FrameBufferInfo) -> Self {
         Self { buffer_start, info }
     }
@@ -360,13 +345,6 @@ impl FrameBuffer {
     pub fn buffer_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.buffer_start as *mut u8, self.info.byte_len) }
     }
-
-    /// Consumes the descriptor and returns a mutable slice with caller-chosen
-    /// lifetime.
-    ///
-    /// # Safety
-    /// The framebuffer allocation must remain live and exclusively borrowed
-    /// for the full returned lifetime.
     pub unsafe fn into_buffer_mut<'a>(self) -> &'a mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.buffer_start as *mut u8, self.info.byte_len) }
     }
@@ -525,10 +503,6 @@ pub struct KernelSections {
 }
 
 impl KernelSections {
-    /// # Safety
-    ///
-    /// `ptr` must reference `len` initialized `KernelSection` values that
-    /// remain alive for every borrow produced from this value.
     pub const unsafe fn from_raw_parts(ptr: *const KernelSection, len: usize) -> Self {
         Self { ptr, len }
     }
