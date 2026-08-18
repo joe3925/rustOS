@@ -397,10 +397,6 @@ impl KernelSymbolString {
         }
     }
 
-    /// # Safety
-    ///
-    /// `ptr` must reference `len` bytes of valid UTF-8 that remain alive for
-    /// every borrow produced from this value.
     pub const unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
         Self { ptr, len }
     }
@@ -452,10 +448,6 @@ pub struct KernelSymbols {
 }
 
 impl KernelSymbols {
-    /// # Safety
-    ///
-    /// `ptr` must reference `len` initialized `KernelSymbol` values that remain
-    /// alive for every borrow produced from this value.
     pub const unsafe fn from_raw_parts(ptr: *const KernelSymbol, len: usize) -> Self {
         Self { ptr, len }
     }
