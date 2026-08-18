@@ -3,7 +3,7 @@ use super::slot::WakeAction;
 use super::task_slab::get_task_table;
 
 const PTR_SHARD_BITS: usize = 3;
-const PTR_LOCAL_BITS: usize = 16;
+const PTR_LOCAL_BITS: usize = 32;
 const PTR_GEN_BITS: usize = 16;
 
 const PTR_SHARD_SHIFT: usize = 0;
@@ -14,8 +14,10 @@ const PTR_SHARD_MASK: usize = (1usize << PTR_SHARD_BITS) - 1;
 const PTR_LOCAL_MASK: usize = (1usize << PTR_LOCAL_BITS) - 1;
 const PTR_GEN_MASK: usize = (1usize << PTR_GEN_BITS) - 1;
 
+const _: () = assert!(usize::BITS as usize >= PTR_GEN_SHIFT + PTR_GEN_BITS);
+
 #[inline]
-pub fn encode_slab_task_ptr(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
+pub fn encode_slab_task_ptr(shard_idx: u8, local_idx: u32, generation: u32) -> usize {
     let shard_bits = ((shard_idx as usize) & PTR_SHARD_MASK) << PTR_SHARD_SHIFT;
     let local_bits = ((local_idx as usize) & PTR_LOCAL_MASK) << PTR_LOCAL_SHIFT;
     let gen_bits = ((generation as usize) & PTR_GEN_MASK) << PTR_GEN_SHIFT;
@@ -68,7 +70,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
 
     match slot.record_wake() {
         WakeAction::Enqueue => {
-            let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
+            let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
             let domain_id = slot
                 .executor_domain_id()
                 .expect("queued slab task has no executor domain");
@@ -83,4 +85,18 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
 #[inline(never)]
 pub extern "C" fn slab_task_poll_trampoline(ctx: usize) {
     poll_slab_task(ctx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_slab_task_ptr, encode_slab_task_ptr};
+
+    #[test]
+    fn task_pointer_round_trips_u32_local_index() {
+        let encoded = encode_slab_task_ptr(7, 0xFEDC_BA98, 0x7654_3210);
+        assert_eq!(
+            decode_slab_task_ptr(encoded),
+            Some((7, 0xFEDC_BA98, 0x3210))
+        );
+    }
 }

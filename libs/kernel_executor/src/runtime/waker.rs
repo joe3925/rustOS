@@ -20,7 +20,7 @@ static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 );
 
 pub fn create_slab_task_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-    let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
+    let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
     unsafe {
         Waker::from_raw(RawWaker::new(
             encoded_to_waker_ptr(encoded),

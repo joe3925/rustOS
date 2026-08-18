@@ -7,12 +7,14 @@ use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Orderin
 use crate::sync::spin_loop;
 
 pub const DEFAULT_SLAB_SHARDS: usize = 8;
-const MAX_LOCAL_SLOTS: usize = 1 << 16;
+// Keep the eagerly allocated per-shard chunk table bounded while allowing the
+// executor to hold well over one million resident tasks with its default shards.
+pub(crate) const MAX_LOCAL_SLOTS: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlabHandle {
     pub shard: u8,
-    pub local_index: u16,
+    pub local_index: u32,
     pub generation: u32,
 }
 
@@ -189,7 +191,7 @@ impl<T> SlabShard<T> {
                 self.allocated_count.fetch_add(1, Ordering::Relaxed);
                 return Some(SlabHandle {
                     shard,
-                    local_index: index as u16,
+                    local_index: index as u32,
                     generation,
                 });
             }

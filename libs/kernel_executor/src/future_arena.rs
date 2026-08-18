@@ -283,10 +283,10 @@ impl FutureArena {
         let token = match allocation.backing {
             FutureBacking::Slab { class, handle } => {
                 (1u64 << 63)
-                    | ((class as u64) << 56)
-                    | ((handle.shard as u64) << 48)
-                    | ((handle.local_index as u64) << 32)
-                    | handle.generation as u64
+                    | ((class as u64) << 60)
+                    | ((handle.shard as u64) << 52)
+                    | ((handle.local_index as u64) << 20)
+                    | (handle.generation as u64 & 0xffff)
             }
             FutureBacking::Large => large_token(
                 allocation.ptr,
@@ -321,7 +321,7 @@ impl FutureArena {
         let capacity = allocation.capacity as usize;
         let align = allocation.align as usize;
         let backing = if allocation.token >> 63 == 1 {
-            let class = match ((allocation.token >> 56) & 0x7) as u8 {
+            let class = match ((allocation.token >> 60) & 0x7) as u8 {
                 0 => FutureSizeClass::Bytes64,
                 1 => FutureSizeClass::Bytes128,
                 2 => FutureSizeClass::Bytes256,
@@ -335,9 +335,9 @@ impl FutureArena {
                 return false;
             }
             let handle = SlabHandle {
-                shard: ((allocation.token >> 48) & 0xff) as u8,
-                local_index: ((allocation.token >> 32) & 0xffff) as u16,
-                generation: allocation.token as u32,
+                shard: ((allocation.token >> 52) & 0xff) as u8,
+                local_index: ((allocation.token >> 20) & 0xffff_ffff) as u32,
+                generation: (allocation.token & 0xffff) as u32,
             };
             let expected = match class {
                 FutureSizeClass::Bytes64 => block_ptr(&self.c64, handle),
@@ -404,6 +404,30 @@ mod tests {
 
     fn arena(config: FutureArenaConfig) -> FutureArena {
         FutureArena::new(ExecutorDomainId::from_parts(100, 1), config)
+    }
+
+    #[test]
+    fn abi_token_preserves_u32_slab_local_index() {
+        let allocation = FutureAllocation {
+            ptr: NonNull::dangling(),
+            owner_domain: ExecutorDomainId::from_parts(100, 1),
+            backing: FutureBacking::Slab {
+                class: FutureSizeClass::Bytes256,
+                handle: SlabHandle {
+                    shard: 7,
+                    local_index: 0xFEDC_BA98,
+                    generation: 0x3210,
+                },
+            },
+            capacity: 256,
+            align: 8,
+        };
+        let abi = FutureArena::into_abi(allocation);
+
+        assert_eq!((abi.token >> 60) & 0x7, FutureSizeClass::Bytes256 as u64);
+        assert_eq!((abi.token >> 52) & 0xff, 7);
+        assert_eq!((abi.token >> 20) & 0xffff_ffff, 0xFEDC_BA98);
+        assert_eq!(abi.token & 0xffff, 0x3210);
     }
 
     #[test]

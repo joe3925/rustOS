@@ -2,7 +2,7 @@ use core::mem::MaybeUninit;
 
 use spin::Once;
 
-use crate::growable_slab::{GrowableSlab, SlabHandle};
+use crate::growable_slab::{GrowableSlab, SlabHandle, MAX_LOCAL_SLOTS};
 use crate::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::{SlabConfig, SlabConfigBuilder, SlabStats};
@@ -46,7 +46,7 @@ impl TaskTable {
         config.slots_per_shard = config
             .slots_per_shard
             .clamp(MIN_SLOTS_PER_SHARD, MAX_SLOTS_PER_SHARD);
-        let max_chunks = (1usize << 16) / config.slots_per_shard;
+        let max_chunks = MAX_LOCAL_SLOTS / config.slots_per_shard;
         Self {
             slab: GrowableSlab::new(
                 NUM_SHARDS,
@@ -70,12 +70,12 @@ impl TaskTable {
 
     #[inline]
     fn make_handle(&self, shard: usize, local: usize, generation: u32) -> Option<SlabHandle> {
-        if shard >= NUM_SHARDS || local > u16::MAX as usize {
+        if shard >= NUM_SHARDS || local > u32::MAX as usize {
             return None;
         }
         Some(SlabHandle {
             shard: shard as u8,
-            local_index: local as u16,
+            local_index: local as u32,
             generation: generation & GEN_MASK,
         })
     }
