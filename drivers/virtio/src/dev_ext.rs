@@ -1,6 +1,5 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
 use kernel_api::device::DeviceObject;
@@ -23,7 +22,7 @@ pub enum QueueSelectionStrategy {
 pub struct QueueState {
     pub queue: RwLock<Virtqueue>,
     pub arena: BlkIoSlots,
-    pub irq_handle: UnsafeCell<Option<IrqHandle>>,
+    pub irq_handle: Once<IrqHandle>,
     pub msix_vector: Option<u8>,
     pub completion_slots: CompletionTable,
     pub read_ops: PendingOpPool<FromDevice>,

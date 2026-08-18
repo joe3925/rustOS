@@ -23,6 +23,7 @@ pub mod reg;
 pub mod runtime;
 pub mod task;
 pub mod util;
+pub use spin;
 pub const IOCTL_MOUNTMGR_UNMOUNT: u32 = 0x4D4D_0002;
 pub const IOCTL_MOUNTMGR_QUERY: u32 = 0x4D4D_0003;
 pub const IOCTL_MOUNTMGR_RESYNC: u32 = 0x4D4D_0004;

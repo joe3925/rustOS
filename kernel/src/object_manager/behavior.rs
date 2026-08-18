@@ -58,11 +58,6 @@ pub enum ObjectQueryError {
 
 pub const MAX_OBJECT_QUERY_SIZE: usize = 128;
 
-/// An ABI value whose initialized representation contains no padding bytes.
-///
-/// # Safety
-/// Implementors must be `Copy` and have no uninitialized padding because the
-/// complete value representation is copied into a user-visible query buffer.
 pub unsafe trait ObjectQueryInfo: Copy {}
 
 pub struct ObjectQueryBuffer {

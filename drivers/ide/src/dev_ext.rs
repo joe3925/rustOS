@@ -1,9 +1,8 @@
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::port::Port;
-
+use kernel_api::spin::Once;
 #[repr(C)]
 pub struct Ports {
     pub data: Port<u16>,
@@ -44,8 +43,7 @@ pub struct DevExt {
     pub present: AtomicBool,
     pub enumerated: AtomicBool,
     pub controller: AsyncMutex<ControllerState>,
-    /// Set once during StartDevice, then read-only.
-    pub irq_handle: UnsafeCell<Option<IrqHandle>>,
+    pub irq_handle: Once<IrqHandle>,
 }
 
 unsafe impl Send for DevExt {}
@@ -59,7 +57,7 @@ impl DevExt {
             controller: AsyncMutex::new(ControllerState {
                 ports: Ports::new(io_base, ctrl_base),
             }),
-            irq_handle: UnsafeCell::new(None),
+            irq_handle: Once::new(),
         }
     }
 
@@ -79,12 +77,7 @@ impl DevExt {
     pub fn is_enumerated(&self) -> bool {
         self.enumerated.load(Ordering::Acquire)
     }
-
-    /// Get the IRQ handle reference (safe after init).
-    ///
-    /// # Safety
-    /// Must only be called after StartDevice has completed writing the handle.
-    pub unsafe fn irq(&self) -> &Option<IrqHandle> {
-        unsafe { &*self.irq_handle.get() }
+    pub unsafe fn irq(&self) -> Option<&IrqHandle> {
+        self.irq_handle.get()
     }
 }
