@@ -44,6 +44,7 @@ If there is a * it must be completed before user space is started
 
 ## Executor (EXE)
 1. [ ] Figure out emergency interrupt queue exhaustion.
+2. [ ] Consider adding a build flag that uses `u64` executor slab-local indices.
 
 ## Error handling (ERH) (all around messy and I need to refactor it, not sure in what direction I want to take it yet)
 1. [x] * Figure out how error handling should be refactored

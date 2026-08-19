@@ -240,7 +240,7 @@ impl TaskSlot {
         let domain_id =
             unsafe { *self.domain_id.get() }.expect("task domain missing while polling");
         let _context_guard = CurrentExecutorContextGuard::enter(CurrentExecutorContext {
-            task_id: encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation),
+            task_id: encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
             domain_id: domain_id.raw(),
         });
         if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
@@ -248,7 +248,7 @@ impl TaskSlot {
                 unsafe {
                     cancel(
                         self,
-                        encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation),
+                        encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
                     )
                 };
                 self.state.store(STATE_COMPLETED, Ordering::Release);
@@ -268,7 +268,7 @@ impl TaskSlot {
                     unsafe {
                         cancel(
                             self,
-                            encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation),
+                            encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
                         )
                     };
                     self.state.store(STATE_COMPLETED, Ordering::Release);
@@ -285,7 +285,7 @@ impl TaskSlot {
                 self.state.store(STATE_QUEUED, Ordering::Release);
                 let slab = get_task_table();
                 slab.increment_ref(shard_idx, local_idx, generation);
-                let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u16, generation);
+                let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
                 submit_global_to_executor_domain(domain_id, encoded);
             }
             false

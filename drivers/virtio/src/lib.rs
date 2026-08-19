@@ -25,7 +25,6 @@ use kernel_api::kernel_types::protocol::pci::PciProtocol;
 
 use alloc::{sync::Arc, vec, vec::Vec};
 use blk::{BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP};
-use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
 use core::panic::PanicInfo;
@@ -71,7 +70,7 @@ use kernel_api::request::DeviceControl;
 use kernel_api::runtime::{KernelStopwatch, cycle_counter, spawn_detached};
 use kernel_api::util::panic_common;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
-use spin::{Mutex, RwLock};
+use spin::{Mutex, Once, RwLock};
 use virtqueue::Virtqueue;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -626,7 +625,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 );
 
                 for qs in queue_states.iter() {
-                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                    if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
                     if let Some(vec) = qs.msix_vector {
@@ -660,8 +659,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             }
         };
 
-        let (irq_handle, msix_vector) = if use_msix && i < msix_allocations.len()
-        {
+        let (irq_handle, msix_vector) = if use_msix && i < msix_allocations.len() {
             match msix_allocations[i].take() {
                 Some((vec, handle, _table_idx)) => (Some(handle), Some(vec)),
                 None => (None, None),
@@ -683,7 +681,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 );
 
                 for qs in queue_states.iter() {
-                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                    if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
                     if let Some(vec) = qs.msix_vector {
@@ -719,7 +717,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 );
 
                 for qs in queue_states.iter() {
-                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                    if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
                     if let Some(vec) = qs.msix_vector {
@@ -754,7 +752,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 );
 
                 for qs in queue_states.iter() {
-                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                    if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
                     if let Some(vec) = qs.msix_vector {
@@ -789,7 +787,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 );
 
                 for qs in queue_states.iter() {
-                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                    if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
                     if let Some(vec) = qs.msix_vector {
@@ -817,10 +815,15 @@ async fn virtio_init_complete<'req, 'data, 'b>(
 
         let used_idx = vq.used_idx_ptr();
 
+        let irq_handle_once = Once::new();
+        if let Some(handle) = irq_handle {
+            irq_handle_once.call_once(|| handle);
+        }
+
         queue_states.push(QueueState {
             queue: RwLock::new(vq),
             arena,
-            irq_handle: UnsafeCell::new(irq_handle),
+            irq_handle: irq_handle_once,
             msix_vector,
             completion_slots,
             read_ops,
@@ -849,7 +852,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         );
         unsafe { blk::reset_device(caps.common_cfg) };
         for qs in queue_states.iter() {
-            if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+            if let Some(h) = qs.irq_handle.get() {
                 h.unregister();
             }
             if let Some(vec) = qs.msix_vector {
@@ -891,7 +894,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     // and the task exits cleanly.
     if let Some(inner) = dx.inner.get().cloned() {
         for queue_idx in 0..inner.queue_count {
-            let irq = unsafe { (*inner.queues[queue_idx].irq_handle.get()).clone() };
+            let irq = inner.queues[queue_idx].irq_handle.get().cloned();
             if let Some(handle) = irq {
                 let inner_clone = inner.clone();
                 spawn_detached(async move {
@@ -917,7 +920,7 @@ async fn virtio_pnp_remove<'req, 'data, 'b>(
             for qs in inner.queues.iter() {
                 // Unregistering closes the handle, causing the drain task's
                 // irq_handle.wait() to return IRQ_WAIT_CLOSED so it exits.
-                if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                if let Some(h) = qs.irq_handle.get() {
                     h.unregister();
                 }
 

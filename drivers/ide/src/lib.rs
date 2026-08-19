@@ -8,15 +8,6 @@ extern crate alloc;
 
 mod dev_ext;
 
-
-
-use kernel_api::kernel_types::pci::BarKind;
-use kernel_api::kernel_types::protocol::pci::PciProtocol;
-use kernel_api::pnp::InitComplete;
-use kernel_api::pnp::QueryDeviceRelations;
-use kernel_api::pnp::QueryId;
-use kernel_api::pnp::QueryResources;
-use kernel_api::pnp::StartDevice;
 use alloc::sync::Weak;
 use alloc::vec;
 use alloc::{
@@ -27,7 +18,11 @@ use alloc::{
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
-use kernel_api::device::{open_protocol_to_next_lower, ProtocolHandle, register_protocol, DeviceInit, DeviceObject, DriverObject, publish_stack_protocol};
+use kernel_api::device::{
+    DeviceInit, DeviceObject, DriverObject, ProtocolHandle, open_protocol_to_next_lower,
+    publish_stack_protocol, register_protocol,
+};
+use kernel_api::error::{DriverErrorKind, ErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
     IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
@@ -37,20 +32,24 @@ use kernel_api::kernel_types::io::{
     DeviceControlHandler, DeviceControlOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
     DiskInfo,
 };
-use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::kernel_types::irq::{IrqFrame, IrqMeta};
+use kernel_api::kernel_types::pci::BarKind;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::port::Port;
+use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
+use kernel_api::kernel_types::protocol::pci::PciProtocol;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::QueryResources;
+use kernel_api::pnp::StartDevice;
 use kernel_api::pnp::{
-    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, ResourceKind,
-    ResourceSet, driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
+    DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, ResourceKind, ResourceSet,
+    driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{DeviceControl, Read, Write};
 use kernel_api::request_handler;
-use kernel_api::error::{
-    error, DriverErrorKind, ErrorKind, KernelError, ResultErrorContext,
-};
 use kernel_api::util::wait_duration;
 
 use dev_ext::{ControllerState, DevExt, Ports};
@@ -283,12 +282,7 @@ struct IdeIoValidationError {
 }
 
 impl IdeIoValidationError {
-    const fn new(
-        kind: DriverErrorKind,
-        offset: u64,
-        len: usize,
-        reason: &'static str,
-    ) -> Self {
+    const fn new(kind: DriverErrorKind, offset: u64, len: usize, reason: &'static str) -> Self {
         Self {
             kind,
             offset,
@@ -299,10 +293,7 @@ impl IdeIoValidationError {
 }
 
 #[inline]
-fn ide_lba_sectors(
-    offset: u64,
-    len: usize,
-) -> Result<Option<(u32, u32)>, IdeIoValidationError> {
+fn ide_lba_sectors(offset: u64, len: usize) -> Result<Option<(u32, u32)>, IdeIoValidationError> {
     if len == 0 {
         return Ok(None);
     }
@@ -350,9 +341,7 @@ fn ide_lba_sectors(
     Ok(Some((lba as u32, sectors)))
 }
 
-fn validate_ide_read_chain<'data>(
-    first: &Read<'data>,
-) -> Result<bool, IdeIoValidationError> {
+fn validate_ide_read_chain<'data>(first: &Read<'data>) -> Result<bool, IdeIoValidationError> {
     let mut any = false;
 
     for read in first.iter() {
@@ -393,9 +382,7 @@ fn validate_ide_read_chain<'data>(
     Ok(any)
 }
 
-fn validate_ide_write_chain<'data>(
-    first: &Write<'data>,
-) -> Result<bool, IdeIoValidationError> {
+fn validate_ide_write_chain<'data>(first: &Write<'data>) -> Result<bool, IdeIoValidationError> {
     let mut any = false;
 
     for write in first.iter() {
@@ -446,7 +433,7 @@ impl DeviceRead for IdePdoIo {
             Ok(x) => x,
             Err(_) => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "reading from an IDE PDO without IDE child state")
+                    .with_context(|| "reading from an IDE PDO without IDE child state");
             }
         };
 
@@ -459,7 +446,7 @@ impl DeviceRead for IdePdoIo {
             Some(p) => p,
             None => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "reading from an IDE disk whose controller was removed")
+                    .with_context(|| "reading from an IDE disk whose controller was removed");
             }
         };
 
@@ -467,7 +454,7 @@ impl DeviceRead for IdePdoIo {
             Ok(dx) => dx,
             Err(_) => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "reading from an IDE disk whose controller state is missing")
+                    .with_context(|| "reading from an IDE disk whose controller state is missing");
             }
         };
 
@@ -483,7 +470,7 @@ impl DeviceRead for IdePdoIo {
                             validation.len,
                             validation.reason
                         )
-                    })
+                    });
                 }
             }
         };
@@ -550,14 +537,12 @@ impl DeviceRead for IdePdoIo {
             let Some((lba, sectors, cursor)) = (match next {
                 Ok(v) => v,
                 Err(validation) => {
-                    read_error = Some(error(validation.kind).with_context(
-                        alloc::format!(
-                            "preparing IDE read at offset {} with length {}: {}",
-                            validation.offset,
-                            validation.len,
-                            validation.reason
-                        )
-                    ));
+                    read_error = Some(error(validation.kind).with_context(alloc::format!(
+                        "preparing IDE read at offset {} with length {}: {}",
+                        validation.offset,
+                        validation.len,
+                        validation.reason
+                    )));
                     break;
                 }
             }) else {
@@ -566,9 +551,7 @@ impl DeviceRead for IdePdoIo {
 
             if !ata_pio_read_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
                 read_error = Some(error(DriverErrorKind::DeviceError).with_context(
-                    alloc::format!(
-                        "IDE PIO read failed at LBA {lba} for {sectors} sectors"
-                    )
+                    alloc::format!("IDE PIO read failed at LBA {lba} for {sectors} sectors"),
                 ));
                 break;
             }
@@ -593,7 +576,7 @@ impl DeviceWrite for IdePdoIo {
             Ok(x) => x,
             Err(_) => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "writing to an IDE PDO without IDE child state")
+                    .with_context(|| "writing to an IDE PDO without IDE child state");
             }
         };
 
@@ -606,7 +589,7 @@ impl DeviceWrite for IdePdoIo {
             Some(p) => p,
             None => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "writing to an IDE disk whose controller was removed")
+                    .with_context(|| "writing to an IDE disk whose controller was removed");
             }
         };
 
@@ -614,7 +597,7 @@ impl DeviceWrite for IdePdoIo {
             Ok(dx) => dx,
             Err(_) => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "writing to an IDE disk whose controller state is missing")
+                    .with_context(|| "writing to an IDE disk whose controller state is missing");
             }
         };
 
@@ -630,7 +613,7 @@ impl DeviceWrite for IdePdoIo {
                             validation.len,
                             validation.reason
                         )
-                    })
+                    });
                 }
             }
         };
@@ -697,14 +680,12 @@ impl DeviceWrite for IdePdoIo {
             let Some((lba, sectors, cursor)) = (match next {
                 Ok(v) => v,
                 Err(validation) => {
-                    write_error = Some(error(validation.kind).with_context(
-                        alloc::format!(
-                            "preparing IDE write at offset {} with length {}: {}",
-                            validation.offset,
-                            validation.len,
-                            validation.reason
-                        )
-                    ));
+                    write_error = Some(error(validation.kind).with_context(alloc::format!(
+                        "preparing IDE write at offset {} with length {}: {}",
+                        validation.offset,
+                        validation.len,
+                        validation.reason
+                    )));
                     break;
                 }
             }) else {
@@ -713,9 +694,7 @@ impl DeviceWrite for IdePdoIo {
 
             if !ata_pio_write_phys_async(&mut ctrl, irq, dh, lba, sectors, cursor).await {
                 write_error = Some(error(DriverErrorKind::DeviceError).with_context(
-                    alloc::format!(
-                        "IDE PIO write failed at LBA {lba} for {sectors} sectors"
-                    )
+                    alloc::format!("IDE PIO write failed at LBA {lba} for {sectors} sectors"),
                 ));
                 break;
             }
@@ -740,7 +719,7 @@ impl DeviceControlHandler for IdePdoIo {
             Ok(x) => x,
             Err(_) => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "controlling an IDE PDO without IDE child state")
+                    .with_context(|| "controlling an IDE PDO without IDE child state");
             }
         };
 
@@ -753,7 +732,7 @@ impl DeviceControlHandler for IdePdoIo {
             Some(p) => p,
             None => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "controlling an IDE disk whose controller was removed")
+                    .with_context(|| "controlling an IDE disk whose controller was removed");
             }
         };
 
@@ -761,7 +740,7 @@ impl DeviceControlHandler for IdePdoIo {
             Ok(dx) => dx,
             Err(_) => {
                 return Err(error(DriverErrorKind::NoSuchDevice))
-                    .with_context(|| "controlling an IDE disk whose controller state is missing")
+                    .with_context(|| "controlling an IDE disk whose controller state is missing");
             }
         };
 
@@ -793,7 +772,9 @@ impl DeviceControlHandler for IdePdoIo {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
+pub extern "C" fn DriverEntry(
+    driver: &Arc<DriverObject>,
+) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, ide_device_add);
     Ok(())
 }
@@ -826,7 +807,7 @@ async fn ide_init_complete<'req, 'data, 'b>(
         Err(DriverErrorKind::NoSuchDevice) => None,
         Err(error_kind) => {
             return Err(error(error_kind))
-                .with_context(|| "opening the lower PCI protocol for an IDE controller")
+                .with_context(|| "opening the lower PCI protocol for an IDE controller");
         }
     };
 
@@ -845,7 +826,7 @@ async fn ide_init_complete<'req, 'data, 'b>(
             Err(err) if err.kind() == ErrorKind::Driver(DriverErrorKind::NoSuchDevice) => false,
             Err(err) => {
                 return Err(err)
-                    .with_context(|| "querying resources from the next lower IDE device")
+                    .with_context(|| "querying resources from the next lower IDE device");
             }
         }
     };
@@ -881,8 +862,8 @@ async fn ide_init_complete<'req, 'data, 'b>(
             None
         };
 
-        unsafe {
-            *dx.irq_handle.get() = irq_handle;
+        if let Some(handle) = irq_handle {
+            dx.irq_handle.call_once(|| handle);
         }
 
         {
@@ -1029,8 +1010,7 @@ extern "C" fn ide_disk_info(device: &Arc<DeviceObject>) -> Result<DiskInfo, Kern
     if let Some(di) = cdx.disk_info {
         Ok(di)
     } else {
-        Err(error(DriverErrorKind::Unsuccessful))
-            .with_context(|| "querying IDE disk geometry")
+        Err(error(DriverErrorKind::Unsuccessful)).with_context(|| "querying IDE disk geometry")
     }
 }
 
@@ -1042,7 +1022,6 @@ struct IdeBars {
     gsi: Option<u32>,
     irq_line: Option<u8>,
 }
-
 
 fn parse_ide_bars(proto: Option<&ProtocolHandle<PciProtocol>>) -> IdeBars {
     let mut bars = IdeBars::default();
@@ -1165,7 +1144,7 @@ fn ata_probe_drive_sync(ports: &mut Ports, dh: u8) -> bool {
 
 async fn ata_pio_read_phys_async(
     ctrl: &mut ControllerState,
-    irq: &Option<IrqHandle>,
+    irq: Option<&IrqHandle>,
     dh: u8,
     mut lba: u32,
     mut sectors: u32,
@@ -1230,7 +1209,7 @@ async fn ata_pio_read_phys_async(
 
 async fn ata_pio_write_phys_async(
     ctrl: &mut ControllerState,
-    irq: &Option<IrqHandle>,
+    irq: Option<&IrqHandle>,
     dh: u8,
     mut lba: u32,
     mut sectors: u32,
@@ -1374,7 +1353,7 @@ fn wait_drq_sync(ports: &mut Ports, timeout_ms: u64) -> bool {
     false
 }
 
-async fn wait_not_busy_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
+async fn wait_not_busy_async(ports: &mut Ports, irq: Option<&IrqHandle>, timeout_ms: u64) -> bool {
     let s = unsafe { ports.command.read() };
 
     if (s & ATA_SR_BSY) == 0 {
@@ -1407,7 +1386,7 @@ async fn wait_not_busy_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout
     }
 }
 
-async fn wait_ready_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
+async fn wait_ready_async(ports: &mut Ports, irq: Option<&IrqHandle>, timeout_ms: u64) -> bool {
     let s = unsafe { ports.command.read() };
 
     if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRDY) != 0 {
@@ -1440,7 +1419,7 @@ async fn wait_ready_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms
     }
 }
 
-async fn wait_drq_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
+async fn wait_drq_async(ports: &mut Ports, irq: Option<&IrqHandle>, timeout_ms: u64) -> bool {
     let s = unsafe { ports.command.read() };
 
     if (s & ATA_SR_BSY) == 0 {

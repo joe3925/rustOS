@@ -327,24 +327,6 @@ impl Object {
     }
 }
 
-macro_rules! impl_object_behavior {
-    ($ty:ty, $tag:expr) => {
-        impl ObjectBehavior for $ty {
-            fn class(&self) -> ObjectTag {
-                $tag
-            }
-
-            fn supported_interfaces(&self) -> InterfaceMask {
-                behavior::standard_interfaces($tag)
-            }
-
-            fn required_interface(&self, operation: ObjectOperation) -> Option<InterfaceMask> {
-                Some(behavior::interface_for_operation($tag, operation))
-            }
-        }
-    };
-}
-
 impl ObjectBehavior for DirectoryBody {
     fn class(&self) -> ObjectTag {
         ObjectTag::Directory
@@ -369,7 +351,20 @@ impl ObjectBehavior for SymlinkBody {
     }
 }
 
-impl_object_behavior!(ObjRef, ObjectTag::Generic);
+impl ObjectBehavior for ObjRef {
+    fn class(&self) -> ObjectTag {
+        (ObjectTag::Generic)
+    }
+    fn supported_interfaces(&self) -> InterfaceMask {
+        behavior::standard_interfaces((ObjectTag::Generic))
+    }
+    fn required_interface(&self, operation: ObjectOperation) -> Option<InterfaceMask> {
+        Some(behavior::interface_for_operation(
+            (ObjectTag::Generic),
+            operation,
+        ))
+    }
+}
 
 impl ObjectBehavior for ModuleHandle {
     fn class(&self) -> ObjectTag {

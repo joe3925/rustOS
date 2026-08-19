@@ -189,7 +189,7 @@ where
 
     JoinHandle {
         shard_idx: shard_idx as u8,
-        local_idx: local_idx as u16,
+        local_idx: local_idx as u32,
         generation,
         consumed: false,
         storage: storage_ptr,
@@ -199,7 +199,7 @@ where
 
 pub struct JoinHandle<'a, T: Send + 'static> {
     shard_idx: u8,
-    local_idx: u16,
+    local_idx: u32,
     generation: u32,
     consumed: bool,
     storage: *mut JoinStorage<T>,

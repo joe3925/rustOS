@@ -22,7 +22,8 @@ const DOMAIN_CHUNK_SIZE: usize = 1 << DOMAIN_CHUNK_BITS;
 const DOMAIN_CHUNK_MASK: usize = DOMAIN_CHUNK_SIZE - 1;
 const MAX_DOMAIN_CHUNKS: usize = 64;
 const MAX_DOMAIN_SLOTS: usize = DOMAIN_CHUNK_SIZE * MAX_DOMAIN_CHUNKS;
-const TASK_ID_BITS: u32 = 35;
+// Encoded slab task IDs contain 3 shard, 32 local-index, and 16 generation bits.
+const TASK_ID_BITS: u32 = 51;
 const TASK_ID_MASK: u64 = (1u64 << TASK_ID_BITS) - 1;
 const READY_TAG_MASK: u64 = (1u64 << (64 - TASK_ID_BITS)) - 1;
 pub const MAX_READY_SHARDS: usize = 64;
