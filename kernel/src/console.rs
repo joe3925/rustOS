@@ -145,7 +145,9 @@ pub struct Screen {
 
 impl Screen {
     pub fn clear_framebuffer() {
-        if let Some(mut console) = CONSOLE.try_lock() {
+        if let Some(mut console) = CONSOLE.try_lock()
+            && let Some(console) = console.as_mut()
+        {
             console.screen.buffer_start.fill(0);
         }
     }
@@ -352,20 +354,20 @@ pub struct Console {
 }
 
 impl Console {
-    pub fn new() -> Self {
-        let screen = Screen::new().expect("No framebuffer available");
+    pub fn new() -> Option<Self> {
+        let screen = Screen::new()?;
 
         let style = MonoTextStyle::new(&FONT_9X18, Rgb888::new(52, 100, 235));
         let text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
 
-        Self {
+        Some(Self {
             screen,
             cursor_pose: Cursor { x: 0, y: 0 },
             style,
             text_style,
             pending: [0; PRINT_SLOT_SIZE],
             pending_len: 0,
-        }
+        })
     }
 
     pub(crate) fn print(&mut self, bytes: &[u8]) {
@@ -526,7 +528,7 @@ impl fmt::Write for Console {
 }
 
 lazy_static! {
-    pub static ref CONSOLE: IrqSafeMutex<Console> = IrqSafeMutex::new(Console::new());
+    pub static ref CONSOLE: IrqSafeMutex<Option<Console>> = IrqSafeMutex::new(Console::new());
     static ref PRINT_QUEUE: ArrayQueue<PrintSlot> = ArrayQueue::new(PRINT_QUEUE_SLOTS);
 }
 
@@ -580,7 +582,10 @@ fn print_queue_full_panic(slot: PrintSlot) -> ! {
     }
 
     loop {
-        if let Some(mut c) = CONSOLE.try_lock() {
+        if let Some(mut console) = CONSOLE.try_lock() {
+            let Some(c) = console.as_mut() else {
+                panic!("print queue full");
+            };
             c.flush_queued_prints();
             c.push_bytes(slot.as_bytes());
             c.flush_pending();
@@ -595,8 +600,10 @@ fn print_queue_full_panic(slot: PrintSlot) -> ! {
 }
 
 fn try_flush_print_queue() -> bool {
-    if let Some(mut c) = CONSOLE.try_lock() {
-        c.flush_queued_prints();
+    if let Some(mut console) = CONSOLE.try_lock() {
+        if let Some(c) = console.as_mut() {
+            c.flush_queued_prints();
+        }
         return true;
     }
 
@@ -611,7 +618,10 @@ pub(crate) fn _print(args: fmt::Arguments) {
             return;
         }
 
-        if let Some(mut c) = CONSOLE.try_lock() {
+        if let Some(mut console) = CONSOLE.try_lock() {
+            let Some(c) = console.as_mut() else {
+                return;
+            };
             c.flush_queued_prints();
             let _ = c.write_fmt(args);
             c.flush_pending();
@@ -641,7 +651,10 @@ pub(crate) fn _print_atomic(message: &str) {
             return;
         }
 
-        if let Some(mut c) = CONSOLE.try_lock() {
+        if let Some(mut console) = CONSOLE.try_lock() {
+            let Some(c) = console.as_mut() else {
+                return;
+            };
             c.flush_queued_prints();
             let _ = c.write_str(message);
             c.flush_pending();

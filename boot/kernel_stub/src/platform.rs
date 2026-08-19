@@ -1,3 +1,5 @@
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
 use goblin::pe::tls::ImageTlsDirectory;
 use kernel_abi::{
     BootArchInfo as KernelBootArchInfo, BootInfo, BootPackages, KernelSections, KernelSymbols,
@@ -119,4 +121,52 @@ pub trait BootloaderPlatform: KernelImagePlatform {
         bootloader_info: &mut Self::BootloaderInfo,
         parts: BootInfoParts<Self::TlsDirectory>,
     ) -> Result<BootInfo<Self::BootArchInfo>, &'static str>;
+}
+
+pub struct BootFrameSource<P: BootloaderPlatform> {
+    bootloader_info: *const P::BootloaderInfo,
+    platform: PhantomData<P>,
+}
+
+static NEXT_BOOT_FRAME: AtomicU64 = AtomicU64::new(0);
+
+impl<P: BootloaderPlatform> BootFrameSource<P> {
+    pub fn new(bootloader_info: &P::BootloaderInfo, minimum_address: u64) -> Self {
+        Self {
+            bootloader_info,
+            platform: PhantomData,
+        }
+        .with_minimum(minimum_address)
+    }
+
+    fn with_minimum(self, minimum_address: u64) -> Self {
+        NEXT_BOOT_FRAME.fetch_max(minimum_address, Ordering::SeqCst);
+        self
+    }
+
+    pub fn allocate(&mut self, frame_size: u64) -> Option<u64> {
+        if !frame_size.is_power_of_two() {
+            return None;
+        }
+        let mut best = None;
+        P::for_each_memory_region(unsafe { &*self.bootloader_info }, |region| {
+            if region.kind != MemoryRegionKind::Usable || region.end <= region.start {
+                return Ok(());
+            }
+            let start = crate::align_up(
+                region.start.max(NEXT_BOOT_FRAME.load(Ordering::SeqCst)),
+                frame_size,
+            );
+            let end = region.end & !(frame_size - 1);
+            if start < end {
+                best = Some(best.map_or(start, |current: u64| current.min(start)));
+            }
+            Ok(())
+        })
+        .ok()?;
+        let frame = best?;
+        NEXT_BOOT_FRAME.store(frame.checked_add(frame_size)?, Ordering::SeqCst);
+        crate::record_allocated_frame_range(frame, frame_size).ok()?;
+        Some(frame)
+    }
 }

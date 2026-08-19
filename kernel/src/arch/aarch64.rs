@@ -1,3 +1,13 @@
-pub struct Aarch64Platform;
+mod cpu;
+mod debug;
+mod interrupts;
+mod machine;
+mod memory;
+mod pci;
+mod platform;
+mod scheduling;
+mod serial;
+mod timer;
+mod unwind;
 
-pub type PlatformImpl = Aarch64Platform;
+pub use platform::Aarch64Platform as PlatformImpl;

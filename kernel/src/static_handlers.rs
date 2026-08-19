@@ -244,12 +244,16 @@ pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
     crate::platform::serial_write_bytes(str.as_bytes());
-    CONSOLE.lock().print(str.as_bytes());
+    if let Some(console) = CONSOLE.lock().as_mut() {
+        console.print(str.as_bytes());
+    }
 }
 #[unsafe(no_mangle)]
 pub fn routing_print_impl(s: &str) {
     crate::platform::serial_write_bytes(s.as_bytes());
-    CONSOLE.lock().print(s.as_bytes());
+    if let Some(console) = CONSOLE.lock().as_mut() {
+        console.print(s.as_bytes());
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn wait_duration(time: Duration) {

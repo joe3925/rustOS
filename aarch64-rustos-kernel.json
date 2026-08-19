@@ -29,7 +29,7 @@
   "split-debuginfo": "off",
   "supported-split-debuginfo": ["off"],
   "panic-strategy": "abort",
-  "relocation-model": "static",
+  "relocation-model": "pic",
   "code-model": "large",
   "executables": true,
   "no-default-libraries": true,
@@ -39,8 +39,6 @@
       "/NODEFAULTLIB",
       "/SUBSYSTEM:NATIVE",
       "/ENTRY:kernel_pe_entry",
-      "/FIXED",
-      "/DYNAMICBASE:NO",
       "/EXPORT:kernel_pe_entry",
       "/DEBUG:SYMTAB"
     ],
@@ -49,13 +47,11 @@
       "/NODEFAULTLIB",
       "/SUBSYSTEM:NATIVE",
       "/ENTRY:kernel_pe_entry",
-      "/FIXED",
-      "/DYNAMICBASE:NO",
       "/EXPORT:kernel_pe_entry",
       "/DEBUG:SYMTAB"
     ]
   },
-  "requires-uwtable": true,
+  "requires-uwtable": false,
   "crt-static-respected": true,
   "crt-static-allows-dylibs": false,
   "plt-by-default": false,

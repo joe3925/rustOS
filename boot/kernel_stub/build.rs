@@ -36,6 +36,13 @@ fn kernel_pe_target() -> KernelPeTarget {
             image_base: layout.kernel_image_base,
             image_end_limit: layout.stub_image_base,
         },
+        "aarch64" => KernelPeTarget {
+            machine: 0xAA64,
+            machine_name: "aarch64",
+            optional_magic: 0x20B,
+            image_base: layout.kernel_image_base,
+            image_end_limit: layout.stub_image_base,
+        },
         _ => panic!("kernel_stub build does not have an implementation for target architecture `{target_arch}`"),
     }
 }

@@ -190,11 +190,6 @@ where
     if pe.entry == 0 {
         return Err("kernel_stub: kernel PE has no entry point");
     }
-    if pe.relocation_data.is_some()
-        || directory_present(opt.data_directories.get_base_relocation_table())
-    {
-        return Err("kernel_stub: kernel PE relocations are not supported");
-    }
     if directory_present(opt.data_directories.get_delay_import_descriptor()) {
         return Err("kernel_stub: kernel PE delay imports are not supported");
     }
@@ -551,10 +546,10 @@ fn store_kernel_symbol_string(value: &str) -> Result<KernelSymbolString, &'stati
     }
 }
 
-pub(crate) fn record_allocated_frame(phys: u64) -> Result<(), &'static str> {
+pub(crate) fn record_allocated_frame_range(phys: u64, size: u64) -> Result<(), &'static str> {
     unsafe {
         let end = phys
-            .checked_add(ActivePlatform::base_page_size())
+            .checked_add(size)
             .ok_or("kernel_stub: physical allocation range overflow")?;
         if ALLOCATED_RANGE_COUNT > 0 {
             let last = &mut ALLOCATED_RANGES[ALLOCATED_RANGE_COUNT - 1];

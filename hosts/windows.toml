@@ -4,10 +4,10 @@ os = "windows"
 
 [qemu]
 executable_patterns = [
-    "C:/Program Files/qemu/{executable}w.exe",
     "C:/Program Files/qemu/{executable}.exe",
-    "C:/Program Files (x86)/qemu/{executable}w.exe",
+    "C:/Program Files/qemu/{executable}w.exe",
     "C:/Program Files (x86)/qemu/{executable}.exe",
+    "C:/Program Files (x86)/qemu/{executable}w.exe",
 ]
 data_directories = [
     "../qemu",

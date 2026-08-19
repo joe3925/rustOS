@@ -7,6 +7,10 @@ pub mod x86;
 #[cfg(target_arch = "x86_64")]
 pub use x86::Platform;
 
+#[cfg(target_arch = "aarch64")]
+#[path = "arch/aarch64.rs"]
+mod aarch64;
+
 #[cfg(not(target_arch = "x86_64"))]
 pub struct Platform;
 

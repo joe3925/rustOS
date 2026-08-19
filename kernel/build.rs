@@ -226,11 +226,12 @@ fn emit_kernel_pe_link_args(target_os: &str, target_arch: &str) {
         "/NODEFAULTLIB",
         "/SUBSYSTEM:NATIVE",
         "/ENTRY:kernel_pe_entry",
-        "/FIXED",
-        "/DYNAMICBASE:NO",
         "/EXPORT:kernel_pe_entry",
     ] {
         println!("cargo:rustc-link-arg-bin=kernel={arg}");
+    }
+    if target_arch == "x86_64" {
+        println!("cargo:rustc-link-arg-bin=kernel=/FIXED");
     }
     println!("cargo:rustc-link-arg-bin=kernel={image_base}");
 }

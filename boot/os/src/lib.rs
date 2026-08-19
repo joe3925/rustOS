@@ -12,6 +12,8 @@ const AARCH64_BOOTLOADER_MANIFEST: &str = "third_party/aarch64-bootloader/bootlo
 const AARCH64_BOOTLOADER_PACKAGE: &str = "aarch64-bootloader";
 const AARCH64_BOOTLOADER_TARGET: &str = "aarch64-unknown-uefi";
 const AARCH64_EFI_PATH: &str = "/EFI/BOOT/BOOTAA64.EFI";
+const AARCH64_STARTUP_PATH: &str = "/startup.nsh";
+const AARCH64_STARTUP: &[u8] = b"FS0:\\EFI\\BOOT\\BOOTAA64.EFI\r\n";
 const AARCH64_CONFIG_ENV: &str = "RUSTOS_BOOT_CONFIG_PATH";
 const MIB: u64 = 1024 * 1024;
 
@@ -167,7 +169,7 @@ impl ImagePath {
         }
         let fat = parts.join("/");
         Ok(Self {
-            uefi: format!("/{fat}"),
+            uefi: format!("\\{}", parts.join("\\")),
             fat,
         })
     }
@@ -330,6 +332,7 @@ fn create_aarch64_image(
             .map_err(|err| format!("failed to open AArch64 EFI partition: {err}"))?;
         let root = filesystem.root_dir();
         write_host_file(&root, AARCH64_EFI_PATH, bootloader)?;
+        write_bytes(&root, AARCH64_STARTUP_PATH, AARCH64_STARTUP)?;
         write_host_file(&root, layout.payload_path.as_fat_path(), stub)?;
         write_bytes(&root, layout.config_path.as_fat_path(), &config)?;
     }

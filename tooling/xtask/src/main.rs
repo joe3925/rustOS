@@ -1012,10 +1012,19 @@ fn find_firmware(launch: &LaunchPlan, host: &HostPlan, qemu: &Path) -> Result<Pa
 fn firmware_paths_from_qemu(qemu: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
+    if let Some(directory) = qemu.parent() {
+        for share in [directory.join("share"), directory.join("share").join("qemu")] {
+            for file in files {
+                paths.push(share.join(file));
+            }
+        }
+    }
+
     for prefix in qemu_prefixes(qemu) {
-        let share = prefix.join("share").join("qemu");
-        for file in files {
-            paths.push(share.join(file));
+        for share in [prefix.join("share"), prefix.join("share").join("qemu")] {
+            for file in files {
+                paths.push(share.join(file));
+            }
         }
     }
 

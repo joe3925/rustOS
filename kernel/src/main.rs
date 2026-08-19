@@ -45,28 +45,28 @@ mod util;
 use crate::util::{KERNEL_INITIALIZED, panic_common};
 
 use alloc::{format, vec};
-use core::mem::MaybeUninit;
 use core::panic::PanicInfo;
 use core::ptr::{addr_of_mut, copy_nonoverlapping};
-use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_abi::RUSTOS_BOOT_INFO_MAGIC;
 use kernel_abi::{
     BootInfo, FrameBuffer, KernelSection, KernelSections, KernelSymbol, KernelSymbolString,
     KernelSymbols, MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS,
     MAX_KERNEL_SECTIONS, MAX_KERNEL_SYMBOL_STRING_BYTES, MemoryRegion, MemoryRegions, Optional,
 };
-use kernel_abi::RUSTOS_BOOT_INFO_MAGIC;
 use lazy_static::lazy_static;
+use spin::{Mutex, Once};
 
 use crate::platform::{ActivePlatform, Platform};
 
 pub type ActiveBootInfo = BootInfo<<ActivePlatform as Platform>::BootArchInfo>;
 
-static mut BOOT_INFO: ActiveBootInfo = ActiveBootInfo::empty();
+struct SharedBootInfo(ActiveBootInfo);
 
-static BOOT_INFO_INITIALIZED: AtomicBool = AtomicBool::new(false);
-static BOOT_FRAMEBUFFER_TAKEN: AtomicBool = AtomicBool::new(false);
-static BOOT_FRAMEBUFFER_AVAILABLE: AtomicBool = AtomicBool::new(false);
-static mut BOOT_FRAMEBUFFER: MaybeUninit<FrameBuffer> = MaybeUninit::uninit();
+unsafe impl Send for SharedBootInfo {}
+unsafe impl Sync for SharedBootInfo {}
+
+static BOOT_INFO: Once<SharedBootInfo> = Once::new();
+static BOOT_FRAMEBUFFER: Mutex<Option<FrameBuffer>> = Mutex::new(None);
 static mut BOOT_MEMORY_REGIONS: [MemoryRegion; MAX_BOOT_MEMORY_REGIONS] =
     [MemoryRegion::empty(); MAX_BOOT_MEMORY_REGIONS];
 static mut BOOT_KERNEL_SECTIONS: [KernelSection; MAX_KERNEL_SECTIONS] =
@@ -96,14 +96,13 @@ pub extern "C" fn kernel_pe_entry(boot_info: *const ActiveBootInfo) -> ! {
         panic!("kernel_pe_entry received an invalid boot info block");
     }
     unsafe {
-        copy_boot_info(boot_info);
-        BOOT_INFO_INITIALIZED.store(true, Ordering::Release);
+        BOOT_INFO.call_once(|| SharedBootInfo(copy_boot_info(boot_info)));
         util::init();
     }
 
     loop {}
 }
-unsafe fn copy_boot_info(src: &ActiveBootInfo) {
+unsafe fn copy_boot_info(src: &ActiveBootInfo) -> ActiveBootInfo {
     BOOT_KERNEL_SYMBOL_STRING_LEN = 0;
 
     let memory_regions = copy_memory_regions(&src.memory_regions);
@@ -120,11 +119,10 @@ unsafe fn copy_boot_info(src: &ActiveBootInfo) {
     let kernel_sections = copy_kernel_sections(&src.kernel_sections);
     let framebuffer = copy_framebuffer(&src.framebuffer);
     if let Optional::Some(framebuffer) = framebuffer {
-        addr_of_mut!(BOOT_FRAMEBUFFER).write(MaybeUninit::new(framebuffer));
-        BOOT_FRAMEBUFFER_AVAILABLE.store(true, Ordering::Release);
+        *BOOT_FRAMEBUFFER.lock() = Some(framebuffer);
     }
 
-    BOOT_INFO = ActiveBootInfo {
+    ActiveBootInfo {
         magic: src.magic,
         flags: src.flags,
         rsdp_addr: src.rsdp_addr,
@@ -147,7 +145,7 @@ unsafe fn copy_boot_info(src: &ActiveBootInfo) {
         boot_packages: src.boot_packages,
         stub_base: src.stub_base,
         stub_size: src.stub_size,
-    };
+    }
 }
 
 unsafe fn copy_memory_regions(src: &MemoryRegions) -> MemoryRegions {

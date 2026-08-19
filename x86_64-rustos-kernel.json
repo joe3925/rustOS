@@ -40,7 +40,6 @@
       "/SUBSYSTEM:NATIVE",
       "/ENTRY:kernel_pe_entry",
       "/FIXED",
-      "/DYNAMICBASE:NO",
       "/EXPORT:kernel_pe_entry",
       "/DEBUG:SYMTAB"
     ],
@@ -50,7 +49,6 @@
       "/SUBSYSTEM:NATIVE",
       "/ENTRY:kernel_pe_entry",
       "/FIXED",
-      "/DYNAMICBASE:NO",
       "/EXPORT:kernel_pe_entry",
       "/DEBUG:SYMTAB"
     ]

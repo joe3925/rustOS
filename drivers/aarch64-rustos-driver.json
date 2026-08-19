@@ -53,7 +53,7 @@
       "/EXPORT:DriverEntry"
     ]
   },
-  "requires-uwtable": true,
+  "requires-uwtable": false,
   "crt-static-respected": true,
   "crt-static-allows-dylibs": true,
   "plt-by-default": false,

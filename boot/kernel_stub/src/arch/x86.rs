@@ -22,8 +22,8 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::platform::{
-    BootInfoParts, BootloaderMemoryRegion, BootloaderPlatform, KernelImagePermissions,
-    KernelImagePlatform, PhysRange, Platform,
+    BootFrameSource, BootInfoParts, BootloaderMemoryRegion, BootloaderPlatform,
+    KernelImagePermissions, KernelImagePlatform, PhysRange, Platform,
 };
 
 pub struct X86Platform;
@@ -380,44 +380,20 @@ fn stub_image_size(bootloader_info: &bootloader_api::BootInfo) -> u64 {
 }
 
 pub struct BootFrameAllocator {
-    regions: *const info::MemoryRegion,
-    len: usize,
-    next_frame: u64,
+    source: BootFrameSource<X86Platform>,
 }
 
 impl BootFrameAllocator {
     fn new(boot_info: &bootloader_api::BootInfo) -> Self {
         Self {
-            regions: boot_info.memory_regions.as_ptr(),
-            len: boot_info.memory_regions.len(),
-            next_frame: LOW_RESERVED_END / PAGE_SIZE,
+            source: BootFrameSource::new(boot_info, LOW_RESERVED_END),
         }
-    }
-
-    fn regions(&self) -> &[info::MemoryRegion] {
-        unsafe { core::slice::from_raw_parts(self.regions, self.len) }
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        let mut best: Option<u64> = None;
-
-        for region in self.regions() {
-            if region.kind != Usable || region.end <= region.start {
-                continue;
-            }
-
-            let start = crate::align_up(region.start, PAGE_SIZE).max(self.next_frame * PAGE_SIZE);
-            let end = region.end & !(PAGE_SIZE - 1);
-            if start < end {
-                best = Some(best.map_or(start, |current| current.min(start)));
-            }
-        }
-
-        let phys = best?;
-        self.next_frame = phys / PAGE_SIZE + 1;
-        crate::record_allocated_frame(phys).ok()?;
+        let phys = self.source.allocate(PAGE_SIZE)?;
         Some(PhysFrame::containing_address(PhysAddr::new(phys)))
     }
 }
