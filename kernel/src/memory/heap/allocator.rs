@@ -1,4 +1,5 @@
 use crate::memory::heap::bootstrap_allocator::BootstrapAllocator;
+use crate::memory::heap::mimalloc;
 use crate::memory::paging::frame_alloc::total_usable_bytes;
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
@@ -15,127 +16,122 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
-cfg_if::cfg_if! {
-    if #[cfg(feature = "allocator-mimalloc")] {
-        use crate::memory::heap::mimalloc;
 
-        pub struct KernelAllocator {
-            bootstrap: BootstrapAllocator,
-            mimalloc_enabled: AtomicBool,
-            enable_lock: spin::Mutex<()>,
+pub struct KernelAllocator {
+    bootstrap: BootstrapAllocator,
+    mimalloc_enabled: AtomicBool,
+    enable_lock: spin::Mutex<()>,
+}
+
+impl KernelAllocator {
+    pub const fn new() -> Self {
+        Self {
+            bootstrap: BootstrapAllocator::new(),
+            mimalloc_enabled: AtomicBool::new(false),
+            enable_lock: spin::Mutex::new(()),
+        }
+    }
+
+    pub fn enable_mimalloc(&self) {
+        if self.mimalloc_enabled.load(Ordering::Acquire) {
+            return;
         }
 
-        impl KernelAllocator {
-            pub const fn new() -> Self {
-                Self {
-                    bootstrap: BootstrapAllocator::new(),
-                    mimalloc_enabled: AtomicBool::new(false),
-                    enable_lock: spin::Mutex::new(()),
-                }
+        let _guard = self.enable_lock.lock();
+        if !self.mimalloc_enabled.load(Ordering::Acquire) {
+            unsafe {
+                mimalloc::enable_mimalloc_impl();
             }
+            self.mimalloc_enabled.store(true, Ordering::Release);
+        }
+    }
 
-            pub fn enable_mimalloc(&self) {
-                if self.mimalloc_enabled.load(Ordering::Acquire) {
-                    return;
-                }
+    #[inline(always)]
+    pub fn mimalloc_enabled(&self) -> bool {
+        self.mimalloc_enabled.load(Ordering::Acquire)
+    }
 
-                let _guard = self.enable_lock.lock();
-                if !self.mimalloc_enabled.load(Ordering::Acquire) {
-                    unsafe { mimalloc::enable_mimalloc_impl(); }
-                    self.mimalloc_enabled.store(true, Ordering::Release);
-                }
+    pub fn mimalloc_thread_done(&self) {
+        if self.mimalloc_enabled() {
+            if platform::current_is_in_interrupt() {
+                panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
             }
-
-            #[inline(always)]
-            pub fn mimalloc_enabled(&self) -> bool {
-                self.mimalloc_enabled.load(Ordering::Acquire)
-            }
-
-            pub fn mimalloc_thread_done(&self) {
-                if self.mimalloc_enabled() {
-                    if platform::current_is_in_interrupt() {
-                        panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
-                    }
-                    unsafe { mimalloc::mimalloc_thread_done_impl(); }
-                }
-            }
-
-            pub fn free_memory(&self) -> usize {
-                self.bootstrap.free_memory() + mimalloc::get_mimalloc_free_memory()
+            unsafe {
+                mimalloc::mimalloc_thread_done_impl();
             }
         }
+    }
 
-        unsafe impl GlobalAlloc for KernelAllocator {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                if self.mimalloc_enabled() {
-                    if platform::current_is_in_interrupt() {
-                        panic!("Cannot accses allocator from interrupt");
-                    }
-                    mimalloc::mimalloc_alloc(layout)
-                } else {
-                    self.bootstrap.alloc(layout)
-                }
+    pub fn free_memory(&self) -> usize {
+        self.bootstrap.free_memory() + mimalloc::get_mimalloc_free_memory()
+    }
+}
+
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if self.mimalloc_enabled() {
+            if platform::current_is_in_interrupt() {
+                panic!("Cannot accses allocator from interrupt");
             }
+            mimalloc::mimalloc_alloc(layout)
+        } else {
+            self.bootstrap.alloc(layout)
+        }
+    }
 
-            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                if self.mimalloc_enabled() {
-                    if platform::current_is_in_interrupt() {
-                        panic!("Cannot accses allocator from interrupt");
-                    }
-                    mimalloc::mimalloc_alloc_zeroed(layout)
-                } else {
-                    let ptr = self.bootstrap.alloc(layout);
-                    if !ptr.is_null() {
-                        core::ptr::write_bytes(ptr, 0, layout.size());
-                    }
-                    ptr
-                }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if self.mimalloc_enabled() {
+            if platform::current_is_in_interrupt() {
+                panic!("Cannot accses allocator from interrupt");
             }
-
-            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-
-                if ptr.is_null() {
-                    return;
-                }
-
-                if mimalloc::ptr_is_mimalloc(ptr) {
-                    if platform::current_is_in_interrupt() {
-                        panic!("Cannot accses allocator from interrupt");
-                    }
-                    mimalloc::mimalloc_dealloc(ptr, layout)
-                } else {
-                    self.bootstrap.dealloc(ptr, layout)
-                }
+            mimalloc::mimalloc_alloc_zeroed(layout)
+        } else {
+            let ptr = self.bootstrap.alloc(layout);
+            if !ptr.is_null() {
+                core::ptr::write_bytes(ptr, 0, layout.size());
             }
+            ptr
+        }
+    }
 
-            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                if ptr.is_null() {
-                    return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
-                }
-
-                if mimalloc::ptr_is_mimalloc(ptr) {
-                    if platform::current_is_in_interrupt() {
-                        panic!("Cannot accses allocator from interrupt");
-                    }
-                    mimalloc::mimalloc_realloc(ptr, layout, new_size)
-                } else {
-                    let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-                    let new_ptr = self.alloc(new_layout);
-                    if !new_ptr.is_null() {
-                        core::ptr::copy_nonoverlapping(
-                            ptr,
-                            new_ptr,
-                            core::cmp::min(layout.size(), new_size),
-                        );
-                        self.bootstrap.dealloc(ptr, layout);
-                    }
-                    new_ptr
-                }
-            }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() {
+            return;
         }
 
-    } else {
-        compile_error!("The kernel requires the 'allocator-mimalloc' feature.");
+        if mimalloc::ptr_is_mimalloc(ptr) {
+            if platform::current_is_in_interrupt() {
+                panic!("Cannot accses allocator from interrupt");
+            }
+            mimalloc::mimalloc_dealloc(ptr, layout)
+        } else {
+            self.bootstrap.dealloc(ptr, layout)
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
+        }
+
+        if mimalloc::ptr_is_mimalloc(ptr) {
+            if platform::current_is_in_interrupt() {
+                panic!("Cannot accses allocator from interrupt");
+            }
+            mimalloc::mimalloc_realloc(ptr, layout, new_size)
+        } else {
+            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+            let new_ptr = self.alloc(new_layout);
+            if !new_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(
+                    ptr,
+                    new_ptr,
+                    core::cmp::min(layout.size(), new_size),
+                );
+                self.bootstrap.dealloc(ptr, layout);
+            }
+            new_ptr
+        }
     }
 }
 
@@ -313,55 +309,51 @@ pub fn test_full_heap_parallel() {
     }
 }
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "allocator-mimalloc")] {
-        fn reset_parallel_heap_test_stats() {
-            crate::memory::heap::mimalloc::mimalloc_commit_stats_reset();
-            crate::memory::heap::mimalloc::mimalloc_alloc_stats_reset();
-        }
+fn reset_parallel_heap_test_stats() {
+    crate::memory::heap::mimalloc::mimalloc_commit_stats_reset();
+    crate::memory::heap::mimalloc::mimalloc_alloc_stats_reset();
+}
 
-        fn force_heap_collection() {
-            crate::memory::heap::mimalloc::mimalloc_collect(true);
-        }
+fn force_heap_collection() {
+    crate::memory::heap::mimalloc::mimalloc_collect(true);
+}
 
-        fn print_parallel_heap_test_result(
-            num_threads: usize,
-            elapsed_ms: u128,
-            push_max_ms: usize,
-            push_total_ms: usize,
-            verify_ms: usize,
-        ) {
-            let commit_stats = crate::memory::heap::mimalloc::mimalloc_commit_stats();
-            let alloc_stats = crate::memory::heap::mimalloc::mimalloc_alloc_stats();
-            let commit_ms = Stopwatch::from_cycles(commit_stats.cycles).as_millis();
-            let alloc_ms = Stopwatch::from_cycles(alloc_stats.alloc_cycles).as_millis();
-            let realloc_ms = Stopwatch::from_cycles(alloc_stats.realloc_cycles).as_millis();
-            let dealloc_ms = Stopwatch::from_cycles(alloc_stats.dealloc_cycles).as_millis();
+fn print_parallel_heap_test_result(
+    num_threads: usize,
+    elapsed_ms: u128,
+    push_max_ms: usize,
+    push_total_ms: usize,
+    verify_ms: usize,
+) {
+    let commit_stats = crate::memory::heap::mimalloc::mimalloc_commit_stats();
+    let alloc_stats = crate::memory::heap::mimalloc::mimalloc_alloc_stats();
+    let commit_ms = Stopwatch::from_cycles(commit_stats.cycles).as_millis();
+    let alloc_ms = Stopwatch::from_cycles(alloc_stats.alloc_cycles).as_millis();
+    let realloc_ms = Stopwatch::from_cycles(alloc_stats.realloc_cycles).as_millis();
+    let dealloc_ms = Stopwatch::from_cycles(alloc_stats.dealloc_cycles).as_millis();
 
-            println!(
-                "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify main {} ms, commits calls/maps {} / {}, req/map {} / {} MiB, commit {} ms, alloc/realloc/free calls {} / {} / {}, MiB {} / {} / {}, ms {} / {} / {})",
-                num_threads,
-                elapsed_ms,
-                push_max_ms,
-                push_total_ms,
-                verify_ms,
-                commit_stats.calls,
-                commit_stats.map_calls,
-                commit_stats.requested / (1024 * 1024),
-                commit_stats.mapped / (1024 * 1024),
-                commit_ms,
-                alloc_stats.alloc_calls,
-                alloc_stats.realloc_calls,
-                alloc_stats.dealloc_calls,
-                alloc_stats.alloc_bytes / (1024 * 1024),
-                alloc_stats.realloc_new_bytes / (1024 * 1024),
-                alloc_stats.dealloc_bytes / (1024 * 1024),
-                alloc_ms,
-                realloc_ms,
-                dealloc_ms
-            );
-        }
-    }
+    println!(
+        "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify main {} ms, commits calls/maps {} / {}, req/map {} / {} MiB, commit {} ms, alloc/realloc/free calls {} / {} / {}, MiB {} / {} / {}, ms {} / {} / {})",
+        num_threads,
+        elapsed_ms,
+        push_max_ms,
+        push_total_ms,
+        verify_ms,
+        commit_stats.calls,
+        commit_stats.map_calls,
+        commit_stats.requested / (1024 * 1024),
+        commit_stats.mapped / (1024 * 1024),
+        commit_ms,
+        alloc_stats.alloc_calls,
+        alloc_stats.realloc_calls,
+        alloc_stats.dealloc_calls,
+        alloc_stats.alloc_bytes / (1024 * 1024),
+        alloc_stats.realloc_new_bytes / (1024 * 1024),
+        alloc_stats.dealloc_bytes / (1024 * 1024),
+        alloc_ms,
+        realloc_ms,
+        dealloc_ms
+    );
 }
 fn atomic_max(target: &AtomicUsize, value: usize) {
     let mut current = target.load(Ordering::Relaxed);

@@ -10,8 +10,6 @@ name = "kernel"
 path = "src/main.rs"
 
 [features]
-default = ["allocator-mimalloc"]
-allocator-mimalloc = []
 kernel-bench = []
 
 [dependencies]
