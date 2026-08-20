@@ -8,7 +8,6 @@ binary = "kernel"
 target = "../aarch64-rustos-kernel.json"
 import_library_machine = "ARM64"
 no_default_features = true
-features = ["allocator-mimalloc"]
 
 [drivers]
 target = "../drivers/aarch64-rustos-driver.json"

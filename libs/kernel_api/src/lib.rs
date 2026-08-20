@@ -1,5 +1,4 @@
 #![no_std]
-#![cfg(target_env = "msvc")]
 #![allow(non_upper_case_globals)]
 pub extern crate alloc;
 

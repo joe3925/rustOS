@@ -865,7 +865,9 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
     if ptr.is_null() || !user_ptr(ptr) {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
-    let c_str = unsafe { core::ffi::CStr::from_ptr(ptr as *const i8) };
+
+    let c_str = unsafe { core::ffi::CStr::from_ptr(ptr.cast()) };
+
     if let Ok(s) = c_str.to_str() {
         print_wrapper(s.to_string());
         0
@@ -873,7 +875,6 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
         make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 1)
     }
 }
-
 pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
     let caller_pid = SCHEDULER
         .get_current_task(platform::current_cpu_id())

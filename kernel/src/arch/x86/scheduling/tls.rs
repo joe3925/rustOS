@@ -1,4 +1,4 @@
-use super::super::drivers::interrupt_index::PERCPU_TLS_ARRAY_POINTER_OFF;
+use crate::drivers::ACPI::PERCPU_TLS_ARRAY_POINTER_OFF;
 use crate::util::boot_info;
 use alloc::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::sync::Arc;
@@ -94,9 +94,7 @@ impl fmt::Debug for KernelTls {
 }
 
 #[inline(always)]
-/// # Safety
-/// The TLS allocation identified by `tls_array_pointer` must remain live until
-/// another TLS pointer is activated on this CPU.
+
 pub(crate) unsafe fn activate(tls_array_pointer: u64) {
     unsafe {
         asm!(

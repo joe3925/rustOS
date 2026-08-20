@@ -3,10 +3,6 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use aarch64_bootloader_api::{
-    BootInfo as LoaderBootInfo, GranuleKind, Optional as LoaderOptional,
-    PixelFormat as LoaderPixelFormat,
-};
 use aarch64_vmsa::address::{TranslationGranule, VirtAddr};
 use aarch64_vmsa::attrs::{
     AllocationHints, CachePolicy, Cacheability, DataAccess, DirtyBitManagement, DirtyControl,
@@ -25,6 +21,10 @@ use aarch64_vmsa::table::{
     TableReclaim,
 };
 use aarch64_vmsa::translation::{WalkInputAddr, WalkOutputAddr};
+use bootloader_api::{
+    BootInfo as LoaderBootInfo, GranuleKind, Optional as LoaderOptional,
+    PixelFormat as LoaderPixelFormat,
+};
 use goblin::pe::header::COFF_MACHINE_ARM64;
 use kernel_abi::arch::{
     Aarch64BootArchInfo, Aarch64PeTlsDirectory, RawTableFrameProvider, RecursiveFrameZeroProvider,

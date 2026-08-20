@@ -10,9 +10,9 @@ use crate::profiling::backtrace::{Backtrace, BacktraceStatus, MAX_BACKTRACE_DEPT
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
-use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
+use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_archive_for_path};
 use crate::structs::stopwatch::Stopwatch;
-use crate::util::{boot_info, TOTAL_TIME};
+use crate::util::{TOTAL_TIME, boot_info};
 use crate::{platform, print, println, vec};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -28,21 +28,21 @@ use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{
-    block_on, spawn_blocking, spawn_blocking_many, spawn_detached, spawn_join_owned as spawn,
-    JoinAll,
+    JoinAll, block_on, spawn_blocking, spawn_blocking_many, spawn_detached,
+    spawn_join_owned as spawn,
 };
+use kernel_types::Message;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
-    BenchDroppedSampleCounterProto, BenchOverflowPolicy, BenchSampleChunkProto, BenchSampleProto,
-    BenchWindowConfig, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
+    BENCH_SAMPLE_PROTO_SCHEMA_VERSION, BenchDroppedSampleCounterProto, BenchOverflowPolicy,
+    BenchSampleChunkProto, BenchSampleProto, BenchWindowConfig,
 };
 use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::error::KernelError;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::DeviceControl;
-use kernel_types::Message;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use spin::{Mutex, Once};
 
 const MAX_CALLCHAIN_DEPTH: usize = MAX_BACKTRACE_DEPTH;
@@ -2282,22 +2282,24 @@ impl BenchWindow {
                 let interval = secs;
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
-                spawn_blocking(move || loop {
-                    platform::wait_duration(interval);
+                spawn_blocking(move || {
+                    loop {
+                        platform::wait_duration(interval);
 
-                    if !BENCH_ENABLED {
-                        return;
-                    }
-
-                    {
-                        let inner = this_arc.inner.lock();
-                        if !inner.running {
-                            break;
+                        if !BENCH_ENABLED {
+                            return;
                         }
-                    }
 
-                    let moved = Arc::clone(&this_arc);
-                    block_on(moved.persist());
+                        {
+                            let inner = this_arc.inner.lock();
+                            if !inner.running {
+                                break;
+                            }
+                        }
+
+                        let moved = Arc::clone(&this_arc);
+                        block_on(moved.persist());
+                    }
                 });
             }
         }
@@ -2719,18 +2721,12 @@ pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Resul
 }
 
 pub fn used_memory() -> usize {
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "allocator-mimalloc")] {
-            let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
-                + crate::memory::heap::mimalloc_os_heap_size();
-            let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
-            let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
-                .load(core::sync::atomic::Ordering::Relaxed);
-            used_non_arena + used_arena
-        } else {
-            0
-        }
-    }
+    let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
+        + crate::memory::heap::mimalloc_os_heap_size();
+    let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
+    let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
+        .load(core::sync::atomic::Ordering::Relaxed);
+    used_non_arena + used_arena
 }
 
 // =====================

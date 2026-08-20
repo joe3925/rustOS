@@ -22,7 +22,7 @@ x86_64 = { version = "=0.15.2", default-features = false, features = [
 ] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-aarch64-bootloader-api = { package = "bootloader-api", path = "../../third_party/aarch64-bootloader/bootloader-api" }
+bootloader-api = { git = "https://github.com/joe3925/aarch64-bootloader.git" }
 aarch64-vmsa = { git = "https://github.com/joe3925/aarch64-vmsa.git" }
 
 [build-dependencies]

@@ -455,7 +455,6 @@ mod tests {
         assert!(!whpx.capabilities.debug);
         assert_eq!(aarch64.id, "aarch64-uefi");
         assert!(aarch64.kernel.no_default_features);
-        assert_eq!(aarch64.kernel.features, ["allocator-mimalloc"]);
         assert!(aarch64_tcg.capabilities.debug);
         assert!(!aarch64_hvf.capabilities.debug);
         assert!(!aarch64_kvm.capabilities.debug);

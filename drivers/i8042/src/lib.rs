@@ -5,15 +5,15 @@
 #![feature(const_trait_impl)]
 extern crate alloc;
 
-use kernel_api::pnp::QueryDeviceRelations;
-use kernel_api::pnp::QueryId;
-use kernel_api::pnp::StartDevice;
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     panic::PanicInfo,
     sync::atomic::{AtomicBool, Ordering},
 };
 use i8042::probe_i8042;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::StartDevice;
 use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::pnp::DeviceIds,
@@ -45,7 +45,9 @@ pub struct Ps2ChildExt {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
+pub extern "C" fn DriverEntry(
+    driver: &Arc<DriverObject>,
+) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, ps2_device_add);
     Ok(())
 }
@@ -80,7 +82,9 @@ pub async fn ps2_start<'req, 'data, 'b>(
             ext.have_mouse.store(have_mouse, Ordering::Release);
         }
     } else {
-        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
+        return Err(kernel_api::error::error(
+            kernel_api::error::DriverErrorKind::NoSuchDevice,
+        ));
     }
     Ok(DriverStep::Continue)
 }
@@ -94,20 +98,26 @@ pub async fn ps2_query_devrels<'req, 'data, 'b>(
     use kernel_api::pnp::DeviceRelationType;
     let relation = req.relation;
     if relation != DeviceRelationType::BusRelations {
-        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
+        return Err(kernel_api::error::error(
+            kernel_api::error::DriverErrorKind::NotImplemented,
+        ));
     }
 
     let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
+            return Err(kernel_api::error::error(
+                kernel_api::error::DriverErrorKind::NoSuchDevice,
+            ));
         }
     };
 
     let ext = match device.try_devext::<DevExt>() {
         Ok(g) => g,
         Err(_) => {
-            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
+            return Err(kernel_api::error::error(
+                kernel_api::error::DriverErrorKind::NoSuchDevice,
+            ));
         }
     };
 
@@ -183,7 +193,11 @@ async fn ps2_child_query_id<'req, 'data, 'b>(
 ) -> Result<DriverStep, kernel_api::error::KernelError> {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
-        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice)),
+        Err(_) => {
+            return Err(kernel_api::error::error(
+                kernel_api::error::DriverErrorKind::NoSuchDevice,
+            ));
+        }
     };
 
     match req.id_type {

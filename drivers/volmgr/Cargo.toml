@@ -16,8 +16,5 @@ configuration = "src/volmgr.toml"
 
 [dependencies]
 kernel_api = { workspace = true }
-spin = { version = "0.10", default-features = false, features = [
-    "mutex",
-    "rwlock",
-] }
+spin = { version = "0.10", default-features = false}
 schnellru = { version = "0.2.4", default-features = false }

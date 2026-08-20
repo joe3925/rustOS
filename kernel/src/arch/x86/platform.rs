@@ -99,7 +99,7 @@ impl Platform for X86Platform {
 }
 
 impl CpuPlatform for X86Platform {
-    type PerCpuState = super::drivers::interrupt_index::PerCpu;
+    type PerCpuState = crate::drivers::ACPI::PerCpu;
 
     const MAX_CPUS: usize = super::MAX_CPUS;
 

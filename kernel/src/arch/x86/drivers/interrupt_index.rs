@@ -5,6 +5,11 @@ use super::super::idt::load_idt;
 use super::super::syscalls::syscall::syscall_init;
 use super::timer_driver::set_num_cores;
 use crate::KERNEL_INITIALIZED;
+use crate::drivers::ACPI::PerCpu;
+use crate::drivers::ACPI::alloc_or_get_percpu_for;
+use crate::drivers::ACPI::{
+    PERCPU_CPU_ID_OFF, PERCPU_IS_IN_INTERRUPT_OFF, PERCPU_TLS_ARRAY_POINTER_OFF,
+};
 use crate::machine::MachineInterruptInfo;
 use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::scheduling::scheduler::SCHEDULER;
@@ -284,46 +289,6 @@ pub fn get_current_logical_id() -> u8 {
         .expect("cpu id not available?")
         .initial_local_apic_id()
 }
-
-static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
-
-pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
-    let idx = lapic_id as usize;
-
-    let mut v = PERCPU_SLOTS.lock();
-
-    if v.len() <= idx {
-        v.resize_with(idx + 1, || None);
-    }
-
-    if let Some(p) = v[idx] {
-        return p;
-    }
-
-    let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
-        is_in_interrupt: AtomicBool::new(false),
-        reserved_interrupt_pad: [0; 0x7],
-        cpu_id: lapic_id as u64,
-        reserved0: [0; 0x48],
-        tls_array_pointer: 0,
-    }));
-
-    v[idx] = Some(p);
-    p
-}
-
-#[repr(C, align(64))]
-pub struct PerCpu {
-    pub is_in_interrupt: AtomicBool, // 0x00
-    reserved_interrupt_pad: [u8; 0x7],
-    pub cpu_id: u64, // 0x08
-    reserved0: [u8; 0x48],
-    pub tls_array_pointer: u64, // 0x58
-}
-
-pub const PERCPU_IS_IN_INTERRUPT_OFF: usize = 0x00;
-pub const PERCPU_CPU_ID_OFF: usize = 0x08;
-pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = 0x58;
 
 const _: () = {
     assert!(core::mem::align_of::<PerCpu>() == 0x40);
