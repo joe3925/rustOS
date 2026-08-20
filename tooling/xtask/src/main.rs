@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_GDB_PORT: u16 = 1234;
+const DEFAULT_SERIAL_PORT: u16 = 4321;
 const DEFAULT_META_PORT: u16 = 4322;
 
 fn main() {
@@ -248,10 +249,11 @@ fn usage() -> String {
         "                    defaults to rustOS.vhdx on Windows, rustOS.dmg elsewhere",
         "  RUSTOS_QEMU_MEMORY QEMU memory size, overrides launch defaults",
         "  RUSTOS_QEMU_SMP   QEMU CPU count",
-        "  RUSTOS_QEMU_SERIAL QEMU serial backend used unless --console-serial is passed",
+        "  RUSTOS_QEMU_SERIAL QEMU serial backend override used unless --console-serial is passed",
         "",
         "serial ports:",
-        "  COM1 (0x3F8)  normal kernel log output (controlled by RUSTOS_QEMU_SERIAL)",
+        "  COM1 (0x3F8)  kernel logs; debug sessions stream to LLDB on TCP port 4321",
+        "                other runs use RUSTOS_QEMU_SERIAL and default to no output",
         "  COM2 (0x2F8)  structured debugger metadata, enabled with --lldb-meta",
         "                host TCP port defaults to 4322 (override with --meta-port)",
         "                connect with: .zed/lldb/rustos_meta.py via rustos-meta-connect",
@@ -1168,8 +1170,12 @@ fn qemu_serial_arg(root: &Path, options: &QemuOptions) -> Result<String, String>
         let path = qemu_serial_log_path(root);
         let path = qemu_path_string(root, &path)?;
         Ok(format!("file:{path}"))
+    } else if options.debug {
+        Ok(format!(
+            "tcp:127.0.0.1:{DEFAULT_SERIAL_PORT},server=on,wait=off,nodelay=on"
+        ))
     } else {
-        Ok(env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "stdio".to_string()))
+        Ok(env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "null".to_string()))
     }
 }
 
@@ -1194,9 +1200,7 @@ fn write_lldb_commands(
     })?;
     let metadata_script = root.join(".zed").join("lldb").join("rustos_meta.py");
 
-    if options.lldb_meta {
-        assert_exists(&metadata_script, "LLDB metadata script")?;
-    }
+    assert_exists(&metadata_script, "LLDB integration script")?;
 
     let search_paths = artifacts
         .debug_search_paths
@@ -1214,13 +1218,19 @@ fn write_lldb_commands(
             "target modules load --file {} --slide 0",
             lldb_quote_path(&artifacts.kernel)?
         ),
-    ];
-
-    if options.lldb_meta {
-        commands.push(format!(
+        format!(
             "command script import {}",
             lldb_quote_path(&metadata_script)?
+        ),
+    ];
+
+    if !options.console_serial {
+        commands.push(format!(
+            "rustos-serial-connect 127.0.0.1 {DEFAULT_SERIAL_PORT}"
         ));
+    }
+
+    if options.lldb_meta {
         commands.push(format!(
             "rustos-meta-connect 127.0.0.1 {} {}",
             options.meta_port,

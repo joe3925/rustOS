@@ -287,7 +287,95 @@ class _MetaConnection:
         print(msg)
 
 
+class _SerialConnection:
+    def __init__(self, host: str, port: int) -> None:
+        self._host = host
+        self._port = port
+        self._sock: Optional[socket.socket] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> bool:
+        try:
+            self._sock = socket.create_connection((self._host, self._port), timeout=5.0)
+            self._sock.settimeout(None)
+        except OSError as exc:
+            print(
+                f"[rustos-serial] ERROR: could not connect to {self._host}:{self._port}: {exc}"
+            )
+            return False
+
+        self._thread = threading.Thread(
+            target=self._reader_loop, name="rustos-serial-reader", daemon=True
+        )
+        self._thread.start()
+        print(f"[rustos-serial] connected to {self._host}:{self._port}")
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _reader_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                chunk = self._sock.recv(4096)
+            except OSError:
+                if not self._stop.is_set():
+                    print("[rustos-serial] socket closed")
+                return
+            if not chunk:
+                if not self._stop.is_set():
+                    print("[rustos-serial] EOF")
+                return
+            print(chunk.decode("utf-8", errors="replace"), end="", flush=True)
+
+
 _active_connection: Optional[_MetaConnection] = None
+_active_serial_connection: Optional[_SerialConnection] = None
+
+
+class _RustosSerialConnectCommand:
+    def __init__(self, debugger, _internal_dict) -> None:
+        pass
+
+    def __call__(self, debugger, command: str, exe_ctx, result) -> None:
+        global _active_serial_connection
+
+        args = shlex.split(command)
+        if len(args) != 2:
+            result.SetError("usage: rustos-serial-connect HOST PORT")
+            return
+
+        host, port_str = args
+        try:
+            port = int(port_str)
+        except ValueError:
+            result.SetError(f"invalid port: {port_str!r}")
+            return
+
+        if _active_serial_connection is not None:
+            _active_serial_connection.stop()
+
+        conn = _SerialConnection(host, port)
+        if not conn.start():
+            result.SetError(f"failed to connect to {host}:{port}")
+            return
+
+        _active_serial_connection = conn
+        result.SetStatus(0)
+
+    def get_short_help(self) -> str:
+        return "Connect to the RustOS COM1 serial socket"
+
+    def get_long_help(self) -> str:
+        return "rustos-serial-connect HOST PORT"
 
 
 class _RustosMetaConnectCommand:
@@ -335,6 +423,9 @@ class _RustosMetaConnectCommand:
 
 
 def __lldb_init_module(debugger, internal_dict) -> None:
+    debugger.HandleCommand(
+        "command script add -c rustos_meta._RustosSerialConnectCommand rustos-serial-connect"
+    )
     debugger.HandleCommand(
         "command script add -c rustos_meta._RustosMetaConnectCommand rustos-meta-connect"
     )
