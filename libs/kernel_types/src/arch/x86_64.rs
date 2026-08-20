@@ -29,7 +29,7 @@ impl PlatformInfo for Platform {
 
 impl PagingPlatform for Platform {
     fn translate_addr(addr: VirtAddr) -> Option<TranslatedBlock> {
-        resolve_virtual_range_frame(addr).map(|(block_size, phys_addr)| TranslatedBlock {
+        sys_resolve_virtual_range_frame(addr).map(|(block_size, phys_addr)| TranslatedBlock {
             phys_addr,
             block_size,
         })
@@ -37,18 +37,17 @@ impl PagingPlatform for Platform {
 }
 
 #[cfg(any(test, feature = "hosted-tests"))]
-fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     Some((Size4KiB::SIZE, PhysAddr::new(addr.as_u64())))
 }
 
 #[cfg(not(any(test, feature = "hosted-tests")))]
-fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     unsafe extern "C" {
-        #[link_name = "resolve_virtual_range_frame"]
-        fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+        fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     }
 
-    unsafe { sys_resolve_virtual_range_frame(addr) }
+    unsafe { resolve_virtual_range_frame(addr) }
 }
 
 impl PortAccess for Platform {

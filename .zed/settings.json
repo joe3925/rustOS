@@ -10,41 +10,43 @@
           "kernel/Cargo.toml",
           "libs/kernel_types/Cargo.toml",
           "third_party/rust-fatfs/Cargo.toml",
-          "third_party/rust-fatfs/Cargo.toml",
           "third_party/aarch64-bootloader/bootloader/Cargo.toml",
           "third_party/aarch64-bootloader/bootloader-api/Cargo.toml",
           "libs/kernel_macros/Cargo.toml",
-          "Cargo.toml",
+          "Cargo.toml"
         ],
-
-                "cargo": {
-                    "target": "x86_64-pc-windows-msvc",
-                    "allTargets": false,
-                    //"metadataExtraArgs": ["-Zjson-target-spec"],
-                    //"extraArgs": ["-Zjson-target-spec"],
-                    "buildScripts": {
-                        "enable": false,
-                    },
-                },
-
-                "procMacro": {
-                    "enable": true,
-                },
-
-                "checkOnSave": true,
-
-                "check": {
-                    "allTargets": false,
-                    "targets": ["x86_64-pc-windows-msvc"],
-                    //"extraArgs": ["-Zjson-target-spec"],
-                },
-
-                "diagnostics": {
-                    "experimental": {
-                        "enable": false,
-                    },
-                },
-            },
+        "cfg": {
+            "setTest": false
         },
-    },
+        "cargo": {
+
+          "allTargets": false,
+          "target": "aarch64-unknown-none",
+          "buildScripts": {
+            "enable": false
+          }
+        },
+
+        "procMacro": {
+          "enable": true
+        },
+
+        "checkOnSave": true,
+
+        "check": {
+          "allTargets": false,
+          "targets": [
+            "x86_64-pc-windows-msvc",
+            "aarch64-unknown-none"
+          ]
+        },
+
+        "diagnostics": {
+          "experimental": {
+            "enable": false
+          }
+        }
+      }
+    }
+  }
 }

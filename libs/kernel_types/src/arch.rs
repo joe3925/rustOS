@@ -9,10 +9,9 @@ pub use x86::Platform;
 
 #[cfg(target_arch = "aarch64")]
 #[path = "arch/aarch64.rs"]
-mod aarch64;
-
-#[cfg(not(target_arch = "x86_64"))]
-pub struct Platform;
+pub mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::Platform;
 
 pub trait PlatformInfo {
     const NAME: &'static str;
@@ -160,7 +159,7 @@ impl Not for PageFlags {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(target_arch = "x86_64"), any(test, feature = "hosted-tests")))]
 impl PlatformInfo for Platform {
     const NAME: &'static str = "generic";
 
@@ -169,7 +168,7 @@ impl PlatformInfo for Platform {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(target_arch = "x86_64"), any(test, feature = "hosted-tests")))]
 impl PagingPlatform for Platform {
     fn translate_addr(addr: VirtAddr) -> Option<TranslatedBlock> {
         resolve_virtual_range_frame(addr).map(|(block_size, phys_addr)| TranslatedBlock {
