@@ -10,10 +10,10 @@ use aarch64_bootloader_api::{
 use aarch64_vmsa::address::{TranslationGranule, VirtAddr};
 use aarch64_vmsa::attrs::{
     AllocationHints, CachePolicy, Cacheability, DataAccess, DirtyBitManagement, DirtyControl,
-    MemoryAttributes, MemoryTransience, SemanticLeafAttrs, SemanticStage1LeafAttrs,
-    SemanticStage1TableAttrs, SemanticTableAttrs, SemanticVmsa64Stage1LeafControls,
-    SemanticVmsa64Stage1TableControls, Shareability, SoftwareMetadata, Stage1EffectivePermissions,
-    Stage1MemoryConfig, Stage1PermissionConfig, TwoPrivilegeTablePermissionLimits,
+    MemoryAttributes, MemoryTransience, SemanticLeafAttrs, SemanticTableAttrs,
+    SemanticVmsa64Stage1LeafControls, SemanticVmsa64Stage1TableControls, Shareability,
+    SoftwareMetadata, Stage1EffectivePermissions, Stage1MemoryConfig, Stage1PermissionConfig,
+    TwoPrivilegeTablePermissionLimits,
 };
 use aarch64_vmsa::config::format::Vmsa64;
 use aarch64_vmsa::config::granule::{Granule16KiB, Granule4KiB, Granule64KiB};
@@ -522,6 +522,8 @@ where
     }
     Ok(())
 }
+type LeafAttrs = SemanticLeafAttrs<Vmsa64, NonSecureEl1Stage1>;
+type TableAttrs = SemanticTableAttrs<Vmsa64, NonSecureEl1Stage1>;
 
 fn leaf_attributes(
     writable: bool,
@@ -532,7 +534,7 @@ fn leaf_attributes(
         transience: MemoryTransience::NonTransient,
         allocation: AllocationHints::ReadWriteAllocate,
     };
-    SemanticStage1LeafAttrs {
+    LeafAttrs {
         memory: MemoryAttributes::Normal {
             inner: cache,
             outer: cache,
@@ -563,7 +565,7 @@ fn leaf_attributes(
 }
 
 fn table_attributes() -> SemanticTableAttrs<Vmsa64, NonSecureEl1Stage1> {
-    SemanticStage1TableAttrs {
+    TableAttrs {
         permission_limits: TwoPrivilegeTablePermissionLimits {
             privileged_data_limit: DataAccess::ReadWrite,
             unprivileged_data_limit: DataAccess::None,
