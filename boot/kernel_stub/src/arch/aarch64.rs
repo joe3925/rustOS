@@ -138,8 +138,14 @@ impl Stage1MemoryConfig for MapperConfig {
 
 impl Stage1PermissionConfig for MapperConfig {}
 
+static KERNEL_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+
 #[no_mangle]
-pub extern "C" fn _start(boot_info: &'static mut LoaderBootInfo) -> ! {
+pub extern "C" fn _start(
+    boot_info: &'static mut LoaderBootInfo,
+    kernel_stack_top: u64,
+) -> ! {
+    KERNEL_STACK_TOP.store(kernel_stack_top, Ordering::Relaxed);
     crate::start(boot_info)
 }
 
@@ -241,11 +247,14 @@ impl KernelImagePlatform for Aarch64Platform {
     }
 
     unsafe fn enter_kernel(entry: u64, boot_info: *const BootInfo<Self::BootArchInfo>) -> ! {
+        let kernel_stack_top = KERNEL_STACK_TOP.load(Ordering::Relaxed);
         unsafe {
             asm!(
+                "mov sp, {kernel_stack_top}",
                 "br {entry}",
                 in("x0") boot_info,
                 entry = in(reg) entry,
+                kernel_stack_top = in(reg) kernel_stack_top,
                 options(noreturn)
             )
         }

@@ -5,7 +5,9 @@ use crate::platform::DeviceMmuPlatform;
 use super::super::platform::Aarch64Platform;
 
 impl DeviceMmuPlatform for Aarch64Platform {
-    fn discover_device_mmu(_machine: &MachineInfo) -> DeviceMmuDiscoveryResult<Option<DeviceMmuSystem>> {
+    fn discover_device_mmu(
+        _machine: &MachineInfo,
+    ) -> DeviceMmuDiscoveryResult<Option<DeviceMmuSystem>> {
         todo!()
     }
 }

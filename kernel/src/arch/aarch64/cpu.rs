@@ -5,8 +5,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use aarch64_cpu::asm::barrier::{ISH, SY, dsb, isb};
 use aarch64_cpu::asm::wfi;
 use aarch64_cpu::registers::{
-    CNTFRQ_EL0, CNTVCT_EL0, MPIDR_EL1, PAR_EL1, Readable, SCTLR_EL1, TPIDR_EL1,
-    Writeable,
+    CNTFRQ_EL0, CNTVCT_EL0, MPIDR_EL1, PAR_EL1, Readable, SCTLR_EL1, TPIDR_EL1, Writeable,
 };
 use kernel_types::irq::PlatformCpuId;
 

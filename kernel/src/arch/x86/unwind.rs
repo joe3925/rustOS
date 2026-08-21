@@ -1,21 +1,16 @@
-use core::slice;
-
 use kernel_types::arch::VirtAddr;
 use kernel_types::memory::Module;
 
+use crate::arch::unwind::{
+    PeUnwindModule, STATUS_BAD_STACK_READ, STATUS_BAD_UNWIND_INFO, STATUS_LEAF_FALLBACK,
+    STATUS_NO_UNWIND_INFO, STATUS_PE_UNWIND, STATUS_UNKNOWN_FRAME, STATUS_UNSUPPORTED_OPCODE,
+    backtrace_status, read_image_bytes, read_image_u32, read_stack_u64,
+};
 use crate::platform::UnwindPlatform;
-use crate::profiling::backtrace::{BacktraceStatus, StackBounds, UnwindStart, UnwindStep};
+use crate::profiling::backtrace::{StackBounds, UnwindStart, UnwindStep};
 
 use super::platform::X86Platform;
 use super::scheduling::state::State;
-
-const STATUS_BAD_STACK_READ: u32 = 1 << 0;
-const STATUS_BAD_UNWIND_INFO: u32 = 1 << 1;
-const STATUS_LEAF_FALLBACK: u32 = 1 << 2;
-const STATUS_NO_UNWIND_INFO: u32 = 1 << 3;
-const STATUS_PE_UNWIND: u32 = 1 << 4;
-const STATUS_UNKNOWN_FRAME: u32 = 1 << 5;
-const STATUS_UNSUPPORTED_OPCODE: u32 = 1 << 6;
 
 const UNW_FLAG_EHANDLER: u8 = 0x1;
 const UNW_FLAG_UHANDLER: u8 = 0x2;
@@ -36,34 +31,6 @@ struct RuntimeFunction {
     begin_rva: u32,
     end_rva: u32,
     unwind_rva: u32,
-}
-
-struct PeUnwindModule {
-    image_base: u64,
-    image_end: u64,
-    pdata_base: u64,
-    pdata_len: usize,
-}
-
-impl PeUnwindModule {
-    fn from_module(module: &Module) -> Option<Self> {
-        let pe = module.pe_info.as_ref()?;
-        let pdata = pe
-            .sections
-            .iter()
-            .find(|section| section.name == ".pdata")?;
-        let image_base = module.image_base.as_u64();
-        let image_end = image_base.checked_add(module.image_size)?;
-        let pdata_base = image_base.checked_add(pdata.virtual_address as u64)?;
-        let pdata_len = core::cmp::min(pdata.virtual_size, pdata.raw_size) as usize;
-        let pdata_end = pdata_base.checked_add(pdata_len as u64)?;
-        (pdata_len >= 12 && pdata_end <= image_end).then_some(Self {
-            image_base,
-            image_end,
-            pdata_base,
-            pdata_len,
-        })
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -159,27 +126,6 @@ impl UnwindPlatform for X86Platform {
             status: backtrace_status(status),
         }
     }
-}
-
-fn backtrace_status(status: u32) -> BacktraceStatus {
-    let mut result = BacktraceStatus::empty();
-    for (flag, mapped) in [
-        (STATUS_BAD_STACK_READ, BacktraceStatus::BAD_STACK_READ),
-        (STATUS_BAD_UNWIND_INFO, BacktraceStatus::BAD_UNWIND_INFO),
-        (STATUS_LEAF_FALLBACK, BacktraceStatus::LEAF_FALLBACK),
-        (STATUS_NO_UNWIND_INFO, BacktraceStatus::NO_UNWIND_INFO),
-        (STATUS_PE_UNWIND, BacktraceStatus::PE_UNWIND),
-        (STATUS_UNKNOWN_FRAME, BacktraceStatus::UNKNOWN_FRAME),
-        (
-            STATUS_UNSUPPORTED_OPCODE,
-            BacktraceStatus::UNSUPPORTED_OPERATION,
-        ),
-    ] {
-        if status & flag != 0 {
-            result |= mapped;
-        }
-    }
-    result
 }
 
 fn unwind_pe_x64(
@@ -762,37 +708,12 @@ fn read_unwind_u32_slot(module: &PeUnwindModule, info: u64, idx: usize) -> Optio
     read_image_u32(module, slot)
 }
 
-fn read_image_u32(module: &PeUnwindModule, addr: u64) -> Option<u32> {
-    let bytes = read_image_bytes(module, addr, 4)?;
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn read_image_bytes(module: &PeUnwindModule, addr: u64, len: usize) -> Option<&'static [u8]> {
-    let end = addr.checked_add(len as u64)?;
-
-    if addr < module.image_base || end > module.image_end {
-        return None;
-    }
-
-    Some(unsafe { slice::from_raw_parts(addr as *const u8, len) })
-}
-
 fn leaf_unwind(ctx: &mut UnwindContext, bounds: StackBounds) -> Option<()> {
     let rip = read_stack_u64(bounds, ctx.rsp)?;
     ctx.rsp = ctx.rsp.checked_add(8)?;
     ctx.rip = rip;
     ctx.rip_is_return_address = true;
     Some(())
-}
-
-fn read_stack_u64(bounds: StackBounds, addr: u64) -> Option<u64> {
-    let end = addr.checked_add(8)?;
-
-    if addr < bounds.low.as_u64() || end > bounds.high.as_u64() || (addr & 0x7) != 0 {
-        return None;
-    }
-
-    Some(unsafe { core::ptr::read_unaligned(addr as *const u64) })
 }
 
 fn is_canonical(addr: u64) -> bool {
