@@ -1,24 +1,32 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use x86_64::instructions::port::Port;
+use x86_64::structures::idt::InterruptDescriptorTable;
+
+use crate::platform::{DebugPlatform, DebugTransportPlatform};
+
+use super::platform::X86Platform;
 
 const COM2_BASE: u16 = 0x2F8;
-
 const UART_DATA: u16 = 0;
 const UART_IER: u16 = 1;
 const UART_FCR: u16 = 2;
 const UART_LCR: u16 = 3;
 const UART_MCR: u16 = 4;
 const UART_LSR: u16 = 5;
-
 const LCR_DLAB: u8 = 0x80;
 const LCR_8N1: u8 = 0x03;
 const FCR_ENABLE_CLEAR: u8 = 0xC7;
 const MCR_DTR_RTS_AUX: u8 = 0x0B;
 const LSR_THR_EMPTY: u8 = 0x20;
 const LSR_DATA_READY: u8 = 0x01;
+const HELLO_LINE: &[u8] = b"RUSTOS_META_HELLO version=1\n";
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
+static HELLO_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+static HELLO_DONE: AtomicBool = AtomicBool::new(false);
 
 fn init_once() {
     if INITIALIZED
@@ -29,17 +37,13 @@ fn init_once() {
     }
 
     unsafe {
-        // An unimplemented x86 I/O port reads as 0xFF. A real 16550 line
-        // status register cannot have every bit set, so this distinguishes a
-        // configured COM2 device without relying on optional scratch-register
-        // behavior.
         if Port::<u8>::new(COM2_BASE + UART_LSR).read() == 0xFF {
             return;
         }
 
         Port::<u8>::new(COM2_BASE + UART_IER).write(0x00);
         Port::<u8>::new(COM2_BASE + UART_LCR).write(LCR_DLAB);
-        Port::<u8>::new(COM2_BASE + UART_DATA).write(0x01); // 115200 baud
+        Port::<u8>::new(COM2_BASE + UART_DATA).write(0x01);
         Port::<u8>::new(COM2_BASE + UART_IER).write(0x00);
         Port::<u8>::new(COM2_BASE + UART_LCR).write(LCR_8N1);
         Port::<u8>::new(COM2_BASE + UART_FCR).write(FCR_ENABLE_CLEAR);
@@ -66,7 +70,7 @@ fn transmit_byte(byte: u8) {
     }
 }
 
-pub(crate) fn com2_write_bytes(bytes: &[u8]) {
+fn write_bytes(bytes: &[u8]) {
     init_once();
     if !AVAILABLE.load(Ordering::Acquire) {
         return;
@@ -93,18 +97,8 @@ fn try_rx_byte() -> Option<u8> {
     }
 }
 
-// Host sends this line; kernel responds with ACK then replays the snapshot.
-const HELLO_LINE: &[u8] = b"RUSTOS_META_HELLO version=1\n";
-
-static HELLO_PROGRESS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static HELLO_DONE: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn poll_rx_once() {
-    if !AVAILABLE.load(Ordering::Acquire) {
-        return;
-    }
-
-    if HELLO_DONE.load(Ordering::Acquire) {
+    if !AVAILABLE.load(Ordering::Acquire) || HELLO_DONE.load(Ordering::Acquire) {
         return;
     }
 
@@ -126,20 +120,39 @@ pub(crate) fn poll_rx_once() {
     }
 }
 
-pub(crate) fn metadata_sink(bytes: &[u8]) {
+fn metadata_sink(bytes: &[u8]) {
     init_once();
     if !AVAILABLE.load(Ordering::Acquire) {
         return;
     }
     poll_rx_once();
     if !bytes.is_empty() {
-        com2_write_bytes(bytes);
+        write_bytes(bytes);
     }
 }
 
-pub(crate) fn init_debug_metadata_transport() {
-    init_once();
-    if AVAILABLE.load(Ordering::Acquire) {
-        crate::debug_metadata::register_sink(metadata_sink);
+impl DebugTransportPlatform for X86Platform {
+    fn init_debug_metadata_transport() {
+        init_once();
+        if AVAILABLE.load(Ordering::Acquire) {
+            crate::debug_metadata::register_sink(metadata_sink);
+        }
+    }
+}
+
+impl DebugPlatform for X86Platform {
+    fn breakpoint() {
+        unsafe {
+            asm!("int 3");
+        }
+    }
+
+    fn fatal_reset() -> ! {
+        static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
+
+        unsafe {
+            EMPTY_IDT.load();
+            asm!("ud2", options(noreturn));
+        }
     }
 }

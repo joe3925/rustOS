@@ -1,13 +1,8 @@
-use crate::structs::per_cpu::PERCPU_TLS_ARRAY_POINTER_OFF;
 use crate::util::boot_info;
 use alloc::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
-use alloc::sync::Arc;
-use core::arch::asm;
 use core::fmt;
 use core::ptr;
 use kernel_abi::arch::PeTlsDirectory;
-use kernel_types::runtime::BlockOnThreadState;
-use spin::Mutex;
 use spin::Once;
 use x86_64::VirtAddr;
 
@@ -15,13 +10,6 @@ const PE_TLS_ARRAY_ENTRIES: usize = 1;
 const PE_TLS_ARRAY_BYTES: usize = PE_TLS_ARRAY_ENTRIES * core::mem::size_of::<u64>();
 
 static KERNEL_TLS_LAYOUT: Once<Option<KernelTlsLayout>> = Once::new();
-
-static BLOCK_ON_THREAD_STATE: Mutex<Option<Arc<BlockOnThreadState>>> = Mutex::new(None);
-
-#[thread_local]
-static mut EXECUTOR_TASK_ID: u64 = 0;
-#[thread_local]
-static mut EXECUTOR_DOMAIN_ID: u64 = 0;
 
 #[derive(Clone, Copy, Debug)]
 struct KernelTlsLayout {
@@ -91,50 +79,6 @@ impl fmt::Debug for KernelTls {
             .field("tls_array_pointer", &self.tls_array_pointer)
             .finish()
     }
-}
-
-#[inline(always)]
-
-pub(crate) unsafe fn activate(tls_array_pointer: u64) {
-    unsafe {
-        asm!(
-            "mov qword ptr gs:[{off}], {tls}",
-            off = const PERCPU_TLS_ARRAY_POINTER_OFF,
-            tls = in(reg) tls_array_pointer,
-            options(nostack, preserves_flags)
-        );
-    }
-}
-
-#[inline(always)]
-pub fn ensure_current_thread_runtime_initialized() {
-    let mut state = BLOCK_ON_THREAD_STATE.lock();
-    if state.is_none() {
-        *state = Some(Arc::new(BlockOnThreadState::new()));
-    }
-}
-
-pub fn current_block_on_thread_state() -> Arc<BlockOnThreadState> {
-    BLOCK_ON_THREAD_STATE
-        .lock()
-        .as_ref()
-        .cloned()
-        .expect("kernel block_on state is not initialized for the current thread")
-}
-
-#[inline(always)]
-pub fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
-    unsafe {
-        let previous = (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID);
-        EXECUTOR_TASK_ID = task_id;
-        EXECUTOR_DOMAIN_ID = domain_id;
-        previous
-    }
-}
-
-#[inline(always)]
-pub fn current_executor_context() -> (u64, u64) {
-    unsafe { (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID) }
 }
 
 fn kernel_tls_layout() -> Option<&'static KernelTlsLayout> {

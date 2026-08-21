@@ -3,6 +3,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_types::irq::IrqSafeMutex;
 use x86_64::instructions::port::Port;
 
+use crate::platform::ConsolePlatform;
+
+use super::platform::X86Platform;
+
 const COM1: u16 = 0x3f8;
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static WRITE_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
@@ -43,13 +47,15 @@ fn write_byte(byte: u8) {
     }
 }
 
-pub(crate) fn write_bytes(bytes: &[u8]) {
-    let _guard = WRITE_LOCK.lock();
-    init_once();
-    for &byte in bytes {
-        if byte == b'\n' {
-            write_byte(b'\r');
+impl ConsolePlatform for X86Platform {
+    fn serial_write_bytes(bytes: &[u8]) {
+        let _guard = WRITE_LOCK.lock();
+        init_once();
+        for &byte in bytes {
+            if byte == b'\n' {
+                write_byte(b'\r');
+            }
+            write_byte(byte);
         }
-        write_byte(byte);
     }
 }

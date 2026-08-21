@@ -1,5 +1,4 @@
-use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
-use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::status::PageMapError;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size1GiB,
@@ -8,106 +7,12 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr as X86PhysAddr, VirtAddr as X86VirtAddr};
 
 use crate::memory::paging::{
-    KernelFrameAllocator, LocalTlbFlush, MappingSize, ResolvedMapping, UnmapFrameDisposition,
+    KernelFrameAllocator, LocalTlbFlush, MappingSize, UnmapFrameDisposition,
 };
 use crate::platform::PageTableFrameAllocator;
 use crate::util::boot_info;
 
-use super::flags::page_flags_to_x86;
-use super::tables::{init_mapper, recursive_table_addr};
-
-pub unsafe fn map_leaf<A: PageTableFrameAllocator>(
-    allocator: &mut A,
-    virt: VirtAddr,
-    phys: PhysAddr,
-    size: MappingSize,
-    flags: PageFlags,
-    cache: Option<PhysicalMappingCache>,
-    flush: LocalTlbFlush,
-) -> Result<(), PageMapError> {
-    let recursive_index = boot_info()
-        .arch_info
-        .recursive_index
-        .into_option()
-        .ok_or(PageMapError::NoMemoryMap())?;
-    let mut mapper = unsafe { init_mapper(recursive_index) };
-    let mut table_allocator = X86PageTableFrameAllocator { inner: allocator };
-    let flags = page_flags_to_x86(flags, cache) | PageTableFlags::PRESENT;
-    let virt = X86VirtAddr::new(virt.as_u64());
-    let phys = X86PhysAddr::new(phys.as_u64());
-
-    match size.bytes {
-        Size4KiB::SIZE => unsafe {
-            map_existing_frame::<Size4KiB, A>(
-                &mut mapper,
-                &mut table_allocator,
-                virt,
-                phys,
-                flags,
-                flush,
-            )
-            .map_err(PageMapError::from)
-        },
-        Size2MiB::SIZE => unsafe {
-            map_existing_frame::<Size2MiB, A>(
-                &mut mapper,
-                &mut table_allocator,
-                virt,
-                phys,
-                flags,
-                flush,
-            )
-            .map_err(PageMapError::from)
-        },
-        Size1GiB::SIZE => unsafe {
-            map_existing_frame::<Size1GiB, A>(
-                &mut mapper,
-                &mut table_allocator,
-                virt,
-                phys,
-                flags,
-                flush,
-            )
-            .map_err(PageMapError::from)
-        },
-        _ => Err(PageMapError::TranslationFailed()),
-    }
-}
-
-pub unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
-    _allocator: &mut A,
-    virt: VirtAddr,
-    size: MappingSize,
-    disposition: UnmapFrameDisposition,
-    flush: LocalTlbFlush,
-) -> Result<Option<PhysAddr>, PageMapError> {
-    let recursive_index = boot_info()
-        .arch_info
-        .recursive_index
-        .into_option()
-        .ok_or(PageMapError::NoMemoryMap())?;
-    let mut mapper = unsafe { init_mapper(recursive_index) };
-    let virt = X86VirtAddr::new(virt.as_u64());
-
-    match size.bytes {
-        Size4KiB::SIZE => unmap_leaf_inner::<Size4KiB>(&mut mapper, virt, disposition, flush),
-        Size2MiB::SIZE => unmap_leaf_inner::<Size2MiB>(&mut mapper, virt, disposition, flush),
-        Size1GiB::SIZE => unmap_leaf_inner::<Size1GiB>(&mut mapper, virt, disposition, flush),
-        _ => Err(PageMapError::TranslationFailed()),
-    }
-}
-
-pub fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping> {
-    let recursive_index = boot_info().arch_info.recursive_index.into_option()?;
-    let (mapping_size, phys_addr, user_accessible, writable) =
-        translate_addr(recursive_index, virt)?;
-    Some(ResolvedMapping {
-        mapping_size,
-        phys_addr,
-        user_accessible,
-        writable,
-    })
-}
+use super::tables::recursive_table_addr;
 
 pub fn resolve_virtual_range_frame(addr: X86VirtAddr) -> Option<(u64, X86PhysAddr)> {
     let recursive_index = boot_info().arch_info.recursive_index.into_option()?;
@@ -115,7 +20,10 @@ pub fn resolve_virtual_range_frame(addr: X86VirtAddr) -> Option<(u64, X86PhysAdd
     Some((mapping_size, phys_addr.into()))
 }
 
-fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr, bool, bool)> {
+pub(super) fn translate_addr(
+    recursive_index: u16,
+    addr: VirtAddr,
+) -> Option<(u64, PhysAddr, bool, bool)> {
     let rec = u64::from(recursive_index);
     let v_u64 = addr.as_u64();
 
@@ -182,7 +90,7 @@ fn translate_addr(recursive_index: u16, addr: VirtAddr) -> Option<(u64, PhysAddr
     ))
 }
 
-unsafe fn map_existing_frame<S, A>(
+pub(super) unsafe fn map_existing_frame<S, A>(
     mapper: &mut impl Mapper<S>,
     allocator: &mut X86PageTableFrameAllocator<'_, A>,
     virt: X86VirtAddr,
@@ -208,7 +116,7 @@ where
     Ok(())
 }
 
-fn unmap_leaf_inner<S>(
+pub(super) fn unmap_leaf_inner<S>(
     mapper: &mut impl Mapper<S>,
     virt: X86VirtAddr,
     disposition: UnmapFrameDisposition,
@@ -252,7 +160,7 @@ fn finish_mapping<S: PageSize>(
 }
 
 pub struct X86PageTableFrameAllocator<'a, A: PageTableFrameAllocator> {
-    inner: &'a mut A,
+    pub(super) inner: &'a mut A,
 }
 
 unsafe impl<A: PageTableFrameAllocator> FrameAllocator<Size4KiB>

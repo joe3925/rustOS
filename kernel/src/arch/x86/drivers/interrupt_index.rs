@@ -47,11 +47,6 @@ pub static APIC_TICKS_PER_NS: PerCpuVec<AtomicU64> = PerCpuVec::new();
 
 pub const TIMER_FREQ: u64 = 300;
 
-const PIT_FREQUENCY_HZ: u32 = 1_193_182;
-const PIT_CONTROL_PORT: u16 = 0x43;
-const PIT_CHANNEL2_PORT: u16 = 0x42;
-const PIT_MODE_PORT: u16 = 0x61;
-
 const TRAMPOLINE_BASE: u64 = 0x0000_8000;
 const TRAMPOLINE_STEP: u64 = 0x1000;
 const TRAMPOLINE_EXPECTED_LEN: usize = 0xE4;
@@ -374,10 +369,6 @@ impl InterruptIndex {
         self as u8
     }
 }
-pub fn calibrate_tsc(tsc_start: u64, tsc_end: u64, delay_ms: u64) {
-    let tsc_freq = (tsc_end - tsc_start) * 1000 / delay_ms;
-    TSC_HZ.store(tsc_freq, Ordering::SeqCst);
-}
 pub fn wait_duration(d: Duration) {
     let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
     if tsc_hz == 0 {
@@ -405,32 +396,6 @@ pub fn wait_duration_idle(d: Duration) {
 
     cpu::wait_cycle_idle(target_delta);
 }
-pub fn wait_using_pit_50ms() {
-    let counts_for_50ms: u16 = (PIT_FREQUENCY_HZ / 20) as u16;
-
-    unsafe {
-        let mut control = Port::new(PIT_CONTROL_PORT);
-        let mut ch2 = Port::new(PIT_CHANNEL2_PORT);
-        let mut mode = Port::new(PIT_MODE_PORT);
-
-        control.write(0b1011_0000u8);
-
-        ch2.write((counts_for_50ms & 0xFF) as u8);
-        ch2.write((counts_for_50ms >> 8) as u8);
-
-        let mut val: u8 = mode.read();
-        val = (val & !0b11) | 0b01;
-        mode.write(val);
-
-        loop {
-            let status: u8 = mode.read();
-            if (status & 0b0010_0000) != 0 {
-                break;
-            }
-        }
-    }
-}
-
 fn duration_to_tsc_cycles(d: Duration) -> u128 {
     let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
     if tsc_hz == 0 {
@@ -528,24 +493,6 @@ pub fn apic_program_period_ms(ms: u64) {
     }
     let ns = ms.saturating_mul(1_000_000);
     apic_program_period_ns(ns);
-}
-
-/// Return the list of known APIC logical IDs.
-pub fn apic_logical_ids() -> Vec<kernel_types::irq::PlatformCpuId> {
-    let mut ids: Vec<kernel_types::irq::PlatformCpuId> = Vec::new();
-    ids.push(get_current_logical_id().into());
-
-    {
-        let info = crate::machine::machine_info().cpu_topology();
-        for processor in info.processors.iter() {
-            let id = processor.platform_cpu_id;
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-    }
-
-    ids
 }
 
 #[derive(Debug, Clone, Copy)]
