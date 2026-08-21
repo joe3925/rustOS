@@ -188,10 +188,7 @@ fn pe_tls_raw_data_size(directory: &PeTlsDirectory) -> usize {
         panic!("kernel PE TLS raw data range is backwards");
     }
 
-    u64_to_usize(
-        directory.end_address_of_raw_data - directory.start_address_of_raw_data,
-        "kernel PE TLS raw data size",
-    )
+    (directory.end_address_of_raw_data - directory.start_address_of_raw_data) as usize
 }
 
 fn pe_tls_alignment(directory: &PeTlsDirectory) -> usize {
@@ -225,9 +222,4 @@ fn round_up(value: usize, align: usize) -> usize {
             .checked_add(align - remainder)
             .expect("kernel TLS layout overflow")
     }
-}
-
-#[inline(always)]
-fn u64_to_usize(value: u64, what: &str) -> usize {
-    usize::try_from(value).unwrap_or_else(|_| panic!("{what} does not fit in usize"))
 }

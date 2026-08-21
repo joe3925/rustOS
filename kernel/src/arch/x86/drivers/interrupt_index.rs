@@ -7,9 +7,6 @@ use super::timer_driver::set_num_cores;
 use crate::KERNEL_INITIALIZED;
 use crate::drivers::ACPI::PerCpu;
 use crate::drivers::ACPI::alloc_or_get_percpu_for;
-use crate::drivers::ACPI::{
-    PERCPU_CPU_ID_OFF, PERCPU_IS_IN_INTERRUPT_OFF, PERCPU_TLS_ARRAY_POINTER_OFF,
-};
 use crate::machine::MachineInterruptInfo;
 use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::scheduling::scheduler::SCHEDULER;
@@ -290,14 +287,6 @@ pub fn get_current_logical_id() -> u8 {
         .initial_local_apic_id()
 }
 
-const _: () = {
-    assert!(core::mem::align_of::<PerCpu>() == 0x40);
-    assert!(core::mem::size_of::<PerCpu>() == 0x80);
-    assert!(core::mem::offset_of!(PerCpu, is_in_interrupt) == PERCPU_IS_IN_INTERRUPT_OFF);
-    assert!(core::mem::offset_of!(PerCpu, cpu_id) == PERCPU_CPU_ID_OFF);
-    assert!(core::mem::offset_of!(PerCpu, tls_array_pointer) == PERCPU_TLS_ARRAY_POINTER_OFF);
-};
-
 const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
@@ -384,32 +373,12 @@ pub fn is_in_interrupt_atomic_for(lapic_id: u32) -> &'static AtomicBool {
 
 #[inline(always)]
 pub fn set_current_cpu_id(id: u32) {
-    let id = id as u64;
-
-    unsafe {
-        asm!(
-            "mov qword ptr gs:[{off}], {id:r}",
-            off = const PERCPU_CPU_ID_OFF,
-            id = in(reg) id,
-            options(nostack, preserves_flags)
-        );
-    }
+    current_percpu().cpu_id.call_once(|| id as u64);
 }
 
 #[inline(always)]
 pub fn current_cpu_id() -> usize {
-    let id: u64;
-
-    unsafe {
-        asm!(
-            "mov {out:r}, qword ptr gs:[{off}]",
-            out = out(reg) id,
-            off = const PERCPU_CPU_ID_OFF,
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-
-    id as usize
+    *current_percpu().cpu_id.get().unwrap() as usize
 }
 impl InterruptIndex {
     pub(crate) fn as_u8(self) -> u8 {
@@ -1022,10 +991,7 @@ impl ApicImpl {
 pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
     let p: &'static PerCpu = alloc_or_get_percpu_for(lapic_id);
     let ptr = p as *const PerCpu;
-    unsafe {
-        (*(ptr as *mut PerCpu)).cpu_id = lapic_id as u64;
-        (*(ptr as *mut PerCpu)).tls_array_pointer = 0;
-    }
+    p.tls_array_pointer.store(0, Ordering::Relaxed);
     unsafe { set_gs_bases(ptr) };
     kernel_types::irq::set_irq_context_query(current_is_in_interrupt);
     kernel_types::irq::set_irq_interrupt_control(

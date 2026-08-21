@@ -3,32 +3,47 @@ use core::arch::asm;
 use alloc::vec::Vec;
 
 use crate::{
+    arch::aarch64::memory,
     drivers::ACPI::{PerCpu, alloc_or_get_percpu_for},
-    platform::CpuPlatform,
+    platform::{CpuPlatform, current_percpu},
 };
 
 use super::platform::Aarch64Platform;
+#[thread_local]
+static mut EXECUTOR_TASK_ID: u64 = 0;
+#[thread_local]
+static mut EXECUTOR_DOMAIN_ID: u64 = 0;
 
-pub unsafe fn set_per_cpu(ptr: *mut PerCpu) {
+#[inline(always)]
+pub unsafe fn set_per_cpu(ptr: *const PerCpu) {
     asm!(
         "msr tpidr_el1, {ptr}",
         ptr = in(reg) ptr,
         options(nostack, preserves_flags)
     );
 }
+#[inline(always)]
+pub fn per_cpu_ptr() -> *const PerCpu {
+    let ptr: *const PerCpu;
 
-pub struct PerCpuState;
+    unsafe {
+        asm!(
+            "mrs {ptr}, tpidr_el1",
+            ptr = out(reg) ptr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
-unsafe impl Send for PerCpuState {}
-unsafe impl Sync for PerCpuState {}
+    ptr
+}
 
 impl CpuPlatform for Aarch64Platform {
-    type PerCpuState = PerCpuState;
+    type PerCpuState = crate::drivers::ACPI::PerCpu;
 
     const MAX_CPUS: usize = 256;
 
     fn current_cpu_id() -> usize {
-        todo!()
+        *current_percpu().cpu_id.get().expect("no cpuid for core") as usize
     }
     fn current_logical_id() -> usize {
         todo!()
@@ -41,11 +56,11 @@ impl CpuPlatform for Aarch64Platform {
     }
     fn init_current_cpu_local_state(logical_id: u32) {
         let cpu = alloc_or_get_percpu_for(logical_id);
-        set_per_cpu()
+        unsafe { set_per_cpu(cpu as *const PerCpu) };
     }
 
     fn current_percpu() -> &'static Self::PerCpuState {
-        todo!()
+        unsafe { &*per_cpu_ptr() }
     }
     fn swap_executor_context(_task_id: u64, _domain_id: u64) -> (u64, u64) {
         todo!()
