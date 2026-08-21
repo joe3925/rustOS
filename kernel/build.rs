@@ -152,10 +152,8 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
     emit_kernel_pe_link_args(&target_os, &target_arch);
-    if env::var_os("CARGO_FEATURE_ALLOCATOR_MIMALLOC").is_some() {
-        compile_mimalloc(&manifest_dir, &target_arch, &out_dir)
-            .expect("Failed to compile mimalloc");
-    }
+    compile_mimalloc(&manifest_dir, &target_arch, &out_dir)
+        .expect("Failed to compile mimalloc");
 
     println!("cargo:rerun-if-changed=build.rs");
 }
