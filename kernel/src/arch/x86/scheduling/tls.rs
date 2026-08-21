@@ -1,4 +1,4 @@
-use crate::drivers::ACPI::PERCPU_TLS_ARRAY_POINTER_OFF;
+use crate::structs::per_cpu::PERCPU_TLS_ARRAY_POINTER_OFF;
 use crate::util::boot_info;
 use alloc::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use alloc::sync::Arc;

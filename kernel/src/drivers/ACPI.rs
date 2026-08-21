@@ -3,55 +3,10 @@ use crate::util::boot_info;
 use acpi;
 use acpi::{AcpiHandler, AcpiTables, PhysicalMapping, PlatformInfo};
 use alloc::alloc::Global;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::mem::offset_of;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64};
-use spin::Mutex;
-use spin::Once;
 
 use kernel_types::arch::{PhysAddr, VirtAddr};
-#[repr(C, align(64))]
-pub struct PerCpu {
-    pub is_in_interrupt: AtomicBool,
-    pub reserved_interrupt_pad: [u8; 0x7],
-    pub cpu_id: Once<u64>,
-    pub reserved0: [u8; 0x48],
-    pub tls_array_pointer: AtomicU64,
-}
-
-pub const PERCPU_IS_IN_INTERRUPT_OFF: usize = offset_of!(PerCpu, is_in_interrupt);
-pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = offset_of!(PerCpu, tls_array_pointer);
-static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
-
-pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
-    let idx = lapic_id as usize;
-
-    let mut v = PERCPU_SLOTS.lock();
-
-    if v.len() <= idx {
-        v.resize_with(idx + 1, || None);
-    }
-
-    if let Some(p) = v[idx] {
-        return p;
-    }
-
-    let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
-        is_in_interrupt: AtomicBool::new(false),
-        reserved_interrupt_pad: [0; 0x7],
-        cpu_id: Once::new(),
-        reserved0: [0; 0x48],
-        tls_array_pointer: AtomicU64::new(0),
-    }));
-    
-    p.cpu_id.call_once(|| lapic_id as u64);
-
-    v[idx] = Some(p);
-    p
-}
 
 unsafe impl Send for AcpiFirmware {}
 unsafe impl Sync for AcpiFirmware {}

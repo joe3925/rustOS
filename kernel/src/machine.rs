@@ -5,6 +5,7 @@ use acpi::AcpiTables;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_types::fdt::FdtHeader;
+use kernel_types::irq::PlatformCpuId;
 use spin::Once;
 
 static MACHINE_INFO: Once<MachineInfo> = Once::new();
@@ -15,18 +16,22 @@ pub fn machine_info() -> &'static MachineInfo {
 
 pub struct MachineInfo {
     firmware: FirmwareResources,
+    cpu_topology: MachineCpuTopology,
     interrupt_info: Option<MachineInterruptInfo>,
 }
 
 impl MachineInfo {
     fn discover() -> Self {
         let firmware = FirmwareResources::discover();
+        let cpu_topology = crate::platform::discover_cpu_topology(&firmware)
+            .unwrap_or_else(|error| panic!("CPU topology discovery failed: {:?}", error));
         let interrupt_info = firmware
             .acpi_tables()
             .and_then(|tables| crate::platform::discover_interrupt_info_from_acpi(tables.as_ref()));
 
         Self {
             firmware,
+            cpu_topology,
             interrupt_info,
         }
     }
@@ -37,6 +42,10 @@ impl MachineInfo {
 
     pub fn interrupt_info(&self) -> Option<&MachineInterruptInfo> {
         self.interrupt_info.as_ref()
+    }
+
+    pub fn cpu_topology(&self) -> &MachineCpuTopology {
+        &self.cpu_topology
     }
 }
 
@@ -72,7 +81,6 @@ impl FirmwareResources {
 pub struct MachineInterruptInfo {
     pub local_interrupt_controller_address: u64,
     pub interrupt_controllers: Vec<MachineInterruptControllerInfo>,
-    pub processors: Vec<MachineProcessorInfo>,
     pub has_compatibility_interrupt_controllers: bool,
 }
 
@@ -85,5 +93,25 @@ pub struct MachineInterruptControllerInfo {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MachineProcessorInfo {
-    pub platform_cpu_id: u32,
+    pub cpu_id: usize,
+    pub platform_cpu_id: PlatformCpuId,
+    pub hardware_id: u64,
+    pub is_boot_processor: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsciConduit {
+    Smc,
+    Hvc,
+}
+
+#[derive(Debug, Clone)]
+pub struct MachineCpuTopology {
+    pub processors: Vec<MachineProcessorInfo>,
+    pub psci_conduit: Option<PsciConduit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuTopologyError {
+    pub reason: &'static str,
 }

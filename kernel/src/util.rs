@@ -22,7 +22,7 @@ use crate::memory::paging::{
 };
 use crate::platform::{
     breakpoint, broadcast_panic_stop, calibrate_boot_timer, current_cpu_id,
-    current_is_in_interrupt, current_logical_id, cycle_counter, disable_interrupts,
+    current_is_in_interrupt, current_platform_cpu_id, cycle_counter, disable_interrupts,
     enable_interrupts, enable_interrupts_and_halt, fatal_reset, halt, init_boot_processor,
     init_current_cpu_local_state, init_periodic_timer, processor_count, start_secondary_cpus,
 };
@@ -105,14 +105,15 @@ pub unsafe fn init() {
         init_dma_manager();
         calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
-        start_secondary_cpus();
+        start_secondary_cpus()
+            .unwrap_or_else(|error| panic!("secondary CPU startup failed: {:?}", error));
     }
 
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {
         spin_loop();
     }
 
-    init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+    init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire));
 
     init_periodic_timer();
     SCHEDULER.init_core(current_cpu_id());
@@ -240,7 +241,7 @@ fn halt_loop() -> ! {
 }
 
 fn current_cpu_owns_panic() -> bool {
-    let current_cpu = current_logical_id() as u32;
+    let current_cpu = current_platform_cpu_id();
     PANIC_OWNER.call_once(|| current_cpu);
     PANIC_OWNER.get().is_some_and(|owner| *owner == current_cpu)
 }

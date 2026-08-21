@@ -3,15 +3,15 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 
 use crate::drivers::ACPI::ACPIImpl;
-use crate::machine::MachineInfo;
 use crate::machine::MachineInterruptInfo;
+use crate::machine::{CpuTopologyError, FirmwareResources, MachineCpuTopology, MachineInfo};
 use crate::memory::device_mmu::{
     DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
 };
 use crate::memory::paging::types::UserVmLayout;
 use acpi::AcpiTables;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
-use kernel_types::irq::{MsiMessage, MsiRequest};
+use kernel_types::irq::{MsiMessage, MsiRequest, PlatformCpuId};
 use kernel_types::memory::Module;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::pci::PciConfigAddress;
@@ -24,6 +24,13 @@ use crate::memory::paging::{
 };
 
 pub type ActivePlatform = crate::arch::PlatformImpl;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuStartupError {
+    pub platform_cpu_id: Option<PlatformCpuId>,
+    pub reason: &'static str,
+    pub status: i64,
+}
 
 pub trait Platform {
     type BootArchInfo: kernel_abi::BootArchInfo;
@@ -40,16 +47,15 @@ pub trait CpuPlatform: Platform {
     const MAX_CPUS: usize;
 
     fn current_cpu_id() -> usize;
-    fn current_logical_id() -> usize;
-    fn cpu_topology_ids() -> Vec<u8>;
+    fn current_platform_cpu_id() -> PlatformCpuId;
+    fn platform_cpu_ids() -> Vec<PlatformCpuId>;
     fn processor_count() -> usize;
-    fn init_current_cpu_local_state(logical_id: u32);
+    fn init_current_cpu_local_state(cpu_id: usize);
     fn current_percpu() -> &'static Self::PerCpuState;
     fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64);
     fn current_executor_context() -> (u64, u64);
-    fn start_secondary_cpus() -> bool;
+    fn start_secondary_cpus() -> Result<(), CpuStartupError>;
     fn halt() -> !;
-    fn broadcast_panic_stop();
 }
 
 pub trait ConsolePlatform: Platform {
@@ -77,7 +83,8 @@ pub trait InterruptPlatform: CpuPlatform {
     fn with_interrupts_disabled<T>(f: impl FnOnce() -> T) -> T;
     fn enable_interrupts_and_halt();
     fn end_interrupt(vector: u8);
-    fn send_ipi(target_platform_cpu_id: usize, vector: u8) -> bool;
+    fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool;
+    fn broadcast_panic_stop();
     fn compose_msi_message(request: &MsiRequest) -> Option<MsiMessage>;
     fn is_reserved_vector(vector: u8) -> bool;
 
@@ -175,6 +182,10 @@ pub trait DeviceMmuPlatform: Platform {
 }
 
 pub trait MachinePlatform: Platform {
+    fn discover_cpu_topology(
+        firmware: &FirmwareResources,
+    ) -> Result<MachineCpuTopology, CpuTopologyError>;
+
     fn discover_interrupt_info_from_acpi(
         tables: &AcpiTables<ACPIImpl>,
     ) -> Option<MachineInterruptInfo>;
@@ -250,12 +261,12 @@ pub fn current_cpu_id() -> usize {
     <ActivePlatform as CpuPlatform>::current_cpu_id()
 }
 
-pub fn current_logical_id() -> usize {
-    <ActivePlatform as CpuPlatform>::current_logical_id()
+pub fn current_platform_cpu_id() -> PlatformCpuId {
+    <ActivePlatform as CpuPlatform>::current_platform_cpu_id()
 }
 
-pub fn cpu_topology_ids() -> Vec<u8> {
-    <ActivePlatform as CpuPlatform>::cpu_topology_ids()
+pub fn platform_cpu_ids() -> Vec<PlatformCpuId> {
+    <ActivePlatform as CpuPlatform>::platform_cpu_ids()
 }
 
 pub fn processor_count() -> usize {
@@ -266,8 +277,8 @@ pub fn init_boot_processor() {
     <ActivePlatform as Platform>::init_boot_processor();
 }
 
-pub fn init_current_cpu_local_state(logical_id: u32) {
-    <ActivePlatform as CpuPlatform>::init_current_cpu_local_state(logical_id);
+pub fn init_current_cpu_local_state(cpu_id: usize) {
+    <ActivePlatform as CpuPlatform>::init_current_cpu_local_state(cpu_id);
 }
 
 pub fn current_percpu() -> &'static <ActivePlatform as CpuPlatform>::PerCpuState {
@@ -290,7 +301,7 @@ pub fn init_debug_metadata_transport() {
     <ActivePlatform as DebugTransportPlatform>::init_debug_metadata_transport();
 }
 
-pub fn start_secondary_cpus() -> bool {
+pub fn start_secondary_cpus() -> Result<(), CpuStartupError> {
     <ActivePlatform as CpuPlatform>::start_secondary_cpus()
 }
 
@@ -299,7 +310,7 @@ pub fn halt() -> ! {
 }
 
 pub fn broadcast_panic_stop() {
-    <ActivePlatform as CpuPlatform>::broadcast_panic_stop();
+    <ActivePlatform as InterruptPlatform>::broadcast_panic_stop();
 }
 
 pub fn disable_interrupts() {
@@ -342,7 +353,7 @@ pub fn end_interrupt(vector: u8) {
     <ActivePlatform as InterruptPlatform>::end_interrupt(vector);
 }
 
-pub fn send_ipi(target_platform_cpu_id: usize, vector: u8) -> bool {
+pub fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool {
     <ActivePlatform as InterruptPlatform>::send_ipi(target_platform_cpu_id, vector)
 }
 
@@ -437,6 +448,12 @@ pub fn discover_interrupt_info_from_acpi(
     tables: &AcpiTables<ACPIImpl>,
 ) -> Option<MachineInterruptInfo> {
     <ActivePlatform as MachinePlatform>::discover_interrupt_info_from_acpi(tables)
+}
+
+pub fn discover_cpu_topology(
+    firmware: &FirmwareResources,
+) -> Result<MachineCpuTopology, CpuTopologyError> {
+    <ActivePlatform as MachinePlatform>::discover_cpu_topology(firmware)
 }
 
 pub fn discover_required_device_mmu(machine: &MachineInfo) -> DeviceMmuSystem {

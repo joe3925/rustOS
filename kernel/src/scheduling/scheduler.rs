@@ -88,7 +88,7 @@ pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
     idle_task: TaskHandle,
     current: CurrentTask,
-    platform_cpu_id: usize,
+    platform_cpu_id: kernel_types::irq::PlatformCpuId,
 }
 
 struct SchedulerState {
@@ -138,7 +138,11 @@ impl Scheduler {
     }
 
     #[inline(always)]
-    fn build_core(&self, cpu_id: usize, platform_cpu_id: usize) -> Arc<CoreScheduler> {
+    fn build_core(
+        &self,
+        cpu_id: usize,
+        platform_cpu_id: kernel_types::irq::PlatformCpuId,
+    ) -> Arc<CoreScheduler> {
         let idle = Task::new_kernel_mode(
             platform::idle_task_entry(),
             0,
@@ -180,7 +184,7 @@ impl Scheduler {
             platform::MAX_CPUS
         );
 
-        let platform_cpu_id = platform::current_logical_id();
+        let platform_cpu_id = platform::current_platform_cpu_id();
         cores.push(self.build_core(cpu_id, platform_cpu_id));
         self.num_cores.store(cores.len(), Ordering::Release);
     }

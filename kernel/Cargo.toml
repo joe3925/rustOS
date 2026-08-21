@@ -51,6 +51,7 @@ kernel_sync = { path = "../libs/kernel_sync", default-features = false }
 cfg-if = "1.0.4"
 prost = { version = "0.14.3", default-features = false, features = ["derive"] }
 registry_format = { path = "../libs/registry_format" }
+device_tree = { path = "../third_party/device_tree" }
 
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
@@ -58,7 +59,7 @@ x86_64 = "=0.15.2"
 pic8259 = "0.10.1"
 raw-cpuid = "11.5.0"
 
-[target.'cfg(target_arch = "AArch64")'.dependencies]
+[target.'cfg(target_arch = "aarch64")'.dependencies]
 aarch64-cpu = "11.2.0"
 bootloader-api = { git = "https://github.com/joe3925/aarch64-bootloader.git" }
 aarch64-vmsa = { git = "https://github.com/joe3925/aarch64-vmsa.git" }

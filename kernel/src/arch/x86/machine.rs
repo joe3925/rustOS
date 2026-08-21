@@ -1,8 +1,49 @@
+use acpi::platform::ProcessorState;
 use acpi::{AcpiTables, InterruptModel};
 use alloc::vec::Vec;
 
 use crate::drivers::ACPI::ACPIImpl;
-use crate::machine::{MachineInterruptControllerInfo, MachineInterruptInfo, MachineProcessorInfo};
+use crate::machine::{
+    CpuTopologyError, FirmwareResources, MachineCpuTopology, MachineInterruptControllerInfo,
+    MachineInterruptInfo, MachineProcessorInfo,
+};
+
+pub(crate) fn discover_cpu_topology(
+    firmware: &FirmwareResources,
+) -> Result<MachineCpuTopology, CpuTopologyError> {
+    let tables = firmware.acpi_tables().ok_or(CpuTopologyError {
+        reason: "ACPI tables are unavailable",
+    })?;
+    let platform_info = tables.platform_info().map_err(|_| CpuTopologyError {
+        reason: "ACPI processor information is invalid",
+    })?;
+    let processor_info = platform_info.processor_info.ok_or(CpuTopologyError {
+        reason: "ACPI processor information is unavailable",
+    })?;
+    let mut processors = Vec::new();
+    let boot = processor_info.boot_processor;
+    processors.push(MachineProcessorInfo {
+        cpu_id: 0,
+        platform_cpu_id: boot.local_apic_id,
+        hardware_id: boot.local_apic_id as u64,
+        is_boot_processor: true,
+    });
+    for processor in processor_info.application_processors.iter() {
+        if processor.state == ProcessorState::Disabled {
+            continue;
+        }
+        processors.push(MachineProcessorInfo {
+            cpu_id: processors.len(),
+            platform_cpu_id: processor.local_apic_id,
+            hardware_id: processor.local_apic_id as u64,
+            is_boot_processor: false,
+        });
+    }
+    Ok(MachineCpuTopology {
+        processors,
+        psci_conduit: None,
+    })
+}
 
 pub(crate) fn discover_interrupt_info_from_acpi(
     tables: &AcpiTables<ACPIImpl>,
@@ -12,18 +53,6 @@ pub(crate) fn discover_interrupt_info_from_acpi(
         InterruptModel::Apic(apic) => apic,
         _ => return None,
     };
-
-    let processors = platform_info
-        .processor_info
-        .map(|info| {
-            info.application_processors
-                .iter()
-                .map(|processor| MachineProcessorInfo {
-                    platform_cpu_id: processor.local_apic_id as u32,
-                })
-                .collect()
-        })
-        .unwrap_or_else(Vec::new);
 
     let interrupt_controllers = apic
         .io_apics
@@ -38,7 +67,6 @@ pub(crate) fn discover_interrupt_info_from_acpi(
     Some(MachineInterruptInfo {
         local_interrupt_controller_address: apic.local_apic_address,
         interrupt_controllers,
-        processors,
         has_compatibility_interrupt_controllers: apic.also_has_legacy_pics,
     })
 }

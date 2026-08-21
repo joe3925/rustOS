@@ -18,6 +18,7 @@ use crate::memory::paging::{
 };
 use kernel_types::irq::{
     MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiMessage, MsiRequest,
+    PlatformCpuId,
 };
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
@@ -42,9 +43,10 @@ use super::drivers::timer_driver::{NUM_CORES, PER_CORE_SWITCHES, TIMER, TIMER_TI
 use super::gdt::PER_CPU_GDT;
 use super::idt::load_idt;
 use crate::platform::{
-    AddressSpacePlatform, ConsolePlatform, CpuPlatform, DebugPlatform, DebugTransportPlatform,
-    DeviceMmuPlatform, InterruptPlatform, MachinePlatform, PageTableFrameAllocator, PagingPlatform,
-    PciConfigPlatform, Platform, TaskPlatform, TimerPlatform,
+    AddressSpacePlatform, ConsolePlatform, CpuPlatform, CpuStartupError, DebugPlatform,
+    DebugTransportPlatform, DeviceMmuPlatform, InterruptPlatform, MachinePlatform,
+    PageTableFrameAllocator, PagingPlatform, PciConfigPlatform, Platform, TaskPlatform,
+    TimerPlatform,
 };
 use crate::println;
 use crate::structs::stopwatch::Stopwatch;
@@ -99,7 +101,7 @@ impl Platform for X86Platform {
 }
 
 impl CpuPlatform for X86Platform {
-    type PerCpuState = crate::drivers::ACPI::PerCpu;
+    type PerCpuState = crate::structs::per_cpu::PerCpu;
 
     const MAX_CPUS: usize = super::MAX_CPUS;
 
@@ -107,11 +109,11 @@ impl CpuPlatform for X86Platform {
         x86_current_cpu_id()
     }
 
-    fn current_logical_id() -> usize {
-        x86_current_logical_id() as usize
+    fn current_platform_cpu_id() -> PlatformCpuId {
+        x86_current_logical_id() as PlatformCpuId
     }
 
-    fn cpu_topology_ids() -> Vec<u8> {
+    fn platform_cpu_ids() -> Vec<PlatformCpuId> {
         apic_logical_ids()
     }
 
@@ -119,8 +121,8 @@ impl CpuPlatform for X86Platform {
         NUM_CORES.load(core::sync::atomic::Ordering::Relaxed)
     }
 
-    fn init_current_cpu_local_state(logical_id: u32) {
-        init_percpu_gs(logical_id);
+    fn init_current_cpu_local_state(cpu_id: usize) {
+        init_percpu_gs(cpu_id);
     }
 
     fn current_percpu() -> &'static Self::PerCpuState {
@@ -135,7 +137,7 @@ impl CpuPlatform for X86Platform {
         super::scheduling::tls::current_executor_context()
     }
 
-    fn start_secondary_cpus() -> bool {
+    fn start_secondary_cpus() -> Result<(), CpuStartupError> {
         let apic_time = Stopwatch::start();
         let started = match ApicImpl::init_apic_full() {
             Ok(_) => {
@@ -155,7 +157,15 @@ impl CpuPlatform for X86Platform {
             );
         }
 
-        started
+        if started {
+            Ok(())
+        } else {
+            Err(CpuStartupError {
+                platform_cpu_id: None,
+                reason: "APIC initialization failed",
+                status: -1,
+            })
+        }
     }
 
     fn halt() -> ! {
@@ -163,14 +173,6 @@ impl CpuPlatform for X86Platform {
             loop {
                 super::debug_meta::poll_rx_once();
                 core::arch::asm!("hlt;", options(nomem, nostack, preserves_flags));
-            }
-        }
-    }
-
-    fn broadcast_panic_stop() {
-        unsafe {
-            if let Some(a) = APIC.lock().as_ref() {
-                a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi);
             }
         }
     }
@@ -234,8 +236,8 @@ impl InterruptPlatform for X86Platform {
         x86_send_eoi(vector);
     }
 
-    fn send_ipi(target_platform_cpu_id: usize, vector: u8) -> bool {
-        if target_platform_cpu_id > u8::MAX as usize {
+    fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool {
+        if target_platform_cpu_id > u8::MAX as PlatformCpuId {
             return false;
         }
 
@@ -271,6 +273,14 @@ impl InterruptPlatform for X86Platform {
         }
 
         false
+    }
+
+    fn broadcast_panic_stop() {
+        unsafe {
+            if let Some(a) = APIC.lock().as_ref() {
+                a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi);
+            }
+        }
     }
 
     fn compose_msi_message(request: &MsiRequest) -> Option<MsiMessage> {
@@ -580,6 +590,12 @@ impl DeviceMmuPlatform for X86Platform {
 }
 
 impl MachinePlatform for X86Platform {
+    fn discover_cpu_topology(
+        firmware: &crate::machine::FirmwareResources,
+    ) -> Result<crate::machine::MachineCpuTopology, crate::machine::CpuTopologyError> {
+        super::machine::discover_cpu_topology(firmware)
+    }
+
     fn discover_interrupt_info_from_acpi(
         tables: &AcpiTables<ACPIImpl>,
     ) -> Option<MachineInterruptInfo> {
@@ -603,7 +619,7 @@ impl TaskPlatform for X86Platform {
         stack_top: VirtAddr,
     ) -> Self::TaskContext {
         let gdt = PER_CPU_GDT.lock();
-        let platform_cpu_id = Self::current_logical_id();
+        let platform_cpu_id = Self::current_platform_cpu_id() as usize;
         let mut state = State::new(0);
         state.rip = entry_point as u64;
         state.rcx = context as u64;
@@ -626,7 +642,7 @@ impl TaskPlatform for X86Platform {
         stack_top: VirtAddr,
     ) -> Self::TaskContext {
         let gdt = PER_CPU_GDT.lock();
-        let platform_cpu_id = Self::current_logical_id();
+        let platform_cpu_id = Self::current_platform_cpu_id() as usize;
         let mut state = State::new(0);
         state.rip = entry_point as u64;
         state.rcx = context as u64;

@@ -13,6 +13,8 @@ If there is a * it must be completed before user space is started
 3. [ ] * Expand xtask for aarch64 boot. 
 4. [ ] * Impl the platform traits for kernel_types, kernel_api, kernel_stub, and the kernel
 5. [ ] * Test everything.
+6. [ ] * Add spin-table startup for secondary CPUs.
+7. [ ] * Add ACPI parking protocol startup for secondary CPUs.
 
 ## Drivers (DRI) - Complete last
 1. [ ] Add a nvme driver.

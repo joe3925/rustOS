@@ -21,6 +21,8 @@ pub const MSI_TARGET_PLATFORM_CPU: u32 = 1;
 pub const MSI_KIND_MSI: u32 = 0;
 pub const MSI_KIND_MSIX: u32 = 1;
 
+pub type PlatformCpuId = u32;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MsiRequester {
@@ -63,7 +65,7 @@ impl MsiRequester {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MsiTarget {
     pub mode: u32,
-    pub platform_cpu_id: u32,
+    pub platform_cpu_id: PlatformCpuId,
 }
 
 impl MsiTarget {
@@ -74,7 +76,7 @@ impl MsiTarget {
         }
     }
 
-    pub const fn platform_cpu(platform_cpu_id: u32) -> Self {
+    pub const fn platform_cpu(platform_cpu_id: PlatformCpuId) -> Self {
         Self {
             mode: MSI_TARGET_PLATFORM_CPU,
             platform_cpu_id,

@@ -7,8 +7,8 @@ use kernel_sys::{
 };
 use kernel_types::irq::IRQ_RESCUE_WAKEUP;
 pub use kernel_types::irq::{
-    IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult, MsiMessage, MsiRequest,
-    MsiRequester, MsiTarget, IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK,
+    IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta,
+    IrqWaitResult, MsiMessage, MsiRequest, MsiRequester, MsiTarget,
 };
 
 use kernel_types::async_ffi::AbiFuture;
@@ -90,31 +90,19 @@ impl IrqBorrowedHandleExt for IrqBorrowedHandle {
 pub fn irq_register_isr(vector: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
     let h = unsafe { kernel_irq_register(vector, isr, ctx) };
 
-    if h.is_closed() {
-        None
-    } else {
-        Some(h)
-    }
+    if h.is_closed() { None } else { Some(h) }
 }
 
 pub fn irq_register_isr_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
     let h = unsafe { kernel_irq_register_gsi(gsi, isr, ctx) };
 
-    if h.is_closed() {
-        None
-    } else {
-        Some(h)
-    }
+    if h.is_closed() { None } else { Some(h) }
 }
 
 pub fn irq_alloc_vector() -> Option<u8> {
     let v = unsafe { kernel_irq_alloc_vector() };
 
-    if v < 0 {
-        None
-    } else {
-        Some(v as u8)
-    }
+    if v < 0 { None } else { Some(v as u8) }
 }
 
 pub fn irq_free_vector(vector: u8) -> bool {
@@ -131,7 +119,7 @@ pub fn irq_compose_msi_message(request: &MsiRequest) -> Option<MsiMessage> {
     }
 }
 
-pub fn platform_cpu_ids() -> alloc::vec::Vec<u8> {
+pub fn platform_cpu_ids() -> alloc::vec::Vec<kernel_types::irq::PlatformCpuId> {
     unsafe { kernel_platform_cpu_ids() }
 }
 

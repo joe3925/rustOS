@@ -209,7 +209,7 @@ unsafe extern "C" {
     pub fn pnp_remove_symlink(link_path: String) -> Result<(), DriverErrorKind>;
 
     pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit)
-        -> Arc<DeviceObject>;
+    -> Arc<DeviceObject>;
 
     pub fn pnp_create_control_device_and_link(
         name: String,
@@ -229,7 +229,7 @@ unsafe extern "C" {
     ) -> AbiFuture<Result<(), KernelError>>;
 
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
-    pub fn kernel_platform_cpu_ids() -> Vec<u8>;
+    pub fn kernel_platform_cpu_ids() -> Vec<kernel_types::irq::PlatformCpuId>;
 
     // Bench (drivers)
     pub fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle;

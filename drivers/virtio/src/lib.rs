@@ -340,12 +340,12 @@ extern "C" fn virtio_msix_isr(
 async fn setup_msix_via_pci(
     dev: &Arc<DeviceObject>,
     vector: u8,
-    platform_cpu_id: u8,
+    platform_cpu_id: kernel_api::kernel_types::irq::PlatformCpuId,
     table_index: u16,
 ) -> Result<(), KernelError> {
     let setup = MsiRequest::pci_msix(
         vector,
-        MsiTarget::platform_cpu(platform_cpu_id as u32),
+        MsiTarget::platform_cpu(platform_cpu_id),
         table_index,
     );
 

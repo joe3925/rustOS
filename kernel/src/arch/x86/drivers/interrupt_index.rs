@@ -5,11 +5,10 @@ use super::super::idt::load_idt;
 use super::super::syscalls::syscall::syscall_init;
 use super::timer_driver::set_num_cores;
 use crate::KERNEL_INITIALIZED;
-use crate::drivers::ACPI::PerCpu;
-use crate::drivers::ACPI::alloc_or_get_percpu_for;
 use crate::machine::MachineInterruptInfo;
 use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::scheduling::scheduler::SCHEDULER;
+use crate::structs::per_cpu::{PerCpu, alloc_or_get_percpu};
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::util::{CORE_LOCK, CPU_ID, INIT_LOCK, boot_info};
 use alloc::boxed::Box;
@@ -367,18 +366,8 @@ extern "C" fn irq_interrupts_enable_and_hlt() {
 }
 
 #[inline(always)]
-pub fn is_in_interrupt_atomic_for(lapic_id: u32) -> &'static AtomicBool {
-    &alloc_or_get_percpu_for(lapic_id).is_in_interrupt
-}
-
-#[inline(always)]
-pub fn set_current_cpu_id(id: u32) {
-    current_percpu().cpu_id.call_once(|| id as u64);
-}
-
-#[inline(always)]
 pub fn current_cpu_id() -> usize {
-    *current_percpu().cpu_id.get().unwrap() as usize
+    *current_percpu().cpu_id.get().unwrap()
 }
 impl InterruptIndex {
     pub(crate) fn as_u8(self) -> u8 {
@@ -542,13 +531,14 @@ pub fn apic_program_period_ms(ms: u64) {
 }
 
 /// Return the list of known APIC logical IDs.
-pub fn apic_logical_ids() -> Vec<u8> {
-    let mut ids = Vec::new();
-    ids.push(get_current_logical_id());
+pub fn apic_logical_ids() -> Vec<kernel_types::irq::PlatformCpuId> {
+    let mut ids: Vec<kernel_types::irq::PlatformCpuId> = Vec::new();
+    ids.push(get_current_logical_id().into());
 
-    if let Some(info) = crate::machine::machine_info().interrupt_info() {
+    {
+        let info = crate::machine::machine_info().cpu_topology();
         for processor in info.processors.iter() {
-            let id = processor.platform_cpu_id as u8;
+            let id = processor.platform_cpu_id;
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -823,7 +813,13 @@ impl ApicImpl {
     }
 
     pub fn start_aps(&self) {
-        let apics = &self.apic_info.processors;
+        let topology = crate::machine::machine_info().cpu_topology();
+        let apics: Vec<_> = topology
+            .processors
+            .iter()
+            .filter(|processor| !processor.is_boot_processor)
+            .copied()
+            .collect();
 
         let ap_count = apics.len();
         set_num_cores(ap_count + 1);
@@ -988,8 +984,9 @@ impl ApicImpl {
 }
 
 #[inline(always)]
-pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
-    let p: &'static PerCpu = alloc_or_get_percpu_for(lapic_id);
+pub fn init_percpu_gs(cpu_id: usize) -> &'static PerCpu {
+    let platform_cpu_id = get_current_logical_id() as kernel_types::irq::PlatformCpuId;
+    let p: &'static PerCpu = alloc_or_get_percpu(cpu_id, platform_cpu_id);
     let ptr = p as *const PerCpu;
     p.tls_array_pointer.store(0, Ordering::Relaxed);
     unsafe { set_gs_bases(ptr) };
@@ -1017,7 +1014,7 @@ extern "C" fn ap_startup() -> ! {
         load_idt();
 
         let lapic_id = get_current_logical_id() as u32;
-        init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+        init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire));
 
         unsafe {
             let mut guard = APIC.lock();

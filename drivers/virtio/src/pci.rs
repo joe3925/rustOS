@@ -139,5 +139,3 @@ pub const COMMON_QUEUE_DRIVER: usize = 0x28;
 pub const COMMON_QUEUE_DEVICE: usize = 0x30;
 pub const COMMON_MSIX_CONFIG: usize = 0x10;
 pub const COMMON_QUEUE_MSIX_VECTOR: usize = 0x1A;
-
-

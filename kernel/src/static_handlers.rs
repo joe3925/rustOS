@@ -15,12 +15,12 @@ use crate::memory::heap::allocator::KernelAllocator;
 use crate::scheduling::task::TaskError;
 use crate::{
     benchmarking::{
-        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
+        BenchSpanGuard, BenchWindow, bench_log_span_end, bench_span_guard, bench_submit_rip_sample,
     },
     console::CONSOLE,
     drivers::{
-        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
         ACPI::ACPIImpl,
+        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
     },
     file_system::{
         file::{self, File},
@@ -46,6 +46,7 @@ use alloc::{
 };
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::{
+    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
     async_ffi::{AbiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchMetricDirection, BenchMetricUnit, BenchObjectId, BenchRunHandle,
@@ -65,7 +66,6 @@ use kernel_types::{
     pnp::{DeviceIds, DeviceRelationType},
     runtime::BlockOnThreadState,
     status::{Data, PageMapError},
-    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
 
@@ -79,7 +79,7 @@ pub unsafe extern "C" fn park_self_and_yield() {
     SCHEDULER.park_current();
 }
 pub extern "C" fn get_current_platform_cpu_id() -> usize {
-    crate::platform::current_logical_id()
+    crate::platform::current_platform_cpu_id() as usize
 }
 
 pub extern "C" fn wake_task(id: u64) {
@@ -238,8 +238,8 @@ pub extern "C" fn kernel_dma_map_persistent_contiguous_backing(
     crate::memory::dma::map_persistent_contiguous_backing(device, backing)
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_platform_cpu_ids() -> Vec<u8> {
-    crate::platform::cpu_topology_ids()
+pub extern "C" fn kernel_platform_cpu_ids() -> Vec<kernel_types::irq::PlatformCpuId> {
+    crate::platform::platform_cpu_ids()
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn print(str: &str) {
