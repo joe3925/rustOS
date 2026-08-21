@@ -43,7 +43,7 @@ If there is a * it must be completed before user space is started
 ## Kernel General (KEG)
 1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 
 2. [x] * Change the registry from inline proto to a .proto file
-
+3. [ ] Currently all interrupts are hard interrupts, evaulate proper soulutions. I want to try to avoid lower and upper half handlers 
 ## Executor (EXE)
 1. [ ] Figure out emergency interrupt queue exhaustion.
 2. [ ] Consider adding a build flag that uses `u64` executor slab-local indices.
