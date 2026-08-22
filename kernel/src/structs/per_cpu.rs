@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicBool, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use kernel_types::irq::PlatformCpuId;
 use spin::{Mutex, Once};
@@ -9,7 +9,8 @@ use spin::{Mutex, Once};
 #[repr(C, align(64))]
 pub struct PerCpu {
     pub is_in_interrupt: AtomicBool,
-    pub reserved_interrupt_pad: [u8; 0x7],
+    pub reserved_interrupt_pad: [u8; 0x3],
+    pub active_interrupt_token: AtomicU32,
     pub reserved0: [u8; 0x50],
     pub tls_array_pointer: AtomicU64,
     pub cpu_id: Once<usize>,
@@ -38,7 +39,8 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
 
     let percpu = Box::leak(Box::new(PerCpu {
         is_in_interrupt: AtomicBool::new(false),
-        reserved_interrupt_pad: [0; 0x7],
+        reserved_interrupt_pad: [0; 0x3],
+        active_interrupt_token: AtomicU32::new(u32::MAX),
         reserved0: [0; 0x50],
         tls_array_pointer: AtomicU64::new(0),
         cpu_id: Once::new(),

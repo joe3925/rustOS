@@ -208,6 +208,7 @@ impl CpuPlatform for Aarch64Platform {
         let percpu = alloc_or_get_percpu(cpu_id, processor.platform_cpu_id);
         percpu.tls_array_pointer.store(0, Ordering::Relaxed);
         unsafe { set_per_cpu(percpu as *const PerCpu) };
+        super::interrupts::init_current_cpu_interrupts();
         mark_online(cpu_id);
     }
 
