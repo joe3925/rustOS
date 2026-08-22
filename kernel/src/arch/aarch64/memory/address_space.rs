@@ -1,40 +1,118 @@
+use aarch64_cpu::asm::barrier::{ISH, ISHST, SY, dsb, isb};
+use aarch64_cpu::registers::{Readable, TTBR0_EL1, Writeable};
 use kernel_types::arch::PhysAddr;
+use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
+use spin::Once;
 
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator};
+use crate::util::boot_info;
 
 use super::super::platform::Aarch64Platform;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Root(u64);
 
+static KERNEL_ROOT: Once<Root> = Once::new();
+
 impl AddressSpacePlatform for Aarch64Platform {
     type Root = Root;
 
     fn init_kernel_root() {
-        todo!()
+        assert_eq!(boot_info().arch_info.granule_shift, 12);
+        assert!(boot_info().arch_info.output_addr_bits <= 48);
+        let root = root_from_ttbr(TTBR0_EL1.get());
+        KERNEL_ROOT.call_once(|| root);
     }
+
     fn kernel_root() -> Self::Root {
-        todo!()
+        *KERNEL_ROOT
+            .get()
+            .expect("kernel address-space root is not initialized")
     }
+
     fn current_root() -> Self::Root {
-        todo!()
+        root_from_ttbr(TTBR0_EL1.get())
     }
-    unsafe fn switch_root(_root: Self::Root) {
-        todo!()
+
+    unsafe fn switch_root(root: Self::Root) {
+        assert_eq!(root.0 & (root_table_size() - 1), 0);
+        dsb(ISHST);
+        TTBR0_EL1.set(root.0);
+        isb(SY);
+        unsafe {
+            core::arch::asm!("tlbi vmalle1is", options(nostack, preserves_flags));
+        }
+        dsb(ISH);
+        isb(SY);
     }
-    fn root_to_phys(_root: Self::Root) -> PhysAddr {
-        todo!()
+
+    fn root_to_phys(root: Self::Root) -> PhysAddr {
+        PhysAddr::new(root.0)
     }
+
     fn create_user_root<A: PageTableFrameAllocator>(
-        _allocator: &mut A,
+        allocator: &mut A,
     ) -> Result<Self::Root, PageMapError> {
-        todo!()
+        let root_phys = allocator
+            .allocate_page_table_frame()
+            .ok_or(PageMapError::NoMemory())?;
+        let table_size = root_table_size();
+
+        if root_phys.as_u64() & (table_size - 1) != 0 {
+            allocator.free_page_table_frame(root_phys);
+            return Err(PageMapError::TranslationFailed());
+        }
+
+        let root_virt = match crate::memory::paging::map_physical_pages(
+            root_phys,
+            table_size,
+            PhysicalMappingCache::Cached,
+        ) {
+            Ok(root_virt) => root_virt,
+            Err(error) => {
+                allocator.free_page_table_frame(root_phys);
+                return Err(error);
+            }
+        };
+
+        unsafe {
+            root_virt
+                .as_mut_ptr::<u8>()
+                .write_bytes(0, table_size as usize);
+        }
+
+        if let Err(error) =
+            unsafe { crate::memory::paging::unmap_physical_pages(root_virt, table_size) }
+        {
+            return Err(error);
+        }
+
+        Ok(Root(root_phys.as_u64()))
     }
+
     unsafe fn destroy_user_root<A: PageTableFrameAllocator>(
-        _root: Self::Root,
-        _allocator: &mut A,
+        root: Self::Root,
+        allocator: &mut A,
     ) -> Result<(), PageMapError> {
-        todo!()
+        if root == Self::current_root() || root == Self::kernel_root() {
+            return Err(PageMapError::TranslationFailed());
+        }
+        allocator.free_page_table_frame(PhysAddr::new(root.0));
+        Ok(())
     }
+}
+
+fn root_from_ttbr(ttbr: u64) -> Root {
+    let output_bits = boot_info().arch_info.output_addr_bits;
+    let address_mask = if output_bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << output_bits) - 1
+    };
+    Root(ttbr & address_mask & !(root_table_size() - 1))
+}
+
+fn root_table_size() -> u64 {
+    1u64 << boot_info().arch_info.granule_shift
 }

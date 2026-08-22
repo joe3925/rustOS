@@ -183,7 +183,6 @@ impl PageTableFrameAllocator for KernelPageTableFrameAllocator {
     }
 }
 
-/// Initializes the fixed early bitmap without heap allocation.
 pub fn init_from_memory_regions(memory_regions: &[MemoryRegion]) {
     let frame_size = base_page_size();
     let frame_size_usize = usize::try_from(frame_size).unwrap_or(usize::MAX);
