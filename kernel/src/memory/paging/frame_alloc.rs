@@ -103,6 +103,62 @@ impl KernelFrameAllocator {
         allocate_base_frame_boot()
     }
 
+    pub fn allocate_zeroed_base_frame() -> Option<PhysAddr> {
+        let runtime = RUNTIME_MEMORY_BITMAP.get()?;
+
+        if let Some(frame) = runtime.alloc_zeroed_frame() {
+            return finish_runtime_frame_allocation(runtime, frame);
+        }
+
+        let frame = runtime.alloc_dirty_frame()?;
+        let phys = match checked_frame_phys(frame, cached_frame_size()) {
+            Some(phys) => PhysAddr::new(phys),
+            None => {
+                unsafe { runtime.free_frame(frame) };
+                super::zero::wake_zero_page_worker();
+                return None;
+            }
+        };
+
+        if zero_physical_frame(phys).is_err() {
+            unsafe { runtime.free_frame(frame) };
+            super::zero::wake_zero_page_worker();
+            return None;
+        }
+
+        USED_MEMORY_BYTES.fetch_add(cached_frame_size() as usize, Ordering::Relaxed);
+        Some(phys)
+    }
+
+    pub fn zero_one_free_frame() -> bool {
+        let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() else {
+            return false;
+        };
+        let Some(frame) = runtime.alloc_dirty_frame() else {
+            return false;
+        };
+        let Some(phys) = checked_frame_phys(frame, cached_frame_size()) else {
+            unsafe { runtime.free_frame(frame) };
+            super::zero::wake_zero_page_worker();
+            return false;
+        };
+
+        if zero_physical_frame(PhysAddr::new(phys)).is_err() {
+            unsafe { runtime.free_frame(frame) };
+            super::zero::wake_zero_page_worker();
+            return false;
+        }
+
+        unsafe { runtime.publish_zeroed_frame(frame) };
+        true
+    }
+
+    pub fn has_dirty_free_frames() -> bool {
+        RUNTIME_MEMORY_BITMAP
+            .get()
+            .is_some_and(RuntimeFrameBitmap::has_dirty_frames)
+    }
+
     /// Allocates a frame range suitable for a mapping of `size`.
     pub fn allocate_mapping_frame(size: MappingSize) -> Option<PhysAddr> {
         let frame_count = base_frame_count_for_mapping(size)?;
@@ -342,6 +398,10 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
 
 fn allocate_base_frame_runtime(runtime: &RuntimeFrameBitmap) -> Option<PhysAddr> {
     let frame = runtime.alloc_frame()?;
+    finish_runtime_frame_allocation(runtime, frame)
+}
+
+fn finish_runtime_frame_allocation(runtime: &RuntimeFrameBitmap, frame: usize) -> Option<PhysAddr> {
     let frame_size = cached_frame_size();
 
     let Some(phys) = checked_frame_phys(frame, frame_size) else {
@@ -352,6 +412,10 @@ fn allocate_base_frame_runtime(runtime: &RuntimeFrameBitmap) -> Option<PhysAddr>
     USED_MEMORY_BYTES.fetch_add(frame_size as usize, Ordering::Relaxed);
 
     Some(PhysAddr::new(phys))
+}
+
+fn zero_physical_frame(phys: PhysAddr) -> Result<(), ()> {
+    super::emergency_zero_physical_frame(phys).map_err(|_| ())
 }
 /// wait free if count = 1
 fn allocate_contiguous_frames_aligned_runtime(
@@ -401,6 +465,7 @@ fn free_mapping_frame_runtime(runtime: &RuntimeFrameBitmap, base: PhysAddr, size
         len.saturating_mul(cached_frame_size() as usize),
         Ordering::Relaxed,
     );
+    super::zero::wake_zero_page_worker();
 }
 
 fn release_reserved_mapping_frame_runtime(
@@ -442,6 +507,7 @@ fn release_reserved_mapping_frame_runtime(
     }
 
     unsafe { runtime.free_contiguous_frames(base_idx, len) };
+    super::zero::wake_zero_page_worker();
 }
 
 fn allocate_base_frame_boot() -> Option<PhysAddr> {

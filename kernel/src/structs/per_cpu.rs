@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU64};
 
+use kernel_types::arch::VirtAddr;
 use kernel_types::irq::PlatformCpuId;
 use spin::{Mutex, Once};
 
@@ -12,6 +13,8 @@ pub struct PerCpu {
     pub reserved_interrupt_pad: [u8; 0x7],
     pub reserved0: [u8; 0x50],
     pub tls_array_pointer: AtomicU64,
+    pub emergency_zero_address: Once<VirtAddr>,
+    pub emergency_zero_in_use: AtomicBool,
     pub cpu_id: Once<usize>,
     pub platform_cpu_id: Once<PlatformCpuId>,
 }
@@ -41,6 +44,8 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
         reserved_interrupt_pad: [0; 0x7],
         reserved0: [0; 0x50],
         tls_array_pointer: AtomicU64::new(0),
+        emergency_zero_address: Once::new(),
+        emergency_zero_in_use: AtomicBool::new(false),
         cpu_id: Once::new(),
         platform_cpu_id: Once::new(),
     }));
@@ -49,4 +54,8 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
     percpu.platform_cpu_id.call_once(|| platform_cpu_id);
     slots[cpu_id] = Some(percpu);
     percpu
+}
+
+pub fn percpu_by_id(cpu_id: usize) -> Option<&'static PerCpu> {
+    PERCPU_SLOTS.lock().get(cpu_id).copied().flatten()
 }

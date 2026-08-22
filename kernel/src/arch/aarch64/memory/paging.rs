@@ -21,6 +21,17 @@ impl PagingPlatform for Aarch64Platform {
     fn user_virtual_layout() -> UserVmLayout {
         todo!()
     }
+    unsafe fn prepare_emergency_zero_mapping(
+        _virtual_address: VirtAddr,
+    ) -> Result<(), PageMapError> {
+        todo!()
+    }
+    unsafe fn emergency_zero_physical_frame(
+        _virtual_address: VirtAddr,
+        _physical_address: PhysAddr,
+    ) -> Result<(), PageMapError> {
+        todo!()
+    }
     unsafe fn map_leaf<A: PageTableFrameAllocator>(
         _allocator: &mut A,
         _virt: VirtAddr,

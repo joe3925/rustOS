@@ -39,6 +39,7 @@ If there is a * it must be completed before user space is started
 1. [x] * Pinned pages for iobuffers and stuff
 2. [ ] subsytem for providing zeroed frames; i like how windows does this. 
 3. [ ] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
+4. [ ] stop using the x86_64 crate for paging 
 
 ## Kernel General (KEG)
 1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 
