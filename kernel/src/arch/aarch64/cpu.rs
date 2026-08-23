@@ -11,7 +11,7 @@ use kernel_types::irq::PlatformCpuId;
 
 use crate::machine::{PsciConduit, machine_info};
 use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
-use crate::platform::{CpuPlatform, CpuStartupError};
+use crate::platform::{AddressSpacePlatform, CpuPlatform, CpuStartupError};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu::{PerCpu, alloc_or_get_percpu};
 use crate::util::{CORE_LOCK, INIT_LOCK, KERNEL_INITIALIZED};
@@ -344,7 +344,7 @@ fn physical_address(virtual_address: u64) -> Result<u64, CpuStartupError> {
     }
 }
 
-fn startup_tcr(value: u64) -> u64 {
+pub(super) fn startup_tcr(value: u64) -> u64 {
     let clear =
         TCR_T0SZ_MASK | TCR_EPD0 | TCR_IRGN0_MASK | TCR_ORGN0_MASK | TCR_SH0_MASK | TCR_TG0_MASK;
     (value & !clear) | 16 | (1 << 8) | (1 << 10) | (0b11 << 12)
@@ -499,6 +499,11 @@ fn instruction_cache_line_size() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_secondary_entry(cpu_id: u64) -> ! {
     let cpu_id = cpu_id as usize;
+    unsafe {
+        <Aarch64Platform as AddressSpacePlatform>::switch_root(
+            <Aarch64Platform as AddressSpacePlatform>::kernel_root(),
+        );
+    }
     <Aarch64Platform as CpuPlatform>::init_current_cpu_local_state(cpu_id);
     CORE_LOCK.fetch_add(1, Ordering::SeqCst);
     mark_handshake(cpu_id);

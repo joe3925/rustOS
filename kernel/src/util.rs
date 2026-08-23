@@ -16,9 +16,9 @@ use crate::memory::heap::{enable_mimalloc, heap_capacity_bytes, init_heap};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::memory::paging::{
-    KernelFrameAllocator, boot_usable_bytes, init_kernel_address_space_root,
-    kernel_address_space_root, resize_bitmap_for_ram, switch_address_space_root,
-    unmap_reserved_range_unchecked,
+    KernelFrameAllocator, boot_usable_bytes, init_emergency_zero_mappings,
+    init_kernel_address_space_root, kernel_address_space_root, resize_bitmap_for_ram,
+    start_zero_page_worker, switch_address_space_root, unmap_reserved_range_unchecked,
 };
 use crate::platform::{
     ActivePlatform, ConsolePlatform, breakpoint, broadcast_panic_stop, calibrate_boot_timer,
@@ -138,10 +138,12 @@ pub unsafe fn init() {
 }
 pub extern "C" fn kernel_main(ctx: usize) {
     enable_mimalloc();
+    init_emergency_zero_mappings().expect("Failed to initialize emergency zero mappings");
     resize_bitmap_for_ram(boot_usable_bytes()).expect(&alloc::format!(
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
     ));
+    start_zero_page_worker();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);

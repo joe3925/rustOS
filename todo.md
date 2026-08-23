@@ -39,7 +39,8 @@ If there is a * it must be completed before user space is started
 1. [x] * Pinned pages for iobuffers and stuff
 2. [ ] subsytem for providing zeroed frames; i like how windows does this. 
 3. [ ] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
-
+4. [ ] stop using the x86_64 crate for paging 
+5. [ ] when we move away from the x86_64 crate program.rs should be refactored to not care if the table is offline or online just passes a table to map leaf 
 ## Kernel General (KEG)
 1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 
 2. [x] * Change the registry from inline proto to a .proto file

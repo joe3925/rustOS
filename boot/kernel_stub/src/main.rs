@@ -114,6 +114,8 @@ pub fn start(boot_info: &'static mut <ActivePlatform as BootloaderPlatform>::Boo
 
     let loaded = load_kernel_pe::<ActivePlatform>(&mut mapper, &mut frame_allocator)
         .unwrap_or_else(|err| fatal::<ActivePlatform>(err));
+    ActivePlatform::prepare_bootstrap_zero_mapping(&mut mapper, &mut frame_allocator)
+        .unwrap_or_else(|err| fatal::<ActivePlatform>(err));
     let handoff =
         build_handoff(boot_info, loaded).unwrap_or_else(|err| fatal::<ActivePlatform>(err));
 

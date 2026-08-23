@@ -339,6 +339,7 @@ impl BootloaderPlatform for Aarch64Platform {
         let arch_info = Aarch64BootArchInfo {
             root_table: translation.root_table,
             recursive_base: translation.recursive_base,
+            scratch_page: translation.scratch_page,
             recursive_index: translation
                 .recursive_index
                 .try_into()

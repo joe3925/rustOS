@@ -8,6 +8,7 @@ pub mod stack;
 pub mod tlb;
 pub mod types;
 pub mod virt_tracker;
+pub mod zero;
 
 pub use address_space::{
     AddressSpaceRoot, address_space_root_phys, create_user_address_space,
@@ -46,6 +47,9 @@ pub use types::{
 pub use virt_tracker::{
     allocate_auto_kernel_range, allocate_auto_kernel_range_aligned, allocate_kernel_range,
     deallocate_kernel_range,
+};
+pub use zero::{
+    emergency_zero_physical_frame, init_emergency_zero_mappings, start_zero_page_worker,
 };
 
 pub fn init_paging() {

@@ -37,3 +37,8 @@
 
 ## Potential solutions
   - Divide the backing into a tree of ranges, similar to a page table. An IO buffer reserves one large range when possible, or a few smaller ranges when needed. Each reserved range points to the IO buffer that owns it, making overlap checks and releasing the range potentially cheap just a few array indexes and some comparisions.
+
+# PAG-1
+## My issues with the x86_64 mapper
+ - The way its recursive page table works allows dirty pages on to the page table in order to zero them using the recursive index. If user mode were to intentionally place illegal mappings on a frame then said frame is allocated by the frame allocator for use as a page table frame there is a small window where a user created page table frame is on the page table.
+ - Always zeroing memory is also slow and uneeded when the kernel has a way to supply zeroed frames.
