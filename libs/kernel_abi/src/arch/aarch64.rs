@@ -109,6 +109,7 @@ pub const STUB_DYNAMIC_RANGE_END: u64 = BOOT_VIRTUAL_LAYOUT.stub_dynamic_range_e
 pub struct Aarch64BootArchInfo {
     pub root_table: u64,
     pub recursive_base: u64,
+    pub scratch_page: u64,
     pub recursive_index: u16,
     pub granule_shift: u8,
     pub input_addr_bits: u8,
@@ -136,6 +137,7 @@ impl Aarch64BootArchInfo {
         Self {
             root_table: 0,
             recursive_base: 0,
+            scratch_page: 0,
             recursive_index: 0,
             granule_shift: 0,
             input_addr_bits: 0,

@@ -1,6 +1,6 @@
 use alloc::string::ToString;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Once;
+use spin::{Mutex, Once};
 
 use kernel_sync::Platform;
 use kernel_types::arch::PhysAddr;
@@ -18,6 +18,8 @@ use crate::sync_platform::{KernelPlatform, WaitQueue};
 use super::{allocate_auto_kernel_range_aligned, base_page_size};
 
 static ZERO_PAGE_WAIT_QUEUE: Once<WaitQueue> = Once::new();
+static BOOTSTRAP_ZERO_LOCK: Mutex<()> = Mutex::new(());
+static EMERGENCY_ZERO_READY: AtomicBool = AtomicBool::new(false);
 
 struct EmergencyZeroGuard<'a>(&'a AtomicBool);
 
@@ -50,6 +52,7 @@ pub fn init_emergency_zero_mappings() -> Result<(), PageMapError> {
         percpu.emergency_zero_address.call_once(|| address);
     }
 
+    EMERGENCY_ZERO_READY.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -59,6 +62,18 @@ pub fn emergency_zero_physical_frame(physical_address: PhysAddr) -> Result<(), P
     }
 
     crate::platform::with_interrupts_disabled(|| {
+        if !EMERGENCY_ZERO_READY.load(Ordering::Acquire) {
+            let address = <ActivePlatform as PagingPlatform>::bootstrap_emergency_zero_address()
+                .ok_or(PageMapError::NoMemoryMap())?;
+            let _guard = BOOTSTRAP_ZERO_LOCK.lock();
+            return unsafe {
+                <ActivePlatform as PagingPlatform>::emergency_zero_physical_frame(
+                    address,
+                    physical_address,
+                )
+            };
+        }
+
         let percpu = crate::platform::current_percpu();
         if percpu
             .emergency_zero_in_use

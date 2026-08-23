@@ -104,7 +104,19 @@ impl KernelFrameAllocator {
     }
 
     pub fn allocate_zeroed_base_frame() -> Option<PhysAddr> {
-        let runtime = RUNTIME_MEMORY_BITMAP.get()?;
+        let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() else {
+            let phys = allocate_base_frame_boot()?;
+            if super::emergency_zero_physical_frame(phys).is_err() {
+                free_mapping_frame_boot(
+                    phys,
+                    MappingSize {
+                        bytes: cached_frame_size(),
+                    },
+                );
+                return None;
+            }
+            return Some(phys);
+        };
 
         if let Some(frame) = runtime.alloc_zeroed_frame() {
             return finish_runtime_frame_allocation(runtime, frame);
@@ -120,7 +132,7 @@ impl KernelFrameAllocator {
             }
         };
 
-        if zero_physical_frame(phys).is_err() {
+        if super::emergency_zero_physical_frame(phys).is_err() {
             unsafe { runtime.free_frame(frame) };
             super::zero::wake_zero_page_worker();
             return None;
@@ -143,7 +155,7 @@ impl KernelFrameAllocator {
             return false;
         };
 
-        if zero_physical_frame(PhysAddr::new(phys)).is_err() {
+        if super::emergency_zero_physical_frame(PhysAddr::new(phys)).is_err() {
             unsafe { runtime.free_frame(frame) };
             super::zero::wake_zero_page_worker();
             return false;
@@ -224,7 +236,7 @@ pub struct KernelPageTableFrameAllocator;
 
 impl PageTableFrameAllocator for KernelPageTableFrameAllocator {
     fn allocate_page_table_frame(&mut self) -> Option<PhysAddr> {
-        KernelFrameAllocator::allocate_base_frame()
+        KernelFrameAllocator::allocate_zeroed_base_frame()
     }
 
     fn free_page_table_frame(&mut self, phys: PhysAddr) {
@@ -414,9 +426,6 @@ fn finish_runtime_frame_allocation(runtime: &RuntimeFrameBitmap, frame: usize) -
     Some(PhysAddr::new(phys))
 }
 
-fn zero_physical_frame(phys: PhysAddr) -> Result<(), ()> {
-    super::emergency_zero_physical_frame(phys).map_err(|_| ())
-}
 /// wait free if count = 1
 fn allocate_contiguous_frames_aligned_runtime(
     runtime: &RuntimeFrameBitmap,

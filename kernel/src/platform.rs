@@ -143,6 +143,9 @@ pub trait PagingPlatform: AddressSpacePlatform {
     fn paging_capabilities() -> PagingCapabilities;
     fn kernel_virtual_layout() -> KernelVirtualLayout;
     fn user_virtual_layout() -> UserVmLayout;
+    fn bootstrap_emergency_zero_address() -> Option<VirtAddr> {
+        None
+    }
     unsafe fn prepare_emergency_zero_mapping(virtual_address: VirtAddr)
     -> Result<(), PageMapError>;
     unsafe fn emergency_zero_physical_frame(

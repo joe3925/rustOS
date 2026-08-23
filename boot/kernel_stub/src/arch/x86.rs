@@ -1,4 +1,5 @@
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use bootloader_api::config::Mapping;
 use bootloader_api::info;
@@ -32,6 +33,7 @@ pub type PlatformImpl = X86Platform;
 
 const PAGE_SIZE: u64 = 0x1000;
 const LOW_RESERVED_END: u64 = 0x20_0000;
+static BOOTSTRAP_SCRATCH_PAGE: AtomicU64 = AtomicU64::new(0);
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -179,6 +181,33 @@ impl KernelImagePlatform for X86Platform {
         Ok(())
     }
 
+    fn prepare_bootstrap_zero_mapping(
+        mapper: &mut Self::ImageMapper,
+        frame_allocator: &mut Self::FrameAllocator,
+    ) -> Result<(), &'static str> {
+        let address = STUB_DYNAMIC_RANGE_END - PAGE_SIZE;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(address));
+        match mapper.translate_page(page) {
+            Err(TranslateError::PageNotMapped) => {}
+            _ => return Err("kernel_stub: bootstrap scratch page is unavailable"),
+        }
+        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(0));
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+        unsafe {
+            mapper
+                .map_to(page, frame, flags, frame_allocator)
+                .map_err(|_| "kernel_stub: failed to build bootstrap scratch mapping")?
+                .flush();
+            mapper
+                .unmap(page)
+                .map_err(|_| "kernel_stub: failed to clear bootstrap scratch mapping")?
+                .1
+                .flush();
+        }
+        BOOTSTRAP_SCRATCH_PAGE.store(address, Ordering::Release);
+        Ok(())
+    }
+
     fn tls_directory_from_pe(directory: goblin::pe::tls::ImageTlsDirectory) -> Self::TlsDirectory {
         PeTlsDirectory {
             start_address_of_raw_data: directory.start_address_of_raw_data,
@@ -301,6 +330,7 @@ impl BootloaderPlatform for X86Platform {
     ) -> Result<BootInfo<Self::BootArchInfo>, &'static str> {
         let arch_info = X86BootArchInfo {
             recursive_index: translate_optional(bootloader_info.recursive_index),
+            scratch_page: BOOTSTRAP_SCRATCH_PAGE.load(Ordering::Acquire),
             pe_tls_directory: parts.tls_directory,
         };
         let (ramdisk_addr, ramdisk_len) = ramdisk(bootloader_info);

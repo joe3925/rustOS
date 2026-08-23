@@ -86,6 +86,13 @@ pub trait KernelImagePlatform: Platform {
         permissions: KernelImagePermissions,
     ) -> Result<(), &'static str>;
 
+    fn prepare_bootstrap_zero_mapping(
+        _mapper: &mut Self::ImageMapper,
+        _frame_allocator: &mut Self::FrameAllocator,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     fn tls_directory_from_pe(directory: ImageTlsDirectory) -> Self::TlsDirectory;
     fn validate_tls_directory(
         image_base: u64,

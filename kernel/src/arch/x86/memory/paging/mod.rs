@@ -89,6 +89,11 @@ impl PagingPlatform for X86Platform {
         }
     }
 
+    fn bootstrap_emergency_zero_address() -> Option<VirtAddr> {
+        let address = boot_info().arch_info.scratch_page;
+        (address != 0).then_some(VirtAddr::new(address))
+    }
+
     unsafe fn prepare_emergency_zero_mapping(
         virtual_address: VirtAddr,
     ) -> Result<(), PageMapError> {
