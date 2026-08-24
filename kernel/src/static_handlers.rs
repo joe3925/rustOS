@@ -27,9 +27,9 @@ use crate::{
         file_provider::VFS_PROVIDER,
     },
     idt::{
-        irq_alloc_vector, irq_borrowed_ensure_signal, irq_borrowed_signal, irq_borrowed_signal_all,
-        irq_borrowed_signal_n, irq_free_vector, irq_register, irq_register_gsi, irq_signal,
-        irq_signal_all, irq_signal_exactly, irq_signal_n,
+        bind_msi_interrupt, bind_wired_interrupt, irq_borrowed_ensure_signal, irq_borrowed_signal,
+        irq_borrowed_signal_all, irq_borrowed_signal_n, irq_signal, irq_signal_all,
+        irq_signal_exactly, irq_signal_n,
     },
     memory::{dma, paging::stack::StackSize},
     registry::reg,
@@ -61,7 +61,10 @@ use kernel_types::{
     fdt::FdtHeader,
     fs::{OpenFlags, Path},
     io::IoTarget,
-    irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, MsiMessage, MsiRequest},
+    irq::{
+        HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, MsiBinding,
+        MsiBindingRequest,
+    },
     pci::PciConfigAddress,
     pnp::{DeviceIds, DeviceRelationType},
     runtime::BlockOnThreadState,
@@ -105,33 +108,24 @@ pub unsafe extern "C" fn kernel_free(ptr: *mut u8, layout: Layout) {
     };
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
-    irq_register(vector, isr, ctx)
+pub extern "C" fn kernel_interrupt_bind_wired(
+    source: HardwareInterruptId,
+    isr: IrqIsrFn,
+    ctx: usize,
+) -> IrqHandle {
+    bind_wired_interrupt(source, isr, ctx)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
-    irq_register_gsi(gsi, isr, ctx)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_irq_alloc_vector() -> i32 {
-    irq_alloc_vector().map(|v| v as i32).unwrap_or(-1)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_irq_free_vector(vector: u8) -> bool {
-    irq_free_vector(vector)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_irq_compose_msi_message(
-    request: &MsiRequest,
-    out: &mut MsiMessage,
+pub extern "C" fn kernel_interrupt_bind_msi(
+    request: &MsiBindingRequest,
+    isr: IrqIsrFn,
+    ctx: usize,
+    out: &mut MsiBinding,
 ) -> bool {
-    match crate::platform::compose_msi_message(request) {
-        Some(message) => {
-            *out = message;
+    match bind_msi_interrupt(request, isr, ctx) {
+        Some(binding) => {
+            *out = binding;
             true
         }
         None => false,

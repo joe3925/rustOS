@@ -23,7 +23,6 @@ pub struct QueueState {
     pub queue: RwLock<Virtqueue>,
     pub arena: BlkIoSlots,
     pub irq_handle: Once<IrqHandle>,
-    pub msix_vector: Option<u8>,
     pub completion_slots: CompletionTable,
     pub read_ops: PendingOpPool<FromDevice>,
     pub write_ops: PendingOpPool<ToDevice>,

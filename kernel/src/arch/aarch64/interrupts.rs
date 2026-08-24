@@ -7,7 +7,7 @@ use aarch64_cpu::registers::{DAIF, Readable, VBAR_EL1, Writeable};
 use acpi::madt::{Madt, MadtEntry};
 use device_tree::{DeviceTree, Node};
 use kernel_types::arch::PhysAddr;
-use kernel_types::irq::{MsiMessage, MsiRequest, PlatformCpuId};
+use kernel_types::irq::{HardwareInterruptId, MsiBindingRequest, MsiMessage, PlatformCpuId};
 use kernel_types::memory::PhysicalMappingCache;
 use spin::{Mutex, Once};
 
@@ -23,9 +23,8 @@ const SCHEDULER_SGI: u8 = 1;
 const TLB_SHOOTDOWN_SGI: u8 = 2;
 const PANIC_STOP_SGI: u8 = 3;
 const VIRTUAL_TIMER_PPI: u8 = 27;
-const SPI_START: u8 = 32;
-const SPI_END: u8 = 255;
-const NO_ACTIVE_INTERRUPT: u32 = u32::MAX;
+const SPI_START: u32 = 32;
+const SPI_END: u32 = 1019;
 
 #[repr(C)]
 pub struct InterruptFrame {
@@ -38,7 +37,7 @@ pub struct InterruptFrame {
 #[derive(Clone, Copy)]
 struct InterruptToken {
     raw: u32,
-    vector: u8,
+    interrupt_id: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -199,9 +198,15 @@ impl InterruptController {
         }
     }
 
-    fn unmask_spi(&self, intid: u8) {
+    fn unmask_spi(&self, intid: u32) {
         match self {
             Self::GicV3(gic) => gic.unmask_spi(intid),
+        }
+    }
+
+    fn mask_spi(&self, intid: u32) {
+        match self {
+            Self::GicV3(gic) => gic.mask_spi(intid),
         }
     }
 }
@@ -282,12 +287,12 @@ impl GicV3 {
     fn acknowledge(&self) -> Option<InterruptToken> {
         let raw = unsafe { read_icc_iar1_el1() };
         let intid = raw & 0x00ff_ffff;
-        if intid >= 1020 || intid > u8::MAX as u32 {
+        if intid >= 1020 {
             return None;
         }
         Some(InterruptToken {
             raw,
-            vector: intid as u8,
+            interrupt_id: intid,
         })
     }
 
@@ -330,12 +335,22 @@ impl GicV3 {
         }
     }
 
-    fn unmask_spi(&self, intid: u8) {
+    fn unmask_spi(&self, intid: u32) {
         assert!((SPI_START..=SPI_END).contains(&intid));
         let _lock = self.distributor_lock.lock();
         unsafe {
             self.write64(0x6100 + (intid as u32 - 32) * 8, current_route_affinity());
             self.write32(0x100 + (intid as u32 / 32) * 4, 1 << (intid % 32));
+            self.wait_rwp();
+        }
+        dsb(SY);
+    }
+
+    fn mask_spi(&self, intid: u32) {
+        assert!((SPI_START..=SPI_END).contains(&intid));
+        let _lock = self.distributor_lock.lock();
+        unsafe {
+            self.write32(0x180 + (intid as u32 / 32) * 4, 1 << (intid % 32));
             self.wait_rwp();
         }
         dsb(SY);
@@ -407,13 +422,9 @@ extern "C" fn aarch64_irq_handler(frame: &mut InterruptFrame) {
     let Some(token) = controller().acknowledge() else {
         return;
     };
-    let percpu = Aarch64Platform::current_percpu();
-    let previous = percpu
-        .active_interrupt_token
-        .swap(token.raw, Ordering::AcqRel);
-    assert_eq!(previous, NO_ACTIVE_INTERRUPT);
     let _interrupt_guard = InterruptGuard::new();
-    irq_dispatch(token.vector, frame);
+    irq_dispatch(token.interrupt_id, frame);
+    controller().end_interrupt(token);
 }
 
 extern "C" fn irq_context_query() -> bool {
@@ -560,8 +571,8 @@ fn current_route_affinity() -> u64 {
 
 impl InterruptPlatform for Aarch64Platform {
     type InterruptFrame = InterruptFrame;
-    const DYNAMIC_VECTOR_START: u8 = SPI_START;
-    const DYNAMIC_VECTOR_END: u8 = SPI_END;
+    const DYNAMIC_VECTOR_START: u8 = SPI_START as u8;
+    const DYNAMIC_VECTOR_END: u8 = u8::MAX;
     fn scheduler_ipi_vector() -> u8 {
         SCHEDULER_SGI
     }
@@ -599,39 +610,35 @@ impl InterruptPlatform for Aarch64Platform {
         isb(SY);
         wfi();
     }
-    fn end_interrupt(vector: u8) {
-        let raw = Self::current_percpu()
-            .active_interrupt_token
-            .swap(NO_ACTIVE_INTERRUPT, Ordering::AcqRel);
-        assert_ne!(raw, NO_ACTIVE_INTERRUPT);
-        let token = InterruptToken {
-            raw,
-            vector: (raw & 0xff) as u8,
-        };
-        assert_eq!(token.vector, vector);
-        controller().end_interrupt(token);
-    }
+    fn end_interrupt(_vector: u8) {}
     fn send_ipi(target: PlatformCpuId, vector: u8) -> bool {
         controller().send_ipi(target, vector)
     }
     fn broadcast_panic_stop() {
         controller().broadcast_ipi(PANIC_STOP_SGI);
     }
-    fn compose_msi_message(_request: &MsiRequest) -> Option<MsiMessage> {
+    fn compose_msi_message(_request: &MsiBindingRequest, _vector: u8) -> Option<MsiMessage> {
         None
     }
     fn is_reserved_vector(vector: u8) -> bool {
-        vector < SPI_START
+        (vector as u32) < SPI_START
     }
-    fn gsi_to_vector(gsi: u8) -> Option<u8> {
-        (SPI_START..=SPI_END).contains(&gsi).then_some(gsi)
+    fn bind_wired_interrupt(source: HardwareInterruptId, interrupt_id: u32) -> bool {
+        if source.0 != interrupt_id || !(SPI_START..=SPI_END).contains(&source.0) {
+            return false;
+        }
+        controller().unmask_spi(source.0);
+        true
     }
-    fn vector_to_gsi(vector: u8) -> Option<u8> {
-        (SPI_START..=SPI_END).contains(&vector).then_some(vector)
+    fn unbind_wired_interrupt(source: HardwareInterruptId) {
+        if (SPI_START..=SPI_END).contains(&source.0) {
+            controller().mask_spi(source.0);
+        }
     }
-    fn unmask_gsi_any_cpu(gsi: u8, vector: u8) {
-        assert_eq!(gsi, vector);
-        controller().unmask_spi(vector);
+    fn wired_interrupt_id(source: HardwareInterruptId) -> Option<u32> {
+        (SPI_START..=SPI_END)
+            .contains(&source.0)
+            .then_some(source.0)
     }
     fn enter_interrupt() -> bool {
         Self::current_percpu()

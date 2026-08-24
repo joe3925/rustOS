@@ -4,7 +4,6 @@ use spin::Once;
 use x86_64::VirtAddr;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
-use super::drivers::interrupt_index::InterruptIndex;
 use super::drivers::timer_driver::timer_interrupt_entry;
 use super::exception_handlers::exception_handlers;
 use super::gdt::{
@@ -21,38 +20,11 @@ pub type InterruptFrame = InterruptStackFrame;
 
 pub(crate) const SCHED_IPI_VECTOR: u8 = 0xF2;
 pub(crate) const TLB_FLUSH_VECTOR: u8 = 0xF3;
+pub(crate) const TIMER_VECTOR: u8 = 0x20;
 pub(crate) const DYNAMIC_VECTOR_START: u8 = 0x60;
 pub(crate) const DYNAMIC_VECTOR_END: u8 = 0xEF;
 pub(crate) const SYSCALL_VECTOR: u8 = 0x80;
 pub(crate) const MAX_GSI: u8 = 64;
-
-pub struct NestedInterruptEnableGuard {
-    disable_on_drop: bool,
-}
-
-impl NestedInterruptEnableGuard {
-    #[inline(always)]
-    pub fn new() -> Self {
-        let was_enabled = x86_64::instructions::interrupts::are_enabled();
-
-        if !was_enabled {
-            x86_64::instructions::interrupts::enable();
-        }
-
-        Self {
-            disable_on_drop: !was_enabled,
-        }
-    }
-}
-
-impl Drop for NestedInterruptEnableGuard {
-    #[inline(always)]
-    fn drop(&mut self) {
-        if self.disable_on_drop {
-            x86_64::instructions::interrupts::disable();
-        }
-    }
-}
 
 // =============================================================================
 // IRQ VECTOR STUBS
@@ -63,9 +35,9 @@ const IRQ_SAVED_GPR_BYTES: usize = 15 * 8;
 extern "C" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
     let interrupt_guard = InterruptGuard::new();
     let _fpu_guard = interrupt_guard.is_outermost().then(KernelFpuGuard::new);
-    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let frame = unsafe { &mut *frame };
-    irq_dispatch(vector, frame);
+    irq_dispatch(vector as u32, frame);
+    crate::platform::end_interrupt(vector);
 }
 
 macro_rules! gen_irq_stub {
@@ -401,7 +373,7 @@ fn init_idt() -> InterruptDescriptorTable {
     }
 
     unsafe {
-        idt[InterruptIndex::Timer.as_u8()]
+        idt[TIMER_VECTOR]
             .set_handler_addr(VirtAddr::new(timer_interrupt_entry as *const () as u64))
             .set_stack_index(TIMER_IST_INDEX);
     }

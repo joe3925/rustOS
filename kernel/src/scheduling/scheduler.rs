@@ -771,7 +771,6 @@ pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
-    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = platform::current_cpu_id();
 
     unsafe { SCHEDULER.on_ipi(state, cpu_id) };
@@ -789,7 +788,6 @@ pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
-    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = platform::current_cpu_id();
 
     unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };

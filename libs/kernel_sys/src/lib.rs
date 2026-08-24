@@ -22,8 +22,8 @@ use kernel_types::dma::{
 };
 use kernel_types::error::{DriverErrorKind, ErrorBacktrace, KernelError};
 use kernel_types::irq::{
-    DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult, MsiMessage,
-    MsiRequest,
+    DropHook, HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult,
+    MsiBinding, MsiBindingRequest,
 };
 use kernel_types::object_manager::OmError;
 use kernel_types::pci::PciConfigAddress;
@@ -68,8 +68,17 @@ unsafe extern "C" {
     pub unsafe fn wake_task(id: u64);
 
     // IRQ
-    pub fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle;
-    pub fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle;
+    pub fn kernel_interrupt_bind_wired(
+        source: HardwareInterruptId,
+        isr: IrqIsrFn,
+        ctx: usize,
+    ) -> IrqHandle;
+    pub fn kernel_interrupt_bind_msi(
+        request: &MsiBindingRequest,
+        isr: IrqIsrFn,
+        ctx: usize,
+        out: &mut MsiBinding,
+    ) -> bool;
     pub fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta);
     pub fn kernel_irq_borrowed_signal_n(handle: IrqBorrowedHandle, meta: IrqMeta, n: u32);
     pub fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta);
@@ -86,9 +95,6 @@ unsafe extern "C" {
     pub fn irq_handle_get_user_ctx(h: &IrqHandle) -> usize;
 
     pub fn irq_handle_wait_abi(h: &IrqHandle, meta: IrqMeta) -> AbiFuture<IrqWaitResult>;
-    pub fn kernel_irq_alloc_vector() -> i32;
-    pub fn kernel_irq_free_vector(vector: u8) -> bool;
-    pub fn kernel_irq_compose_msi_message(request: &MsiRequest, out: &mut MsiMessage) -> bool;
 
     // PCI platform config access
     pub fn kernel_pci_read_config_u32(address: PciConfigAddress, out: &mut u32) -> bool;

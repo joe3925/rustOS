@@ -1,14 +1,14 @@
 use kernel_sys::{
     irq_handle_get_user_ctx, irq_handle_is_closed, irq_handle_set_user_ctx, irq_handle_unregister,
-    irq_handle_wait_abi, kernel_irq_alloc_vector, kernel_irq_borrowed_ensure_signal,
-    kernel_irq_borrowed_signal, kernel_irq_borrowed_signal_all, kernel_irq_borrowed_signal_n,
-    kernel_irq_compose_msi_message, kernel_irq_free_vector, kernel_irq_register,
-    kernel_irq_register_gsi, kernel_platform_cpu_ids,
+    irq_handle_wait_abi, kernel_interrupt_bind_msi, kernel_interrupt_bind_wired,
+    kernel_irq_borrowed_ensure_signal, kernel_irq_borrowed_signal, kernel_irq_borrowed_signal_all,
+    kernel_irq_borrowed_signal_n, kernel_platform_cpu_ids,
 };
 use kernel_types::irq::IRQ_RESCUE_WAKEUP;
 pub use kernel_types::irq::{
-    IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta,
-    IrqWaitResult, MsiMessage, MsiRequest, MsiRequester, MsiTarget,
+    HardwareInterruptId, IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK, IrqBorrowedHandle, IrqHandle,
+    IrqIsrFn, IrqMeta, IrqWaitResult, MsiBinding, MsiBindingRequest, MsiMessage, MsiRequester,
+    MsiTarget,
 };
 
 use kernel_types::async_ffi::AbiFuture;
@@ -87,33 +87,27 @@ impl IrqBorrowedHandleExt for IrqBorrowedHandle {
     }
 }
 
-pub fn irq_register_isr(vector: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
-    let h = unsafe { kernel_irq_register(vector, isr, ctx) };
+pub fn bind_wired_interrupt(
+    source: HardwareInterruptId,
+    isr: IrqIsrFn,
+    ctx: usize,
+) -> Option<IrqHandle> {
+    let h = unsafe { kernel_interrupt_bind_wired(source, isr, ctx) };
 
     if h.is_closed() { None } else { Some(h) }
 }
 
-pub fn irq_register_isr_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
-    let h = unsafe { kernel_irq_register_gsi(gsi, isr, ctx) };
-
-    if h.is_closed() { None } else { Some(h) }
-}
-
-pub fn irq_alloc_vector() -> Option<u8> {
-    let v = unsafe { kernel_irq_alloc_vector() };
-
-    if v < 0 { None } else { Some(v as u8) }
-}
-
-pub fn irq_free_vector(vector: u8) -> bool {
-    unsafe { kernel_irq_free_vector(vector) }
-}
-
-pub fn irq_compose_msi_message(request: &MsiRequest) -> Option<MsiMessage> {
-    let mut message = MsiMessage::default();
-
-    if unsafe { kernel_irq_compose_msi_message(request, &mut message) } {
-        Some(message)
+pub fn bind_msi_interrupt(
+    request: &MsiBindingRequest,
+    isr: IrqIsrFn,
+    ctx: usize,
+) -> Option<MsiBinding> {
+    let mut binding = MsiBinding {
+        handle: IrqHandle::null(),
+        message: MsiMessage::default(),
+    };
+    if unsafe { kernel_interrupt_bind_msi(request, isr, ctx, &mut binding) } {
+        Some(binding)
     } else {
         None
     }

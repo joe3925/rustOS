@@ -42,7 +42,6 @@ impl MachinePlatform for Aarch64Platform {
                 address: distributor.1,
                 global_system_interrupt_base: 0,
             }],
-            has_compatibility_interrupt_controllers: false,
         })
     }
 }

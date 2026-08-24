@@ -2,8 +2,8 @@ pub use x86_64::instructions::hlt;
 pub use x86_64::instructions::interrupts::*;
 
 use kernel_types::irq::{
-    MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiMessage, MsiRequest,
-    PlatformCpuId,
+    HardwareInterruptId, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
+    MsiBindingRequest, MsiMessage, PlatformCpuId,
 };
 use x86_64::structures::idt::InterruptStackFrame;
 
@@ -26,7 +26,7 @@ impl InterruptPlatform for X86Platform {
     }
 
     fn timer_interrupt_vector() -> u8 {
-        super::drivers::interrupt_index::InterruptIndex::Timer.as_u8()
+        super::idt::TIMER_VECTOR
     }
 
     fn tlb_shootdown_vector() -> u8 {
@@ -108,7 +108,7 @@ impl InterruptPlatform for X86Platform {
         }
     }
 
-    fn compose_msi_message(request: &MsiRequest) -> Option<MsiMessage> {
+    fn compose_msi_message(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
         match request.kind {
             MSI_KIND_MSI | MSI_KIND_MSIX => {}
             _ => return None,
@@ -125,7 +125,7 @@ impl InterruptPlatform for X86Platform {
         }
 
         let address = 0xFEE0_0000u64 | ((destination as u64) << 12);
-        let data = request.vector as u32;
+        let data = vector as u32;
 
         Some(MsiMessage::new(address, data))
     }
@@ -134,31 +134,25 @@ impl InterruptPlatform for X86Platform {
         vector == super::idt::SYSCALL_VECTOR
     }
 
-    fn gsi_to_vector(gsi: u8) -> Option<u8> {
-        if gsi < super::idt::MAX_GSI {
-            Some(super::drivers::interrupt_index::InterruptIndex::Timer.as_u8() + gsi)
-        } else {
-            None
+    fn bind_wired_interrupt(source: HardwareInterruptId, interrupt_id: u32) -> bool {
+        let Ok(vector) = u8::try_from(interrupt_id) else {
+            return false;
+        };
+        let guard = APIC.lock();
+        let Some(apic) = guard.as_ref() else {
+            return false;
+        };
+        apic.bind_wired_interrupt(source.0, vector, get_current_logical_id())
+    }
+
+    fn unbind_wired_interrupt(source: HardwareInterruptId) {
+        if let Some(apic) = APIC.lock().as_ref() {
+            apic.unbind_wired_interrupt(source.0);
         }
     }
 
-    fn vector_to_gsi(vector: u8) -> Option<u8> {
-        let base = super::drivers::interrupt_index::InterruptIndex::Timer.as_u8();
-        let gsi = vector.wrapping_sub(base);
-
-        if gsi < super::idt::MAX_GSI {
-            Some(gsi)
-        } else {
-            None
-        }
-    }
-
-    fn unmask_gsi_any_cpu(gsi: u8, vector: u8) {
-        APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
-            gsi,
-            vector,
-            get_current_logical_id(),
-        );
+    fn wired_interrupt_id(_source: HardwareInterruptId) -> Option<u32> {
+        None
     }
 
     fn enter_interrupt() -> bool {

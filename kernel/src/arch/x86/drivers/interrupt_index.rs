@@ -20,23 +20,16 @@ use core::{mem, ptr};
 use kernel_types::irq::IrqSafeMutex;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
-use pic8259::ChainedPics;
 use spin::Mutex;
-use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::sgdt;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::DescriptorTablePointer;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame};
 use x86_64::{PhysAddr, VirtAddr};
 
-pub(crate) const PIC_1_OFFSET: u8 = 0x20;
-pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 0x8;
 pub(crate) const APIC_START_PERIOD: u64 = 500000;
 
-pub static PICS: Mutex<ChainedPics> =
-    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 pub static APIC: IrqSafeMutex<Option<ApicImpl>> = IrqSafeMutex::new(None);
-pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 /// Counts APs that have made it into Rust code (past the SIPI trampoline).
 static AP_BOOTED: AtomicUsize = AtomicUsize::new(0);
 
@@ -264,16 +257,6 @@ fn read_trampoline_u64(offset: usize) -> u64 {
     unsafe { ptr::read_unaligned((TRAMPOLINE_BASE as *const u8).add(offset) as *const u64) }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-
-pub enum InterruptIndex {
-    Timer = PIC_1_OFFSET,
-    KeyboardIndex = PIC_1_OFFSET + 0x1,
-    PrimaryDrive = PIC_1_OFFSET + 0xE,
-    SecondaryDrive = PIC_1_OFFSET + 0xF,
-    SysCall = PIC_1_OFFSET + 0x60,
-}
 pub fn get_current_logical_id() -> u8 {
     let info = get_cpu_info();
     info.get_feature_info()
@@ -363,11 +346,6 @@ extern "C" fn irq_interrupts_enable_and_hlt() {
 #[inline(always)]
 pub fn current_cpu_id() -> usize {
     *current_percpu().cpu_id.get().unwrap()
-}
-impl InterruptIndex {
-    pub(crate) fn as_u8(self) -> u8 {
-        self as u8
-    }
 }
 pub fn wait_duration(d: Duration) {
     let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
@@ -523,9 +501,6 @@ pub trait LocalApic {
     unsafe fn write(&self, offset: usize, value: u32);
 }
 
-pub trait IoApic {
-    fn init_keyboard(&self);
-}
 pub struct Lapic {
     base_addr: VirtAddr,
 }
@@ -635,23 +610,45 @@ impl LocalApic for Lapic {
 }
 pub struct Ioapic {
     base_addr: VirtAddr,
+    gsi_base: u32,
+    entry_count: u32,
 }
 
 impl Ioapic {
-    pub fn new(phys: PhysAddr) -> Result<Self, ()> {
+    pub fn new(phys: PhysAddr, gsi_base: u32) -> Result<Self, ()> {
         let virt = map_physical_pages(
             phys,
             0x2048,
             kernel_types::memory::PhysicalMappingCache::Uncached,
         )
         .map_err(|_| ())?;
-        Ok(Self { base_addr: virt })
+        let mut result = Self {
+            base_addr: virt,
+            gsi_base,
+            entry_count: 0,
+        };
+        result.entry_count = ((result.read_register(1) >> 16) & 0xff) + 1;
+        Ok(result)
     }
 
     fn ptr(&self) -> *mut u32 {
         self.base_addr.as_mut_ptr()
     }
-    pub fn unmask_irq_any_cpu(&self, irq: u8, vector: u8, cpu_logical_mask: u8) {
+    fn read_register(&self, register: u32) -> u32 {
+        unsafe {
+            let ioregsel = self.ptr();
+            let iowin = (self.base_addr.as_u64() + 0x10) as *const u32;
+            ioregsel.write_volatile(register);
+            iowin.read_volatile()
+        }
+    }
+
+    fn owns(&self, source: u32) -> bool {
+        source >= self.gsi_base && source < self.gsi_base + self.entry_count
+    }
+
+    pub fn unmask_irq_any_cpu(&self, source: u32, vector: u8, cpu_logical_mask: u8) {
+        let irq = source - self.gsi_base;
         let reg_low = 0x10 + (irq as u32) * 2;
         let reg_high = reg_low + 1;
 
@@ -673,22 +670,25 @@ impl Ioapic {
             iowin.write_volatile(low & !IOAPIC_MASKED);
         }
     }
-}
 
-impl IoApic for Ioapic {
-    fn init_keyboard(&self) {
+    pub fn mask_irq(&self, source: u32) {
+        let irq = source - self.gsi_base;
+        let reg_low = 0x10 + (irq as u32) * 2;
         unsafe {
-            self.ptr().add(0).write_volatile(0x12);
-            self.ptr()
-                .add(4)
-                .write_volatile(InterruptIndex::KeyboardIndex as u8 as u32);
+            let ioregsel = self.ptr();
+            let iowin = (self.base_addr.as_u64() + 0x10) as *mut u32;
+            ioregsel.write_volatile(reg_low);
+            let low = iowin.read_volatile();
+            ioregsel.write_volatile(reg_low);
+            iowin.write_volatile(low | (1 << 16));
         }
     }
 }
+
 pub struct ApicImpl {
     pub apic_info: MachineInterruptInfo,
     pub lapic: Lapic,
-    pub ioapic: Ioapic,
+    pub ioapics: Vec<Ioapic>,
 }
 
 impl ApicImpl {
@@ -706,18 +706,39 @@ impl ApicImpl {
             .clone();
         let lapic = Lapic::new(PhysAddr::new(model.local_interrupt_controller_address))
             .map_err(|_| BadInterruptModel)?;
-        let ioapic_info = model
-            .interrupt_controllers
-            .first()
-            .ok_or(BadInterruptModel)?;
-        let ioapic =
-            Ioapic::new(PhysAddr::new(ioapic_info.address)).map_err(|_| BadInterruptModel)?;
+        let mut ioapics = Vec::with_capacity(model.interrupt_controllers.len());
+        for info in &model.interrupt_controllers {
+            ioapics.push(
+                Ioapic::new(
+                    PhysAddr::new(info.address),
+                    info.global_system_interrupt_base,
+                )
+                .map_err(|_| BadInterruptModel)?,
+            );
+        }
+        if ioapics.is_empty() {
+            return Err(BadInterruptModel);
+        }
 
         Ok(Self {
             apic_info: model,
             lapic,
-            ioapic,
+            ioapics,
         })
+    }
+
+    pub fn bind_wired_interrupt(&self, source: u32, vector: u8, destination: u8) -> bool {
+        let Some(ioapic) = self.ioapics.iter().find(|ioapic| ioapic.owns(source)) else {
+            return false;
+        };
+        ioapic.unmask_irq_any_cpu(source, vector, destination);
+        true
+    }
+
+    pub fn unbind_wired_interrupt(&self, source: u32) {
+        if let Some(ioapic) = self.ioapics.iter().find(|ioapic| ioapic.owns(source)) {
+            ioapic.mask_irq(source);
+        }
     }
     pub fn init_apic_full() -> Result<(), ApicErrors> {
         use core::sync::atomic::Ordering;
@@ -730,25 +751,14 @@ impl ApicImpl {
             return Err(ApicErrors::AlreadyInit);
         }
 
-        let first_time = !USE_APIC.load(Ordering::SeqCst);
-
         let apic = ApicImpl::new()?;
 
         unsafe {
-            if apic.apic_info.has_compatibility_interrupt_controllers {
-                PICS.lock().disable();
-            }
-
             let logical_id = get_current_logical_id();
             apic.lapic.init(logical_id);
             apic.lapic.init_timer();
-
-            if first_time {
-                apic.ioapic.init_keyboard();
-            }
             LAPIC_BASE_VA.store(apic.lapic.base_addr.as_u64(), Ordering::Release);
             APIC.lock().replace(apic);
-            USE_APIC.store(true, Ordering::SeqCst);
         }
 
         interrupts::enable();
@@ -1075,21 +1085,12 @@ pub enum IpiKind {
 }
 
 #[inline(always)]
-pub fn send_eoi(vector: u8) {
-    if USE_APIC.load(Ordering::Relaxed) {
-        let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
-        if base != 0 {
-            unsafe {
-                ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
-            }
-            return;
+pub fn send_eoi(_vector: u8) {
+    let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
         }
-    }
-    unsafe {
-        if vector >= PIC_1_OFFSET + 8 {
-            Port::new(0xA0u16).write(0x20u8);
-        }
-        Port::new(0x20u16).write(0x20u8);
     }
 }
 /// A faster send eoi for the timer interrupt

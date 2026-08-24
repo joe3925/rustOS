@@ -2,13 +2,12 @@ use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
 
 use kernel_api::device::DeviceObject;
-use kernel_api::irq::irq_compose_msi_message;
+use kernel_api::irq::{IrqHandleExt, bind_msi_interrupt};
 use kernel_api::kernel_types::irq::{
-    MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiRequest, MsiRequester,
+    IrqHandle, IrqIsrFn, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiBindingRequest,
+    MsiRequester,
 };
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
-use kernel_api::pnp::DriverStep;
-use kernel_api::request::DeviceControl;
 
 use crate::dev_ext::PciPdoExt;
 use kernel_api::kernel_types::pci::BarKind;
@@ -28,38 +27,35 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 }
 
 /// Program MSI-X table and enable MSI-X capability.
-pub async fn pci_setup_msix<'req, 'data>(
-    dev: Arc<DeviceObject>,
-    req: &mut DeviceControl<'data>,
-) -> Result<DriverStep, kernel_api::error::KernelError> {
+pub extern "C" fn pci_setup_msix(
+    dev: &Arc<DeviceObject>,
+    request: MsiBindingRequest,
+    isr: IrqIsrFn,
+    context: usize,
+) -> IrqHandle {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(e) => e,
-        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice)),
+        Err(_) => return IrqHandle::null(),
     };
 
     let msix = match ext.msix.as_ref() {
         Some(m) => m,
-        None => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented)),
+        None => return IrqHandle::null(),
     };
 
-    let msi_request = match { req.data.view::<MsiRequest>().copied() } {
-        Some(request) => request,
-        None => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter)),
-    };
-
-    if msi_request.kind != MSI_KIND_MSIX
-        || msi_request.table_index >= msix.table_size
+    if request.kind != MSI_KIND_MSIX
+        || request.table_index >= msix.table_size
         || !matches!(
-            msi_request.target.mode,
+            request.target.mode,
             MSI_TARGET_ANY | MSI_TARGET_PLATFORM_CPU
         )
     {
-        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
+        return IrqHandle::null();
     }
 
     let table_bar = &ext.bars[msix.table_bar as usize];
     if table_bar.kind == BarKind::None {
-        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
+        return IrqHandle::null();
     }
 
     let table_region_size = ((msix.table_size as u64 * 16) + 0xFFF) & !0xFFF;
@@ -67,20 +63,15 @@ pub async fn pci_setup_msix<'req, 'data>(
 
     let table_va = match map_mmio_region(PhysAddr::new(table_phys), table_region_size) {
         Ok(va) => va,
-        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InsufficientResources)),
+        Err(_) => return IrqHandle::null(),
     };
 
-    let msi_request =
-        msi_request.with_requester(MsiRequester::pci(ext.seg, ext.bus, ext.dev, ext.func));
-    let message = match irq_compose_msi_message(&msi_request) {
-        Some(message) => message,
-        None => {
-            let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
-        }
+    let request = request.with_requester(MsiRequester::pci(ext.seg, ext.bus, ext.dev, ext.func));
+    let Some(binding) = bind_msi_interrupt(&request, isr, context) else {
+        let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
+        return IrqHandle::null();
     };
-
-    let entry_offset = msi_request.table_index as u64 * 16;
+    let entry_offset = request.table_index as u64 * 16;
     let entry_va = table_va.as_u64() + entry_offset;
 
     // Vector Control: bit 0 = mask (0 = masked)
@@ -90,9 +81,9 @@ pub async fn pci_setup_msix<'req, 'data>(
     unsafe {
         // Program entry while masked to avoid spurious interrupts on picky devices.
         write_volatile((entry_va + 12) as *mut u32, vector_ctrl_masked);
-        write_volatile((entry_va + 0) as *mut u32, message.address_lo());
-        write_volatile((entry_va + 4) as *mut u32, message.address_hi());
-        write_volatile((entry_va + 8) as *mut u32, message.data);
+        write_volatile((entry_va + 0) as *mut u32, binding.message.address_lo());
+        write_volatile((entry_va + 4) as *mut u32, binding.message.address_hi());
+        write_volatile((entry_va + 8) as *mut u32, binding.message.data);
         write_volatile((entry_va + 12) as *mut u32, vector_ctrl_unmasked);
     }
 
@@ -105,7 +96,8 @@ pub async fn pci_setup_msix<'req, 'data>(
         Ok(va) => va,
         Err(_) => {
             let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InsufficientResources));
+            binding.handle.unregister();
+            return IrqHandle::null();
         }
     };
 
@@ -126,5 +118,5 @@ pub async fn pci_setup_msix<'req, 'data>(
     let _ = unsafe { unmap_mmio_region(cfg_va, 4096) };
     let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
 
-    Ok(DriverStep::Complete)
+    binding.handle
 }

@@ -42,15 +42,15 @@ use kernel_api::error::{
 };
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
-    IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
-    irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
+    HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqHandleExt, bind_wired_interrupt,
+    irq_wait_closed,
 };
 use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
 };
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqFrame, IrqMeta};
-use kernel_api::kernel_types::irq::{MsiRequest, MsiTarget};
+use kernel_api::kernel_types::irq::{MsiBindingRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::memory::map_mmio_region;
@@ -69,13 +69,11 @@ use kernel_api::pnp::{
 use kernel_api::request::DeviceControl;
 use kernel_api::runtime::{KernelStopwatch, cycle_counter, spawn_detached};
 use kernel_api::util::panic_common;
-use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
+use kernel_api::{println, request_handler};
 use spin::{Mutex, Once, RwLock};
 use virtqueue::Virtqueue;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
-
-const PIC_BASE_VECTOR: u8 = 0x20;
 
 const COMPLETION_POLL_MIN_NS: u64 = 2_000;
 const COMPLETION_POLL_MAX_NS: u64 = 550_000;
@@ -301,7 +299,7 @@ pub extern "C" fn virtio_device_add(
 }
 
 extern "C" fn virtio_isr(
-    _vector: u8,
+    _interrupt_id: u32,
     _cpu: u32,
     _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
@@ -323,7 +321,7 @@ extern "C" fn virtio_isr(
 }
 
 extern "C" fn virtio_msix_isr(
-    _vector: u8,
+    _interrupt_id: u32,
     _cpu: u32,
     _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
@@ -339,25 +337,18 @@ extern "C" fn virtio_msix_isr(
 
 async fn setup_msix_via_pci(
     dev: &Arc<DeviceObject>,
-    vector: u8,
-    platform_cpu_id: kernel_api::kernel_types::irq::PlatformCpuId,
+    request: MsiBindingRequest,
     table_index: u16,
-) -> Result<(), KernelError> {
-    let setup = MsiRequest::pci_msix(
-        vector,
-        MsiTarget::platform_cpu(platform_cpu_id),
-        table_index,
-    );
-
-    let mut req = DeviceControl::new_t(IOCTL_PCI_SETUP_MSIX, setup);
-    send_next_lower(dev.clone(), &mut req)
-        .await
-        .map(|_| ())
-        .with_context(|| {
-            alloc::format!(
-                "configuring virtio MSI-X vector {vector} on CPU {platform_cpu_id} at table index {table_index}"
-            )
-        })
+) -> Result<IrqHandle, KernelError> {
+    let proto = open_protocol_to_next_lower::<PciProtocol>(dev)
+        .map_err(|_| error(DriverErrorKind::NoSuchDevice))?;
+    let handle = (proto.setup_msix)(&proto.provider(), request, virtio_msix_isr, 0);
+    if !handle.is_null() {
+        Ok(handle)
+    } else {
+        Err(error(DriverErrorKind::DeviceError))
+            .with_context(|| alloc::format!("configuring virtio MSI-X table index {table_index}"))
+    }
 }
 #[request_handler]
 async fn virtio_pnp_start<'req, 'data, 'b>(
@@ -500,35 +491,16 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     }
 
     let actual_queue_count = virtqueues.len();
-    let mut msix_allocations: Vec<Option<(u8, IrqHandle, u16)>> = Vec::new();
+    let mut msix_allocations: Vec<Option<(IrqHandle, u16)>> = Vec::new();
 
     if msix_cap.is_some() {
         for queue_idx in 0..actual_queue_count {
-            let vector = match irq_alloc_vector() {
-                Some(v) => v,
-                None => {
-                    println!(
-                        "virtio-blk: failed to allocate vector for queue {}",
-                        queue_idx
-                    );
-                    break;
-                }
-            };
-
-            let handle = match irq_register_isr(vector, virtio_msix_isr, 0) {
-                Some(h) => h,
-                None => {
-                    let _ = irq_free_vector(vector);
-                    println!("virtio-blk: failed to register ISR for queue {}", queue_idx);
-                    break;
-                }
-            };
-
             let target_cpu = cpu_ids[queue_idx % cpu_count];
             let table_index = queue_idx as u16;
-
-            match setup_msix_via_pci(&dev, vector, target_cpu, table_index).await {
-                Ok(()) => {
+            let request =
+                MsiBindingRequest::pci_msix(MsiTarget::platform_cpu(target_cpu), table_index);
+            match setup_msix_via_pci(&dev, request, table_index).await {
+                Ok(handle) => {
                     unsafe {
                         pci::common_write_u16(
                             caps.common_cfg,
@@ -548,19 +520,16 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     if readback == 0xFFFF {
                         println!("virtio-blk: device rejected MSI-X for queue {}", queue_idx);
                         handle.unregister();
-                        let _ = irq_free_vector(vector);
                         break;
                     }
 
-                    msix_allocations.push(Some((vector, handle, table_index)));
+                    msix_allocations.push(Some((handle, table_index)));
                 }
                 Err(e) => {
                     println!(
                         "virtio-blk: MSI-X setup failed for queue {}: {:?}",
                         queue_idx, e
                     );
-                    handle.unregister();
-                    let _ = irq_free_vector(vector);
                     break;
                 }
             }
@@ -589,18 +558,11 @@ async fn virtio_init_complete<'req, 'data, 'b>(
 
     let line_irq_handle: Option<IrqHandle> = if !use_msix {
         if let Some(g) = gsi {
-            if g < 64 {
-                irq_register_isr_gsi(g as u8, virtio_isr, caps.isr_cfg.as_u64() as usize)
-            } else {
-                None
-            }
-        } else if let Some(line) = int_line {
-            if line < 16 {
-                let vector = PIC_BASE_VECTOR + line;
-                irq_register_isr(vector, virtio_isr, caps.isr_cfg.as_u64() as usize)
-            } else {
-                None
-            }
+            bind_wired_interrupt(
+                HardwareInterruptId(g as u32),
+                virtio_isr,
+                caps.isr_cfg.as_u64() as usize,
+            )
         } else {
             None
         }
@@ -628,9 +590,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
-                    if let Some(vec) = qs.msix_vector {
-                        let _ = irq_free_vector(vec);
-                    }
                     qs.queue
                         .try_write()
                         .expect("queue not locked during cleanup")
@@ -638,9 +597,8 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 }
 
                 for alloc in msix_allocations.iter().skip(i) {
-                    if let Some((vec, handle, _)) = alloc {
+                    if let Some((handle, _)) = alloc {
                         handle.unregister();
-                        let _ = irq_free_vector(*vec);
                     }
                 }
 
@@ -659,15 +617,15 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             }
         };
 
-        let (irq_handle, msix_vector) = if use_msix && i < msix_allocations.len() {
+        let irq_handle = if use_msix && i < msix_allocations.len() {
             match msix_allocations[i].take() {
-                Some((vec, handle, _table_idx)) => (Some(handle), Some(vec)),
-                None => (None, None),
+                Some((handle, _table_idx)) => Some(handle),
+                None => None,
             }
         } else if i == 0 && !use_msix {
-            (line_irq_handle.clone(), None)
+            line_irq_handle.clone()
         } else {
-            (None, None)
+            None
         };
 
         let vq_capacity = vq.size as usize;
@@ -683,9 +641,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for qs in queue_states.iter() {
                     if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
-                    }
-                    if let Some(vec) = qs.msix_vector {
-                        let _ = irq_free_vector(vec);
                     }
                     qs.queue
                         .try_write()
@@ -720,9 +675,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
-                    if let Some(vec) = qs.msix_vector {
-                        let _ = irq_free_vector(vec);
-                    }
                     qs.queue
                         .try_write()
                         .expect("queue not locked during cleanup")
@@ -754,9 +706,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 for qs in queue_states.iter() {
                     if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
-                    }
-                    if let Some(vec) = qs.msix_vector {
-                        let _ = irq_free_vector(vec);
                     }
                     qs.queue
                         .try_write()
@@ -790,9 +739,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
-                    if let Some(vec) = qs.msix_vector {
-                        let _ = irq_free_vector(vec);
-                    }
                     qs.queue
                         .try_write()
                         .expect("queue not locked during cleanup")
@@ -824,7 +770,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             queue: RwLock::new(vq),
             arena,
             irq_handle: irq_handle_once,
-            msix_vector,
             completion_slots,
             read_ops,
             write_ops,
@@ -854,9 +799,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for qs in queue_states.iter() {
             if let Some(h) = qs.irq_handle.get() {
                 h.unregister();
-            }
-            if let Some(vec) = qs.msix_vector {
-                let _ = irq_free_vector(vec);
             }
             qs.queue
                 .try_write()
@@ -922,10 +864,6 @@ async fn virtio_pnp_remove<'req, 'data, 'b>(
                 // irq_handle.wait() to return IRQ_WAIT_CLOSED so it exits.
                 if let Some(h) = qs.irq_handle.get() {
                     h.unregister();
-                }
-
-                if let Some(vec) = qs.msix_vector {
-                    let _ = irq_free_vector(vec);
                 }
 
                 // Acquire write lock to wait for any in-progress drain to finish

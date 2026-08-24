@@ -13,7 +13,6 @@ impl Platform for X86Platform {
         Self::init_kernel_root();
         unsafe {
             super::gdt::PER_CPU_GDT.lock().init_gdt();
-            super::drivers::interrupt_index::PICS.lock().initialize();
         }
         Self::disable_interrupts();
         super::syscalls::syscall::syscall_init();
