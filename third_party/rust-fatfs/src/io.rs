@@ -13,7 +13,7 @@ pub trait IoBase: Send {
 ///
 /// It is based on the `std::io::Read` trait.
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
-use kernel_types::dma::{FromDevice, IoBuffer, ToDevice};
+use kernel_types::dma::implementation::{FromDevice, IoBuffer, ToDevice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoKind {

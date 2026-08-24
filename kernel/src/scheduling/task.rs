@@ -1,6 +1,6 @@
-use crate::memory::paging::{
-    StackSize, allocate_kernel_stack, base_page_size, deallocate_kernel_stack, map_range,
-};
+use crate::memory::paging::layout::{base_page_size};
+use crate::memory::paging::map::{map_range};
+use crate::memory::paging::stack::{StackSize, allocate_kernel_stack, deallocate_kernel_stack};
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
 use crate::scheduling::scheduler::{kernel_task_sched_binding, user_task_sched_binding};

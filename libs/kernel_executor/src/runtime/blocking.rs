@@ -196,14 +196,14 @@ impl<R: Send + 'static> Future for BlockingJoin<R> {
 
         header.register_waker(cx.waker());
 
-        if let Some(res) = header.take_result() {
+        match header.take_result() { Some(res) => {
             // Result arrived after we registered the waker. Clear any stored
             // waker to avoid keeping an unnecessary ref alive.
             header.drop_waker();
             Poll::Ready(res)
-        } else {
+        } _ => {
             Poll::Pending
-        }
+        }}
     }
 }
 

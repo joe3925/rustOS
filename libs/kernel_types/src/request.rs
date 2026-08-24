@@ -1,6 +1,6 @@
 use crate::async_ffi::AbiFuture;
 use crate::device::DeviceObject;
-use crate::dma::{FromDevice, IoBuffer, ToDevice};
+use crate::dma::implementation::{FromDevice, IoBuffer, ToDevice};
 use crate::fs::{
     FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult,
     FsDeleteParams, FsDeleteResult, FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult,

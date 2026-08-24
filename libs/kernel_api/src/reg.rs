@@ -31,6 +31,6 @@ pub async fn list_values(base_path: &str) -> Result<Vec<String>, KernelError> {
     unsafe { kernel_sys::reg_list_values(base_path).await }
 }
 
-pub async unsafe fn switch_to_vfs_async() -> Result<(), KernelError> {
+pub async unsafe fn switch_to_vfs_async() -> Result<(), KernelError> { unsafe {
     kernel_sys::switch_to_vfs_async().await
-}
+}}

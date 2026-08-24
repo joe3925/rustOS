@@ -12,7 +12,7 @@ use crate::platform::UnwindPlatform;
 use crate::profiling::backtrace::{StackBounds, UnwindStart, UnwindStep};
 
 use super::platform::Aarch64Platform;
-use super::scheduling::TaskContext;
+use super::scheduling::state::TaskContext;
 
 #[derive(Clone, Copy)]
 #[repr(C)]

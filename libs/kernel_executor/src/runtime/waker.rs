@@ -1,6 +1,7 @@
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
-use super::slab::{decode_slab_task_ptr, encode_slab_task_ptr, enqueue_slab_task, get_task_table};
+use super::slab::ptr::{decode_slab_task_ptr, encode_slab_task_ptr, enqueue_slab_task};
+use super::slab::task_slab::get_task_table;
 
 #[inline]
 fn encoded_to_waker_ptr(encoded: usize) -> *const () {

@@ -6,14 +6,14 @@ use core::task::{Context, Poll, Waker};
 
 use crate::executable::program::{Message, ProgramHandle, QueueHandle};
 use crate::object_manager::behavior::CONFIGURE_BIT;
-use crate::object_manager::{InterfaceMask, Object, ObjectPayload};
+use crate::object_manager::manager::{InterfaceMask, Object, ObjectPayload};
 use kernel_sync::{AsyncRecvError, WaitRegistration};
 use kernel_types::object_manager::ObjectTag;
 use spin::Mutex;
 
-use super::{IO_STATUS_BUFFER_TOO_SMALL, IO_STATUS_CANCELLED, IoRequestOutput};
+use super::request::{IO_STATUS_BUFFER_TOO_SMALL, IO_STATUS_CANCELLED, IoRequestOutput};
 use crate::memory::io_buffer::OwnedIoBuffer;
-use kernel_types::dma::FromDevice;
+use kernel_types::dma::implementation::FromDevice;
 
 struct DeliveryInner {
     completion: Option<IoRequestOutput>,

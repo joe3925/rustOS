@@ -8,7 +8,7 @@ use crate::sync::atomic::{AtomicU64, Ordering};
 use super::config::{SlabConfig, SlabConfigBuilder, SlabStats};
 use super::ptr::encode_slab_task_ptr;
 use super::slot::TaskSlot;
-use super::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
+use super::constants::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
 
 const GEN_SHIFT: u32 = 16;
 const REF_MASK: u32 = 0xFFFF;

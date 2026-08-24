@@ -6,7 +6,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::completion::CompletionToken;
-use kernel_api::dma::dma::{IoBuffer, IoBufferAccess};
+use kernel_api::kernel_types::dma::implementation::{IoBuffer, IoBufferAccess};
 
 pub(crate) const VIRTIO_QUEUE_BATCH_LIMIT: usize = 64;
 

@@ -4,10 +4,8 @@ mod interrupts;
 mod machine;
 mod memory;
 mod pci;
-mod platform;
+pub mod platform;
 mod scheduling;
 mod serial;
 mod timer;
 mod unwind;
-
-pub use platform::Aarch64Platform as PlatformImpl;

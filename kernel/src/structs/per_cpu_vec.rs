@@ -70,9 +70,9 @@ impl<T> PerCpuVec<T> {
     }
 
     /// Unsafe iterator - caller ensures no concurrent modification
-    pub unsafe fn iter(&self) -> impl Iterator<Item = &T> {
+    pub unsafe fn iter(&self) -> impl Iterator<Item = &T> { unsafe {
         (*self.data.get()).iter()
-    }
+    }}
 
     /// Set value at explicit ID, growing the vec if necessary.
     /// Useful for cases where IDs may not be sequential or pre-initialized.

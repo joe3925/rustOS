@@ -71,7 +71,6 @@ impl MachinePlatform for X86Platform {
         Some(MachineInterruptInfo {
             local_interrupt_controller_address: apic.local_apic_address,
             interrupt_controllers,
-            has_compatibility_interrupt_controllers: apic.also_has_legacy_pics,
         })
     }
 }

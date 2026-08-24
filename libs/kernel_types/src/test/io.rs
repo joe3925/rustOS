@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::async_ffi::{AbiFuture, FutureExt};
 use crate::device::DeviceObject;
-use crate::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
+use crate::dma::implementation::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use crate::error::{DriverErrorKind, KernelError};
 use crate::io::{
     DeviceControlHandler, DeviceControlOp, DeviceFlush, DeviceFlushOp, DeviceOps, DeviceRead,

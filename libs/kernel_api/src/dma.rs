@@ -1,9 +1,9 @@
 use alloc::sync::Arc;
 
 use kernel_types::device::DeviceObject;
-pub use kernel_types::dma;
-use kernel_types::dma::{
-    DmaBufferView, DmaMapError, DmaMappedBuffer, DmaMappingStrategy, IoBuffer, IoBufferAccess,
+use kernel_types::dma::implementation::{
+    DeviceMmuPlatformDeviceIdentity, DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError,
+    DmaMappedBuffer, DmaMappingStrategy, DmaPciDeviceIdentity, IoBuffer, IoBufferAccess,
     IoBufferBacking, IoBufferError,
 };
 use kernel_types::error::DriverErrorKind;
@@ -14,25 +14,25 @@ pub fn dma_base_page_size() -> usize {
 
 pub fn register_pci_pdo(
     pdo: &Arc<DeviceObject>,
-    identity: dma::DmaPciDeviceIdentity,
+    identity: DmaPciDeviceIdentity,
 ) -> Result<(), DriverErrorKind> {
     unsafe { kernel_sys::kernel_dma_register_pci_pdo(pdo, identity) }
 }
 
 pub fn register_platform_pdo(
     pdo: &Arc<DeviceObject>,
-    identity: dma::DeviceMmuPlatformDeviceIdentity,
+    identity: DeviceMmuPlatformDeviceIdentity,
 ) -> Result<(), DriverErrorKind> {
     unsafe { kernel_sys::kernel_dma_register_platform_pdo(pdo, identity) }
 }
 
 pub fn open_device_handle(
     device: &Arc<DeviceObject>,
-) -> Result<dma::DmaDeviceHandle, DriverErrorKind> {
+) -> Result<DmaDeviceHandle, DriverErrorKind> {
     unsafe { kernel_sys::kernel_dma_open_device_handle(device) }
 }
 
-pub fn query_device_state(device: &Arc<DeviceObject>) -> Option<dma::DmaDeviceState> {
+pub fn query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState> {
     unsafe { kernel_sys::kernel_dma_query_device_state(device) }
 }
 

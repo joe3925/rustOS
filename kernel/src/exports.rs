@@ -3,7 +3,7 @@ use crate::error::{kernel_capture_error_backtrace, kernel_resolve_error_context_
 use crate::export;
 use crate::function;
 use crate::get_rva;
-use crate::idt::*;
+use crate::idt::interrupt_impl::*;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;
@@ -63,10 +63,8 @@ export! {
     kernel_dma_map_buffer,
     kernel_dma_map_persistent_contiguous_backing,
 
-    kernel_irq_register,
-    kernel_irq_register_gsi,
-    kernel_irq_alloc_vector,
-    kernel_irq_free_vector,
+    kernel_interrupt_bind_wired,
+    kernel_interrupt_bind_msi,
     kernel_irq_borrowed_signal,
     kernel_irq_borrowed_ensure_signal,
     kernel_irq_borrowed_signal_n,
@@ -137,7 +135,6 @@ export! {
     bench_kernel_measure,
 
     kernel_platform_cpu_ids,
-    kernel_irq_compose_msi_message,
     kernel_pci_read_config_u32,
     kernel_pci_write_config_u32,
 

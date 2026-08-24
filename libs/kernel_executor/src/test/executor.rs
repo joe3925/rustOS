@@ -10,7 +10,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::runtime::runtime::{block_on, spawn_join_owned as spawn, JoinAll};
-use crate::runtime::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
+use crate::runtime::slab::constants::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::net::TcpStream as TokioTcpStream;
@@ -515,7 +515,7 @@ fn stress_task_total() -> usize {
 }
 
 fn stress_network_concurrency() -> usize {
-    let default = super::test_shard_count() * NETWORK_CONCURRENCY_PER_SHARD;
+    let default = super::support::test_shard_count() * NETWORK_CONCURRENCY_PER_SHARD;
     std::env::var("KERNEL_EXECUTOR_HTTP_STRESS_CONCURRENCY")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -594,14 +594,14 @@ where
 }
 
 fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let task_count = stress_task_total();
     let progress = Arc::new(AtomicUsize::new(0));
     let tokio = Arc::new(
         Builder::new_multi_thread()
-            .worker_threads(super::test_shard_count().max(2))
+            .worker_threads(super::support::test_shard_count().max(2))
             .enable_io()
             .build()
             .expect("build executor stress Tokio runtime"),
@@ -648,7 +648,7 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
     assert_eq!(saw_inline, future_set.expects_inline());
     assert_eq!(saw_large, future_set.expects_large());
 
-    super::wait_until(Duration::from_secs(60), || {
+    super::support::wait_until(Duration::from_secs(60), || {
         gate.parked_count() == task_count
     });
     gate.open();

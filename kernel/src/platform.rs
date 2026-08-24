@@ -11,19 +11,23 @@ use crate::memory::device_mmu::{
 use crate::memory::paging::types::UserVmLayout;
 use acpi::AcpiTables;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
-use kernel_types::irq::{MsiMessage, MsiRequest, PlatformCpuId};
+use kernel_types::irq::{HardwareInterruptId, MsiBindingRequest, MsiMessage, PlatformCpuId};
 use kernel_types::memory::Module;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
 use kernel_types::status::PageMapError;
 
-use crate::memory::paging::{
+use crate::memory::paging::types::{
     KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
     UnmapFrameDisposition,
 };
 
-pub type ActivePlatform = crate::arch::PlatformImpl;
+#[cfg(target_arch = "x86_64")]
+pub type ActivePlatform = crate::arch::x86::platform::X86Platform;
+
+#[cfg(target_arch = "aarch64")]
+pub type ActivePlatform = crate::arch::aarch64::platform::Aarch64Platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuStartupError {
@@ -38,6 +42,7 @@ pub trait Platform {
     const NAME: &'static str;
     const KERNEL_IMAGE_BASE: u64;
 
+    fn init_early_kernel();
     fn init_boot_processor();
 }
 
@@ -85,7 +90,7 @@ pub trait InterruptPlatform: CpuPlatform {
     fn end_interrupt(vector: u8);
     fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool;
     fn broadcast_panic_stop();
-    fn compose_msi_message(request: &MsiRequest) -> Option<MsiMessage>;
+    fn compose_msi_message(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage>;
     fn is_reserved_vector(vector: u8) -> bool;
 
     fn is_dynamic_vector(vector: u8) -> bool {
@@ -94,9 +99,9 @@ pub trait InterruptPlatform: CpuPlatform {
             && !Self::is_reserved_vector(vector)
     }
 
-    fn gsi_to_vector(gsi: u8) -> Option<u8>;
-    fn vector_to_gsi(vector: u8) -> Option<u8>;
-    fn unmask_gsi_any_cpu(gsi: u8, vector: u8);
+    fn bind_wired_interrupt(source: HardwareInterruptId, interrupt_id: u32) -> bool;
+    fn unbind_wired_interrupt(source: HardwareInterruptId);
+    fn wired_interrupt_id(source: HardwareInterruptId) -> Option<u32>;
     fn enter_interrupt() -> bool;
     fn leave_interrupt(was_in_interrupt: bool);
 }
@@ -366,8 +371,8 @@ pub fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool {
     <ActivePlatform as InterruptPlatform>::send_ipi(target_platform_cpu_id, vector)
 }
 
-pub fn compose_msi_message(request: &MsiRequest) -> Option<MsiMessage> {
-    <ActivePlatform as InterruptPlatform>::compose_msi_message(request)
+pub fn compose_msi_message(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
+    <ActivePlatform as InterruptPlatform>::compose_msi_message(request, vector)
 }
 
 pub fn is_reserved_vector(vector: u8) -> bool {
@@ -383,16 +388,16 @@ pub fn dynamic_vector_range() -> core::ops::RangeInclusive<u8> {
         ..=<ActivePlatform as InterruptPlatform>::DYNAMIC_VECTOR_END
 }
 
-pub fn gsi_to_vector(gsi: u8) -> Option<u8> {
-    <ActivePlatform as InterruptPlatform>::gsi_to_vector(gsi)
+pub fn bind_wired_interrupt(source: HardwareInterruptId, interrupt_id: u32) -> bool {
+    <ActivePlatform as InterruptPlatform>::bind_wired_interrupt(source, interrupt_id)
 }
 
-pub fn vector_to_gsi(vector: u8) -> Option<u8> {
-    <ActivePlatform as InterruptPlatform>::vector_to_gsi(vector)
+pub fn unbind_wired_interrupt(source: HardwareInterruptId) {
+    <ActivePlatform as InterruptPlatform>::unbind_wired_interrupt(source);
 }
 
-pub fn unmask_gsi_any_cpu(gsi: u8, vector: u8) {
-    <ActivePlatform as InterruptPlatform>::unmask_gsi_any_cpu(gsi, vector);
+pub fn wired_interrupt_id(source: HardwareInterruptId) -> Option<u32> {
+    <ActivePlatform as InterruptPlatform>::wired_interrupt_id(source)
 }
 
 pub fn enter_interrupt() -> bool {

@@ -106,7 +106,7 @@ impl KernelFrameAllocator {
     pub fn allocate_zeroed_base_frame() -> Option<PhysAddr> {
         let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() else {
             let phys = allocate_base_frame_boot()?;
-            if super::emergency_zero_physical_frame(phys).is_err() {
+            if super::zero::emergency_zero_physical_frame(phys).is_err() {
                 free_mapping_frame_boot(
                     phys,
                     MappingSize {
@@ -132,7 +132,7 @@ impl KernelFrameAllocator {
             }
         };
 
-        if super::emergency_zero_physical_frame(phys).is_err() {
+        if super::zero::emergency_zero_physical_frame(phys).is_err() {
             unsafe { runtime.free_frame(frame) };
             super::zero::wake_zero_page_worker();
             return None;
@@ -155,7 +155,7 @@ impl KernelFrameAllocator {
             return false;
         };
 
-        if super::emergency_zero_physical_frame(PhysAddr::new(phys)).is_err() {
+        if super::zero::emergency_zero_physical_frame(PhysAddr::new(phys)).is_err() {
             unsafe { runtime.free_frame(frame) };
             super::zero::wake_zero_page_worker();
             return false;

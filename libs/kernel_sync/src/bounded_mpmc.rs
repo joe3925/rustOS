@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};
-use crate::platform::Platform;
+use crate::platform::contract::Platform;
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,17 +185,17 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
     }
 
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if let Some(value) = self.inner.queue.try_pop() {
+        match self.inner.queue.try_pop() { Some(value) => {
             Ok(value)
-        } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-            if let Some(value) = self.inner.queue.try_pop() {
+        } _ => if self.inner.sender_count.load(Ordering::Acquire) == 0 {
+            match self.inner.queue.try_pop() { Some(value) => {
                 Ok(value)
-            } else {
+            } _ => {
                 Err(TryRecvError::Disconnected)
-            }
+            }}
         } else {
             Err(TryRecvError::Empty)
-        }
+        }}
     }
 
     pub fn is_disconnected(&self) -> bool {

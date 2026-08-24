@@ -27,7 +27,6 @@ pub const IOCTL_MOUNTMGR_UNMOUNT: u32 = 0x4D4D_0002;
 pub const IOCTL_MOUNTMGR_QUERY: u32 = 0x4D4D_0003;
 pub const IOCTL_MOUNTMGR_RESYNC: u32 = 0x4D4D_0004;
 pub const IOCTL_MOUNTMGR_LIST_FS: u32 = 0x4D4D_0005;
-pub const IOCTL_PCI_SETUP_MSIX: u32 = 0x5043_0001; // "PC" prefix
 
 pub const GLOBAL_NS: &str = "\\GLOBAL";
 pub const GLOBAL_CTRL_LINK: &str = "\\GLOBAL\\MountMgr";
@@ -59,7 +58,7 @@ macro_rules! println_no_format {
         }
     }};
 
-    ($s:expr) => {{
+    ($s:expr_2021) => {{
         unsafe {
             $crate::util::print($s);
             $crate::util::print("\n");

@@ -16,13 +16,13 @@ use spin::{Mutex, RwLock};
 
 use crate::{
     executable::pe_loadable::PELoader,
-    object_manager::{InterfaceMask, OBJECT_MANAGER, Object, ObjectPayload},
+    object_manager::manager::{InterfaceMask, OBJECT_MANAGER, Object, ObjectPayload},
     platform,
     scheduling::task::TaskHandle,
     util::generate_guid,
 };
 use crate::{
-    memory::paging::{AddressSpaceRoot, map_range},
+    memory::paging::{address_space::AddressSpaceRoot, map::map_range},
     memory::user_pins::UserMemoryPins,
     scheduling::scheduler::SCHEDULER,
     structs::range_tracker::RangeTracker,
@@ -392,10 +392,10 @@ impl Program {
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
 
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
         });
 
         let res = (|| {
@@ -405,7 +405,7 @@ impl Program {
         })();
 
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
 
         res
@@ -417,10 +417,10 @@ impl Program {
         if guard.is_pinned(start.as_u64(), end.as_u64()) {
             return Err(PageMapError::RangePinned());
         }
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
 
         unsafe {
-            crate::memory::paging::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
         }
 
         let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
@@ -428,7 +428,7 @@ impl Program {
             unsafe { map_range(start.into(), end.as_u64() - start.as_u64(), flags, false) };
 
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
 
         result
@@ -442,10 +442,10 @@ impl Program {
             .into();
         let end = start + size as u64;
 
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
         });
 
         let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
@@ -454,13 +454,13 @@ impl Program {
             map_range(start.into(), end.as_u64() - start.as_u64(), flags, false)?;
         }
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
 
         Ok(start)
     }
     pub fn unmap_user_vm(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
-        let size = crate::memory::paging::align_up_to_base_page(size as u64)
+        let size = crate::memory::paging::layout::align_up_to_base_page(size as u64)
             .ok_or(PageMapError::NoMemory())?;
 
         if size == 0 {
@@ -486,12 +486,12 @@ impl Program {
 
         unsafe { self.tracker.dealloc(start, size) };
 
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::switch_address_space_root(self.address_space_root);
-            crate::memory::paging::unmap_range_unchecked(virt_addr.into(), size);
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::map::unmap_range_unchecked(virt_addr.into(), size);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         });
 
         Ok(())
@@ -601,11 +601,11 @@ impl Program {
         };
         self.modules.write().remove(index);
         unsafe { self.tracker.dealloc(base.as_u64(), size) };
-        let old_root = crate::memory::paging::current_address_space_root();
+        let old_root = crate::memory::paging::address_space::current_address_space_root();
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::switch_address_space_root(self.address_space_root);
-            crate::memory::paging::unmap_range_unchecked(base.into(), size);
-            crate::memory::paging::switch_address_space_root(old_root);
+            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::map::unmap_range_unchecked(base.into(), size);
+            crate::memory::paging::address_space::switch_address_space_root(old_root);
         });
         Ok(())
     }

@@ -5,15 +5,15 @@
 
 use alloc::vec::Vec;
 
-use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
+use kernel_types::dma::implementation::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
 use spin::Mutex;
 use x86_64::PhysAddr;
 
-use super::alloc_zeroed_pages_contiguous;
+use super::backend::alloc_zeroed_pages_contiguous;
 use super::domain::{IommuDomain, IommuError};
 use super::page_table::{self, AMD_IR, AMD_IW, PTE_ADDR_MASK, PTE_P};
-use super::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo, X86PlatformDeviceRoute};
-use crate::memory::paging::map_physical_pages;
+use super::backend::{AmdIvhdDeviceEntry, AmdPlatformIommuInfo, X86PlatformDeviceRoute};
+use crate::memory::paging::mmio::map_physical_pages;
 use crate::println;
 
 const DEV_TAB_BAR: usize = 0x0000;

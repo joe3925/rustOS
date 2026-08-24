@@ -1,6 +1,6 @@
 use kernel_api::async_ffi::AbiFuture;
-use kernel_api::dma::dma::{IoBufferBacking, IoBufferError};
-use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
+use kernel_api::kernel_types::dma::implementation::{IoBufferBacking, IoBufferError};
+use kernel_api::kernel_types::dma::implementation::{FromDevice, IoBuffer};
 use kernel_api::request::{Read, Write};
 
 #[derive(Debug, Clone, Copy)]

@@ -8,7 +8,7 @@ use kernel_api::error::{DriverErrorKind, KernelError, ResultErrorContext, error}
 use kernel_api::{
     kernel_types::{
         async_ffi::{AbiFuture, FutureExt},
-        dma::{
+        dma::implementation::{
             FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
             IoBufferBackingScratch, ToDevice,
         },

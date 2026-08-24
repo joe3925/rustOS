@@ -58,7 +58,7 @@ impl ExecutorRuntime {
     fn new(cpu_count: usize) -> Self {
         Self {
             domains: ExecutorDomainTable::new(cpu_count),
-            run_queue: DomainRunQueue::new(crate::runtime::slab::MAX_TASK_SLOTS),
+            run_queue: DomainRunQueue::new(crate::runtime::slab::constants::MAX_TASK_SLOTS),
         }
     }
 }
@@ -89,7 +89,7 @@ impl GlobalAsyncExecutor {
     pub fn init(&self, shards: usize, initial_task_capacity: usize) {
         let shards = shards.clamp(1, MAX_SHARDS);
 
-        crate::runtime::slab::init_task_table_with(|config| config.capacity(initial_task_capacity));
+        crate::runtime::slab::task_slab::init_task_table_with(|config| config.capacity(initial_task_capacity));
 
         self.runtime.call_once(|| ExecutorRuntime::new(shards));
 
@@ -286,7 +286,7 @@ impl GlobalAsyncExecutor {
                 None => break,
             };
 
-            crate::runtime::slab::slab_task_poll_trampoline(task_id);
+            crate::runtime::slab::ptr::slab_task_poll_trampoline(task_id);
             domain.record_completed();
             ran += 1;
         }

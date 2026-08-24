@@ -23,6 +23,10 @@ pub const MSI_KIND_MSIX: u32 = 1;
 
 pub type PlatformCpuId = u32;
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HardwareInterruptId(pub u32);
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MsiRequester {
@@ -112,49 +116,47 @@ impl MsiMessage {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, kernel_macros::RequestPayload)]
-pub struct MsiRequest {
+pub struct MsiBindingRequest {
     pub requester: MsiRequester,
     pub target: MsiTarget,
-    pub vector: u8,
-    pub reserved0: u8,
     pub table_index: u16,
+    pub reserved0: u16,
     pub kind: u32,
     pub flags: u32,
 }
 
-impl MsiRequest {
+impl MsiBindingRequest {
     pub const fn new(
         requester: MsiRequester,
         target: MsiTarget,
-        vector: u8,
         kind: u32,
         table_index: u16,
     ) -> Self {
         Self {
             requester,
             target,
-            vector,
-            reserved0: 0,
             table_index,
+            reserved0: 0,
             kind,
             flags: 0,
         }
     }
 
-    pub const fn pci_msix(vector: u8, target: MsiTarget, table_index: u16) -> Self {
-        Self::new(
-            MsiRequester::none(),
-            target,
-            vector,
-            MSI_KIND_MSIX,
-            table_index,
-        )
+    pub const fn pci_msix(target: MsiTarget, table_index: u16) -> Self {
+        Self::new(MsiRequester::none(), target, MSI_KIND_MSIX, table_index)
     }
 
     pub const fn with_requester(mut self, requester: MsiRequester) -> Self {
         self.requester = requester;
         self
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsiBinding {
+    pub handle: IrqHandle,
+    pub message: MsiMessage,
 }
 
 static IRQ_CONTEXT_QUERY: AtomicUsize = AtomicUsize::new(0);
@@ -243,7 +245,7 @@ pub struct IrqFrame {
 }
 
 pub type IrqIsrFn = extern "C" fn(
-    vector: u8,
+    interrupt_id: u32,
     cpu: u32,
     frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,

@@ -132,7 +132,7 @@ unsafe fn map_range_with_flush(
     flags: PageFlags,
     ignore_already_mapped: bool,
     flush: LocalTlbFlush,
-) -> Result<(), PageMapError> {
+) -> Result<(), PageMapError> { unsafe {
     let mut virt = addr.as_u64();
     let mut remaining = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
     let mut mapped_bytes = 0u64;
@@ -210,7 +210,7 @@ unsafe fn map_range_with_flush(
     }
 
     Ok(())
-}
+}}
 
 pub unsafe fn map_contiguous_physical_range(
     virt_base: VirtAddr,

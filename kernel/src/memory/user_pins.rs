@@ -4,7 +4,9 @@ use kernel_types::arch::VirtAddr;
 use spin::{Mutex, MutexGuard};
 
 use crate::{
-    memory::paging::{AddressSpaceRoot, current_address_space_root, switch_address_space_root},
+    memory::paging::address_space::{
+        AddressSpaceRoot, current_address_space_root, switch_address_space_root,
+    },
     platform,
     structs::range_tracker::RangeTracker,
 };
@@ -271,7 +273,7 @@ fn teardown_user_mappings(root: AddressSpaceRoot, tracker: &RangeTracker) {
     platform::with_interrupts_disabled(|| unsafe {
         switch_address_space_root(root);
         for (start, size) in tracker.get_allocations() {
-            crate::memory::paging::unmap_range_unchecked(VirtAddr::new(start).into(), size);
+            crate::memory::paging::map::unmap_range_unchecked(VirtAddr::new(start).into(), size);
         }
         switch_address_space_root(old_root);
     });

@@ -29,7 +29,6 @@ use crate::platform::{
 
 pub struct X86Platform;
 
-pub type PlatformImpl = X86Platform;
 
 const PAGE_SIZE: u64 = 0x1000;
 const LOW_RESERVED_END: u64 = 0x20_0000;

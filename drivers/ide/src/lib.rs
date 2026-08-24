@@ -25,9 +25,10 @@ use kernel_api::device::{
 use kernel_api::error::{DriverErrorKind, ErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
-    IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
+    HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqHandleExt, bind_wired_interrupt,
+    irq_wait_ok,
 };
-use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
+use kernel_api::kernel_types::dma::implementation::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
 use kernel_api::kernel_types::io::{
     DeviceControlHandler, DeviceControlOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
     DiskInfo,
@@ -245,7 +246,7 @@ fn write_buffer_cursor<'backing, 'data>(
 }
 
 extern "C" fn ide_isr(
-    _vector: u8,
+    _interrupt_id: u32,
     _cpu: u32,
     _frame: &mut IrqFrame,
     handle: IrqBorrowedHandle,
@@ -846,18 +847,7 @@ async fn ide_init_complete<'req, 'data, 'b>(
         }
 
         let irq_handle = if let Some(gsi) = bars.gsi {
-            if gsi < 64 {
-                irq_register_isr_gsi(gsi as u8, ide_isr, cb as usize)
-            } else {
-                None
-            }
-        } else if let Some(line) = bars.irq_line {
-            if line < 16 {
-                let vector = 0x20 + line;
-                irq_register_isr(vector, ide_isr, cb as usize)
-            } else {
-                None
-            }
+            bind_wired_interrupt(HardwareInterruptId(gsi as u32), ide_isr, cb as usize)
         } else {
             None
         };

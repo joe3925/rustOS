@@ -1,8 +1,8 @@
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::idt::InterruptGuard;
-use crate::memory::heap::mimalloc_thread_done;
+use crate::idt::interrupt_impl::InterruptGuard;
+use crate::memory::heap::heap::mimalloc_thread_done;
 use crate::memory::paging::stack::StackSize;
-use crate::memory::paging::switch_address_space_root;
+use crate::memory::paging::address_space::switch_address_space_root;
 use crate::platform;
 use crate::scheduling::domain::{
     CpuSet, DomainEntry, DomainMaster, EnqueueReason, KERNEL_DOMAIN_ID, RoundRobinDomainAlgorithm,
@@ -771,7 +771,6 @@ pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
-    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = platform::current_cpu_id();
 
     unsafe { SCHEDULER.on_ipi(state, cpu_id) };
@@ -789,7 +788,6 @@ pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
 
     let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
-    //let _nested_interrupts = NestedInterruptEnableGuard::new();
     let cpu_id = platform::current_cpu_id();
 
     unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };

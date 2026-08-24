@@ -4,17 +4,20 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
-use kernel_types::dma::{
+use kernel_types::dma::implementation::{
     FromDevice, IoBuffer, IoBufferAccess, IoBufferBacking, IoBufferBackingConfig,
     IoBufferBackingDesc, IoBufferError, IoBufferExtent, IoBufferPageFrame, ToDevice,
 };
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 
-use crate::memory::paging::{
-    KernelPageTableFrameAllocator, LocalTlbFlush, MappingSize, UnmapFrameDisposition,
-    allocate_auto_kernel_range, base_page_size, deallocate_kernel_range,
-};
+use crate::memory::paging::frame_alloc::{KernelPageTableFrameAllocator};
+
+use crate::memory::paging::layout::{base_page_size};
+
+use crate::memory::paging::types::{LocalTlbFlush, MappingSize, UnmapFrameDisposition};
+
+use crate::memory::paging::virt_tracker::{allocate_auto_kernel_range, deallocate_kernel_range};
 use crate::memory::user_pins::UserRangePin;
 use crate::platform::{ActivePlatform, PagingPlatform};
 

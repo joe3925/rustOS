@@ -31,10 +31,10 @@ macro_rules! println {
 
 #[macro_export]
 macro_rules! spawn_join {
-    ($future:expr) => {
+    ($future:expr_2021) => {
         $crate::runtime::runtime::spawn_join_owned($future)
     };
-    (in $domain:expr, $future:expr) => {
+    (in $domain:expr_2021, $future:expr_2021) => {
         $crate::runtime::runtime::spawn_join_owned_in_executor_domain($domain, $future)
     };
 }

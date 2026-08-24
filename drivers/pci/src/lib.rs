@@ -7,37 +7,34 @@ extern crate alloc;
 mod dev_ext;
 mod msix;
 
-use kernel_api::device::{publish_stack_protocol, register_protocol};
-use kernel_api::error::{error, DriverErrorKind, ErrorKind, KernelError, ResultErrorContext};
-use kernel_api::pnp::QueryDeviceRelations;
-use kernel_api::pnp::QueryId;
-use kernel_api::pnp::StartDevice;
 use alloc::{sync::Arc, vec::Vec};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
-use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
-use kernel_api::dma::dma::DmaPciDeviceIdentity;
+use kernel_api::device::{publish_stack_protocol, register_protocol};
+use kernel_api::kernel_types::dma::implementation::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
+use kernel_api::kernel_types::dma::implementation::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
+use kernel_api::kernel_types::dma::implementation::DmaPciDeviceIdentity;
+use kernel_api::error::{DriverErrorKind, ErrorKind, KernelError, ResultErrorContext, error};
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::QueryId;
+use kernel_api::pnp::StartDevice;
 
 use dev_ext::{
-    DevExt, McfgSegment, PciPdoExt, PrtEntry, ecam_bus_base_from_segment,
-    hwids_for, instance_path_for, load_segments_from_parent, map_ecam_bus, map_ecam_segment_range,
-    name_for, parse_ecam_segments_from_blob, parse_prt_from_blob, scan_ecam_bus_mapped,
+    DevExt, McfgSegment, PciPdoExt, PrtEntry, ecam_bus_base_from_segment, hwids_for,
+    instance_path_for, load_segments_from_parent, map_ecam_bus, map_ecam_segment_range, name_for,
+    parse_ecam_segments_from_blob, parse_prt_from_blob, scan_ecam_bus_mapped,
 };
 
 use kernel_api::{
-    IOCTL_PCI_SETUP_MSIX,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
-    kernel_types::{io::{DeviceControlHandler, DeviceControlOp}, pnp::DeviceIds},
+    kernel_types::pnp::DeviceIds,
     memory::{VirtAddr, unmap_mmio_region},
     pnp::{
         DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceSet,
         driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
     },
-    println,
-    request::DeviceControl,
-    request_handler,
+    println, request_handler,
     runtime::spawn_blocking,
 };
 use spin::Once;
@@ -49,7 +46,9 @@ use kernel_api::kernel_types::protocol::pci::{PciProtocol, PciProtocolVTable};
 
 extern "C" fn pci_proto_get_bar(dev: &Arc<DeviceObject>, index: u8) -> Option<Bar> {
     let ext = dev.try_devext::<PciPdoExt>().ok()?;
-    if index >= 6 { return None; }
+    if index >= 6 {
+        return None;
+    }
     Some(ext.bars[index as usize])
 }
 
@@ -83,24 +82,8 @@ static PCI_PROTO_VTABLE: PciProtocolVTable = PciProtocolVTable {
     get_gsi: pci_proto_get_gsi,
     get_interrupt_line: pci_proto_get_interrupt_line,
     get_msix: pci_proto_get_msix,
+    setup_msix: msix::pci_setup_msix,
 };
-
-struct PciPdoIo;
-
-impl DeviceControlHandler for PciPdoIo {
-    #[request_handler]
-    async fn handler<'req, 'data, 'b>(
-        dev: &Arc<DeviceObject>,
-        req: &'b mut DeviceControl<'data>,
-    ) -> Result<DriverStep, kernel_api::error::KernelError> {
-        let code = req.code;
-
-        match code {
-            IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev.clone(), req).await,
-            _ => Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented)),
-        }
-    }
-}
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -110,7 +93,9 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
+pub extern "C" fn DriverEntry(
+    driver: &Arc<DriverObject>,
+) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, bus_driver_device_add);
     Ok(())
 }
@@ -144,39 +129,39 @@ pub async fn pci_bus_pnp_start<'req, 'data, 'b>(
 
     match pnp::send_next_lower(device.clone(), &mut query_handle).await {
         Ok(_) => {
-        let blob = match query_handle.resources {
-            ResourceSet::Encoded(blob) => blob,
-            _ => Vec::new(),
-        };
-        let segs = parse_ecam_segments_from_blob(&blob);
+            let blob = match query_handle.resources {
+                ResourceSet::Encoded(blob) => blob,
+                _ => Vec::new(),
+            };
+            let segs = parse_ecam_segments_from_blob(&blob);
 
-        if segs.is_empty() {
-            println!("[PCI] no ECAM block found in parent resources");
-            return Ok(DriverStep::Continue);
-        }
-
-        let prt_entries = parse_prt_from_blob(&blob);
-
-        if let Ok(ext) = device.try_devext::<DevExt>() {
-            ext.segments.call_once(|| segs);
-            if !prt_entries.is_empty() {
-                ext.prt.call_once(|| prt_entries);
+            if segs.is_empty() {
+                println!("[PCI] no ECAM block found in parent resources");
+                return Ok(DriverStep::Continue);
             }
-        } else {
-            return Ok(DriverStep::Continue);
-        }
+
+            let prt_entries = parse_prt_from_blob(&blob);
+
+            if let Ok(ext) = device.try_devext::<DevExt>() {
+                ext.segments.call_once(|| segs);
+                if !prt_entries.is_empty() {
+                    ext.prt.call_once(|| prt_entries);
+                }
+            } else {
+                return Ok(DriverStep::Continue);
+            }
         }
         Err(error) if error.kind() == ErrorKind::Driver(DriverErrorKind::NoSuchDevice) => {
-        let segs = load_segments_from_parent(&device)
-            .await
-            .with_context(|| "loading PCI segments from the parent device")?;
-        if let Ok(ext) = device.try_devext::<DevExt>() {
-            if !segs.is_empty() {
-                ext.segments.call_once(|| segs);
+            let segs = load_segments_from_parent(&device)
+                .await
+                .with_context(|| "loading PCI segments from the parent device")?;
+            if let Ok(ext) = device.try_devext::<DevExt>() {
+                if !segs.is_empty() {
+                    ext.segments.call_once(|| segs);
+                }
+            } else {
+                return Ok(DriverStep::Continue);
             }
-        } else {
-            return Ok(DriverStep::Continue);
-        }
         }
         Err(error) => {
             return Err(error.with_context("querying parent resources for PCI ECAM data"));
@@ -360,7 +345,6 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     vt.query_device_relations.set(pci_pdo_query_devrels);
 
     let mut child_init = DeviceInit::with_pnp(Some(vt));
-    child_init.ops.register::<DeviceControlOp, PciPdoIo>();
     child_init.set_dev_ext_from(*p);
 
     let name = name_for(p);
@@ -410,7 +394,11 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
 ) -> Result<DriverStep, kernel_api::error::KernelError> {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
-        Err(_) => return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice)),
+        Err(_) => {
+            return Err(kernel_api::error::error(
+                kernel_api::error::DriverErrorKind::NoSuchDevice,
+            ));
+        }
     };
 
     match req.id_type {
@@ -427,7 +415,9 @@ pub async fn pci_pdo_query_id<'req, 'data, 'b>(
             if let Some(primary) = hw.first() {
                 req.ids.push(primary.clone());
             } else {
-                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::NoSuchDevice,
+                ));
             }
         }
         QueryIdType::InstanceId => {

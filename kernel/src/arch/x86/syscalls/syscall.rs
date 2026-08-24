@@ -1,9 +1,9 @@
-use super::super::drivers::interrupt_index::get_current_logical_id;
+use super::super::cpu::platform_cpu_id;
 use super::super::gdt::PER_CPU_GDT;
 
 use crate::executable::program::{Message, UserHandle};
 use crate::scheduling::scheduler::KernelFpuGuard;
-use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
+use crate::structs::io_request::request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
 use kernel_types::executor::{UserExecutorDomainCreate, UserExecutorDomainUpdate};
@@ -15,7 +15,7 @@ pub fn syscall_init() {
     let gdt = PER_CPU_GDT.lock();
     unsafe { Efer::update(|e| e.set(EferFlags::SYSTEM_CALL_EXTENSIONS, true)) };
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    let id = get_current_logical_id() as usize;
+    let id = platform_cpu_id() as usize;
     let selectors = unsafe { gdt.selectors_per_cpu.get_by_id(id) };
     let kernel_cs = selectors.kernel_code_selector;
     let kernel_ss = selectors.kernel_data_selector;
@@ -97,19 +97,19 @@ macro_rules! make_wrapper {
     ($wrap:ident, $real:path $(, $t:ty )* $(,)?) => {
         #[inline(always)]
         unsafe fn $wrap(rcx: u64, rdx: u64, r8: u64, r9: u64,
-                        rest: *const u64) -> u64 {
+                        rest: *const u64) -> u64 { unsafe {
             let regs = [rcx, rdx, r8, r9];
             let mut idx = 0usize;
             #[inline(always)]
-            unsafe fn next(regs: &[u64;4], rest: *const u64, idx: &mut usize) -> u64 {
+            unsafe fn next(regs: &[u64;4], rest: *const u64, idx: &mut usize) -> u64 { unsafe {
                 let v = if *idx < 4 { regs[*idx] } else { *rest.add(*idx - 4) };
                 *idx += 1;
                 v
-            }
+            }}
             $real(
                 $( next(&regs, rest, &mut idx) as $t ),*
             ) as u64
-        }
+        }}
     };
 }
 

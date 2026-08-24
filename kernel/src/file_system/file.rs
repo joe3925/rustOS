@@ -11,7 +11,7 @@ use alloc::{
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
 use kernel_types::{
-    dma::{FromDevice, IoBuffer, ToDevice},
+    dma::implementation::{FromDevice, IoBuffer, ToDevice},
     error::{ErrorKind, FileErrorKind, KernelError},
     fs::{OpenFlags, Path},
 };
@@ -22,7 +22,7 @@ use kernel_executor::runtime::runtime::{JoinAll, spawn_join_owned as spawn};
 
 use crate::{
     file_system::file_provider::{self, ProviderKind, install_file_provider},
-    memory::paging::used_bytes,
+    memory::paging::frame_alloc::used_bytes,
     platform::wait_duration,
     println,
     registry::rebind_and_persist_after_provider_switch,

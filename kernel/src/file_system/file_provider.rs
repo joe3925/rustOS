@@ -1,7 +1,7 @@
 use crate::println;
 use core::sync::atomic::{AtomicU8, Ordering};
 use kernel_types::{
-    dma::{FromDevice, IoBuffer, ToDevice},
+    dma::implementation::{FromDevice, IoBuffer, ToDevice},
     error::{FileErrorKind, KernelError},
     fs::{Path, *},
 };

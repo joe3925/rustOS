@@ -1,7 +1,7 @@
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use alloc::vec::Vec;
 
-use crate::platform::Platform;
+use crate::platform::contract::Platform;
 use kernel_types::io::TreiberStack;
 static NEXT_WAIT_QUEUE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::mpmc::{RecvError, SendError, TryRecvError};
-use crate::test::{recv_timeout, P};
+use crate::test::support::{recv_timeout, P};
 
 #[test]
 fn try_recv_send_recv_and_disconnect() {

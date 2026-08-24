@@ -6,13 +6,13 @@ pub fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String)
 }
 
 #[inline]
-pub unsafe fn sleep_self_and_yield() {
+pub unsafe fn sleep_self_and_yield() { unsafe {
     kernel_sys::park_self_and_yield();
-}
+}}
 
-pub unsafe fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
+pub unsafe fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> { unsafe {
     kernel_sys::kill_kernel_task_by_id(id)
-}
+}}
 
 #[inline]
 pub fn wake_task(id: u64) {
