@@ -1,0 +1,51 @@
+name: Platform builds
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-builds-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover-platforms:
+    runs-on: ubuntu-latest
+    outputs:
+      platforms: ${{ steps.platforms.outputs.platforms }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Discover platforms
+        id: platforms
+        shell: bash
+        run: |
+          platforms="$(find platforms -maxdepth 1 -type f -name '*.toml' -printf '%f\n' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+          if [[ "$platforms" == "[]" ]]; then
+            echo "::error::No platform definitions were found under platforms/."
+            exit 1
+          fi
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+
+  build-platform:
+    needs: discover-platforms
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.discover-platforms.outputs.platforms) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build ${{ matrix.platform }}
+        run: cargo run --release -p xtask -- build --release --platform "platforms/${{ matrix.platform }}"
