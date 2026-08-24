@@ -173,18 +173,18 @@ impl<P: Platform, T> Receiver<P, T> {
 
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.inner.drain_inbox();
-        if let Some(value) = self.inner.queue.pop() {
+        match self.inner.queue.pop() { Some(value) => {
             Ok(value)
-        } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
+        } _ => if self.inner.sender_count.load(Ordering::Acquire) == 0 {
             self.inner.drain_inbox();
-            if let Some(value) = self.inner.queue.pop() {
+            match self.inner.queue.pop() { Some(value) => {
                 Ok(value)
-            } else {
+            } _ => {
                 Err(TryRecvError::Disconnected)
-            }
+            }}
         } else {
             Err(TryRecvError::Empty)
-        }
+        }}
     }
 
     pub fn is_disconnected(&self) -> bool {

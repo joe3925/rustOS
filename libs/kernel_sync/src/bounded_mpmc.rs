@@ -185,17 +185,17 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
     }
 
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if let Some(value) = self.inner.queue.try_pop() {
+        match self.inner.queue.try_pop() { Some(value) => {
             Ok(value)
-        } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-            if let Some(value) = self.inner.queue.try_pop() {
+        } _ => if self.inner.sender_count.load(Ordering::Acquire) == 0 {
+            match self.inner.queue.try_pop() { Some(value) => {
                 Ok(value)
-            } else {
+            } _ => {
                 Err(TryRecvError::Disconnected)
-            }
+            }}
         } else {
             Err(TryRecvError::Empty)
-        }
+        }}
     }
 
     pub fn is_disconnected(&self) -> bool {

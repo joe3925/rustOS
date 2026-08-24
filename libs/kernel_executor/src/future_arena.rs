@@ -240,7 +240,7 @@ impl FutureArena {
         result
     }
 
-    pub unsafe fn release(&self, allocation: FutureAllocation) -> bool {
+    pub unsafe fn release(&self, allocation: FutureAllocation) -> bool { unsafe {
         if allocation.owner_domain != self.owner {
             return false;
         }
@@ -270,7 +270,7 @@ impl FutureArena {
             }
         }
         released
-    }
+    }}
 
     pub fn live_futures(&self) -> usize {
         self.live.load(Ordering::Acquire)
@@ -310,7 +310,7 @@ impl FutureArena {
         }
     }
 
-    pub unsafe fn release_abi(&self, allocation: AbiFutureAllocation) -> bool {
+    pub unsafe fn release_abi(&self, allocation: AbiFutureAllocation) -> bool { unsafe {
         let Some(ptr) = NonNull::new(allocation.ptr.cast::<u8>()) else {
             return false;
         };
@@ -365,7 +365,7 @@ impl FutureArena {
             capacity,
             align,
         })
-    }
+    }}
 }
 
 fn large_token(

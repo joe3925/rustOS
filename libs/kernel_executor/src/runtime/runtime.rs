@@ -114,17 +114,17 @@ impl<T> JoinStorage<T> {
         }
     }
 
-    pub(crate) unsafe fn write(&self, output: T) {
+    pub(crate) unsafe fn write(&self, output: T) { unsafe {
         (*self.output.get()).write(output);
-    }
+    }}
 
-    unsafe fn take(&self) -> T {
+    unsafe fn take(&self) -> T { unsafe {
         (*self.output.get()).assume_init_read()
-    }
+    }}
 
-    unsafe fn drop_output(&self) {
+    unsafe fn drop_output(&self) { unsafe {
         (*self.output.get()).assume_init_drop();
-    }
+    }}
 }
 
 unsafe impl<T: Send> Send for JoinStorage<T> {}

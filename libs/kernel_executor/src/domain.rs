@@ -607,10 +607,10 @@ impl DomainSlot {
     }
 
     #[inline]
-    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> {
+    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> { unsafe {
         Arc::increment_strong_count(ptr);
         Arc::from_raw(ptr)
-    }
+    }}
 }
 
 struct DomainChunk {

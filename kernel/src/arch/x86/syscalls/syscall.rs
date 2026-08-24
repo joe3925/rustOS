@@ -97,19 +97,19 @@ macro_rules! make_wrapper {
     ($wrap:ident, $real:path $(, $t:ty )* $(,)?) => {
         #[inline(always)]
         unsafe fn $wrap(rcx: u64, rdx: u64, r8: u64, r9: u64,
-                        rest: *const u64) -> u64 {
+                        rest: *const u64) -> u64 { unsafe {
             let regs = [rcx, rdx, r8, r9];
             let mut idx = 0usize;
             #[inline(always)]
-            unsafe fn next(regs: &[u64;4], rest: *const u64, idx: &mut usize) -> u64 {
+            unsafe fn next(regs: &[u64;4], rest: *const u64, idx: &mut usize) -> u64 { unsafe {
                 let v = if *idx < 4 { regs[*idx] } else { *rest.add(*idx - 4) };
                 *idx += 1;
                 v
-            }
+            }}
             $real(
                 $( next(&regs, rest, &mut idx) as $t ),*
             ) as u64
-        }
+        }}
     };
 }
 

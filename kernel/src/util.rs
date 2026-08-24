@@ -564,21 +564,21 @@ fn validate_stub_slice(ptr: usize, len: usize, stub_base: u64, stub_size: u64, w
         panic!("boot package {what} lies outside kernel stub memory");
     }
 }
-unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) {
+unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) { unsafe {
     (
         TLS_TEST_INIT_U64,
         TLS_TEST_INIT_BYTES,
         TLS_TEST_ZERO_U64,
         TLS_TEST_ZERO_BYTES,
     )
-}
+}}
 
-unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) {
+unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) { unsafe {
     TLS_TEST_INIT_U64 = init_u64;
     TLS_TEST_INIT_BYTES = init_bytes;
     TLS_TEST_ZERO_U64 = zero_u64;
     TLS_TEST_ZERO_BYTES = zero_bytes;
-}
+}}
 
 extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
     let expected = unsafe { tls_test_snapshot() };

@@ -58,7 +58,7 @@ macro_rules! println_no_format {
         }
     }};
 
-    ($s:expr) => {{
+    ($s:expr_2021) => {{
         unsafe {
             $crate::util::print($s);
             $crate::util::print("\n");

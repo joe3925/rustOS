@@ -3,14 +3,14 @@ use kernel_sys::{kernel_alloc, kernel_free};
 pub struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
     #[inline]
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         kernel_alloc(layout)
-    }
+    }}
 
     #[inline]
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { unsafe {
         kernel_free(ptr, layout)
-    }
+    }}
 }
 
 #[global_allocator]

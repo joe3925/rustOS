@@ -49,7 +49,7 @@ impl AcpiHandler for ACPIImpl {
         &self,
         physical_address: usize,
         size: usize,
-    ) -> PhysicalMapping<Self, T> {
+    ) -> PhysicalMapping<Self, T> { unsafe {
         let virt_addr = map_physical_pages(
             PhysAddr::new(physical_address as u64).into(),
             size as u64,
@@ -63,7 +63,7 @@ impl AcpiHandler for ACPIImpl {
             size,
             self.clone(),
         )
-    }
+    }}
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
         let _ = unsafe {

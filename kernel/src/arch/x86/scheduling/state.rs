@@ -169,9 +169,9 @@ impl State {
         self.rax = rax;
     }
     #[inline(always)]
-    pub unsafe extern "C" fn restore(&self, state: *mut State) {
+    pub unsafe extern "C" fn restore(&self, state: *mut State) { unsafe {
         core::ptr::write(state, *self);
-    }
+    }}
     #[inline(always)]
     pub fn into_interrupt_stack_frame(self) -> InterruptStackFrame {
         InterruptStackFrame::new(

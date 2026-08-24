@@ -33,16 +33,16 @@ impl Lapic {
         self.base_addr.as_mut_ptr()
     }
 
-    pub(crate) unsafe fn wait_for_delivery(&self) {
+    pub(crate) unsafe fn wait_for_delivery(&self) { unsafe {
         let icr1 = self.ptr().add(APICOffset::Icr1 as usize / 4);
         while (icr1.read_volatile() & (1 << 12)) != 0 {
             core::hint::spin_loop();
         }
-    }
+    }}
 }
 
 impl LocalApic for Lapic {
-    unsafe fn init(&self, logical_id: u8) {
+    unsafe fn init(&self, logical_id: u8) { unsafe {
         let base = self.ptr();
 
         let svr = base.add(APICOffset::Svr as usize / 4);
@@ -54,7 +54,7 @@ impl LocalApic for Lapic {
             .write_volatile((logical_id as u32) << 24);
 
         base.add(APICOffset::Tpr as usize / 4).write_volatile(0);
-    }
+    }}
 
     fn init_timer(&self) {
         unsafe {
@@ -69,7 +69,7 @@ impl LocalApic for Lapic {
         }
     }
 
-    unsafe fn send_ipi(&self, dest: IpiDest, kind: IpiKind) {
+    unsafe fn send_ipi(&self, dest: IpiDest, kind: IpiKind) { unsafe {
         let base = self.ptr();
         let icr1 = base.add(APICOffset::Icr1 as usize / 4);
         let icr2 = base.add(APICOffset::Icr2 as usize / 4);
@@ -109,7 +109,7 @@ impl LocalApic for Lapic {
 
         icr2.write_volatile(hi);
         icr1.write_volatile(shorthand | lo);
-    }
+    }}
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy)]

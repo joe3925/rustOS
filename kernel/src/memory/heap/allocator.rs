@@ -68,7 +68,7 @@ impl KernelAllocator {
 }
 
 unsafe impl GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
             if platform::current_is_in_interrupt() {
                 panic!("Cannot accses allocator from interrupt");
@@ -77,9 +77,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
         } else {
             self.bootstrap.alloc(layout)
         }
-    }
+    }}
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
             if platform::current_is_in_interrupt() {
                 panic!("Cannot accses allocator from interrupt");
@@ -92,9 +92,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
             }
             ptr
         }
-    }
+    }}
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { unsafe {
         if ptr.is_null() {
             return;
         }
@@ -107,9 +107,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
         } else {
             self.bootstrap.dealloc(ptr, layout)
         }
-    }
+    }}
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 { unsafe {
         if ptr.is_null() {
             return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
         }
@@ -132,7 +132,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
             }
             new_ptr
         }
-    }
+    }}
 }
 
 struct ParallelCtx {

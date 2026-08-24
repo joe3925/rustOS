@@ -400,9 +400,9 @@ unsafe impl Sync for TaskSchedBinding {}
 
 impl TaskSchedBinding {
     pub fn new<T: Send + Sync + 'static>(domain: DomainId, class_state: T) -> Self {
-        unsafe fn drop_state<T>(ptr: NonNull<()>) {
+        unsafe fn drop_state<T>(ptr: NonNull<()>) { unsafe {
             drop(Box::from_raw(ptr.cast::<T>().as_ptr()));
-        }
+        }}
 
         let raw = Box::into_raw(Box::new(class_state));
         let class_state = NonNull::new(raw.cast::<()>()).expect("class state allocation failed");

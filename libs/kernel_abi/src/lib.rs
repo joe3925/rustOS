@@ -125,9 +125,9 @@ impl BootByteSlice {
         self.len == 0
     }
 
-    pub unsafe fn as_slice<'a>(&self) -> &'a [u8] {
+    pub unsafe fn as_slice<'a>(&self) -> &'a [u8] { unsafe {
         slice::from_raw_parts(self.ptr, self.len)
-    }
+    }}
 }
 
 #[repr(C)]
@@ -185,9 +185,9 @@ impl BootPackages {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
-    pub unsafe fn as_slice<'a>(&self) -> &'a [BootPackage] {
+    pub unsafe fn as_slice<'a>(&self) -> &'a [BootPackage] { unsafe {
         slice::from_raw_parts(self.ptr, self.len)
-    }
+    }}
 }
 
 #[repr(C)]

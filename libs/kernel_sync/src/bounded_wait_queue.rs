@@ -55,18 +55,18 @@ impl<P: Platform> WaitSlot<P> {
     }
 
     #[inline]
-    unsafe fn write_task(&self, task: P::Task) {
+    unsafe fn write_task(&self, task: P::Task) { unsafe {
         let id = P::task_id(&task);
         *self.task.get() = Some(task);
         self.task_id.store(id, Ordering::Release);
-    }
+    }}
 
     #[inline]
-    unsafe fn take_task(&self) -> Option<P::Task> {
+    unsafe fn take_task(&self) -> Option<P::Task> { unsafe {
         let task = (*self.task.get()).take();
         self.task_id.store(0, Ordering::Release);
         task
-    }
+    }}
 
     #[inline]
     fn task_id(&self) -> u64 {
@@ -74,12 +74,12 @@ impl<P: Platform> WaitSlot<P> {
     }
 
     #[inline]
-    unsafe fn task_is(&self, target: &P::Task) -> bool {
+    unsafe fn task_is(&self, target: &P::Task) -> bool { unsafe {
         match (*self.task.get()).as_ref() {
             Some(task) => P::same_task(task, target),
             None => false,
         }
-    }
+    }}
 }
 
 unsafe impl<P: Platform> Send for WaitSlot<P> {}

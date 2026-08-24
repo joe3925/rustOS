@@ -150,7 +150,7 @@ unsafe extern "C" {
 
 static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocator::new(0, 0));
 
-pub unsafe fn enable_mimalloc_impl() {
+pub unsafe fn enable_mimalloc_impl() { unsafe {
     let arena_start = mimalloc_arena_start();
     let arena_size = mimalloc_arena_size();
     if arena_size < MIMALLOC_COMMIT_GRANULARITY {
@@ -172,11 +172,11 @@ pub unsafe fn enable_mimalloc_impl() {
     if !rustos_mi_manage_arena(arena_start as *mut c_void, arena_size) {
         panic!("failed to register rustOS mimalloc arena");
     }
-}
+}}
 
-pub unsafe fn mimalloc_thread_done_impl() {
+pub unsafe fn mimalloc_thread_done_impl() { unsafe {
     mi_thread_done();
-}
+}}
 
 pub fn mimalloc_collect(force: bool) {
     unsafe {
@@ -240,7 +240,7 @@ pub fn get_mimalloc_free_memory() -> usize {
     MIMALLOC_OS_ALLOCATOR.lock().free_memory()
 }
 
-pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
+pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 { unsafe {
     let start = mimalloc_stats_start();
     let size = layout.size().max(1);
     let ptr = if layout.align() <= core::mem::align_of::<usize>() {
@@ -250,9 +250,9 @@ pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
     } as *mut u8;
     mimalloc_record_alloc(layout.size(), start);
     ptr
-}
+}}
 
-pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
+pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 { unsafe {
     let start = mimalloc_stats_start();
     let size = layout.size().max(1);
     let ptr = if layout.align() <= core::mem::align_of::<usize>() {
@@ -262,15 +262,15 @@ pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
     } as *mut u8;
     mimalloc_record_alloc(layout.size(), start);
     ptr
-}
+}}
 
-pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
+pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
     let start = mimalloc_stats_start();
     mi_free(ptr.cast::<c_void>());
     mimalloc_record_dealloc(layout.size(), start);
-}
+}}
 
-pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 { unsafe {
     let start = mimalloc_stats_start();
     let size = new_size.max(1);
     let new_ptr = if layout.align() <= core::mem::align_of::<usize>() {
@@ -280,7 +280,7 @@ pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) ->
     } as *mut u8;
     mimalloc_record_realloc(layout.size(), new_size, start);
     new_ptr
-}
+}}
 
 #[inline(always)]
 fn mimalloc_stats_start() -> u64 {
@@ -397,7 +397,7 @@ impl RangeAllocator {
         self.free_bytes
     }
 
-    unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+    unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 { unsafe {
         self.ensure_init();
 
         let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
@@ -426,9 +426,9 @@ impl RangeAllocator {
             core::ptr::write_bytes(alloc_start as *mut u8, 0, size);
         }
         alloc_start as *mut u8
-    }
+    }}
 
-    unsafe fn free(&mut self, ptr: *mut u8, size: usize) {
+    unsafe fn free(&mut self, ptr: *mut u8, size: usize) { unsafe {
         if ptr.is_null() || size == 0 {
             return;
         }
@@ -443,9 +443,9 @@ impl RangeAllocator {
         let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
         self.add_free_region(addr, size);
         self.free_bytes = self.free_bytes.saturating_add(size).min(self.size);
-    }
+    }}
 
-    unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
+    unsafe fn add_free_region(&mut self, addr: usize, size: usize) { unsafe {
         if size < core::mem::size_of::<ListNode>() || size < base_page_size() as usize {
             return;
         }
@@ -489,7 +489,7 @@ impl RangeAllocator {
                 prev_ref.next = cur_next;
             }
         }
-    }
+    }}
 
     fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
         let mut prev: *mut ListNode = &mut self.free_list.head as *mut ListNode;
@@ -585,7 +585,7 @@ pub fn init_mimalloc_diagnostics() {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
+pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool { unsafe {
     let start_cycles = mimalloc_stats_start();
 
     if MIMALLOC_STATS_ENABLED {
@@ -687,7 +687,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
 
     mimalloc_record_commit_cycles(start_cycles);
     true
-}
+}}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -> bool {
@@ -778,7 +778,7 @@ fn mimalloc_record_commit_cycles(start: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void {
+pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void { unsafe {
     let ptr = platform::with_interrupts_disabled(|| {
         MIMALLOC_OS_ALLOCATOR
             .lock()
@@ -795,16 +795,16 @@ pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *m
     }
 
     ptr
-}
+}}
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
+pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) { unsafe {
     if !addr.is_null() {
         platform::with_interrupts_disabled(|| {
             MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size)
         });
     }
-}
+}}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
@@ -831,7 +831,7 @@ pub extern "C" fn rustos_mi_clock_now() -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> bool {
+pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> bool { unsafe {
     if buf.is_null() {
         return false;
     }
@@ -845,7 +845,7 @@ pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> b
         *byte = (state >> 56) as u8;
     }
     true
-}
+}}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}
