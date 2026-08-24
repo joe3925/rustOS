@@ -7,7 +7,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::device::{DeviceInit, DeviceObject};
-use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
+use kernel_types::dma::implementation::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::error::{DriverErrorKind, ErrorKind, KernelError};
 use kernel_types::io::{DeviceOps, DeviceRead, DeviceReadOp};
 use kernel_types::pnp::{DriverStep, PnpOps, QueryId, QueryIdType, StartDevice};

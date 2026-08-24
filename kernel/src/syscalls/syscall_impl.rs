@@ -3,15 +3,13 @@ use crate::executable::program::{
 };
 use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::stack::StackSize;
-use crate::memory::paging::{base_page_size, kernel_space_base};
+use crate::memory::paging::layout::{base_page_size, kernel_space_base};
 use crate::platform;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
-use crate::structs::io_request::{
-    FileObject, IoOpcode, KernelIoOp, MessageDelivery, RequestId, UserIoCompletion, UserIoOp,
-    UserPathDescriptor,
-};
+use crate::structs::io_request::message::{MessageDelivery};
+use crate::structs::io_request::request::{FileObject, IoOpcode, KernelIoOp, RequestId, UserIoCompletion, UserIoOp, UserPathDescriptor};
 use crate::{format, print};
 use crate::{scheduling::task::TaskHandle, util::generate_guid};
 use alloc::slice;
@@ -22,17 +20,14 @@ use kernel_executor::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor,
 };
 use kernel_types::arch::{PhysAddr, VirtAddr};
-use kernel_types::dma::IoBufferError;
+use kernel_types::dma::implementation::IoBufferError;
 use kernel_types::executor::{
     USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainUpdate,
 };
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::{ObjectInformationClass, ObjectTag, UserObjectBasicInfo};
 
-use crate::object_manager::{
-    AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
-    ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, TaskQueueRef,
-};
+use crate::object_manager::manager::{AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload, ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, TaskQueueRef};
 use crate::structs::executor_domain::UserExecutorDomain;
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
@@ -385,7 +380,7 @@ pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u
         Some(end) => end,
         None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
     };
-    let mapped_end = match crate::memory::paging::align_up_to_base_page(end) {
+    let mapped_end = match crate::memory::paging::layout::align_up_to_base_page(end) {
         Some(end) => end,
         None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
     };
@@ -1941,7 +1936,7 @@ pub(crate) fn sys_message_complete(delivery_handle: UserHandle, status: u64, res
         };
         delivery
     };
-    if !delivery.complete(crate::structs::io_request::IoRequestOutput {
+    if !delivery.complete(crate::structs::io_request::request::IoRequestOutput {
         status,
         result,
         extra: 0,

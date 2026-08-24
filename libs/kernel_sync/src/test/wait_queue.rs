@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::platform::Platform;
-use crate::test::{recv_timeout, P};
+use crate::platform::contract::Platform;
+use crate::test::support::{recv_timeout, P};
 use crate::WaitQueue;
 
 #[test]

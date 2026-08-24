@@ -1,3 +1,1 @@
-mod implementation;
-
-pub use implementation::*;
+pub mod implementation;

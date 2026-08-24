@@ -3,7 +3,7 @@ use super::super::gdt::PER_CPU_GDT;
 
 use crate::executable::program::{Message, UserHandle};
 use crate::scheduling::scheduler::KernelFpuGuard;
-use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
+use crate::structs::io_request::request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
 use kernel_types::executor::{UserExecutorDomainCreate, UserExecutorDomainUpdate};

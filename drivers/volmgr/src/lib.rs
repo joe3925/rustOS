@@ -15,7 +15,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::AbiFuture;
 use kernel_api::async_ffi::FutureExt;
-use kernel_api::dma::dma::IoBufferBacking;
+use kernel_api::kernel_types::dma::implementation::IoBufferBacking;
 use kernel_api::pnp::RemoveDevice;
 use kernel_api::pnp::StartDevice;
 use kernel_api::println;
@@ -28,7 +28,7 @@ use kernel_api::device::{open_public_protocol, publish_stack_protocol, register_
 use kernel_api::error::{
     error, error_with_message, DriverErrorKind, ErrorKind, KernelError, ResultErrorContext,
 };
-use kernel_api::kernel_types::dma::{FromDevice, IoBuffer};
+use kernel_api::kernel_types::dma::implementation::{FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::{

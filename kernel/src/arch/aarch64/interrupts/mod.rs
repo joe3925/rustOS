@@ -1,8 +1,6 @@
-mod controller;
-mod discovery;
-mod entry;
-mod gicv3;
-mod init;
-mod platform;
-
-pub(crate) use init::{init_boot_interrupts, init_current_cpu_interrupts};
+pub(crate) mod controller;
+pub(crate) mod discovery;
+pub(crate) mod entry;
+pub(crate) mod gicv3;
+pub(crate) mod init;
+pub(crate) mod platform;

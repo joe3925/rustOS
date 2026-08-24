@@ -42,7 +42,6 @@ use crate::platform::{
 
 pub struct Aarch64Platform;
 
-pub type PlatformImpl = Aarch64Platform;
 
 static PAGE_SIZE: AtomicU64 = AtomicU64::new(0x1000);
 static MAIR: AtomicU64 = AtomicU64::new(0xff);

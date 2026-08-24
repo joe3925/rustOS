@@ -6,7 +6,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use kernel_types::completion::TaskToken;
 
-use kernel_types::dma::{FromDevice, ToDevice};
+use kernel_types::dma::implementation::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
@@ -15,8 +15,8 @@ use spin::{Mutex, RwLock};
 use crate::executable::program::{Message, ProgramHandle, QueueHandle, UserHandle};
 use crate::file_system::file::File;
 use crate::memory::io_buffer::OwnedIoBuffer;
-use crate::memory::paging::{base_page_size, kernel_space_base};
-use crate::object_manager::{OBJECT_MANAGER, Object, ObjectPayload};
+use crate::memory::paging::layout::{base_page_size, kernel_space_base};
+use crate::object_manager::manager::{OBJECT_MANAGER, Object, ObjectPayload};
 use crate::platform;
 use crate::util::generate_guid;
 
@@ -823,15 +823,15 @@ fn user_ptr_range_ok(addr: u64, bytes: usize) -> bool {
 
 fn with_process_address_space<T>(owner: &ProgramHandle, f: impl FnOnce() -> T) -> T {
     let process_address_space_root = owner.read().address_space_root;
-    let old_address_space_root = crate::memory::paging::current_address_space_root();
+    let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
 
     platform::with_interrupts_disabled(|| {
         unsafe {
-            crate::memory::paging::switch_address_space_root(process_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(process_address_space_root);
         }
         let result = f();
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
         result
     })

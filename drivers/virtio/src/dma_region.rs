@@ -3,7 +3,7 @@ use core::ptr::NonNull;
 
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::{self, dma_base_page_size};
-use kernel_api::kernel_types::dma::{
+use kernel_api::kernel_types::dma::implementation::{
     Bidirectional, DmaMappingStrategy, IoBuffer, IoBufferBacking, IoBufferBackingConfig,
     IoBufferBackingDesc,
 };

@@ -11,10 +11,10 @@ use super::super::gdt::{
     YIELD_IST_INDEX,
 };
 use super::super::memory::paging::tlb::tlb_flush_entry;
-use super::super::scheduling::{ipi_entry, yield_interrupt_entry};
+use super::super::scheduling::platform_impl::{ipi_entry, yield_interrupt_entry};
 use crate::scheduling::scheduler::KernelFpuGuard;
 
-use crate::idt::{InterruptGuard, irq_dispatch};
+use crate::idt::interrupt_impl::{InterruptGuard, irq_dispatch};
 
 pub type InterruptFrame = InterruptStackFrame;
 

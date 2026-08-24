@@ -9,7 +9,7 @@ impl Platform for X86Platform {
     const KERNEL_IMAGE_BASE: u64 = kernel_abi::arch::KERNEL_PE_BASE;
 
     fn init_boot_processor() {
-        super::idt::load_idt();
+        super::idt::table::load_idt();
         Self::init_kernel_root();
         unsafe {
             super::gdt::PER_CPU_GDT.lock().init_gdt();

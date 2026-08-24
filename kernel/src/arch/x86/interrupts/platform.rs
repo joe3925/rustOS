@@ -9,24 +9,25 @@ use crate::platform::InterruptPlatform;
 use crate::arch::x86::cpu::{current_is_in_interrupt_atomic, platform_cpu_id};
 use crate::arch::x86::platform::X86Platform;
 
-use super::apic::{APIC, IpiDest, IpiKind, LocalApic, send_eoi};
+use super::apic::controller::APIC;
+use super::apic::local::{IpiDest, IpiKind, LocalApic, send_eoi};
 
 impl InterruptPlatform for X86Platform {
     type InterruptFrame = InterruptStackFrame;
 
-    const DYNAMIC_VECTOR_START: u8 = crate::arch::x86::idt::DYNAMIC_VECTOR_START;
-    const DYNAMIC_VECTOR_END: u8 = crate::arch::x86::idt::DYNAMIC_VECTOR_END;
+    const DYNAMIC_VECTOR_START: u8 = crate::arch::x86::idt::table::DYNAMIC_VECTOR_START;
+    const DYNAMIC_VECTOR_END: u8 = crate::arch::x86::idt::table::DYNAMIC_VECTOR_END;
 
     fn scheduler_ipi_vector() -> u8 {
-        crate::arch::x86::idt::SCHED_IPI_VECTOR
+        crate::arch::x86::idt::table::SCHED_IPI_VECTOR
     }
 
     fn timer_interrupt_vector() -> u8 {
-        crate::arch::x86::idt::TIMER_VECTOR
+        crate::arch::x86::idt::table::TIMER_VECTOR
     }
 
     fn tlb_shootdown_vector() -> u8 {
-        crate::arch::x86::idt::TLB_FLUSH_VECTOR
+        crate::arch::x86::idt::table::TLB_FLUSH_VECTOR
     }
 
     fn interrupts_enabled() -> bool {
@@ -127,7 +128,7 @@ impl InterruptPlatform for X86Platform {
     }
 
     fn is_reserved_vector(vector: u8) -> bool {
-        vector == crate::arch::x86::idt::SYSCALL_VECTOR
+        vector == crate::arch::x86::idt::table::SYSCALL_VECTOR
     }
 
     fn bind_wired_interrupt(source: HardwareInterruptId, interrupt_id: u32) -> bool {

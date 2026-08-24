@@ -1,8 +1,9 @@
 use super::cpu::{self, current_cpu_id, init_percpu_gs, platform_cpu_id};
 use super::drivers::timer_driver::set_num_cores;
 use super::gdt::PER_CPU_GDT;
-use super::idt::load_idt;
-use super::interrupts::{APIC, ApicImpl, IpiDest, IpiKind, LocalApic};
+use super::idt::table::load_idt;
+use super::interrupts::apic::controller::{APIC, ApicImpl};
+use super::interrupts::apic::local::{IpiDest, IpiKind, LocalApic};
 use super::syscalls::syscall::syscall_init;
 use super::timer::{
     APIC_START_PERIOD, apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns,
@@ -65,7 +66,7 @@ const TRAMPOLINE_DATA_END: usize = LONGMODE_GDTR_BASE_OFF + mem::size_of::<u64>(
 core::arch::global_asm!(include_str!("ap_startup.s"));
 
 fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    crate::memory::paging::virt_to_phys(addr.into()).map(|(size, phys)| (size, phys.into()))
+    crate::memory::paging::map::virt_to_phys(addr.into()).map(|(size, phys)| (size, phys.into()))
 }
 
 unsafe extern "C" {
@@ -277,7 +278,7 @@ impl ApicImpl {
         map_len = (map_len + 0x0FFF) & !0x0FFF;
 
         unsafe {
-            crate::memory::paging::identity_map_page(
+            crate::memory::paging::map::identity_map_page(
                 PhysAddr::new(map_start).into(),
                 map_len as usize,
                 (PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE)
@@ -413,7 +414,7 @@ impl ApicImpl {
         }
 
         unsafe {
-            crate::memory::paging::unmap_range(VirtAddr::new(map_start).into(), map_len as u64)
+            crate::memory::paging::map::unmap_range(VirtAddr::new(map_start).into(), map_len as u64)
         };
     }
 }

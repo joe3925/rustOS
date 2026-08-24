@@ -1,8 +1,8 @@
 use crate::structs::range_tracker::RangeTracker;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
-use kernel_types::dma::DmaPciDeviceIdentity;
+use kernel_types::dma::implementation::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::implementation::DmaPciDeviceIdentity;
 use spin::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

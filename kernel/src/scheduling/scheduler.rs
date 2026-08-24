@@ -1,8 +1,8 @@
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::idt::InterruptGuard;
-use crate::memory::heap::mimalloc_thread_done;
+use crate::idt::interrupt_impl::InterruptGuard;
+use crate::memory::heap::heap::mimalloc_thread_done;
 use crate::memory::paging::stack::StackSize;
-use crate::memory::paging::switch_address_space_root;
+use crate::memory::paging::address_space::switch_address_space_root;
 use crate::platform;
 use crate::scheduling::domain::{
     CpuSet, DomainEntry, DomainMaster, EnqueueReason, KERNEL_DOMAIN_ID, RoundRobinDomainAlgorithm,

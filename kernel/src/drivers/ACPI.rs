@@ -1,4 +1,4 @@
-use crate::memory::paging::{map_physical_pages, unmap_physical_pages};
+use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
 use crate::util::boot_info;
 use acpi;
 use acpi::{AcpiHandler, AcpiTables, PhysicalMapping, PlatformInfo};

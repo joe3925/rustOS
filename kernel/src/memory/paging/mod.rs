@@ -1,7 +1,7 @@
 pub mod address_space;
 pub mod frame_alloc;
 pub mod frame_bitmap;
-mod init;
+pub mod init;
 pub mod layout;
 pub mod map;
 pub mod mmio;
@@ -10,15 +10,3 @@ pub mod tlb;
 pub mod types;
 pub mod virt_tracker;
 pub mod zero;
-
-pub use address_space::*;
-pub use frame_alloc::*;
-pub use init::init_paging;
-pub use layout::*;
-pub use map::*;
-pub use mmio::*;
-pub use stack::*;
-pub use tlb::*;
-pub use types::*;
-pub use virt_tracker::*;
-pub use zero::*;

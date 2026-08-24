@@ -26,10 +26,8 @@ use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::{PageMapError, PageMapFailure};
 
 use crate::memory::paging::types::UserVmLayout;
-use crate::memory::paging::{
-    KernelFrameAllocator, KernelPageTableFrameAllocator, KernelVirtualLayout, LocalTlbFlush,
-    MappingSize, PagingCapabilities, ResolvedMapping, UnmapFrameDisposition,
-};
+use crate::memory::paging::frame_alloc::{KernelFrameAllocator, KernelPageTableFrameAllocator};
+use crate::memory::paging::types::{KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping, UnmapFrameDisposition};
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator, PagingPlatform};
 use crate::util::boot_info;
 

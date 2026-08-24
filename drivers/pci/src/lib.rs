@@ -11,9 +11,9 @@ use alloc::{sync::Arc, vec::Vec};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use kernel_api::device::{publish_stack_protocol, register_protocol};
-use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
-use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
-use kernel_api::dma::dma::DmaPciDeviceIdentity;
+use kernel_api::kernel_types::dma::implementation::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
+use kernel_api::kernel_types::dma::implementation::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
+use kernel_api::kernel_types::dma::implementation::DmaPciDeviceIdentity;
 use kernel_api::error::{DriverErrorKind, ErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::pnp::QueryDeviceRelations;
 use kernel_api::pnp::QueryId;

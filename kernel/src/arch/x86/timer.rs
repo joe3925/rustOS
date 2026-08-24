@@ -7,7 +7,7 @@ use crate::platform::TimerPlatform;
 
 use super::cpu;
 use super::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER, TIMER_TIME_SCHED};
-use super::interrupts::{APICOffset, LAPIC_BASE_VA};
+use super::interrupts::apic::local::{APICOffset, LAPIC_BASE_VA};
 use super::platform::X86Platform;
 use crate::structs::per_cpu_vec::PerCpuVec;
 

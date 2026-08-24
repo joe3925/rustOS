@@ -101,14 +101,14 @@ fn init_test_platform() {
     crate::platform::init(&THREAD_POOL_PLATFORM);
 }
 
-fn test_shard_count() -> usize {
+pub(super) fn test_shard_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .clamp(1, EXECUTOR_MAX_SHARDS)
 }
 
-fn stress_task_count(multiplier: usize) -> usize {
+pub(super) fn stress_task_count(multiplier: usize) -> usize {
     test_shard_count() * multiplier
 }
 

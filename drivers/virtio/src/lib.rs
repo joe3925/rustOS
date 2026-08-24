@@ -35,8 +35,8 @@ use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::dma::dma::IoBufferAccess;
-use kernel_api::dma::dma::ToDevice;
+use kernel_api::kernel_types::dma::implementation::IoBufferAccess;
+use kernel_api::kernel_types::dma::implementation::ToDevice;
 use kernel_api::error::{
     DriverErrorKind, KernelError, ResultErrorContext, error, error_with_message,
 };
@@ -45,7 +45,7 @@ use kernel_api::irq::{
     HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqHandleExt, bind_wired_interrupt,
     irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
+use kernel_api::kernel_types::dma::implementation::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
 };

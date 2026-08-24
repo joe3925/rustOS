@@ -26,7 +26,7 @@ use crate::memory::io_buffer::MappedIoBufferBacking;
 use crate::scheduling::task::TaskHandle;
 use crate::structs::completion_queue::CompletionQueue;
 use crate::structs::executor_domain::UserExecutorDomain;
-use crate::structs::io_request::FileObject;
+use crate::structs::io_request::request::FileObject;
 
 use super::behavior;
 pub use super::behavior::{
@@ -252,8 +252,8 @@ impl Object {
         }
     }
 
-    pub async fn destroy(&self) -> crate::structs::io_request::IoRequestOutput {
-        use crate::structs::io_request::{IO_STATUS_INVALID_PARAMETER, IoRequestOutput};
+    pub async fn destroy(&self) -> crate::structs::io_request::request::IoRequestOutput {
+        use crate::structs::io_request::request::{IO_STATUS_INVALID_PARAMETER, IoRequestOutput};
 
         match &self.payload {
             ObjectPayload::IoBufferBacking(_) => IoRequestOutput::success(0, 0),

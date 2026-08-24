@@ -6,7 +6,7 @@ use core::marker::PhantomData;
 
 use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender};
 use crate::mpmc::{mpmc_channel, Receiver, RecvError, Sender, TryRecvError};
-use crate::platform::Platform;
+use crate::platform::contract::Platform;
 
 pub type JobFn = extern "C" fn(usize);
 

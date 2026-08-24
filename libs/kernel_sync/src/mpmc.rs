@@ -2,7 +2,7 @@ use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use crossbeam_queue::SegQueue;
 
-use crate::platform::Platform;
+use crate::platform::contract::Platform;
 use crate::wait_queue::WaitQueue;
 use kernel_types::io::TreiberStack;
 

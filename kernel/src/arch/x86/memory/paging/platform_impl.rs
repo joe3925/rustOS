@@ -5,10 +5,9 @@ use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageSize, PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 use x86_64::{PhysAddr as X86PhysAddr, VirtAddr as X86VirtAddr};
 
-use crate::memory::paging::{
-    KernelFrameAllocator, KernelPageTableFrameAllocator, KernelVirtualLayout, LocalTlbFlush,
-    MappingSize, PagingCapabilities, ResolvedMapping, UnmapFrameDisposition,
-};
+use crate::memory::paging::frame_alloc::{KernelFrameAllocator, KernelPageTableFrameAllocator};
+
+use crate::memory::paging::types::{KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping, UnmapFrameDisposition};
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator, PagingPlatform};
 use crate::util::boot_info;
 
@@ -16,7 +15,8 @@ use super::flags::page_flags_to_x86;
 use super::mapper::{X86PageTableFrameAllocator, map_existing_frame, unmap_leaf_inner};
 use super::tables::init_mapper;
 use super::{layout, mapper, tables};
-use super::super::super::interrupts::{APIC, IpiDest, IpiKind, LocalApic};
+use super::super::super::interrupts::apic::controller::APIC;
+use super::super::super::interrupts::apic::local::{IpiDest, IpiKind, LocalApic};
 use super::super::super::platform::X86Platform;
 
 const X86_MAPPING_SIZES_WITH_1G: [MappingSize; 3] = [
@@ -320,7 +320,7 @@ impl PagingPlatform for X86Platform {
                 apic.lapic.send_ipi(
                     IpiDest::AllExcludingSelf,
                     IpiKind::Fixed {
-                        vector: super::super::super::idt::TLB_FLUSH_VECTOR,
+                        vector: super::super::super::idt::table::TLB_FLUSH_VECTOR,
                     },
                 );
                 return true;

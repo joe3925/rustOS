@@ -4,7 +4,7 @@ mod cpu_startup;
 pub(crate) mod debug;
 pub mod drivers;
 pub mod exception_handlers;
-mod exports;
+pub mod exports;
 pub mod gdt;
 pub mod idt;
 pub mod idt_types;
@@ -20,5 +20,3 @@ pub(crate) mod serial;
 pub mod syscalls;
 pub(crate) mod timer;
 pub(crate) mod unwind;
-
-pub use exports::{MAX_CPUS, PlatformImpl};

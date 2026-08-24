@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::platform::{Platform, ThreadEntry};
+use crate::platform::contract::{Platform, ThreadEntry};
 
 const WAIT_QUEUE_NONE: u64 = 0;
 

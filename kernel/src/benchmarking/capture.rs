@@ -3,8 +3,8 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
 use crate::memory::{
-    heap::heap_capacity_bytes,
-    paging::{total_usable_bytes, used_bytes as physical_used_bytes},
+    heap::heap::heap_capacity_bytes,
+    paging::frame_alloc::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::backtrace::{Backtrace, BacktraceStatus, MAX_BACKTRACE_DEPTH};
 use crate::scheduling::scheduler::SCHEDULER;
@@ -37,7 +37,7 @@ use kernel_types::benchmark::{
     BENCH_SAMPLE_PROTO_SCHEMA_VERSION, BenchDroppedSampleCounterProto, BenchOverflowPolicy,
     BenchSampleChunkProto, BenchSampleProto, BenchWindowConfig,
 };
-use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
+use kernel_types::dma::implementation::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::error::KernelError;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
@@ -2721,9 +2721,9 @@ pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Resul
 }
 
 pub fn used_memory() -> usize {
-    let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
-        + crate::memory::heap::mimalloc_os_heap_size();
-    let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
+    let capacity = crate::memory::heap::heap::BOOTSTRAP_HEAP_SIZE as usize
+        + crate::memory::heap::heap::mimalloc_os_heap_size();
+    let used_non_arena = capacity - crate::memory::heap::heap::ALLOCATOR.free_memory();
     let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
         .load(core::sync::atomic::Ordering::Relaxed);
     used_non_arena + used_arena

@@ -12,14 +12,13 @@ use crate::file_system::file_provider::{
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::memory::heap::{enable_mimalloc, heap_capacity_bytes, init_heap};
+use crate::memory::heap::heap::{enable_mimalloc, heap_capacity_bytes, init_heap};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
-use crate::memory::paging::{
-    KernelFrameAllocator, boot_usable_bytes, init_emergency_zero_mappings,
-    init_kernel_address_space_root, kernel_address_space_root, resize_bitmap_for_ram,
-    start_zero_page_worker, switch_address_space_root, unmap_reserved_range_unchecked,
-};
+use crate::memory::paging::address_space::{init_kernel_address_space_root, kernel_address_space_root, switch_address_space_root};
+use crate::memory::paging::frame_alloc::{KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram};
+use crate::memory::paging::map::{unmap_reserved_range_unchecked};
+use crate::memory::paging::zero::{init_emergency_zero_mappings, start_zero_page_worker};
 use crate::platform::{
     ActivePlatform, ConsolePlatform, breakpoint, broadcast_panic_stop, calibrate_boot_timer,
     current_cpu_id, current_is_in_interrupt, current_platform_cpu_id, cycle_counter,

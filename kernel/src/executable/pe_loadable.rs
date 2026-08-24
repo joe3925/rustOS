@@ -2,7 +2,7 @@ use core::mem::transmute;
 use core::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 
 use crate::file_system::file::File;
-use crate::memory::paging::base_page_size;
+use crate::memory::paging::layout::base_page_size;
 use crate::platform;
 use crate::println;
 use crate::scheduling::task::Task;
@@ -301,17 +301,17 @@ impl PELoader {
         }
 
         let new_address_space_root = program.address_space_root;
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
         let were_enabled = platform::interrupts_enabled();
         if were_enabled {
             platform::disable_interrupts();
         }
         unsafe {
-            crate::memory::paging::switch_address_space_root(new_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(new_address_space_root);
         }
         let result = self.map_into_program(program).map(|(handle, _, _)| handle);
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
         if were_enabled {
             platform::enable_interrupts();
@@ -320,17 +320,17 @@ impl PELoader {
     }
 
     pub(crate) fn patch_mapped_dll(&mut self, program: &mut Program) -> Result<(), LoadError> {
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
         let were_enabled = platform::interrupts_enabled();
         if were_enabled {
             platform::disable_interrupts();
         }
         unsafe {
-            crate::memory::paging::switch_address_space_root(program.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(program.address_space_root);
         }
         let result = self.patch_imports_sync(program);
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
         if were_enabled {
             platform::enable_interrupts();
@@ -395,8 +395,8 @@ impl PELoader {
             self.current_base = VirtAddr::new(preferred_image_base);
         }
 
-        let new_frame = crate::memory::paging::create_user_address_space()?;
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let new_frame = crate::memory::paging::address_space::create_user_address_space()?;
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
 
         let stack_base = layout.stack_base(self.current_base);
         let stack_top = layout.stack_top(self.current_base);
@@ -421,7 +421,7 @@ impl PELoader {
         }
 
         unsafe {
-            crate::memory::paging::switch_address_space_root(new_frame);
+            crate::memory::paging::address_space::switch_address_space_root(new_frame);
         }
 
         let map_result = (|| -> Result<(), LoadError> {
@@ -445,7 +445,7 @@ impl PELoader {
         })();
 
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
 
         if were_enabled {
@@ -478,7 +478,7 @@ impl PELoader {
 
         self.resolve_imports(&mut program).await?;
 
-        let old_address_space_root = crate::memory::paging::current_address_space_root();
+        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
 
         let were_enabled = platform::interrupts_enabled();
         if were_enabled {
@@ -486,13 +486,13 @@ impl PELoader {
         }
 
         unsafe {
-            crate::memory::paging::switch_address_space_root(new_frame);
+            crate::memory::paging::address_space::switch_address_space_root(new_frame);
         }
 
         let patch_result = self.patch_imports(&mut program);
 
         unsafe {
-            crate::memory::paging::switch_address_space_root(old_address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         }
 
         if were_enabled {

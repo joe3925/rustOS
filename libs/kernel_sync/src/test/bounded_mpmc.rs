@@ -1,6 +1,6 @@
 use crate::bounded_mpmc::BoundedSendError;
 use crate::mpmc::{RecvError, TryRecvError};
-use crate::test::{recv_timeout, P};
+use crate::test::support::{recv_timeout, P};
 
 #[test]
 fn capacity_len_and_fifo_progress() {

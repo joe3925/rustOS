@@ -15,7 +15,8 @@ use crate::scheduling::task::Task;
 use crate::structs::per_cpu::percpu_by_id;
 use crate::sync_platform::{KernelPlatform, WaitQueue};
 
-use super::{allocate_auto_kernel_range_aligned, base_page_size};
+use super::layout::base_page_size;
+use super::virt_tracker::allocate_auto_kernel_range_aligned;
 
 static ZERO_PAGE_WAIT_QUEUE: Once<WaitQueue> = Once::new();
 static BOOTSTRAP_ZERO_LOCK: Mutex<()> = Mutex::new(());

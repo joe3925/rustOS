@@ -10,7 +10,7 @@ use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedSendError};
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue};
 use crate::completion_port::CompletionPort;
 use crate::mpmc::{mpmc_channel, SendError as MpmcSendError, TryRecvError};
-use crate::platform::{Platform, ThreadEntry};
+use crate::platform::contract::{Platform, ThreadEntry};
 use crate::sync::model;
 use crate::wait_queue::WaitQueue;
 

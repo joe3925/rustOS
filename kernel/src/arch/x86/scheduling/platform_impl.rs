@@ -129,7 +129,7 @@ impl TaskPlatform for X86Platform {
     }
 
     fn request_task_yield() {
-        unsafe { super::super::syscalls::task_yield_interrupt() };
+        unsafe { super::super::syscalls::yield_interrupt::task_yield_interrupt() };
     }
 }
 

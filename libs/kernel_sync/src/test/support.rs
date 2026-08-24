@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 extern "C" fn kernel_resolve_error_context_module(_instruction_pointer: usize) -> Option<String> {
     None
 }
-use crate::platform::StdPlatform;
+use crate::platform::std::StdPlatform;
 
 pub(super) type P = StdPlatform;
 

@@ -12,7 +12,7 @@ use crate::structs::per_cpu::{PerCpu, alloc_or_get_percpu};
 use crate::structs::stopwatch::Stopwatch;
 
 use super::drivers::timer_driver::NUM_CORES;
-use super::interrupts::{APIC, ApicImpl};
+use super::interrupts::apic::controller::{APIC, ApicImpl};
 use super::platform::X86Platform;
 
 #[thread_local]
@@ -175,7 +175,7 @@ pub fn enable_sse() {
 impl CpuPlatform for X86Platform {
     type PerCpuState = crate::structs::per_cpu::PerCpu;
 
-    const MAX_CPUS: usize = super::MAX_CPUS;
+    const MAX_CPUS: usize = super::exports::MAX_CPUS;
 
     fn current_cpu_id() -> usize {
         current_cpu_id()

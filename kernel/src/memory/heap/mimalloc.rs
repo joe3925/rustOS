@@ -1,10 +1,6 @@
-use crate::memory::heap::{
-    mimalloc_arena_size, mimalloc_arena_start, mimalloc_heap_end, mimalloc_heap_start,
-    mimalloc_os_heap_size,
-};
-use crate::memory::paging::{
-    align_up_to_base_page, base_page_size, map_fresh_kernel_range_no_flush, unmap_range_unchecked,
-};
+use crate::memory::heap::heap::{mimalloc_arena_size, mimalloc_arena_start, mimalloc_heap_end, mimalloc_heap_start, mimalloc_os_heap_size};
+use crate::memory::paging::layout::{align_up_to_base_page, base_page_size};
+use crate::memory::paging::map::{map_fresh_kernel_range_no_flush, unmap_range_unchecked};
 use crate::platform;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;

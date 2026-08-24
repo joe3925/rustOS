@@ -8,7 +8,7 @@ pub(crate) struct Ioapic {
 
 impl Ioapic {
     pub fn new(phys: PhysAddr, gsi_base: u32) -> Result<Self, ()> {
-        let virt = crate::memory::paging::map_physical_pages(
+        let virt = crate::memory::paging::mmio::map_physical_pages(
             phys.into(),
             0x2048,
             kernel_types::memory::PhysicalMappingCache::Uncached,

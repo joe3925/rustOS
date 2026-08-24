@@ -28,7 +28,7 @@ use kernel_api::irq::{
     HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqHandleExt, bind_wired_interrupt,
     irq_wait_ok,
 };
-use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
+use kernel_api::kernel_types::dma::implementation::{FromDevice, IoBuffer, IoBufferAccess, ToDevice};
 use kernel_api::kernel_types::io::{
     DeviceControlHandler, DeviceControlOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
     DiskInfo,

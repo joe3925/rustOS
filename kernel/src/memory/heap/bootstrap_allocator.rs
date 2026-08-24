@@ -3,10 +3,10 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::memory::paging::heap_range_start;
+use crate::memory::paging::layout::heap_range_start;
 use crate::platform::with_interrupts_disabled;
 
-use crate::memory::heap::BOOTSTRAP_HEAP_SIZE;
+use crate::memory::heap::heap::BOOTSTRAP_HEAP_SIZE;
 
 pub struct BootstrapAllocator {
     inner: LockedHeap<32>,

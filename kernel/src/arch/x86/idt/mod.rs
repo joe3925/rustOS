@@ -1,3 +1,1 @@
-mod table;
-
-pub use table::*;
+pub mod table;

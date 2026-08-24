@@ -1,6 +1,6 @@
 use core::arch::global_asm;
 
-use crate::idt::{InterruptGuard, irq_dispatch};
+use crate::idt::interrupt_impl::{InterruptGuard, irq_dispatch};
 
 use super::init::controller;
 

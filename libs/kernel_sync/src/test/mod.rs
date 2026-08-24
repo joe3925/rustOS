@@ -1,7 +1,5 @@
 mod support;
 
-use support::*;
-
 mod bounded_mpmc;
 mod bounded_wait_queue;
 mod completion_port;

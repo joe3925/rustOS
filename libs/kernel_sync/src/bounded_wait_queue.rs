@@ -2,7 +2,7 @@ use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::platform::Platform;
+use crate::platform::contract::Platform;
 use crate::sync::RwLock;
 
 static NEXT_BOUNDED_WAIT_QUEUE_ID: core::sync::atomic::AtomicU64 =

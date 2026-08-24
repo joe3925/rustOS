@@ -7,7 +7,7 @@ use kernel_types::memory::PhysicalMappingCache;
 use spin::Mutex;
 
 use crate::machine::machine_info;
-use crate::memory::paging::map_physical_pages;
+use crate::memory::paging::mmio::map_physical_pages;
 
 use super::controller::{
     PANIC_STOP_SGI, SCHEDULER_SGI, SPI_END, SPI_START, TLB_SHOOTDOWN_SGI, VIRTUAL_TIMER_PPI,

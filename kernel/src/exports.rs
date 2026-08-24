@@ -3,7 +3,7 @@ use crate::error::{kernel_capture_error_backtrace, kernel_resolve_error_context_
 use crate::export;
 use crate::function;
 use crate::get_rva;
-use crate::idt::*;
+use crate::idt::interrupt_impl::*;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;

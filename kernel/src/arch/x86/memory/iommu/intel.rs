@@ -6,14 +6,14 @@
 
 use alloc::vec::Vec;
 
-use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
+use kernel_types::dma::implementation::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
 use super::domain::{IommuDomain, IommuError};
 use super::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
-use super::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo, X86PlatformDeviceRoute};
-use crate::memory::paging::{map_physical_pages, unmap_physical_pages};
+use super::backend::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo, X86PlatformDeviceRoute};
+use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
 use crate::println;
 
 const VER_REG: usize = 0x00;

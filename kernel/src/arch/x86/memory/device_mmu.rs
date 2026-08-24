@@ -3,7 +3,7 @@ use crate::memory::device_mmu::{DeviceMmuDiscoveryResult, DeviceMmuSystem};
 use crate::platform::DeviceMmuPlatform;
 
 use super::super::platform::X86Platform;
-use super::iommu::X86DeviceMmu;
+use super::iommu::backend::X86DeviceMmu;
 
 impl DeviceMmuPlatform for X86Platform {
     fn discover_device_mmu(

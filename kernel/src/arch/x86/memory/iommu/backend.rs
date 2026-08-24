@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
 use core::mem::size_of;
-use kernel_types::dma::{
+use kernel_types::dma::implementation::{
     DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR, DeviceMmuPlatformDeviceIdentity,
     DmaPciDeviceIdentity,
 };
@@ -21,9 +21,7 @@ use crate::memory::device_mmu::{
     DeviceMmuDeviceIdentity, DeviceMmuDomain, DeviceMmuDomainInfo, DeviceMmuError,
     DeviceMmuMapPermissions, DeviceMmuResult,
 };
-use crate::memory::paging::{
-    allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous, virt_to_phys,
-};
+use crate::memory::paging::map::{allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
 use crate::println;
 
 use super::amd::AmdViBackend;

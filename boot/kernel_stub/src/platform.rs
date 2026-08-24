@@ -6,7 +6,11 @@ use kernel_abi::{
     KernelTextSection, MemoryRegionKind, MemoryRegions, Optional,
 };
 
-pub type ActivePlatform = crate::arch::PlatformImpl;
+#[cfg(target_arch = "x86_64")]
+pub type ActivePlatform = crate::arch::x86::X86Platform;
+
+#[cfg(target_arch = "aarch64")]
+pub type ActivePlatform = crate::arch::aarch64::Aarch64Platform;
 
 #[derive(Clone, Copy)]
 pub struct LoadedKernel {

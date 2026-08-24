@@ -9,5 +9,3 @@ mod scheduling;
 mod serial;
 mod timer;
 mod unwind;
-
-pub use platform::Aarch64Platform as PlatformImpl;

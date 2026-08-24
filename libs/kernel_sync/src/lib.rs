@@ -17,7 +17,7 @@ pub use bounded_mpmc::{bounded_mpmc_channel, BoundedReceiver, BoundedSendError, 
 pub use bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueError};
 pub use completion_port::{CompletionPort, PortPermit, PortReserveError, PortResizeError};
 pub use mpmc::mpmc_channel;
-pub use platform::{Platform, ThreadEntry};
+pub use platform::contract::{Platform, ThreadEntry};
 pub use thread_pool::{
     BoundedJobs, BoundedJobsConfig, BoundedThreadPool, Job, JobFn, JobQueue, QueueSendError,
     SubmitError, ThreadPool, ThreadPoolImpl, UnboundedJobs,

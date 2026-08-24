@@ -18,7 +18,7 @@ pub(crate) struct Lapic {
 
 impl Lapic {
     pub(crate) fn new(phys: PhysAddr) -> Result<Self, ()> {
-        let virt = crate::memory::paging::map_physical_pages(
+        let virt = crate::memory::paging::mmio::map_physical_pages(
             phys.into(),
             0x1000,
             kernel_types::memory::PhysicalMappingCache::Uncached,
@@ -200,16 +200,6 @@ pub(crate) enum IpiKind {
 
 #[inline(always)]
 pub(crate) fn send_eoi(_vector: u8) {
-    let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
-    if base != 0 {
-        unsafe {
-            ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
-        }
-    }
-}
-/// A faster send eoi for the timer interrupt
-#[inline(always)]
-pub(crate) extern "C" fn send_eoi_timer() {
     let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
     if base != 0 {
         unsafe {

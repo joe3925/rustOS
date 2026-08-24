@@ -95,8 +95,8 @@ fn poll_once<F: Future + Unpin>(future: &mut F, waker: &Waker) -> Poll<F::Output
 // consumed exactly once through BlockingJoin.
 #[test]
 fn spawn_blocking_runs_job_and_join_consumes_result() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let join = spawn_blocking(|| 21usize * 2);
     assert_eq!(block_on(join), 42);
@@ -107,8 +107,8 @@ fn spawn_blocking_runs_job_and_join_consumes_result() {
 // the test polls the join again.
 #[test]
 fn blocking_join_pending_poll_wakes_registered_waiter_on_completion() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let release = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicUsize::new(0));
@@ -122,7 +122,7 @@ fn blocking_join_pending_poll_wakes_registered_waiter_on_completion() {
         123usize
     });
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         started.load(Ordering::Acquire) == 1
     });
 
@@ -148,8 +148,8 @@ fn blocking_join_pending_poll_wakes_registered_waiter_on_completion() {
 // task rather than a stale one.
 #[test]
 fn blocking_join_completion_uses_latest_registered_waiter() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let release = Arc::new(AtomicBool::new(false));
     let started = Arc::new(AtomicUsize::new(0));
@@ -163,7 +163,7 @@ fn blocking_join_completion_uses_latest_registered_waiter() {
         456usize
     });
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         started.load(Ordering::Acquire) == 1
     });
 
@@ -198,10 +198,10 @@ fn blocking_join_completion_uses_latest_registered_waiter() {
 // verifies that parallel execution does not change the public join/result order.
 #[test]
 fn spawn_blocking_many_preserves_join_order_under_thread_pool_load() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
-    let count = super::stress_task_count(256);
+    let count = super::support::stress_task_count(256);
     let funcs: Vec<_> = (0..count)
         .map(|i| {
             move || {
@@ -233,10 +233,10 @@ fn spawn_blocking_many_empty_returns_empty_join_list() {
 // complete through JoinAll.
 #[test]
 fn runtime_tasks_can_await_blocking_work_under_load() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
-    let count = super::stress_task_count(128);
+    let count = super::support::stress_task_count(128);
     let results = block_on(async {
         let handles = (0..count)
             .map(|i| {
@@ -263,8 +263,8 @@ fn runtime_tasks_can_await_blocking_work_under_load() {
 // when the shared blocking task is released.
 #[test]
 fn dropping_blocking_join_before_completion_does_not_leak_result() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let drops = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(AtomicUsize::new(0));
@@ -283,7 +283,7 @@ fn dropping_blocking_join_before_completion_does_not_leak_result() {
 
     drop(join);
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         started.load(Ordering::Acquire) == 1 && drops.load(Ordering::Acquire) == 1
     });
 }

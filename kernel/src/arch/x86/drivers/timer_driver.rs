@@ -1,10 +1,10 @@
-use crate::idt::InterruptGuard;
+use crate::idt::interrupt_impl::InterruptGuard;
 use kernel_routing::println;
 
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 
 use super::super::cpu::{current_cpu_id, current_is_in_interrupt_atomic};
-use super::super::interrupts::send_eoi_timer;
+use super::super::interrupts::apic::local::send_eoi as send_eoi_timer;
 use super::super::timer::APIC_TICKS_PER_NS;
 use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
 use crate::scheduling::state::State;

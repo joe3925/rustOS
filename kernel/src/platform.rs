@@ -18,12 +18,13 @@ use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
 use kernel_types::status::PageMapError;
 
-use crate::memory::paging::{
-    KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
-    UnmapFrameDisposition,
-};
+use crate::memory::paging::types::{KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping, UnmapFrameDisposition};
 
-pub type ActivePlatform = crate::arch::PlatformImpl;
+#[cfg(target_arch = "x86_64")]
+pub type ActivePlatform = crate::arch::x86::platform::X86Platform;
+
+#[cfg(target_arch = "aarch64")]
+pub type ActivePlatform = crate::arch::aarch64::platform::Aarch64Platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuStartupError {

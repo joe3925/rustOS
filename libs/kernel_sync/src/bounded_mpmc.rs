@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};
-use crate::platform::Platform;
+use crate::platform::contract::Platform;
 use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

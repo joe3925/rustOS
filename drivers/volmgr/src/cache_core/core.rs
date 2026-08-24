@@ -15,7 +15,7 @@ use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
-use kernel_api::kernel_types::dma::{
+use kernel_api::kernel_types::dma::implementation::{
     FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, ToDevice,
 };
 use kernel_api::memory::{

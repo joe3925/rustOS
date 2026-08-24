@@ -1,4 +1,4 @@
-use crate::memory::paging::base_page_size;
+use crate::memory::paging::layout::base_page_size;
 use alloc::vec::Vec;
 use spin::{Mutex, MutexGuard};
 
