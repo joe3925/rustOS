@@ -91,7 +91,8 @@ jobs:
           BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          mkdir -p target/bench/baselines
+          baseline_cache="$RUNNER_TEMP/rustos-baselines"
+          mkdir -p "$baseline_cache"
 
           list_runs() {
             local branch="$1"
@@ -103,11 +104,11 @@ jobs:
           }
 
           echo "trusted_available=false" >> "$GITHUB_OUTPUT"
-          trusted_candidates="target/bench/baselines/trusted-candidates.txt"
+          trusted_candidates="$baseline_cache/trusted-candidates.txt"
           list_runs "$DEFAULT_BRANCH" completed |
             jq -r '.workflow_runs[].id' > "$trusted_candidates"
           while read -r run_id; do
-            run_dir="target/bench/baselines/trusted-${run_id}"
+            run_dir="$baseline_cache/trusted-${run_id}"
             mkdir -p "$run_dir"
             if ! gh run download "$run_id" \
               --name kernel-benchmark-anchor \
@@ -131,11 +132,11 @@ jobs:
           done < "$trusted_candidates"
 
           echo "previous_available=false" >> "$GITHUB_OUTPUT"
-          previous_candidates="target/bench/baselines/previous-candidates.txt"
+          previous_candidates="$baseline_cache/previous-candidates.txt"
           list_runs "$BENCH_BRANCH" completed |
             jq -r '.workflow_runs[].id' > "$previous_candidates"
           while read -r run_id; do
-            run_dir="target/bench/baselines/previous-${run_id}"
+            run_dir="$baseline_cache/previous-${run_id}"
             mkdir -p "$run_dir"
             if ! gh run download "$run_id" \
               --name kernel-benchmarks \
@@ -253,6 +254,8 @@ jobs:
             target/bench/**/*.md
             target/bench/**/*.log
             target/bench/head/boot.img
+            !target/bench/baselines/**
+            !target/bench/anchor/**
           if-no-files-found: warn
           retention-days: 14
 
