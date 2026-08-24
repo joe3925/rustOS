@@ -521,7 +521,7 @@ impl PagingPlatform for Aarch64Platform {
             },
             pas: (),
             controls: SemanticVmsa64Stage1TableControls {
-                access_flag: false,
+                access_flag: true,
                 software: SoftwareMetadata::new(0),
             },
         };

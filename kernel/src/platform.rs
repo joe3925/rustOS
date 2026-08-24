@@ -18,7 +18,10 @@ use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::BlockOnThreadState;
 use kernel_types::status::PageMapError;
 
-use crate::memory::paging::types::{KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping, UnmapFrameDisposition};
+use crate::memory::paging::types::{
+    KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
+    UnmapFrameDisposition,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub type ActivePlatform = crate::arch::x86::platform::X86Platform;
@@ -39,6 +42,7 @@ pub trait Platform {
     const NAME: &'static str;
     const KERNEL_IMAGE_BASE: u64;
 
+    fn init_early_kernel();
     fn init_boot_processor();
 }
 

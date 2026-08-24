@@ -6,7 +6,8 @@ use kernel_types::runtime::BlockOnThreadState;
 use crate::platform::TaskPlatform;
 
 use super::super::platform::Aarch64Platform;
-use super::{FpuState, KernelTls, TaskContext, TaskEntry, tls};
+use super::state::{FpuState, TaskContext, TaskEntry};
+use super::tls::{self, KernelTls};
 
 impl TaskPlatform for Aarch64Platform {
     type TaskEntry = TaskEntry;

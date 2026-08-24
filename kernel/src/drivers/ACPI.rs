@@ -53,7 +53,7 @@ impl AcpiHandler for ACPIImpl {
         let virt_addr = map_physical_pages(
             PhysAddr::new(physical_address as u64).into(),
             size as u64,
-            kernel_types::memory::PhysicalMappingCache::Uncached,
+            kernel_types::memory::PhysicalMappingCache::Cached,
         )
         .expect("Failed to map physical region for ACPI");
         PhysicalMapping::new(

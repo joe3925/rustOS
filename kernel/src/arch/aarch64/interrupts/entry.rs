@@ -115,7 +115,7 @@ aarch64_unhandled_exception:
 );
 
 unsafe extern "C" {
-    pub(super) static aarch64_exception_vectors: u8;
+    pub(crate) static aarch64_exception_vectors: u8;
 }
 
 #[unsafe(no_mangle)]

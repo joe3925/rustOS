@@ -87,6 +87,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_pe_entry(boot_info: *const ActiveBootInfo) -> ! {
+    ActivePlatform::init_early_kernel();
     if boot_info.is_null() {
         panic!("kernel_pe_entry received a null boot info pointer");
     }
