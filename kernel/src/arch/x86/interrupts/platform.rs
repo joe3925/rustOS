@@ -1,6 +1,3 @@
-pub use x86_64::instructions::hlt;
-pub use x86_64::instructions::interrupts::*;
-
 use kernel_types::irq::{
     HardwareInterruptId, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
     MsiBindingRequest, MsiMessage, PlatformCpuId,
@@ -9,28 +6,27 @@ use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::platform::InterruptPlatform;
 
-use super::drivers::interrupt_index::{
-    APIC, IpiDest, IpiKind, LocalApic, current_is_in_interrupt_atomic, get_current_logical_id,
-    send_eoi,
-};
-use super::platform::X86Platform;
+use crate::arch::x86::cpu::{current_is_in_interrupt_atomic, platform_cpu_id};
+use crate::arch::x86::platform::X86Platform;
+
+use super::apic::{APIC, IpiDest, IpiKind, LocalApic, send_eoi};
 
 impl InterruptPlatform for X86Platform {
     type InterruptFrame = InterruptStackFrame;
 
-    const DYNAMIC_VECTOR_START: u8 = super::idt::DYNAMIC_VECTOR_START;
-    const DYNAMIC_VECTOR_END: u8 = super::idt::DYNAMIC_VECTOR_END;
+    const DYNAMIC_VECTOR_START: u8 = crate::arch::x86::idt::DYNAMIC_VECTOR_START;
+    const DYNAMIC_VECTOR_END: u8 = crate::arch::x86::idt::DYNAMIC_VECTOR_END;
 
     fn scheduler_ipi_vector() -> u8 {
-        super::idt::SCHED_IPI_VECTOR
+        crate::arch::x86::idt::SCHED_IPI_VECTOR
     }
 
     fn timer_interrupt_vector() -> u8 {
-        super::idt::TIMER_VECTOR
+        crate::arch::x86::idt::TIMER_VECTOR
     }
 
     fn tlb_shootdown_vector() -> u8 {
-        super::idt::TLB_FLUSH_VECTOR
+        crate::arch::x86::idt::TLB_FLUSH_VECTOR
     }
 
     fn interrupts_enabled() -> bool {
@@ -115,7 +111,7 @@ impl InterruptPlatform for X86Platform {
         }
 
         let destination = match request.target.mode {
-            MSI_TARGET_ANY => get_current_logical_id() as u32,
+            MSI_TARGET_ANY => platform_cpu_id() as u32,
             MSI_TARGET_PLATFORM_CPU => request.target.platform_cpu_id,
             _ => return None,
         };
@@ -131,7 +127,7 @@ impl InterruptPlatform for X86Platform {
     }
 
     fn is_reserved_vector(vector: u8) -> bool {
-        vector == super::idt::SYSCALL_VECTOR
+        vector == crate::arch::x86::idt::SYSCALL_VECTOR
     }
 
     fn bind_wired_interrupt(source: HardwareInterruptId, interrupt_id: u32) -> bool {
@@ -142,7 +138,7 @@ impl InterruptPlatform for X86Platform {
         let Some(apic) = guard.as_ref() else {
             return false;
         };
-        apic.bind_wired_interrupt(source.0, vector, get_current_logical_id())
+        apic.bind_wired_interrupt(source.0, vector, platform_cpu_id())
     }
 
     fn unbind_wired_interrupt(source: HardwareInterruptId) {

@@ -1,35 +1,6 @@
-use alloc::string::String;
+mod contract;
 
-pub type ThreadEntry = extern "C" fn(usize);
-
-/// Static platform binding used by the sync primitives.
-///
-/// The primitives are generic over this trait and never store `dyn Platform`,
-/// so platform calls are monomorphized by the compiler.
-pub trait Platform: Sized + 'static {
-    type Task: Clone + Send + Sync + 'static;
-
-    fn current_task() -> Option<Self::Task>;
-    fn task_id(task: &Self::Task) -> u64;
-    fn same_task(a: &Self::Task, b: &Self::Task) -> bool;
-
-    fn mark_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
-    fn clear_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
-    fn is_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
-
-    fn unpark(task: &Self::Task);
-    fn park_current();
-
-    fn spawn_thread(name: String, entry: ThreadEntry, context: usize);
-
-    #[inline]
-    fn prepare_blocking_worker() {}
-
-    #[inline]
-    fn spin_loop() {
-        core::hint::spin_loop();
-    }
-}
+pub use contract::*;
 
 #[cfg(feature = "std")]
 pub mod std;
@@ -38,4 +9,4 @@ pub mod std;
 pub use self::std::StdPlatform;
 
 #[cfg(all(feature = "std", windows))]
-pub type WindowsPlatform = StdPlatform;
+pub use self::std::WindowsPlatform;

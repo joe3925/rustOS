@@ -1,4 +1,4 @@
-use super::super::drivers::interrupt_index::get_current_logical_id;
+use super::super::cpu::platform_cpu_id;
 use super::super::gdt::PER_CPU_GDT;
 
 use crate::executable::program::{Message, UserHandle};
@@ -15,7 +15,7 @@ pub fn syscall_init() {
     let gdt = PER_CPU_GDT.lock();
     unsafe { Efer::update(|e| e.set(EferFlags::SYSTEM_CALL_EXTENSIONS, true)) };
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    let id = get_current_logical_id() as usize;
+    let id = platform_cpu_id() as usize;
     let selectors = unsafe { gdt.selectors_per_cpu.get_by_id(id) };
     let kernel_cs = selectors.kernel_code_selector;
     let kernel_ss = selectors.kernel_data_selector;

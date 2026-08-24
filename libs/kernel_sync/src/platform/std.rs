@@ -99,3 +99,6 @@ impl Platform for StdPlatform {
         ::std::thread::yield_now();
     }
 }
+
+#[cfg(windows)]
+pub type WindowsPlatform = StdPlatform;

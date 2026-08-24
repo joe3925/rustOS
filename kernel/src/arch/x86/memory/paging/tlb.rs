@@ -1,6 +1,6 @@
 use core::arch::naked_asm;
 
-use super::super::super::drivers::interrupt_index::send_eoi;
+use super::super::super::interrupts::send_eoi;
 use super::super::super::idt::TLB_FLUSH_VECTOR;
 use crate::idt::InterruptGuard;
 
