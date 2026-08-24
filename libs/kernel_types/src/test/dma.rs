@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::device::{DeviceInit, DeviceObject};
-use crate::dma::{
+use crate::dma::implementation::{
     Bidirectional, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
     IoBufferDmaMappingLayout, IoBufferDmaSegment, IoBufferError, IoBufferPageFrame,
 };

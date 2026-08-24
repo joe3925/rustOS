@@ -1,6 +1,6 @@
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
 
-use crate::test::P;
+use crate::test::support::P;
 use crate::CompletionPort;
 
 #[test]

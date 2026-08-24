@@ -1,5 +1,5 @@
 use crate::device::DevNode;
-use crate::dma::IoBufferBacking;
+use crate::dma::implementation::IoBufferBacking;
 use crate::error::{DriverErrorKind, KernelError};
 use crate::io::{HandlerSlot, IoHandler, IoTarget};
 use alloc::string::String;

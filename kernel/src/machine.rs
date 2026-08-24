@@ -81,7 +81,6 @@ impl FirmwareResources {
 pub struct MachineInterruptInfo {
     pub local_interrupt_controller_address: u64,
     pub interrupt_controllers: Vec<MachineInterruptControllerInfo>,
-    pub has_compatibility_interrupt_controllers: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -21,7 +21,7 @@ pub extern "C" fn kernel_abi_future_allocate(size: usize, align: usize) -> AbiFu
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kernel_abi_future_free(allocation: AbiFutureAllocation) {
+pub unsafe extern "C" fn kernel_abi_future_free(allocation: AbiFutureAllocation) { unsafe {
     let domain_id = ExecutorDomainId::from_raw(allocation.owner_domain);
     let domain = GlobalAsyncExecutor::global()
         .get_executor_domain(domain_id)
@@ -31,4 +31,4 @@ pub unsafe extern "C" fn kernel_abi_future_free(allocation: AbiFutureAllocation)
         "invalid or stale ABI future allocation token"
     );
     domain.maybe_finish_draining();
-}
+}}

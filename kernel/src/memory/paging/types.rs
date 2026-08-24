@@ -64,7 +64,7 @@ impl TlbShootdownRange {
         Self {
             start,
             size,
-            stride: crate::memory::paging::base_page_size(),
+            stride: crate::memory::paging::layout::base_page_size(),
         }
     }
 

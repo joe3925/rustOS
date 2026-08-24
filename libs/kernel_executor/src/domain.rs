@@ -370,11 +370,11 @@ impl ExecutorDomain {
         if self.state() == ExecutorDomainState::Dead || task_id == 0 {
             return false;
         }
-        let Some((shard, local, generation)) = crate::runtime::slab::decode_slab_task_ptr(task_id)
+        let Some((shard, local, generation)) = crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
         else {
             return false;
         };
-        let slab = crate::runtime::slab::get_task_table();
+        let slab = crate::runtime::slab::task_slab::get_task_table();
         let Some(slot) = slab.get_slot(shard, local, generation) else {
             return false;
         };
@@ -414,7 +414,7 @@ impl ExecutorDomain {
     }
 
     fn pop_task_from_head(&self, ready_shard: usize) -> Option<usize> {
-        let slab = crate::runtime::slab::get_task_table();
+        let slab = crate::runtime::slab::task_slab::get_task_table();
         let ready_head = &self.ready_heads[ready_shard];
         let mut head = ready_head.0.load(Ordering::Acquire);
         loop {
@@ -422,7 +422,7 @@ impl ExecutorDomain {
             if task_id == 0 {
                 return None;
             }
-            let (shard, local, generation) = crate::runtime::slab::decode_slab_task_ptr(task_id)?;
+            let (shard, local, generation) = crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)?;
             let slot = slab.get_slot(shard, local, generation)?;
             let next_id = slot.ready_next.load(Ordering::Acquire);
             let tag = ((head >> TASK_ID_BITS).wrapping_add(1)) & READY_TAG_MASK;
@@ -607,10 +607,10 @@ impl DomainSlot {
     }
 
     #[inline]
-    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> {
+    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> { unsafe {
         Arc::increment_strong_count(ptr);
         Arc::from_raw(ptr)
-    }
+    }}
 }
 
 struct DomainChunk {

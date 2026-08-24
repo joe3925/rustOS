@@ -39,7 +39,7 @@ impl GDTTracker {
             selectors_per_cpu: PerCpuVec::new(),
         }
     }
-    pub unsafe fn init_gdt(&mut self) {
+    pub unsafe fn init_gdt(&mut self) { unsafe {
         let tss_static: &'static mut TaskStateSegment =
             Box::leak(Box::new(TaskStateSegment::new()));
         // Stacks
@@ -108,7 +108,7 @@ impl GDTTracker {
             self.selectors_per_cpu
                 .set_by_id(id, selectors, Selectors::default);
         }
-    }
+    }}
 }
 pub struct Selectors {
     pub(crate) kernel_code_selector: SegmentSelector,

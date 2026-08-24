@@ -1,12 +1,11 @@
-use crate::idt::InterruptGuard;
+use crate::idt::interrupt_impl::InterruptGuard;
 use kernel_routing::println;
 
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 
-use super::super::idt::NestedInterruptEnableGuard;
-use super::interrupt_index::{
-    APIC_TICKS_PER_NS, current_cpu_id, current_is_in_interrupt_atomic, send_eoi_timer,
-};
+use super::super::cpu::{current_cpu_id, current_is_in_interrupt_atomic};
+use super::super::interrupts::apic::local::send_eoi as send_eoi_timer;
+use super::super::timer::APIC_TICKS_PER_NS;
 use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
 use crate::scheduling::state::State;
 use crate::structs::per_cpu_vec::PerCpuVec;
@@ -48,7 +47,6 @@ pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     let Some(_fpu_guard) = KernelFpuGuard::try_new() else {
         return;
     };
-    // let _nested_interrupts = NestedInterruptEnableGuard::new();
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();
     bench_submit_interrupt_sample_current_core(unsafe { &*state });

@@ -219,7 +219,7 @@ impl<T> SlabShard<T> {
         Some(slot)
     }
 
-    unsafe fn release(&self, handle: SlabHandle) -> bool {
+    unsafe fn release(&self, handle: SlabHandle) -> bool { unsafe {
         let Some(slot) = self.slot(handle) else {
             return false;
         };
@@ -238,7 +238,7 @@ impl<T> SlabShard<T> {
         self.alloc_hint.store(index, Ordering::Relaxed);
         self.allocated_count.fetch_sub(1, Ordering::Relaxed);
         true
-    }
+    }}
 }
 
 impl<T> Drop for SlabShard<T> {
@@ -302,12 +302,12 @@ impl<T> GrowableSlab<T> {
         Some(slot.value.get())
     }
 
-    pub unsafe fn release(&self, handle: SlabHandle) -> bool {
+    pub unsafe fn release(&self, handle: SlabHandle) -> bool { unsafe {
         let Some(shard) = self.shards.get(handle.shard as usize) else {
             return false;
         };
         shard.release(handle)
-    }
+    }}
 
     pub fn allocated_count(&self) -> usize {
         self.shards

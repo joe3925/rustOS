@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
-use kernel_api::kernel_types::dma::IoBufferDmaSegment;
+use kernel_api::kernel_types::dma::implementation::IoBufferDmaSegment;
 use kernel_api::memory::VirtAddr;
 
 use crate::dma_region::ContiguousDmaRegion;

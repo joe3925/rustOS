@@ -1,4 +1,6 @@
-use super::{DEFAULT_SLOTS_PER_SHARD, MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
+use super::constants::{
+    DEFAULT_SLOTS_PER_SHARD, MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS,
+};
 
 #[derive(Clone, Copy)]
 pub struct SlabConfig {

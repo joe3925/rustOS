@@ -46,7 +46,7 @@ impl AddressSpacePlatform for X86Platform {
             .allocate_page_table_frame()
             .ok_or(PageMapError::NoMemory())?;
 
-        let root_virt = crate::memory::paging::map_physical_pages(
+        let root_virt = crate::memory::paging::mmio::map_physical_pages(
             root_phys,
             size_of::<PageTable>() as u64,
             PhysicalMappingCache::Cached,
@@ -66,7 +66,7 @@ impl AddressSpacePlatform for X86Platform {
         }
 
         let _ = unsafe {
-            crate::memory::paging::unmap_physical_pages(root_virt, size_of::<PageTable>() as u64)
+            crate::memory::paging::mmio::unmap_physical_pages(root_virt, size_of::<PageTable>() as u64)
         };
 
         Ok(PhysFrame::containing_address(PhysAddr::new(

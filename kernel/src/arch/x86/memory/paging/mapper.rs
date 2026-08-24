@@ -6,9 +6,9 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr as X86PhysAddr, VirtAddr as X86VirtAddr};
 
-use crate::memory::paging::{
-    KernelFrameAllocator, LocalTlbFlush, MappingSize, UnmapFrameDisposition,
-};
+use crate::memory::paging::frame_alloc::{KernelFrameAllocator};
+
+use crate::memory::paging::types::{LocalTlbFlush, MappingSize, UnmapFrameDisposition};
 use crate::platform::PageTableFrameAllocator;
 use crate::util::boot_info;
 

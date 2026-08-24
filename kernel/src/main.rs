@@ -87,6 +87,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_pe_entry(boot_info: *const ActiveBootInfo) -> ! {
+    ActivePlatform::init_early_kernel();
     if boot_info.is_null() {
         panic!("kernel_pe_entry received a null boot info pointer");
     }
@@ -103,65 +104,68 @@ pub extern "C" fn kernel_pe_entry(boot_info: *const ActiveBootInfo) -> ! {
     loop {}
 }
 unsafe fn copy_boot_info(src: &ActiveBootInfo) -> ActiveBootInfo {
-    BOOT_KERNEL_SYMBOL_STRING_LEN = 0;
+    unsafe {
+        BOOT_KERNEL_SYMBOL_STRING_LEN = 0;
 
-    let memory_regions = copy_memory_regions(&src.memory_regions);
-    let kernel_imports = copy_kernel_symbols(
-        &src.kernel_imports,
-        addr_of_mut!(BOOT_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
-        MAX_KERNEL_IMPORT_SYMBOLS,
-    );
-    let kernel_exports = copy_kernel_symbols(
-        &src.kernel_exports,
-        addr_of_mut!(BOOT_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
-        MAX_KERNEL_EXPORT_SYMBOLS,
-    );
-    let kernel_sections = copy_kernel_sections(&src.kernel_sections);
-    let framebuffer = copy_framebuffer(&src.framebuffer);
-    if let Optional::Some(framebuffer) = framebuffer {
-        *BOOT_FRAMEBUFFER.lock() = Some(framebuffer);
-    }
+        let memory_regions = copy_memory_regions(&src.memory_regions);
+        let kernel_imports = copy_kernel_symbols(
+            &src.kernel_imports,
+            addr_of_mut!(BOOT_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
+            MAX_KERNEL_IMPORT_SYMBOLS,
+        );
+        let kernel_exports = copy_kernel_symbols(
+            &src.kernel_exports,
+            addr_of_mut!(BOOT_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
+            MAX_KERNEL_EXPORT_SYMBOLS,
+        );
+        let kernel_sections = copy_kernel_sections(&src.kernel_sections);
+        let framebuffer = copy_framebuffer(&src.framebuffer);
+        if let Optional::Some(framebuffer) = framebuffer {
+            *BOOT_FRAMEBUFFER.lock() = Some(framebuffer);
+        }
 
-    ActiveBootInfo {
-        magic: src.magic,
-        flags: src.flags,
-        rsdp_addr: src.rsdp_addr,
-        arch_info: src.arch_info,
-        memory_regions,
-        framebuffer: Optional::None,
-        fdt_header: src.fdt_header,
-        kernel_imports,
-        kernel_exports,
-        ramdisk_addr: src.ramdisk_addr,
-        ramdisk_len: src.ramdisk_len,
-        kernel_addr: src.kernel_addr,
-        kernel_len: src.kernel_len,
-        kernel_image_offset: src.kernel_image_offset,
-        kernel_image_base: src.kernel_image_base,
-        kernel_image_size: src.kernel_image_size,
-        kernel_entry: src.kernel_entry,
-        kernel_text: src.kernel_text,
-        kernel_sections,
-        boot_packages: src.boot_packages,
-        stub_base: src.stub_base,
-        stub_size: src.stub_size,
+        ActiveBootInfo {
+            magic: src.magic,
+            flags: src.flags,
+            rsdp_addr: src.rsdp_addr,
+            arch_info: src.arch_info,
+            memory_regions,
+            framebuffer: Optional::None,
+            fdt_header: src.fdt_header,
+            kernel_imports,
+            kernel_exports,
+            ramdisk_addr: src.ramdisk_addr,
+            ramdisk_len: src.ramdisk_len,
+            kernel_addr: src.kernel_addr,
+            kernel_len: src.kernel_len,
+            kernel_image_offset: src.kernel_image_offset,
+            kernel_image_base: src.kernel_image_base,
+            kernel_image_size: src.kernel_image_size,
+            kernel_entry: src.kernel_entry,
+            kernel_text: src.kernel_text,
+            kernel_sections,
+            boot_packages: src.boot_packages,
+            stub_base: src.stub_base,
+            stub_size: src.stub_size,
+        }
     }
 }
 
 unsafe fn copy_memory_regions(src: &MemoryRegions) -> MemoryRegions {
-    if src.len() > MAX_BOOT_MEMORY_REGIONS {
-        panic!("kernel_pe_entry received too many memory regions");
-    }
-    if !src.is_empty() && src.as_ptr().is_null() {
-        panic!("kernel_pe_entry received a null memory region array");
-    }
+    unsafe {
+        if src.len() > MAX_BOOT_MEMORY_REGIONS {
+            panic!("kernel_pe_entry received too many memory regions");
+        }
+        if !src.is_empty() && src.as_ptr().is_null() {
+            panic!("kernel_pe_entry received a null memory region array");
+        }
 
-    let dst = addr_of_mut!(BOOT_MEMORY_REGIONS).cast::<MemoryRegion>();
-    if !src.is_empty() {
-        copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        let dst = addr_of_mut!(BOOT_MEMORY_REGIONS).cast::<MemoryRegion>();
+        if !src.is_empty() {
+            copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        }
+        MemoryRegions::from_raw_parts(dst, src.len())
     }
-
-    MemoryRegions::from_raw_parts(dst, src.len())
 }
 
 unsafe fn copy_kernel_symbols(
@@ -169,63 +173,69 @@ unsafe fn copy_kernel_symbols(
     dst: *mut KernelSymbol,
     capacity: usize,
 ) -> KernelSymbols {
-    if src.len() > capacity {
-        panic!("kernel_pe_entry received too many kernel symbols");
-    }
-    if !src.is_empty() && src.as_ptr().is_null() {
-        panic!("kernel_pe_entry received a null kernel symbol array");
-    }
+    unsafe {
+        if src.len() > capacity {
+            panic!("kernel_pe_entry received too many kernel symbols");
+        }
+        if !src.is_empty() && src.as_ptr().is_null() {
+            panic!("kernel_pe_entry received a null kernel symbol array");
+        }
 
-    for i in 0..src.len() {
-        let symbol = *src.as_ptr().add(i);
-        dst.add(i).write(KernelSymbol {
-            name: copy_kernel_symbol_string(symbol.name),
-            module: copy_kernel_symbol_string(symbol.module),
-        });
-    }
+        for i in 0..src.len() {
+            let symbol = *src.as_ptr().add(i);
+            dst.add(i).write(KernelSymbol {
+                name: copy_kernel_symbol_string(symbol.name),
+                module: copy_kernel_symbol_string(symbol.module),
+            });
+        }
 
-    KernelSymbols::from_raw_parts(dst.cast_const(), src.len())
+        KernelSymbols::from_raw_parts(dst.cast_const(), src.len())
+    }
 }
 
 unsafe fn copy_kernel_symbol_string(src: KernelSymbolString) -> KernelSymbolString {
-    if src.is_empty() {
-        return KernelSymbolString::empty();
-    }
-    if src.as_ptr().is_null() {
-        panic!("kernel_pe_entry received a null kernel symbol string");
-    }
+    unsafe {
+        if src.is_empty() {
+            return KernelSymbolString::empty();
+        }
+        if src.as_ptr().is_null() {
+            panic!("kernel_pe_entry received a null kernel symbol string");
+        }
 
-    let start = BOOT_KERNEL_SYMBOL_STRING_LEN;
-    let end = start
-        .checked_add(src.len())
-        .expect("kernel symbol string storage overflow");
-    if end > MAX_KERNEL_SYMBOL_STRING_BYTES {
-        panic!("kernel_pe_entry received too much kernel symbol string data");
+        let start = BOOT_KERNEL_SYMBOL_STRING_LEN;
+        let end = start
+            .checked_add(src.len())
+            .expect("kernel symbol string storage overflow");
+        if end > MAX_KERNEL_SYMBOL_STRING_BYTES {
+            panic!("kernel_pe_entry received too much kernel symbol string data");
+        }
+
+        let dst = addr_of_mut!(BOOT_KERNEL_SYMBOL_STRING_BYTES)
+            .cast::<u8>()
+            .add(start);
+        copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        BOOT_KERNEL_SYMBOL_STRING_LEN = end;
+
+        KernelSymbolString::from_raw_parts(dst.cast_const(), src.len())
     }
-
-    let dst = addr_of_mut!(BOOT_KERNEL_SYMBOL_STRING_BYTES)
-        .cast::<u8>()
-        .add(start);
-    copy_nonoverlapping(src.as_ptr(), dst, src.len());
-    BOOT_KERNEL_SYMBOL_STRING_LEN = end;
-
-    KernelSymbolString::from_raw_parts(dst.cast_const(), src.len())
 }
 
 unsafe fn copy_kernel_sections(src: &KernelSections) -> KernelSections {
-    if src.len() > MAX_KERNEL_SECTIONS {
-        panic!("kernel_pe_entry received too many kernel sections");
-    }
-    if !src.is_empty() && src.as_ptr().is_null() {
-        panic!("kernel_pe_entry received a null kernel section array");
-    }
+    unsafe {
+        if src.len() > MAX_KERNEL_SECTIONS {
+            panic!("kernel_pe_entry received too many kernel sections");
+        }
+        if !src.is_empty() && src.as_ptr().is_null() {
+            panic!("kernel_pe_entry received a null kernel section array");
+        }
 
-    let dst = addr_of_mut!(BOOT_KERNEL_SECTIONS).cast::<KernelSection>();
-    if !src.is_empty() {
-        copy_nonoverlapping(src.as_ptr(), dst, src.len());
-    }
+        let dst = addr_of_mut!(BOOT_KERNEL_SECTIONS).cast::<KernelSection>();
+        if !src.is_empty() {
+            copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        }
 
-    KernelSections::from_raw_parts(dst.cast_const(), src.len())
+        KernelSections::from_raw_parts(dst.cast_const(), src.len())
+    }
 }
 
 fn copy_framebuffer(src: &Optional<FrameBuffer>) -> Optional<FrameBuffer> {

@@ -7,7 +7,7 @@ use artifacts::{
     ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel,
     PublishedSdk, StubArtifact,
 };
-use config::{BuildPlan, HostPlan, LaunchPlan};
+use config::{BootPackageSource, BuildPlan, HostPlan, LaunchPlan};
 use serde::Serialize;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -66,6 +66,113 @@ fn try_main() -> Result<(), String> {
             run_qemu(&root, &plan, &launch, &host, options)
         }
         CliCommand::Bench(command) => bench::execute(&root, command),
+        CliCommand::Cargo(options) => {
+            let platform = options
+                .platform
+                .as_deref()
+                .ok_or_else(|| "cargo requires --platform NAME|FILE".to_string())?;
+            let plan = config::load_platform(&root, platform)?;
+            let release = options.args.iter().any(|arg| arg == "--release");
+            let offline = options.args.iter().any(|arg| arg == "--offline");
+
+            match options.component.as_str() {
+                "kernel" => {
+                    let (package_id, package_name) =
+                        driver::cargo_package_identity(&plan.kernel.manifest)?;
+                    if package_name != plan.kernel.package {
+                        return Err(format!(
+                            "kernel manifest contains package `{package_name}`, expected `{}`",
+                            plan.kernel.package
+                        ));
+                    }
+                    let mut command = cargo(&root);
+                    command
+                        .args(&options.args)
+                        .args(["--manifest-path"])
+                        .arg(&plan.kernel.manifest)
+                        .args(["-p", &package_id, "--target"])
+                        .arg(&plan.kernel.target)
+                        .args(["--bin", &plan.kernel.binary])
+                        .args(build_std_args())
+                        .env(
+                            "CARGO_TARGET_DIR",
+                            root.join("target/cargo").join(&plan.id).join("kernel"),
+                        );
+                    if plan.kernel.no_default_features {
+                        command.arg("--no-default-features");
+                    }
+                    if !plan.kernel.features.is_empty() {
+                        command.arg("--features").arg(plan.kernel.features.join(","));
+                    }
+                    run(command, "running Cargo for kernel")
+                }
+                "drivers" => {
+                    let sdk = create_kernel_sdk(&root, &plan, release)?;
+                    let mut found = false;
+                    for source in &plan.drivers.boot_packages {
+                        let BootPackageSource::LocalCargo { manifest } = source else {
+                            continue;
+                        };
+                        found = true;
+                        let (package_id, _) = driver::cargo_package_identity(manifest)?;
+                        let mut command = cargo(&root);
+                        command
+                            .args(&options.args)
+                            .args(["--manifest-path"])
+                            .arg(manifest)
+                            .args(["-p", &package_id, "--target"])
+                            .arg(&plan.drivers.target)
+                            .arg("--lib")
+                            .args(build_std_args())
+                            .env(
+                                "CARGO_TARGET_DIR",
+                                root.join("target/cargo").join(&plan.id).join("drivers"),
+                            )
+                            .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
+                        run(command, &format!("running Cargo for {}", manifest.display()))?;
+                    }
+                    if found {
+                        Ok(())
+                    } else {
+                        Err("platform has no local Cargo drivers".to_string())
+                    }
+                }
+                "stub" => {
+                    build_platform(&root, &plan, release, offline, &[])?;
+                    let (package_id, package_name) =
+                        driver::cargo_package_identity(&plan.stub.manifest)?;
+                    if package_name != plan.stub.package {
+                        return Err(format!(
+                            "stub manifest contains package `{package_name}`, expected `{}`",
+                            plan.stub.package
+                        ));
+                    }
+                    let output = artifact_root(&root, &plan, release);
+                    let mut command = cargo(&root);
+                    command
+                        .args(&options.args)
+                        .args(["--manifest-path"])
+                        .arg(&plan.stub.manifest)
+                        .args(["-p", &package_id, "--target", &plan.stub.target])
+                        .args(["--bin", &plan.stub.binary])
+                        .args(build_std_args())
+                        .env(
+                            "CARGO_TARGET_DIR",
+                            root.join("target/cargo").join(&plan.id).join("stub"),
+                        )
+                        .env(stub_rustflags_env(&plan.stub.target), &plan.stub.rustflags)
+                        .env("KERNEL_PE_PATH", output.join("kernel/kernel.exe"))
+                        .env(
+                            "RUSTOS_BOOT_PACKAGES_MANIFEST",
+                            output.join("generated/boot-packages.toml"),
+                        );
+                    run(command, "running Cargo for kernel stub")
+                }
+                other => Err(format!(
+                    "unknown cargo component `{other}`; expected kernel, drivers, or stub"
+                )),
+            }
+        }
     }
 }
 
@@ -77,6 +184,13 @@ enum CliCommand {
     Build(BuildOptions),
     Qemu(QemuOptions),
     Bench(bench::BenchCommand),
+    Cargo(CargoOptions),
+}
+
+struct CargoOptions {
+    platform: Option<String>,
+    component: String,
+    args: Vec<String>,
 }
 
 struct BuildOptions {
@@ -224,6 +338,39 @@ impl Cli {
                     command: CliCommand::Bench(command),
                 })
             }
+            Some("cargo") => {
+                args.next();
+                let mut platform = None;
+                while args.peek().is_some_and(|arg| arg != "--") {
+                    match args.next().unwrap().as_str() {
+                        "--platform" => {
+                            platform = Some(args.next().ok_or_else(|| {
+                                "--platform requires a name or TOML path".to_string()
+                            })?);
+                        }
+                        component => {
+                            if args.next().as_deref() != Some("--") {
+                                return Err(format!(
+                                    "cargo component `{component}` must be followed by `--`"
+                                ));
+                            }
+                            let cargo_args = args.collect::<Vec<_>>();
+                            if cargo_args.is_empty() {
+                                return Err("cargo passthrough requires a Cargo command after `--`"
+                                    .to_string());
+                            }
+                            return Ok(Self {
+                                command: CliCommand::Cargo(CargoOptions {
+                                    platform,
+                                    component: component.to_string(),
+                                    args: cargo_args,
+                                }),
+                            });
+                        }
+                    }
+                }
+                Err(usage())
+            }
             Some("-h" | "--help") => Err(usage()),
             Some(other) => Err(format!("unknown command `{other}`\n\n{}", usage())),
             None => Err(usage()),
@@ -238,6 +385,7 @@ fn usage() -> String {
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
         "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
+        "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
         "",
         "environment:",
         "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",

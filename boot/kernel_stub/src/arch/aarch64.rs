@@ -12,7 +12,7 @@ use aarch64_vmsa::attrs::{
     TwoPrivilegeTablePermissionLimits,
 };
 use aarch64_vmsa::config::format::Vmsa64;
-use aarch64_vmsa::config::granule::{Granule16KiB, Granule4KiB, Granule64KiB};
+use aarch64_vmsa::config::granule::{Granule4KiB, Granule16KiB, Granule64KiB};
 use aarch64_vmsa::config::regime::NonSecureEl1Stage1;
 use aarch64_vmsa::descriptor::{DescriptorFormat, HasLayout};
 use aarch64_vmsa::mapper::{Live, Mapper, MapperInvalidation};
@@ -27,8 +27,8 @@ use bootloader_api::{
 };
 use goblin::pe::header::COFF_MACHINE_ARM64;
 use kernel_abi::arch::{
-    Aarch64BootArchInfo, Aarch64PeTlsDirectory, RawTableFrameProvider, RecursiveFrameZeroProvider,
-    KERNEL_PE_BASE,
+    Aarch64BootArchInfo, Aarch64PeTlsDirectory, KERNEL_PE_BASE, RawTableFrameProvider,
+    RecursiveFrameZeroProvider,
 };
 use kernel_abi::{
     BootInfo, FdtHeader, FrameBuffer, FrameBufferInfo, MemoryRegionKind, Optional, PixelFormat,
@@ -41,8 +41,6 @@ use crate::platform::{
 };
 
 pub struct Aarch64Platform;
-
-pub type PlatformImpl = Aarch64Platform;
 
 static PAGE_SIZE: AtomicU64 = AtomicU64::new(0x1000);
 static MAIR: AtomicU64 = AtomicU64::new(0xff);
@@ -140,11 +138,8 @@ impl Stage1PermissionConfig for MapperConfig {}
 
 static KERNEL_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
-#[no_mangle]
-pub extern "C" fn _start(
-    boot_info: &'static mut LoaderBootInfo,
-    kernel_stack_top: u64,
-) -> ! {
+#[unsafe(no_mangle)]
+pub extern "C" fn _start(boot_info: &'static mut LoaderBootInfo, kernel_stack_top: u64) -> ! {
     KERNEL_STACK_TOP.store(kernel_stack_top, Ordering::Relaxed);
     crate::start(boot_info)
 }

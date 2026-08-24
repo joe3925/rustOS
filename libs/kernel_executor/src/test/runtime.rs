@@ -14,7 +14,7 @@ use crate::runtime::runtime::{
     block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
     spawn_join_owned_in_executor_domain as spawn_in_executor_domain, JoinAll,
 };
-use crate::runtime::slab::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
+use crate::runtime::slab::constants::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
 
 fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
@@ -41,8 +41,8 @@ fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
 
 #[test]
 fn caller_storage_and_spawn_join_macro_return_results() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let mut storage = core::pin::pin!(crate::runtime::runtime::JoinStorage::<usize>::new());
     let explicit = crate::runtime::runtime::spawn(storage.as_mut(), async { 41usize });
@@ -364,8 +364,8 @@ fn join_all_polls_ready_queue_after_child_wakes_parent() {
 // over-aligned futures all have to complete through the same public spawn API.
 #[test]
 fn spawn_joinhandle_completes_small_and_large_arena_storage_paths() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     assert!(size_of::<LargeJoinFuture>() > JOINABLE_STORAGE_SIZE);
     assert!(size_of::<LargeResult>() > JOINABLE_STORAGE_SIZE);
@@ -401,8 +401,8 @@ fn spawn_joinhandle_completes_small_and_large_arena_storage_paths() {
 // instead of relying on block_on or JoinAll to poll in a loop.
 #[test]
 fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -420,7 +420,7 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
         Poll::Pending
     ));
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -445,8 +445,8 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
 // the large-future path from depending on eager repolling by block_on/JoinAll.
 #[test]
 fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -468,7 +468,7 @@ fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
         Poll::Pending
     ));
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -494,8 +494,8 @@ fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
 // a stale waker left over from an earlier poll.
 #[test]
 fn slab_joinhandle_completion_uses_latest_registered_waiter() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -519,7 +519,7 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
         Poll::Pending
     ));
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -549,8 +549,8 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
 // same stale-waiter check independently.
 #[test]
 fn joinhandle_completion_uses_latest_registered_waiter() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -573,7 +573,7 @@ fn joinhandle_completion_uses_latest_registered_waiter() {
         Poll::Pending
     ));
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -603,8 +603,8 @@ fn joinhandle_completion_uses_latest_registered_waiter() {
 // dropped without consuming the result.
 #[test]
 fn dropping_completed_slab_joinhandle_drops_unconsumed_result_once() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -624,7 +624,7 @@ fn dropping_completed_slab_joinhandle_drops_unconsumed_result_once() {
         poll_once(&mut handle, &join_wake.waker()),
         Poll::Pending
     ));
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -641,7 +641,7 @@ fn dropping_completed_slab_joinhandle_drops_unconsumed_result_once() {
 
     drop(handle);
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         drops.load(Ordering::Acquire) == 1
     });
 }
@@ -651,8 +651,8 @@ fn dropping_completed_slab_joinhandle_drops_unconsumed_result_once() {
 // still be dropped exactly once when the slot is released.
 #[test]
 fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -672,7 +672,7 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
         poll_once(&mut handle, &join_wake.waker()),
         Poll::Pending
     ));
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -683,7 +683,7 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
     ready.store(true, Ordering::Release);
     take_child_waker(&child_waker).wake();
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         completed.load(Ordering::Acquire) == 1 && drops.load(Ordering::Acquire) == 1
     });
 }
@@ -693,8 +693,8 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
 // still drop that result exactly once.
 #[test]
 fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -718,7 +718,7 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
         poll_once(&mut handle, &join_wake.waker()),
         Poll::Pending
     ));
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -735,7 +735,7 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
 
     drop(handle);
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         drops.load(Ordering::Acquire) == 1
     });
 }
@@ -745,8 +745,8 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
 // dropped when the task finishes with no waiter left.
 #[test]
 fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
@@ -770,7 +770,7 @@ fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
         poll_once(&mut handle, &join_wake.waker()),
         Poll::Pending
     ));
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         child_waker
             .lock()
             .expect("controlled future waker lock")
@@ -781,7 +781,7 @@ fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
     ready.store(true, Ordering::Release);
     take_child_waker(&child_waker).wake();
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         completed.load(Ordering::Acquire) == 1 && drops.load(Ordering::Acquire) == 1
     });
 }
@@ -792,8 +792,8 @@ fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
 #[test]
 #[should_panic(expected = "JoinHandle polled after completion")]
 fn slab_joinhandle_panics_when_polled_after_completion() {
-    let guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let mut handle = spawn(async { 5usize });
     assert_eq!(block_on(async { (&mut handle).await }), 5);
@@ -825,10 +825,10 @@ fn join_all_empty_is_ready_without_parent_wake() {
 // JoinAll paths to cooperate while many tasks are in flight.
 #[test]
 fn many_joinable_tasks_reschedule_across_core_count_shards() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
-    let tasks = super::stress_task_count(256);
+    let tasks = super::support::stress_task_count(256);
     let expected = tasks * (tasks - 1) / 2;
 
     let results = block_on(async {
@@ -852,13 +852,13 @@ fn many_joinable_tasks_reschedule_across_core_count_shards() {
 // shared state instead.
 #[test]
 fn spawn_detached_runs_size_class_and_large_direct_futures() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     assert!(size_of::<LargeDetachedFuture>() > 4096);
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let inline_tasks = super::stress_task_count(128);
+    let inline_tasks = super::support::stress_task_count(128);
 
     for _ in 0..inline_tasks {
         let counter = counter.clone();
@@ -872,7 +872,7 @@ fn spawn_detached_runs_size_class_and_large_direct_futures() {
         counter: counter.clone(),
     });
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         counter.load(Ordering::Acquire) == inline_tasks + 1
     });
 }
@@ -882,8 +882,8 @@ fn spawn_detached_runs_size_class_and_large_direct_futures() {
 // oversized future cleanup paths.
 #[test]
 fn dropping_joinhandles_does_not_cancel_queued_work() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let completed = Arc::new(AtomicUsize::new(0));
 
@@ -902,7 +902,7 @@ fn dropping_joinhandles_does_not_cancel_queued_work() {
     drop(small);
     drop(large);
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         completed.load(Ordering::Acquire) == 2
     });
 }
@@ -911,8 +911,8 @@ fn dropping_joinhandles_does_not_cancel_queued_work() {
 // different host thread after returning Pending.
 #[test]
 fn externally_woken_future_is_rescheduled_by_executor_waker() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
     let value = block_on(async {
@@ -931,8 +931,8 @@ fn externally_woken_future_is_rescheduled_by_executor_waker() {
 // and driven to completion by the same executor backend.
 #[test]
 fn abi_spawn_internal_runs_owned_abi_future() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let completed = Arc::new(AtomicUsize::new(0));
     let completed_for_future = completed.clone();
@@ -944,7 +944,7 @@ fn abi_spawn_internal_runs_owned_abi_future() {
         kernel_spawn_abi_internal(future);
     }));
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         completed.load(Ordering::Acquire) == 1
     });
 }
@@ -998,8 +998,8 @@ impl Future for RootAbiProbe {
 
 #[test]
 fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let domain_id =
         GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
@@ -1020,7 +1020,7 @@ fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
         },
     ));
 
-    super::wait_until(Duration::from_secs(5), || {
+    super::support::wait_until(Duration::from_secs(5), || {
         GlobalAsyncExecutor::global()
             .executor_domain_stats(domain_id)
             .is_some_and(|stats| stats.live_task_count == 0)
@@ -1040,8 +1040,8 @@ fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
 
 #[test]
 fn spawn_in_executor_domain_completes_joinhandle() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelHigh,
@@ -1051,7 +1051,7 @@ fn spawn_in_executor_domain_completes_joinhandle() {
     let value = block_on(async { spawn_in_executor_domain(domain_id, async { 1234usize }).await });
     assert_eq!(value, 1234);
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         GlobalAsyncExecutor::global()
             .executor_domain_stats(domain_id)
             .is_some_and(|stats| stats.completed >= 1)
@@ -1060,8 +1060,8 @@ fn spawn_in_executor_domain_completes_joinhandle() {
 
 #[test]
 fn spawn_detached_in_executor_domain_executes_work() {
-    let _guard = super::global_runtime_lock();
-    super::init_threaded_runtime();
+    let _guard = super::support::global_runtime_lock();
+    super::support::init_threaded_runtime();
 
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
         class: ExecutorDomainClass::KernelBackground,
@@ -1074,11 +1074,11 @@ fn spawn_detached_in_executor_domain_executes_work() {
         counter_for_task.fetch_add(1, Ordering::AcqRel);
     });
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         counter.load(Ordering::Acquire) == 1
     });
 
-    super::wait_until(Duration::from_secs(10), || {
+    super::support::wait_until(Duration::from_secs(10), || {
         GlobalAsyncExecutor::global()
             .executor_domain_stats(domain_id)
             .is_some_and(|stats| stats.completed >= 1)

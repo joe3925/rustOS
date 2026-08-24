@@ -1,4 +1,4 @@
-use crate::dma::{FromDevice, IoBuffer, ToDevice};
+use crate::dma::implementation::{FromDevice, IoBuffer, ToDevice};
 use crate::error::KernelError;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;

@@ -2,7 +2,7 @@ use super::driver_index::{self, HwIndex};
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::error::error_with_message;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::object_manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
+use crate::object_manager::manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
 use kernel_types::error::{DriverErrorKind, KernelError, ResultErrorContext};
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;

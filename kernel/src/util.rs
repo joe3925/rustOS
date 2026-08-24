@@ -12,19 +12,19 @@ use crate::file_system::file_provider::{
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::memory::heap::{enable_mimalloc, heap_capacity_bytes, init_heap};
+use crate::memory::heap::heap::{enable_mimalloc, heap_capacity_bytes, init_heap};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
-use crate::memory::paging::{
-    KernelFrameAllocator, boot_usable_bytes, init_emergency_zero_mappings,
-    init_kernel_address_space_root, kernel_address_space_root, resize_bitmap_for_ram,
-    start_zero_page_worker, switch_address_space_root, unmap_reserved_range_unchecked,
-};
+use crate::memory::paging::address_space::{init_kernel_address_space_root, kernel_address_space_root, switch_address_space_root};
+use crate::memory::paging::frame_alloc::{KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram};
+use crate::memory::paging::map::{unmap_reserved_range_unchecked};
+use crate::memory::paging::zero::{init_emergency_zero_mappings, start_zero_page_worker};
 use crate::platform::{
-    breakpoint, broadcast_panic_stop, calibrate_boot_timer, current_cpu_id,
-    current_is_in_interrupt, current_platform_cpu_id, cycle_counter, disable_interrupts,
-    enable_interrupts, enable_interrupts_and_halt, fatal_reset, halt, init_boot_processor,
-    init_current_cpu_local_state, init_periodic_timer, processor_count, start_secondary_cpus,
+    ActivePlatform, ConsolePlatform, breakpoint, broadcast_panic_stop, calibrate_boot_timer,
+    current_cpu_id, current_is_in_interrupt, current_platform_cpu_id, cycle_counter,
+    disable_interrupts, enable_interrupts, enable_interrupts_and_halt, fatal_reset, halt,
+    init_boot_processor, init_current_cpu_local_state, init_periodic_timer, processor_count,
+    start_secondary_cpus,
 };
 use crate::profiling::backtrace::{self, Backtrace};
 use crate::registry::init as init_registry;
@@ -39,6 +39,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use core::cmp::max;
+use core::fmt::Write;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -63,6 +64,7 @@ pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANIC_RUNTIME_READY: AtomicBool = AtomicBool::new(false);
 
 static PANIC_OWNER: Once<u32> = Once::new();
 pub static PANIC_STATE: Once<State> = Once::new();
@@ -117,6 +119,7 @@ pub unsafe fn init() {
 
     init_periodic_timer();
     SCHEDULER.init_core(current_cpu_id());
+    PANIC_RUNTIME_READY.store(true, Ordering::Release);
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
         0,
@@ -250,6 +253,13 @@ fn current_cpu_owns_panic() -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
+    if !PANIC_RUNTIME_READY.load(Ordering::Acquire) {
+        let mut writer = EarlyPanicWriter;
+        let _ = writeln!(writer, "=== EARLY KERNEL PANIC [{}] ===", mod_name);
+        let _ = writeln!(writer, "{}", info);
+        halt_loop()
+    }
+
     if !current_cpu_owns_panic() {
         halt_loop()
     }
@@ -332,6 +342,15 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     broadcast_panic_stop();
 
     halt_loop()
+}
+
+struct EarlyPanicWriter;
+
+impl Write for EarlyPanicWriter {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        <ActivePlatform as ConsolePlatform>::serial_write_bytes(value.as_bytes());
+        Ok(())
+    }
 }
 
 pub fn exception_panic(message: String, state: &State) -> ! {
@@ -545,21 +564,21 @@ fn validate_stub_slice(ptr: usize, len: usize, stub_base: u64, stub_size: u64, w
         panic!("boot package {what} lies outside kernel stub memory");
     }
 }
-unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) {
+unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) { unsafe {
     (
         TLS_TEST_INIT_U64,
         TLS_TEST_INIT_BYTES,
         TLS_TEST_ZERO_U64,
         TLS_TEST_ZERO_BYTES,
     )
-}
+}}
 
-unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) {
+unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) { unsafe {
     TLS_TEST_INIT_U64 = init_u64;
     TLS_TEST_INIT_BYTES = init_bytes;
     TLS_TEST_ZERO_U64 = zero_u64;
     TLS_TEST_ZERO_BYTES = zero_bytes;
-}
+}}
 
 extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
     let expected = unsafe { tls_test_snapshot() };

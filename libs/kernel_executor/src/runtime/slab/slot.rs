@@ -175,11 +175,11 @@ impl TaskSlot {
     ) where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
-    {
+    { unsafe {
         self.result_ptr
             .store(result_ptr as usize, Ordering::Release);
         self.init_internal::<F, T>(domain_id, allocation, poll_joinable::<F, T>);
-    }
+    }}
 
     pub fn executor_domain_id(&self) -> Option<ExecutorDomainId> {
         unsafe { *self.domain_id.get() }
@@ -188,9 +188,9 @@ impl TaskSlot {
     pub unsafe fn init_detached<F>(&self, domain_id: ExecutorDomainId, allocation: FutureAllocation)
     where
         F: Future<Output = ()> + Send + 'static,
-    {
+    { unsafe {
         self.init_internal::<F, ()>(domain_id, allocation, poll_detached::<F>);
-    }
+    }}
 
     unsafe fn init_internal<F, T>(
         &self,
@@ -200,7 +200,7 @@ impl TaskSlot {
     ) where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
-    {
+    { unsafe {
         *self.domain_id.get() = Some(domain_id);
         *self.future.get() = Some(allocation);
         write_poll_fn(&self.poll_fn, Some(poll_fn));
@@ -210,7 +210,7 @@ impl TaskSlot {
         self.cached_waker_state.store(CW_NONE, Ordering::Release);
 
         self.state.store(STATE_QUEUED, Ordering::Release);
-    }
+    }}
 
     pub fn poll_once(
         &self,
@@ -298,10 +298,10 @@ impl TaskSlot {
         allocation: FutureAllocation,
     ) where
         F: Future<Output = ()> + Send + 'static,
-    {
+    { unsafe {
         self.init_detached::<F>(domain_id, allocation);
         *self.cancel_fn.get() = Some(cancel_future::<F>);
-    }
+    }}
 
     pub fn request_abort(&self) -> bool {
         if self.state.load(Ordering::Acquire) == STATE_COMPLETED {
@@ -502,7 +502,7 @@ unsafe fn poll_joinable<F, T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
     F: Future<Output = T>,
     T: Send + 'static,
-{
+{ unsafe {
     let allocation = (&mut *slot.future.get())
         .as_mut()
         .expect("task future allocation missing");
@@ -538,12 +538,12 @@ where
         }
         Poll::Pending => false,
     }
-}
+}}
 
 unsafe fn poll_detached<F>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
     F: Future<Output = ()>,
-{
+{ unsafe {
     let allocation = (&mut *slot.future.get())
         .as_mut()
         .expect("task future allocation missing");
@@ -559,18 +559,18 @@ where
         }
         Poll::Pending => false,
     }
-}
+}}
 
-unsafe fn release_future_allocation(allocation: FutureAllocation) {
+unsafe fn release_future_allocation(allocation: FutureAllocation) { unsafe {
     let domain_id = allocation.owner_domain;
     let domain = GlobalAsyncExecutor::global()
         .get_executor_domain(domain_id)
         .expect("future owner domain disappeared while allocation was live");
     assert!(domain.future_arena().release(allocation));
     domain.maybe_finish_draining();
-}
+}}
 
-unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) {
+unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) { unsafe {
     if let Some(allocation) = (&mut *slot.future.get()).take() {
         core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
         release_future_allocation(allocation);
@@ -578,4 +578,4 @@ unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) {
     write_poll_fn(&slot.poll_fn, None);
     write_drop_fn(&slot.drop_fn, None);
     *slot.cancel_fn.get() = None;
-}
+}}

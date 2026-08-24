@@ -213,8 +213,10 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
     let boot_image = if let Some(path) = &options.boot_image {
         resolve(root, path)
     } else {
-        std::env::set_var("RUSTOS_BENCH_SUITES", options.suites.join(","));
-        std::env::set_var("RUSTOS_BENCH_TAGS", options.tags.join(","));
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RUSTOS_BENCH_SUITES", options.suites.join(",")) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RUSTOS_BENCH_TAGS", options.tags.join(",")) };
         build_platform(
             root,
             &platform,
@@ -369,8 +371,10 @@ fn run_topology(
         launch: Some(launch.id.clone()),
         host: None,
     };
-    std::env::set_var("RUSTOS_QEMU_SMP", cpus.to_string());
-    std::env::set_var("RUSTOS_QEMU_SERIAL", "stdio");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RUSTOS_QEMU_SMP", cpus.to_string()) };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RUSTOS_QEMU_SERIAL", "stdio") };
     let args = qemu_args(root, launch, firmware, boot_image, disk, &qemu_options)?;
 
     let mut child = Command::new(qemu)

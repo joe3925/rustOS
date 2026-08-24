@@ -8,7 +8,7 @@ use kernel_types::completion::{CompletionPermit, TaskCompletion};
 
 use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};
-use crate::platform::Platform;
+use crate::platform::contract::Platform;
 
 struct PortChunk<T> {
     queue: BoundedMpmcQueue<TaskCompletion<T>>,

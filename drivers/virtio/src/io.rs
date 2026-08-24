@@ -10,12 +10,12 @@ use crate::{
 use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
-use kernel_api::dma::dma::IoBuffer;
-use kernel_api::dma::dma::IoBufferAccess;
+use kernel_api::kernel_types::dma::implementation::IoBuffer;
+use kernel_api::kernel_types::dma::implementation::IoBufferAccess;
 use kernel_api::error::{
     DriverErrorKind, KernelError, ResultErrorContext, error, error_with_message,
 };
-use kernel_api::kernel_types::dma::IoBufferDmaSegment;
+use kernel_api::kernel_types::dma::implementation::IoBufferDmaSegment;
 use kernel_api::kernel_types::io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite};
 use kernel_api::pnp::DriverStep;
 use kernel_api::request::{DeviceControl, Flush, Read, Write};

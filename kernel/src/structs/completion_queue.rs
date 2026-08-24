@@ -9,7 +9,7 @@ use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome};
 use crate::sync_platform::{CompletionPort as KernelCompletionPort, CompletionPortPermit};
 use crate::structs::executor_domain::UserExecutorDomain;
 
-use super::io_request::{
+use super::io_request::request::{
     CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable, KernelIoOp,
     RequestId, RequestTableError, UserIoCompletion,
 };

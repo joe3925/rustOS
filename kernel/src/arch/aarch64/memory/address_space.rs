@@ -84,7 +84,7 @@ impl AddressSpacePlatform for Aarch64Platform {
             return Err(PageMapError::TranslationFailed());
         }
 
-        let root_virt = match crate::memory::paging::map_physical_pages(
+        let root_virt = match crate::memory::paging::mmio::map_physical_pages(
             root_phys,
             table_size,
             PhysicalMappingCache::Cached,
@@ -105,7 +105,7 @@ impl AddressSpacePlatform for Aarch64Platform {
         let entries = table_size as usize / core::mem::size_of::<u64>();
         let recursive_index = usize::from(boot_info().arch_info.recursive_index);
         if recursive_index >= entries {
-            let _ = unsafe { crate::memory::paging::unmap_physical_pages(root_virt, table_size) };
+            let _ = unsafe { crate::memory::paging::mmio::unmap_physical_pages(root_virt, table_size) };
             allocator.free_page_table_frame(root_phys);
             return Err(PageMapError::TranslationFailed());
         }
@@ -119,7 +119,7 @@ impl AddressSpacePlatform for Aarch64Platform {
         unsafe { new_table.add(recursive_index).write(recursive) };
 
         if let Err(error) =
-            unsafe { crate::memory::paging::unmap_physical_pages(root_virt, table_size) }
+            unsafe { crate::memory::paging::mmio::unmap_physical_pages(root_virt, table_size) }
         {
             return Err(error);
         }

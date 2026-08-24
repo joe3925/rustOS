@@ -7,9 +7,10 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::irq::{
-    AtomicIrqMeta, DropHook, IrqBorrowedHandle, IrqFrame, IrqHandle, IrqHandleInner, IrqIsrFn,
-    IrqMeta, IrqSafeRwLock, IrqWaitResult, WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET,
-    WAITER_PREPARING, WAITER_SIGNALED, WAITER_WAITING, WaiterSlot,
+    AtomicIrqMeta, DropHook, HardwareInterruptId, IrqBorrowedHandle, IrqFrame, IrqHandle,
+    IrqHandleInner, IrqIsrFn, IrqMeta, IrqSafeRwLock, IrqWaitResult, MsiBinding, MsiBindingRequest,
+    WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET, WAITER_PREPARING, WAITER_SIGNALED,
+    WAITER_WAITING, WaiterSlot,
 };
 use spin::{Mutex, Once};
 
@@ -21,12 +22,15 @@ const MAX_HANDLERS_PER_VECTOR: usize = 4;
 const MAX_TOTAL_REGISTRATIONS: usize = 64;
 const RESERVED_ID: usize = usize::MAX;
 const NO_VECTOR: usize = usize::MAX;
+const NO_SOURCE: usize = usize::MAX;
+const MAX_INTERRUPT_IDS: usize = 1024;
+static BINDING_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_handle_create(drop_hook: DropHook) -> IrqHandle {
     let ptr = create_irq_handle_inner(drop_hook);
 
-    match irq_manager().install_handle(NO_VECTOR, ptr) {
+    match irq_manager().install_handle(NO_VECTOR, NO_SOURCE, ptr) {
         Some(handle) => handle,
         None => {
             unsafe {
@@ -48,6 +52,7 @@ pub extern "C" fn irq_handle_drop(_h: IrqHandle) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_handle_unregister(h: &IrqHandle) {
+    let _lifecycle = BINDING_LIFECYCLE.lock();
     irq_manager().unregister_handle(*h);
 }
 
@@ -473,7 +478,7 @@ unsafe impl Send for IrqReg {}
 unsafe impl Sync for IrqReg {}
 
 extern "C" fn dummy_isr(
-    _: u8,
+    _: u32,
     _: u32,
     _: &mut InterruptFrame,
     _: IrqBorrowedHandle,
@@ -502,6 +507,7 @@ struct IdMapEntry {
     id: AtomicUsize,
     generation: AtomicUsize,
     vector: AtomicUsize,
+    source: AtomicUsize,
     ptr: AtomicUsize,
     lifetime: IrqSafeRwLock<()>,
 }
@@ -512,6 +518,7 @@ impl IdMapEntry {
             id: AtomicUsize::new(0),
             generation: AtomicUsize::new(0),
             vector: AtomicUsize::new(NO_VECTOR),
+            source: AtomicUsize::new(NO_SOURCE),
             ptr: AtomicUsize::new(0),
             lifetime: IrqSafeRwLock::new(()),
         }
@@ -600,27 +607,10 @@ impl VectorAllocator {
             state.allocated.store(false, Ordering::Release);
         }
     }
-
-    fn free_explicit(vector: u8) -> bool {
-        if !Self::is_dynamic(vector) {
-            return false;
-        }
-
-        let state = &vector_alloc_table()[vector as usize];
-
-        if state.users.load(Ordering::Acquire) != 0 {
-            return false;
-        }
-
-        state
-            .allocated
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
 }
 
 pub struct IrqManager {
-    vectors: [VectorSlot; 256],
+    vectors: [VectorSlot; MAX_INTERRUPT_IDS],
     id_map: [IdMapEntry; MAX_TOTAL_REGISTRATIONS],
     next_id: AtomicUsize,
     next_generation: AtomicUsize,
@@ -656,7 +646,12 @@ impl IrqManager {
         generation
     }
 
-    fn install_handle(&self, vector: usize, ptr: NonNull<IrqHandleInner>) -> Option<IrqHandle> {
+    fn install_handle(
+        &self,
+        vector: usize,
+        source: usize,
+        ptr: NonNull<IrqHandleInner>,
+    ) -> Option<IrqHandle> {
         let id = self.alloc_id();
         let generation = self.alloc_generation();
 
@@ -673,6 +668,7 @@ impl IrqManager {
 
             entry.ptr.store(ptr.as_ptr() as usize, Ordering::Release);
             entry.vector.store(vector, Ordering::Release);
+            entry.source.store(source, Ordering::Release);
             entry.generation.store(generation, Ordering::Release);
             entry.id.store(id, Ordering::Release);
 
@@ -717,20 +713,21 @@ impl IrqManager {
 
     fn register(
         &self,
-        vector: u8,
+        interrupt_id: u32,
         isr: IrqIsrFn,
         ctx: usize,
         handle: NonNull<IrqHandleInner>,
         exclusive: bool,
+        source: usize,
     ) -> Option<IrqHandle> {
-        let slot = &self.vectors[vector as usize];
+        let slot = self.vectors.get(interrupt_id as usize)?;
         let mut regs = slot.regs.write();
 
         if regs.len() >= MAX_HANDLERS_PER_VECTOR || (exclusive && !regs.is_empty()) {
             return None;
         }
 
-        let public_handle = self.install_handle(vector as usize, handle)?;
+        let public_handle = self.install_handle(interrupt_id as usize, source, handle)?;
 
         regs.push(IrqReg {
             id: public_handle.id,
@@ -785,6 +782,10 @@ impl IrqManager {
                     return;
                 };
 
+                let source = entry.source.load(Ordering::Acquire);
+                if regs.len() == 1 && source != NO_SOURCE {
+                    platform::unbind_wired_interrupt(HardwareInterruptId(source as u32));
+                }
                 let reg = regs.swap_remove(pos);
                 let inner = unsafe { reg.handle.as_ref() };
 
@@ -796,6 +797,7 @@ impl IrqManager {
 
                 entry.ptr.store(0, Ordering::Release);
                 entry.vector.store(NO_VECTOR, Ordering::Release);
+                entry.source.store(NO_SOURCE, Ordering::Release);
                 entry.generation.store(0, Ordering::Release);
                 entry.id.store(0, Ordering::Release);
 
@@ -806,7 +808,12 @@ impl IrqManager {
                     drop(Box::from_raw(reg.handle.as_ptr()));
                 }
 
-                if VectorAllocator::is_dynamic(vector as u8) {
+                let owns_vector = source == NO_SOURCE
+                    || platform::wired_interrupt_id(HardwareInterruptId(source as u32)).is_none();
+                if vector <= u8::MAX as usize
+                    && owns_vector
+                    && VectorAllocator::is_dynamic(vector as u8)
+                {
                     VectorAllocator::release_after_unregister(vector as u8);
                 }
 
@@ -839,6 +846,7 @@ impl IrqManager {
 
             entry.ptr.store(0, Ordering::Release);
             entry.vector.store(NO_VECTOR, Ordering::Release);
+            entry.source.store(NO_SOURCE, Ordering::Release);
             entry.generation.store(0, Ordering::Release);
             entry.id.store(0, Ordering::Release);
 
@@ -852,21 +860,21 @@ impl IrqManager {
         }
     }
 
-    fn dispatch(&self, vector: u8, frame: &mut InterruptFrame) {
+    fn dispatch(&self, interrupt_id: u32, frame: &mut InterruptFrame) {
         let cpu = platform::current_cpu_id() as u32;
-        let slot = &self.vectors[vector as usize];
+        let Some(slot) = self.vectors.get(interrupt_id as usize) else {
+            return;
+        };
         let regs = slot.regs.read();
 
         for r in regs.iter() {
             let frame = unsafe { &mut *(frame as *mut InterruptFrame as *mut IrqFrame) };
-            let claimed = (r.isr)(vector, cpu, frame, r.handle.as_ptr(), r.ctx);
+            let claimed = (r.isr)(interrupt_id, cpu, frame, r.handle.as_ptr(), r.ctx);
 
             if claimed {
                 break;
             }
         }
-
-        platform::end_interrupt(vector);
     }
 }
 
@@ -882,7 +890,7 @@ fn null_handle() -> IrqHandle {
 
 extern "C" fn dummy_drop(_: usize) {}
 
-pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
+fn register_vector(vector: u8, isr: IrqIsrFn, ctx: usize, source: usize) -> IrqHandle {
     if platform::is_reserved_vector(vector) {
         return null_handle();
     }
@@ -895,12 +903,8 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
 
     let handle_ptr = create_irq_handle_inner(DropHook::new(dummy_drop, 0));
 
-    let first_for_vector = {
-        let regs = irq_manager().vectors[vector as usize].regs.read();
-        regs.is_empty()
-    };
-
-    let Some(handle) = irq_manager().register(vector, isr, ctx, handle_ptr, dynamic) else {
+    let Some(handle) = irq_manager().register(vector as u32, isr, ctx, handle_ptr, dynamic, source)
+    else {
         unsafe {
             drop(Box::from_raw(handle_ptr.as_ptr()));
         }
@@ -912,44 +916,69 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
         return null_handle();
     };
 
-    if first_for_vector {
-        if let Some(gsi) = platform::vector_to_gsi(vector) {
-            platform::unmask_gsi_any_cpu(gsi, vector);
-        }
-    }
-
     handle
 }
 
-pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
-    let Some(vector) = platform::gsi_to_vector(gsi) else {
-        return null_handle();
-    };
-
-    let handle_ptr = create_irq_handle_inner(DropHook::new(dummy_drop, 0));
-
-    let first_for_vector = {
-        let regs = irq_manager().vectors[vector as usize].regs.read();
-        regs.is_empty()
-    };
-
-    let Some(handle) = irq_manager().register(vector, isr, ctx, handle_ptr, false) else {
-        unsafe {
-            drop(Box::from_raw(handle_ptr.as_ptr()));
+pub fn bind_wired_interrupt(source: HardwareInterruptId, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
+    let lifecycle = BINDING_LIFECYCLE.lock();
+    let (interrupt_id, handle, activate) = if let Some(interrupt_id) =
+        platform::wired_interrupt_id(source)
+    {
+        if interrupt_id as usize >= MAX_INTERRUPT_IDS {
+            return null_handle();
         }
-
-        return null_handle();
+        let activate = irq_manager().vectors[interrupt_id as usize]
+            .regs
+            .read()
+            .is_empty();
+        let handle_ptr = create_irq_handle_inner(DropHook::new(dummy_drop, 0));
+        let Some(handle) =
+            irq_manager().register(interrupt_id, isr, ctx, handle_ptr, false, source.0 as usize)
+        else {
+            unsafe { drop(Box::from_raw(handle_ptr.as_ptr())) };
+            return null_handle();
+        };
+        (interrupt_id, handle, activate)
+    } else {
+        let Some(vector) = VectorAllocator::alloc() else {
+            return null_handle();
+        };
+        (
+            vector as u32,
+            register_vector(vector, isr, ctx, source.0 as usize),
+            true,
+        )
     };
-
-    if first_for_vector {
-        platform::unmask_gsi_any_cpu(gsi, vector);
+    if handle.is_null() {
+        return handle;
     }
-
+    if activate && !platform::bind_wired_interrupt(source, interrupt_id) {
+        drop(lifecycle);
+        irq_manager().unregister_handle(handle);
+        return null_handle();
+    }
     handle
 }
 
-pub fn irq_dispatch(vector: u8, frame: &mut InterruptFrame) {
-    irq_manager().dispatch(vector, frame);
+pub fn bind_msi_interrupt(
+    request: &MsiBindingRequest,
+    isr: IrqIsrFn,
+    ctx: usize,
+) -> Option<MsiBinding> {
+    let vector = VectorAllocator::alloc()?;
+    let handle = register_vector(vector, isr, ctx, NO_SOURCE);
+    if handle.is_null() {
+        return None;
+    }
+    let Some(message) = platform::compose_msi_message(request, vector) else {
+        irq_manager().unregister_handle(handle);
+        return None;
+    };
+    Some(MsiBinding { handle, message })
+}
+
+pub fn irq_dispatch(interrupt_id: u32, frame: &mut InterruptFrame) {
+    irq_manager().dispatch(interrupt_id, frame);
 }
 
 pub fn irq_signal(handle: &IrqHandle, meta: IrqMeta) {
@@ -1006,14 +1035,6 @@ pub unsafe fn irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta) 
     };
 
     inner.signal_all(meta);
-}
-
-pub fn irq_alloc_vector() -> Option<u8> {
-    VectorAllocator::alloc()
-}
-
-pub fn irq_free_vector(vector: u8) -> bool {
-    VectorAllocator::free_explicit(vector)
 }
 
 pub struct InterruptGuard {

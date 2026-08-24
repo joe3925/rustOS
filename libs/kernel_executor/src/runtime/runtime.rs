@@ -15,7 +15,7 @@ use crate::platform::{platform, Job};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
 
-use super::slab::get_task_table;
+use super::slab::task_slab::get_task_table;
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
 
 pub(crate) fn submit_global_to_executor_domain(domain_id: ExecutorDomainId, ctx: usize) {
@@ -114,17 +114,17 @@ impl<T> JoinStorage<T> {
         }
     }
 
-    pub(crate) unsafe fn write(&self, output: T) {
+    pub(crate) unsafe fn write(&self, output: T) { unsafe {
         (*self.output.get()).write(output);
-    }
+    }}
 
-    unsafe fn take(&self) -> T {
+    unsafe fn take(&self) -> T { unsafe {
         (*self.output.get()).assume_init_read()
-    }
+    }}
 
-    unsafe fn drop_output(&self) {
+    unsafe fn drop_output(&self) { unsafe {
         (*self.output.get()).assume_init_drop();
-    }
+    }}
 }
 
 unsafe impl<T: Send> Send for JoinStorage<T> {}
@@ -597,7 +597,7 @@ where
 }
 
 pub fn abort_task(token: TaskToken) -> bool {
-    let Some((shard, local, generation)) = super::slab::decode_slab_task_ptr(token.raw()) else {
+    let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token.raw()) else {
         return false;
     };
     let slab = get_task_table();
@@ -608,7 +608,7 @@ pub fn abort_task(token: TaskToken) -> bool {
         .get_slot(shard, local, generation)
         .is_some_and(|slot| slot.request_abort());
     if result {
-        super::slab::enqueue_slab_task(shard, local, generation);
+        super::slab::ptr::enqueue_slab_task(shard, local, generation);
     }
     slab.decrement_ref(shard, local, generation);
     result

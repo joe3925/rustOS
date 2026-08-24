@@ -45,7 +45,7 @@ static mut HEAP: Heap = Heap([0; STUB_HEAP_SIZE]);
 static NEXT_HEAP_OFFSET: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         let heap_start = addr_of_mut!(HEAP.0).cast::<u8>() as usize;
         let align_mask = layout.align().saturating_sub(1);
         let size = layout.size();
@@ -72,7 +72,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
                 Err(actual) => current = actual,
             }
         }
-    }
+    }}
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }

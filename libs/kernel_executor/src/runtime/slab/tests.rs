@@ -1,6 +1,8 @@
 #[cfg(not(any(loom, feature = "loom")))]
 mod threaded {
-    use crate::runtime::slab::{enqueue_slab_task, get_task_table, slab_stats, SlabConfigBuilder};
+    use crate::runtime::slab::config::SlabConfigBuilder;
+    use crate::runtime::slab::ptr::enqueue_slab_task;
+    use crate::runtime::slab::task_slab::{get_task_table, slab_stats};
     use alloc::{sync::Arc, vec::Vec};
     use core::future::Future;
     use core::pin::Pin;
@@ -51,8 +53,8 @@ mod threaded {
     // the same slot, with no partially initialized waker visible.
     #[test]
     fn joinable_slot_cached_waker_initializes_once_under_thread_contention() {
-        let _guard = crate::test::global_runtime_lock();
-        crate::test::init_threaded_runtime();
+        let _guard = crate::test::support::global_runtime_lock();
+        crate::test::support::init_threaded_runtime();
 
         let slab = get_task_table();
         let handle = slab.allocate().expect("expected a joinable slab slot");
@@ -87,8 +89,8 @@ mod threaded {
     // stale waker or by a direct stale refcount increment.
     #[test]
     fn stale_joinable_generation_cannot_reacquire_freed_slot() {
-        let _guard = crate::test::global_runtime_lock();
-        crate::test::init_threaded_runtime();
+        let _guard = crate::test::support::global_runtime_lock();
+        crate::test::support::init_threaded_runtime();
 
         let slab = get_task_table();
         let handle = slab.allocate().expect("expected a joinable slab slot");
@@ -113,8 +115,8 @@ mod threaded {
     // runtime and reports sane capacity/allocation counters after startup.
     #[test]
     fn global_slab_stats_are_readable_after_default_initialization() {
-        let _guard = crate::test::global_runtime_lock();
-        crate::test::init_threaded_runtime();
+        let _guard = crate::test::support::global_runtime_lock();
+        crate::test::support::init_threaded_runtime();
 
         let stats = slab_stats();
         assert!(stats.total_capacity >= 64);
@@ -125,8 +127,8 @@ mod threaded {
     // first published chunk pending, forces growth, then wakes all tasks.
     #[test]
     fn task_table_grows_for_detached_tasks() {
-        let _guard = crate::test::global_runtime_lock();
-        crate::test::init_threaded_runtime();
+        let _guard = crate::test::support::global_runtime_lock();
+        crate::test::support::init_threaded_runtime();
 
         let stats = slab_stats();
         let tasks = stats.total_capacity + 64;
@@ -142,7 +144,7 @@ mod threaded {
             });
         }
 
-        crate::test::wait_until(Duration::from_secs(10), || {
+        crate::test::support::wait_until(Duration::from_secs(10), || {
             wakers
                 .lock()
                 .expect("gated detached future waker lock")
@@ -160,7 +162,7 @@ mod threaded {
             waker.wake();
         }
 
-        crate::test::wait_until(Duration::from_secs(10), || {
+        crate::test::support::wait_until(Duration::from_secs(10), || {
             completed.load(Ordering::Acquire) == tasks
         });
     }

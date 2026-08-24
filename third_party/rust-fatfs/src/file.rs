@@ -8,7 +8,7 @@ use crate::io::{IoBase, Read, ReadIoBuffer, SeekFrom, Write, WriteIoBuffer};
 use crate::time::{Date, DateTime, TimeProvider};
 
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
-use kernel_types::dma::{FromDevice, IoBuffer, ToDevice};
+use kernel_types::dma::implementation::{FromDevice, IoBuffer, ToDevice};
 
 pub const MAX_FILE_SIZE: u32 = u32::MAX;
 

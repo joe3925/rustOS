@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
-use kernel_api::kernel_types::dma::{FromDevice, ToDevice};
+use kernel_api::kernel_types::dma::implementation::{FromDevice, ToDevice};
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::memory::VirtAddr;
 use spin::{Mutex, Once, RwLock};
@@ -23,7 +23,6 @@ pub struct QueueState {
     pub queue: RwLock<Virtqueue>,
     pub arena: BlkIoSlots,
     pub irq_handle: Once<IrqHandle>,
-    pub msix_vector: Option<u8>,
     pub completion_slots: CompletionTable,
     pub read_ops: PendingOpPool<FromDevice>,
     pub write_ops: PendingOpPool<ToDevice>,

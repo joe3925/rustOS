@@ -3,7 +3,8 @@ use crate::scheduling::state::State;
 use core::hint::black_box;
 
 use super::super::memory::paging::tables::kernel_cr3;
-use crate::memory::paging::{base_page_size, kernel_stack_max_bytes};
+use crate::memory::paging::layout::{base_page_size};
+use crate::memory::paging::stack::{kernel_stack_max_bytes};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::static_handlers::get_current_cpu_id;

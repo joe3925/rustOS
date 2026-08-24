@@ -18,7 +18,7 @@
 
 use super::domain::IommuError;
 use crate::memory::device_mmu::DeviceMmuMapPermissions;
-use crate::memory::paging::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
+use crate::memory::paging::map::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
 use x86_64::structures::paging::PageTableFlags;
 
 pub const PTE_P: u64 = 1 << 0;

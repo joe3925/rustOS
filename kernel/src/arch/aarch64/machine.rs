@@ -28,9 +28,21 @@ impl MachinePlatform for Aarch64Platform {
     }
 
     fn discover_interrupt_info_from_acpi(
-        _tables: &AcpiTables<ACPIImpl>,
+        tables: &AcpiTables<ACPIImpl>,
     ) -> Option<MachineInterruptInfo> {
-        todo!()
+        let madt = tables.find_table::<Madt>().ok()?;
+        let distributor = madt.get().entries().find_map(|entry| match entry {
+            MadtEntry::Gicd(gicd) => Some((gicd.gic_id, gicd.physical_base_address)),
+            _ => None,
+        })?;
+        Some(MachineInterruptInfo {
+            local_interrupt_controller_address: distributor.1,
+            interrupt_controllers: alloc::vec![crate::machine::MachineInterruptControllerInfo {
+                id: distributor.0.try_into().ok()?,
+                address: distributor.1,
+                global_system_interrupt_base: 0,
+            }],
+        })
     }
 }
 
