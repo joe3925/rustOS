@@ -119,7 +119,6 @@ impl Vfs {
             return Err(FileErrorKind::BadPath);
         }
 
-        // Resolve drive letter to symlink
         if let Some(d) = user_path.symlink {
             let label_buf: [u8; 2] = [d as u8, b':'];
             // SAFETY: d is a validated ASCII drive letter, so [d, ':'] is valid UTF-8

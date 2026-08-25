@@ -23,7 +23,8 @@ use crate::platform::{
     ActivePlatform, ConsolePlatform, breakpoint, broadcast_panic_stop, calibrate_boot_timer,
     current_cpu_id, current_is_in_interrupt, current_platform_cpu_id, cycle_counter,
     disable_interrupts, enable_interrupts, enable_interrupts_and_halt, fatal_reset, halt,
-    init_boot_processor, init_current_cpu_local_state, init_periodic_timer, processor_count,
+    init_boot_processor, init_current_cpu_local_state, init_early_serial_mapping,
+    init_periodic_timer, processor_count,
     start_secondary_cpus,
 };
 use crate::profiling::backtrace::{self, Backtrace};
@@ -94,12 +95,13 @@ static mut TLS_TEST_ZERO_U64: u64 = 0;
 #[thread_local]
 static mut TLS_TEST_ZERO_BYTES: [u8; 16] = [0; 16];
 pub unsafe fn init() {
-    init_kernel_address_space_root();
     let memory_map = &boot_info().memory_regions;
     KernelFrameAllocator::init_from_boot_memory_map();
+    init_kernel_address_space_root();
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
+        init_early_serial_mapping().expect("failed to map the early serial device");
         initialize_bootstrap_provider();
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
