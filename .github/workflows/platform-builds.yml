@@ -51,8 +51,8 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
-          target="$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["stub"]["target"])' "platforms/$PLATFORM")"
-          rustup target add "$target"
+          targets="$(python3 -c 'import sys, tomllib; p=tomllib.load(open(sys.argv[1], "rb")); t=p["stub"]["target"]; print(t); print(t.removesuffix("-unknown-none") + "-unknown-uefi") if p["bootloader"]["firmware"] == "uefi" else None' "platforms/$PLATFORM")"
+          rustup target add $targets
 
       - name: Build ${{ matrix.platform }}
         run: cargo run --release -p xtask -- build --release --platform "platforms/${{ matrix.platform }}"
