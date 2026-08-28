@@ -6,14 +6,14 @@ use core::mem::ManuallyDrop;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::dma::implementation::{
     FromDevice, IoBuffer, IoBufferAccess, IoBufferBacking, IoBufferBackingConfig,
-    IoBufferBackingDesc, IoBufferError, IoBufferExtent, IoBufferPageFrame, ToDevice,
+    IoBufferBackingDesc, IoBufferError, IoBufferExtent, PhysicalFrameExtent, ToDevice,
 };
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 
-use crate::memory::paging::frame_alloc::{KernelPageTableFrameAllocator};
+use crate::memory::paging::frame_alloc::KernelPageTableFrameAllocator;
 
-use crate::memory::paging::layout::{base_page_size};
+use crate::memory::paging::layout::base_page_size;
 
 use crate::memory::paging::types::{LocalTlbFlush, MappingSize, UnmapFrameDisposition};
 
@@ -131,45 +131,14 @@ impl core::fmt::Debug for MappedIoBufferBacking {
 }
 
 impl MappedIoBufferBacking {
-    pub fn new(
-        physical_pages: Vec<PhysAddr>,
-        first_page_offset: usize,
+    /// Maps a pinned user address range, returns a backing io buffer
+    /// Saftey: The pinned range must live as long as the returned backing
+    pub unsafe fn new(
+        pinned_memory: UserRangePin,
         length: usize,
         access: UserBufferAccess,
-        user_pin: UserRangePin,
     ) -> Result<Self, IoBufferError> {
-        let mapping = KernelIoMapping::map_pages(&physical_pages)
-            .map_err(|_| IoBufferError::AllocationFailed)?;
-        let page_size = base_page_size();
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(physical_pages.len())
-            .map_err(|_| IoBufferError::AllocationFailed)?;
-        for (index, physical) in physical_pages.into_iter().enumerate() {
-            frames.push(unsafe {
-                IoBufferPageFrame::new(
-                    physical.as_u64(),
-                    page_size,
-                    mapping.base + index as u64 * page_size,
-                )
-            });
-        }
-        let extents = [unsafe {
-            IoBufferExtent::new(
-                Some(mapping.base.as_u64() as usize + first_page_offset),
-                first_page_offset,
-                length,
-                0,
-                frames.len(),
-            )
-        }];
-        let backing = IoBufferBacking::new(
-            IoBufferBackingDesc::PhysicalExtents {
-                frames: &frames,
-                extents: &extents,
-            },
-            IoBufferBackingConfig::worst_case_for_len(length),
-        )?;
+        KernelIoMapping::map_pages(pinned_memory.base_address())
         Ok(Self {
             backing: ManuallyDrop::new(unsafe {
                 core::mem::transmute::<IoBufferBacking<'_>, IoBufferBacking<'static>>(backing)

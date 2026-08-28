@@ -22,7 +22,7 @@ use kernel_types::dma::implementation::DmaMappingStrategy;
 use kernel_types::dma::implementation::DmaPciDeviceIdentity;
 use kernel_types::dma::implementation::IoBufferBacking;
 use kernel_types::dma::implementation::IoBufferDmaMappingLayout;
-use kernel_types::dma::implementation::IoBufferPageFrame;
+use kernel_types::dma::implementation::PhysicalFrameExtent;
 use kernel_types::error::DriverErrorKind;
 use spin::Mutex;
 use spin::Once;
@@ -387,7 +387,7 @@ fn validate_dma_buffer(
 }
 fn for_each_buffer_extent<F>(buffer: &DmaBufferView<'_>, mut f: F) -> Result<(), DmaMapError>
 where
-    F: FnMut(&[IoBufferPageFrame], usize, usize) -> Result<(), DmaMapError>,
+    F: FnMut(&[PhysicalFrameExtent], usize, usize) -> Result<(), DmaMapError>,
 {
     for region in buffer.regions() {
         if region.is_empty() {
@@ -472,7 +472,7 @@ fn buffer_supports_contiguous_iova(buffer: &DmaBufferView<'_>, device_page_size:
 }
 
 fn frames_cover_buffer(
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     frame_offset: usize,
     buffer_len: usize,
 ) -> bool {
@@ -524,7 +524,7 @@ fn covered_iommu_page_count_for_buffer(
 }
 
 fn covered_iommu_page_count(
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     frame_offset: usize,
     buffer_len: usize,
     device_page_size: usize,
@@ -550,7 +550,7 @@ fn covered_iommu_page_count(
 }
 
 fn for_each_covered_page_run<F>(
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     frame_offset: usize,
     buffer_len: usize,
     device_page_size: usize,

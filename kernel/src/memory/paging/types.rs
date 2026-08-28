@@ -1,4 +1,7 @@
+use acpi::PhysicalMapping;
+use hashbrown::hash_table::Iter;
 use kernel_types::arch::{PhysAddr, VirtAddr};
+use kernel_types::dma::implementation::PhysicalFrameExtent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MappingSize {
@@ -74,5 +77,18 @@ impl TlbShootdownRange {
             size,
             stride,
         }
+    }
+}
+pub struct PhysicalMemoryIter {
+    cursor: u64,
+    next_extent: Option<PhysicalFrameExtent>,
+    base_address: VirtAddr,
+    len: u64,
+}
+impl Iterator for PhysicalMemoryIter {
+    type Item = PhysicalFrameExtent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
     }
 }

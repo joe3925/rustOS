@@ -250,7 +250,11 @@ pub struct UserRangePin {
     start: u64,
     id: u64,
 }
-
+impl UserRangePin {
+    pub fn base_address(&self) -> u64 {
+        self.start
+    }
+}
 impl Drop for UserRangePin {
     fn drop(&mut self) {
         let teardown = {
