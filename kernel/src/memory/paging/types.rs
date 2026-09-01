@@ -3,6 +3,9 @@ use hashbrown::hash_table::Iter;
 use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::dma::implementation::PhysicalFrameExtent;
 
+use crate::memory::paging::address_space::AddressSpaceRoot;
+use crate::memory::paging::map::map_contiguous_physical_range;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MappingSize {
     pub bytes: u64,
@@ -80,8 +83,10 @@ impl TlbShootdownRange {
     }
 }
 pub struct PhysicalMemoryIter {
-    cursor: u64,
-    next_extent: Option<PhysicalFrameExtent>,
+    // In order to identify extents we may end up translating an extra page -> frame. This caches that extra frame
+    next_frame: Option<ResolvedMapping>,
+    addr_space_root: AddressSpaceRoot,
+    cursor: VirtAddr,
     base_address: VirtAddr,
     len: u64,
 }
@@ -89,6 +94,44 @@ impl Iterator for PhysicalMemoryIter {
     type Item = PhysicalFrameExtent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        let mapping = match self.next_frame.take() {
+            Some(mapping) => mapping,
+            None => {
+                let mapping =
+                    crate::platform::resolve_mapping_in_root(self.addr_space_root, self.cursor)?;
+
+                self.cursor += mapping.mapping_size;
+                mapping
+            }
+        };
+
+        let phys_base = mapping.phys_addr;
+        let mut phys_len = mapping.mapping_size;
+        let virt_base = self.cursor.as_u64() - mapping.mapping_size;
+
+        while self.cursor - self.base_address < self.len {
+            let Some(mapping) =
+                crate::platform::resolve_mapping_in_root(self.addr_space_root, self.cursor)
+            else {
+                break;
+            };
+
+            self.cursor += mapping.mapping_size;
+
+            if phys_base.as_u64() + phys_len != mapping.phys_addr.as_u64() {
+                self.next_frame = Some(mapping);
+                break;
+            }
+
+            phys_len += mapping.mapping_size;
+        }
+
+        unsafe {
+            Some(PhysicalFrameExtent::new(
+                phys_base.as_u64(),
+                phys_len,
+                VirtAddr::new(virt_base),
+            ))
+        }
     }
 }
