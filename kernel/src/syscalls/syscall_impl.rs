@@ -401,7 +401,7 @@ pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u
         pin
     };
 
-    let backing = match MappedIoBufferBacking::new(user_pin, length, access) {
+    let backing = match unsafe { MappedIoBufferBacking::new(user_pin, length, access) } {
         Ok(backing) => Arc::new(backing),
         Err(error) => return map_io_buffer_error(error),
     };

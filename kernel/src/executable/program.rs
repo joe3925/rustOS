@@ -369,12 +369,13 @@ impl Program {
             main_thread: None,
             managed_threads: Mutex::new(Vec::new()),
             modules: RwLock::new(Vec::new()),
+            // TODO: consider getting rid of this and having usermemory provide it
             address_space_root,
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
             working_dir,
             default_queue: Arc::new(MessageQueue::new()),
-            user_memory: Arc::new(UserMemoryPins::new()),
+            user_memory: Arc::new(UserMemoryPins::new(address_space_root)),
             extra_queues: Mutex::new(BTreeMap::new()),
             routing_rules: Mutex::new(Vec::new()),
         }
@@ -392,10 +393,13 @@ impl Program {
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
 
-        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
+        let old_address_space_root =
+            crate::memory::paging::address_space::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(
+                self.address_space_root,
+            );
         });
 
         let res = (|| {
@@ -417,10 +421,13 @@ impl Program {
         if guard.is_pinned(start.as_u64(), end.as_u64()) {
             return Err(PageMapError::RangePinned());
         }
-        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
+        let old_address_space_root =
+            crate::memory::paging::address_space::current_address_space_root();
 
         unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(
+                self.address_space_root,
+            );
         }
 
         let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
@@ -442,10 +449,13 @@ impl Program {
             .into();
         let end = start + size as u64;
 
-        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
+        let old_address_space_root =
+            crate::memory::paging::address_space::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(
+                self.address_space_root,
+            );
         });
 
         let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
@@ -486,10 +496,13 @@ impl Program {
 
         unsafe { self.tracker.dealloc(start, size) };
 
-        let old_address_space_root = crate::memory::paging::address_space::current_address_space_root();
+        let old_address_space_root =
+            crate::memory::paging::address_space::current_address_space_root();
 
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(
+                self.address_space_root,
+            );
             crate::memory::paging::map::unmap_range_unchecked(virt_addr.into(), size);
             crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
         });
@@ -603,7 +616,9 @@ impl Program {
         unsafe { self.tracker.dealloc(base.as_u64(), size) };
         let old_root = crate::memory::paging::address_space::current_address_space_root();
         platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(self.address_space_root);
+            crate::memory::paging::address_space::switch_address_space_root(
+                self.address_space_root,
+            );
             crate::memory::paging::map::unmap_range_unchecked(base.into(), size);
             crate::memory::paging::address_space::switch_address_space_root(old_root);
         });

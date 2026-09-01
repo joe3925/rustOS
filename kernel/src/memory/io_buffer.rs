@@ -15,7 +15,9 @@ use crate::memory::paging::frame_alloc::KernelPageTableFrameAllocator;
 
 use crate::memory::paging::layout::base_page_size;
 
-use crate::memory::paging::types::{LocalTlbFlush, MappingSize, UnmapFrameDisposition};
+use crate::memory::paging::types::{
+    LocalTlbFlush, MappingSize, PhysicalMemoryIter, UnmapFrameDisposition,
+};
 
 use crate::memory::paging::virt_tracker::{allocate_auto_kernel_range, deallocate_kernel_range};
 use crate::memory::user_pins::UserRangePin;
@@ -45,44 +47,87 @@ pub struct KernelIoMapping {
 }
 
 impl KernelIoMapping {
-    fn map_pages(physical_pages: &[PhysAddr]) -> Result<Self, PageMapError> {
-        let page_size = base_page_size();
-        let mapped_len = (physical_pages.len() as u64)
-            .checked_mul(page_size)
-            .ok_or(PageMapError::NoMemory())?;
-        let base = allocate_auto_kernel_range(mapped_len).ok_or(PageMapError::NoMemory())?;
-        let mut allocator = KernelPageTableFrameAllocator;
-        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::GLOBAL;
+    /// This will map the Physical Memory Range to a contiguous virtual region from the kernels dynamic range.
+    /// The mappings will be writable.
+    fn map_pages(mut physical_memory: PhysicalMemoryIter) -> Result<Self, PageMapError> {
+        let mapped_len = physical_memory.len();
+        if mapped_len == 0 {
+            return Err(PageMapError::NoMemory());
+        }
 
-        for (index, physical) in physical_pages.iter().copied().enumerate() {
-            let virt = base + (index as u64 * page_size);
+        let base = allocate_auto_kernel_range(mapped_len).ok_or(PageMapError::NoMemory())?;
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::GLOBAL;
+        let mut mapped = 0u64;
+
+        for extent in &mut physical_memory {
+            let extent_len = extent.len();
+
+            let Some(next_mapped) = mapped.checked_add(extent_len) else {
+                if mapped != 0 {
+                    unsafe {
+                        crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                    }
+                }
+
+                unsafe {
+                    deallocate_kernel_range(base, mapped_len);
+                }
+
+                return Err(PageMapError::NoMemory());
+            };
+
+            if next_mapped > mapped_len {
+                if mapped != 0 {
+                    unsafe {
+                        crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                    }
+                }
+
+                unsafe {
+                    deallocate_kernel_range(base, mapped_len);
+                }
+
+                return Err(PageMapError::TranslationFailed());
+            }
+
             if let Err(error) = unsafe {
-                <ActivePlatform as PagingPlatform>::map_leaf(
-                    &mut allocator,
-                    virt,
-                    physical,
-                    MappingSize { bytes: page_size },
+                crate::memory::paging::map::map_contiguous_physical_range(
+                    base + mapped,
+                    PhysAddr::new(extent.physical_address()),
+                    extent_len,
                     flags,
                     Some(PhysicalMappingCache::Cached),
                     LocalTlbFlush::Flush,
                 )
             } {
-                let mut rollback_offset = 0;
-                while rollback_offset < index as u64 * page_size {
-                    let _ = unsafe {
-                        <ActivePlatform as PagingPlatform>::unmap_leaf(
-                            &mut allocator,
-                            base + rollback_offset,
-                            MappingSize { bytes: page_size },
-                            UnmapFrameDisposition::KeepFrame,
-                            LocalTlbFlush::Flush,
-                        )
-                    };
-                    rollback_offset += page_size;
+                if mapped != 0 {
+                    unsafe {
+                        crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                    }
                 }
-                unsafe { deallocate_kernel_range(base, mapped_len) };
+
+                unsafe {
+                    deallocate_kernel_range(base, mapped_len);
+                }
+
                 return Err(error);
             }
+
+            mapped = next_mapped;
+        }
+
+        if mapped != mapped_len {
+            if mapped != 0 {
+                unsafe {
+                    crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                }
+            }
+
+            unsafe {
+                deallocate_kernel_range(base, mapped_len);
+            }
+
+            return Err(PageMapError::TranslationFailed());
         }
 
         Ok(Self { base, mapped_len })
@@ -131,21 +176,65 @@ impl core::fmt::Debug for MappedIoBufferBacking {
 }
 
 impl MappedIoBufferBacking {
-    /// Maps a pinned user address range, returns a backing io buffer
+    /// Maps a pinned user address range into kernel space, returns a backing io buffer
     /// Saftey: The pinned range must live as long as the returned backing
     pub unsafe fn new(
         pinned_memory: UserRangePin,
         length: usize,
         access: UserBufferAccess,
     ) -> Result<Self, IoBufferError> {
-        KernelIoMapping::map_pages(pinned_memory.base_address())
+        if length == 0 || length as u64 > pinned_memory.len() {
+            return Err(IoBufferError::InvalidRange);
+        }
+
+        let page_size = base_page_size();
+        let page_offset = pinned_memory.base_address().as_u64() & (page_size - 1);
+
+        let mapping = KernelIoMapping::map_pages((&pinned_memory).into_iter())
+            .map_err(|_| IoBufferError::InvalidRange)?;
+
+        let mapped_offset =
+            usize::try_from(page_offset).map_err(|_| IoBufferError::InvalidRange)?;
+        let mapped_len =
+            usize::try_from(mapping.mapped_len).map_err(|_| IoBufferError::InvalidRange)?;
+
+        let end = mapped_offset
+            .checked_add(length)
+            .ok_or(IoBufferError::InvalidRange)?;
+
+        if end > mapped_len {
+            return Err(IoBufferError::InvalidRange);
+        }
+
+        let data = mapping.base + page_offset;
+
+        let backing = match access {
+            UserBufferAccess::Read => {
+                let slice = unsafe { core::slice::from_raw_parts(data.as_ptr::<u8>(), length) };
+
+                IoBufferBacking::new(
+                    IoBufferBackingDesc::Slice(slice),
+                    IoBufferBackingConfig::worst_case_for_len(length),
+                )?
+            }
+            UserBufferAccess::ReadWrite => {
+                let slice =
+                    unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr::<u8>(), length) };
+
+                IoBufferBacking::new(
+                    IoBufferBackingDesc::SliceMut(slice),
+                    IoBufferBackingConfig::worst_case_for_len(length),
+                )?
+            }
+        };
+
         Ok(Self {
             backing: ManuallyDrop::new(unsafe {
                 core::mem::transmute::<IoBufferBacking<'_>, IoBufferBacking<'static>>(backing)
             }),
             mapping,
             access,
-            _user_pin: user_pin,
+            _user_pin: pinned_memory,
         })
     }
 

@@ -82,6 +82,7 @@ impl TlbShootdownRange {
         }
     }
 }
+
 pub struct PhysicalMemoryIter {
     // In order to identify extents we may end up translating an extra page -> frame. This caches that extra frame
     next_frame: Option<ResolvedMapping>,
@@ -90,6 +91,22 @@ pub struct PhysicalMemoryIter {
     base_address: VirtAddr,
     len: u64,
 }
+impl PhysicalMemoryIter {
+    pub fn len(&self) -> u64 {
+        return self.len;
+    }
+    /// While an iter can be created for any sized virtual range, its returned extents will always be page aligned and at least page sized.
+    pub fn new(addr_space_root: AddressSpaceRoot, base_address: VirtAddr, len: u64) -> Self {
+        Self {
+            next_frame: None,
+            addr_space_root,
+            cursor: base_address,
+            base_address,
+            len,
+        }
+    }
+}
+
 impl Iterator for PhysicalMemoryIter {
     type Item = PhysicalFrameExtent;
 
