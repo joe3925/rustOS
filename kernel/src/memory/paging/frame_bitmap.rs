@@ -96,6 +96,59 @@ pub struct RuntimeFrameBitmap {
     zeroed_free: HierarchicalFrameIndex,
 }
 
+pub struct RuntimeFrameBitmapBuilder {
+    frames: usize,
+    words: Vec<AtomicBitmapWord>,
+    hierarchy: HierarchyLayout,
+    dirty_free: HierarchicalFrameIndex,
+    zeroed_free: HierarchicalFrameIndex,
+}
+
+impl RuntimeFrameBitmapBuilder {
+    /// Populates preallocated storage without performing any heap allocation.
+    pub fn build(
+        mut self,
+        storage: &[BitmapWord],
+    ) -> Result<RuntimeFrameBitmap, BitmapResizeError> {
+        let needed_words =
+            bitmap_words_for_frames(self.frames).ok_or(BitmapResizeError::RamTooLarge)?;
+        if storage.len() < needed_words {
+            return Err(BitmapResizeError::AllocatedFramesWouldBeTruncated);
+        }
+        if self.words.capacity() < needed_words {
+            return Err(BitmapResizeError::AllocationFailed);
+        }
+
+        for &word in &storage[..needed_words] {
+            self.words.push(AtomicBitmapWord::new(word));
+        }
+
+        for (word_index, word) in self.words.iter().enumerate() {
+            let mut free = !word.load(Ordering::Relaxed);
+
+            while free != 0 {
+                let bit = free.trailing_zeros() as usize;
+                let frame = word_index * WORD_BITS + bit;
+
+                if frame < self.frames {
+                    self.dirty_free.insert(&self.hierarchy, frame);
+                }
+
+                free &= free - 1;
+            }
+        }
+
+        Ok(RuntimeFrameBitmap {
+            words: self.words,
+            frames: self.frames,
+            next_word: AtomicUsize::new(0),
+            hierarchy: self.hierarchy,
+            dirty_free: self.dirty_free,
+            zeroed_free: self.zeroed_free,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BitmapLevel {
     word_offset: usize,
@@ -400,79 +453,30 @@ impl RuntimeFrameBitmap {
         start
     }
 
-    /// Allocates backing storage for the runtime atomic bitmap.
-    pub fn reserved_atomic_storage(
-        words: usize,
-    ) -> Result<Vec<AtomicBitmapWord>, BitmapResizeError> {
-        let mut storage = Vec::new();
-
-        storage
-            .try_reserve_exact(words)
+    /// Allocates every component needed to build a runtime bitmap.
+    pub fn prepare(frames: usize) -> Result<RuntimeFrameBitmapBuilder, BitmapResizeError> {
+        let needed_words = bitmap_words_for_frames(frames).ok_or(BitmapResizeError::RamTooLarge)?;
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(needed_words)
             .map_err(|_| BitmapResizeError::AllocationFailed)?;
-
-        Ok(storage)
-    }
-
-    /// Builds the live atomic frame bitmap from plain bitmap words.
-    pub fn from_words(storage: Vec<BitmapWord>, frames: usize) -> Result<Self, BitmapResizeError> {
-        let needed_words = bitmap_words_for_frames(frames).ok_or(BitmapResizeError::RamTooLarge)?;
-        let atomic_storage = Self::reserved_atomic_storage(needed_words)?;
-
-        Self::from_words_preallocated(storage, frames, atomic_storage)
-    }
-
-    /// Builds the live atomic frame bitmap using already-reserved atomic storage.
-    pub fn from_words_preallocated(
-        mut storage: Vec<BitmapWord>,
-        frames: usize,
-        mut atomic_storage: Vec<AtomicBitmapWord>,
-    ) -> Result<Self, BitmapResizeError> {
-        let needed_words = bitmap_words_for_frames(frames).ok_or(BitmapResizeError::RamTooLarge)?;
-
-        if storage.len() < needed_words {
-            return Err(BitmapResizeError::AllocatedFramesWouldBeTruncated);
-        }
-
-        if atomic_storage.capacity() < needed_words {
-            return Err(BitmapResizeError::AllocationFailed);
-        }
-
-        storage.truncate(needed_words);
-        mark_unused_tail_bits_allocated(storage.as_mut_slice(), frames);
-
-        atomic_storage.clear();
-
-        for word in storage {
-            atomic_storage.push(AtomicBitmapWord::new(word));
-        }
 
         let hierarchy = HierarchyLayout::for_frames(frames)?;
         let dirty_free = HierarchicalFrameIndex::empty(&hierarchy)?;
         let zeroed_free = HierarchicalFrameIndex::empty(&hierarchy)?;
 
-        for (word_index, word) in atomic_storage.iter().enumerate() {
-            let mut free = !word.load(Ordering::Relaxed);
-
-            while free != 0 {
-                let bit = free.trailing_zeros() as usize;
-                let frame = word_index * WORD_BITS + bit;
-
-                if frame < frames {
-                    dirty_free.insert(&hierarchy, frame);
-                }
-
-                free &= free - 1;
-            }
-        }
-
-        Ok(Self {
-            words: atomic_storage,
+        Ok(RuntimeFrameBitmapBuilder {
             frames,
-            next_word: AtomicUsize::new(0),
+            words,
             hierarchy,
             dirty_free,
             zeroed_free,
         })
+    }
+
+    /// Builds the live atomic frame bitmap from plain bitmap words.
+    pub fn from_words(storage: Vec<BitmapWord>, frames: usize) -> Result<Self, BitmapResizeError> {
+        Self::prepare(frames)?.build(storage.as_slice())
     }
 
     /// Copies a mutable boot/build bitmap into the live atomic frame bitmap.
@@ -1141,7 +1145,7 @@ pub fn physical_coverage_for_ram(
 
     let map_top = memory_regions
         .iter()
-        .filter(|r| r.end > r.start)
+        .filter(|r| r.kind == MemoryRegionKind::Usable && r.end > r.start)
         .map(|r| r.end)
         .max()
         .unwrap_or(0);

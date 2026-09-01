@@ -350,7 +350,7 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
 
     let mut new_bitmap = build_memory_bitmap(memory_regions, new_frames, new_words)?;
     let mut new_reclaimed = heap_bitmap(new_words, 0)?;
-    let atomic_storage = RuntimeFrameBitmap::reserved_atomic_storage(new_words)?;
+    let runtime_builder = RuntimeFrameBitmap::prepare(new_frames)?;
 
     let old_reclaimed_heap = {
         let bm = MEMORY_BITMAP.write();
@@ -383,8 +383,7 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
         clear_unused_tail_bits(new_reclaimed.as_mut_slice(), new_frames);
 
         let reclaimed_frames = count_set_bits_up_to(new_reclaimed.as_slice(), new_frames);
-        let runtime_bitmap =
-            RuntimeFrameBitmap::from_words_preallocated(new_bitmap, new_frames, atomic_storage)?;
+        let runtime_bitmap = runtime_builder.build(new_bitmap.as_slice())?;
 
         let old_reclaimed_heap = reclaimed.replace_with_heap_storage(new_reclaimed, new_frames);
 

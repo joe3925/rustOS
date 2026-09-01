@@ -16,7 +16,7 @@ use crate::memory::paging::map::map_range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::arch::{PageFlags, VirtAddr};
 
-pub const BOOTSTRAP_HEAP_SIZE: u64 = 128 * 1024 * 1024;
+pub const BOOTSTRAP_HEAP_SIZE: u64 = 8 * 1024 * 1024;
 
 pub fn mimalloc_heap_start() -> usize {
     heap_range_start().as_u64() as usize + BOOTSTRAP_HEAP_SIZE as usize

@@ -138,11 +138,11 @@ pub unsafe fn init() {
     }
 }
 pub extern "C" fn kernel_main(ctx: usize) {
+    enable_mimalloc();
     resize_bitmap_for_ram(boot_usable_bytes()).expect(&alloc::format!(
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
     ));
-    enable_mimalloc();
     init_emergency_zero_mappings().expect("Failed to initialize emergency zero mappings");
     start_zero_page_worker();
     init_executor_platform();
