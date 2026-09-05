@@ -8,7 +8,10 @@ use kernel_types::error::{KernelError, RegistryErrorKind, ResultErrorContext};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::status::Data;
 use prost::Message;
-use registry_format::{CreateKey, DeleteKey, DeleteValue, Delta, Key, Registry, SetValue, Value};
+use registry_format::{
+    BootOwnership, CreateKey, DeleteKey, DeleteValue, Delta, Key, Registry, RegistryBatch,
+    RegistrySnapshot, SetValue, Value,
+};
 use spin::{Once, RwLock};
 
 use crate::error::error;
@@ -22,7 +25,13 @@ const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_VERSION: u32 = 1;
 const WAL_VERSION: u32 = 2;
 
-const SNAPSHOT_DELTA_THRESHOLD: u64 = 100;
+const SNAPSHOT_PATHS: [&str; 2] = [
+    "C:\\system\\registry\\registry.0.pb",
+    "C:\\system\\registry\\registry.1.pb",
+];
+const OWNED_SNAPSHOT_VERSION: u32 = 2;
+const MIN_CHECKPOINT_BYTES: u64 = 256 * 1024;
+use crate::file_system::file_provider::{Provider, ProviderKind, install_file_provider};
 
 const CLASS_LIST: &[(&str, &str)] = &[
     ("disk", "Block storage"),
@@ -63,21 +72,24 @@ struct RegistryState {
     registry: Registry,
     wal_seq: u64,
     deltas_since_snapshot: u64,
+    bootstrap: bool,
+    ownership: BootOwnership,
+    boot_deletes: Vec<Delta>,
+    wal_bytes: u64,
+    snapshot_slot: Option<usize>,
 }
 
 struct RegistryStore {
     state: RwLock<RegistryState>,
-    io: AsyncMutex<()>,
+    io: AsyncMutex<RegistryIo>,
+}
+
+#[derive(Default)]
+struct RegistryIo {
+    wal: Option<File>,
 }
 
 static REGISTRY: Once<RegistryStore> = Once::new();
-
-struct WalReplay {
-    max_seq: u64,
-    applied: u64,
-    valid_len: u64,
-    file_len: u64,
-}
 
 fn value_from_data(data: &Data) -> Value {
     let value = match data {
@@ -107,7 +119,7 @@ fn data_from_value(value: Value) -> Result<Data, KernelError> {
 
 impl RegistryStore {
     async fn create_key(&self, path: String) -> Result<(), KernelError> {
-        let _io = self.io.lock().await;
+        let mut io = self.io.lock().await;
 
         {
             let state = self.state.read();
@@ -121,13 +133,20 @@ impl RegistryStore {
             }
         }
 
-        let seq = self.state.read().wal_seq + 1;
+        let seq = self
+            .state
+            .read()
+            .wal_seq
+            .checked_add(1)
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
         let delta = Delta {
             delta: Some(registry_format::delta::Delta::CreateKey(CreateKey { path })),
         };
 
-        append_wal(seq, &delta).await?;
+        if !self.state.read().bootstrap {
+            append_wal(&mut io, seq, &delta).await?;
+        }
 
         let Some(registry_format::delta::Delta::CreateKey(delta)) = delta.delta else {
             unreachable!();
@@ -140,21 +159,39 @@ impl RegistryStore {
 
             state.wal_seq = seq;
             state.deltas_since_snapshot += 1;
+            if !state.bootstrap {
+                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
+            }
         }
 
-        self.checkpoint_if_needed().await;
+        self.checkpoint_if_needed(&mut io).await;
 
         Ok(())
     }
 
     async fn delete_key(&self, path: &str) -> Result<bool, KernelError> {
-        let _io = self.io.lock().await;
+        let mut io = self.io.lock().await;
+        {
+            let mut state = self.state.write();
+            if state.bootstrap {
+                state.boot_deletes.push(Delta {
+                    delta: Some(registry_format::delta::Delta::DeleteKey(DeleteKey {
+                        path: registry_format::reconcile::canonical_path(path),
+                    })),
+                });
+            }
+        }
 
         if walk(&self.state.read().registry, path).is_none() {
             return Ok(false);
         }
 
-        let seq = self.state.read().wal_seq + 1;
+        let seq = self
+            .state
+            .read()
+            .wal_seq
+            .checked_add(1)
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
         let delta = Delta {
             delta: Some(registry_format::delta::Delta::DeleteKey(DeleteKey {
@@ -162,7 +199,9 @@ impl RegistryStore {
             })),
         };
 
-        append_wal(seq, &delta).await?;
+        if !self.state.read().bootstrap {
+            append_wal(&mut io, seq, &delta).await?;
+        }
 
         {
             let mut state = self.state.write();
@@ -171,15 +210,18 @@ impl RegistryStore {
 
             state.wal_seq = seq;
             state.deltas_since_snapshot += 1;
+            if !state.bootstrap {
+                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
+            }
         }
 
-        self.checkpoint_if_needed().await;
+        self.checkpoint_if_needed(&mut io).await;
 
         Ok(true)
     }
 
     async fn set_value(&self, key_path: &str, name: &str, data: Data) -> Result<(), KernelError> {
-        let _io = self.io.lock().await;
+        let mut io = self.io.lock().await;
 
         {
             let state = self.state.read();
@@ -191,7 +233,12 @@ impl RegistryStore {
             }
         }
 
-        let seq = self.state.read().wal_seq + 1;
+        let seq = self
+            .state
+            .read()
+            .wal_seq
+            .checked_add(1)
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
         let delta = Delta {
             delta: Some(registry_format::delta::Delta::SetValue(SetValue {
@@ -201,7 +248,9 @@ impl RegistryStore {
             })),
         };
 
-        append_wal(seq, &delta).await?;
+        if !self.state.read().bootstrap {
+            append_wal(&mut io, seq, &delta).await?;
+        }
 
         {
             let mut state = self.state.write();
@@ -212,15 +261,29 @@ impl RegistryStore {
 
             state.wal_seq = seq;
             state.deltas_since_snapshot += 1;
+            if !state.bootstrap {
+                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
+            }
         }
 
-        self.checkpoint_if_needed().await;
+        self.checkpoint_if_needed(&mut io).await;
 
         Ok(())
     }
 
     async fn delete_value(&self, key_path: &str, name: &str) -> Result<bool, KernelError> {
-        let _io = self.io.lock().await;
+        let mut io = self.io.lock().await;
+        {
+            let mut state = self.state.write();
+            if state.bootstrap {
+                state.boot_deletes.push(Delta {
+                    delta: Some(registry_format::delta::Delta::DeleteValue(DeleteValue {
+                        key_path: registry_format::reconcile::canonical_path(key_path),
+                        name: name.to_string(),
+                    })),
+                });
+            }
+        }
 
         {
             let state = self.state.read();
@@ -233,7 +296,12 @@ impl RegistryStore {
             }
         }
 
-        let seq = self.state.read().wal_seq + 1;
+        let seq = self
+            .state
+            .read()
+            .wal_seq
+            .checked_add(1)
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
         let delta = Delta {
             delta: Some(registry_format::delta::Delta::DeleteValue(DeleteValue {
@@ -242,7 +310,9 @@ impl RegistryStore {
             })),
         };
 
-        append_wal(seq, &delta).await?;
+        if !self.state.read().bootstrap {
+            append_wal(&mut io, seq, &delta).await?;
+        }
 
         {
             let mut state = self.state.write();
@@ -253,36 +323,47 @@ impl RegistryStore {
 
             state.wal_seq = seq;
             state.deltas_since_snapshot += 1;
+            if !state.bootstrap {
+                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
+            }
         }
 
-        self.checkpoint_if_needed().await;
+        self.checkpoint_if_needed(&mut io).await;
 
         Ok(true)
     }
 
-    async fn checkpoint_if_needed(&self) {
-        let bytes = {
+    async fn checkpoint_if_needed(&self, io: &mut RegistryIo) {
+        let (bytes, slot) = {
             let state = self.state.read();
-
-            if state.deltas_since_snapshot < SNAPSHOT_DELTA_THRESHOLD {
+            if state.bootstrap || state.wal_bytes < MIN_CHECKPOINT_BYTES {
                 return;
             }
-
-            match encode_snapshot(&state.registry, state.wal_seq) {
-                Ok(bytes) => bytes,
-                Err(_) => return,
+            let Ok(bytes) = encode_owned_snapshot(&state) else {
+                return;
+            };
+            if state.wal_bytes <= (bytes.len() as u64).max(MIN_CHECKPOINT_BYTES) {
+                return;
             }
+            (bytes, state.snapshot_slot.map_or(0, |slot| 1 - slot))
         };
-
-        if persist_snapshot(&bytes).await.is_err() {
+        if persist_snapshot_at(SNAPSHOT_PATHS[slot], &bytes)
+            .await
+            .is_err()
+        {
             return;
         }
-
-        if clear_wal().await.is_err() {
-            return;
+        // Publish the new slot before clearing the log. Either log state can
+        // be replayed with this durable snapshot after an interrupted clear.
+        self.state.write().snapshot_slot = Some(slot);
+        if let Some(file) = io.wal.as_mut() {
+            if file.set_len(0).await.is_err() || file.flush().await.is_err() {
+                return;
+            }
         }
-
-        self.state.write().deltas_since_snapshot = 0;
+        let mut state = self.state.write();
+        state.wal_bytes = 0;
+        state.deltas_since_snapshot = 0;
     }
 }
 
@@ -406,11 +487,6 @@ fn fresh_registry() -> Registry {
     registry
 }
 
-fn encode_snapshot(registry: &Registry, last_wal_seq: u64) -> Result<Vec<u8>, KernelError> {
-    registry_format::encode_frame(SNAPSHOT_VERSION, last_wal_seq, registry)
-        .map_err(|_| error(RegistryErrorKind::EncodingFailed))
-}
-
 fn decode_snapshot(bytes: &[u8]) -> Result<(Registry, u64), KernelError> {
     let (last_wal_seq, payload, frame_len) = registry_format::decode_frame(bytes, SNAPSHOT_VERSION)
         .map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
@@ -429,7 +505,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<(Registry, u64), KernelError> {
 }
 
 async fn read_file(path: &str) -> Result<Vec<u8>, KernelError> {
-    let file = File::open(
+    let file = File::open_on(
+        Provider::Vfs,
         &Path::from_string(path),
         &[OpenFlags::Open, OpenFlags::ReadOnly],
     )
@@ -437,16 +514,24 @@ async fn read_file(path: &str) -> Result<Vec<u8>, KernelError> {
 
     let mut bytes = alloc::vec![0; file.size as usize];
 
-    let read = match file.read(&mut bytes).await {
-        Ok(read) => read,
-        Err(error) => {
-            return Err(close_preserving_error(file, error, "after a registry read failed").await);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match file.read_at(offset as u64, &mut bytes[offset..]).await {
+            Ok(0) => {
+                return Err(close_preserving_error(
+                    file,
+                    error(RegistryErrorKind::EncodingFailed),
+                    "unexpected end of registry file",
+                )
+                .await);
+            }
+            Ok(n) => offset += n,
+            Err(error) => {
+                return Err(close_preserving_error(file, error, "reading registry file").await);
+            }
         }
-    };
-
+    }
     file.close().await?;
-
-    bytes.truncate(read);
 
     Ok(bytes)
 }
@@ -466,9 +551,10 @@ async fn load_best_snapshot() -> Result<(Registry, u64), KernelError> {
     decode_snapshot(&bytes)
 }
 
-async fn persist_snapshot(bytes: &[u8]) -> Result<(), KernelError> {
-    let mut file = match File::open(
-        &Path::from_string(REG_PATH),
+async fn persist_snapshot_at(path: &str, bytes: &[u8]) -> Result<(), KernelError> {
+    let mut file = match File::open_on(
+        Provider::Vfs,
+        &Path::from_string(path),
         &[OpenFlags::Create, OpenFlags::WriteThrough],
     )
     .await
@@ -481,8 +567,9 @@ async fn persist_snapshot(bytes: &[u8]) -> Result<(), KernelError> {
                     kernel_types::error::FileErrorKind::AlreadyExists,
                 ) =>
         {
-            File::open(
-                &Path::from_string(REG_PATH),
+            File::open_on(
+                Provider::Vfs,
+                &Path::from_string(path),
                 &[
                     OpenFlags::Open,
                     OpenFlags::ReadWrite,
@@ -519,267 +606,163 @@ async fn persist_snapshot(bytes: &[u8]) -> Result<(), KernelError> {
         return Err(close_preserving_error(file, error, "after a short snapshot write").await);
     }
 
+    if let Err(error) = file.flush().await {
+        return Err(close_preserving_error(file, error, "flushing snapshot").await);
+    }
     file.close().await?;
 
     Ok(())
 }
 
-async fn append_wal(seq: u64, delta: &Delta) -> Result<(), KernelError> {
+fn missing(error: &KernelError) -> bool {
+    error.kind()
+        == kernel_types::error::ErrorKind::File(kernel_types::error::FileErrorKind::PathNotFound)
+}
+
+async fn open_wal() -> Result<File, KernelError> {
+    let path = Path::from_string(WAL_PATH);
+    match File::open_on(
+        Provider::Vfs,
+        &path,
+        &[
+            OpenFlags::Open,
+            OpenFlags::ReadWrite,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await
+    {
+        Ok(file) => Ok(file),
+        Err(error) if missing(&error) => {
+            File::open_on(
+                Provider::Vfs,
+                &path,
+                &[OpenFlags::Create, OpenFlags::WriteThrough],
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn append_wal(io: &mut RegistryIo, seq: u64, delta: &Delta) -> Result<(), KernelError> {
     let record = registry_format::encode_frame(WAL_VERSION, seq, delta)
         .map_err(|_| error(RegistryErrorKind::EncodingFailed))?;
-
-    let mut file = match File::open(
-        &Path::from_string(WAL_PATH),
-        &[OpenFlags::Create, OpenFlags::WriteThrough],
-    )
-    .await
-    {
-        Ok(file) => file,
-
-        Err(error)
-            if error.kind()
-                == kernel_types::error::ErrorKind::File(
-                    kernel_types::error::FileErrorKind::AlreadyExists,
-                ) =>
-        {
-            File::open(
-                &Path::from_string(WAL_PATH),
-                &[
-                    OpenFlags::Open,
-                    OpenFlags::ReadWrite,
-                    OpenFlags::WriteThrough,
-                ],
-            )
-            .await?
-        }
-        Err(error) => {
-            return Err(error.with_context("creating the registry WAL file"));
-        }
-    };
-
+    if io.wal.is_none() {
+        io.wal = Some(open_wal().await?);
+    }
+    let file = io.wal.as_mut().unwrap();
     let original_len = file.size;
-
-    let written = match file.append(&record).await {
-        Ok(written) => written,
-        Err(error) => {
-            return Err(
-                close_preserving_error(file, error, "after appending the WAL failed").await,
-            );
-        }
+    let result = match file.append(&record).await {
+        Ok(n) if n == record.len() => file.flush().await,
+        Ok(_) => Err(error(RegistryErrorKind::PersistenceFailed).with_context("short WAL append")),
+        Err(error) => Err(error),
     };
-
-    if written != record.len() {
-        let mut error = error(RegistryErrorKind::PersistenceFailed).with_context(format!(
-            "WAL append was short: wrote {written} of {} bytes",
-            record.len()
-        ));
-        if let Err(restore_error) = file.set_len(original_len).await {
-            error = error.with_context(format!(
-                "restoring the WAL to {original_len} bytes also failed: {restore_error}"
-            ));
+    if let Err(error) = result {
+        // Never append beyond a failed/torn record on a subsequent operation.
+        if file.set_len(original_len).await.is_err() || file.flush().await.is_err() {
+            panic!("registry WAL rollback failed after: {error}");
         }
-        return Err(close_preserving_error(file, error, "after a short WAL append").await);
+        return Err(error);
     }
-
-    file.close().await?;
-
     Ok(())
 }
 
-async fn clear_wal() -> Result<(), KernelError> {
-    let mut file = match File::open(
-        &Path::from_string(WAL_PATH),
-        &[
-            OpenFlags::Open,
-            OpenFlags::ReadWrite,
-            OpenFlags::WriteThrough,
-        ],
+fn encode_owned_snapshot(state: &RegistryState) -> Result<Vec<u8>, KernelError> {
+    registry_format::encode_frame(
+        OWNED_SNAPSHOT_VERSION,
+        state.wal_seq,
+        &RegistrySnapshot {
+            registry: Some(state.registry.clone()),
+            boot_ownership: Some(state.ownership.clone()),
+        },
     )
-    .await
-    {
-        Ok(file) => file,
-        Err(error)
-            if error.kind()
-                == kernel_types::error::ErrorKind::File(
-                    kernel_types::error::FileErrorKind::PathNotFound,
-                ) =>
-        {
-            return Ok(());
-        }
-        Err(error) => return Err(error.with_context("opening the WAL for clearing")),
-    };
-
-    if let Err(error) = file.set_len(0).await {
-        return Err(close_preserving_error(file, error, "after clearing the WAL failed").await);
-    }
-
-    file.close().await?;
-
-    Ok(())
+    .map_err(|_| error(RegistryErrorKind::EncodingFailed))
 }
 
-async fn truncate_wal(len: u64) -> Result<(), KernelError> {
-    let mut file = File::open(
-        &Path::from_string(WAL_PATH),
-        &[
-            OpenFlags::Open,
-            OpenFlags::ReadWrite,
-            OpenFlags::WriteThrough,
-        ],
-    )
-    .await?;
-
-    if let Err(error) = file.set_len(len).await {
-        return Err(close_preserving_error(file, error, "after truncating the WAL failed").await);
+fn empty_state(registry: Registry, bootstrap: bool) -> RegistryState {
+    RegistryState {
+        registry,
+        wal_seq: 0,
+        deltas_since_snapshot: 0,
+        bootstrap,
+        ownership: BootOwnership::default(),
+        boot_deletes: Vec::new(),
+        wal_bytes: 0,
+        snapshot_slot: None,
     }
-
-    file.close().await?;
-
-    Ok(())
 }
 
-fn apply_wal_delta(registry: &mut Registry, delta: Delta) -> Result<(), KernelError> {
-    match delta
-        .delta
-        .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?
-    {
-        registry_format::delta::Delta::CreateKey(delta) => {
-            if path_parts(&delta.path).next().is_none() {
-                return Err(error(RegistryErrorKind::EncodingFailed));
+async fn load_registry_state() -> Result<(RegistryState, u64, bool), KernelError> {
+    let mut best: Option<RegistryState> = None;
+    let mut corrupt = false;
+    for (slot, path) in SNAPSHOT_PATHS.iter().enumerate() {
+        let bytes = match read_file(path).await {
+            Ok(bytes) => bytes,
+            Err(error) if missing(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let decoded = (|| {
+            let (seq, registry, ownership) =
+                registry_format::reconcile::decode_owned_snapshot(&bytes, REGISTRY_SCHEMA_VERSION)
+                    .ok()?;
+            let mut state = empty_state(registry, false);
+            state.wal_seq = seq;
+            state.ownership = ownership;
+            state.snapshot_slot = Some(slot);
+            Some(state)
+        })();
+        match decoded {
+            Some(state) if best.as_ref().is_none_or(|old| state.wal_seq > old.wal_seq) => {
+                best = Some(state)
             }
-
-            create_key_inner(registry, &delta.path);
-        }
-
-        registry_format::delta::Delta::DeleteKey(delta) => {
-            delete_key_inner(registry, &delta.path);
-        }
-
-        registry_format::delta::Delta::SetValue(delta) => {
-            let key = walk_mut(registry, &delta.key_path)
-                .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
-
-            key.values.insert(
-                delta.name,
-                delta
-                    .data
-                    .ok_or_else(|| error(RegistryErrorKind::EncodingFailed))?,
-            );
-        }
-
-        registry_format::delta::Delta::DeleteValue(delta) => {
-            if let Some(key) = walk_mut(registry, &delta.key_path) {
-                key.values.remove(&delta.name);
-            }
+            Some(_) => {}
+            None => corrupt = true,
         }
     }
-
-    Ok(())
-}
-
-async fn replay_wal(registry: &mut Registry, snapshot_seq: u64) -> Result<WalReplay, KernelError> {
+    if best.is_none() {
+        match load_best_snapshot().await {
+            Ok((registry, seq)) => {
+                let mut state = empty_state(registry, false);
+                state.wal_seq = seq;
+                best = Some(state);
+            }
+            Err(error) if missing(&error) && !corrupt => {}
+            Err(error) => return Err(error.with_context("no valid registry snapshot")),
+        }
+        if best.is_none() && corrupt {
+            return Err(error(RegistryErrorKind::EncodingFailed));
+        }
+    }
+    let is_new = best.is_none();
+    let mut state = best.unwrap_or_else(|| empty_state(fresh_registry(), false));
     let bytes = match read_file(WAL_PATH).await {
         Ok(bytes) => bytes,
-
-        Err(_) => {
-            return Ok(WalReplay {
-                max_seq: snapshot_seq,
-                applied: 0,
-                valid_len: 0,
-                file_len: 0,
-            });
-        }
+        Err(error) if missing(&error) => Vec::new(),
+        Err(error) => return Err(error),
     };
-
-    let mut offset = 0;
-    let mut previous_seq = None;
-    let mut max_seq = snapshot_seq;
-    let mut applied = 0;
-
-    while offset < bytes.len() {
-        let Ok((seq, payload, frame_len)) =
-            registry_format::decode_frame(&bytes[offset..], WAL_VERSION)
-        else {
-            break;
-        };
-
-        if previous_seq.is_some_and(|previous| seq <= previous) {
-            break;
-        }
-
-        if seq > snapshot_seq {
-            if max_seq == u64::MAX || seq != max_seq + 1 {
-                break;
-            }
-
-            let Ok(delta) = Delta::decode(payload) else {
-                break;
-            };
-
-            if apply_wal_delta(registry, delta).is_err() {
-                break;
-            }
-
-            max_seq = seq;
-            applied += 1;
-        }
-
-        previous_seq = Some(seq);
-        offset += frame_len;
+    if is_new && !bytes.is_empty() {
+        return Err(error(RegistryErrorKind::EncodingFailed)
+            .with_context("WAL exists without a registry snapshot"));
     }
-
-    Ok(WalReplay {
-        max_seq,
-        applied,
-        valid_len: offset as u64,
-        file_len: bytes.len() as u64,
-    })
-}
-
-async fn load_registry_state() -> Result<RegistryState, KernelError> {
-    let (mut registry, snapshot_seq) = match load_best_snapshot().await {
-        Ok(snapshot) => snapshot,
-
-        Err(_) => {
-            let registry = fresh_registry();
-            let bytes = encode_snapshot(&registry, 0)?;
-
-            persist_snapshot(&bytes).await?;
-            clear_wal().await?;
-
-            return Ok(RegistryState {
-                registry,
-                wal_seq: 0,
-                deltas_since_snapshot: 0,
-            });
-        }
-    };
-
-    let replay = replay_wal(&mut registry, snapshot_seq).await?;
-
-    if replay.valid_len < replay.file_len {
-        truncate_wal(replay.valid_len).await?;
-    }
-
-    Ok(RegistryState {
-        registry,
-        wal_seq: replay.max_seq,
-        deltas_since_snapshot: replay.applied,
-    })
+    let replay = registry_format::reconcile::replay(
+        &mut state.registry,
+        &mut state.ownership,
+        state.wal_seq,
+        &bytes,
+    )
+    .map_err(|message| error(RegistryErrorKind::EncodingFailed).with_context(message))?;
+    state.wal_seq = replay.sequence;
+    state.deltas_since_snapshot = replay.applied;
+    state.wal_bytes = replay.valid_len as u64;
+    Ok((state, bytes.len() as u64, is_new))
 }
 
 pub async fn init() -> Result<(), KernelError> {
-    if REGISTRY.get().is_some() {
-        return Ok(());
-    }
-
-    let state = load_registry_state().await?;
-
     REGISTRY.call_once(|| RegistryStore {
-        state: RwLock::new(state),
-        io: AsyncMutex::new(()),
+        state: RwLock::new(empty_state(fresh_registry(), true)),
+        io: AsyncMutex::new(RegistryIo::default()),
     });
-
     Ok(())
 }
 
@@ -991,24 +974,111 @@ pub mod reg {
     }
 }
 
-pub async fn rebind_and_persist_after_provider_switch() -> Result<(), KernelError> {
+/// Returns true only for the caller that completes the transition.
+pub async fn rebind_and_persist_after_provider_switch() -> Result<bool, KernelError> {
     let store = REGISTRY
         .get()
         .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
-
-    let _io = store.io.lock().await;
-
-    let bytes = {
-        let state = store.state.read();
-        encode_snapshot(&state.registry, state.wal_seq)?
+    let mut io = store.io.lock().await;
+    if !store.state.read().bootstrap {
+        return Ok(false);
+    }
+    #[cfg(feature = "boot-timings")]
+    let timing = crate::structs::stopwatch::Stopwatch::start();
+    let (mut runtime, file_len, is_new) = load_registry_state().await?;
+    #[cfg(feature = "boot-timings")]
+    let load_ms = timing.elapsed_millis();
+    let before = runtime.registry.clone();
+    let previous = runtime.ownership.clone();
+    let ownership = {
+        let boot = store.state.read();
+        registry_format::reconcile::merge(
+            &mut runtime.registry,
+            &previous,
+            &boot.registry,
+            &boot.boot_deletes,
+        )
+        .map_err(|message| error(RegistryErrorKind::EncodingFailed).with_context(message))?
     };
-
-    persist_snapshot(&bytes).await?;
-    clear_wal().await?;
-
-    store.state.write().deltas_since_snapshot = 0;
-
-    Ok(())
+    let changes: Vec<Delta> = diff_registry(&before, &runtime.registry)
+        .into_iter()
+        .map(|delta| Delta {
+            delta: Some(match delta {
+                RegDelta::CreateKey { path } => {
+                    registry_format::delta::Delta::CreateKey(CreateKey { path })
+                }
+                RegDelta::DeleteKey { path } => {
+                    registry_format::delta::Delta::DeleteKey(DeleteKey { path })
+                }
+                RegDelta::SetValue {
+                    key_path,
+                    name,
+                    data,
+                } => registry_format::delta::Delta::SetValue(SetValue {
+                    key_path,
+                    name,
+                    data: Some(value_from_data(&data)),
+                }),
+                RegDelta::DeleteValue { key_path, name } => {
+                    registry_format::delta::Delta::DeleteValue(DeleteValue { key_path, name })
+                }
+            }),
+        })
+        .collect();
+    #[cfg(feature = "boot-timings")]
+    let merge_ms = timing.elapsed_millis();
+    #[cfg(feature = "boot-timings")]
+    let change_count = changes.len();
+    #[cfg(feature = "boot-timings")]
+    let writes_batch = !is_new && (!changes.is_empty() || previous != ownership);
+    // Repair a torn tail before any subsequent append, including normal runtime writes.
+    if runtime.wal_bytes < file_len {
+        if io.wal.is_none() {
+            io.wal = Some(open_wal().await?);
+        }
+        let wal = io.wal.as_mut().unwrap();
+        wal.set_len(runtime.wal_bytes).await?;
+        wal.flush().await?;
+    }
+    if is_new {
+        runtime.ownership = ownership;
+        let bytes = encode_owned_snapshot(&runtime)?;
+        persist_snapshot_at(SNAPSHOT_PATHS[0], &bytes).await?;
+        runtime.snapshot_slot = Some(0);
+    } else if !changes.is_empty() || previous != ownership {
+        let seq = runtime
+            .wal_seq
+            .checked_add(1)
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
+        let batch = Delta {
+            delta: Some(registry_format::delta::Delta::Batch(RegistryBatch {
+                changes,
+                boot_ownership: Some(ownership.clone()),
+            })),
+        };
+        append_wal(&mut io, seq, &batch).await?;
+        runtime.wal_seq = seq;
+        runtime.ownership = ownership;
+        runtime.wal_bytes = io.wal.as_ref().unwrap().size;
+        runtime.deltas_since_snapshot += 1;
+    }
+    // Registry mutations remain excluded until both publications are complete.
+    {
+        let mut state = store.state.write();
+        *state = runtime;
+        install_file_provider(ProviderKind::Vfs);
+    }
+    #[cfg(feature = "boot-timings")]
+    println!(
+        "registry handoff: load={}ms merge={}ms persist={}ms changes={} batch={} snapshot={}",
+        load_ms,
+        merge_ms - load_ms,
+        timing.elapsed_millis() - merge_ms,
+        change_count,
+        writes_batch,
+        is_new
+    );
+    Ok(true)
 }
 
 pub async fn is_first_boot() -> bool {

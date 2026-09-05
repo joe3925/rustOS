@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::device::{DeviceInit, DeviceObject};
 use crate::dma::implementation::{
     Bidirectional, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-    IoBufferDmaMappingLayout, IoBufferDmaSegment, IoBufferError, IoBufferPageFrame,
+    IoBufferDmaMappingLayout, IoBufferDmaSegment, IoBufferError, PhysicalFrameExtent,
 };
 
 const TEST_FRAME_SIZE: u64 = 512 * 8;
@@ -20,14 +20,14 @@ fn device() -> Arc<DeviceObject> {
     DeviceObject::new(DeviceInit::new())
 }
 
-fn frame(phys_addr: u64) -> IoBufferPageFrame {
-    unsafe { IoBufferPageFrame::new(phys_addr, TEST_FRAME_SIZE, crate::arch::VirtAddr::new(0)) }
+fn frame(phys_addr: u64) -> PhysicalFrameExtent {
+    unsafe { PhysicalFrameExtent::new(phys_addr, TEST_FRAME_SIZE, crate::arch::VirtAddr::new(0)) }
 }
 
 fn backing_from_frames<'a>(
     frame_offset: usize,
     byte_len: usize,
-    frames: &'a [IoBufferPageFrame],
+    frames: &'a [PhysicalFrameExtent],
 ) -> Result<IoBufferBacking<'a>, IoBufferError> {
     IoBufferBacking::new(
         IoBufferBackingDesc::Frames {
@@ -42,7 +42,7 @@ fn backing_from_frames<'a>(
 fn backing_from_frames_err(
     frame_offset: usize,
     byte_len: usize,
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
 ) -> IoBufferError {
     match backing_from_frames(frame_offset, byte_len, frames) {
         Ok(_) => panic!("expected IoBufferBacking::new to fail"),

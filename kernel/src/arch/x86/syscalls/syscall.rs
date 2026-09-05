@@ -172,7 +172,6 @@ make_wrapper!(wrap_get_thread, sys_get_thread,);
 make_wrapper!(wrap_mq_request, sys_mq_request, UserHandle, *mut Message);
 make_wrapper!(wrap_mq_route_add, sys_rule_add, *const UserRoutingRule);
 make_wrapper!(wrap_mq_route_clear, sys_rule_clear, *const UserRoutingRule);
-make_wrapper!(wrap_mq_peek_removed, sys_mq_peek_removed,);
 make_wrapper!(wrap_get_default_mq_handle, sys_get_default_mq_handle,);
 make_wrapper!(wrap_create_mq, sys_create_mq,);
 make_wrapper!(
@@ -222,7 +221,6 @@ const SYSCALL_TABLE: &[Handler] = &[
     wrap_mq_request,
     wrap_mq_route_add,
     wrap_mq_route_clear,
-    wrap_mq_peek_removed,
     wrap_get_default_mq_handle,
     wrap_create_mq,
     wrap_object_acquire,

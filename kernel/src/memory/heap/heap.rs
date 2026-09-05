@@ -12,11 +12,11 @@ pub fn mimalloc_thread_done() {
 use crate::memory::heap::allocator::KernelAllocator;
 use crate::memory::paging::frame_alloc::boot_usable_bytes;
 use crate::memory::paging::layout::{align_up_to_base_page, heap_range_end, heap_range_start};
-use crate::memory::paging::map::{map_range};
+use crate::memory::paging::map::map_range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::arch::{PageFlags, VirtAddr};
 
-pub const BOOTSTRAP_HEAP_SIZE: u64 = 64 * 1024 * 1024;
+pub const BOOTSTRAP_HEAP_SIZE: u64 = 8 * 1024 * 1024;
 
 pub fn mimalloc_heap_start() -> usize {
     heap_range_start().as_u64() as usize + BOOTSTRAP_HEAP_SIZE as usize

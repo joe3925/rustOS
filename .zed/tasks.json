@@ -63,6 +63,7 @@
       "x86_64-uefi",
       "--launch",
       "qemu-x86_64-q35-tcg",
+      "--release",
       "--console-serial",
     ],
     "cwd": "$ZED_WORKTREE_ROOT",

@@ -1,11 +1,13 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_types::arch::VirtAddr;
+use kernel_types::{arch::VirtAddr, dma::implementation::PhysicalFrameExtent};
 use spin::{Mutex, MutexGuard};
+use toml::map::IntoIter;
 
 use crate::{
-    memory::paging::address_space::{
-        AddressSpaceRoot, current_address_space_root, switch_address_space_root,
+    memory::paging::{
+        address_space::{AddressSpaceRoot, current_address_space_root, switch_address_space_root},
+        types::PhysicalMemoryIter,
     },
     platform,
     structs::range_tracker::RangeTracker,
@@ -189,17 +191,24 @@ impl PinTree {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UserMemoryPins {
+    address_space_root: AddressSpaceRoot,
     next_id: AtomicU64,
     tree: Mutex<PinTree>,
 }
 
 impl UserMemoryPins {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(address_space_root: AddressSpaceRoot) -> Self {
+        Self {
+            address_space_root,
+            next_id: AtomicU64::default(),
+            tree: Mutex::new(PinTree::default()),
+        }
     }
-
+    pub fn address_space_root(&self) -> AddressSpaceRoot {
+        return self.address_space_root;
+    }
     pub fn lock(self: &Arc<Self>) -> UserMemoryLock<'_> {
         UserMemoryLock {
             owner: self,
@@ -239,6 +248,7 @@ impl UserMemoryLock<'_> {
         Ok(UserRangePin {
             owner: self.owner.clone(),
             start,
+            end,
             id,
         })
     }
@@ -248,9 +258,43 @@ impl UserMemoryLock<'_> {
 pub struct UserRangePin {
     owner: Arc<UserMemoryPins>,
     start: u64,
+    end: u64,
     id: u64,
 }
+impl UserRangePin {
+    pub fn base_address(&self) -> VirtAddr {
+        VirtAddr::new(self.start)
+    }
+    pub fn len(&self) -> u64 {
+        self.end - self.start
+    }
+}
+impl IntoIterator for UserRangePin {
+    type Item = PhysicalFrameExtent;
 
+    type IntoIter = PhysicalMemoryIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        PhysicalMemoryIter::new(
+            self.owner.address_space_root(),
+            self.base_address(),
+            self.len(),
+        )
+    }
+}
+impl IntoIterator for &UserRangePin {
+    type Item = PhysicalFrameExtent;
+
+    type IntoIter = PhysicalMemoryIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        PhysicalMemoryIter::new(
+            self.owner.address_space_root(),
+            self.base_address(),
+            self.len(),
+        )
+    }
+}
 impl Drop for UserRangePin {
     fn drop(&mut self) {
         let teardown = {

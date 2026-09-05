@@ -29,6 +29,7 @@ message Delta {
     DeleteKey delete_key = 2;
     SetValue set_value = 3;
     DeleteValue delete_value = 4;
+    RegistryBatch batch = 5;
   }
 }
 
@@ -49,4 +50,21 @@ message SetValue {
 message DeleteValue {
   string key_path = 1;
   string name = 2;
+}
+
+message ValuePath {
+  string key = 1;
+  string name = 2;
+}
+message BootOwnership {
+  repeated string keys = 1;
+  repeated ValuePath values = 2;
+}
+message RegistryBatch {
+  repeated Delta changes = 1;
+  BootOwnership boot_ownership = 2;
+}
+message RegistrySnapshot {
+  Registry registry = 1;
+  BootOwnership boot_ownership = 2;
 }

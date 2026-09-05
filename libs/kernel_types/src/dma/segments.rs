@@ -2,7 +2,7 @@ pub struct IoBufferRegion<'a> {
     virtual_addr: Option<usize>,
     frame_offset: usize,
     byte_len: usize,
-    page_frames: &'a [IoBufferPageFrame],
+    page_frames: &'a [PhysicalFrameExtent],
 }
 
 impl<'a> IoBufferRegion<'a> {
@@ -26,15 +26,14 @@ impl<'a> IoBufferRegion<'a> {
         self.byte_len == 0
     }
 
-    pub fn page_frames(&self) -> &'a [IoBufferPageFrame] {
+    pub fn page_frames(&self) -> &'a [PhysicalFrameExtent] {
         self.page_frames
     }
-
 }
 
 pub struct IoBufferRegionIter<'a> {
     extents: &'a [IoBufferExtent],
-    frames: &'a [IoBufferPageFrame],
+    frames: &'a [PhysicalFrameExtent],
     next_extent: usize,
     logical_cursor: usize,
     view_start: usize,
@@ -44,7 +43,7 @@ pub struct IoBufferRegionIter<'a> {
 impl<'a> IoBufferRegionIter<'a> {
     fn new(
         extents: &'a [IoBufferExtent],
-        frames: &'a [IoBufferPageFrame],
+        frames: &'a [PhysicalFrameExtent],
         view_start: usize,
         view_len: usize,
     ) -> Self {
@@ -101,7 +100,7 @@ impl<'a> Iterator for IoBufferRegionIter<'a> {
 pub struct IoBufferDmaSegmentIter<'a> {
     layout: DmaSegmentLayout,
     extents: &'a [IoBufferExtent],
-    frames: &'a [IoBufferPageFrame],
+    frames: &'a [PhysicalFrameExtent],
     mapped_start: usize,
     mapped_end: usize,
     skip: usize,
@@ -122,7 +121,7 @@ pub struct IoBufferDmaSegmentIter<'a> {
 }
 
 impl<'a> IoBufferDmaSegmentIter<'a> {
-    fn empty(extents: &'a [IoBufferExtent], frames: &'a [IoBufferPageFrame]) -> Self {
+    fn empty(extents: &'a [IoBufferExtent], frames: &'a [PhysicalFrameExtent]) -> Self {
         Self::new(DmaSegmentLayout::None, 0, 0, 0, 0, extents, frames)
     }
 
@@ -133,7 +132,7 @@ impl<'a> IoBufferDmaSegmentIter<'a> {
         lease_start: usize,
         lease_len: usize,
         extents: &'a [IoBufferExtent],
-        frames: &'a [IoBufferPageFrame],
+        frames: &'a [PhysicalFrameExtent],
     ) -> Self {
         Self {
             layout,
@@ -295,7 +294,7 @@ impl<'a> IoBufferDmaSegmentIter<'a> {
 
 fn extent_subrange_frames(
     extent: IoBufferExtent,
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     offset_in_extent: usize,
     len: usize,
 ) -> Option<(usize, usize, usize)> {
@@ -439,7 +438,7 @@ fn next_scatter_gather_segment(
 
 fn next_identity_extent_segment_view(
     extents: &[IoBufferExtent],
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     view_start: usize,
     view_end: usize,
     extent_index: &mut usize,
@@ -492,7 +491,7 @@ fn next_identity_extent_segment_view(
 }
 
 fn next_identity_segment_limited(
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     frame_end: usize,
     frame_index: &mut usize,
     frame_offset: &mut usize,
@@ -551,20 +550,19 @@ fn next_identity_segment_limited(
     })
 }
 
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmaBufferRegion<'frames> {
     frame_offset: usize,
     byte_len: usize,
-    frames: &'frames [IoBufferPageFrame],
+    frames: &'frames [PhysicalFrameExtent],
 }
 
 impl<'frames> DmaBufferRegion<'frames> {
     const fn new(
         frame_offset: usize,
         byte_len: usize,
-        frames: &'frames [IoBufferPageFrame],
+        frames: &'frames [PhysicalFrameExtent],
     ) -> Self {
         Self {
             frame_offset,
@@ -583,7 +581,7 @@ impl<'frames> DmaBufferRegion<'frames> {
     }
 
     #[inline]
-    pub const fn page_frames(&self) -> &'frames [IoBufferPageFrame] {
+    pub const fn page_frames(&self) -> &'frames [PhysicalFrameExtent] {
         self.frames
     }
     pub const fn is_empty(&self) -> bool {
@@ -594,7 +592,7 @@ impl<'frames> DmaBufferRegion<'frames> {
 enum DmaBufferRegionSource<'a> {
     IoBuffer {
         extents: &'a [IoBufferExtent],
-        frames: &'a [IoBufferPageFrame],
+        frames: &'a [PhysicalFrameExtent],
         start: usize,
         len: usize,
     },
@@ -609,7 +607,7 @@ impl<'a> DmaBufferView<'a> {
     const fn from_iobuffer_parts(
         byte_len: usize,
         extents: &'a [IoBufferExtent],
-        frames: &'a [IoBufferPageFrame],
+        frames: &'a [PhysicalFrameExtent],
         start: usize,
         len: usize,
     ) -> Self {
@@ -679,7 +677,7 @@ impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
     fn next_iobuffer_region(
         &mut self,
         extents: &'a [IoBufferExtent],
-        frames: &'a [IoBufferPageFrame],
+        frames: &'a [PhysicalFrameExtent],
     ) -> Option<DmaBufferRegion<'a>> {
         while self.extent_index < extents.len() {
             let extent = extents[self.extent_index];
@@ -723,7 +721,7 @@ impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
 
 fn extent_subrange_frames_for_dma_region(
     extent: IoBufferExtent,
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     offset_in_extent: usize,
     len: usize,
 ) -> Option<(usize, usize, usize)> {

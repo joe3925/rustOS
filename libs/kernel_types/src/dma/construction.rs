@@ -45,7 +45,7 @@ fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 fn build_backing_into<'data>(
     desc: IoBufferBackingDesc<'data>,
     extents: &mut Vec<IoBufferExtent>,
-    frames: &mut Vec<IoBufferPageFrame>,
+    frames: &mut Vec<PhysicalFrameExtent>,
 ) -> Result<(BackingMemory<'data>, usize), IoBufferError> {
     extents.clear();
     frames.clear();
@@ -139,7 +139,7 @@ fn build_backing_into<'data>(
 fn build_virtual_backing_from_iter<I>(
     regions: I,
     extents: &mut Vec<IoBufferExtent>,
-    frames: &mut Vec<IoBufferPageFrame>,
+    frames: &mut Vec<PhysicalFrameExtent>,
 ) -> Result<usize, IoBufferError>
 where
     I: IntoIterator<Item = (usize, usize)>,
@@ -157,13 +157,7 @@ where
             .map_err(|_| IoBufferError::AllocationFailed)?;
 
         extents.push(unsafe {
-            IoBufferExtent::new(
-                Some(virt_addr),
-                frame_offset,
-                len,
-                first_frame,
-                frame_count,
-            )
+            IoBufferExtent::new(Some(virt_addr), frame_offset, len, first_frame, frame_count)
         });
 
         byte_len = byte_len
@@ -177,9 +171,9 @@ where
 fn build_physical_backing_into(
     frame_offset: usize,
     byte_len: usize,
-    source_frames: &[IoBufferPageFrame],
+    source_frames: &[PhysicalFrameExtent],
     extents: &mut Vec<IoBufferExtent>,
-    frames: &mut Vec<IoBufferPageFrame>,
+    frames: &mut Vec<PhysicalFrameExtent>,
 ) -> Result<usize, IoBufferError> {
     validate_physical_frames(frame_offset, byte_len, source_frames)?;
 
@@ -201,13 +195,7 @@ fn build_physical_backing_into(
         .map_err(|_| IoBufferError::AllocationFailed)?;
 
     extents.push(unsafe {
-        IoBufferExtent::new(
-            virtual_addr,
-            frame_offset,
-            byte_len,
-            0,
-            source_frames.len(),
-        )
+        IoBufferExtent::new(virtual_addr, frame_offset, byte_len, 0, source_frames.len())
     });
 
     frames.extend_from_slice(source_frames);
@@ -216,10 +204,10 @@ fn build_physical_backing_into(
 }
 
 fn build_physical_extent_backing_into(
-    source_frames: &[IoBufferPageFrame],
+    source_frames: &[PhysicalFrameExtent],
     source_extents: &[IoBufferExtent],
     extents: &mut Vec<IoBufferExtent>,
-    frames: &mut Vec<IoBufferPageFrame>,
+    frames: &mut Vec<PhysicalFrameExtent>,
 ) -> Result<usize, IoBufferError> {
     let byte_len = validate_physical_extents(source_frames, source_extents)?;
 
@@ -240,7 +228,7 @@ fn build_physical_extent_backing_into(
 fn describe_virtual_buffer_to_frames(
     virt_addr: usize,
     byte_len: usize,
-    frames: &mut Vec<IoBufferPageFrame>,
+    frames: &mut Vec<PhysicalFrameExtent>,
 ) -> Result<(usize, usize), IoBufferError> {
     if byte_len == 0 {
         return Ok((0, 0));
@@ -278,7 +266,7 @@ fn describe_virtual_buffer_to_frames(
             .map_err(|_| IoBufferError::AllocationFailed)?;
 
         frames.push(unsafe {
-            IoBufferPageFrame::new(
+            PhysicalFrameExtent::new(
                 translated.phys_addr,
                 translated.byte_len,
                 VirtAddr::new(current_base_va as u64),
@@ -332,7 +320,7 @@ fn validate_mut_segments_disjoint(segments: &[&mut [u8]]) -> Result<(), IoBuffer
 fn validate_physical_frames(
     frame_offset: usize,
     byte_len: usize,
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
 ) -> Result<(), IoBufferError> {
     if byte_len == 0 {
         return Ok(());
@@ -385,7 +373,7 @@ fn validate_physical_frames(
 }
 
 fn validate_physical_extents(
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     extents: &[IoBufferExtent],
 ) -> Result<usize, IoBufferError> {
     let mut total_len = 0usize;
@@ -500,4 +488,3 @@ fn checked_slice_mut<'a>(
     }
     Some(unsafe { slice::from_raw_parts_mut(ptr.add(offset), len) })
 }
-

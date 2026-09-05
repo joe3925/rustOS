@@ -33,7 +33,7 @@ pub fn install_file_provider(kind: ProviderKind) {
     CURRENT_PROVIDER.store(kind as u8, Ordering::Release);
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub(crate) enum Provider {
     Bootstrap,
     Vfs,

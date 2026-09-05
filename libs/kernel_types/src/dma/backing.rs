@@ -39,7 +39,7 @@ enum BackingMemory<'data> {
 
 pub struct IoBufferBackingScratch {
     extents: Vec<IoBufferExtent>,
-    frames: Vec<IoBufferPageFrame>,
+    frames: Vec<PhysicalFrameExtent>,
     leases: Box<[LeaseSlot]>,
     dma_records: Vec<DmaRecord>,
 }
@@ -108,7 +108,6 @@ impl IoBufferBackingScratch {
         Ok(())
     }
 }
-
 
 struct LeaseSlot {
     state: AtomicU8,
@@ -223,7 +222,7 @@ pub struct IoBufferBacking<'data> {
     memory: BackingMemory<'data>,
     byte_len: usize,
     extents: Vec<IoBufferExtent>,
-    frames: Vec<IoBufferPageFrame>,
+    frames: Vec<PhysicalFrameExtent>,
     leases: RwLock<Box<[LeaseSlot]>>,
     lease_alloc_lock: Mutex<()>,
     dma_records: Mutex<Vec<DmaRecord>>,

@@ -112,13 +112,13 @@ pub enum DmaMapError {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IoBufferPageFrame {
+pub struct PhysicalFrameExtent {
     pub(super) phys_addr: u64,
     pub(super) byte_len: u64,
     pub(super) cpu_addr: VirtAddr,
 }
 
-impl IoBufferPageFrame {
+impl PhysicalFrameExtent {
     /// # Safety
     /// `cpu_addr`, when nonzero, must map this physical frame for at least
     /// `byte_len` bytes and remain valid while the descriptor is in use.
@@ -300,10 +300,10 @@ pub enum IoBufferBackingDesc<'data> {
     Frames {
         frame_offset: usize,
         byte_len: usize,
-        frames: &'data [IoBufferPageFrame],
+        frames: &'data [PhysicalFrameExtent],
     },
     PhysicalExtents {
-        frames: &'data [IoBufferPageFrame],
+        frames: &'data [PhysicalFrameExtent],
         extents: &'data [IoBufferExtent],
     },
 }

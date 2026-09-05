@@ -32,6 +32,7 @@ use kernel_executor::runtime::runtime::spawn_detached;
 
 #[derive(Debug)]
 pub struct File {
+    provider: file_provider::Provider,
     fs_file_id: u64,
     path: Path,
     pub(crate) size: u64,
@@ -97,14 +98,21 @@ impl File {
     }
 
     pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<Self, KernelError> {
+        Self::open_on(file_provider::provider(), path, flags).await
+    }
+
+    pub(crate) async fn open_on(
+        provider: file_provider::Provider,
+        path: &Path,
+        flags: &[OpenFlags],
+    ) -> Result<Self, KernelError> {
         let write_through = flags.contains(&OpenFlags::WriteThrough);
-        let res = file_provider::provider()
-            .open_path(path, flags, write_through)
-            .await?;
+        let res = provider.open_path(path, flags, write_through).await?;
         if let Some(e) = res.error {
             return Err(e);
         }
         Ok(Self {
+            provider,
             fs_file_id: res.fs_file_id,
             path: path.clone(),
             size: res.size,
@@ -114,7 +122,7 @@ impl File {
     }
 
     pub async fn delete(&mut self) -> Result<(), KernelError> {
-        let r = file_provider::provider().delete_path(&self.path).await?;
+        let r = self.provider.delete_path(&self.path).await?;
         match r.error {
             None => Ok(()),
             Some(e) => Err(e),
@@ -189,7 +197,8 @@ impl File {
             return Ok(0);
         }
 
-        let res = file_provider::provider()
+        let res = self
+            .provider
             .read_iobuffer_at(self.fs_file_id, offset, buffer)
             .await?;
         match res.error {
@@ -218,7 +227,8 @@ impl File {
             return Ok(0);
         }
 
-        let wr = file_provider::provider()
+        let wr = self
+            .provider
             .write_iobuffer_at(self.fs_file_id, offset, buffer, self.write_through)
             .await?;
         match wr.error {
@@ -235,9 +245,7 @@ impl File {
     }
 
     pub async fn move_no_copy(&self, dst: &Path) -> Result<(), KernelError> {
-        let r = file_provider::provider()
-            .rename_path(&self.path, dst)
-            .await?;
+        let r = self.provider.rename_path(&self.path, dst).await?;
         match r.error {
             None => Ok(()),
             Some(e) => Err(e),
@@ -248,7 +256,8 @@ impl File {
         offset: i64,
         origin: kernel_types::fs::FsSeekWhence,
     ) -> Result<u64, KernelError> {
-        let res = file_provider::provider()
+        let res = self
+            .provider
             .seek_handle(self.fs_file_id, offset, origin)
             .await?;
         if let Some(e) = res.error {
@@ -258,9 +267,7 @@ impl File {
     }
 
     pub async fn flush(&self) -> Result<(), KernelError> {
-        let res = file_provider::provider()
-            .flush_handle(self.fs_file_id)
-            .await?;
+        let res = self.provider.flush_handle(self.fs_file_id).await?;
         match res.error {
             None => Ok(()),
             Some(e) => Err(e),
@@ -273,7 +280,7 @@ impl File {
             return Ok(());
         }
 
-        let res = file_provider::provider().close_handle(id).await?;
+        let res = self.provider.close_handle(id).await?;
         match res.error {
             None => Ok(()),
             Some(e) => Err(e),
@@ -285,9 +292,7 @@ impl File {
     /// If `new_size` is greater than the current size, the file is extended
     /// with zero bytes for reads in the extended region.
     pub async fn set_len(&mut self, new_size: u64) -> Result<(), KernelError> {
-        let res = file_provider::provider()
-            .set_len(self.fs_file_id, new_size)
-            .await?;
+        let res = self.provider.set_len(self.fs_file_id, new_size).await?;
         if let Some(e) = res.error {
             return Err(e);
         }
@@ -316,7 +321,8 @@ impl File {
             return Ok(0);
         }
 
-        let res = file_provider::provider()
+        let res = self
+            .provider
             .append_iobuffer(self.fs_file_id, buffer, self.write_through)
             .await?;
         if let Some(e) = res.error {
@@ -330,7 +336,8 @@ impl File {
     /// The range must be within the current file bounds (offset <= file_len).
     /// If the range extends past EOF, only bytes up to EOF are zeroed.
     pub async fn zero_range(&mut self, offset: u64, len: u64) -> Result<(), KernelError> {
-        let res = file_provider::provider()
+        let res = self
+            .provider
             .zero_range(self.fs_file_id, offset, len)
             .await?;
         match res.error {
@@ -346,7 +353,7 @@ impl Drop for File {
             return;
         }
         // TODO: find a way so this doesnt block
-        if let Err(error) = block_on(file_provider::provider().close_handle(id)) {
+        if let Err(error) = block_on(self.provider.close_handle(id)) {
             println!("failed to close dropped file handle {id}: {error}");
         }
     }
@@ -389,14 +396,11 @@ async fn file_exists(path: &Path) -> bool {
 }
 
 pub async fn switch_to_vfs() -> Result<(), KernelError> {
-    install_file_provider(ProviderKind::Vfs);
-
-    rebind_and_persist_after_provider_switch().await?;
-
-    let vfs_mod = Path::from_string("C:\\system\\mod");
-    let vfs_toml = Path::from_string("C:\\system\\toml");
-    ensure_dir(&vfs_mod).await?;
-    ensure_dir(&vfs_toml).await?;
+    // The mount manager has already validated the boot volume directories.
+    // The registry transition publishes VFS only after its durable merge.
+    if !rebind_and_persist_after_provider_switch().await? {
+        return Ok(());
+    }
 
     let boot_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
     let secs = boot_ms as f64 / 1000 as f64;

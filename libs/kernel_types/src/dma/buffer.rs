@@ -22,7 +22,7 @@ struct VirtIoBuffer {
 
 struct VirtPhys {
     extents: Vec<IoBufferExtent>,
-    frames: Vec<IoBufferPageFrame>,
+    frames: Vec<PhysicalFrameExtent>,
 }
 
 struct VirtDma {
@@ -613,7 +613,7 @@ impl<'backing, 'data, Access: IoBufferAccess> fmt::Debug for IoBuffer<'backing, 
 }
 
 fn copy_from_io_buffer_frames(
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     buffer_offset: usize,
     dst: *mut u8,
     len: usize,
@@ -651,7 +651,7 @@ fn copy_from_io_buffer_frames(
 }
 
 fn copy_to_io_buffer_frames(
-    frames: &[IoBufferPageFrame],
+    frames: &[PhysicalFrameExtent],
     buffer_offset: usize,
     src: *const u8,
     len: usize,

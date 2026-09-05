@@ -2,14 +2,16 @@ use crate::executable::program::{
     Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
 };
 use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
-use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::layout::{base_page_size, kernel_space_base};
-use crate::platform;
+use crate::memory::paging::stack::StackSize;
+use crate::platform::{self, resolve_mapping_in_root};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
-use crate::structs::io_request::message::{MessageDelivery};
-use crate::structs::io_request::request::{FileObject, IoOpcode, KernelIoOp, RequestId, UserIoCompletion, UserIoOp, UserPathDescriptor};
+use crate::structs::io_request::message::MessageDelivery;
+use crate::structs::io_request::request::{
+    FileObject, IoOpcode, KernelIoOp, RequestId, UserIoCompletion, UserIoOp, UserPathDescriptor,
+};
 use crate::{format, print};
 use crate::{scheduling::task::TaskHandle, util::generate_guid};
 use alloc::slice;
@@ -20,14 +22,17 @@ use kernel_executor::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor,
 };
 use kernel_types::arch::{PhysAddr, VirtAddr};
-use kernel_types::dma::implementation::IoBufferError;
+use kernel_types::dma::implementation::{IoBufferError, PhysicalFrameExtent};
 use kernel_types::executor::{
     USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainUpdate,
 };
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::{ObjectInformationClass, ObjectTag, UserObjectBasicInfo};
 
-use crate::object_manager::manager::{AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload, ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, TaskQueueRef};
+use crate::object_manager::manager::{
+    AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
+    ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, TaskQueueRef,
+};
 use crate::structs::executor_domain::UserExecutorDomain;
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
@@ -385,45 +390,18 @@ pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u
         None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
     };
     let page_count = ((mapped_end - first_page) / page_size) as usize;
-    let mut physical_pages = Vec::new();
-    if physical_pages.try_reserve_exact(page_count).is_err() {
-        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
-    }
 
     let user_pin = {
         let program = caller.read();
         let mut user_memory = program.user_memory.lock();
-        for index in 0..page_count {
-            let virt = VirtAddr::new(first_page + index as u64 * page_size);
-            let Some(mapping) =
-                crate::platform::resolve_mapping_in_root(program.address_space_root, virt)
-            else {
-                return make_err(ErrClass::Memory, MemErr::MapFailed as u16, index as u32);
-            };
-            if !mapping.user_accessible
-                || (access == UserBufferAccess::ReadWrite && !mapping.writable)
-            {
-                return make_err(
-                    ErrClass::Common,
-                    CommonErr::AccessDenied as u16,
-                    index as u32,
-                );
-            }
-            physical_pages.push(PhysAddr::new(mapping.phys_addr.as_u64() & !(page_size - 1)));
-        }
-        match user_memory.pin(first_page, mapped_end) {
-            Ok(pin) => pin,
-            Err(()) => return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0),
-        }
+
+        let Some(pin) = user_memory.pin(user_address, length as u64).ok() else {
+            return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
+        };
+        pin
     };
 
-    let backing = match MappedIoBufferBacking::new(
-        physical_pages,
-        (user_address - first_page) as usize,
-        length,
-        access,
-        user_pin,
-    ) {
+    let backing = match unsafe { MappedIoBufferBacking::new(user_pin, length, access) } {
         Ok(backing) => Arc::new(backing),
         Err(error) => return map_io_buffer_error(error),
     };
@@ -1572,10 +1550,6 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
         },
     );
     0
-}
-
-pub(crate) fn sys_mq_peek_removed() -> u64 {
-    make_err(ErrClass::Common, CommonErr::NotImplemented as u16, 0)
 }
 
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {

@@ -444,11 +444,16 @@ extern "C" fn ap_startup() -> ! {
         }
 
         syscall_init();
-        apic_calibrate_ticks_per_ns_via_wait(10);
-        apic_program_period_ns(APIC_START_PERIOD);
+        // Register while still holding the lock that assigned this CPU's ID.
+        // Scheduler storage requires contiguous insertion order; calibration
+        // can finish in a different order on each AP.
         SCHEDULER.init_core(current_cpu_id());
-        CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     }
+    // Timer storage was allocated for all CPUs before AP startup. Each AP
+    // measures its own local timer without holding up the other APs.
+    apic_calibrate_ticks_per_ns_via_wait(10);
+    apic_program_period_ns(APIC_START_PERIOD);
+    CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
 
     while !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
         core::hint::spin_loop()

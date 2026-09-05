@@ -64,6 +64,10 @@ pub trait CpuPlatform: Platform {
 }
 
 pub trait ConsolePlatform: Platform {
+    fn init_early_serial_mapping() -> Result<(), PageMapError> {
+        Ok(())
+    }
+
     fn serial_write_bytes(bytes: &[u8]);
 }
 
@@ -309,6 +313,10 @@ pub fn current_executor_context() -> (u64, u64) {
 
 pub fn serial_write_bytes(bytes: &[u8]) {
     <ActivePlatform as ConsolePlatform>::serial_write_bytes(bytes);
+}
+
+pub fn init_early_serial_mapping() -> Result<(), PageMapError> {
+    <ActivePlatform as ConsolePlatform>::init_early_serial_mapping()
 }
 
 pub fn init_debug_metadata_transport() {
