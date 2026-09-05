@@ -11,8 +11,6 @@ use kernel_types::{error::FileErrorKind, fs::*};
 
 const C_PREFIX: &str = "C:/";
 const REG_DIR: &str = "C:/system/registry";
-const REG_SNAP_PATH: &str = "C:/system/registry/registry.snap";
-const REG_WAL_PATH: &str = "C:/system/registry/registry.wal";
 const DRIVER_ROOT: &str = "C:/install/drivers";
 
 fn norm_upcase(p: &str) -> String {
@@ -123,22 +121,6 @@ impl BootstrapProvider {
             .children
             .insert("registry".into(), norm_upcase(REG_DIR));
 
-        // Create registry.snap file (RAM-backed)
-        let snap_key = norm_upcase(REG_SNAP_PATH);
-        n.insert(snap_key.clone(), Node::file(DataRef::Ram(Vec::new())));
-        n.get_mut(&norm_upcase(REG_DIR))
-            .unwrap()
-            .children
-            .insert("registry.snap".into(), snap_key);
-
-        // Create registry.wal file (RAM-backed)
-        let wal_key = norm_upcase(REG_WAL_PATH);
-        n.insert(wal_key.clone(), Node::file(DataRef::Ram(Vec::new())));
-        n.get_mut(&norm_upcase(REG_DIR))
-            .unwrap()
-            .children
-            .insert("registry.wal".into(), wal_key);
-
         for bp in boot {
             let ddir = norm_upcase(&alloc::format!("{}/{}", DRIVER_ROOT, bp.name));
             n.entry(ddir.clone()).or_insert_with(Node::dir);
@@ -208,11 +190,6 @@ impl BootstrapProvider {
                 }
             }
         }
-    }
-
-    fn is_registry_file(path: &str) -> bool {
-        let p = norm_upcase(path);
-        p == norm_upcase(REG_SNAP_PATH) || p == norm_upcase(REG_WAL_PATH)
     }
 
     pub(crate) fn seek_handle_sync(
@@ -665,20 +642,6 @@ impl BootstrapProvider {
             }
         };
 
-        // Handle registry files specially - clear content instead of deleting
-        if Self::is_registry_file(&p) {
-            let mut map = self.nodes.write();
-            if let Some(Node {
-                data: Some(DataRef::Ram(v)),
-                ..
-            }) = map.get_mut(&p)
-            {
-                v.clear();
-                return (FsCreateResult { error: None });
-            }
-        }
-
-        // For other files, attempt actual deletion
         let mut map = self.nodes.write();
 
         // Check if file exists and is not a directory

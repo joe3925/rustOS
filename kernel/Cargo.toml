@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [features]
 kernel-bench = []
+kernel-self-tests = []
+boot-timings = []
 
 [dependencies]
 spin = "0.10.0"

@@ -151,6 +151,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
     init_executor_platform();
     GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
+    #[cfg(feature = "kernel-self-tests")]
     test_kernel_tls_runtime();
     let kernel_image_base = boot_info().kernel_image_base;
     let mut program = Program::new(
