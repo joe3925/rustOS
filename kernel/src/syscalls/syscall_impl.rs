@@ -1552,10 +1552,6 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     0
 }
 
-pub(crate) fn sys_mq_peek_removed() -> u64 {
-    make_err(ErrClass::Common, CommonErr::NotImplemented as u16, 0)
-}
-
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
     let caller_pid = SCHEDULER
         .get_current_task(platform::current_cpu_id())

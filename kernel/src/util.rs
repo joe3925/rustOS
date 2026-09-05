@@ -13,19 +13,22 @@ use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::heap::{enable_mimalloc, heap_capacity_bytes, init_heap};
+use crate::memory::paging::address_space::{
+    init_kernel_address_space_root, kernel_address_space_root, switch_address_space_root,
+};
+use crate::memory::paging::frame_alloc::{
+    KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram,
+};
+use crate::memory::paging::map::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
-use crate::memory::paging::address_space::{init_kernel_address_space_root, kernel_address_space_root, switch_address_space_root};
-use crate::memory::paging::frame_alloc::{KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram};
-use crate::memory::paging::map::{unmap_reserved_range_unchecked};
 use crate::memory::paging::zero::{init_emergency_zero_mappings, start_zero_page_worker};
 use crate::platform::{
     ActivePlatform, ConsolePlatform, breakpoint, broadcast_panic_stop, calibrate_boot_timer,
     current_cpu_id, current_is_in_interrupt, current_platform_cpu_id, cycle_counter,
     disable_interrupts, enable_interrupts, enable_interrupts_and_halt, fatal_reset, halt,
     init_boot_processor, init_current_cpu_local_state, init_early_serial_mapping,
-    init_periodic_timer, processor_count,
-    start_secondary_cpus,
+    init_periodic_timer, processor_count, start_secondary_cpus,
 };
 use crate::profiling::backtrace::{self, Backtrace};
 use crate::registry::init as init_registry;
@@ -566,21 +569,25 @@ fn validate_stub_slice(ptr: usize, len: usize, stub_base: u64, stub_size: u64, w
         panic!("boot package {what} lies outside kernel stub memory");
     }
 }
-unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) { unsafe {
-    (
-        TLS_TEST_INIT_U64,
-        TLS_TEST_INIT_BYTES,
-        TLS_TEST_ZERO_U64,
-        TLS_TEST_ZERO_BYTES,
-    )
-}}
+unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) {
+    unsafe {
+        (
+            TLS_TEST_INIT_U64,
+            TLS_TEST_INIT_BYTES,
+            TLS_TEST_ZERO_U64,
+            TLS_TEST_ZERO_BYTES,
+        )
+    }
+}
 
-unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) { unsafe {
-    TLS_TEST_INIT_U64 = init_u64;
-    TLS_TEST_INIT_BYTES = init_bytes;
-    TLS_TEST_ZERO_U64 = zero_u64;
-    TLS_TEST_ZERO_BYTES = zero_bytes;
-}}
+unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) {
+    unsafe {
+        TLS_TEST_INIT_U64 = init_u64;
+        TLS_TEST_INIT_BYTES = init_bytes;
+        TLS_TEST_ZERO_U64 = zero_u64;
+        TLS_TEST_ZERO_BYTES = zero_bytes;
+    }
+}
 
 extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
     let expected = unsafe { tls_test_snapshot() };
