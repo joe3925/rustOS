@@ -9,8 +9,8 @@ If there is a * it must be completed before user space is started
 
 ## AArch64 (AA64)
 1. [ ] * Finish aarch64-vmsa crate.
-2. [ ] * Make debug.json platform independent, find a way for xtask to be able to pass info to it.
-3. [ ] * Expand xtask for aarch64 boot. 
+2. [x] * Make debug.json platform independent, find a way for xtask to be able to pass info to it.
+3. [x] * Expand xtask for aarch64 boot. 
 4. [ ] * Impl the platform traits for kernel_types, kernel_api, kernel_stub, and the kernel
 5. [ ] * Test everything.
 6. [ ] * Add spin-table startup for secondary CPUs.
@@ -41,6 +41,7 @@ If there is a * it must be completed before user space is started
 3. [ ] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
 4. [ ] stop using the x86_64 crate for paging 
 5. [ ] when we move away from the x86_64 crate program.rs should be refactored to not care if the table is offline or online just passes a table to map leaf 
+6. [ ] low prio but the vtable cost in the devicemmu -> arch-specific backend can probably be removed considering mmus arent swapped at runtime 
 
 ## Kernel General (KEG)
 1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 
@@ -69,7 +70,7 @@ If there is a * it must be completed before user space is started
 
 # User Space 
 ## User Space DLL (USD)
-1. [ ] Figure out a name for it.
+1. [x] Figure out a name for it.
 2. [ ] Figure out where it goes.
 3. [ ] Figure out what its role and scope is. 
 4. [ ] Plan the structure. 
