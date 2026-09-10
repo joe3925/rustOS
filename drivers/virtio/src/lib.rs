@@ -188,17 +188,6 @@ where
     let profile_timer = KernelStopwatch::start();
     let mut completion = core::pin::pin!(completion);
 
-    let Some(poll_ns) = virtio_completion_should_poll(byte_len) else {
-        let result = completion.await;
-
-        let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-
-        record_completion_fit_sample(byte_len, elapsed_ns);
-        return result;
-    };
-
-    let poll_timer = KernelStopwatch::start();
-
     loop {
         drain_queue_completions(qs);
 
@@ -214,21 +203,8 @@ where
             return result;
         }
 
-        let poll_elapsed_ns = poll_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-
-        if poll_elapsed_ns >= poll_ns as u64 {
-            break;
-        }
-
         core::hint::spin_loop();
     }
-
-    let result = completion.await;
-
-    let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-
-    record_completion_fit_sample(byte_len, elapsed_ns);
-    result
 }
 #[inline(always)]
 fn continue_req<K>(_req: &mut K) -> Result<DriverStep, kernel_api::error::KernelError> {
