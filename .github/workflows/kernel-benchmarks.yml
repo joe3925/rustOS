@@ -35,6 +35,12 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Enable KVM access
+        shell: bash
+        run: |
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+
       - name: Verify benchmark host
         shell: bash
         run: |
