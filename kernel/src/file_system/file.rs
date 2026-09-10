@@ -421,7 +421,10 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
     });
     #[cfg(not(feature = "kernel-bench"))]
     spawn_detached(async {
-        bench_c_drive_io_async(true).await;
+        loop {
+            bench_c_drive_io_async(true).await;
+            bench_c_drive_io_async(false).await;
+        }
     });
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});

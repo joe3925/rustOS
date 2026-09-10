@@ -21,7 +21,7 @@ If there is a * it must be completed before user space is started
 2. [ ] Add a usb driver.
 3. [ ] * Create the mouse stack. 
 4. [x] Change how the filesystem hint works so that preferably the pnp manager has no filesystem specific code.
-5. [ ] Expand the pci(e) protocol. 
+5. [x] Expand the pci(e) protocol. 
 
 ## User I/O (UIO)
 1. [x] * Currently the request_io code expects the user to provide a raw unpinned buffer. Change this to expect some type of registered buffer and so that read no longer allocates.

@@ -33,8 +33,21 @@ jobs:
           submodules: recursive
 
       - name: Verify benchmark host
+        shell: bash
         run: |
           qemu-system-x86_64 --version
+          if [[ ! -c /dev/kvm || ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo "::error::The runner account must have read and write access to /dev/kvm."
+            exit 1
+          fi
+          printf 'quit\n' | timeout 15s qemu-system-x86_64 \
+            -machine q35,kernel-irqchip=on \
+            -accel kvm \
+            -cpu qemu64,+apic,+acpi \
+            -smp 4 \
+            -m 128M \
+            -device amd-iommu,intremap=off \
+            -display none -serial none -monitor stdio -S
           sgdisk --version
           dpkg-query --show --showformat='dosfstools ${Version}\n' dosfstools
           clang --version

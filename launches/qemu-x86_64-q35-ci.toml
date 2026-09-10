@@ -3,7 +3,8 @@ id = "qemu-x86_64-q35-ci"
 provider = "qemu"
 executable = "qemu-system-x86_64"
 compatible_platforms = ["x86_64-uefi"]
-supported_hosts = ["windows", "macos", "linux"]
+supported_hosts = ["linux"]
+supported_host_arches = ["x86_64"]
 firmware_files = [
     "OVMF_CODE_4M.fd",
     "OVMF_X64.fd",
@@ -14,13 +15,13 @@ firmware_files = [
 args = [
     "-m", "{memory}",
     "-cpu", "qemu64,+apic,+acpi",
-    "-machine", "q35",
-    "-accel", "tcg,thread=single",
+    "-machine", "q35,kernel-irqchip=on",
+    "-accel", "kvm",
     "-smp", "{cpus}",
     "-display", "none",
     "-no-reboot",
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-device", "amd-iommu",
+    "-device", "amd-iommu,intremap=off",
     "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",
     "-serial", "{primary_serial}",
     "-drive", "file={boot_image},format=raw",

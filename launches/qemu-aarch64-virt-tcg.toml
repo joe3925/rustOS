@@ -29,8 +29,8 @@ debug_args = [
 ]
 
 [defaults]
-memory = "12G"
-cpus = "1"
+memory = "2G"
+cpus = "3"
 
 [capabilities]
 debug = true

@@ -25,7 +25,7 @@ args = [
 ]
 
 [defaults]
-memory = "12G"
+memory = "700M"
 cpus = "3"
 
 [capabilities]
