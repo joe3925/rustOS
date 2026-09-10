@@ -253,7 +253,9 @@ impl X86DeviceMmu {
         }
 
         let format = match self {
-            Self::Intel { .. } => page_table::X86IommuPageTableFormat::Intel,
+            Self::Intel { .. } => page_table::X86IommuPageTableFormat::Intel {
+                levels: raw.page_table_levels,
+            },
             Self::Amd { .. } => page_table::X86IommuPageTableFormat::Amd,
         };
 
@@ -630,6 +632,8 @@ pub fn try_discover_x86_iommu_from_acpi(
         BootIommuVendor::Intel => {
             if has_table::<DmarTable>(tables) {
                 Ok(Some(X86PlatformIommuInfo::Intel(parse_intel_dmar(tables))))
+            } else if has_table::<IvrsTable>(tables) {
+                Ok(Some(X86PlatformIommuInfo::Amd(parse_amd_ivrs(tables))))
             } else {
                 Ok(None)
             }
@@ -637,6 +641,8 @@ pub fn try_discover_x86_iommu_from_acpi(
         BootIommuVendor::Amd => {
             if has_table::<IvrsTable>(tables) {
                 Ok(Some(X86PlatformIommuInfo::Amd(parse_amd_ivrs(tables))))
+            } else if has_table::<DmarTable>(tables) {
+                Ok(Some(X86PlatformIommuInfo::Intel(parse_intel_dmar(tables))))
             } else {
                 Ok(None)
             }

@@ -1,21 +1,3 @@
-//! Shared x86-64 4-level page-table walker for IOMMU domains.
-//!
-//! Intel VT-d second-level page tables (§9.3 of the VT-d spec) and
-//! AMD-Vi I/O page tables (§2.2.3 of the AMD-Vi spec) share the
-//! PML4/PDPT/PD/PT depth and PFN layout, but differ in the flag bits:
-//! Intel uses bit 0=R / bit 1=W on every entry (presence is implicit
-//! in R|W); AMD uses bit 0=P plus bits 61/62=IR/IW for permissions,
-//! and non-leaf entries additionally carry a Next-Level field at
-//! bits [11:9]. The walker therefore takes callbacks from the vendor
-//! backend to supply the correct flag bits.
-//!
-//! Interior (non-leaf) page-table frames are deliberately **not tracked
-//! per-mapping** — they grow monotonically with the domain's live IOVA
-//! space and are reclaimed when the domain itself is destroyed. Tracking
-//! them would force a Vec allocation on every `map_4k` call in the hot
-//! path. The cost is bounded: the full tree for a 48-bit IOVA space is
-//! <= 2 MiB of intermediate frames even if every L1 leaf is populated.
-
 use super::domain::IommuError;
 use crate::memory::device_mmu::DeviceMmuMapPermissions;
 use crate::memory::paging::map::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
@@ -156,6 +138,7 @@ pub fn map_range(
                 |level| format.interior_flags(permissions, level),
                 format.leaf_flags(permissions, 1),
                 format.present_mask(),
+                format.root_level(),
             )?;
 
             cur_iova += 4096;
@@ -182,7 +165,7 @@ pub fn ensure_iommu_2mib_mapped(
 
     let mut table_phys = root_phys;
 
-    for lvl in (3..=4).rev() {
+    for lvl in (3..=format.root_level()).rev() {
         let idx = iova_index(iova, lvl);
         let entry = read_entry(table_phys, idx);
 
@@ -223,17 +206,20 @@ pub fn ensure_iommu_1gib_mapped(
 
     let mut table_phys = root_phys;
 
-    let idx = iova_index(iova, 4);
-    let entry = read_entry(table_phys, idx);
+    for lvl in (4..=format.root_level()).rev() {
+        let idx = iova_index(iova, lvl);
+        let entry = read_entry(table_phys, idx);
 
-    if entry & format.present_mask() == 0 {
-        let new_table = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
-        let new_entry = (new_table & PTE_ADDR_MASK) | format.interior_flags(permissions, 4);
+        if entry & format.present_mask() == 0 {
+            let new_table = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
+            let new_entry =
+                (new_table & PTE_ADDR_MASK) | format.interior_flags(permissions, lvl);
 
-        write_entry(table_phys, idx, new_entry);
-        table_phys = new_table;
-    } else {
-        table_phys = entry & PTE_ADDR_MASK;
+            write_entry(table_phys, idx, new_entry);
+            table_phys = new_table;
+        } else {
+            table_phys = entry & PTE_ADDR_MASK;
+        }
     }
 
     let idx = iova_index(iova, 3);
@@ -254,13 +240,14 @@ pub fn map_4k<F: Fn(u32) -> u64>(
     interior_flags: F,
     leaf_flags: u64,
     present_mask: u64,
+    root_level: u32,
 ) -> Result<(), IommuError> {
     debug_assert_eq!(iova & 0xFFF, 0);
     debug_assert_eq!(phys & 0xFFF, 0);
 
     let mut table_phys = root_phys;
 
-    for lvl in (2..=4).rev() {
+    for lvl in (2..=root_level).rev() {
         let idx = iova_index(iova, lvl);
         let entry = read_entry(table_phys, idx);
         if entry & present_mask != 0 {
@@ -280,11 +267,16 @@ pub fn map_4k<F: Fn(u32) -> u64>(
 
 /// Clear one 4 KiB leaf. Returns the physical address that was mapped, if any.
 #[inline]
-pub fn unmap_4k(root_phys: u64, iova: u64, present_mask: u64) -> Option<u64> {
+pub fn unmap_4k(
+    root_phys: u64,
+    iova: u64,
+    present_mask: u64,
+    root_level: u32,
+) -> Option<u64> {
     debug_assert_eq!(iova & 0xFFF, 0);
 
     let mut table_phys = root_phys;
-    for lvl in (2..=4).rev() {
+    for lvl in (2..=root_level).rev() {
         let idx = iova_index(iova, lvl);
         let entry = read_entry(table_phys, idx);
         if entry & present_mask == 0 {
@@ -323,6 +315,7 @@ pub fn identity_map_range(
             interior_flags,
             leaf_flags,
             present_mask,
+            4,
         )?;
         cur += 0x1000;
     }
@@ -335,7 +328,7 @@ pub fn alloc_root_table() -> Result<u64, IommuError> {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X86IommuPageTableFormat {
-    Intel,
+    Intel { levels: u32 },
     Amd,
 }
 
@@ -343,7 +336,7 @@ impl X86IommuPageTableFormat {
     #[inline]
     fn interior_flags(self, permissions: DeviceMmuMapPermissions, level: u32) -> u64 {
         match self {
-            Self::Intel => PTE_P | PTE_RW,
+            Self::Intel { .. } => PTE_P | PTE_RW,
             Self::Amd => amd_permission_flags(permissions) | (((level - 1) as u64) << 9),
         }
     }
@@ -351,7 +344,7 @@ impl X86IommuPageTableFormat {
     #[inline]
     fn leaf_flags(self, permissions: DeviceMmuMapPermissions, level: u32) -> u64 {
         match self {
-            Self::Intel => {
+            Self::Intel { .. } => {
                 let mut flags = intel_permission_flags(permissions);
                 if level > 1 {
                     flags |= 1 << 7;
@@ -371,8 +364,16 @@ impl X86IommuPageTableFormat {
     #[inline]
     fn present_mask(self) -> u64 {
         match self {
-            Self::Intel => PTE_P | PTE_RW,
+            Self::Intel { .. } => PTE_P | PTE_RW,
             Self::Amd => PTE_P,
+        }
+    }
+
+    #[inline]
+    fn root_level(self) -> u32 {
+        match self {
+            Self::Intel { levels } => levels,
+            Self::Amd => 4,
         }
     }
 }

@@ -1,9 +1,6 @@
 //! Intel VT-d (DMA remapping) backend. Register offsets and field
 //! layouts follow Intel VT-d Architecture Specification rev 4.1.
 //!
-//! This implementation uses legacy root/context tables, 4-level
-//! second-level paging, and register-based invalidation.
-
 use alloc::vec::Vec;
 
 use kernel_types::dma::implementation::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
@@ -24,11 +21,16 @@ const GSTS_REG: usize = 0x1C;
 const RTADDR_REG: usize = 0x20;
 const CCMD_REG: usize = 0x28;
 const FSTS_REG: usize = 0x34;
+const IQH_REG: usize = 0x80;
+const IQT_REG: usize = 0x88;
+const IQA_REG: usize = 0x90;
 
 const GCMD_TE: u32 = 1 << 31;
 const GCMD_SRTP: u32 = 1 << 30;
 const GSTS_TES: u32 = 1 << 31;
 const GSTS_RTPS: u32 = 1 << 30;
+const GCMD_QIE: u32 = 1 << 26;
+const GSTS_QIES: u32 = 1 << 26;
 
 const GSTS_ENABLE_MASK: u32 = (1 << 31) | (1 << 26) | (1 << 25) | (1 << 23);
 
@@ -41,8 +43,6 @@ const IOTLB_IIRG_GLOBAL: u64 = 1 << 60;
 const IOTLB_IIRG_DOMAIN: u64 = 2 << 60;
 const IOTLB_DW: u64 = 1 << 48;
 const IOTLB_DR: u64 = 1 << 49;
-
-const AGAW_48: u64 = 0b010;
 
 pub struct IntelVtdBackend {
     inner: Mutex<VtdInner>,
@@ -65,6 +65,11 @@ struct VtdUnit {
     platform_routes: Vec<X86PlatformDeviceRoute>,
     domain_id_count: u32,
     next_domain_id: u32,
+    agaw: u64,
+    page_table_levels: u32,
+    inv_queue_va: *mut u64,
+    inv_queue_tail: u16,
+    queued_invalidation: bool,
 }
 
 unsafe impl Send for VtdInner {}
@@ -90,9 +95,13 @@ impl IntelVtdBackend {
             let iotlb_reg_off = iro * 16 + 0x08;
 
             let sagaw = ((cap >> 8) & 0x1f) as u32;
-            if (sagaw & (1 << 2)) == 0 {
+            let (agaw, page_table_levels) = if (sagaw & (1 << 2)) != 0 {
+                (2, 4)
+            } else if (sagaw & (1 << 1)) != 0 {
+                (1, 3)
+            } else {
                 return Err(IommuError::Unsupported);
-            }
+            };
 
             let mgaw = ((cap >> 16) & 0x3f) as u32;
             let iova_end = 1u64 << core::cmp::min(mgaw + 1, 48);
@@ -101,23 +110,54 @@ impl IntelVtdBackend {
             let domain_id_count = domain_id_count_from_nd(nd).ok_or(IommuError::Unsupported)?;
 
             let root_phys = page_table::alloc_root_table()?;
+            let queued_invalidation = (ver >> 4) >= 6;
+            let (inv_queue_phys, inv_queue_va) = if queued_invalidation {
+                let (phys, va) = super::backend::alloc_zeroed_pages_contiguous(1)?;
+                (phys.as_u64(), va.as_mut_ptr::<u64>())
+            } else {
+                (0, core::ptr::null_mut())
+            };
+            let mut inv_queue_tail = 0u16;
 
             unsafe {
+                write_reg32(reg_va, GCMD_REG, 0);
+                wait_bit_clear32(reg_va, GSTS_REG, GSTS_TES | GSTS_QIES);
                 write_reg32(reg_va, FSTS_REG, 0xffff_ffff);
 
                 write_reg64(reg_va, RTADDR_REG, root_phys);
                 gcmd_issue(reg_va, GCMD_SRTP);
                 wait_bit_set32(reg_va, GSTS_REG, GSTS_RTPS);
 
-                write_reg64(reg_va, CCMD_REG, CCMD_ICC | CCMD_CIRG_GLOBAL);
-                wait_bit_clear64(reg_va, CCMD_REG, CCMD_ICC);
+                if queued_invalidation {
+                    write_reg64(reg_va, IQA_REG, inv_queue_phys);
+                    write_reg64(reg_va, IQT_REG, 0);
+                    gcmd_issue(reg_va, GCMD_QIE);
+                    wait_bit_set32(reg_va, GSTS_REG, GSTS_QIES);
+                    submit_queued_invalidation(
+                        reg_va,
+                        inv_queue_va,
+                        &mut inv_queue_tail,
+                        0x11,
+                        0,
+                    );
+                    submit_queued_invalidation(
+                        reg_va,
+                        inv_queue_va,
+                        &mut inv_queue_tail,
+                        0xd2,
+                        0,
+                    );
+                } else {
+                    write_reg64(reg_va, CCMD_REG, CCMD_ICC | CCMD_CIRG_GLOBAL);
+                    wait_bit_clear64(reg_va, CCMD_REG, CCMD_ICC);
 
-                write_reg64(
-                    reg_va,
-                    iotlb_reg_off,
-                    IOTLB_IVT | IOTLB_IIRG_GLOBAL | IOTLB_DW | IOTLB_DR,
-                );
-                wait_bit_clear64(reg_va, iotlb_reg_off, IOTLB_IVT);
+                    write_reg64(
+                        reg_va,
+                        iotlb_reg_off,
+                        IOTLB_IVT | IOTLB_IIRG_GLOBAL | IOTLB_DW | IOTLB_DR,
+                    );
+                    wait_bit_clear64(reg_va, iotlb_reg_off, IOTLB_IVT);
+                }
 
                 gcmd_issue(reg_va, GCMD_TE);
                 wait_bit_set32(reg_va, GSTS_REG, GSTS_TES);
@@ -142,6 +182,11 @@ impl IntelVtdBackend {
                 platform_routes: unit.platform_routes.clone(),
                 domain_id_count,
                 next_domain_id: 1,
+                agaw,
+                page_table_levels,
+                inv_queue_va,
+                inv_queue_tail,
+                queued_invalidation,
             });
         }
 
@@ -155,12 +200,12 @@ impl IntelVtdBackend {
     }
 
     pub fn create_domain(&self, identity: DmaPciDeviceIdentity) -> Result<IommuDomain, IommuError> {
-        let (unit_index, domain_id, iova_end) = {
+        let (unit_index, domain_id, iova_end, page_table_levels) = {
             let mut inner = self.inner.lock();
             let unit_index = inner.select_unit_index(identity)?;
             let unit = &mut inner.units[unit_index];
             let domain_id = allocate_domain_id(unit)?;
-            (unit_index, domain_id, unit.iova_end)
+            (unit_index, domain_id, unit.iova_end, unit.page_table_levels)
         };
 
         let root_phys = page_table::alloc_root_table()?;
@@ -171,6 +216,7 @@ impl IntelVtdBackend {
             identity.requester_id,
             unit_index as u32,
             iova_end,
+            page_table_levels,
         ))
     }
 
@@ -178,7 +224,7 @@ impl IntelVtdBackend {
         &self,
         identity: DeviceMmuPlatformDeviceIdentity,
     ) -> Result<IommuDomain, IommuError> {
-        let (unit_index, segment, source_id, domain_id, iova_end) = {
+        let (unit_index, segment, source_id, domain_id, iova_end, page_table_levels) = {
             let mut inner = self.inner.lock();
             let (unit_index, source_id) = inner.select_platform_route(identity)?;
             let unit = &mut inner.units[unit_index];
@@ -189,6 +235,7 @@ impl IntelVtdBackend {
                 source_id,
                 domain_id,
                 unit.iova_end,
+                unit.page_table_levels,
             )
         };
 
@@ -200,6 +247,7 @@ impl IntelVtdBackend {
             source_id,
             unit_index as u32,
             iova_end,
+            page_table_levels,
         ))
     }
 
@@ -247,15 +295,20 @@ impl IntelVtdBackend {
     pub fn unmap_pages(&self, domain: &IommuDomain, iova: u64, page_count: u32) {
         let mut cur = iova;
         for _ in 0..page_count {
-            let _ = page_table::unmap_4k(domain.root_phys, cur, PTE_P | PTE_RW);
+            let _ = page_table::unmap_4k(
+                domain.root_phys,
+                cur,
+                PTE_P | PTE_RW,
+                domain.page_table_levels,
+            );
             cur += 0x1000;
         }
         self.invalidate(domain, 0, 0);
     }
 
     pub fn invalidate(&self, domain: &IommuDomain, _iova: u64, _len: u64) {
-        let inner = self.inner.lock();
-        let Some(unit) = inner.units.get(domain.remapper_index as usize) else {
+        let mut inner = self.inner.lock();
+        let Some(unit) = inner.units.get_mut(domain.remapper_index as usize) else {
             return;
         };
         invalidate_domain_iotlb(unit, domain.domain_id);
@@ -350,7 +403,7 @@ fn attach_source_id(
     let devfn = (source_id & 0xff) as u8;
     let ctx_phys = ensure_context_table(unit, bus)?;
     let qw0 = (domain.root_phys & PTE_ADDR_MASK) | 1;
-    let qw1 = AGAW_48 | ((domain.domain_id as u64) << 8);
+    let qw1 = unit.agaw | ((domain.domain_id as u64) << 8);
     write_table_pair(ctx_phys, (devfn as usize) * 2, qw0, qw1)
 }
 
@@ -372,7 +425,21 @@ fn ensure_context_table(unit: &mut VtdUnit, bus: u8) -> Result<u64, IommuError> 
     Ok(new_ctx)
 }
 
-fn invalidate_context_domain(unit: &VtdUnit, domain_id: u16) {
+fn invalidate_context_domain(unit: &mut VtdUnit, domain_id: u16) {
+    if unit.queued_invalidation {
+        let descriptor = 0x21 | ((domain_id as u64) << 16);
+        unsafe {
+            submit_queued_invalidation(
+                unit.reg_base_va,
+                unit.inv_queue_va,
+                &mut unit.inv_queue_tail,
+                descriptor,
+                0,
+            );
+        }
+        return;
+    }
+
     let ccmd = CCMD_ICC | CCMD_CIRG_DOMAIN | ((domain_id as u64) << 16);
     unsafe {
         write_reg64(unit.reg_base_va, CCMD_REG, ccmd);
@@ -425,7 +492,21 @@ fn platform_route_matches(
 }
 
 #[inline]
-fn invalidate_domain_iotlb(unit: &VtdUnit, domain_id: u16) {
+fn invalidate_domain_iotlb(unit: &mut VtdUnit, domain_id: u16) {
+    if unit.queued_invalidation {
+        let descriptor = 0xe2 | ((domain_id as u64) << 16);
+        unsafe {
+            submit_queued_invalidation(
+                unit.reg_base_va,
+                unit.inv_queue_va,
+                &mut unit.inv_queue_tail,
+                descriptor,
+                0,
+            );
+        }
+        return;
+    }
+
     let iotlb = IOTLB_IVT | IOTLB_IIRG_DOMAIN | IOTLB_DW | IOTLB_DR | ((domain_id as u64) << 32);
     unsafe {
         write_reg64(unit.reg_base_va, unit.iotlb_reg_off, iotlb);
@@ -626,6 +707,33 @@ unsafe fn write_reg64(base: *mut u8, off: usize, v: u64) {
 #[inline]
 unsafe fn wait_bit_set32(base: *mut u8, off: usize, bit: u32) {
     while unsafe { read_reg32(base, off) } & bit == 0 {
+        core::hint::spin_loop();
+    }
+}
+
+unsafe fn submit_queued_invalidation(
+    reg_base: *mut u8,
+    queue: *mut u64,
+    tail: &mut u16,
+    low: u64,
+    high: u64,
+) {
+    let index = *tail as usize * 2;
+    unsafe {
+        queue.add(index).write_volatile(low);
+        queue.add(index + 1).write_volatile(high);
+    }
+    *tail = (*tail + 1) & 0xff;
+    let byte_tail = (*tail as u64) * 16;
+    unsafe { write_reg64(reg_base, IQT_REG, byte_tail) };
+    while unsafe { read_reg64(reg_base, IQH_REG) } & 0xfff != byte_tail {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+unsafe fn wait_bit_clear32(base: *mut u8, off: usize, bit: u32) {
+    while unsafe { read_reg32(base, off) } & bit != 0 {
         core::hint::spin_loop();
     }
 }

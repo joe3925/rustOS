@@ -11,6 +11,7 @@ pub struct IommuDomain {
     pub remapper_index: u32,
     pub iova_start: u64,
     pub iova_end: u64,
+    pub page_table_levels: u32,
 }
 
 impl IommuDomain {
@@ -21,6 +22,7 @@ impl IommuDomain {
         requester_id: u16,
         remapper_index: u32,
         iova_end: u64,
+        page_table_levels: u32,
     ) -> Self {
         Self {
             root_phys,
@@ -30,6 +32,7 @@ impl IommuDomain {
             remapper_index,
             iova_start: X86_IOVA_START,
             iova_end,
+            page_table_levels,
         }
     }
 

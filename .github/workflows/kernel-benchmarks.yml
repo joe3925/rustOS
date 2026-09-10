@@ -43,7 +43,7 @@ jobs:
           printf 'quit\n' | timeout 15s qemu-system-x86_64 \
             -machine q35,kernel-irqchip=on \
             -accel kvm \
-            -cpu qemu64,+apic,+acpi \
+            -cpu host \
             -smp 4 \
             -m 128M \
             -device amd-iommu,intremap=off \

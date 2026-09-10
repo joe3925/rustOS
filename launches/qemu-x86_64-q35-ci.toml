@@ -14,7 +14,7 @@ firmware_files = [
 ]
 args = [
     "-m", "{memory}",
-    "-cpu", "qemu64,+apic,+acpi",
+    "-cpu", "host",
     "-machine", "q35,kernel-irqchip=on",
     "-accel", "kvm",
     "-smp", "{cpus}",
