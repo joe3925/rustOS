@@ -1,5 +1,5 @@
 use acpi::platform::ProcessorState;
-use acpi::{AcpiTables, InterruptModel};
+use acpi::{AcpiTables, platform::InterruptModel};
 use alloc::vec::Vec;
 
 use crate::drivers::ACPI::ACPIImpl;
@@ -18,10 +18,11 @@ impl MachinePlatform for X86Platform {
         let tables = firmware.acpi_tables().ok_or(CpuTopologyError {
             reason: "ACPI tables are unavailable",
         })?;
-        let platform_info = tables.platform_info().map_err(|_| CpuTopologyError {
+        let (interrupt_model, processor_info) = InterruptModel::new(&tables).map_err(|_| CpuTopologyError {
             reason: "ACPI processor information is invalid",
         })?;
-        let processor_info = platform_info.processor_info.ok_or(CpuTopologyError {
+        let _ = interrupt_model;
+        let processor_info = processor_info.ok_or(CpuTopologyError {
             reason: "ACPI processor information is unavailable",
         })?;
         let mut processors = Vec::new();
@@ -52,8 +53,8 @@ impl MachinePlatform for X86Platform {
     fn discover_interrupt_info_from_acpi(
         tables: &AcpiTables<ACPIImpl>,
     ) -> Option<MachineInterruptInfo> {
-        let platform_info = tables.platform_info().ok()?;
-        let apic = match platform_info.interrupt_model {
+        let (interrupt_model, _) = InterruptModel::new(tables).ok()?;
+        let apic = match interrupt_model {
             InterruptModel::Apic(apic) => apic,
             _ => return None,
         };

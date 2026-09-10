@@ -1,4 +1,4 @@
-use acpi::madt::{Madt, MadtEntry};
+use acpi::sdt::madt::{Madt, MadtEntry};
 use device_tree::{DeviceTree, Node};
 
 use crate::machine::machine_info;
@@ -17,7 +17,7 @@ pub(super) fn discover_gicv3() -> Option<GicDescription> {
 
 fn discover_gicv3_acpi() -> Option<GicDescription> {
     let tables = machine_info().firmware().acpi_tables()?;
-    let madt = tables.find_table::<Madt>().ok()?;
+    let madt = tables.find_table::<Madt>()?;
     let mut distributor = None;
     let mut redistributor = None;
     let mut gicc_redistributor = None;

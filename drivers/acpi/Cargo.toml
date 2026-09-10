@@ -16,6 +16,6 @@ configuration = "src/acpi.toml"
 
 [dependencies]
 kernel_api = { workspace = true }
-aml = "0.16.4"
+aml = { package = "acpi", git = "https://github.com/rust-osdev/acpi", rev = "09d5c67" }
 
 spin = { version = "0.10", default-features = false, features = ["mutex"] }

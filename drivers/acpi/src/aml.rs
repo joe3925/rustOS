@@ -9,16 +9,17 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use aml::value::Args;
-use aml::{AmlContext, AmlName, AmlValue, Handler};
-use core::ptr::{read_volatile, write_volatile};
-use kernel_api::acpi::mcfg::Mcfg;
+use aml::aml::Interpreter;
+use aml::aml::namespace::AmlName;
+use aml::aml::object::{Object as AmlValue, WrappedObject};
+use aml::{Handler, PciAddress, PhysicalMapping, Handle};
+use core::{ptr::{read_volatile, write_volatile}, str::FromStr};
+use aml::sdt::mcfg::Mcfg;
 use kernel_api::device::DevNode;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::pci::EcamSegment;
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::kernel_types::request::IoctlData;
 use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpOp;
@@ -29,8 +30,10 @@ use kernel_api::pnp::get_acpi_tables;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::request_handler;
 pub const PAGE_SIZE: usize = 4096;
+#[derive(Clone)]
 #[repr(C)]
 pub struct KernelAmlHandler;
+pub type AmlContext = Interpreter<KernelAmlHandler>;
 
 pub type McfgSeg = EcamSegment;
 
@@ -92,11 +95,11 @@ unsafe fn mmio_write<T: Copy>(paddr: usize, val: T) {
 #[inline]
 fn ecam_cfg_phys_addr(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Option<usize> {
     let tables = get_acpi_tables();
-    let map = tables.find_table::<Mcfg>().ok()?;
+    let map = tables.find_table::<Mcfg>()?;
     let raw = unsafe {
         core::slice::from_raw_parts(
-            map.virtual_start().as_ptr() as *const u8,
-            map.region_length(),
+            map.virtual_start.as_ptr() as *const u8,
+            map.region_length,
         )
     };
 
@@ -107,6 +110,23 @@ fn ecam_cfg_phys_addr(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Option<
 }
 
 impl Handler for KernelAmlHandler {
+    unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
+        let (va, offset, mapped_length) = unsafe { map_phys_window(physical_address, size) };
+        PhysicalMapping {
+            physical_start: physical_address,
+            virtual_start: core::ptr::NonNull::new((va.as_u64() as usize + offset) as *mut T).unwrap(),
+            region_length: size,
+            mapped_length,
+            handler: self.clone(),
+        }
+    }
+
+    fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
+        let offset = region.physical_start & (PAGE_SIZE - 1);
+        let base = region.virtual_start.as_ptr() as usize - offset;
+        unsafe { unmap_phys_window(VirtAddr::new(base as u64), region.mapped_length) };
+    }
+
     #[inline]
     fn read_u8(&self, address: usize) -> u8 {
         unsafe { mmio_read::<u8>(address) }
@@ -125,19 +145,19 @@ impl Handler for KernelAmlHandler {
     }
 
     #[inline]
-    fn write_u8(&mut self, address: usize, value: u8) {
+    fn write_u8(&self, address: usize, value: u8) {
         unsafe { mmio_write::<u8>(address, value) }
     }
     #[inline]
-    fn write_u16(&mut self, address: usize, value: u16) {
+    fn write_u16(&self, address: usize, value: u16) {
         unsafe { mmio_write::<u16>(address, value) }
     }
     #[inline]
-    fn write_u32(&mut self, address: usize, value: u32) {
+    fn write_u32(&self, address: usize, value: u32) {
         unsafe { mmio_write::<u32>(address, value) }
     }
     #[inline]
-    fn write_u64(&mut self, address: usize, value: u64) {
+    fn write_u64(&self, address: usize, value: u64) {
         unsafe { mmio_write::<u64>(address, value) }
     }
 
@@ -162,50 +182,57 @@ impl Handler for KernelAmlHandler {
     fn write_io_u32(&self, _port: u16, _v: u32) {}
 
     #[inline]
-    fn read_pci_u32(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
-        ecam_cfg_phys_addr(seg, bus, dev, func, off & !3)
+    fn read_pci_u32(&self, address: PciAddress, off: u16) -> u32 {
+        ecam_cfg_phys_addr(address.segment(), address.bus(), address.device(), address.function(), off & !3)
             .map(|addr| unsafe { mmio_read::<u32>(addr) })
             .unwrap_or(u32::MAX)
     }
 
     #[inline]
-    fn read_pci_u16(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u16 {
-        let d = self.read_pci_u32(seg, bus, dev, func, off & !3);
+    fn read_pci_u16(&self, address: PciAddress, off: u16) -> u16 {
+        let d = self.read_pci_u32(address, off & !3);
         let sh = (off & 2) * 8;
         ((d >> sh) & 0xFFFF) as u16
     }
 
     #[inline]
-    fn read_pci_u8(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u8 {
-        let d = self.read_pci_u32(seg, bus, dev, func, off & !3);
+    fn read_pci_u8(&self, address: PciAddress, off: u16) -> u8 {
+        let d = self.read_pci_u32(address, off & !3);
         let sh = (off & 3) * 8;
         ((d >> sh) & 0xFF) as u8
     }
 
     #[inline]
-    fn write_pci_u32(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u32) {
-        if let Some(addr) = ecam_cfg_phys_addr(seg, bus, dev, func, off & !3) {
+    fn write_pci_u32(&self, address: PciAddress, off: u16, val: u32) {
+        if let Some(addr) = ecam_cfg_phys_addr(address.segment(), address.bus(), address.device(), address.function(), off & !3) {
             unsafe { mmio_write::<u32>(addr, val) };
         }
     }
 
     #[inline]
-    fn write_pci_u16(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u16) {
-        let mut d = self.read_pci_u32(seg, bus, dev, func, off & !3);
+    fn write_pci_u16(&self, address: PciAddress, off: u16, val: u16) {
+        let mut d = self.read_pci_u32(address, off & !3);
         let sh = (off & 2) * 8;
         let mask = !(0xFFFFu32 << sh);
         d = (d & mask) | ((val as u32) << sh);
-        self.write_pci_u32(seg, bus, dev, func, off & !3, d);
+        self.write_pci_u32(address, off & !3, d);
     }
 
     #[inline]
-    fn write_pci_u8(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u8) {
-        let mut d = self.read_pci_u32(seg, bus, dev, func, off & !3);
+    fn write_pci_u8(&self, address: PciAddress, off: u16, val: u8) {
+        let mut d = self.read_pci_u32(address, off & !3);
         let sh = (off & 3) * 8;
         let mask = !(0xFFu32 << sh);
         d = (d & mask) | ((val as u32) << sh);
-        self.write_pci_u32(seg, bus, dev, func, off & !3, d);
+        self.write_pci_u32(address, off & !3, d);
     }
+
+    fn nanos_since_boot(&self) -> u64 { 0 }
+    fn stall(&self, microseconds: u64) { for _ in 0..microseconds.saturating_mul(100) { core::hint::spin_loop(); } }
+    fn sleep(&self, milliseconds: u64) { self.stall(milliseconds.saturating_mul(1000)); }
+    fn create_mutex(&self) -> Handle { Handle(0) }
+    fn acquire(&self, _: Handle, _: u16) -> Result<(), aml::aml::AmlError> { Ok(()) }
+    fn release(&self, _: Handle) {}
 }
 
 fn sta_present(ctx: &mut AmlContext, dev: &AmlName) -> bool {
@@ -213,37 +240,30 @@ fn sta_present(ctx: &mut AmlContext, dev: &AmlName) -> bool {
         Ok(p) => p,
         Err(_) => return true,
     };
-    let val = match ctx.namespace.get_by_path(&path) {
-        Ok(aml::AmlValue::Integer(x)) => *x as u32,
-        Ok(aml::AmlValue::Method { .. }) => {
-            match ctx.invoke_method(&path, aml::value::Args::EMPTY) {
-                Ok(aml::AmlValue::Integer(x)) => x as u32,
-                _ => 0x0F,
-            }
-        }
+    let val = match ctx.evaluate(path, alloc::vec![]) {
+        Ok(value) => match &*value {
+            AmlValue::Integer(x) => *x as u32,
+            _ => 0x0F,
+        },
         _ => 0x0F,
     };
     (val & 0x1) != 0
 }
 
 pub fn read_ids(ctx: &mut AmlContext, dev: &AmlName) -> (Option<String>, Vec<String>) {
-    use aml::AmlValue;
+    use aml::aml::object::Object as AmlValue;
 
-    fn read_obj(ctx: &mut AmlContext, p: &AmlName) -> Option<AmlValue> {
-        match ctx.namespace.get_by_path(p) {
-            Ok(AmlValue::Method { .. }) => ctx.invoke_method(p, aml::value::Args::EMPTY).ok(),
-            Ok(v) => Some(v.clone()),
-            Err(_) => None,
-        }
+    fn read_obj(ctx: &mut AmlContext, p: &AmlName) -> Option<WrappedObject> {
+        ctx.evaluate(p.clone(), alloc::vec![]).ok()
     }
 
     let mut hid: Option<String> = None;
     if let Ok(hid_path) = AmlName::from_str(&(dev.as_string() + "._HID"))
         && let Some(v) = read_obj(ctx, &hid_path)
     {
-        match v {
+        match &*v {
             AmlValue::String(s) => hid = Some(format!("ACPI\\{}", s)),
-            AmlValue::Integer(i) => hid = Some(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
+            AmlValue::Integer(i) => hid = Some(format!("ACPI\\{}", pnp_id_from_u32(*i as u32))),
             _ => {}
         }
     }
@@ -252,12 +272,12 @@ pub fn read_ids(ctx: &mut AmlContext, dev: &AmlName) -> (Option<String>, Vec<Str
     if let Ok(cid_path) = AmlName::from_str(&(dev.as_string() + "._CID"))
         && let Some(v) = read_obj(ctx, &cid_path)
     {
-        match v {
+        match &*v {
             AmlValue::String(s) => cids.push(format!("ACPI\\{}", s)),
-            AmlValue::Integer(i) => cids.push(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
+            AmlValue::Integer(i) => cids.push(format!("ACPI\\{}", pnp_id_from_u32(*i as u32))),
             AmlValue::Package(pk) => {
                 for it in pk.iter() {
-                    match it {
+                    match &**it {
                         AmlValue::String(s) => cids.push(format!("ACPI\\{}", s.clone())),
                         AmlValue::Integer(i) => {
                             cids.push(format!("ACPI\\{}", pnp_id_from_u32(*i as u32)))
@@ -282,22 +302,16 @@ const BUS_HIDS: &[&str] = &["ACPI\\PNP0A03", "ACPI\\PNP0A08"];
 
 fn read_uid(ctx: &mut AmlContext, dev: &AmlName) -> Option<String> {
     let path = AmlName::from_str(&(dev.as_string() + "._UID")).ok()?;
-    match ctx.namespace.get_by_path(&path).ok() {
-        Some(aml::AmlValue::String(s)) => Some(s.to_string()),
-        Some(aml::AmlValue::Integer(i)) => Some(format!("{}", i)),
-        Some(aml::AmlValue::Method { .. }) => {
-            match ctx.invoke_method(&path, aml::value::Args::EMPTY).ok()? {
-                aml::AmlValue::String(s) => Some(s),
-                aml::AmlValue::Integer(i) => Some(format!("{}", i)),
-                _ => None,
-            }
-        }
+    let value = ctx.evaluate(path, alloc::vec![]).ok()?;
+    match &*value {
+        AmlValue::String(s) => Some(s.to_string()),
+        AmlValue::Integer(i) => Some(format!("{}", i)),
         _ => None,
     }
 }
 
 pub fn create_pnp_bus_from_acpi(
-    ctx_lock: &Arc<spin::RwLock<aml::AmlContext>>,
+    ctx_lock: &Arc<spin::RwLock<AmlContext>>,
     parent_dev_node: &Arc<DevNode>,
     dev_name: AmlName,
 ) -> bool {
@@ -358,11 +372,11 @@ pub fn create_pnp_bus_from_acpi(
 
     let tables = get_acpi_tables();
     let mut ecam = alloc::vec::Vec::new();
-    if let Ok(map) = tables.find_table::<Mcfg>() {
+    if let Some(map) = tables.find_table::<Mcfg>() {
         let raw = unsafe {
             core::slice::from_raw_parts(
-                map.virtual_start().as_ptr() as *const u8,
-                map.region_length(),
+                map.virtual_start.as_ptr() as *const u8,
+                map.region_length,
             )
         };
         for e in parse_mcfg(raw) {
@@ -438,12 +452,9 @@ fn ser_irq(vector: u32, level: bool, sharable: bool) -> [u8; 12] {
 #[inline]
 fn read_int_method(ctx: &mut AmlContext, dev: &AmlName, suffix: &str) -> Option<u64> {
     let p = AmlName::from_str(&(dev.as_string() + "." + suffix)).ok()?;
-    match ctx.namespace.get_by_path(&p).ok()? {
+    let value = ctx.evaluate(p, alloc::vec![]).ok()?;
+    match &*value {
         AmlValue::Integer(n) => Some(*n),
-        AmlValue::Method { .. } => match ctx.invoke_method(&p, Args::EMPTY).ok()? {
-            AmlValue::Integer(n) => Some(n),
-            _ => None,
-        },
         _ => None,
     }
 }
@@ -460,18 +471,13 @@ fn append_ecam(out: &mut Vec<u8>, base: u64, seg: u16, sb: u8, eb: u8) {
 
 fn irqs_from_crs(ctx: &mut AmlContext, link: &AmlName) -> Option<Vec<u32>> {
     let crs_path = AmlName::from_str(&(link.as_string() + "._CRS")).ok()?;
-    let crs_val = match ctx.namespace.get_by_path(&crs_path) {
-        Ok(AmlValue::Method { .. }) => ctx.invoke_method(&crs_path, Args::EMPTY).ok(),
-        Ok(v) => Some(v.clone()),
-        Err(_) => None,
-    }?;
+    let crs_val = ctx.evaluate(crs_path, alloc::vec![]).ok()?;
 
-    let AmlValue::Buffer(buf) = crs_val else {
+    let AmlValue::Buffer(buf) = &*crs_val else {
         return None;
     };
 
-    let data = buf.lock();
-    let mut bytes = data.as_slice();
+    let mut bytes = buf.as_slice();
     let mut irqs = Vec::new();
 
     while !bytes.is_empty() {
@@ -546,7 +552,7 @@ pub struct PrtEntry {
 /// Evaluate the _PRT method for a PCI host bridge and return routing entries.
 /// Hardwired GSIs (Source == 0) are used directly; link devices are resolved via their _CRS.
 pub fn evaluate_prt(ctx: &mut AmlContext, dev: &AmlName) -> Vec<PrtEntry> {
-    use aml::value::{AmlValue, Args};
+    use aml::aml::object::Object as AmlValue;
     let mut out = Vec::new();
 
     let prt_path = match AmlName::from_str(&(dev.as_string() + "._PRT")) {
@@ -554,21 +560,14 @@ pub fn evaluate_prt(ctx: &mut AmlContext, dev: &AmlName) -> Vec<PrtEntry> {
         Err(_) => return out,
     };
 
-    let val = match ctx.namespace.get_by_path(&prt_path) {
-        Ok(AmlValue::Method { .. }) => match ctx.invoke_method(&prt_path, Args::EMPTY) {
-            Ok(v) => v,
-            Err(_) => return out,
-        },
-        Ok(AmlValue::Package(elems)) => AmlValue::Package(elems.clone()),
-        _ => return out,
-    };
+    let Ok(val) = ctx.evaluate(prt_path, alloc::vec![]) else { return out; };
 
-    let AmlValue::Package(entries) = val else {
+    let AmlValue::Package(entries) = &*val else {
         return out;
     };
 
     for entry in entries.iter() {
-        let AmlValue::Package(fields) = entry else {
+        let AmlValue::Package(fields) = &**entry else {
             continue;
         };
         if fields.len() < 4 {
@@ -576,25 +575,25 @@ pub fn evaluate_prt(ctx: &mut AmlContext, dev: &AmlName) -> Vec<PrtEntry> {
         }
 
         // Field 0: Address - device in high word, 0xFFFF in low word
-        let address = match &fields[0] {
+        let address = match &*fields[0] {
             AmlValue::Integer(n) => *n,
             _ => continue,
         };
         let device = ((address >> 16) & 0xFF) as u8;
 
         // Field 1: Pin (0=INTA, 1=INTB, 2=INTC, 3=INTD)
-        let pin = match &fields[1] {
+        let pin = match &*fields[1] {
             AmlValue::Integer(n) => *n as u8,
             _ => continue,
         };
 
-        let source_index = match &fields[3] {
+        let source_index = match &*fields[3] {
             AmlValue::Integer(n) => *n as usize,
             _ => continue,
         };
 
         // Field 2: Source - 0/"" means hardwired GSI, otherwise link device name
-        let gsi = match &fields[2] {
+        let gsi = match &*fields[2] {
             AmlValue::Integer(0) => u16::try_from(source_index).ok(),
             AmlValue::String(s) if s.is_empty() => u16::try_from(source_index).ok(),
             AmlValue::String(source) => {
@@ -632,13 +631,12 @@ pub fn append_prt_list(out: &mut Vec<u8>, entries: &[PrtEntry]) {
 }
 
 fn bus_range_from_crs(ctx: &mut AmlContext, dev: &AmlName) -> Option<(u8, u8)> {
-    use aml::value::Args;
     let crs = AmlName::from_str(&(dev.as_string() + "._CRS")).ok()?;
-    let aml::AmlValue::Buffer(b) = ctx.invoke_method(&crs, Args::EMPTY).ok()? else {
+    let value = ctx.evaluate(crs, alloc::vec![]).ok()?;
+    let AmlValue::Buffer(b) = &*value else {
         return None;
     };
-    let data = b.lock();
-    let mut bytes = data.as_slice();
+    let mut bytes = b.as_slice();
     let mut lo = None;
     let mut hi = None;
 
@@ -721,17 +719,16 @@ pub fn append_ecam_list(out: &mut Vec<u8>, segs: &[McfgSeg]) {
 }
 
 pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) -> Option<Vec<u8>> {
-    use aml::value::AmlValue;
+    use aml::aml::object::Object as AmlValue;
 
     let crs_path = AmlName::from_str(&(dev.as_string() + "._CRS")).ok()?;
-    let val = ctx.invoke_method(&crs_path, Args::EMPTY).ok()?;
-    let buf = match val {
+    let val = ctx.evaluate(crs_path, alloc::vec![]).ok()?;
+    let buf = match &*val {
         AmlValue::Buffer(b) => b,
         _ => return None,
     };
 
-    let data = buf.lock();
-    let mut bytes = data.as_slice();
+    let mut bytes = buf.as_slice();
     let mut out = Vec::new();
 
     let mut bus_lo: Option<u8> = None;

@@ -21,7 +21,7 @@ async-lock = { version = "3.4.0", default-features = false }
 rand_xoshiro = { version = "0.7.0", default-features = false }
 rand_core = "0.9.0"
 embedded-graphics = "0.8.1"
-acpi = "5.2.0"
+acpi = { git = "https://github.com/rust-osdev/acpi", rev = "09d5c67" }
 
 goblin = { version = "0.10.0", features = [
     "endian_fd",

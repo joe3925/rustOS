@@ -1,5 +1,5 @@
-use acpi::fadt::Fadt;
-use acpi::madt::{Madt, MadtEntry};
+use acpi::sdt::fadt::Fadt;
+use acpi::sdt::madt::{Madt, MadtEntry};
 use acpi::AcpiTables;
 use alloc::vec::Vec;
 use core::slice;
@@ -30,7 +30,7 @@ impl MachinePlatform for Aarch64Platform {
     fn discover_interrupt_info_from_acpi(
         tables: &AcpiTables<ACPIImpl>,
     ) -> Option<MachineInterruptInfo> {
-        let madt = tables.find_table::<Madt>().ok()?;
+        let madt = tables.find_table::<Madt>()?;
         let distributor = madt.get().entries().find_map(|entry| match entry {
             MadtEntry::Gicd(gicd) => Some((gicd.gic_id, gicd.physical_base_address)),
             _ => None,
@@ -64,7 +64,7 @@ fn discover_acpi_topology(
     let Some(tables) = firmware.acpi_tables() else {
         return Ok(None);
     };
-    let Ok(madt) = tables.find_table::<Madt>() else {
+    let Some(madt) = tables.find_table::<Madt>() else {
         return Ok(None);
     };
     let boot_hardware_id = super::cpu::current_hardware_id();
@@ -96,7 +96,7 @@ fn discover_acpi_topology(
         return Ok(None);
     }
     normalize_cpu_order(&mut discovered, boot_hardware_id)?;
-    let conduit = tables.find_table::<Fadt>().ok().and_then(|fadt| {
+    let conduit = tables.find_table::<Fadt>().and_then(|fadt| {
         let arm_boot_arch = fadt.arm_boot_arch;
         if !arm_boot_arch.implements_psci() {
             return None;

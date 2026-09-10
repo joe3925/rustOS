@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use acpi::sdt::{SdtHeader, Signature};
-use acpi::{AcpiHandler, AcpiTable, AcpiTables, PhysicalMapping};
+use acpi::{AcpiTable, AcpiTables, Handler, PhysicalMapping};
 use core::mem::size_of;
 use kernel_types::dma::implementation::{
     DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR, DeviceMmuPlatformDeviceIdentity,
@@ -1176,7 +1176,7 @@ fn parse_amd_device_entries(bytes: &[u8]) -> Vec<AmdIvhdDeviceEntry> {
 }
 
 fn has_table<T: AcpiTable>(tables: &AcpiTables<ACPIImpl>) -> bool {
-    tables.find_table::<T>().is_ok()
+    tables.find_table::<T>().is_some()
 }
 
 fn require_table<T: AcpiTable>(
@@ -1184,19 +1184,16 @@ fn require_table<T: AcpiTable>(
     name: &str,
 ) -> PhysicalMapping<ACPIImpl, T> {
     match tables.find_table::<T>() {
-        Ok(table) => table,
-        Err(err) => panic!(
-            "mandatory IOMMU policy: ACPI {} is missing or invalid: {:?}",
-            name, err
-        ),
+        Some(table) => table,
+        None => panic!("mandatory IOMMU policy: ACPI {} is missing or invalid", name),
     }
 }
 
-fn table_bytes<'a, H: AcpiHandler, T>(table: &'a PhysicalMapping<H, T>) -> &'a [u8] {
+fn table_bytes<'a, H: Handler, T>(table: &'a PhysicalMapping<H, T>) -> &'a [u8] {
     unsafe {
         core::slice::from_raw_parts(
-            table.virtual_start().as_ptr().cast::<u8>(),
-            table.region_length(),
+            table.virtual_start.as_ptr().cast::<u8>(),
+            table.region_length,
         )
     }
 }

@@ -285,7 +285,7 @@ unsafe extern "C" {
 #[derive(Debug, Clone)]
 pub struct KernelAcpiHandler;
 
-impl acpi::AcpiHandler for KernelAcpiHandler {
+impl acpi::Handler for KernelAcpiHandler {
     unsafe fn map_physical_region<T>(
         &self,
         physical_address: usize,
@@ -300,25 +300,43 @@ impl acpi::AcpiHandler for KernelAcpiHandler {
             .expect("failed to map io space for ACPI")
         };
 
-        unsafe {
-            PhysicalMapping::new(
-                physical_address,
-                NonNull::new(virt_addr.as_mut_ptr()).unwrap(),
-                size,
-                size,
-                self.clone(),
-            )
-        }
+        PhysicalMapping { physical_start: physical_address, virtual_start: NonNull::new(virt_addr.as_mut_ptr()).unwrap(), region_length: size, mapped_length: size, handler: self.clone() }
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
         unsafe {
             crate::unmap_range(
-                VirtAddr::new(region.virtual_start().as_ptr() as u64),
-                region.region_length() as u64,
+                VirtAddr::new(region.virtual_start.as_ptr() as u64),
+                region.mapped_length as u64,
             )
         }
     }
+    fn read_u8(&self, _: usize) -> u8 { 0 }
+    fn read_u16(&self, _: usize) -> u16 { 0 }
+    fn read_u32(&self, _: usize) -> u32 { 0 }
+    fn read_u64(&self, _: usize) -> u64 { 0 }
+    fn write_u8(&self, _: usize, _: u8) {}
+    fn write_u16(&self, _: usize, _: u16) {}
+    fn write_u32(&self, _: usize, _: u32) {}
+    fn write_u64(&self, _: usize, _: u64) {}
+    fn read_io_u8(&self, _: u16) -> u8 { 0 }
+    fn read_io_u16(&self, _: u16) -> u16 { 0 }
+    fn read_io_u32(&self, _: u16) -> u32 { 0 }
+    fn write_io_u8(&self, _: u16, _: u8) {}
+    fn write_io_u16(&self, _: u16, _: u16) {}
+    fn write_io_u32(&self, _: u16, _: u32) {}
+    fn read_pci_u8(&self, _: acpi::PciAddress, _: u16) -> u8 { u8::MAX }
+    fn read_pci_u16(&self, _: acpi::PciAddress, _: u16) -> u16 { u16::MAX }
+    fn read_pci_u32(&self, _: acpi::PciAddress, _: u16) -> u32 { u32::MAX }
+    fn write_pci_u8(&self, _: acpi::PciAddress, _: u16, _: u8) {}
+    fn write_pci_u16(&self, _: acpi::PciAddress, _: u16, _: u16) {}
+    fn write_pci_u32(&self, _: acpi::PciAddress, _: u16, _: u32) {}
+    fn nanos_since_boot(&self) -> u64 { 0 }
+    fn stall(&self, _: u64) {}
+    fn sleep(&self, _: u64) {}
+    fn create_mutex(&self) -> acpi::Handle { acpi::Handle(0) }
+    fn acquire(&self, _: acpi::Handle, _: u16) -> Result<(), acpi::aml::AmlError> { Ok(()) }
+    fn release(&self, _: acpi::Handle) {}
 }
 
 #[repr(C)]

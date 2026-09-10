@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use aml::AmlContext;
+use crate::aml::AmlContext;
 use spin::{Once, RwLock};
 
 #[repr(C)]

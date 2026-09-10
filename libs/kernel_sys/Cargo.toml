@@ -11,4 +11,4 @@ crate-type = ["rlib"]
 
 [dependencies]
 kernel_types = { path = "../kernel_types" }
-acpi = "5.0.0"
+acpi = { git = "https://github.com/rust-osdev/acpi", rev = "09d5c67" }

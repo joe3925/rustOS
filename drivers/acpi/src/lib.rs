@@ -8,15 +8,14 @@ mod dev_ext;
 mod pdo;
 use kernel_api::pnp::QueryDeviceRelations;
 use kernel_api::pnp::StartDevice;
-use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
-use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
+use ::aml::aml::{namespace::{AmlName, NamespaceLevelKind}, object::{Object, WrappedObject}, Interpreter};
+use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
+use aml::{AmlContext, KernelAmlHandler, create_pnp_bus_from_acpi};
 use dev_ext::DevExt;
 use kernel_api::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::memory::{PhysAddr, map_mmio_region};
 use kernel_api::pnp::{
-    DriverStep, PnpOp, PnpOps, driver_set_evt_device_add, get_acpi_tables,
+    DriverStep, PnpOp, PnpOps, driver_set_evt_device_add, get_rsdp,
     pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::runtime::spawn_blocking;
@@ -25,7 +24,7 @@ use spin::RwLock;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
-use core::panic;
+use core::str::FromStr;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 #[cfg(not(test))]
@@ -61,56 +60,16 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     _op: PnpOp,
     _req: &'b mut StartDevice,
 ) -> Result<DriverStep, kernel_api::error::KernelError> {
-    let (dsdt, ssdts) = {
-        let acpi_tables = get_acpi_tables();
-
-        let dsdt = acpi_tables
-            .dsdt()
-            .ok()
-            .map(|t| (t.address, t.length as usize));
-
-        let mut ssdts = Vec::new();
-        for t in acpi_tables.ssdts() {
-            ssdts.push((t.address, t.length as usize));
-        }
-
-        (dsdt, ssdts)
-    };
+    let Some(rsdp) = get_rsdp() else { return Ok(DriverStep::Continue); };
 
     let parsed = spawn_blocking(move || -> Result<AmlContext, ()> {
-        let mut aml_ctx = AmlContext::new(Box::new(KernelAmlHandler), DebugVerbosity::All);
-
-        if let Some((addr, len)) = dsdt {
-            let bytes = unsafe { map_aml(addr, len) };
-            if let Err(e) = aml_ctx.parse_table(bytes) {
-                println!("[ACPI] ERROR: parse DSDT: {:?}", e);
-            }
-        }
-
-        for (addr, len) in ssdts {
-            let bytes = unsafe { map_aml(addr, len) };
-            if let Err(e) = aml_ctx.parse_table(bytes) {
-                println!("[ACPI] ERROR: parse SSDT: {:?}", e);
-            }
-        }
-
-        if let Err(e) = aml_ctx.initialize_objects() {
-            println!("[ACPI] ERROR: initialize AML objects: {:?}", e);
-            return Err(());
-        }
-
-        // Inform firmware we want global system interrupt routing from _PRT.
+        let handler = KernelAmlHandler;
+        let tables = unsafe { ::aml::AcpiTables::from_rsdp(handler.clone(), rsdp as usize) }.map_err(|e| { println!("[ACPI] ERROR: parse tables: {:?}", e); })?;
+        let platform = ::aml::platform::AcpiPlatform::new(tables, handler).map_err(|e| { println!("[ACPI] ERROR: create platform: {:?}", e); })?;
+        let aml_ctx = Interpreter::new_from_platform(&platform).map_err(|e| { println!("[ACPI] ERROR: parse AML: {:?}", e); })?;
+        aml_ctx.initialize_namespace();
         if let Ok(pic_path) = AmlName::from_str("\\_PIC") {
-            let args = ::aml::value::Args([
-                Some(::aml::value::AmlValue::Integer(1)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ]);
-            let _ = aml_ctx.invoke_method(&pic_path, args);
+            let _ = aml_ctx.evaluate(pic_path, vec![WrappedObject::new(Object::Integer(1))]);
         }
 
         Ok(aml_ctx)
@@ -125,23 +84,6 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
 
     Ok(DriverStep::Continue)
-}
-pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
-    let offset = paddr & (PAGE_SIZE - 1);
-    let base_pa = paddr - offset;
-    let need = len + offset;
-    let size_rounded = (need + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-    let va = match map_mmio_region(PhysAddr::new(base_pa as u64), size_rounded as u64) {
-        Ok(va) => va,
-        Err(e) => {
-            kernel_api::println!("[ACPI] map_aml: map_mmio_region failed: {:?}", e);
-            panic!("Failed to map AML table");
-        }
-    };
-
-    let ptr = (va.as_u64() as usize + offset) as *const u8;
-    unsafe { core::slice::from_raw_parts(ptr, len) }
 }
 
 #[request_handler]
@@ -165,10 +107,10 @@ pub async fn enumerate_bus<'req, 'data, 'b>(
             .get()
             .unwrap()
             .write()
-            .namespace
+            .namespace.lock()
             .traverse(|name, level| {
-                if matches!(level.typ, LevelType::Device) {
-                    let s = name.as_string();
+                if matches!(level.kind, NamespaceLevelKind::Device) {
+                    let s = name.to_string();
                     let is_sb_child = s.starts_with("\\_SB_.") || s.starts_with("_SB_.");
                     if is_sb_child {
                         let path_after_prefix =
