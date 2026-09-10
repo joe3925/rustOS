@@ -14,6 +14,9 @@ permissions:
   contents: read
   actions: read
 
+env:
+  BENCH_ENV_VERSION: "2"
+
 concurrency:
   group: kernel-bench-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -132,7 +135,8 @@ jobs:
             manifest="$run_dir/manifest.json"
             result="$run_dir/results.json"
             boot_image="$run_dir/boot.img"
-            if [[ -f "$manifest" && -f "$result" && -f "$boot_image" ]]; then
+            if [[ -f "$manifest" && -f "$result" && -f "$boot_image" ]] &&
+              [[ "$(jq -r '.environment_version // empty' "$manifest")" == "$BENCH_ENV_VERSION" ]]; then
               mkdir -p target/bench/anchor
               cp "$manifest" target/bench/anchor/manifest.json
               cp "$result" target/bench/anchor/results.json
@@ -159,7 +163,9 @@ jobs:
 
             result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
             boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
-            if [[ -n "$result" && -n "$boot_image" ]] &&
+            environment_version="$(find "$run_dir" -path '*/head/environment-version' -print -quit)"
+            if [[ -n "$result" && -n "$boot_image" && -n "$environment_version" ]] &&
+              [[ "$(<"$environment_version")" == "$BENCH_ENV_VERSION" ]] &&
               jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
               cp "$boot_image" target/bench/previous-boot.img
               echo "previous_available=true" >> "$GITHUB_OUTPUT"
@@ -179,6 +185,7 @@ jobs:
             --tag ci \
             --prepare-only \
             --export-boot-image target/bench/head/boot.img
+          printf '%s\n' "$BENCH_ENV_VERSION" > target/bench/head/environment-version
 
           run_variant() {
             local variant="$1"
@@ -267,6 +274,7 @@ jobs:
             target/bench/**/*.md
             target/bench/**/*.log
             target/bench/head/boot.img
+            target/bench/head/environment-version
             !target/bench/baselines/**
             !target/bench/anchor/**
           if-no-files-found: warn
@@ -321,8 +329,13 @@ jobs:
 
           result="$(find selected-run -path '*/head/results.json' -print -quit)"
           boot_image="$(find selected-run -path '*/head/boot.img' -print -quit)"
-          if [[ -z "$result" || -z "$boot_image" ]]; then
+          environment_version="$(find selected-run -path '*/head/environment-version' -print -quit)"
+          if [[ -z "$result" || -z "$boot_image" || -z "$environment_version" ]]; then
             echo "::error::Run $ACCEPT_RUN_ID does not contain a complete kernel benchmark artifact."
+            exit 1
+          fi
+          if [[ "$(<"$environment_version")" != "$BENCH_ENV_VERSION" ]]; then
+            echo "::error::Run $ACCEPT_RUN_ID uses a different benchmark environment version."
             exit 1
           fi
           jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null
@@ -332,12 +345,14 @@ jobs:
           jq -n \
             --arg run_id "$ACCEPT_RUN_ID" \
             --arg commit "$source_commit" \
+            --arg environment_version "$BENCH_ENV_VERSION" \
             --arg accepted_by_run "$GITHUB_RUN_ID" \
             --arg accepted_at "$(date --utc --iso-8601=seconds)" \
             '{
               schema: 1,
               run_id: $run_id,
               commit: $commit,
+              environment_version: $environment_version,
               accepted_by_run: $accepted_by_run,
               accepted_at: $accepted_at
             }' > target/bench/anchor/manifest.json
