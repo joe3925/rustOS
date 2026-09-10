@@ -400,7 +400,7 @@ impl Task {
         )
     }
 
-    fn new_kernel_mode_with_sched_binding(
+    pub(crate) fn new_kernel_mode_with_sched_binding(
         entry_point: TaskEntry,
         context: usize,
         stack_size: StackSize,

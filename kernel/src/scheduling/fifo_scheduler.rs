@@ -1,5 +1,6 @@
 use crate::scheduling::domain::{
-    CpuSet, DomainOps, EnqueueReason, SchedulerClass, SwitchOutOutcome,
+    CpuSet, DomainOps, EnqueueReason, KERNEL_DOMAIN_ID, SchedulerClass, SwitchOutOutcome,
+    TaskSchedBinding,
 };
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::SchedState;
@@ -12,6 +13,27 @@ use spin::Mutex;
 
 pub const RUNQ_CAP: usize = 4096;
 const BALANCE_INTERVAL_TICKS: usize = 150;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FifoPriority {
+    Realtime,
+    Normal,
+    Low,
+}
+
+pub struct FifoTaskState {
+    priority: FifoPriority,
+}
+
+impl FifoTaskState {
+    pub(crate) const fn new(priority: FifoPriority) -> Self {
+        Self { priority }
+    }
+}
+
+pub(crate) fn fifo_task_sched_binding(priority: FifoPriority) -> TaskSchedBinding {
+    TaskSchedBinding::new(KERNEL_DOMAIN_ID, FifoTaskState::new(priority))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InboundDrain {
@@ -149,9 +171,29 @@ fn drain_inbound_to_runqueue(cpu_id: usize, cpu: &FifoCpuState) -> InboundDrain 
 
 #[inline(always)]
 fn pop_queued_task(cpu: &FifoCpuState, inbound_drain: InboundDrain) -> Option<TaskHandle> {
-    if let Ok(task) = cpu.run_queue.try_pop_wait_free() {
-        cpu.load.fetch_sub(1, Ordering::Release);
-        return Some(task);
+    let queued = cpu.run_queue.len();
+
+    for _ in 0..queued {
+        let Ok(task) = cpu.run_queue.try_pop_wait_free() else {
+            break;
+        };
+        let priority = task.with_class_state(|state: &FifoTaskState| state.priority);
+
+        if priority != FifoPriority::Low {
+            cpu.load.fetch_sub(1, Ordering::Release);
+            return Some(task);
+        }
+
+        if cpu.run_queue.try_push(task).is_err() {
+            panic!("run queue rotation overflow");
+        }
+    }
+
+    if queued != 0 {
+        if let Ok(task) = cpu.run_queue.try_pop_wait_free() {
+            cpu.load.fetch_sub(1, Ordering::Release);
+            return Some(task);
+        }
     }
 
     if inbound_drain == InboundDrain::Contended {
@@ -210,7 +252,7 @@ fn steal_youngest_runnable(src_cpu_id: usize, src_cpu: &FifoCpuState) -> Option<
 
 impl SchedulerClass for FifoClass {
     type CpuState = FifoCpuState;
-    type TaskState = ();
+    type TaskState = FifoTaskState;
 
     fn enqueue(
         &self,
@@ -358,6 +400,10 @@ impl SchedulerClass for FifoClass {
 
     fn on_task_exit(&self, _task: &TaskHandle, _task_state: &Self::TaskState) {}
 
+    fn should_preempt(&self, _task: &TaskHandle, task_state: &Self::TaskState) -> bool {
+        task_state.priority != FifoPriority::Realtime
+    }
+
     fn maybe_balance(&self, per_cpu: &[Option<Self::CpuState>], now_tick: usize) {
         let last = self.last_balance_tick.load(Ordering::Relaxed);
 
@@ -462,23 +508,29 @@ impl DomainOps for FifoDomain {
     }
 
     fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize {
-        let task_state = ();
-        let cpu_id = self
-            .class
-            .select_cpu(
-                &self.per_cpu,
-                &self.cpus,
-                &task,
-                &task_state,
-                reason,
-                hint_cpu,
-            )
-            .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name));
+        task.with_class_state(|task_state: &FifoTaskState| {
+            let cpu_id = self
+                .class
+                .select_cpu(
+                    &self.per_cpu,
+                    &self.cpus,
+                    &task,
+                    task_state,
+                    reason,
+                    hint_cpu,
+                )
+                .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name));
 
-        task.set_target_cpu(cpu_id);
-        self.class
-            .enqueue(cpu_id, self.cpu_state(cpu_id), task, &task_state, reason);
-        cpu_id
+            task.set_target_cpu(cpu_id);
+            self.class.enqueue(
+                cpu_id,
+                self.cpu_state(cpu_id),
+                task.clone(),
+                task_state,
+                reason,
+            );
+            cpu_id
+        })
     }
 
     fn on_switch_out(
@@ -488,24 +540,31 @@ impl DomainOps for FifoDomain {
         now_cycles: u64,
         outcome: SwitchOutOutcome,
     ) {
-        let task_state = ();
-        self.class.on_switch_out(
-            cpu_id,
-            self.cpu_state(cpu_id),
-            task,
-            &task_state,
-            now_cycles,
-            outcome,
-        );
+        task.with_class_state(|task_state: &FifoTaskState| {
+            self.class.on_switch_out(
+                cpu_id,
+                self.cpu_state(cpu_id),
+                task,
+                task_state,
+                now_cycles,
+                outcome,
+            );
 
-        if outcome == SwitchOutOutcome::Terminated {
-            self.class.on_task_exit(task, &task_state);
-        }
+            if outcome == SwitchOutOutcome::Terminated {
+                self.class.on_task_exit(task, task_state);
+            }
+        });
     }
 
     fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
         self.class
             .pick_next(cpu_id, self.cpu_state(cpu_id), now_cycles)
+    }
+
+    fn should_preempt(&self, task: &TaskHandle) -> bool {
+        task.with_class_state(|task_state: &FifoTaskState| {
+            self.class.should_preempt(task, task_state)
+        })
     }
 
     fn maybe_balance(&self, now_tick: usize) {

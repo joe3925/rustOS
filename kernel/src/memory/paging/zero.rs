@@ -9,6 +9,7 @@ use kernel_types::status::PageMapError;
 use crate::memory::paging::frame_alloc::KernelFrameAllocator;
 use crate::memory::paging::stack::StackSize;
 use crate::platform::{ActivePlatform, PagingPlatform};
+use crate::scheduling::fifo_scheduler::{FifoPriority, fifo_task_sched_binding};
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
@@ -99,12 +100,13 @@ pub fn emergency_zero_physical_frame(physical_address: PhysAddr) -> Result<(), P
 
 pub fn start_zero_page_worker() {
     ZERO_PAGE_WAIT_QUEUE.call_once(WaitQueue::new);
-    SCHEDULER.add_task(Task::new_kernel_mode(
+    SCHEDULER.add_task(Task::new_kernel_mode_with_sched_binding(
         zero_page_worker,
         0,
         StackSize::Tiny,
         "zero-page".to_string(),
         0,
+        fifo_task_sched_binding(FifoPriority::Low),
     ));
 }
 

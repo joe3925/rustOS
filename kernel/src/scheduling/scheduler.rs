@@ -8,7 +8,7 @@ use crate::scheduling::domain::{
     CpuSet, DomainEntry, DomainMaster, EnqueueReason, KERNEL_DOMAIN_ID, RoundRobinDomainAlgorithm,
     SwitchOutOutcome, TaskSchedBinding, USER_DOMAIN_ID,
 };
-use crate::scheduling::fifo_scheduler::build_fifo_domain;
+use crate::scheduling::fifo_scheduler::{FifoPriority, build_fifo_domain, fifo_task_sched_binding};
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{SchedState, State};
 use crate::scheduling::task::CurrentTask;
@@ -27,11 +27,14 @@ use lazy_static::lazy_static;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
 
 pub(crate) fn kernel_task_sched_binding() -> TaskSchedBinding {
-    TaskSchedBinding::new(KERNEL_DOMAIN_ID, ())
+    fifo_task_sched_binding(FifoPriority::Normal)
 }
 
 pub(crate) fn user_task_sched_binding() -> TaskSchedBinding {
-    TaskSchedBinding::new(USER_DOMAIN_ID, ())
+    TaskSchedBinding::new(
+        USER_DOMAIN_ID,
+        crate::scheduling::fifo_scheduler::FifoTaskState::new(FifoPriority::Normal),
+    )
 }
 
 #[derive(Debug)]
@@ -474,6 +477,15 @@ impl Scheduler {
 
         if let Some(prev) = previous {
             let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
+
+            if !prev_is_idle
+                && prev.sched_state() == SchedState::Running
+                && !self.domains.should_preempt(prev.domain_id(), &prev)
+            {
+                sched_state.current = Some(prev.clone());
+                core.current.store(&prev);
+                return Some(prev);
+            }
 
             let mut lock_failed = false;
 

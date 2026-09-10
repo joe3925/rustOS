@@ -106,6 +106,8 @@ pub trait DomainOps: Send + Sync {
 
     fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle>;
 
+    fn should_preempt(&self, task: &TaskHandle) -> bool;
+
     fn maybe_balance(&self, now_tick: usize);
 }
 
@@ -156,6 +158,10 @@ pub trait SchedulerClass: Send + Sync + 'static {
     ) -> Option<TaskHandle>;
 
     fn on_task_exit(&self, task: &TaskHandle, task_state: &Self::TaskState);
+
+    fn should_preempt(&self, _task: &TaskHandle, _task_state: &Self::TaskState) -> bool {
+        true
+    }
 
     fn maybe_balance(&self, _per_cpu: &[Option<Self::CpuState>], _now_tick: usize) {}
 }
@@ -254,6 +260,12 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
     fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
         self.class
             .pick_next(cpu_id, self.cpu_state(cpu_id), now_cycles)
+    }
+
+    fn should_preempt(&self, task: &TaskHandle) -> bool {
+        task.with_class_state(|task_state: &C::TaskState| {
+            self.class.should_preempt(task, task_state)
+        })
     }
 
     fn maybe_balance(&self, now_tick: usize) {
@@ -379,6 +391,10 @@ where
     pub fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
         self.algorithm
             .pick_next(&self.domains, &self.per_cpu_cursor, cpu_id, now_cycles)
+    }
+
+    pub fn should_preempt(&self, id: DomainId, task: &TaskHandle) -> bool {
+        self.get(id).should_preempt(task)
     }
 
     pub fn maybe_balance(&self, current_tick: usize) {
