@@ -280,7 +280,6 @@ impl SchedulerClass for FifoClass {
     ) -> Option<usize> {
         const LOAD_WEIGHT: isize = 100;
         const IDLE_BONUS: isize = 150;
-        const WAKEUP_LAST_CPU_BONUS: isize = 120;
         const HINT_CPU_BONUS: isize = 40;
         const NEW_TASK_IDLE_BONUS: isize = 80;
 
@@ -288,7 +287,10 @@ impl SchedulerClass for FifoClass {
 
         if matches!(
             reason,
-            EnqueueReason::Preempted | EnqueueReason::Yielded | EnqueueReason::Migrated
+            EnqueueReason::Preempted
+                | EnqueueReason::Yielded
+                | EnqueueReason::Migrated
+                | EnqueueReason::Wakeup
         ) {
             if hint_cpu < n
                 && cpus.contains(hint_cpu)
@@ -321,11 +323,6 @@ impl SchedulerClass for FifoClass {
             }
 
             match reason {
-                EnqueueReason::Wakeup => {
-                    if cpu_id == hint_cpu {
-                        score -= WAKEUP_LAST_CPU_BONUS;
-                    }
-                }
                 EnqueueReason::New => {
                     if idle {
                         score -= NEW_TASK_IDLE_BONUS;
@@ -489,7 +486,6 @@ impl SchedulerClass for FifoClass {
                 break;
             };
 
-            task.set_target_cpu(min_idx);
             push_runqueue_or_panic(min_idx, min_cpu, task);
             SCHEDULER.kick_remote_core(min_idx);
         }

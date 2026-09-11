@@ -76,8 +76,12 @@ impl core::fmt::Debug for Backtrace {
 impl Backtrace {
     pub fn capture() -> Self {
         let task = SCHEDULER.get_current_task(crate::platform::current_cpu_id());
+        Self::capture_with_task(task.as_deref())
+    }
+
+    pub fn capture_with_task(task: Option<&TaskRef>) -> Self {
         let start = <ActivePlatform as UnwindPlatform>::begin_current_unwind();
-        Self::from_start(start, task.as_deref(), MAX_BACKTRACE_DEPTH)
+        Self::from_start(start, task, MAX_BACKTRACE_DEPTH)
     }
 
     pub fn from_state(state: &State, task: Option<&TaskRef>) -> Self {

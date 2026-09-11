@@ -12,7 +12,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use core::{mem, ptr};
+use core::{mem, mem::ManuallyDrop, ptr};
 use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
 use spin::Mutex;
@@ -511,44 +511,6 @@ fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
     }
 }
 
-pub(crate) struct CurrentTask {
-    ptr: AtomicPtr<TaskRef>,
-}
-
-impl CurrentTask {
-    #[inline(always)]
-    pub(crate) fn new(task: &TaskHandle) -> Self {
-        Self {
-            ptr: AtomicPtr::new(Arc::as_ptr(task) as *mut TaskRef),
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn store(&self, task: &TaskHandle) {
-        self.ptr
-            .store(Arc::as_ptr(task) as *mut TaskRef, Ordering::Release);
-    }
-
-    #[inline(always)]
-    pub(crate) fn load(&self) -> Option<TaskHandle> {
-        let p = self.ptr.load(Ordering::Acquire);
-        if p.is_null() {
-            return None;
-        }
-
-        unsafe {
-            Arc::increment_strong_count(p);
-            Some(Arc::from_raw(p))
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn is_task(&self, task: &TaskHandle) -> bool {
-        let p = self.ptr.load(Ordering::Acquire);
-        ptr::eq(p, Arc::as_ptr(task) as *mut TaskRef)
-    }
-}
-
 const TASK_ID_INDEX_BITS: u64 = 32;
 const TASK_ID_INDEX_MASK: u64 = (1u64 << TASK_ID_INDEX_BITS) - 1;
 const TASK_ID_MAX_GENERATION: u64 = 1u64 << (64 - TASK_ID_INDEX_BITS);
@@ -704,7 +666,7 @@ impl TaskTable {
         let (idx, generation) = Self::decode_id(id)?;
         let slot = self.slot(idx)?;
 
-        let state = slot.state.load(Ordering::Acquire);
+        let state = slot.state.load(Ordering::SeqCst);
         if !Self::readable_state(state) {
             return None;
         }
@@ -713,17 +675,17 @@ impl TaskTable {
             return None;
         }
 
-        slot.readers.fetch_add(1, Ordering::Acquire);
+        slot.readers.fetch_add(1, Ordering::SeqCst);
 
-        let state = slot.state.load(Ordering::Acquire);
+        let state = slot.state.load(Ordering::SeqCst);
         if !Self::readable_state(state) || slot.generation.load(Ordering::Acquire) != generation {
-            slot.readers.fetch_sub(1, Ordering::Release);
+            slot.readers.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
 
         let p = slot.ptr.load(Ordering::Acquire);
         if p.is_null() {
-            slot.readers.fetch_sub(1, Ordering::Release);
+            slot.readers.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
 
@@ -731,7 +693,7 @@ impl TaskTable {
             Arc::increment_strong_count(p);
         }
 
-        slot.readers.fetch_sub(1, Ordering::Release);
+        slot.readers.fetch_sub(1, Ordering::SeqCst);
 
         unsafe { Some(Arc::from_raw(p)) }
     }
@@ -781,8 +743,8 @@ impl TaskTable {
             .compare_exchange(
                 TASK_SLOT_LIVE,
                 TASK_SLOT_RETIRED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             )
             .is_err()
         {
@@ -801,11 +763,11 @@ impl TaskTable {
             return None;
         };
 
-        if slot.state.load(Ordering::Acquire) != TASK_SLOT_RETIRED {
+        if slot.state.load(Ordering::SeqCst) != TASK_SLOT_RETIRED {
             return None;
         }
 
-        if slot.readers.load(Ordering::Acquire) != 0 {
+        if slot.readers.load(Ordering::SeqCst) != 0 {
             if !self.push_retired_idx(idx) {
                 panic!("failed to requeue retired task slot");
             }
@@ -817,16 +779,29 @@ impl TaskTable {
             .compare_exchange(
                 TASK_SLOT_RETIRED,
                 TASK_SLOT_REAPING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             )
             .is_err()
         {
             return None;
         }
 
-        if slot.readers.load(Ordering::Acquire) != 0 {
-            slot.state.store(TASK_SLOT_RETIRED, Ordering::Release);
+        if slot.readers.load(Ordering::SeqCst) != 0 {
+            slot.state.store(TASK_SLOT_RETIRED, Ordering::SeqCst);
+            if !self.push_retired_idx(idx) {
+                panic!("failed to requeue retired task slot");
+            }
+            return None;
+        }
+
+        let p = slot.ptr.load(Ordering::Acquire);
+        let table_ref = (!p.is_null()).then(|| unsafe { ManuallyDrop::new(Arc::from_raw(p)) });
+        if table_ref
+            .as_ref()
+            .is_some_and(|task| Arc::strong_count(task) != 1)
+        {
+            slot.state.store(TASK_SLOT_RETIRED, Ordering::SeqCst);
             if !self.push_retired_idx(idx) {
                 panic!("failed to requeue retired task slot");
             }

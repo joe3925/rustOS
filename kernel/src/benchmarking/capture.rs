@@ -37,7 +37,9 @@ use kernel_types::benchmark::{
     BENCH_SAMPLE_PROTO_SCHEMA_VERSION, BenchDroppedSampleCounterProto, BenchOverflowPolicy,
     BenchSampleChunkProto, BenchSampleProto, BenchWindowConfig,
 };
-use kernel_types::dma::implementation::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
+use kernel_types::dma::implementation::{
+    IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+};
 use kernel_types::error::KernelError;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};

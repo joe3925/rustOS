@@ -274,25 +274,23 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
         halt_loop()
     }
 
+    let panic_in_interrupt = current_is_in_interrupt();
+    let panic_scheduler_cpu = current_cpu_id();
+
     disable_interrupts();
+    let panic_task = SCHEDULER.try_get_current_task(panic_scheduler_cpu);
     unsafe {
         switch_address_space_root(kernel_address_space_root());
     }
     let backtrace = if let Some(state) = PANIC_STATE.get() {
-        Backtrace::from_state(
-            state,
-            // PANIC_OWNER can't be none
-            SCHEDULER
-                .get_current_task(*PANIC_OWNER.get().unwrap() as usize)
-                .as_deref(),
-        )
+        Backtrace::from_state(state, panic_task.as_deref())
     } else {
-        Backtrace::capture()
+        Backtrace::capture_with_task(panic_task.as_deref())
     };
     crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
 
     println!("=== KERNEL PANIC [{}] ===", mod_name);
-    println!("is in interrupt: {:#?}", current_is_in_interrupt());
+    println!("is in interrupt: {:#?}", panic_in_interrupt);
     println!("{}", info);
     println!("Panic-site backtrace:");
     for trace in backtrace.iter() {

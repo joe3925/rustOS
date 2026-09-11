@@ -11,7 +11,6 @@ use crate::scheduling::domain::{
 use crate::scheduling::fifo_scheduler::{FifoPriority, build_fifo_domain, fifo_task_sched_binding};
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{SchedState, State};
-use crate::scheduling::task::CurrentTask;
 use crate::scheduling::task::Task;
 use crate::scheduling::task::TaskError;
 use crate::scheduling::task::TaskHandle;
@@ -21,7 +20,7 @@ use crate::util::KERNEL_INITIALIZED;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
@@ -90,7 +89,7 @@ impl Drop for KernelFpuGuard {
 pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
     idle_task: TaskHandle,
-    current: CurrentTask,
+    current_is_idle: AtomicBool,
     platform_cpu_id: kernel_types::irq::PlatformCpuId,
 }
 
@@ -160,9 +159,11 @@ impl Scheduler {
         idle.set_target_cpu(cpu_id);
 
         Arc::new(CoreScheduler {
-            sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
+            sched_lock: IrqSafeRwLock::new(SchedulerState {
+                current: Some(idle.clone()),
+            }),
             idle_task: idle.clone(),
-            current: CurrentTask::new(&idle),
+            current_is_idle: AtomicBool::new(true),
             platform_cpu_id,
         })
     }
@@ -281,7 +282,18 @@ impl Scheduler {
 
     #[inline(always)]
     pub fn get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
-        self.core(cpu_id)?.current.load()
+        let core = self.core(cpu_id)?;
+        let state = core.sched_lock.read();
+        state.current.clone()
+    }
+
+    #[inline(always)]
+    pub fn try_get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
+        let cores = self.cores.try_read()?;
+        let core = cores.get(cpu_id)?.clone();
+        drop(cores);
+        let state = core.sched_lock.try_read()?;
+        state.current.clone()
     }
 
     pub fn delete_task(&self, id: u64) -> Result<(), TaskError> {
@@ -326,8 +338,6 @@ impl Scheduler {
         }
 
         let in_interrupt = platform::current_is_in_interrupt();
-        let mut spins: u32 = 0;
-
         loop {
             match task.sched_state() {
                 SchedState::Blocked => {
@@ -359,14 +369,10 @@ impl Scheduler {
                 }
 
                 SchedState::Parking => {
-                    spins += 1;
-                    // TODO: im not sure about this
-                    if spins <= 64 {
-                        spin_loop();
-                        continue;
+                    if in_interrupt {
+                        return;
                     }
-
-                    return;
+                    spin_loop();
                 }
 
                 SchedState::Runnable | SchedState::Running | SchedState::Terminated => {
@@ -483,7 +489,7 @@ impl Scheduler {
                 && !self.domains.should_preempt(prev.domain_id(), &prev)
             {
                 sched_state.current = Some(prev.clone());
-                core.current.store(&prev);
+                core.current_is_idle.store(false, Ordering::Release);
                 return Some(prev);
             }
 
@@ -503,7 +509,7 @@ impl Scheduler {
 
             if lock_failed {
                 sched_state.current = Some(prev.clone());
-                core.current.store(&prev);
+                core.current_is_idle.store(prev_is_idle, Ordering::Release);
                 return Some(prev);
             }
 
@@ -595,7 +601,7 @@ impl Scheduler {
                     }
 
                     sched_state.current = Some(cand.clone());
-                    core.current.store(&cand);
+                    core.current_is_idle.store(false, Ordering::Release);
                     return Some(cand);
                 }
             }
@@ -610,7 +616,7 @@ impl Scheduler {
         }
 
         sched_state.current = Some(core.idle_task.clone());
-        core.current.store(&core.idle_task);
+        core.current_is_idle.store(true, Ordering::Release);
         Some(core.idle_task.clone())
     }
 
@@ -707,7 +713,7 @@ impl Scheduler {
 
     pub(crate) fn cpu_is_idle(&self, cpu_id: usize) -> bool {
         self.core(cpu_id)
-            .is_some_and(|core| core.current.is_task(&core.idle_task))
+            .is_some_and(|core| core.current_is_idle.load(Ordering::Acquire))
     }
 
     pub(crate) fn with_core_sched_lock<R>(

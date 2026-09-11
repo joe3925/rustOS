@@ -1,11 +1,12 @@
-use alloc::{string::ToString, vec, vec::Vec};
+use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
 use core::{
-    future::Future,
+    future::{Future, poll_fn},
     hint::black_box,
     pin::Pin,
-    task::{Context, Poll},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
-use kernel_executor::runtime::runtime::{JoinAll, spawn_join_owned};
+use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_types::{
     async_ffi::{AbiFuture, FutureExt},
     benchmark::{
@@ -13,6 +14,8 @@ use kernel_types::{
         BenchSuiteStatus,
     },
 };
+use spin::Mutex;
+
 use crate::structs::stopwatch::Stopwatch;
 
 use super::{
@@ -99,19 +102,28 @@ async fn executor_correctness(handle: BenchRunHandle) -> bool {
 
     let cpu_count = crate::platform::processor_count().max(1);
     let task_count = CORRECTNESS_TASKS_PER_CPU.saturating_mul(cpu_count);
-    let expected = (0..task_count as u64).fold(0u64, |sum, value| {
-        sum.wrapping_add(value.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-    });
+    let expected = (0..task_count as u64)
+        .fold(0u64, |sum, value| sum.wrapping_add(correctness_value(value)));
 
-    if run_task_batch(task_count, correctness_value).await != expected {
+    let warmup = run_task_batch(task_count, correctness_value).await;
+    if warmup.checksum != expected {
         bench_case_fail(handle, "executor warm-up checksum mismatch".to_string());
         bench_case_end(handle);
         return false;
     }
+    for (cpu, tasks) in warmup.cpu_tasks.into_iter().enumerate() {
+        bench_measure(
+            handle,
+            alloc::format!("warmup_tasks.cpu{cpu}"),
+            tasks as f64,
+            BenchMetricUnit::Count,
+            BenchMetricDirection::Informational,
+        );
+    }
 
     for _ in 0..CORRECTNESS_TRIALS {
         let timer = Stopwatch::start();
-        let actual = run_task_batch(task_count, correctness_value).await;
+        let actual = run_task_batch(task_count, correctness_value).await.checksum;
         let elapsed = timer.elapsed_nanos();
 
         if actual != expected {
@@ -150,11 +162,20 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
     }
 
     let task_count = QUEUE_TASKS_PER_CPU.saturating_mul(crate::platform::processor_count().max(1));
-    run_queue_trial(task_count).await;
+    let warmup = run_queue_trial(task_count).await;
+    for (cpu, tasks) in warmup.cpu_tasks.into_iter().enumerate() {
+        bench_measure(
+            handle,
+            alloc::format!("warmup_tasks.cpu{cpu}"),
+            tasks as f64,
+            BenchMetricUnit::Count,
+            BenchMetricDirection::Informational,
+        );
+    }
 
     for _ in 0..QUEUE_TRIALS {
         let timer = Stopwatch::start();
-        let checksum = run_queue_trial(task_count).await;
+        let checksum = run_queue_trial(task_count).await.checksum;
         let elapsed = timer.elapsed_nanos();
         black_box(checksum);
 
@@ -189,32 +210,107 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
     true
 }
 
-async fn run_queue_trial(task_count: usize) -> u64 {
+async fn run_queue_trial(task_count: usize) -> TaskBatchResult {
     run_task_batch(task_count, queue_value).await
 }
 
-async fn run_task_batch(task_count: usize, operation: fn(u64) -> u64) -> u64 {
-    let mut tasks = Vec::with_capacity(task_count);
+#[repr(align(64))]
+struct AlignedAtomicUsize(AtomicUsize);
+
+struct TaskBatch {
+    results: Vec<AtomicU64>,
+    completed_per_cpu: Vec<AlignedAtomicUsize>,
+    waiters: Vec<Mutex<Option<Waker>>>,
+}
+
+struct TaskBatchResult {
+    checksum: u64,
+    cpu_tasks: Vec<usize>,
+}
+
+async fn run_task_batch(task_count: usize, operation: fn(u64) -> u64) -> TaskBatchResult {
+    let cpu_count = crate::platform::processor_count().max(1);
+    let batch = Arc::new(TaskBatch {
+        results: (0..task_count).map(|_| AtomicU64::new(0)).collect(),
+        completed_per_cpu: (0..cpu_count)
+            .map(|_| AlignedAtomicUsize(AtomicUsize::new(0)))
+            .collect(),
+        waiters: (0..cpu_count).map(|_| Mutex::new(None)).collect(),
+    });
 
     for value in 0..task_count as u64 {
-        tasks.push(spawn_join_owned(async move {
+        let batch = batch.clone();
+        spawn_detached(async move {
             yield_once().await;
-            operation(value)
-        }));
+            let cpu = crate::platform::current_cpu_id();
+            batch.results[value as usize].store(operation(value), Ordering::Relaxed);
+            batch.completed_per_cpu[cpu]
+                .0
+                .fetch_add(1, Ordering::Release);
+            if let Some(waiter) = batch.waiters[cpu].lock().as_ref() {
+                waiter.wake_by_ref();
+            }
+        });
     }
 
-    JoinAll::new(tasks)
-        .await
-        .into_iter()
-        .fold(0u64, u64::wrapping_add)
+    poll_fn(|cx| {
+        let completed = batch
+            .completed_per_cpu
+            .iter()
+            .map(|counter| counter.0.load(Ordering::Acquire))
+            .sum::<usize>();
+        if completed == task_count {
+            Poll::Ready(())
+        } else {
+            for waiter in &batch.waiters {
+                *waiter.lock() = Some(cx.waker().clone());
+            }
+            let completed = batch
+                .completed_per_cpu
+                .iter()
+                .map(|counter| counter.0.load(Ordering::Acquire))
+                .sum::<usize>();
+            if completed == task_count {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    })
+    .await;
+
+    TaskBatchResult {
+        checksum: batch.results.iter().fold(0u64, |checksum, result| {
+            checksum.wrapping_add(result.load(Ordering::Relaxed))
+        }),
+        cpu_tasks: batch
+            .completed_per_cpu
+            .iter()
+            .map(|tasks| tasks.0.load(Ordering::Relaxed))
+            .collect(),
+    }
 }
 
 fn correctness_value(value: u64) -> u64 {
-    value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    let mut result = value.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for round in 0..1_024u64 {
+        result = result
+            .rotate_left(13)
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9)
+            ^ round.wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    result
 }
 
 fn queue_value(value: u64) -> u64 {
-    value.rotate_left(17)
+    let mut result = value.rotate_left(17);
+    for round in 0..1_024u64 {
+        result = result
+            .rotate_left(29)
+            .wrapping_add(0x9e37_79b9_7f4a_7c15)
+            ^ round;
+    }
+    result
 }
  extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {
     async move {
