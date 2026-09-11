@@ -1,12 +1,11 @@
-use alloc::{string::ToString, sync::Arc, vec, vec::Vec};
+use alloc::{string::ToString, vec, vec::Vec};
 use core::{
-    future::{Future, poll_fn},
+    future::Future,
     hint::black_box,
     pin::Pin,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
-use kernel_executor::runtime::runtime::spawn_detached;
+use kernel_executor::runtime::runtime::{JoinAll, spawn_join_owned};
 use kernel_types::{
     async_ffi::{AbiFuture, FutureExt},
     benchmark::{
@@ -14,8 +13,6 @@ use kernel_types::{
         BenchSuiteStatus,
     },
 };
-use spin::Mutex;
-
 use crate::structs::stopwatch::Stopwatch;
 
 use super::{
@@ -196,49 +193,20 @@ async fn run_queue_trial(task_count: usize) -> u64 {
     run_task_batch(task_count, queue_value).await
 }
 
-struct TaskBatch {
-    completed: AtomicUsize,
-    checksum: AtomicU64,
-    waiter: Mutex<Option<Waker>>,
-}
-
 async fn run_task_batch(task_count: usize, operation: fn(u64) -> u64) -> u64 {
-    let batch = Arc::new(TaskBatch {
-        completed: AtomicUsize::new(0),
-        checksum: AtomicU64::new(0),
-        waiter: Mutex::new(None),
-    });
+    let mut tasks = Vec::with_capacity(task_count);
 
     for value in 0..task_count as u64 {
-        let batch = batch.clone();
-        spawn_detached(async move {
+        tasks.push(spawn_join_owned(async move {
             yield_once().await;
-            batch
-                .checksum
-                .fetch_add(operation(value), Ordering::Relaxed);
-            if batch.completed.fetch_add(1, Ordering::AcqRel) + 1 == task_count {
-                if let Some(waiter) = batch.waiter.lock().take() {
-                    waiter.wake();
-                }
-            }
-        });
+            operation(value)
+        }));
     }
 
-    poll_fn(|cx| {
-        if batch.completed.load(Ordering::Acquire) == task_count {
-            Poll::Ready(())
-        } else {
-            *batch.waiter.lock() = Some(cx.waker().clone());
-            if batch.completed.load(Ordering::Acquire) == task_count {
-                batch.waiter.lock().take();
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        }
-    })
-    .await;
-    batch.checksum.load(Ordering::Relaxed)
+    JoinAll::new(tasks)
+        .await
+        .into_iter()
+        .fold(0u64, u64::wrapping_add)
 }
 
 fn correctness_value(value: u64) -> u64 {
