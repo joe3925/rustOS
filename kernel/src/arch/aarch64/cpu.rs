@@ -33,11 +33,6 @@ const BLOCK_ACCESS_FLAG: u64 = 1 << 10;
 const BLOCK_INNER_SHAREABLE: u64 = 0b11 << 8;
 const TWO_MIB: u64 = 2 * 1024 * 1024;
 
-#[thread_local]
-static mut EXECUTOR_TASK_ID: u64 = 0;
-#[thread_local]
-static mut EXECUTOR_DOMAIN_ID: u64 = 0;
-
 static ONLINE_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ONLINE_CPU_BITS: [AtomicU64; 4] = [
     AtomicU64::new(0),
@@ -216,19 +211,6 @@ impl CpuPlatform for Aarch64Platform {
         let ptr = per_cpu_ptr();
         assert!(!ptr.is_null());
         unsafe { &*ptr }
-    }
-
-    fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
-        unsafe {
-            let previous = (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID);
-            EXECUTOR_TASK_ID = task_id;
-            EXECUTOR_DOMAIN_ID = domain_id;
-            previous
-        }
-    }
-
-    fn current_executor_context() -> (u64, u64) {
-        unsafe { (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID) }
     }
 
     fn start_secondary_cpus() -> Result<(), CpuStartupError> {

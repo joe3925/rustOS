@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(not(any(test, loom, feature = "loom")), feature(thread_local))]
 
 extern crate alloc;
 #[cfg(any(test, loom, feature = "loom"))]

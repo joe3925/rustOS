@@ -1,3 +1,4 @@
+use core::cell::Cell;
 use spin::Once;
 
 pub type JobFn = extern "C" fn(usize);
@@ -14,6 +15,15 @@ pub struct CurrentExecutorContext {
     pub domain_id: u64,
 }
 
+#[cfg(not(any(test, loom, feature = "loom")))]
+#[thread_local]
+static EXECUTOR_CONTEXT: Cell<Option<CurrentExecutorContext>> = const { Cell::new(None) };
+
+#[cfg(any(test, loom, feature = "loom"))]
+std::thread_local! {
+    static EXECUTOR_CONTEXT: Cell<Option<CurrentExecutorContext>> = const { Cell::new(None) };
+}
+
 pub trait ExecutorPlatform: Send + Sync {
     fn init_runtime(&self, max_threads: usize, max_jobs: usize);
     fn init_blocking(&self, max_threads: usize);
@@ -23,11 +33,6 @@ pub trait ExecutorPlatform: Send + Sync {
     fn try_steal_blocking_one(&self) -> bool;
     fn yield_now(&self);
     fn print(&self, string: &str);
-    fn swap_executor_context(
-        &self,
-        context: Option<CurrentExecutorContext>,
-    ) -> Option<CurrentExecutorContext>;
-    fn current_executor_context(&self) -> Option<CurrentExecutorContext>;
     fn in_interrupt_context(&self) -> bool;
 }
 pub static PLATFORM: Once<&'static dyn ExecutorPlatform> = Once::new();
@@ -44,7 +49,15 @@ pub fn platform() -> &'static dyn ExecutorPlatform {
 }
 
 pub fn current_executor_context() -> Option<CurrentExecutorContext> {
-    platform().current_executor_context()
+    #[cfg(not(any(test, loom, feature = "loom")))]
+    {
+        EXECUTOR_CONTEXT.get()
+    }
+
+    #[cfg(any(test, loom, feature = "loom"))]
+    {
+        EXECUTOR_CONTEXT.with(Cell::get)
+    }
 }
 
 pub fn in_interrupt_context() -> bool {
@@ -59,14 +72,24 @@ pub struct CurrentExecutorContextGuard {
 
 impl CurrentExecutorContextGuard {
     pub fn enter(context: CurrentExecutorContext) -> Self {
+        #[cfg(not(any(test, loom, feature = "loom")))]
+        let previous = EXECUTOR_CONTEXT.replace(Some(context));
+
+        #[cfg(any(test, loom, feature = "loom"))]
+        let previous = EXECUTOR_CONTEXT.with(|slot| slot.replace(Some(context)));
+
         Self {
-            previous: platform().swap_executor_context(Some(context)),
+            previous,
         }
     }
 }
 
 impl Drop for CurrentExecutorContextGuard {
     fn drop(&mut self) {
-        let _ = platform().swap_executor_context(self.previous);
+        #[cfg(not(any(test, loom, feature = "loom")))]
+        EXECUTOR_CONTEXT.set(self.previous);
+
+        #[cfg(any(test, loom, feature = "loom"))]
+        EXECUTOR_CONTEXT.with(|slot| slot.set(self.previous));
     }
 }

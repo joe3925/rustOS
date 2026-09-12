@@ -15,11 +15,6 @@ use super::drivers::timer_driver::NUM_CORES;
 use super::interrupts::apic::controller::{APIC, ApicImpl};
 use super::platform::X86Platform;
 
-#[thread_local]
-static mut EXECUTOR_TASK_ID: u64 = 0;
-#[thread_local]
-static mut EXECUTOR_DOMAIN_ID: u64 = 0;
-
 pub fn get_cycles() -> u64 {
     unsafe { _rdtsc() }
 }
@@ -210,19 +205,6 @@ impl CpuPlatform for X86Platform {
 
     fn current_percpu() -> &'static Self::PerCpuState {
         current_percpu()
-    }
-
-    fn swap_executor_context(task_id: u64, domain_id: u64) -> (u64, u64) {
-        unsafe {
-            let previous = (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID);
-            EXECUTOR_TASK_ID = task_id;
-            EXECUTOR_DOMAIN_ID = domain_id;
-            previous
-        }
-    }
-
-    fn current_executor_context() -> (u64, u64) {
-        unsafe { (EXECUTOR_TASK_ID, EXECUTOR_DOMAIN_ID) }
     }
 
     fn start_secondary_cpus() -> Result<(), CpuStartupError> {
