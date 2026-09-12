@@ -1,6 +1,6 @@
 use crate::future_arena::{FutureArena, FutureArenaConfig};
 use crate::global_async::CacheAligned;
-use crate::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU8, AtomicU128, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use alloc::boxed::Box;
 use core::ptr;
@@ -22,14 +22,12 @@ const DOMAIN_CHUNK_SIZE: usize = 1 << DOMAIN_CHUNK_BITS;
 const DOMAIN_CHUNK_MASK: usize = DOMAIN_CHUNK_SIZE - 1;
 const MAX_DOMAIN_CHUNKS: usize = 64;
 const MAX_DOMAIN_SLOTS: usize = DOMAIN_CHUNK_SIZE * MAX_DOMAIN_CHUNKS;
-// Encoded slab task IDs contain 3 shard, 32 local-index, and 16 generation bits.
-const TASK_ID_BITS: u32 = 51;
-const TASK_ID_MASK: u64 = (1u64 << TASK_ID_BITS) - 1;
-const READY_TAG_MASK: u64 = (1u64 << (64 - TASK_ID_BITS)) - 1;
+const TASK_ID_MASK: u128 = u64::MAX as u128;
+const READY_TAG_SHIFT: u32 = 64;
 pub const MAX_READY_SHARDS: usize = 64;
 
 #[repr(align(64))]
-struct ReadyHead(AtomicU64);
+struct ReadyHead(AtomicU128);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
@@ -256,7 +254,7 @@ impl ExecutorDomain {
             generation: id.generation(),
             class: config.class,
             ready_heads: (0..config.ready_shards)
-                .map(|_| ReadyHead(AtomicU64::new(0)))
+                .map(|_| ReadyHead(AtomicU128::new(0)))
                 .collect::<alloc::vec::Vec<_>>()
                 .into_boxed_slice(),
             ready_cursor: CacheAligned(AtomicUsize::new(0)),
@@ -362,8 +360,8 @@ impl ExecutorDomain {
     }
 
     #[inline]
-    fn pack_ready(task_id: usize, tag: u64) -> u64 {
-        ((tag & READY_TAG_MASK) << TASK_ID_BITS) | (task_id as u64 & TASK_ID_MASK)
+    fn pack_ready(task_id: usize, tag: u64) -> u128 {
+        ((tag as u128) << READY_TAG_SHIFT) | (task_id as u128 & TASK_ID_MASK)
     }
 
     pub(crate) fn enqueue_task(&self, task_id: usize) -> bool {
@@ -382,9 +380,9 @@ impl ExecutorDomain {
         let ready_head = &self.ready_heads[task_id % self.ready_heads.len()];
         let mut head = ready_head.0.load(Ordering::Acquire);
         loop {
-            let head_id = head & TASK_ID_MASK;
-            slot.ready_next.store(head_id as usize, Ordering::Relaxed);
-            let tag = ((head >> TASK_ID_BITS).wrapping_add(1)) & READY_TAG_MASK;
+            let head_id = (head & TASK_ID_MASK) as usize;
+            slot.ready_next.store(head_id, Ordering::Relaxed);
+            let tag = ((head >> READY_TAG_SHIFT) as u64).wrapping_add(1);
             let next = Self::pack_ready(task_id, tag);
             // A failed strong CAS proves that another CPU changed this head.
             match ready_head
@@ -425,7 +423,7 @@ impl ExecutorDomain {
             let (shard, local, generation) = crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)?;
             let slot = slab.get_slot(shard, local, generation)?;
             let next_id = slot.ready_next.load(Ordering::Acquire);
-            let tag = ((head >> TASK_ID_BITS).wrapping_add(1)) & READY_TAG_MASK;
+            let tag = ((head >> READY_TAG_SHIFT) as u64).wrapping_add(1);
             let next = Self::pack_ready(next_id, tag);
             // As on push, every retry is evidence of concurrent progress.
             match ready_head

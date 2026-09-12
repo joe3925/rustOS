@@ -175,22 +175,22 @@ mod loom {
     use core::mem::ManuallyDrop;
     use core::task::{RawWaker, RawWakerVTable, Waker};
 
-    const MODEL_ID_BITS: u32 = 2;
-    const MODEL_ID_MASK: u64 = (1 << MODEL_ID_BITS) - 1;
+    const MODEL_ID_MASK: u128 = u64::MAX as u128;
+    const MODEL_TAG_SHIFT: u32 = 64;
 
     struct ReadyNode {
         next: crate::sync::atomic::AtomicUsize,
     }
 
-    fn model_push(head: &crate::sync::atomic::AtomicU64, node: &ReadyNode, id: usize) {
+    fn model_push(head: &crate::sync::atomic::AtomicU128, node: &ReadyNode, id: usize) {
         let mut current = head.load(crate::sync::atomic::Ordering::Acquire);
         loop {
             node.next.store(
                 (current & MODEL_ID_MASK) as usize,
                 crate::sync::atomic::Ordering::Relaxed,
             );
-            let tag = (current >> MODEL_ID_BITS).wrapping_add(1);
-            let replacement = (tag << MODEL_ID_BITS) | id as u64;
+            let tag = ((current >> MODEL_TAG_SHIFT) as u64).wrapping_add(1);
+            let replacement = ((tag as u128) << MODEL_TAG_SHIFT) | id as u128;
             match head.compare_exchange(
                 current,
                 replacement,
@@ -204,7 +204,7 @@ mod loom {
     }
 
     fn model_pop(
-        head: &crate::sync::atomic::AtomicU64,
+        head: &crate::sync::atomic::AtomicU128,
         first: &ReadyNode,
         second: &ReadyNode,
     ) -> Option<usize> {
@@ -216,8 +216,8 @@ mod loom {
             }
             let node = if id == 1 { first } else { second };
             let next = node.next.load(crate::sync::atomic::Ordering::Acquire);
-            let tag = (current >> MODEL_ID_BITS).wrapping_add(1);
-            let replacement = (tag << MODEL_ID_BITS) | next as u64;
+            let tag = ((current >> MODEL_TAG_SHIFT) as u64).wrapping_add(1);
+            let replacement = ((tag as u128) << MODEL_TAG_SHIFT) | next as u128;
             match head.compare_exchange(
                 current,
                 replacement,
@@ -233,7 +233,7 @@ mod loom {
     #[test]
     fn loom_intrusive_ready_stack_publishes_each_task_once() {
         exhaustive_model(|| {
-            let head = crate::sync::Arc::new(crate::sync::atomic::AtomicU64::new(0));
+            let head = crate::sync::Arc::new(crate::sync::atomic::AtomicU128::new(0));
             let first = crate::sync::Arc::new(ReadyNode {
                 next: crate::sync::atomic::AtomicUsize::new(0),
             });
@@ -262,8 +262,8 @@ mod loom {
     fn loom_sharded_ready_heads_preserve_cross_shard_work() {
         exhaustive_model(|| {
             let heads = crate::sync::Arc::new([
-                crate::sync::atomic::AtomicU64::new(0),
-                crate::sync::atomic::AtomicU64::new(0),
+                crate::sync::atomic::AtomicU128::new(0),
+                crate::sync::atomic::AtomicU128::new(0),
             ]);
             let first = crate::sync::Arc::new(ReadyNode {
                 next: crate::sync::atomic::AtomicUsize::new(0),
