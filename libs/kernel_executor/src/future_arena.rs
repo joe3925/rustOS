@@ -1,7 +1,7 @@
-use alloc::alloc::{alloc, dealloc, Layout};
+use alloc::alloc::{Layout, alloc, dealloc};
 use core::ptr::NonNull;
 
-use crate::growable_slab::{GrowableSlab, SlabHandle, DEFAULT_SLAB_SHARDS};
+use crate::growable_slab::{DEFAULT_SLAB_SHARDS, GrowableSlab, SlabHandle};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::async_ffi::AbiFutureAllocation;
 
@@ -149,6 +149,17 @@ impl FutureArena {
         }
     }
 
+    fn cache_enabled(&self) -> bool {
+        if self.config.max_chunks_per_class != usize::MAX || crate::platform::in_interrupt_context()
+        {
+            return false;
+        }
+        crate::platform::with_executor_local(|tls| {
+            unsafe { tls.active_domain.get().as_ref() }
+                .is_some_and(|domain| core::ptr::eq(domain.future_arena(), self))
+        })
+    }
+
     fn reserve_accounting(&self, capacity: usize) -> bool {
         if self
             .live
@@ -203,14 +214,15 @@ impl FutureArena {
         }
 
         let result = if let Some(class) = class {
+            let cached = self.cache_enabled();
             let reserved = match class {
-                FutureSizeClass::Bytes64 => reserve_block(&self.c64),
-                FutureSizeClass::Bytes128 => reserve_block(&self.c128),
-                FutureSizeClass::Bytes256 => reserve_block(&self.c256),
-                FutureSizeClass::Bytes512 => reserve_block(&self.c512),
-                FutureSizeClass::Bytes1024 => reserve_block(&self.c1024),
-                FutureSizeClass::Bytes2048 => reserve_block(&self.c2048),
-                FutureSizeClass::Bytes4096 => reserve_block(&self.c4096),
+                FutureSizeClass::Bytes64 => reserve_block(&self.c64, 1, cached),
+                FutureSizeClass::Bytes128 => reserve_block(&self.c128, 2, cached),
+                FutureSizeClass::Bytes256 => reserve_block(&self.c256, 3, cached),
+                FutureSizeClass::Bytes512 => reserve_block(&self.c512, 4, cached),
+                FutureSizeClass::Bytes1024 => reserve_block(&self.c1024, 5, cached),
+                FutureSizeClass::Bytes2048 => reserve_block(&self.c2048, 6, cached),
+                FutureSizeClass::Bytes4096 => reserve_block(&self.c4096, 7, cached),
             };
             reserved.map(|(handle, ptr)| FutureAllocation {
                 ptr,
@@ -240,37 +252,55 @@ impl FutureArena {
         result
     }
 
-    pub unsafe fn release(&self, allocation: FutureAllocation) -> bool { unsafe {
-        if allocation.owner_domain != self.owner {
-            return false;
-        }
-        let released = match allocation.backing {
-            FutureBacking::Slab { class, handle } => match class {
-                FutureSizeClass::Bytes64 => self.c64.release(handle),
-                FutureSizeClass::Bytes128 => self.c128.release(handle),
-                FutureSizeClass::Bytes256 => self.c256.release(handle),
-                FutureSizeClass::Bytes512 => self.c512.release(handle),
-                FutureSizeClass::Bytes1024 => self.c1024.release(handle),
-                FutureSizeClass::Bytes2048 => self.c2048.release(handle),
-                FutureSizeClass::Bytes4096 => self.c4096.release(handle),
-            },
-            FutureBacking::Large => {
-                if let Ok(layout) = Layout::from_size_align(allocation.capacity, allocation.align) {
-                    dealloc(allocation.ptr.as_ptr(), layout);
-                    true
-                } else {
-                    false
+    pub unsafe fn release(&self, allocation: FutureAllocation) -> bool {
+        unsafe {
+            if allocation.owner_domain != self.owner {
+                return false;
+            }
+            let released = match allocation.backing {
+                FutureBacking::Slab { class, handle } => match class {
+                    FutureSizeClass::Bytes64 => {
+                        release_block(&self.c64, handle, 1, self.cache_enabled())
+                    }
+                    FutureSizeClass::Bytes128 => {
+                        release_block(&self.c128, handle, 2, self.cache_enabled())
+                    }
+                    FutureSizeClass::Bytes256 => {
+                        release_block(&self.c256, handle, 3, self.cache_enabled())
+                    }
+                    FutureSizeClass::Bytes512 => {
+                        release_block(&self.c512, handle, 4, self.cache_enabled())
+                    }
+                    FutureSizeClass::Bytes1024 => {
+                        release_block(&self.c1024, handle, 5, self.cache_enabled())
+                    }
+                    FutureSizeClass::Bytes2048 => {
+                        release_block(&self.c2048, handle, 6, self.cache_enabled())
+                    }
+                    FutureSizeClass::Bytes4096 => {
+                        release_block(&self.c4096, handle, 7, self.cache_enabled())
+                    }
+                },
+                FutureBacking::Large => {
+                    if let Ok(layout) =
+                        Layout::from_size_align(allocation.capacity, allocation.align)
+                    {
+                        dealloc(allocation.ptr.as_ptr(), layout);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if released {
+                self.rollback_accounting(allocation.capacity);
+                if let FutureBacking::Slab { class, .. } = allocation.backing {
+                    self.class_live[class as usize].fetch_sub(1, Ordering::AcqRel);
                 }
             }
-        };
-        if released {
-            self.rollback_accounting(allocation.capacity);
-            if let FutureBacking::Slab { class, .. } = allocation.backing {
-                self.class_live[class as usize].fetch_sub(1, Ordering::AcqRel);
-            }
+            released
         }
-        released
-    }}
+    }
 
     pub fn live_futures(&self) -> usize {
         self.live.load(Ordering::Acquire)
@@ -310,62 +340,64 @@ impl FutureArena {
         }
     }
 
-    pub unsafe fn release_abi(&self, allocation: AbiFutureAllocation) -> bool { unsafe {
-        let Some(ptr) = NonNull::new(allocation.ptr.cast::<u8>()) else {
-            return false;
-        };
-        let owner = crate::domain::ExecutorDomainId::from_raw(allocation.owner_domain);
-        if owner != self.owner {
-            return false;
+    pub unsafe fn release_abi(&self, allocation: AbiFutureAllocation) -> bool {
+        unsafe {
+            let Some(ptr) = NonNull::new(allocation.ptr.cast::<u8>()) else {
+                return false;
+            };
+            let owner = crate::domain::ExecutorDomainId::from_raw(allocation.owner_domain);
+            if owner != self.owner {
+                return false;
+            }
+            let capacity = allocation.capacity as usize;
+            let align = allocation.align as usize;
+            let backing = if allocation.token >> 63 == 1 {
+                let class = match ((allocation.token >> 60) & 0x7) as u8 {
+                    0 => FutureSizeClass::Bytes64,
+                    1 => FutureSizeClass::Bytes128,
+                    2 => FutureSizeClass::Bytes256,
+                    3 => FutureSizeClass::Bytes512,
+                    4 => FutureSizeClass::Bytes1024,
+                    5 => FutureSizeClass::Bytes2048,
+                    6 => FutureSizeClass::Bytes4096,
+                    _ => return false,
+                };
+                if capacity != class.capacity() {
+                    return false;
+                }
+                let handle = SlabHandle {
+                    shard: ((allocation.token >> 52) & 0xff) as u8,
+                    local_index: ((allocation.token >> 20) & 0xffff_ffff) as u32,
+                    generation: (allocation.token & 0xffff) as u32,
+                };
+                let expected = match class {
+                    FutureSizeClass::Bytes64 => block_ptr(&self.c64, handle),
+                    FutureSizeClass::Bytes128 => block_ptr(&self.c128, handle),
+                    FutureSizeClass::Bytes256 => block_ptr(&self.c256, handle),
+                    FutureSizeClass::Bytes512 => block_ptr(&self.c512, handle),
+                    FutureSizeClass::Bytes1024 => block_ptr(&self.c1024, handle),
+                    FutureSizeClass::Bytes2048 => block_ptr(&self.c2048, handle),
+                    FutureSizeClass::Bytes4096 => block_ptr(&self.c4096, handle),
+                };
+                if expected != Some(ptr) {
+                    return false;
+                }
+                FutureBacking::Slab { class, handle }
+            } else {
+                if allocation.token != large_token(ptr, owner, capacity, align) {
+                    return false;
+                }
+                FutureBacking::Large
+            };
+            self.release(FutureAllocation {
+                ptr,
+                owner_domain: owner,
+                backing,
+                capacity,
+                align,
+            })
         }
-        let capacity = allocation.capacity as usize;
-        let align = allocation.align as usize;
-        let backing = if allocation.token >> 63 == 1 {
-            let class = match ((allocation.token >> 60) & 0x7) as u8 {
-                0 => FutureSizeClass::Bytes64,
-                1 => FutureSizeClass::Bytes128,
-                2 => FutureSizeClass::Bytes256,
-                3 => FutureSizeClass::Bytes512,
-                4 => FutureSizeClass::Bytes1024,
-                5 => FutureSizeClass::Bytes2048,
-                6 => FutureSizeClass::Bytes4096,
-                _ => return false,
-            };
-            if capacity != class.capacity() {
-                return false;
-            }
-            let handle = SlabHandle {
-                shard: ((allocation.token >> 52) & 0xff) as u8,
-                local_index: ((allocation.token >> 20) & 0xffff_ffff) as u32,
-                generation: (allocation.token & 0xffff) as u32,
-            };
-            let expected = match class {
-                FutureSizeClass::Bytes64 => block_ptr(&self.c64, handle),
-                FutureSizeClass::Bytes128 => block_ptr(&self.c128, handle),
-                FutureSizeClass::Bytes256 => block_ptr(&self.c256, handle),
-                FutureSizeClass::Bytes512 => block_ptr(&self.c512, handle),
-                FutureSizeClass::Bytes1024 => block_ptr(&self.c1024, handle),
-                FutureSizeClass::Bytes2048 => block_ptr(&self.c2048, handle),
-                FutureSizeClass::Bytes4096 => block_ptr(&self.c4096, handle),
-            };
-            if expected != Some(ptr) {
-                return false;
-            }
-            FutureBacking::Slab { class, handle }
-        } else {
-            if allocation.token != large_token(ptr, owner, capacity, align) {
-                return false;
-            }
-            FutureBacking::Large
-        };
-        self.release(FutureAllocation {
-            ptr,
-            owner_domain: owner,
-            backing,
-            capacity,
-            align,
-        })
-    }}
+    }
 }
 
 fn large_token(
@@ -383,10 +415,29 @@ fn large_token(
 
 fn reserve_block<const N: usize>(
     slab: &GrowableSlab<Block<N>>,
+    cache_index: usize,
+    cached: bool,
 ) -> Option<(SlabHandle, NonNull<u8>)> {
-    let handle = slab.reserve()?;
+    let handle = if cached {
+        unsafe { slab.reserve_cached(cache_index, 4)? }
+    } else {
+        slab.reserve()?
+    };
     let ptr = unsafe { slab.get_mut_ptr(handle)? };
     Some((handle, NonNull::new(ptr.cast::<u8>())?))
+}
+
+unsafe fn release_block<const N: usize>(
+    slab: &GrowableSlab<Block<N>>,
+    handle: SlabHandle,
+    cache_index: usize,
+    cached: bool,
+) -> bool {
+    if cached {
+        unsafe { slab.release_cached(handle, cache_index, 4) }
+    } else {
+        unsafe { slab.release(handle) }
+    }
 }
 
 fn block_ptr<const N: usize>(

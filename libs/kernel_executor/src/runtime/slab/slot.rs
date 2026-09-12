@@ -8,7 +8,7 @@ use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
 use crate::runtime::runtime::submit_global_to_executor_domain;
-use crate::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
 
 use super::super::runtime::JoinStorage;
@@ -161,9 +161,9 @@ impl TaskSlot {
         self.state.store(STATE_IDLE, Ordering::Release);
         self.ready_next.store(0, Ordering::Relaxed);
         if let Some(domain_id) = unsafe { (&mut *self.domain_id.get()).take() } {
-            if let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) {
+            GlobalAsyncExecutor::global().with_executor_domain(domain_id, |domain| {
                 domain.release_task();
-            }
+            });
         }
     }
 
@@ -509,73 +509,81 @@ where
     let future = &mut *(allocation.ptr.as_ptr() as *mut F);
     let poll_res = Pin::new_unchecked(&mut *future).poll(cx);
 
-    match poll_res {
-        Poll::Ready(result) => {
-            core::ptr::drop_in_place(future);
-            let allocation = (&mut *slot.future.get())
-                .take()
-                .expect("task future allocation missing on completion");
-            release_future_allocation(allocation);
-            loop {
-                let ptr = slot.result_ptr.load(Ordering::Acquire);
-                if ptr == RESULT_ABANDONED {
-                    drop(result);
-                    break;
+        match poll_res {
+            Poll::Ready(result) => {
+                core::ptr::drop_in_place(future);
+                let allocation = (&mut *slot.future.get())
+                    .take()
+                    .expect("task future allocation missing on completion");
+                release_future_allocation(allocation);
+                loop {
+                    let ptr = slot.result_ptr.load(Ordering::Acquire);
+                    if ptr == RESULT_ABANDONED {
+                        drop(result);
+                        break;
+                    }
+                    if ptr == RESULT_CLAIMED {
+                        panic!("join result storage claimed twice");
+                    }
+                    if slot
+                        .result_ptr
+                        .compare_exchange(ptr, RESULT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        (*(ptr as *mut JoinStorage<T>)).write(result);
+                        break;
+                    }
                 }
-                if ptr == RESULT_CLAIMED {
-                    panic!("join result storage claimed twice");
-                }
-                if slot
-                    .result_ptr
-                    .compare_exchange(ptr, RESULT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    (*(ptr as *mut JoinStorage<T>)).write(result);
-                    break;
-                }
+                true
             }
-            true
+            Poll::Pending => false,
         }
-        Poll::Pending => false,
     }
-}}
+}
 
 unsafe fn poll_detached<F>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
     F: Future<Output = ()>,
-{ unsafe {
-    let allocation = (&mut *slot.future.get())
-        .as_mut()
-        .expect("task future allocation missing");
-    let future = &mut *(allocation.ptr.as_ptr() as *mut F);
-    match Pin::new_unchecked(&mut *future).poll(cx) {
-        Poll::Ready(()) => {
-            core::ptr::drop_in_place(future);
-            let allocation = (&mut *slot.future.get())
-                .take()
-                .expect("task future allocation missing on completion");
-            release_future_allocation(allocation);
-            true
+{
+    unsafe {
+        let allocation = (&mut *slot.future.get())
+            .as_mut()
+            .expect("task future allocation missing");
+        let future = &mut *(allocation.ptr.as_ptr() as *mut F);
+        match Pin::new_unchecked(&mut *future).poll(cx) {
+            Poll::Ready(()) => {
+                core::ptr::drop_in_place(future);
+                let allocation = (&mut *slot.future.get())
+                    .take()
+                    .expect("task future allocation missing on completion");
+                release_future_allocation(allocation);
+                true
+            }
+            Poll::Pending => false,
         }
-        Poll::Pending => false,
     }
-}}
+}
 
-unsafe fn release_future_allocation(allocation: FutureAllocation) { unsafe {
-    let domain_id = allocation.owner_domain;
-    let domain = GlobalAsyncExecutor::global()
-        .get_executor_domain(domain_id)
-        .expect("future owner domain disappeared while allocation was live");
-    assert!(domain.future_arena().release(allocation));
-    domain.maybe_finish_draining();
-}}
-
-unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) { unsafe {
-    if let Some(allocation) = (&mut *slot.future.get()).take() {
-        core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
-        release_future_allocation(allocation);
+unsafe fn release_future_allocation(allocation: FutureAllocation) {
+    unsafe {
+        let domain_id = allocation.owner_domain;
+        GlobalAsyncExecutor::global()
+            .with_executor_domain(domain_id, |domain| {
+                assert!(domain.future_arena().release(allocation));
+                domain.maybe_finish_draining();
+            })
+            .expect("future owner domain disappeared while allocation was live");
     }
-    write_poll_fn(&slot.poll_fn, None);
-    write_drop_fn(&slot.drop_fn, None);
-    *slot.cancel_fn.get() = None;
-}}
+}
+
+unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) {
+    unsafe {
+        if let Some(allocation) = (&mut *slot.future.get()).take() {
+            core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
+            release_future_allocation(allocation);
+        }
+        write_poll_fn(&slot.poll_fn, None);
+        write_drop_fn(&slot.drop_fn, None);
+        *slot.cancel_fn.get() = None;
+    }
+}

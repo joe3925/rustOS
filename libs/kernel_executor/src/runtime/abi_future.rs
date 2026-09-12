@@ -10,25 +10,29 @@ pub extern "C" fn kernel_abi_future_allocate(size: usize, align: usize) -> AbiFu
         return AbiFutureAllocation::null();
     };
     let domain_id = ExecutorDomainId::from_raw(context.domain_id);
-    let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) else {
-        return AbiFutureAllocation::null();
-    };
-    domain
-        .future_arena()
-        .allocate(size, align)
-        .map(FutureArena::into_abi)
+    GlobalAsyncExecutor::global()
+        .with_executor_domain(domain_id, |domain| {
+            domain
+                .future_arena()
+                .allocate(size, align)
+                .map(FutureArena::into_abi)
+        })
+        .flatten()
         .unwrap_or_else(AbiFutureAllocation::null)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kernel_abi_future_free(allocation: AbiFutureAllocation) { unsafe {
-    let domain_id = ExecutorDomainId::from_raw(allocation.owner_domain);
-    let domain = GlobalAsyncExecutor::global()
-        .get_executor_domain(domain_id)
-        .expect("ABI future owner domain is invalid");
-    assert!(
-        domain.future_arena().release_abi(allocation),
-        "invalid or stale ABI future allocation token"
-    );
-    domain.maybe_finish_draining();
-}}
+pub unsafe extern "C" fn kernel_abi_future_free(allocation: AbiFutureAllocation) {
+    unsafe {
+        let domain_id = ExecutorDomainId::from_raw(allocation.owner_domain);
+        GlobalAsyncExecutor::global()
+            .with_executor_domain(domain_id, |domain| {
+                assert!(
+                    domain.future_arena().release_abi(allocation),
+                    "invalid or stale ABI future allocation token"
+                );
+                domain.maybe_finish_draining();
+            })
+            .expect("ABI future owner domain is invalid");
+    }
+}

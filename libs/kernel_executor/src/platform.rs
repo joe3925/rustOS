@@ -1,4 +1,7 @@
-use core::cell::Cell;
+use crate::domain::ExecutorDomain;
+use crate::global_async::WorkerShared;
+use crate::growable_slab::SlabHandle;
+use core::cell::{Cell, RefCell};
 use spin::Once;
 
 pub type JobFn = extern "C" fn(usize);
@@ -15,13 +18,110 @@ pub struct CurrentExecutorContext {
     pub domain_id: u64,
 }
 
+pub(crate) struct SlabCache {
+    pub owner: *const (),
+    pub handles: [Option<SlabHandle>; 8],
+    pub flush: Option<unsafe fn(*const (), &mut [Option<SlabHandle>])>,
+}
+
+impl SlabCache {
+    pub const fn new() -> Self {
+        Self {
+            owner: core::ptr::null(),
+            handles: [None; 8],
+            flush: None,
+        }
+    }
+}
+
+pub(crate) struct ExecutorThreadLocal {
+    pub current: Cell<Option<CurrentExecutorContext>>,
+    pub worker: Cell<*const WorkerShared>,
+    pub active_domain: Cell<*const ExecutorDomain>,
+    pub ready_cursor: Cell<usize>,
+    pub allocation_cursor: Cell<usize>,
+    pub caches: RefCell<[SlabCache; 8]>,
+}
+
+impl ExecutorThreadLocal {
+    const fn new() -> Self {
+        Self {
+            current: Cell::new(None),
+            worker: Cell::new(core::ptr::null()),
+            active_domain: Cell::new(core::ptr::null()),
+            ready_cursor: Cell::new(0),
+            allocation_cursor: Cell::new(0),
+            caches: RefCell::new([const { SlabCache::new() }; 8]),
+        }
+    }
+}
+
 #[cfg(not(any(test, loom, feature = "loom")))]
 #[thread_local]
-static EXECUTOR_CONTEXT: Cell<Option<CurrentExecutorContext>> = const { Cell::new(None) };
+static EXECUTOR_CONTEXT: ExecutorThreadLocal = ExecutorThreadLocal::new();
 
 #[cfg(any(test, loom, feature = "loom"))]
 std::thread_local! {
-    static EXECUTOR_CONTEXT: Cell<Option<CurrentExecutorContext>> = const { Cell::new(None) };
+    static EXECUTOR_CONTEXT: ExecutorThreadLocal = const { ExecutorThreadLocal::new() };
+}
+
+pub(crate) fn with_executor_local<R>(f: impl FnOnce(&ExecutorThreadLocal) -> R) -> R {
+    #[cfg(not(any(test, loom, feature = "loom")))]
+    {
+        f(&EXECUTOR_CONTEXT)
+    }
+    #[cfg(any(test, loom, feature = "loom"))]
+    {
+        EXECUTOR_CONTEXT.with(f)
+    }
+}
+
+pub(crate) struct ExecutorBatchGuard {
+    pub previous_domain: *const ExecutorDomain,
+    pub previous_caches: Option<[SlabCache; 8]>,
+}
+
+impl Drop for ExecutorBatchGuard {
+    fn drop(&mut self) {
+        crate::global_async::GlobalAsyncExecutor::global().flush_local_task();
+        with_executor_local(|tls| {
+            let mut caches = tls.caches.borrow_mut();
+            for cache in &mut *caches {
+                if let Some(flush) = cache.flush.take() {
+                    unsafe { flush(cache.owner, &mut cache.handles) };
+                    cache.owner = core::ptr::null();
+                }
+            }
+            if let Some(previous) = self.previous_caches.take() {
+                *caches = previous;
+            }
+            tls.active_domain.set(self.previous_domain);
+        });
+    }
+}
+
+pub(crate) struct ExecutorSuspendGuard {
+    worker: *const WorkerShared,
+    domain: *const ExecutorDomain,
+}
+
+impl ExecutorSuspendGuard {
+    pub(crate) fn enter() -> Self {
+        crate::global_async::GlobalAsyncExecutor::global().flush_local_task();
+        with_executor_local(|tls| Self {
+            worker: tls.worker.replace(core::ptr::null()),
+            domain: tls.active_domain.replace(core::ptr::null()),
+        })
+    }
+}
+
+impl Drop for ExecutorSuspendGuard {
+    fn drop(&mut self) {
+        with_executor_local(|tls| {
+            tls.worker.set(self.worker);
+            tls.active_domain.set(self.domain);
+        });
+    }
 }
 
 pub trait ExecutorPlatform: Send + Sync {
@@ -49,15 +149,7 @@ pub fn platform() -> &'static dyn ExecutorPlatform {
 }
 
 pub fn current_executor_context() -> Option<CurrentExecutorContext> {
-    #[cfg(not(any(test, loom, feature = "loom")))]
-    {
-        EXECUTOR_CONTEXT.get()
-    }
-
-    #[cfg(any(test, loom, feature = "loom"))]
-    {
-        EXECUTOR_CONTEXT.with(Cell::get)
-    }
+    with_executor_local(|tls| tls.current.get())
 }
 
 pub fn in_interrupt_context() -> bool {
@@ -72,24 +164,14 @@ pub struct CurrentExecutorContextGuard {
 
 impl CurrentExecutorContextGuard {
     pub fn enter(context: CurrentExecutorContext) -> Self {
-        #[cfg(not(any(test, loom, feature = "loom")))]
-        let previous = EXECUTOR_CONTEXT.replace(Some(context));
+        let previous = with_executor_local(|tls| tls.current.replace(Some(context)));
 
-        #[cfg(any(test, loom, feature = "loom"))]
-        let previous = EXECUTOR_CONTEXT.with(|slot| slot.replace(Some(context)));
-
-        Self {
-            previous,
-        }
+        Self { previous }
     }
 }
 
 impl Drop for CurrentExecutorContextGuard {
     fn drop(&mut self) {
-        #[cfg(not(any(test, loom, feature = "loom")))]
-        EXECUTOR_CONTEXT.set(self.previous);
-
-        #[cfg(any(test, loom, feature = "loom"))]
-        EXECUTOR_CONTEXT.with(|slot| slot.set(self.previous));
+        with_executor_local(|tls| tls.current.set(self.previous));
     }
 }

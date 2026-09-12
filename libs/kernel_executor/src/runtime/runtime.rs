@@ -7,16 +7,16 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
 
-pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
+pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
 use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
-use crate::platform::{platform, Job};
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::platform::{Job, platform};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, Ordering};
 
-use super::slab::task_slab::get_task_table;
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
+use super::slab::task_slab::get_task_table;
 
 pub(crate) fn submit_global_to_executor_domain(domain_id: ExecutorDomainId, ctx: usize) {
     GlobalAsyncExecutor::global().enqueue_task_to_executor_domain(domain_id, ctx);
@@ -34,10 +34,12 @@ pub(crate) fn submit_blocking_many(jobs: &[Job]) {
 }
 
 pub fn yield_now() {
+    let _suspend = crate::platform::ExecutorSuspendGuard::enter();
     platform().yield_now();
 }
 
 pub extern "C" fn try_steal_blocking_one() -> bool {
+    let _suspend = crate::platform::ExecutorSuspendGuard::enter();
     platform().try_steal_blocking_one()
 }
 
@@ -76,6 +78,7 @@ pub fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
 {
+    let _suspend = crate::platform::ExecutorSuspendGuard::enter();
     let state = Arc::new(BlockOnWakeState {
         ready: AtomicBool::new(false),
     });
@@ -155,22 +158,21 @@ where
         !crate::platform::in_interrupt_context(),
         "attempted to spawn a task from interrupt context"
     );
-    let domain = GlobalAsyncExecutor::global()
-        .get_executor_domain(domain_id)
-        .expect("invalid executor domain");
-    let allocation = domain
-        .future_arena()
-        .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-        .expect("future arena allocation failed");
-    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
-    let slab = get_task_table();
-    let slot_handle = match slab.allocate() {
-        Some(handle) => handle,
-        None => unsafe {
-            release_unpublished_future::<F>(&domain, allocation);
-            panic!("task table allocation failed");
-        },
-    };
+    GlobalAsyncExecutor::global()
+        .with_executor_domain(domain_id, |domain| {
+            let allocation = domain
+                .future_arena()
+                .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+                .expect("future arena allocation failed");
+            unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
+            let slab = get_task_table();
+            let slot_handle = match slab.allocate() {
+                Some(handle) => handle,
+                None => unsafe {
+                    release_unpublished_future::<F>(domain, allocation);
+                    panic!("task table allocation failed");
+                },
+            };
 
     let (shard_idx, local_idx, generation) = slot_handle.indices();
 
@@ -187,14 +189,16 @@ where
     let encoded = slot_handle.encoded_ptr();
     submit_global_to_executor_domain(domain_id, encoded);
 
-    JoinHandle {
-        shard_idx: shard_idx as u8,
-        local_idx: local_idx as u32,
-        generation,
-        consumed: false,
-        storage: storage_ptr,
-        _marker: PhantomData,
-    }
+            JoinHandle {
+                shard_idx: shard_idx as u8,
+                local_idx: local_idx as u32,
+                generation,
+                consumed: false,
+                storage: storage_ptr,
+                _marker: PhantomData,
+            }
+        })
+        .expect("invalid executor domain")
 }
 
 pub struct JoinHandle<'a, T: Send + 'static> {
@@ -364,24 +368,23 @@ where
         !crate::platform::in_interrupt_context(),
         "attempted to spawn a task from interrupt context"
     );
-    let domain = GlobalAsyncExecutor::global()
-        .get_executor_domain(domain_id)
-        .expect("invalid executor domain");
-    let allocation = domain
-        .future_arena()
-        .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-        .expect("future arena allocation failed");
-    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
-    let slab = get_task_table();
+    GlobalAsyncExecutor::global()
+        .with_executor_domain(domain_id, |domain| {
+            let allocation = domain
+                .future_arena()
+                .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+                .expect("future arena allocation failed");
+            unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
+            let slab = get_task_table();
 
-    let slot_handle = match slab.allocate() {
-        Some(handle) => handle,
-        None => unsafe {
-            release_unpublished_future::<F>(&domain, allocation);
-            panic!("task table allocation failed");
-        },
-    };
-    let (shard_idx, local_idx, generation) = slot_handle.indices();
+            let slot_handle = match slab.allocate() {
+                Some(handle) => handle,
+                None => unsafe {
+                    release_unpublished_future::<F>(domain, allocation);
+                    panic!("task table allocation failed");
+                },
+            };
+            let (shard_idx, local_idx, generation) = slot_handle.indices();
 
     let slot = slab
         .get_slot(shard_idx, local_idx, generation)
@@ -391,8 +394,10 @@ where
 
     slab.increment_ref(shard_idx, local_idx, generation);
 
-    let encoded = slot_handle.encoded_ptr();
-    submit_global_to_executor_domain(domain_id, encoded);
+            let encoded = slot_handle.encoded_ptr();
+            submit_global_to_executor_domain(domain_id, encoded);
+        })
+        .expect("invalid executor domain")
 }
 
 unsafe fn release_unpublished_future<F>(
@@ -551,49 +556,50 @@ where
     if crate::platform::in_interrupt_context() {
         return Err(SpawnToPortError::InterruptContext);
     }
-    let domain = GlobalAsyncExecutor::global()
-        .get_executor_domain(domain_id)
-        .ok_or(SpawnToPortError::InvalidDomain)?;
-    let allocation = domain
-        .future_arena()
-        .allocate(
-            core::mem::size_of::<PortFuture<F, P, T>>(),
-            core::mem::align_of::<PortFuture<F, P, T>>(),
-        )
-        .ok_or(SpawnToPortError::FutureAllocationFailed)?;
-    unsafe {
-        allocation
-            .ptr
-            .as_ptr()
-            .cast::<PortFuture<F, P, T>>()
-            .write(PortFuture {
-                future,
-                permit: Some(permit),
-                key: completion_key,
-                token: 0,
-                completed: false,
-                _output: PhantomData,
-            });
-    }
-    let slab = get_task_table();
-    let Some(handle) = slab.allocate() else {
-        unsafe { release_unpublished_future::<PortFuture<F, P, T>>(&domain, allocation) };
-        return Err(SpawnToPortError::TaskAllocationFailed);
-    };
-    let (shard, local, generation) = handle.indices();
-    let Some(token) = TaskToken::from_raw(handle.encoded_ptr()) else {
-        unsafe { release_unpublished_future::<PortFuture<F, P, T>>(&domain, allocation) };
-        return Err(SpawnToPortError::TaskAllocationFailed);
-    };
-    unsafe { (*allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>()).token = token.raw() };
-    let slot = slab
-        .get_slot(shard, local, generation)
-        .expect("reserved task slot disappeared");
-    unsafe { slot.init_abortable::<PortFuture<F, P, T>>(domain_id, allocation) };
-    domain.retain_task();
-    slab.increment_ref(shard, local, generation);
-    submit_global_to_executor_domain(domain_id, handle.encoded_ptr());
-    Ok(token)
+    GlobalAsyncExecutor::global()
+        .with_executor_domain(domain_id, |domain| {
+            let allocation = domain
+                .future_arena()
+                .allocate(
+                    core::mem::size_of::<PortFuture<F, P, T>>(),
+                    core::mem::align_of::<PortFuture<F, P, T>>(),
+                )
+                .ok_or(SpawnToPortError::FutureAllocationFailed)?;
+            unsafe {
+                allocation
+                    .ptr
+                    .as_ptr()
+                    .cast::<PortFuture<F, P, T>>()
+                    .write(PortFuture {
+                        future,
+                        permit: Some(permit),
+                        key: completion_key,
+                        token: 0,
+                        completed: false,
+                        _output: PhantomData,
+                    });
+            }
+            let slab = get_task_table();
+            let Some(handle) = slab.allocate() else {
+                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(domain, allocation) };
+                return Err(SpawnToPortError::TaskAllocationFailed);
+            };
+            let (shard, local, generation) = handle.indices();
+            let Some(token) = TaskToken::from_raw(handle.encoded_ptr()) else {
+                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(domain, allocation) };
+                return Err(SpawnToPortError::TaskAllocationFailed);
+            };
+            unsafe { (*allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>()).token = token.raw() };
+            let slot = slab
+                .get_slot(shard, local, generation)
+                .expect("reserved task slot disappeared");
+            unsafe { slot.init_abortable::<PortFuture<F, P, T>>(domain_id, allocation) };
+            domain.retain_task();
+            slab.increment_ref(shard, local, generation);
+            submit_global_to_executor_domain(domain_id, handle.encoded_ptr());
+            Ok(token)
+        })
+        .ok_or(SpawnToPortError::InvalidDomain)?
 }
 
 pub fn abort_task(token: TaskToken) -> bool {

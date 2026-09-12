@@ -2,13 +2,13 @@ use core::mem::MaybeUninit;
 
 use spin::Once;
 
-use crate::growable_slab::{GrowableSlab, SlabHandle, MAX_LOCAL_SLOTS};
+use crate::growable_slab::{GrowableSlab, MAX_LOCAL_SLOTS, SlabHandle};
 use crate::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::{SlabConfig, SlabConfigBuilder, SlabStats};
+use super::constants::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
 use super::ptr::encode_slab_task_ptr;
 use super::slot::TaskSlot;
-use super::constants::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
 
 const GEN_SHIFT: u32 = 16;
 const REF_MASK: u32 = 0xFFFF;
@@ -59,7 +59,14 @@ impl TaskTable {
     }
 
     pub fn allocate(&self) -> Option<SlotHandle> {
-        let handle = self.slab.reserve()?;
+        let handle = if TASK_TABLE_PTR
+            .get()
+            .is_some_and(|table| core::ptr::eq(*table, self))
+        {
+            unsafe { self.slab.reserve_cached(0, 8)? }
+        } else {
+            self.slab.reserve()?
+        };
         let slot = self.slab.get(handle)?;
         slot.prepare_for_allocation();
         slot.gen_ref
@@ -152,7 +159,14 @@ impl TaskTable {
                     if refs == 1 {
                         slot.release_last_ref();
                         unsafe {
-                            let _ = self.slab.release(handle);
+                            if TASK_TABLE_PTR
+                                .get()
+                                .is_some_and(|table| core::ptr::eq(*table, self))
+                            {
+                                let _ = self.slab.release_cached(handle, 0, 8);
+                            } else {
+                                let _ = self.slab.release(handle);
+                            }
                         }
                     }
                     return;

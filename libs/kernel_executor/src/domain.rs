@@ -1,7 +1,7 @@
 use crate::future_arena::{FutureArena, FutureArenaConfig};
 use crate::global_async::CacheAligned;
-use crate::sync::atomic::{AtomicU8, AtomicU128, AtomicUsize, Ordering};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicU8, AtomicU128, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
@@ -238,7 +238,7 @@ pub struct ExecutorDomain {
     weight: CacheAligned,
     deficit: CacheAligned,
 
-    submitted: CacheAligned,
+    pub(crate) submitted: CacheAligned,
     completed: CacheAligned,
     total_runs: CacheAligned,
     scheduler_selections: CacheAligned,
@@ -395,13 +395,20 @@ impl ExecutorDomain {
                 Err(actual) => head = actual,
             }
         }
-        self.submitted.0.fetch_add(1, Ordering::Relaxed);
         true
     }
 
     pub(crate) fn pop_task(&self) -> Option<usize> {
         let shard_count = self.ready_heads.len();
-        let start = self.ready_cursor.0.fetch_add(1, Ordering::Relaxed) % shard_count;
+        let start = if crate::platform::in_interrupt_context() {
+            self.ready_cursor.0.fetch_add(1, Ordering::Relaxed) % shard_count
+        } else {
+            crate::platform::with_executor_local(|tls| {
+                let cursor = tls.ready_cursor.get();
+                tls.ready_cursor.set(cursor.wrapping_add(1));
+                cursor % shard_count
+            })
+        };
 
         for offset in 0..shard_count {
             if let Some(task_id) = self.pop_task_from_head((start + offset) % shard_count) {
