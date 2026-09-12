@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 spin = "0.10"
+portable-atomic = "1"
 kernel_types = { path = "../kernel_types" }
 loom = { version = "0.7", optional = true }
 
