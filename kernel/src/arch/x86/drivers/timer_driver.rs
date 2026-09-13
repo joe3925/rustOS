@@ -3,7 +3,7 @@ use kernel_routing::println;
 
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 
-use super::super::cpu::{current_cpu_id, current_is_in_interrupt_atomic};
+use super::super::cpu::{current_cpu_id, current_is_in_interrupt};
 use super::super::interrupts::apic::local::send_eoi as send_eoi_timer;
 use super::super::timer::APIC_TICKS_PER_NS;
 use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
@@ -39,7 +39,7 @@ pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
         return;
     }
 
-    if current_is_in_interrupt_atomic().load(Ordering::Acquire) {
+    if current_is_in_interrupt() {
         return;
     }
 

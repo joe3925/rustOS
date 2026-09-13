@@ -150,7 +150,8 @@ impl FutureArena {
     }
 
     fn cache_enabled(&self) -> bool {
-        if self.config.max_chunks_per_class != usize::MAX {
+        if self.config.max_chunks_per_class != usize::MAX || crate::platform::in_interrupt_context()
+        {
             return false;
         }
         crate::platform::with_executor_local(|tls| {

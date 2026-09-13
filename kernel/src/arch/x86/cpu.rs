@@ -108,8 +108,22 @@ pub fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
     &current_percpu().is_in_interrupt
 }
 
-extern "C" fn current_is_in_interrupt() -> bool {
-    current_is_in_interrupt_atomic().load(Ordering::Acquire)
+#[inline(always)]
+pub fn current_is_in_interrupt() -> bool {
+    let value: u8;
+    unsafe {
+        asm!(
+            "mov {value}, byte ptr gs:[{offset}]",
+            value = out(reg_byte) value,
+            offset = const crate::structs::per_cpu::PERCPU_IS_IN_INTERRUPT_OFF,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    value != 0
+}
+
+extern "C" fn irq_context_query() -> bool {
+    current_is_in_interrupt()
 }
 
 extern "C" fn irq_interrupts_enabled() -> bool {
@@ -140,7 +154,7 @@ pub fn init_percpu_gs(cpu_id: usize) -> &'static PerCpu {
     let ptr = p as *const PerCpu;
     p.tls_array_pointer.store(0, Ordering::Relaxed);
     unsafe { set_gs_bases(ptr) };
-    kernel_types::irq::set_irq_context_query(current_is_in_interrupt);
+    kernel_types::irq::set_irq_context_query(irq_context_query);
     kernel_types::irq::set_irq_interrupt_control(
         irq_interrupts_enabled,
         irq_interrupts_disable,

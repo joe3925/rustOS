@@ -6,7 +6,7 @@ use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::platform::InterruptPlatform;
 
-use crate::arch::x86::cpu::{current_is_in_interrupt_atomic, platform_cpu_id};
+use crate::arch::x86::cpu::{current_is_in_interrupt, current_is_in_interrupt_atomic, platform_cpu_id};
 use crate::arch::x86::platform::X86Platform;
 
 use super::apic::controller::APIC;
@@ -35,7 +35,7 @@ impl InterruptPlatform for X86Platform {
     }
 
     fn current_is_in_interrupt() -> bool {
-        current_is_in_interrupt_atomic().load(core::sync::atomic::Ordering::Relaxed)
+        current_is_in_interrupt()
     }
 
     fn disable_interrupts() {

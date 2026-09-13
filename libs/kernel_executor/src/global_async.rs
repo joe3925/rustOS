@@ -192,10 +192,12 @@ impl GlobalAsyncExecutor {
         domain_id: ExecutorDomainId,
         f: impl FnOnce(&ExecutorDomain) -> R,
     ) -> Option<R> {
-        let cached = with_executor_local(|tls| tls.active_domain.get());
-        if let Some(domain) = unsafe { cached.as_ref() } {
-            if domain.id() == domain_id && domain.state() != ExecutorDomainState::Dead {
-                return Some(f(domain));
+        if !crate::platform::in_interrupt_context() {
+            let cached = with_executor_local(|tls| tls.active_domain.get());
+            if let Some(domain) = unsafe { cached.as_ref() } {
+                if domain.id() == domain_id && domain.state() != ExecutorDomainState::Dead {
+                    return Some(f(domain));
+                }
             }
         }
         let domain = self.get_executor_domain(domain_id)?;
