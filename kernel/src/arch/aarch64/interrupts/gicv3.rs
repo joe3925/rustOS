@@ -57,8 +57,10 @@ impl GicV3 {
                 self.write32(0x80 + intid / 8, u32::MAX);
                 self.write32(0x180 + intid / 8, u32::MAX);
             }
+            for intid in (SPI_START as u32..lines).step_by(4) {
+                self.write32(0x400 + intid, 0xa0a0_a0a0);
+            }
             for intid in SPI_START as u32..lines {
-                self.write8(0x400 + intid, 0xa0);
                 self.write64(0x6100 + (intid - 32) * 8, current_route_affinity());
             }
             self.write32(0, (1 << 4) | (1 << 1));
@@ -79,8 +81,8 @@ impl GicV3 {
             let sgi = frame + 0x1_0000;
             ((sgi + 0x80) as *mut u32).write_volatile(u32::MAX);
             ((sgi + 0x180) as *mut u32).write_volatile(u32::MAX);
-            for intid in 0..32 {
-                ((sgi + 0x400 + intid) as *mut u8).write_volatile(0xa0);
+            for intid in (0..32).step_by(4) {
+                ((sgi + 0x400 + intid) as *mut u32).write_volatile(0xa0a0_a0a0);
             }
             ((sgi + 0x100) as *mut u32).write_volatile(
                 (1 << SCHEDULER_SGI)
@@ -198,11 +200,11 @@ impl GicV3 {
     unsafe fn write32(&self, offset: u32, value: u32) {
         unsafe { ((self.distributor + offset as usize) as *mut u32).write_volatile(value) }
     }
-    unsafe fn write8(&self, offset: u32, value: u8) {
-        unsafe { ((self.distributor + offset as usize) as *mut u8).write_volatile(value) }
-    }
     unsafe fn write64(&self, offset: u32, value: u64) {
-        unsafe { ((self.distributor + offset as usize) as *mut u64).write_volatile(value) }
+        unsafe {
+            self.write32(offset, value as u32);
+            self.write32(offset + 4, (value >> 32) as u32);
+        }
     }
     unsafe fn wait_rwp(&self) {
         while unsafe { self.read32(0) } & (1 << 31) != 0 {
