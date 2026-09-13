@@ -29,7 +29,7 @@ args = [
 
 [defaults]
 memory = "700M"
-cpus = "4"
+cpus = "1"
 
 [capabilities]
 debug = false

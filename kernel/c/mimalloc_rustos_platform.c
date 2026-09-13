@@ -19,7 +19,7 @@ extern void rustos_mi_out_stderr(const char* msg);
 extern void rustos_mi_thread_yield(void);
 
 void rustos_mi_configure_options(void) {
-  mi_option_set(mi_option_eager_commit_delay, 0);
+  mi_option_set(mi_option_eager_commit_delay, 1);
 }
 
 bool rustos_mi_manage_arena(void* start, size_t size) {
