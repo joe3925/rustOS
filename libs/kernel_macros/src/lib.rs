@@ -2,13 +2,13 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::format_ident;
 use quote::quote;
-use syn::parse::{Parse, ParseStream};
-use syn::visit::Visit;
 use syn::Data;
 use syn::DeriveInput;
+use syn::parse::{Parse, ParseStream};
+use syn::visit::Visit;
 use syn::{
-    parse_macro_input, FnArg, GenericParam, ImplItemFn, ItemFn, Pat, ReturnType, Token, Type,
-    WhereClause,
+    FnArg, GenericParam, ImplItemFn, ItemFn, Pat, ReturnType, Token, Type, WhereClause,
+    parse_macro_input,
 };
 
 #[derive(Default)]
@@ -1139,10 +1139,10 @@ fn validate_exception_handler(func: &ItemFn) -> syn::Result<()> {
             ));
         }
 
-        if !type_is_exception_error_code(&error_arg.ty) {
+        if !type_is_exception_context(&error_arg.ty) {
             return Err(syn::Error::new_spanned(
                 &error_arg.ty,
-                "#[exception_handler] second parameter must be u64 or PageFaultErrorCode",
+                "#[exception_handler] second parameter must be u64, PageFaultErrorCode, or Aarch64ExceptionInfo",
             ));
         }
     }
@@ -1177,7 +1177,12 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
     let vis = &func.vis;
     let wrapper_ident = func.sig.ident.clone();
     let inner_ident = format_ident!("__exception_handler_impl_{}", wrapper_ident);
-    let has_error_code = func.sig.inputs.len() == 2;
+    let wrapper_kind = func.sig.inputs.iter().nth(1).map(|input| match input {
+        FnArg::Typed(argument) if type_is_aarch64_exception_info(&argument.ty) => {
+            quote! { exception_info }
+        }
+        _ => quote! { error_code },
+    });
 
     normalize_exception_state_param(&mut func.sig);
     func.sig.ident = inner_ident.clone();
@@ -1186,13 +1191,13 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
     let inner_sig = &func.sig;
     let body = &func.block;
 
-    let wrapper = if has_error_code {
+    let wrapper = if let Some(wrapper_kind) = wrapper_kind {
         quote! {
-            crate::x86_exception_handler_wrapper!(#vis #wrapper_ident, #inner_ident, error_code);
+            crate::platform_exception_handler_wrapper!(#vis #wrapper_ident, #inner_ident, #wrapper_kind);
         }
     } else {
         quote! {
-            crate::x86_exception_handler_wrapper!(#vis #wrapper_ident, #inner_ident, no_error_code);
+            crate::platform_exception_handler_wrapper!(#vis #wrapper_ident, #inner_ident, no_error_code);
         }
     };
 
@@ -1245,4 +1250,21 @@ fn type_is_exception_error_code(ty: &Type) -> bool {
         Type::Group(g) => type_is_exception_error_code(&g.elem),
         _ => false,
     }
+}
+
+fn type_is_aarch64_exception_info(ty: &Type) -> bool {
+    match ty {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Aarch64ExceptionInfo"),
+        Type::Paren(paren) => type_is_aarch64_exception_info(&paren.elem),
+        Type::Group(group) => type_is_aarch64_exception_info(&group.elem),
+        _ => false,
+    }
+}
+
+fn type_is_exception_context(ty: &Type) -> bool {
+    type_is_exception_error_code(ty) || type_is_aarch64_exception_info(ty)
 }

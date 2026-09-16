@@ -1096,7 +1096,10 @@ pub fn bench_submit_interrupt_sample_current_core(state: &State) {
             }
         }
     }
+    #[cfg(target_arch = "x86_64")]
     let rip = state.rip;
+    #[cfg(target_arch = "aarch64")]
+    let rip = state.elr;
     let ts = bench_now_ns();
 
     bench_log_sample_for_core_try(core_id, rip, task_id, callchain, ts);

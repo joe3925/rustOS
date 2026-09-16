@@ -1,5 +1,6 @@
 mod cpu;
 mod debug;
+pub(crate) mod exception_handlers;
 mod interrupts;
 mod machine;
 mod memory;

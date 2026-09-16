@@ -5,13 +5,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use aarch64_vmsa::address::{TranslationGranule, VirtAddr};
 use aarch64_vmsa::attrs::{
-    AllocationHints, CachePolicy, Cacheability, DataAccess, DirtyBitManagement, DirtyControl,
+    AllocationHints, CachePolicy, Cacheability, DataRights, DirtyBitManagement, DirtyControl,
     MemoryAttributes, MemoryTransience, SemanticLeafAttrs, SemanticTableAttrs,
     SemanticVmsa64Stage1LeafControls, SemanticVmsa64Stage1TableControls, Shareability,
-    SoftwareMetadata, Stage1EffectivePermissions, Stage1MemoryConfig, Stage1PermissionConfig,
-    TwoPrivilegeTablePermissionLimits,
+    SoftwareMetadata, Stage1MemoryConfig, Stage1PermissionConfig, Stage1Permissions,
+    TwoPrivilegeTableRestrictions,
 };
-use aarch64_vmsa::config::format::Vmsa64;
+use aarch64_vmsa::config::format::{NativeEndian, Vmsa64};
 use aarch64_vmsa::config::granule::{Granule4KiB, Granule16KiB, Granule64KiB};
 use aarch64_vmsa::config::regime::NonSecureEl1Stage1;
 use aarch64_vmsa::descriptor::{DescriptorFormat, HasLayout};
@@ -42,14 +42,16 @@ use crate::platform::{
 
 pub struct Aarch64Platform;
 
+type Format = Vmsa64<NativeEndian>;
+
 static PAGE_SIZE: AtomicU64 = AtomicU64::new(0x1000);
 static MAIR: AtomicU64 = AtomicU64::new(0xff);
 
 type GranuleMapper<G> = Mapper<
-    Vmsa64,
+    Format,
     NonSecureEl1Stage1,
     G,
-    RecursiveTableAccess<Vmsa64, G>,
+    RecursiveTableAccess<Format, G>,
     RecursiveFrameZeroProvider<TableFrameSource<G>, G>,
     Live<StubInvalidation>,
 >;
@@ -97,18 +99,18 @@ unsafe impl<G: TranslationGranule> RawTableFrameProvider<G> for TableFrameSource
 
 pub struct StubInvalidation;
 
-unsafe impl<G: TranslationGranule> MapperInvalidation<Vmsa64, G> for StubInvalidation {
-    fn leaf_inserted(&mut self, _: TableAccessLocation<Vmsa64, G>, _: usize, _: u64, _: u64) {}
-    fn leaf_removed(&mut self, _: TableAccessLocation<Vmsa64, G>, _: usize, _: u64) {}
+unsafe impl<G: TranslationGranule> MapperInvalidation<Format, G> for StubInvalidation {
+    fn leaf_inserted(&mut self, _: TableAccessLocation<Format, G>, _: usize, _: u64, _: u64) {}
+    fn leaf_removed(&mut self, _: TableAccessLocation<Format, G>, _: usize, _: u64) {}
     fn table_descriptor_inserted(
         &mut self,
-        _: TableAccessLocation<Vmsa64, G>,
+        _: TableAccessLocation<Format, G>,
         _: usize,
         _: u64,
         _: u64,
     ) {
     }
-    fn table_descriptor_removed(&mut self, _: TableAccessLocation<Vmsa64, G>, _: usize, _: u64) {}
+    fn table_descriptor_removed(&mut self, _: TableAccessLocation<Format, G>, _: usize, _: u64) {}
     fn before_table_frame_reclaim(&mut self, _: TableAddr<G>, _: TableAllocLayout) {}
     fn synchronize(&mut self) {
         unsafe {
@@ -400,12 +402,12 @@ impl BootloaderPlatform for Aarch64Platform {
 fn init_mapper_for<G>(boot_info: &LoaderBootInfo) -> Result<GranuleMapper<G>, &'static str>
 where
     G: TranslationGranule,
-    Vmsa64: HasLayout<<NonSecureEl1Stage1 as aarch64_vmsa::regime::TranslationRegime>::Stage, G>,
+    Format: HasLayout<<NonSecureEl1Stage1 as aarch64_vmsa::regime::TranslationRegime>::Stage, G>,
 {
     let translation = boot_info.translation;
     let root_addr = TableAddr::<G>::new(translation.root_table)
         .map_err(|_| "kernel_stub: invalid root table")?;
-    let geometry = RootTableGeometry::<Vmsa64, G>::new(
+    let geometry = RootTableGeometry::<Format, G>::new(
         root_addr,
         translation.input_addr_bits,
         translation.output_addr_bits,
@@ -445,7 +447,7 @@ fn map_range<G>(
 ) -> Result<(), &'static str>
 where
     G: TranslationGranule,
-    Vmsa64: HasLayout<<NonSecureEl1Stage1 as aarch64_vmsa::regime::TranslationRegime>::Stage, G>,
+    Format: HasLayout<<NonSecureEl1Stage1 as aarch64_vmsa::regime::TranslationRegime>::Stage, G>,
 {
     if size == 0 || base & (G::SIZE - 1) != 0 || size & (G::SIZE - 1) != 0 {
         return Err("kernel_stub: invalid PE image range");
@@ -473,7 +475,7 @@ where
                 &config,
                 input,
                 WalkOutputAddr::new(frame),
-                Vmsa64::FINAL_LEVEL,
+                Format::FINAL_LEVEL,
                 leaf_attributes(true, false),
                 table_attributes(),
             )
@@ -491,7 +493,7 @@ fn set_permissions<G>(
 ) -> Result<(), &'static str>
 where
     G: TranslationGranule,
-    Vmsa64: HasLayout<<NonSecureEl1Stage1 as aarch64_vmsa::regime::TranslationRegime>::Stage, G>,
+    Format: HasLayout<<NonSecureEl1Stage1 as aarch64_vmsa::regime::TranslationRegime>::Stage, G>,
 {
     let start = base & !(G::SIZE - 1);
     let end = crate::align_up(
@@ -527,13 +529,13 @@ where
     }
     Ok(())
 }
-type LeafAttrs = SemanticLeafAttrs<Vmsa64, NonSecureEl1Stage1>;
-type TableAttrs = SemanticTableAttrs<Vmsa64, NonSecureEl1Stage1>;
+type LeafAttrs = SemanticLeafAttrs<Format, NonSecureEl1Stage1>;
+type TableAttrs = SemanticTableAttrs<Format, NonSecureEl1Stage1>;
 
 fn leaf_attributes(
     writable: bool,
     executable: bool,
-) -> SemanticLeafAttrs<Vmsa64, NonSecureEl1Stage1> {
+) -> SemanticLeafAttrs<Format, NonSecureEl1Stage1> {
     let cache = Cacheability::Cacheable {
         policy: CachePolicy::WriteBack,
         transience: MemoryTransience::NonTransient,
@@ -544,18 +546,18 @@ fn leaf_attributes(
             inner: cache,
             outer: cache,
         },
-        permissions: Stage1EffectivePermissions {
-            privileged_data: if writable {
-                DataAccess::ReadWrite
+        permissions: Stage1Permissions::new(
+            if writable {
+                DataRights::ReadWrite
             } else {
-                DataAccess::ReadOnly
+                DataRights::Read
             },
-            unprivileged_data: DataAccess::None,
-            privileged_execute: executable,
-            unprivileged_execute: false,
-            privileged_gcs: false,
-            unprivileged_gcs: false,
-        },
+            DataRights::None,
+            executable,
+            false,
+            false,
+            false,
+        ),
         pas: (),
         controls: SemanticVmsa64Stage1LeafControls {
             shareability: Shareability::InnerShareable,
@@ -569,11 +571,11 @@ fn leaf_attributes(
     }
 }
 
-fn table_attributes() -> SemanticTableAttrs<Vmsa64, NonSecureEl1Stage1> {
+fn table_attributes() -> SemanticTableAttrs<Format, NonSecureEl1Stage1> {
     TableAttrs {
-        permission_limits: TwoPrivilegeTablePermissionLimits {
-            privileged_data_limit: DataAccess::ReadWrite,
-            unprivileged_data_limit: DataAccess::None,
+        restrictions: TwoPrivilegeTableRestrictions {
+            privileged_data_limit: DataRights::ReadWrite,
+            unprivileged_data_limit: DataRights::None,
             privileged_execute_limit: true,
             unprivileged_execute_limit: false,
         },

@@ -92,7 +92,8 @@ pub trait InterruptPlatform: CpuPlatform {
     fn end_interrupt(vector: u8);
     fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool;
     fn broadcast_panic_stop();
-    fn compose_msi_message(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage>;
+    fn bind_msi(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage>;
+    fn unbind_msi(vector: u8);
     fn is_reserved_vector(vector: u8) -> bool;
 
     fn is_dynamic_vector(vector: u8) -> bool {
@@ -369,8 +370,12 @@ pub fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool {
     <ActivePlatform as InterruptPlatform>::send_ipi(target_platform_cpu_id, vector)
 }
 
-pub fn compose_msi_message(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
-    <ActivePlatform as InterruptPlatform>::compose_msi_message(request, vector)
+pub fn bind_msi(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
+    <ActivePlatform as InterruptPlatform>::bind_msi(request, vector)
+}
+
+pub fn unbind_msi(vector: u8) {
+    <ActivePlatform as InterruptPlatform>::unbind_msi(vector);
 }
 
 pub fn is_reserved_vector(vector: u8) -> bool {

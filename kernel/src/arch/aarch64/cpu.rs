@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use aarch64_cpu::asm::barrier::{ISH, SY, dsb, isb};
 use aarch64_cpu::asm::wfi;
 use aarch64_cpu::registers::{
-    CNTFRQ_EL0, CNTVCT_EL0, MPIDR_EL1, PAR_EL1, Readable, SCTLR_EL1, TPIDR_EL1, Writeable,
+    CNTFRQ_EL0, CNTVCT_EL0, MPIDR_EL1, PAR_EL1, Readable, SCTLR_EL1, TPIDR_EL1, VBAR_EL1, Writeable,
 };
 use kernel_types::irq::PlatformCpuId;
 
@@ -14,7 +14,7 @@ use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::platform::{AddressSpacePlatform, CpuPlatform, CpuStartupError};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu::{PerCpu, alloc_or_get_percpu};
-use crate::util::{CORE_LOCK, INIT_LOCK, KERNEL_INITIALIZED};
+use crate::util::{CORE_LOCK, KERNEL_INITIALIZED};
 
 use super::platform::Aarch64Platform;
 
@@ -32,6 +32,23 @@ const BLOCK_DESCRIPTOR: u64 = 0b01;
 const BLOCK_ACCESS_FLAG: u64 = 1 << 10;
 const BLOCK_INNER_SHAREABLE: u64 = 0b11 << 8;
 const TWO_MIB: u64 = 2 * 1024 * 1024;
+const CPACR_EL1_FPEN: u64 = 0b11 << 20;
+
+global_asm!(
+    r#"
+    .global aarch64_enter_el1t
+aarch64_enter_el1t:
+    mov x9, sp
+    mov sp, x0
+    msr spsel, #0
+    mov sp, x9
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn aarch64_enter_el1t(exception_stack_top: u64);
+}
 
 static ONLINE_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 static ONLINE_CPU_BITS: [AtomicU64; 4] = [
@@ -46,6 +63,7 @@ static AP_HANDSHAKE_BITS: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
+static AP_SCHEDULER_TURN: AtomicUsize = AtomicUsize::new(1);
 
 #[repr(C, align(4096))]
 struct StartupTable([u64; 512]);
@@ -95,6 +113,10 @@ global_asm!(
     "ldr x15, [x0, #48]",
     "ldr x16, [x0, #56]",
     "msr daifset, #0xf",
+    "mrs x17, cpacr_el1",
+    "orr x17, x17, {fp_enable}",
+    "msr cpacr_el1, x17",
+    "isb",
     "msr mair_el1, x12",
     "msr ttbr0_el1, x9",
     "msr ttbr1_el1, x10",
@@ -109,6 +131,7 @@ global_asm!(
     "mov x0, x16",
     "br x15",
     "aarch64_ap_trampoline_end:",
+    fp_enable = const CPACR_EL1_FPEN,
 );
 
 unsafe extern "C" {
@@ -204,6 +227,13 @@ impl CpuPlatform for Aarch64Platform {
         percpu.tls_array_pointer.store(0, Ordering::Relaxed);
         unsafe { set_per_cpu(percpu as *const PerCpu) };
         super::interrupts::init::init_current_cpu_interrupts();
+        let exception_stack_top = allocate_kernel_stack(StackSize::Medium)
+            .expect("failed to allocate AArch64 exception stack")
+            .as_u64();
+        percpu
+            .exception_stack_top
+            .store(exception_stack_top, Ordering::Release);
+        unsafe { aarch64_enter_el1t(exception_stack_top) };
         mark_online(cpu_id);
     }
 
@@ -228,7 +258,7 @@ impl CpuPlatform for Aarch64Platform {
         let trampoline_phys = physical_address(trampoline_virt)?;
         let record_virt = AP_STARTUP_RECORD.0.get() as u64;
         let record_phys = physical_address(record_virt)?;
-        prepare_identity_translation(trampoline_phys)?;
+        prepare_identity_translation(trampoline_phys, record_phys)?;
         for processor in topology
             .processors
             .iter()
@@ -336,8 +366,8 @@ fn current_sctlr() -> u64 {
     SCTLR_EL1.get()
 }
 
-fn prepare_identity_translation(entry_phys: u64) -> Result<(), CpuStartupError> {
-    if entry_phys >= 1u64 << 48 {
+fn prepare_identity_translation(entry_phys: u64, record_phys: u64) -> Result<(), CpuStartupError> {
+    if entry_phys >= 1u64 << 48 || record_phys >= 1u64 << 48 {
         return Err(CpuStartupError {
             platform_cpu_id: None,
             reason: "secondary CPU entry exceeds the identity address range",
@@ -348,14 +378,28 @@ fn prepare_identity_translation(entry_phys: u64) -> Result<(), CpuStartupError> 
     let l2_phys = physical_address(core::ptr::addr_of!(AP_TTBR0_L2) as u64)?;
     let l0_index = ((entry_phys >> 39) & 0x1ff) as usize;
     let l1_index = ((entry_phys >> 30) & 0x1ff) as usize;
-    let l2_index = ((entry_phys >> 21) & 0x1ff) as usize;
+    let entry_l2_index = ((entry_phys >> 21) & 0x1ff) as usize;
+    let record_l0_index = ((record_phys >> 39) & 0x1ff) as usize;
+    let record_l1_index = ((record_phys >> 30) & 0x1ff) as usize;
+    let record_l2_index = ((record_phys >> 21) & 0x1ff) as usize;
+    if record_l0_index != l0_index || record_l1_index != l1_index {
+        return Err(CpuStartupError {
+            platform_cpu_id: None,
+            reason: "secondary CPU startup objects exceed the identity table span",
+            status: -1,
+        });
+    }
     unsafe {
         core::ptr::write_bytes(core::ptr::addr_of_mut!(AP_TTBR0_L0.0).cast::<u8>(), 0, 4096);
         core::ptr::write_bytes(core::ptr::addr_of_mut!(AP_TTBR0_L1.0).cast::<u8>(), 0, 4096);
         core::ptr::write_bytes(core::ptr::addr_of_mut!(AP_TTBR0_L2.0).cast::<u8>(), 0, 4096);
         AP_TTBR0_L0.0[l0_index] = l1_phys | TABLE_DESCRIPTOR;
         AP_TTBR0_L1.0[l1_index] = l2_phys | TABLE_DESCRIPTOR;
-        AP_TTBR0_L2.0[l2_index] = (entry_phys & !(TWO_MIB - 1))
+        AP_TTBR0_L2.0[entry_l2_index] = (entry_phys & !(TWO_MIB - 1))
+            | BLOCK_DESCRIPTOR
+            | BLOCK_ACCESS_FLAG
+            | BLOCK_INNER_SHAREABLE;
+        AP_TTBR0_L2.0[record_l2_index] = (record_phys & !(TWO_MIB - 1))
             | BLOCK_DESCRIPTOR
             | BLOCK_ACCESS_FLAG
             | BLOCK_INNER_SHAREABLE;
@@ -426,7 +470,7 @@ fn wait_for_handshake(
     }
 }
 
-fn clean_to_poc(start: u64, length: usize) {
+pub(crate) fn clean_to_poc(start: u64, length: usize) {
     let line_size = data_cache_line_size();
     let end = start.saturating_add(length as u64);
     let mut address = start & !(line_size - 1);
@@ -481,6 +525,8 @@ fn instruction_cache_line_size() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_secondary_entry(cpu_id: u64) -> ! {
     let cpu_id = cpu_id as usize;
+    VBAR_EL1.set(&raw const super::interrupts::entry::aarch64_exception_vectors as u64);
+    isb(SY);
     unsafe {
         <Aarch64Platform as AddressSpacePlatform>::switch_root(
             <Aarch64Platform as AddressSpacePlatform>::kernel_root(),
@@ -489,15 +535,16 @@ extern "C" fn aarch64_secondary_entry(cpu_id: u64) -> ! {
     <Aarch64Platform as CpuPlatform>::init_current_cpu_local_state(cpu_id);
     CORE_LOCK.fetch_add(1, Ordering::SeqCst);
     mark_handshake(cpu_id);
-    {
-        let _guard = INIT_LOCK.lock();
-        crate::platform::init_periodic_timer();
-        SCHEDULER.init_core(cpu_id);
-        CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
-    }
+    CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     while !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
         core::hint::spin_loop();
     }
+    while AP_SCHEDULER_TURN.load(Ordering::Acquire) != cpu_id {
+        core::hint::spin_loop();
+    }
+    crate::platform::init_periodic_timer();
+    SCHEDULER.init_core(cpu_id);
+    AP_SCHEDULER_TURN.fetch_add(1, Ordering::Release);
     crate::platform::enable_interrupts();
     loop {
         crate::platform::enable_interrupts_and_halt();

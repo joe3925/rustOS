@@ -378,10 +378,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     let mut mapped_bars = alloc::vec::Vec::new();
     for i in 0..6 {
         if let Some(bar) = (proto.get_bar)(&proto.provider(), i) {
+            println!("virtio BAR {} kind={:?} base={:#x} size={:#x}", i, bar.kind, bar.base, bar.size);
             if bar.kind == BarKind::Mem32 || bar.kind == BarKind::Mem64 {
                 if bar.size > 0 {
-                    if let Ok(va) = map_mmio_region(PhysAddr::new(bar.base), bar.size) {
-                        mapped_bars.push((i as u32, va, bar.size));
+                    match map_mmio_region(PhysAddr::new(bar.base), bar.size) {
+                        Ok(va) => mapped_bars.push((i as u32, va, bar.size)),
+                        Err(error) => println!("virtio BAR {} map failed: {:?}", i, error),
                     }
                 }
             }

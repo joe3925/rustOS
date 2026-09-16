@@ -7,6 +7,27 @@ import threading
 from typing import Dict, List, Optional, Tuple
 
 
+_console_lock = threading.Lock()
+
+
+def _write_codelldb_console(debugger, text: str) -> None:
+    """Write to CodeLLDB's dedicated console pipe, never its DAP stdout."""
+    try:
+        from codelldb import interface as codelldb_interface
+
+        stream = codelldb_interface.session_stdouts.get(debugger.GetID())
+        if stream is None:
+            return
+
+        with _console_lock:
+            stream.write(text)
+            stream.flush()
+    except Exception:
+        # Never fall back to print()/sys.stdout here: CodeLLDB uses stdout for
+        # DAP framing, so background writes there can corrupt the DAP stream.
+        return
+
+
 class _Section:
     __slots__ = ("name", "addr", "size")
 
@@ -284,11 +305,12 @@ class _MetaConnection:
         return result
 
     def _print(self, msg: str) -> None:
-        print(msg)
+        _write_codelldb_console(self._debugger, msg + "\n")
 
 
 class _SerialConnection:
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, debugger, host: str, port: int) -> None:
+        self._debugger = debugger
         self._host = host
         self._port = port
         self._sock: Optional[socket.socket] = None
@@ -300,8 +322,9 @@ class _SerialConnection:
             self._sock = socket.create_connection((self._host, self._port), timeout=5.0)
             self._sock.settimeout(None)
         except OSError as exc:
-            print(
-                f"[rustos-serial] ERROR: could not connect to {self._host}:{self._port}: {exc}"
+            _write_codelldb_console(
+                self._debugger,
+                f"[rustos-serial] ERROR: could not connect to {self._host}:{self._port}: {exc}\n",
             )
             return False
 
@@ -309,7 +332,10 @@ class _SerialConnection:
             target=self._reader_loop, name="rustos-serial-reader", daemon=True
         )
         self._thread.start()
-        print(f"[rustos-serial] connected to {self._host}:{self._port}")
+        _write_codelldb_console(
+            self._debugger,
+            f"[rustos-serial] connected to {self._host}:{self._port}\n",
+        )
         return True
 
     def stop(self) -> None:
@@ -328,13 +354,19 @@ class _SerialConnection:
                 chunk = self._sock.recv(4096)
             except OSError:
                 if not self._stop.is_set():
-                    print("[rustos-serial] socket closed")
+                    _write_codelldb_console(
+                        self._debugger, "[rustos-serial] socket closed\n"
+                    )
                 return
             if not chunk:
                 if not self._stop.is_set():
-                    print("[rustos-serial] EOF")
+                    _write_codelldb_console(
+                        self._debugger, "[rustos-serial] EOF\n"
+                    )
                 return
-            print(chunk.decode("utf-8", errors="replace"), end="", flush=True)
+            _write_codelldb_console(
+                self._debugger, chunk.decode("utf-8", errors="replace")
+            )
 
 
 _active_connection: Optional[_MetaConnection] = None
@@ -363,7 +395,7 @@ class _RustosSerialConnectCommand:
         if _active_serial_connection is not None:
             _active_serial_connection.stop()
 
-        conn = _SerialConnection(host, port)
+        conn = _SerialConnection(debugger, host, port)
         if not conn.start():
             result.SetError(f"failed to connect to {host}:{port}")
             return
@@ -429,6 +461,7 @@ def __lldb_init_module(debugger, internal_dict) -> None:
     debugger.HandleCommand(
         "command script add -c rustos_meta._RustosMetaConnectCommand rustos-meta-connect"
     )
-    print(
-        "[rustos-meta] loaded — use 'rustos-meta-connect HOST PORT DRIVER_DIR' to start"
+    _write_codelldb_console(
+        debugger,
+        "[rustos-meta] loaded — use 'rustos-meta-connect HOST PORT DRIVER_DIR' to start\n",
     )

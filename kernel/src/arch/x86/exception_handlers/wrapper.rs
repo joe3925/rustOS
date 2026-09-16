@@ -1,6 +1,6 @@
 #[allow(dead_code)]
 #[macro_export]
-macro_rules! x86_exception_handler_wrapper {
+macro_rules! platform_exception_handler_wrapper {
     ($vis:vis $wrapper:ident, $handler:ident, error_code) => {
         #[unsafe(naked)]
         $vis extern "C" fn $wrapper() {
@@ -119,4 +119,3 @@ macro_rules! x86_exception_handler_wrapper {
         }
     };
 }
-

@@ -20,7 +20,9 @@ use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::pci::EcamSegment;
 use kernel_api::kernel_types::pnp::DeviceIds;
-use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
+use kernel_api::memory::{
+    PhysAddr, PhysicalMappingCache, VirtAddr, map_physical_pages, unmap_mmio_region,
+};
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpOp;
 use kernel_api::pnp::PnpOps;
@@ -58,11 +60,15 @@ fn round_up(n: usize, align: usize) -> usize {
 }
 
 #[inline]
-unsafe fn map_phys_window(paddr: usize, bytes: usize) -> (VirtAddr, usize, usize) {
+unsafe fn map_phys_window(
+    paddr: usize,
+    bytes: usize,
+    cache: PhysicalMappingCache,
+) -> (VirtAddr, usize, usize) {
     let off = paddr & (PAGE_SIZE - 1);
     let base = paddr - off;
     let size = round_up(off + bytes, PAGE_SIZE);
-    let va = map_mmio_region(PhysAddr::new(base as u64), size as u64).unwrap_or_else(|e| {
+    let va = map_physical_pages(PhysAddr::new(base as u64), size as u64, cache).unwrap_or_else(|e| {
         kernel_api::println!("[ACPI] map_phys_window failed: {:?}", e);
         panic!("map_phys_window failed");
     });
@@ -77,7 +83,13 @@ unsafe fn unmap_phys_window(va: VirtAddr, size: usize) {
 
 #[inline]
 unsafe fn mmio_read<T: Copy>(paddr: usize) -> T {
-    let (va, off, size) = unsafe { map_phys_window(paddr, core::mem::size_of::<T>()) };
+    let (va, off, size) = unsafe {
+        map_phys_window(
+            paddr,
+            core::mem::size_of::<T>(),
+            PhysicalMappingCache::Uncached,
+        )
+    };
     let ptr = (va.as_u64() as usize + off) as *const u8;
     let v = unsafe { read_volatile_unaligned::<T>(ptr) };
     unsafe { unmap_phys_window(va, size) };
@@ -86,7 +98,13 @@ unsafe fn mmio_read<T: Copy>(paddr: usize) -> T {
 
 #[inline]
 unsafe fn mmio_write<T: Copy>(paddr: usize, val: T) {
-    let (va, off, size) = unsafe { map_phys_window(paddr, core::mem::size_of::<T>()) };
+    let (va, off, size) = unsafe {
+        map_phys_window(
+            paddr,
+            core::mem::size_of::<T>(),
+            PhysicalMappingCache::Uncached,
+        )
+    };
     let ptr = (va.as_u64() as usize + off) as *mut u8;
     unsafe { write_volatile_unaligned::<T>(ptr, val) };
     unsafe { unmap_phys_window(va, size) };
@@ -111,7 +129,9 @@ fn ecam_cfg_phys_addr(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Option<
 
 impl Handler for KernelAmlHandler {
     unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
-        let (va, offset, mapped_length) = unsafe { map_phys_window(physical_address, size) };
+        let (va, offset, mapped_length) = unsafe {
+            map_phys_window(physical_address, size, PhysicalMappingCache::Cached)
+        };
         PhysicalMapping {
             physical_start: physical_address,
             virtual_start: core::ptr::NonNull::new((va.as_u64() as usize + offset) as *mut T).unwrap(),

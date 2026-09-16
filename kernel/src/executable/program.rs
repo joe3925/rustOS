@@ -403,7 +403,7 @@ impl Program {
         });
 
         let res = (|| {
-            let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
+            let flags = self.private_mapping_flags();
 
             unsafe { map_range(start.into(), end.as_u64() - start.as_u64(), flags, false) }
         })();
@@ -430,7 +430,7 @@ impl Program {
             );
         }
 
-        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
+        let flags = self.private_mapping_flags();
         let result =
             unsafe { map_range(start.into(), end.as_u64() - start.as_u64(), flags, false) };
 
@@ -458,7 +458,7 @@ impl Program {
             );
         });
 
-        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER_ACCESSIBLE;
+        let flags = self.private_mapping_flags();
 
         unsafe {
             map_range(start.into(), end.as_u64() - start.as_u64(), flags, false)?;
@@ -469,6 +469,18 @@ impl Program {
 
         Ok(start)
     }
+
+    fn private_mapping_flags(&self) -> PageFlags {
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
+        if self.address_space_root
+            == crate::memory::paging::address_space::kernel_address_space_root()
+        {
+            flags
+        } else {
+            flags | PageFlags::USER_ACCESSIBLE
+        }
+    }
+
     pub fn unmap_user_vm(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
         let size = crate::memory::paging::layout::align_up_to_base_page(size as u64)
             .ok_or(PageMapError::NoMemory())?;

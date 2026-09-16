@@ -13,6 +13,7 @@ pub struct PerCpu {
     pub reserved_interrupt_pad: [u8; 0x3],
     pub reserved0: [u8; 0x50],
     pub tls_array_pointer: AtomicU64,
+    pub exception_stack_top: AtomicU64,
     pub emergency_zero_address: Once<VirtAddr>,
     pub emergency_zero_in_use: AtomicBool,
     pub cpu_id: Once<usize>,
@@ -21,6 +22,7 @@ pub struct PerCpu {
 
 pub const PERCPU_IS_IN_INTERRUPT_OFF: usize = offset_of!(PerCpu, is_in_interrupt);
 pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = offset_of!(PerCpu, tls_array_pointer);
+pub const PERCPU_EXCEPTION_STACK_TOP_OFF: usize = offset_of!(PerCpu, exception_stack_top);
 
 const _: () = assert!(PERCPU_IS_IN_INTERRUPT_OFF == 0);
 const _: () = assert!(PERCPU_TLS_ARRAY_POINTER_OFF == 0x58);
@@ -44,6 +46,7 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
         reserved_interrupt_pad: [0; 0x3],
         reserved0: [0; 0x50],
         tls_array_pointer: AtomicU64::new(0),
+        exception_stack_top: AtomicU64::new(0),
         emergency_zero_address: Once::new(),
         emergency_zero_in_use: AtomicBool::new(false),
         cpu_id: Once::new(),

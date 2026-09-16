@@ -1,8 +1,8 @@
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::interrupt_impl::InterruptGuard;
 use crate::memory::heap::heap::mimalloc_thread_done;
+use crate::memory::paging::address_space::{kernel_address_space_root, switch_address_space_root};
 use crate::memory::paging::stack::StackSize;
-use crate::memory::paging::address_space::switch_address_space_root;
 use crate::platform;
 use crate::scheduling::domain::{
     CpuSet, DomainEntry, DomainMaster, EnqueueReason, KERNEL_DOMAIN_ID, RoundRobinDomainAlgorithm,
@@ -159,11 +159,9 @@ impl Scheduler {
         idle.set_target_cpu(cpu_id);
 
         Arc::new(CoreScheduler {
-            sched_lock: IrqSafeRwLock::new(SchedulerState {
-                current: Some(idle.clone()),
-            }),
+            sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
             idle_task: idle.clone(),
-            current_is_idle: AtomicBool::new(true),
+            current_is_idle: AtomicBool::new(false),
             platform_cpu_id,
         })
     }
@@ -667,6 +665,7 @@ impl Scheduler {
     #[inline(always)]
     pub fn restore_page_table(&self, task_handle: &TaskHandle) {
         if task_handle.is_kernel_mode() {
+            unsafe { switch_address_space_root(kernel_address_space_root()) };
             return;
         }
 
@@ -743,15 +742,15 @@ impl Scheduler {
             return;
         };
 
-        let is_idle = {
+        let can_schedule = {
             let sched_state = core.sched_lock.read();
             match sched_state.current.as_ref() {
                 Some(t) => Arc::ptr_eq(t, &core.idle_task),
-                None => false,
+                None => true,
             }
         };
 
-        if !is_idle {
+        if !can_schedule {
             platform::end_interrupt(platform::scheduler_ipi_vector());
             return;
         }

@@ -9,7 +9,7 @@ use kernel_api::kernel_types::dma::implementation::{
 };
 use kernel_api::memory::{
     PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
-    deallocate_kernel_range, unmap_range,
+    unmap_range,
 };
 
 struct DmaChunk {
@@ -67,6 +67,7 @@ impl ContiguousDmaRegion {
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         let base_va =
             allocate_auto_kernel_range_mapped_contiguous(alloc_bytes as u64, flags).ok()?;
+        kernel_api::println!("virtio DMA allocation va={:#x} bytes={:#x}", base_va.as_u64(), alloc_bytes);
 
         unsafe {
             core::ptr::write_bytes(base_va.as_u64() as *mut u8, 0, alloc_bytes);
@@ -101,7 +102,8 @@ impl ContiguousDmaRegion {
                 IoBufferBackingConfig::worst_case_for_len(byte_len),
             ) {
                 Ok(backing) => backing,
-                Err(_) => {
+                Err(error) => {
+                    kernel_api::println!("virtio DMA backing failed: {:?}", error);
                     region.destroy();
                     return None;
                 }
@@ -112,7 +114,8 @@ impl ContiguousDmaRegion {
 
             let buffer = match backing_ref.create_bidirectional(0, byte_len) {
                 Ok(buffer) => buffer,
-                Err(_) => {
+                Err(error) => {
+                    kernel_api::println!("virtio DMA buffer failed: {:?}", error);
                     unsafe {
                         drop(Box::from_raw(backing_ptr.as_ptr()));
                     }
@@ -125,7 +128,8 @@ impl ContiguousDmaRegion {
             let mapped = match dma::map_buffer(device, buffer, DmaMappingStrategy::SingleContiguous)
             {
                 Ok(mapped) => mapped,
-                Err((buffer, _)) => {
+                Err((buffer, error)) => {
+                    kernel_api::println!("virtio DMA map failed: {:?}", error);
                     drop(buffer);
 
                     unsafe {
@@ -201,6 +205,7 @@ impl ContiguousDmaRegion {
     }
 
     pub fn destroy(&mut self) {
+        kernel_api::println!("virtio DMA destroy va={:#x} bytes={:#x}", self.base_va.as_u64(), self.alloc_bytes);
         for chunk in &mut self.chunks {
             drop(chunk.buffer.take());
 
@@ -220,8 +225,6 @@ impl ContiguousDmaRegion {
         unsafe {
             unmap_range(self.base_va, self.alloc_bytes as u64);
         }
-
-        unsafe { deallocate_kernel_range(self.base_va, self.alloc_bytes as u64) };
 
         self.base_va = VirtAddr::new(0);
         self.alloc_bytes = 0;

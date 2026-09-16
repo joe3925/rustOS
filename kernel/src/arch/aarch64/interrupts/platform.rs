@@ -62,8 +62,11 @@ impl InterruptPlatform for Aarch64Platform {
     fn broadcast_panic_stop() {
         controller().broadcast_ipi(PANIC_STOP_SGI);
     }
-    fn compose_msi_message(_request: &MsiBindingRequest, _vector: u8) -> Option<MsiMessage> {
-        None
+    fn bind_msi(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
+        controller().bind_msi(request, vector)
+    }
+    fn unbind_msi(vector: u8) {
+        controller().unbind_msi(vector);
     }
     fn is_reserved_vector(vector: u8) -> bool {
         (vector as u32) < SPI_START

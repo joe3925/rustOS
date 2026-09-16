@@ -62,6 +62,7 @@ pub struct DmaDeviceState {
 pub const DMA_IOMMU_VENDOR_NONE: u8 = 0;
 pub const DMA_IOMMU_VENDOR_INTEL_DMAR: u8 = 1;
 pub const DMA_IOMMU_VENDOR_AMD_IVRS: u8 = 2;
+pub const DMA_IOMMU_VENDOR_ARM_SMMU: u8 = 3;
 
 pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE: u32 = 1 << 0;
 pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED: u32 = 1 << 1;

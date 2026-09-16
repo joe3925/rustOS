@@ -48,6 +48,7 @@ If there is a * it must be completed before user space is started
 2. [x] * Change the registry from inline proto to a .proto file
 3. [ ] Currently all interrupts are hard interrupts, evaulate proper soulutions. I want to try to avoid lower and upper half handlers 
 4. [ ] refactor scheduling to get rid of the vtable cost 
+5. [ ] Driver faults, some should unload the device some should be passed for recovery. Like C_BAD_STE on smmuv3 should cause the device to be faulted then unloaded. 
 
 ## Executor (EXE)
 1. [ ] Figure out emergency interrupt queue exhaustion.

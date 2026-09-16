@@ -1,17 +1,13 @@
 use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::scheduling::state::State;
 use core::hint::black_box;
+use core::sync::atomic::Ordering;
 
 use super::super::memory::paging::tables::kernel_cr3;
-use crate::memory::paging::layout::{base_page_size};
-use crate::memory::paging::stack::{kernel_stack_max_bytes};
 use crate::println;
-use crate::scheduling::scheduler::SCHEDULER;
-use crate::static_handlers::get_current_cpu_id;
+use crate::scheduling::task::{KernelStackFaultResolution, resolve_current_kernel_stack_fault};
 use crate::util::{PANIC_ACTIVE, exception_panic};
 use alloc::{fmt, format};
-use core::sync::atomic::Ordering;
-use kernel_types::arch::PageFlags;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
@@ -165,50 +161,31 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
         }
     }
     if !is_protection {
-        if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
-            if task.is_kernel_mode() && !is_user {
-                let gp = task.guard_page.load(Ordering::Acquire);
-                if gp != 0 {
-                    let stack_start = task.stack_start.load(Ordering::Relaxed);
-                    let max_depth = stack_start.saturating_sub(kernel_stack_max_bytes());
-
-                    // Allow growth for faults anywhere within the reserved stack window below stack_start.
-                    if fault >= max_depth && fault < stack_start {
-                        let page_size = base_page_size();
-                        let flags =
-                            PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-                        while fault < task.guard_page.load(Ordering::Acquire) + page_size {
-                            match task.grow_stack(flags) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    println!("false");
-                                    break;
-                                }
-                                Err(e) => {
-                                    println!("grow stack error: {:#?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                        if fault >= task.guard_page.load(Ordering::Acquire) + page_size {
-                            return;
-                        }
-                    }
-
-                    let reserved_start = gp - kernel_stack_max_bytes();
-
-                    if fault >= reserved_start && fault < gp {
-                        unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
-                        panic_exception!(
-                            stack_frame,
-                            "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",
-                            error_code,
-                            fault,
-                            gp,
-                            *stack_frame
-                        );
-                    }
+        if !is_user {
+            match resolve_current_kernel_stack_fault(fault) {
+                KernelStackFaultResolution::Grown => return,
+                KernelStackFaultResolution::Overflow => {
+                    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
+                    panic_exception!(
+                        stack_frame,
+                        "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n{:#?}",
+                        error_code,
+                        fault,
+                        *stack_frame
+                    );
                 }
+                KernelStackFaultResolution::GrowthFailed(error) => {
+                    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
+                    panic_exception!(
+                        stack_frame,
+                        "KERNEL STACK GROWTH FAILED\nerror_code={:?}\ncr2={:#x}\nerror={:?}\n{:#?}",
+                        error_code,
+                        fault,
+                        error,
+                        *stack_frame
+                    );
+                }
+                KernelStackFaultResolution::NotStack => {}
             }
         }
     }

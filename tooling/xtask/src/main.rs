@@ -14,8 +14,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,7 +50,10 @@ fn try_main() -> Result<(), String> {
             )
             .map(|_| ())
         }
-        CliCommand::Qemu(options) => {
+        CliCommand::Qemu {
+            options,
+            file_serial,
+        } => {
             let platform = options
                 .platform
                 .as_deref()
@@ -63,7 +66,7 @@ fn try_main() -> Result<(), String> {
             let launch = config::load_launch(&root, launch)?;
             let host_selector = options.host.as_deref().unwrap_or(std::env::consts::OS);
             let host = config::load_host(&root, host_selector)?;
-            run_qemu(&root, &plan, &launch, &host, options)
+            run_qemu(&root, &plan, &launch, &host, options, file_serial)
         }
         CliCommand::Bench(command) => bench::execute(&root, command),
         CliCommand::Cargo(options) => {
@@ -102,7 +105,9 @@ fn try_main() -> Result<(), String> {
                         command.arg("--no-default-features");
                     }
                     if !plan.kernel.features.is_empty() {
-                        command.arg("--features").arg(plan.kernel.features.join(","));
+                        command
+                            .arg("--features")
+                            .arg(plan.kernel.features.join(","));
                     }
                     run(command, "running Cargo for kernel")
                 }
@@ -129,7 +134,10 @@ fn try_main() -> Result<(), String> {
                                 root.join("target/cargo").join(&plan.id).join("drivers"),
                             )
                             .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
-                        run(command, &format!("running Cargo for {}", manifest.display()))?;
+                        run(
+                            command,
+                            &format!("running Cargo for {}", manifest.display()),
+                        )?;
                     }
                     if found {
                         Ok(())
@@ -182,7 +190,10 @@ struct Cli {
 
 enum CliCommand {
     Build(BuildOptions),
-    Qemu(QemuOptions),
+    Qemu {
+        options: QemuOptions,
+        file_serial: Option<PathBuf>,
+    },
     Bench(bench::BenchCommand),
     Cargo(CargoOptions),
 }
@@ -264,6 +275,7 @@ impl Cli {
             }
             Some("qemu") => {
                 args.next();
+                let mut file_serial = None;
                 let mut options = QemuOptions {
                     release: false,
                     debug: false,
@@ -285,6 +297,12 @@ impl Cli {
                         "--detach" => options.detach = true,
                         "--dry-run" => options.dry_run = true,
                         "--console-serial" => options.console_serial = true,
+                        "--file-serial" => {
+                            file_serial =
+                                Some(PathBuf::from(args.next().ok_or_else(|| {
+                                    "--file-serial requires a path".to_string()
+                                })?));
+                        }
                         "--gdb-port" => {
                             let port = args
                                 .next()
@@ -329,7 +347,10 @@ impl Cli {
                 }
 
                 Ok(Self {
-                    command: CliCommand::Qemu(options),
+                    command: CliCommand::Qemu {
+                        options,
+                        file_serial,
+                    },
                 })
             }
             Some("bench") => {
@@ -356,8 +377,10 @@ impl Cli {
                             }
                             let cargo_args = args.collect::<Vec<_>>();
                             if cargo_args.is_empty() {
-                                return Err("cargo passthrough requires a Cargo command after `--`"
-                                    .to_string());
+                                return Err(
+                                    "cargo passthrough requires a Cargo command after `--`"
+                                        .to_string(),
+                                );
                             }
                             return Ok(Self {
                                 command: CliCommand::Cargo(CargoOptions {
@@ -382,7 +405,7 @@ fn usage() -> String {
     [
         "usage:",
         "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
-        "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
+        "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
         "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
@@ -401,6 +424,7 @@ fn usage() -> String {
         "",
         "serial ports:",
         "  COM1 (0x3F8)  kernel logs; debug sessions stream to LLDB on TCP port 4321",
+        "                --file-serial PATH additionally records COM1 at PATH",
         "                other runs use RUSTOS_QEMU_SERIAL and default to no output",
         "  COM2 (0x2F8)  structured debugger metadata, enabled with --lldb-meta",
         "                host TCP port defaults to 4322 (override with --meta-port)",
@@ -415,6 +439,7 @@ fn run_qemu(
     launch: &LaunchPlan,
     host: &HostPlan,
     options: QemuOptions,
+    file_serial: Option<PathBuf>,
 ) -> Result<(), String> {
     if options.detach && options.console_serial {
         return Err("--console-serial cannot be used with --detach".to_string());
@@ -426,7 +451,15 @@ fn run_qemu(
     let qemu = find_qemu(launch, host)?;
     let firmware = find_firmware(launch, host, &qemu)?;
     let system_disk = system_disk(root)?;
-    let args = qemu_args(root, launch, &firmware, &boot_image, &system_disk, &options)?;
+    let args = qemu_args_inner(
+        root,
+        launch,
+        &firmware,
+        &boot_image,
+        &system_disk,
+        &options,
+        file_serial.as_deref(),
+    )?;
 
     assert_exists(&boot_image, "boot image")?;
 
@@ -437,6 +470,22 @@ fn run_qemu(
     if options.dry_run {
         print_command(&qemu, &args);
         return Ok(());
+    }
+
+    if let Some(path) = file_serial.as_deref() {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create file-serial directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
     }
 
     if options.detach {
@@ -912,11 +961,7 @@ fn build_std_args() -> [&'static str; 4] {
 }
 
 fn profile(release: bool) -> &'static str {
-    if release {
-        "release"
-    } else {
-        "debug"
-    }
+    if release { "release" } else { "debug" }
 }
 
 fn copy_artifact(source: &Path, destination: &Path, what: &str) -> Result<(), String> {
@@ -955,6 +1000,7 @@ fn find_pdb(binary: &Path) -> Option<PathBuf> {
 
 struct ResolvedArtifacts {
     kernel: PathBuf,
+    kernel_debug: Option<PathBuf>,
     boot_image: PathBuf,
     debug_search_paths: Vec<PathBuf>,
 }
@@ -1060,6 +1106,7 @@ fn load_artifact_manifest(
         }
     };
     let kernel = resolve(&manifest.kernel.image);
+    let kernel_debug = manifest.kernel.debug.as_ref().map(|debug| resolve(debug));
     let boot_image = resolve(&manifest.boot_image);
     let debug_search_paths: Vec<PathBuf> = manifest
         .debug_search_paths
@@ -1080,8 +1127,8 @@ fn load_artifact_manifest(
         ),
         ("kernel stub", resolve(&manifest.stub)),
     ];
-    if let Some(debug) = &manifest.kernel.debug {
-        required.push(("kernel debug information", resolve(debug)));
+    if let Some(debug) = &kernel_debug {
+        required.push(("kernel debug information", debug.clone()));
     }
     for package in &manifest.boot_packages {
         required.push(("driver configuration", resolve(&package.configuration)));
@@ -1104,6 +1151,7 @@ fn load_artifact_manifest(
 
     Ok(ResolvedArtifacts {
         kernel,
+        kernel_debug,
         boot_image,
         debug_search_paths,
     })
@@ -1163,7 +1211,10 @@ fn firmware_paths_from_qemu(qemu: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     if let Some(directory) = qemu.parent() {
-        for share in [directory.join("share"), directory.join("share").join("qemu")] {
+        for share in [
+            directory.join("share"),
+            directory.join("share").join("qemu"),
+        ] {
             for file in files {
                 paths.push(share.join(file));
             }
@@ -1253,6 +1304,11 @@ fn disk_format(path: &Path) -> String {
     }
 }
 
+struct QemuSerialConfig {
+    primary: String,
+    prefix_args: Vec<String>,
+}
+
 fn qemu_args(
     root: &Path,
     launch: &LaunchPlan,
@@ -1261,9 +1317,29 @@ fn qemu_args(
     system_disk: &SystemDisk,
     options: &QemuOptions,
 ) -> Result<Vec<OsString>, String> {
+    qemu_args_inner(
+        root,
+        launch,
+        firmware,
+        boot_image,
+        system_disk,
+        options,
+        None,
+    )
+}
+
+fn qemu_args_inner(
+    root: &Path,
+    launch: &LaunchPlan,
+    firmware: &Path,
+    boot_image: &Path,
+    system_disk: &SystemDisk,
+    options: &QemuOptions,
+    file_serial: Option<&Path>,
+) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| launch.defaults.memory.clone());
     let cpus = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| launch.defaults.cpus.clone());
-    let serial = qemu_serial_arg(root, options)?;
+    let serial = qemu_serial_config(root, options, file_serial)?;
     let values = [
         ("memory", memory),
         ("cpus", cpus),
@@ -1271,12 +1347,13 @@ fn qemu_args(
         ("boot_image", portable_path(boot_image)?),
         ("system_disk", portable_path(&system_disk.path)?),
         ("system_disk_format", system_disk.format.clone()),
-        ("primary_serial", serial),
+        ("primary_serial", serial.primary),
         ("gdb_port", options.gdb_port.to_string()),
         ("meta_port", options.meta_port.to_string()),
     ];
 
-    let mut templates = launch.args.clone();
+    let mut templates = serial.prefix_args;
+    templates.extend(launch.args.iter().cloned());
 
     if options.debug {
         templates.extend(launch.debug_args.iter().cloned());
@@ -1309,22 +1386,77 @@ fn portable_path(path: &Path) -> Result<String, String> {
     path_string(path).map(|path| path.replace('\\', "/"))
 }
 
-fn qemu_serial_log_path(root: &Path) -> PathBuf {
-    root.join("target").join("qemu-com1.log")
+fn qemu_console_serial_log_path(root: &Path) -> PathBuf {
+    root.join("target").join("qemu-console-serial.log")
 }
 
-fn qemu_serial_arg(root: &Path, options: &QemuOptions) -> Result<String, String> {
+fn qemu_serial_config(
+    root: &Path,
+    options: &QemuOptions,
+    file_serial: Option<&Path>,
+) -> Result<QemuSerialConfig, String> {
+    let file_log = file_serial
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            qemu_path_string(root, &path)
+        })
+        .transpose()?;
+
     if options.console_serial {
-        let path = qemu_serial_log_path(root);
-        let path = qemu_path_string(root, &path)?;
-        Ok(format!("file:{path}"))
-    } else if options.debug {
-        Ok(format!(
-            "tcp:127.0.0.1:{DEFAULT_SERIAL_PORT},server=on,wait=off,nodelay=on"
-        ))
-    } else {
-        Ok(env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "null".to_string()))
+        let console_log = qemu_path_string(root, &qemu_console_serial_log_path(root))?;
+
+        if let Some(file_log) = file_log {
+            return Ok(QemuSerialConfig {
+                primary: "chardev:rustos_com1".to_string(),
+                prefix_args: vec![
+                    "-chardev".to_string(),
+                    format!(
+                        "file,id=rustos_com1,path={console_log},logfile={file_log},logappend=off"
+                    ),
+                ],
+            });
+        }
+
+        return Ok(QemuSerialConfig {
+            primary: format!("file:{console_log}"),
+            prefix_args: Vec::new(),
+        });
     }
+
+    if options.debug {
+        if let Some(file_log) = file_log {
+            return Ok(QemuSerialConfig {
+                primary: "chardev:rustos_com1".to_string(),
+                prefix_args: vec![
+                    "-chardev".to_string(),
+                    format!(
+                        "socket,id=rustos_com1,host=127.0.0.1,port={DEFAULT_SERIAL_PORT},server=on,wait=off,nodelay=on,logfile={file_log},logappend=off"
+                    ),
+                ],
+            });
+        }
+
+        return Ok(QemuSerialConfig {
+            primary: format!("tcp:127.0.0.1:{DEFAULT_SERIAL_PORT},server=on,wait=off,nodelay=on"),
+            prefix_args: Vec::new(),
+        });
+    }
+
+    if let Some(file_log) = file_log {
+        return Ok(QemuSerialConfig {
+            primary: format!("file:{file_log}"),
+            prefix_args: Vec::new(),
+        });
+    }
+
+    Ok(QemuSerialConfig {
+        primary: env::var("RUSTOS_QEMU_SERIAL").unwrap_or_else(|_| "null".to_string()),
+        prefix_args: Vec::new(),
+    })
 }
 
 fn path_string(path: &Path) -> Result<String, String> {
@@ -1361,16 +1493,23 @@ fn write_lldb_commands(
             "settings set target.debug-file-search-paths {}",
             search_paths
         ),
-        format!("gdb-remote localhost:{}", options.gdb_port),
         format!(
             "target modules load --file {} --slide 0",
             lldb_quote_path(&artifacts.kernel)?
         ),
-        format!(
-            "command script import {}",
-            lldb_quote_path(&metadata_script)?
-        ),
     ];
+
+    if let Some(kernel_debug) = &artifacts.kernel_debug {
+        commands.push(format!(
+            "target symbols add {}",
+            lldb_quote_path(kernel_debug)?
+        ));
+    }
+
+    commands.push(format!(
+        "command script import {}",
+        lldb_quote_path(&metadata_script)?
+    ));
 
     if !options.console_serial {
         commands.push(format!(
@@ -1385,8 +1524,6 @@ fn write_lldb_commands(
             lldb_quote_path(&driver_dir)?
         ));
     }
-
-    commands.push("process continue".to_string());
 
     let output = root.join("target").join("rustos").join("debug.lldb");
     let parent = output
@@ -1419,6 +1556,16 @@ fn spawn_qemu_detached(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
 
     #[cfg(unix)]
     {
@@ -1459,7 +1606,7 @@ fn run_qemu_foreground(
         return check_status(status, "running QEMU");
     }
 
-    let serial_log = qemu_serial_log_path(root);
+    let serial_log = qemu_console_serial_log_path(root);
 
     if let Some(parent) = serial_log.parent() {
         fs::create_dir_all(parent).map_err(|err| {

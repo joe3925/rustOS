@@ -12,9 +12,7 @@ impl Platform for Aarch64Platform {
     const KERNEL_IMAGE_BASE: u64 = kernel_abi::arch::KERNEL_PE_BASE;
 
     fn init_early_kernel() {
-        VBAR_EL1.set(
-            &raw const super::interrupts::entry::aarch64_exception_vectors as u64,
-        );
+        VBAR_EL1.set(&raw const super::interrupts::entry::aarch64_exception_vectors as u64);
         isb(SY);
     }
 

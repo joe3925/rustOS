@@ -105,7 +105,7 @@ impl InterruptPlatform for X86Platform {
         }
     }
 
-    fn compose_msi_message(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
+    fn bind_msi(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
         match request.kind {
             MSI_KIND_MSI | MSI_KIND_MSIX => {}
             _ => return None,
@@ -126,6 +126,8 @@ impl InterruptPlatform for X86Platform {
 
         Some(MsiMessage::new(address, data))
     }
+
+    fn unbind_msi(_vector: u8) {}
 
     fn is_reserved_vector(vector: u8) -> bool {
         vector == crate::arch::x86::idt::table::SYSCALL_VECTOR

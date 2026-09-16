@@ -12,7 +12,7 @@ use crate::arch::aarch64::platform::Aarch64Platform;
 
 static INTERRUPT_CONTROLLER: Once<InterruptController> = Once::new();
 
-pub(super) fn controller() -> &'static InterruptController {
+pub(crate) fn controller() -> &'static InterruptController {
     INTERRUPT_CONTROLLER.get().expect("GIC is not initialized")
 }
 

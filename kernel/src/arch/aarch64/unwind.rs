@@ -539,14 +539,24 @@ fn valid_address(address: u64) -> bool {
 impl UnwindContext {
     fn from_state(state: &TaskContext) -> Self {
         Self {
-            pc: state.rip,
+            pc: state.elr,
             sp: state.sp,
             registers: [
-                state.x19, state.x20, state.x21, state.x22, state.x23, state.x24, state.x25,
-                state.x26, state.x27, state.x28, 0, 0,
+                state.x[19],
+                state.x[20],
+                state.x[21],
+                state.x[22],
+                state.x[23],
+                state.x[24],
+                state.x[25],
+                state.x[26],
+                state.x[27],
+                state.x[28],
+                0,
+                0,
             ],
-            fp: state.fp,
-            lr: state.lr,
+            fp: state.x[29],
+            lr: state.x[30],
             pc_is_return_address: false,
         }
     }

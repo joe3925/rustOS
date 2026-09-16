@@ -1,6 +1,4 @@
-use crate::structs::range_tracker::RangeTracker;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use kernel_types::dma::implementation::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::implementation::DmaPciDeviceIdentity;
 use spin::Mutex;
@@ -140,8 +138,9 @@ pub struct DeviceMmuDomain {
     domain_id: u64,
     translation_unit_index: u32,
     capabilities: DeviceMmuCapabilities,
-    iova_tracker: RangeTracker,
-    iova_cache: Mutex<Vec<CachedIovaRange>>,
+    iova_start: u64,
+    iova_end: u64,
+    iova_allocations: Mutex<[Option<CachedIovaRange>; MAX_IOVA_ALLOCATIONS]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +149,7 @@ struct CachedIovaRange {
     size: u64,
 }
 
-const MAX_CACHED_IOVA_RANGES: usize = 64;
+const MAX_IOVA_ALLOCATIONS: usize = 1024;
 
 impl DeviceMmuDomain {
     pub fn new(info: DeviceMmuDomainInfo) -> DeviceMmuResult<Self> {
@@ -165,12 +164,9 @@ impl DeviceMmuDomain {
             domain_id: info.domain_id,
             translation_unit_index: info.translation_unit_index,
             capabilities: info.capabilities,
-            iova_tracker: RangeTracker::new_with_granularity(
-                info.iova_start,
-                info.iova_end,
-                granularity,
-            ),
-            iova_cache: Mutex::new(Vec::new()),
+            iova_start: info.iova_start,
+            iova_end: info.iova_end,
+            iova_allocations: Mutex::new([None; MAX_IOVA_ALLOCATIONS]),
         })
     }
 
@@ -196,27 +192,45 @@ impl DeviceMmuDomain {
 
     #[inline]
     pub fn alloc_iova(&self, size: u64) -> Option<u64> {
-        let result = {
-            let mut cache = self.iova_cache.lock();
-            cache
-                .iter()
-                .position(|range| range.size == size)
-                .map(|index| cache.swap_remove(index).base)
+        let granularity = self.device_page_size();
+        let size = size.checked_add(granularity - 1)? & !(granularity - 1);
+        let mut allocations = self.iova_allocations.lock();
+        let free_slot = allocations.iter().position(|slot| slot.is_none())?;
+        let mut candidate = self.iova_start;
+        loop {
+            let mut next = None;
+            for range in allocations.iter().flatten() {
+                if range.base >= candidate
+                    && next.is_none_or(|current: CachedIovaRange| range.base < current.base)
+                {
+                    next = Some(*range);
+                }
+            }
+            match next {
+                Some(range) if candidate.checked_add(size)? <= range.base => break,
+                Some(range) => candidate = range.base.checked_add(range.size)?,
+                None => break,
+            }
         }
-        .or_else(|| self.iova_tracker.alloc_auto(size).map(|addr| addr.as_u64()));
-        result
+        if candidate.checked_add(size)? > self.iova_end {
+            return None;
+        }
+        allocations[free_slot] = Some(CachedIovaRange {
+            base: candidate,
+            size,
+        });
+        Some(candidate)
     }
 
     #[inline]
     pub fn free_iova(&self, base: u64, size: u64) {
-        let mut cache = self.iova_cache.lock();
-        if cache.len() < MAX_CACHED_IOVA_RANGES {
-            cache.push(CachedIovaRange { base, size });
-            return;
+        let mut allocations = self.iova_allocations.lock();
+        if let Some(slot) = allocations
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|range| range.base == base && range.size == size))
+        {
+            *slot = None;
         }
-        drop(cache);
-
-        unsafe { self.iova_tracker.dealloc(base, size) };
     }
 }
 

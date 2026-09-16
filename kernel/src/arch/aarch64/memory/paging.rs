@@ -2,13 +2,13 @@ use core::arch::asm;
 
 use aarch64_vmsa::address::{Level, TranslationGranule};
 use aarch64_vmsa::attrs::{
-    AllocationHints, AttributeCodec, CachePolicy, Cacheability, DataAccess, DeviceMemoryType,
+    AllocationHints, AttributeCodec, CachePolicy, Cacheability, DataRights, DeviceMemoryType,
     DirtyBitManagement, DirtyControl, MemoryAttributes, MemoryTransience, SemanticLeafAttrs,
     SemanticTableAttrs, SemanticVmsa64Stage1LeafControls, SemanticVmsa64Stage1TableControls,
-    Shareability, SoftwareMetadata, Stage1EffectivePermissions, Stage1MemoryConfig,
-    Stage1PermissionConfig, TwoPrivilegeTablePermissionLimits,
+    Shareability, SoftwareMetadata, Stage1MemoryConfig, Stage1PermissionConfig, Stage1Permissions,
+    TwoPrivilegeTableRestrictions,
 };
-use aarch64_vmsa::config::format::Vmsa64;
+use aarch64_vmsa::config::format::{NativeEndian, Vmsa64};
 use aarch64_vmsa::config::granule::Granule4KiB;
 use aarch64_vmsa::config::regime::NonSecureEl1Stage1;
 use aarch64_vmsa::descriptor::{DescriptorFormat, DescriptorLayout, HasLayout};
@@ -20,14 +20,18 @@ use aarch64_vmsa::table::{
     RecursiveTableAccess, RootTable, RootTableGeometry, TableAccessLocation, TableAddr,
     TableAllocLayout, TableFrameProvider, TableGeometry, TableReclaim,
 };
+use aarch64_vmsa::translation::Stage1;
 use aarch64_vmsa::translation::{WalkInputAddr, WalkOutcome, WalkOutputAddr, Walker};
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::{PageMapError, PageMapFailure};
 
-use crate::memory::paging::types::UserVmLayout;
 use crate::memory::paging::frame_alloc::{KernelFrameAllocator, KernelPageTableFrameAllocator};
-use crate::memory::paging::types::{KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping, UnmapFrameDisposition};
+use crate::memory::paging::types::UserVmLayout;
+use crate::memory::paging::types::{
+    KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
+    UnmapFrameDisposition,
+};
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator, PagingPlatform};
 use crate::util::boot_info;
 
@@ -36,10 +40,12 @@ use super::address_space::Root;
 
 type Regime = NonSecureEl1Stage1;
 type Granule = Granule4KiB;
-type Access = RecursiveTableAccess<Vmsa64, Granule>;
-type KernelWalker = Walker<Vmsa64, Regime, Granule, Access>;
-type LeafAttrs = SemanticLeafAttrs<Vmsa64, Regime>;
-type TableAttrs = SemanticTableAttrs<Vmsa64, Regime>;
+type Format = Vmsa64<NativeEndian>;
+type Access = RecursiveTableAccess<Format, Granule>;
+type KernelWalker = Walker<Format, Regime, Granule, Access>;
+type LeafAttrs = SemanticLeafAttrs<Format, Regime>;
+type TableAttrs = SemanticTableAttrs<Format, Regime>;
+
 
 const AARCH64_MAPPING_SIZES: [MappingSize; 3] = [
     MappingSize {
@@ -102,15 +108,15 @@ unsafe impl<A: PageTableFrameAllocator> TableFrameProvider<Granule> for Aarch64T
 
 struct Aarch64Invalidation;
 
-unsafe impl MapperInvalidation<Vmsa64, Granule> for Aarch64Invalidation {
-    fn leaf_inserted(&mut self, _: TableAccessLocation<Vmsa64, Granule>, _: usize, _: u64, _: u64) {
+unsafe impl MapperInvalidation<Format, Granule> for Aarch64Invalidation {
+    fn leaf_inserted(&mut self, _: TableAccessLocation<Format, Granule>, _: usize, _: u64, _: u64) {
     }
 
-    fn leaf_removed(&mut self, _: TableAccessLocation<Vmsa64, Granule>, _: usize, _: u64) {}
+    fn leaf_removed(&mut self, _: TableAccessLocation<Format, Granule>, _: usize, _: u64) {}
 
     fn table_descriptor_inserted(
         &mut self,
-        _: TableAccessLocation<Vmsa64, Granule>,
+        _: TableAccessLocation<Format, Granule>,
         _: usize,
         _: u64,
         _: u64,
@@ -119,7 +125,7 @@ unsafe impl MapperInvalidation<Vmsa64, Granule> for Aarch64Invalidation {
 
     fn table_descriptor_removed(
         &mut self,
-        _: TableAccessLocation<Vmsa64, Granule>,
+        _: TableAccessLocation<Format, Granule>,
         _: usize,
         _: u64,
     ) {
@@ -132,11 +138,11 @@ unsafe impl MapperInvalidation<Vmsa64, Granule> for Aarch64Invalidation {
     }
 }
 
-fn root_table(root: Root) -> Result<RootTable<Vmsa64, Regime, Granule>, PageMapError> {
+fn root_table(root: Root) -> Result<RootTable<Format, Regime, Granule>, PageMapError> {
     let info = &boot_info().arch_info;
     let address = TableAddr::new(root.physical_address().as_u64())
         .map_err(|_| PageMapError::TranslationFailed())?;
-    let geometry = RootTableGeometry::<Vmsa64, Granule>::new(
+    let geometry = RootTableGeometry::<Format, Granule>::new(
         address,
         info.input_addr_bits,
         info.output_addr_bits,
@@ -145,7 +151,7 @@ fn root_table(root: Root) -> Result<RootTable<Vmsa64, Regime, Granule>, PageMapE
     Ok(geometry.with_regime::<Regime>())
 }
 
-fn recursive_access(root: RootTable<Vmsa64, Regime, Granule>) -> Result<Access, PageMapError> {
+fn recursive_access(root: RootTable<Format, Regime, Granule>) -> Result<Access, PageMapError> {
     let info = &boot_info().arch_info;
     unsafe {
         RecursiveTableAccess::new(
@@ -165,7 +171,7 @@ fn current_walker() -> Result<KernelWalker, PageMapError> {
 }
 
 fn input_address(
-    root: RootTable<Vmsa64, Regime, Granule>,
+    root: RootTable<Format, Regime, Granule>,
     address: u64,
 ) -> Result<WalkInputAddr, PageMapError> {
     WalkInputAddr::from_canonical(address, root.addr_bits())
@@ -217,24 +223,26 @@ fn leaf_attributes(flags: PageFlags, cache: Option<PhysicalMappingCache>) -> Lea
             Shareability::OuterShareable,
         ),
     };
-    let data = if flags.contains(PageFlags::WRITABLE) {
-        DataAccess::ReadWrite
+    let writable = flags.contains(PageFlags::WRITABLE);
+    let data = if writable {
+        DataRights::ReadWrite
     } else {
-        DataAccess::ReadOnly
+        DataRights::Read
     };
     let user = flags.contains(PageFlags::USER_ACCESSIBLE);
     let executable = !flags.contains(PageFlags::NO_EXECUTE);
+    let privileged_executable = executable && !(user && writable);
 
     LeafAttrs {
         memory,
-        permissions: Stage1EffectivePermissions {
-            privileged_data: data,
-            unprivileged_data: if user { data } else { DataAccess::None },
-            privileged_execute: executable,
-            unprivileged_execute: user && executable,
-            privileged_gcs: false,
-            unprivileged_gcs: false,
-        },
+        permissions: Stage1Permissions::new(
+            data,
+            if user { data } else { DataRights::None },
+            privileged_executable,
+            user && executable,
+            false,
+            false,
+        ),
         pas: (),
         controls: SemanticVmsa64Stage1LeafControls {
             shareability,
@@ -289,13 +297,13 @@ unsafe fn replace_leaf_with_walker(
 
     let (cursor, index, old) = match outcome {
         WalkOutcome::Invalid(invalid) if physical_address.is_some() => {
-            if invalid.level() != Vmsa64::FINAL_LEVEL {
+            if invalid.level() != Format::FINAL_LEVEL {
                 return Err(PageMapError::NoMemoryMap());
             }
             (invalid.cursor(), invalid.entry_index(), None)
         }
         WalkOutcome::Leaf(leaf) if physical_address.is_none() => {
-            if leaf.level() != Vmsa64::FINAL_LEVEL {
+            if leaf.level() != Format::FINAL_LEVEL {
                 return Err(PageMapError::TranslationFailed());
             }
             (
@@ -312,7 +320,7 @@ unsafe fn replace_leaf_with_walker(
 
     let path = cursor.path();
     let mut depth = path.len();
-    let mut slot_level = Vmsa64::FINAL_LEVEL;
+    let mut slot_level = Format::FINAL_LEVEL;
     let mut descriptor_address = boot_info().arch_info.recursive_base;
     while depth > 0 {
         depth -= 1;
@@ -321,9 +329,9 @@ unsafe fn replace_leaf_with_walker(
             .ok_or(PageMapError::TranslationFailed())?;
         let stride_count = entry.parent().stride_count().raw();
         let index_mask =
-            TableGeometry::<Vmsa64, Granule>::checked_index_mask_for_stride_count(stride_count)
+            TableGeometry::<Format, Granule>::checked_index_mask_for_stride_count(stride_count)
                 .ok_or(PageMapError::TranslationFailed())?;
-        let shift = TableGeometry::<Vmsa64, Granule>::checked_level_shift(slot_level)
+        let shift = TableGeometry::<Format, Granule>::checked_level_shift(slot_level)
             .ok_or(PageMapError::TranslationFailed())?;
         let field_mask = index_mask
             .checked_shl(u32::from(shift))
@@ -336,33 +344,34 @@ unsafe fn replace_leaf_with_walker(
         let config = MapperConfig {
             mair: boot_info().arch_info.mair_el1,
         };
-        let fields = <Vmsa64 as AttributeCodec<Regime, Granule, MapperConfig>>::encode_leaf(
-            &config,
-            Vmsa64::FINAL_LEVEL,
-            leaf_attributes(
-                PageFlags::PRESENT
-                    | PageFlags::WRITABLE
-                    | PageFlags::NO_EXECUTE
-                    | PageFlags::GLOBAL,
-                None,
-            ),
-        )
-        .map_err(|_| PageMapError::TranslationFailed())?;
-        <<Vmsa64 as HasLayout<
+        let fields =
+            <Stage1 as AttributeCodec<Format, Regime, Granule, MapperConfig>>::encode_leaf(
+                &config,
+                Format::FINAL_LEVEL,
+                leaf_attributes(
+                    PageFlags::PRESENT
+                        | PageFlags::WRITABLE
+                        | PageFlags::NO_EXECUTE
+                        | PageFlags::GLOBAL,
+                    None,
+                ),
+            )
+            .map_err(|_| PageMapError::TranslationFailed())?;
+        <<Format as HasLayout<
             <Regime as TranslationRegime>::Stage,
             Granule,
         >>::Layout as DescriptorLayout<<Regime as TranslationRegime>::Stage, Granule>>::leaf_descriptor(
             aarch64_vmsa::address::PhysAddr(physical_address.as_u64()),
-            Vmsa64::FINAL_LEVEL,
+            Format::FINAL_LEVEL,
             fields,
         )
         .map_err(|_| PageMapError::TranslationFailed())?
     } else {
-        Vmsa64::invalid()
+        Format::invalid()
     };
 
     let pointer = (descriptor_address as *mut u64).wrapping_add(index);
-    unsafe { Vmsa64::write_descriptor(pointer, raw) };
+    unsafe { Format::write_descriptor(pointer, raw) };
     synchronize_address(virtual_address);
     Ok(old)
 }
@@ -395,11 +404,11 @@ fn resolve_in_current_root(virtual_address: VirtAddr) -> Option<ResolvedMapping>
     let root = root_table(<Aarch64Platform as AddressSpacePlatform>::current_root()).ok()?;
     let input = input_address(root, virtual_address.as_u64()).ok()?;
     let leaf = walker.translate(input).ok()??;
-    let mapping_size = TableGeometry::<Vmsa64, Granule>::level_span(leaf.level())?;
+    let mapping_size = TableGeometry::<Format, Granule>::level_span(leaf.level())?;
     let config = MapperConfig {
         mair: boot_info().arch_info.mair_el1,
     };
-    let attrs = decode_semantic_leaf::<Vmsa64, Regime, Granule, MapperConfig>(
+    let attrs = decode_semantic_leaf::<Format, Regime, Granule, MapperConfig>(
         &config,
         leaf.level(),
         *leaf.fields(),
@@ -409,9 +418,9 @@ fn resolve_in_current_root(virtual_address: VirtAddr) -> Option<ResolvedMapping>
     Some(ResolvedMapping {
         mapping_size,
         phys_addr: PhysAddr::new(leaf.output().raw()),
-        user_accessible: attrs.permissions.unprivileged_data != DataAccess::None
-            || attrs.permissions.unprivileged_execute,
-        writable: attrs.permissions.privileged_data == DataAccess::ReadWrite,
+        user_accessible: attrs.permissions.data.unprivileged != DataRights::None
+            || attrs.permissions.execute.unprivileged(),
+        writable: attrs.permissions.data.privileged == DataRights::ReadWrite,
     })
 }
 
@@ -513,9 +522,9 @@ impl PagingPlatform for Aarch64Platform {
             mair: boot_info().arch_info.mair_el1,
         };
         let table_attrs = TableAttrs {
-            permission_limits: TwoPrivilegeTablePermissionLimits {
-                privileged_data_limit: DataAccess::ReadWrite,
-                unprivileged_data_limit: DataAccess::ReadWrite,
+            restrictions: TwoPrivilegeTableRestrictions {
+                privileged_data_limit: DataRights::ReadWrite,
+                unprivileged_data_limit: DataRights::ReadWrite,
                 privileged_execute_limit: true,
                 unprivileged_execute_limit: true,
             },
@@ -656,6 +665,8 @@ impl PagingPlatform for Aarch64Platform {
 
     fn broadcast_tlb_shootdown() -> bool {
         synchronize_all();
-        false
+        super::super::interrupts::init::controller()
+            .broadcast_ipi(crate::platform::tlb_shootdown_vector());
+        true
     }
 }

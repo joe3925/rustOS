@@ -1,11 +1,18 @@
 use crate::memory::paging::layout::base_page_size;
-use alloc::vec::Vec;
 use spin::{Mutex, MutexGuard};
 
 use kernel_types::arch::VirtAddr;
 
+const MAX_ALLOCATIONS: usize = 4096;
+
+#[derive(Debug)]
+struct Allocations {
+    entries: [(u64, u64); MAX_ALLOCATIONS],
+    len: usize,
+}
+
 pub struct AllocationIter<'a> {
-    guard: MutexGuard<'a, Vec<(u64, u64)>>,
+    guard: MutexGuard<'a, Allocations>,
     idx: usize,
 }
 
@@ -13,30 +20,31 @@ impl<'a> Iterator for AllocationIter<'a> {
     type Item = (u64, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let out = self.guard.get(self.idx).copied();
-        if out.is_some() {
-            self.idx += 1;
+        if self.idx >= self.guard.len {
+            return None;
         }
-        out
+        let out = self.guard.entries[self.idx];
+        self.idx += 1;
+        Some(out)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.guard.len() - self.idx;
+        let remaining = self.guard.len - self.idx;
         (remaining, Some(remaining))
     }
 }
 
-impl<'a> ExactSizeIterator for AllocationIter<'a> {}
+impl ExactSizeIterator for AllocationIter<'_> {}
 
 pub enum RangeAllocationError {
     Overlap,
     OutOfRange,
     Unaligned,
 }
+
 #[derive(Debug)]
 pub struct RangeTracker {
-    allocations: Mutex<Vec<(u64, u64)>>,
-
+    allocations: Mutex<Allocations>,
     pub start: u64,
     pub end: u64,
     granularity: u64,
@@ -49,7 +57,10 @@ impl RangeTracker {
 
     pub fn new_with_granularity(start: u64, end: u64, granularity: u64) -> Self {
         Self {
-            allocations: Mutex::new(Vec::new()),
+            allocations: Mutex::new(Allocations {
+                entries: [(0, 0); MAX_ALLOCATIONS],
+                len: 0,
+            }),
             start,
             end,
             granularity,
@@ -61,25 +72,27 @@ impl RangeTracker {
     }
 
     pub fn alloc(&self, base: u64, size: u64) -> Result<VirtAddr, RangeAllocationError> {
-        let aligned_size = self
-            .align_size(size)
-            .ok_or(RangeAllocationError::OutOfRange)?;
+        let aligned_size = self.align_size(size).ok_or(RangeAllocationError::OutOfRange)?;
         let mut lock = self.allocations.lock();
-        if (base < self.start || base + aligned_size > self.end) {
+        let request_end = base.checked_add(aligned_size).ok_or(RangeAllocationError::OutOfRange)?;
+        if base < self.start || request_end > self.end {
             return Err(RangeAllocationError::OutOfRange);
         }
-        // Ensure no overlap
-        if lock.iter().any(|&(a, s)| {
-            let end = a + s;
-            let req_end = base + aligned_size;
-            !(base >= end || req_end <= a)
+        if lock.entries[..lock.len].iter().any(|&(allocated_base, allocated_size)| {
+            let allocated_end = allocated_base + allocated_size;
+            !(base >= allocated_end || request_end <= allocated_base)
         }) {
             return Err(RangeAllocationError::Overlap);
         }
-
-        lock.push((base, aligned_size));
+        if lock.len == MAX_ALLOCATIONS {
+            return Err(RangeAllocationError::OutOfRange);
+        }
+        let index = lock.len;
+        lock.entries[index] = (base, aligned_size);
+        lock.len += 1;
         Ok(VirtAddr::new(base))
     }
+
     pub fn get_allocations(&self) -> AllocationIter<'_> {
         AllocationIter {
             guard: self.allocations.lock(),
@@ -87,98 +100,65 @@ impl RangeTracker {
         }
     }
 
-    /// # Safety
-    /// The exact range must currently be allocated by this tracker and must be
-    /// returned exactly once after all users have released it.
     pub unsafe fn dealloc(&self, base: u64, size: u64) {
         let Some(aligned_size) = self.align_size(size) else {
             return;
         };
         let mut lock = self.allocations.lock();
-        if let Some(index) = lock
+        if let Some(index) = lock.entries[..lock.len]
             .iter()
-            .position(|&(a, s)| a == base && s == aligned_size)
+            .position(|&(allocated_base, allocated_size)| allocated_base == base && allocated_size == aligned_size)
         {
-            lock.remove(index);
+            lock.len -= 1;
+            let last = lock.len;
+            lock.entries[index] = lock.entries[last];
         }
     }
 
-    // Finds a free region of at least `size` bytes and allocates it
     pub fn alloc_auto(&self, size: u64) -> Option<VirtAddr> {
         let aligned_size = self.align_size(size)?;
-        let mut lock = self.allocations.lock();
-
-        // Sort existing allocations by base address
-        lock.sort_unstable_by_key(|&(base, _)| base);
-
-        let mut current = self.start;
-
-        for &(alloc_base, alloc_size) in lock.iter() {
-            let alloc_end = alloc_base;
-
-            if current + aligned_size <= alloc_end {
-                // Found gap
-                lock.push((current, aligned_size));
-                return Some(VirtAddr::new(current));
-            }
-
-            // Move past this allocation
-            current = alloc_base + alloc_size;
-            if current > self.end {
-                return None;
-            }
-        }
-
-        // Check space at the end
-        if current + aligned_size <= self.end {
-            lock.push((current, aligned_size));
-            return Some(VirtAddr::new(current));
-        }
-
-        None
+        self.alloc_auto_aligned(aligned_size, self.granularity)
     }
 
     pub fn alloc_auto_aligned(&self, size: u64, alignment: u64) -> Option<VirtAddr> {
         let aligned_size = self.align_size(size)?;
         if aligned_size == 0
             || alignment < self.granularity
-            || (alignment & (alignment - 1)) != 0
-            || (alignment % self.granularity) != 0
+            || !alignment.is_power_of_two()
+            || alignment % self.granularity != 0
         {
             return None;
         }
 
         let mut lock = self.allocations.lock();
-        lock.sort_unstable_by_key(|&(base, _)| base);
-
+        if lock.len == MAX_ALLOCATIONS {
+            return None;
+        }
+        let len = lock.len;
+        lock.entries[..len].sort_unstable_by_key(|&(base, _)| base);
         let mut current = align_up(self.start, alignment)?;
 
-        for &(alloc_base, alloc_size) in lock.iter() {
-            if current
-                .checked_add(aligned_size)
-                .is_some_and(|end| end <= alloc_base)
-            {
-                lock.push((current, aligned_size));
+        for index in 0..len {
+            let (allocated_base, allocated_size) = lock.entries[index];
+            if current.checked_add(aligned_size).is_some_and(|end| end <= allocated_base) {
+                lock.entries[len] = (current, aligned_size);
+                lock.len += 1;
                 return Some(VirtAddr::new(current));
             }
-
-            let alloc_end = alloc_base.checked_add(alloc_size)?;
-            if alloc_end > current {
-                current = align_up(alloc_end, alignment)?;
+            let allocated_end = allocated_base.checked_add(allocated_size)?;
+            if allocated_end > current {
+                current = align_up(allocated_end, alignment)?;
             }
             if current > self.end {
                 return None;
             }
         }
 
-        if current
-            .checked_add(aligned_size)
-            .is_some_and(|end| end <= self.end)
-        {
-            lock.push((current, aligned_size));
+        if current.checked_add(aligned_size).is_some_and(|end| end <= self.end) {
+            lock.entries[len] = (current, aligned_size);
+            lock.len += 1;
             return Some(VirtAddr::new(current));
         }
-
         None
     }
 }
@@ -186,7 +166,5 @@ impl RangeTracker {
 #[inline]
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
     debug_assert!(alignment.is_power_of_two());
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
+    value.checked_add(alignment - 1).map(|value| value & !(alignment - 1))
 }

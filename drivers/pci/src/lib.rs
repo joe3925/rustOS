@@ -11,10 +11,10 @@ use alloc::{sync::Arc, vec::Vec};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use kernel_api::device::{publish_stack_protocol, register_protocol};
+use kernel_api::error::{DriverErrorKind, ErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::kernel_types::dma::implementation::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_api::kernel_types::dma::implementation::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
 use kernel_api::kernel_types::dma::implementation::DmaPciDeviceIdentity;
-use kernel_api::error::{DriverErrorKind, ErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::pnp::QueryDeviceRelations;
 use kernel_api::pnp::QueryId;
 use kernel_api::pnp::StartDevice;
@@ -321,6 +321,10 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> Result<(), KernelError
     }
     for join in joins {
         for p in join.await {
+            println!(
+                "[PCI] {}:{}:{}.{} command={:#06x}",
+                p.seg, p.bus, p.dev, p.func, p.command,
+            );
             make_pdo_for_function(&devnode, &p);
         }
     }

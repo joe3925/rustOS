@@ -1,10 +1,12 @@
 use super::entry::InterruptToken;
 use super::gicv3::GicV3;
 use kernel_types::irq::PlatformCpuId;
+use kernel_types::irq::{MsiBindingRequest, MsiMessage};
 
 pub(super) const SCHEDULER_SGI: u8 = 1;
 pub(super) const TLB_SHOOTDOWN_SGI: u8 = 2;
 pub(super) const PANIC_STOP_SGI: u8 = 3;
+pub(crate) const TASK_YIELD_SGI: u8 = 4;
 pub(super) const VIRTUAL_TIMER_PPI: u8 = 27;
 pub(super) const SPI_START: u32 = 32;
 pub(super) const SPI_END: u32 = 1019;
@@ -53,6 +55,18 @@ impl InterruptController {
     pub(crate) fn mask_spi(&self, intid: u32) {
         match self {
             Self::GicV3(gic) => gic.mask_spi(intid),
+        }
+    }
+
+    pub(crate) fn bind_msi(&self, request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
+        match self {
+            Self::GicV3(gic) => gic.bind_msi(request, vector),
+        }
+    }
+
+    pub(crate) fn unbind_msi(&self, vector: u8) {
+        match self {
+            Self::GicV3(gic) => gic.unbind_msi(vector),
         }
     }
 }

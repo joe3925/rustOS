@@ -99,10 +99,10 @@ pub extern "C" fn kernel_resolve_error_context_module(
     let Some(program) = PROGRAM_MANAGER.get(0) else {
         return None;
     };
-    let Some(module) = program
-        .read()
-        .module_containing(VirtAddr::new(instruction_pointer as u64))
-    else {
+    let Some(program) = program.try_read() else {
+        return None;
+    };
+    let Some(module) = program.module_containing(VirtAddr::new(instruction_pointer as u64)) else {
         return None;
     };
     let Some(module) = module.try_read() else {

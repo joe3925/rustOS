@@ -1,6 +1,8 @@
-use crate::memory::paging::layout::{base_page_size};
-use crate::memory::paging::map::{map_range};
-use crate::memory::paging::stack::{StackSize, allocate_kernel_stack, deallocate_kernel_stack};
+use crate::memory::paging::layout::base_page_size;
+use crate::memory::paging::map::map_range;
+use crate::memory::paging::stack::{
+    StackSize, allocate_kernel_stack, deallocate_kernel_stack, kernel_stack_max_bytes,
+};
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
 use crate::scheduling::scheduler::{kernel_task_sched_binding, user_task_sched_binding};
@@ -89,6 +91,51 @@ pub struct TaskRef {
 
 /// Handle type used throughout the scheduler
 pub type TaskHandle = Arc<TaskRef>;
+
+#[derive(Debug)]
+pub(crate) enum KernelStackFaultResolution {
+    Grown,
+    NotStack,
+    Overflow,
+    GrowthFailed(PageMapError),
+}
+
+pub(crate) fn resolve_current_kernel_stack_fault(fault_address: u64) -> KernelStackFaultResolution {
+    let Some(task) =
+        crate::scheduling::scheduler::SCHEDULER.get_current_task(platform::current_cpu_id())
+    else {
+        return KernelStackFaultResolution::NotStack;
+    };
+    if !task.is_kernel_mode() {
+        return KernelStackFaultResolution::NotStack;
+    }
+
+    let stack_top = task.stack_start.load(Ordering::Acquire);
+    let reserved_start = stack_top.saturating_sub(kernel_stack_max_bytes());
+    if fault_address < reserved_start || fault_address >= stack_top {
+        return KernelStackFaultResolution::NotStack;
+    }
+
+    let page_size = base_page_size();
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
+    while fault_address
+        < task
+            .guard_page
+            .load(Ordering::Acquire)
+            .saturating_add(page_size)
+    {
+        if task.guard_page.load(Ordering::Acquire) < reserved_start {
+            return KernelStackFaultResolution::Overflow;
+        }
+        match task.grow_stack(flags) {
+            Ok(true) => {}
+            Ok(false) => return KernelStackFaultResolution::Overflow,
+            Err(error) => return KernelStackFaultResolution::GrowthFailed(error),
+        }
+    }
+
+    KernelStackFaultResolution::Grown
+}
 
 impl TaskRef {
     /// Get the current scheduling state
@@ -409,7 +456,6 @@ impl Task {
         sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
         let cpu_id = platform::current_cpu_id();
-
         let stack_top = allocate_kernel_stack(stack_size).expect("Failed to allocate stack");
         let stack_top_u64 = stack_top.as_u64();
         let guard_page = initial_guard_page(stack_top_u64, stack_size.as_bytes());

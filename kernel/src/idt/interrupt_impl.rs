@@ -890,7 +890,19 @@ fn null_handle() -> IrqHandle {
 
 extern "C" fn dummy_drop(_: usize) {}
 
-fn register_vector(vector: u8, isr: IrqIsrFn, ctx: usize, source: usize) -> IrqHandle {
+extern "C" fn msi_drop(vector: usize) {
+    if let Ok(vector) = u8::try_from(vector) {
+        platform::unbind_msi(vector);
+    }
+}
+
+fn register_vector(
+    vector: u8,
+    isr: IrqIsrFn,
+    ctx: usize,
+    source: usize,
+    drop_hook: DropHook,
+) -> IrqHandle {
     if platform::is_reserved_vector(vector) {
         return null_handle();
     }
@@ -901,7 +913,7 @@ fn register_vector(vector: u8, isr: IrqIsrFn, ctx: usize, source: usize) -> IrqH
         return null_handle();
     }
 
-    let handle_ptr = create_irq_handle_inner(DropHook::new(dummy_drop, 0));
+    let handle_ptr = create_irq_handle_inner(drop_hook);
 
     let Some(handle) = irq_manager().register(vector as u32, isr, ctx, handle_ptr, dynamic, source)
     else {
@@ -945,7 +957,13 @@ pub fn bind_wired_interrupt(source: HardwareInterruptId, isr: IrqIsrFn, ctx: usi
         };
         (
             vector as u32,
-            register_vector(vector, isr, ctx, source.0 as usize),
+            register_vector(
+                vector,
+                isr,
+                ctx,
+                source.0 as usize,
+                DropHook::new(dummy_drop, 0),
+            ),
             true,
         )
     };
@@ -966,11 +984,17 @@ pub fn bind_msi_interrupt(
     ctx: usize,
 ) -> Option<MsiBinding> {
     let vector = VectorAllocator::alloc()?;
-    let handle = register_vector(vector, isr, ctx, NO_SOURCE);
+    let handle = register_vector(
+        vector,
+        isr,
+        ctx,
+        NO_SOURCE,
+        DropHook::new(msi_drop, vector as usize),
+    );
     if handle.is_null() {
         return None;
     }
-    let Some(message) = platform::compose_msi_message(request, vector) else {
+    let Some(message) = platform::bind_msi(request, vector) else {
         irq_manager().unregister_handle(handle);
         return None;
     };

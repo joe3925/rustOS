@@ -1,4 +1,5 @@
 {
+
   "lsp": {
     "rust-analyzer": {
       "binary": {

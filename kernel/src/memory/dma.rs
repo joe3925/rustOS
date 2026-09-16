@@ -9,7 +9,6 @@ use crate::memory::device_mmu::DeviceMmuSystem;
 use crate::memory::device_mmu::MappingRecord;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
-use alloc::vec::Vec;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::implementation::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
 use kernel_types::dma::implementation::DeviceMmuPlatformDeviceIdentity;
@@ -139,7 +138,10 @@ pub fn map_buffer(
     }
 
     let PreparedDmaMapping { records, layout } = prepared;
-    let cookie = m.alloc_cookie();
+    let Some(cookie) = m.alloc_cookie() else {
+        rollback_mappings(&m.device_mmu, &active.domain, &records);
+        return Err(DmaMapError::RemappingUnavailable);
+    };
 
     m.insert_pending_unmap(
         cookie,
@@ -943,7 +945,7 @@ impl DmaManager {
         })
     }
 
-    fn alloc_cookie(&self) -> u64 {
+    fn alloc_cookie(&self) -> Option<u64> {
         let mut state = self.state.lock();
         state.alloc_cookie()
     }
@@ -959,27 +961,25 @@ impl DmaManager {
 
 struct DmaManagerState {
     devices: alloc::collections::BTreeMap<usize, Arc<RegisteredDmaDevice>>,
-    pending_unmaps: Vec<Option<PendingUnmap>>,
-    free_cookies: Vec<u64>,
+    pending_unmaps: [Option<PendingUnmap>; MAX_PENDING_UNMAPS],
+    reserved_cookies: [bool; MAX_PENDING_UNMAPS],
 }
+
+const MAX_PENDING_UNMAPS: usize = 256;
 
 impl DmaManagerState {
     fn new() -> Self {
         Self {
             devices: alloc::collections::BTreeMap::new(),
-            pending_unmaps: Vec::new(),
-            free_cookies: Vec::new(),
+            pending_unmaps: core::array::from_fn(|_| None),
+            reserved_cookies: [false; MAX_PENDING_UNMAPS],
         }
     }
 
-    fn alloc_cookie(&mut self) -> u64 {
-        if let Some(cookie) = self.free_cookies.pop() {
-            return cookie;
-        }
-
-        let index = self.pending_unmaps.len();
-        self.pending_unmaps.push(None);
-        (index as u64).saturating_add(1)
+    fn alloc_cookie(&mut self) -> Option<u64> {
+        let index = self.reserved_cookies.iter().position(|reserved| !*reserved)?;
+        self.reserved_cookies[index] = true;
+        Some(index as u64 + 1)
     }
 
     fn insert_pending_unmap(&mut self, cookie: u64, pending: PendingUnmap) {
@@ -987,7 +987,9 @@ impl DmaManagerState {
             return;
         };
 
-        if let Some(slot) = self.pending_unmaps.get_mut(index) {
+        if self.reserved_cookies.get(index).copied() == Some(true)
+            && let Some(slot) = self.pending_unmaps.get_mut(index)
+        {
             *slot = Some(pending);
         }
     }
@@ -997,9 +999,7 @@ impl DmaManagerState {
             .checked_sub(1)
             .and_then(|v| usize::try_from(v).ok())?;
         let pending = self.pending_unmaps.get_mut(index)?.take();
-        if pending.is_some() {
-            self.free_cookies.push(cookie);
-        }
+        self.reserved_cookies[index] = false;
         pending
     }
 }
@@ -1060,7 +1060,7 @@ impl Drop for InFlightMapGuard {
     }
 }
 
-const INLINE_MAPPING_RECORD_CAPACITY: usize = 4;
+const MAX_MAPPING_RECORDS: usize = 64;
 
 const EMPTY_MAPPING_RECORD: MappingRecord = MappingRecord {
     iova_base: 0,
@@ -1070,16 +1070,14 @@ const EMPTY_MAPPING_RECORD: MappingRecord = MappingRecord {
 
 #[derive(Clone)]
 struct PendingMappingRecords {
-    inline: [MappingRecord; INLINE_MAPPING_RECORD_CAPACITY],
-    heap: Option<Vec<MappingRecord>>,
+    records: [MappingRecord; MAX_MAPPING_RECORDS],
     len: usize,
 }
 
 impl PendingMappingRecords {
     fn new() -> Self {
         Self {
-            inline: [EMPTY_MAPPING_RECORD; INLINE_MAPPING_RECORD_CAPACITY],
-            heap: None,
+            records: [EMPTY_MAPPING_RECORD; MAX_MAPPING_RECORDS],
             len: 0,
         }
     }
@@ -1089,39 +1087,20 @@ impl PendingMappingRecords {
     }
 
     fn as_slice(&self) -> &[MappingRecord] {
-        match self.heap.as_ref() {
-            Some(records) => records.as_slice(),
-            None => &self.inline[..self.len],
-        }
+        &self.records[..self.len]
     }
 
     fn push(&mut self, rec: MappingRecord) -> Result<(), DmaMapError> {
-        if let Some(records) = self.heap.as_mut() {
-            records.push(rec);
-            self.len = records.len();
-            return Ok(());
-        }
-
-        if self.len < INLINE_MAPPING_RECORD_CAPACITY {
-            self.inline[self.len] = rec;
+        if self.len < MAX_MAPPING_RECORDS {
+            self.records[self.len] = rec;
             self.len += 1;
             return Ok(());
         }
-
-        let mut records = Vec::with_capacity(INLINE_MAPPING_RECORD_CAPACITY * 2);
-        records.extend_from_slice(&self.inline[..self.len]);
-        records.push(rec);
-        self.len = records.len();
-        self.heap = Some(records);
-
-        Ok(())
+        Err(DmaMapError::InvalidSize)
     }
 
     fn last_mut(&mut self) -> Option<&mut MappingRecord> {
-        match self.heap.as_mut() {
-            Some(records) => records.last_mut(),
-            None => self.inline[..self.len].last_mut(),
-        }
+        self.records[..self.len].last_mut()
     }
 
     fn push_range(

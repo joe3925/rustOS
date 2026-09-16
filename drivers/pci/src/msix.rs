@@ -65,9 +65,11 @@ pub extern "C" fn pci_setup_msix(
         Ok(va) => va,
         Err(_) => return IrqHandle::null(),
     };
+    kernel_api::println!("MSI-X table phys={:#x} va={:#x} size={:#x}", table_phys, table_va.as_u64(), table_region_size);
 
     let request = request.with_requester(MsiRequester::pci(ext.seg, ext.bus, ext.dev, ext.func));
     let Some(binding) = bind_msi_interrupt(&request, isr, context) else {
+        kernel_api::println!("MSI-X bind failed table va={:#x}", table_va.as_u64());
         let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
         return IrqHandle::null();
     };

@@ -1,6 +1,6 @@
+use acpi::AcpiTables;
 use acpi::sdt::fadt::Fadt;
 use acpi::sdt::madt::{Madt, MadtEntry};
-use acpi::AcpiTables;
 use alloc::vec::Vec;
 use core::slice;
 use device_tree::{DeviceTree, Node};

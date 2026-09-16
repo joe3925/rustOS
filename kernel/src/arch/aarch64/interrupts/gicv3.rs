@@ -10,15 +10,19 @@ use crate::machine::machine_info;
 use crate::memory::paging::mmio::map_physical_pages;
 
 use super::controller::{
-    PANIC_STOP_SGI, SCHEDULER_SGI, SPI_END, SPI_START, TLB_SHOOTDOWN_SGI, VIRTUAL_TIMER_PPI,
+    PANIC_STOP_SGI, SCHEDULER_SGI, SPI_END, SPI_START, TASK_YIELD_SGI, TLB_SHOOTDOWN_SGI,
+    VIRTUAL_TIMER_PPI,
 };
 use super::discovery::GicDescription;
 use super::entry::InterruptToken;
+use super::its::Its;
 
 pub(crate) struct GicV3 {
     distributor: usize,
     redistributor: usize,
+    redistributor_phys: u64,
     redistributor_size: usize,
+    its: Option<Its>,
     distributor_lock: Mutex<()>,
 }
 
@@ -39,10 +43,13 @@ impl GicV3 {
             PhysicalMappingCache::Uncached,
         )
         .expect("failed to map GICv3 redistributor range");
+        let its = description.its.and_then(Its::new);
         Self {
             distributor: distributor.as_u64() as usize,
             redistributor: redistributor.as_u64() as usize,
+            redistributor_phys: description.redistributor,
             redistributor_size: description.redistributor_size as usize,
+            its,
             distributor_lock: Mutex::new(()),
         }
     }
@@ -86,6 +93,7 @@ impl GicV3 {
                 (1 << SCHEDULER_SGI)
                     | (1 << TLB_SHOOTDOWN_SGI)
                     | (1 << PANIC_STOP_SGI)
+                    | (1 << TASK_YIELD_SGI)
                     | (1 << VIRTUAL_TIMER_PPI),
             );
             write_icc_sre_el1(read_icc_sre_el1() | 1);
@@ -96,6 +104,14 @@ impl GicV3 {
         }
         dsb(SY);
         isb(SY);
+        if let Some(its) = &self.its {
+            let frame_phys = self.redistributor_phys + (frame - self.redistributor) as u64;
+            let _ = its.init_cpu(
+                frame,
+                frame_phys,
+                crate::platform::current_platform_cpu_id(),
+            );
+        }
     }
 
     pub(super) fn acknowledge(&self) -> Option<InterruptToken> {
@@ -104,9 +120,15 @@ impl GicV3 {
         if intid >= 1020 {
             return None;
         }
+        let interrupt_id = self
+            .its
+            .as_ref()
+            .and_then(|its| its.vector_for_lpi(intid))
+            .map(u32::from)
+            .unwrap_or(intid);
         Some(InterruptToken {
             raw,
-            interrupt_id: intid,
+            interrupt_id,
         })
     }
 
@@ -168,6 +190,20 @@ impl GicV3 {
             self.wait_rwp();
         }
         dsb(SY);
+    }
+
+    pub(super) fn bind_msi(
+        &self,
+        request: &kernel_types::irq::MsiBindingRequest,
+        vector: u8,
+    ) -> Option<kernel_types::irq::MsiMessage> {
+        self.its.as_ref()?.bind(request, vector)
+    }
+
+    pub(super) fn unbind_msi(&self, vector: u8) {
+        if let Some(its) = &self.its {
+            its.unbind(vector);
+        }
     }
 
     fn current_redistributor(&self) -> usize {

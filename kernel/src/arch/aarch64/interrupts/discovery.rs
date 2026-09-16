@@ -9,6 +9,7 @@ pub(super) struct GicDescription {
     pub(super) distributor: u64,
     pub(super) redistributor: u64,
     pub(super) redistributor_size: u64,
+    pub(super) its: Option<u64>,
 }
 
 pub(super) fn discover_gicv3() -> Option<GicDescription> {
@@ -21,6 +22,7 @@ fn discover_gicv3_acpi() -> Option<GicDescription> {
     let mut distributor = None;
     let mut redistributor = None;
     let mut gicc_redistributor = None;
+    let mut its = None;
     for entry in madt.get().entries() {
         match entry {
             MadtEntry::Gicd(gicd) if gicd.gic_version == 3 || gicd.gic_version == 4 => {
@@ -35,6 +37,9 @@ fn discover_gicv3_acpi() -> Option<GicDescription> {
             MadtEntry::Gicc(gicc) if gicc.gicr_base_address != 0 => {
                 gicc_redistributor = Some(gicc.gicr_base_address)
             }
+            MadtEntry::GicInterruptTranslationService(entry) => {
+                its = Some(entry.physical_base_address)
+            }
             _ => {}
         }
     }
@@ -47,6 +52,7 @@ fn discover_gicv3_acpi() -> Option<GicDescription> {
         distributor: distributor?,
         redistributor,
         redistributor_size,
+        its,
     })
 }
 
@@ -80,6 +86,20 @@ fn find_gicv3_node(
         if stride == 0 || reg.len() < stride * 2 {
             return None;
         }
+        let its = node.children.iter().find_map(|child| {
+            child
+                .prop_raw("compatible")
+                .is_some_and(|value| {
+                    value
+                        .split(|byte| *byte == 0)
+                        .any(|part| part == b"arm,gic-v3-its")
+                })
+                .then(|| {
+                    let reg = child.prop_raw("reg")?;
+                    read_cells(reg, 0, address_cells)
+                })
+                .flatten()
+        });
         return Some(GicDescription {
             distributor: read_cells(reg, 0, parent_address_cells)?,
             redistributor: read_cells(reg, stride, parent_address_cells)?,
@@ -88,6 +108,7 @@ fn find_gicv3_node(
                 stride + parent_address_cells as usize * 4,
                 parent_size_cells,
             )?,
+            its,
         });
     }
     node.children
