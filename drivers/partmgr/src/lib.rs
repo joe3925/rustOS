@@ -5,10 +5,6 @@
 #![feature(likely_unlikely)]
 extern crate alloc;
 
-use kernel_api::pnp::InitComplete;
-use kernel_api::pnp::QueryDeviceRelations;
-use kernel_api::pnp::RegisterDmaBacking;
-use kernel_api::pnp::StartDevice;
 use alloc::sync::Weak;
 use alloc::{boxed::Box, string::String, sync::Arc, vec};
 use core::hint::{cold_path, likely, unlikely};
@@ -18,25 +14,28 @@ use core::ptr;
 use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::device::{open_public_protocol, publish_stack_protocol, register_protocol};
+use kernel_api::error::{DriverErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::kernel_types::dma::implementation::IoBufferBackingConfig;
-use kernel_api::kernel_types::dma::implementation::{IoBufferBacking, IoBufferBackingDesc};
 use kernel_api::kernel_types::dma::implementation::{FromDevice, IoBuffer};
+use kernel_api::kernel_types::dma::implementation::{IoBufferBacking, IoBufferBackingDesc};
 use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceRead, DeviceReadOp,
-    DeviceWrite, DeviceWriteOp, DiskInfo, GptHeader,
-    GptPartitionEntry, PartitionInfo,
+    DeviceWrite, DeviceWriteOp, DiskInfo, GptHeader, GptPartitionEntry, PartitionInfo,
 };
+use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::protocol::disk::{
     DiskInfoProtocol, DiskInfoProtocolVTable, PartitionInfoProtocol, PartitionInfoProtocolVTable,
 };
-use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::IoctlData;
+use kernel_api::pnp::InitComplete;
+use kernel_api::pnp::QueryDeviceRelations;
+use kernel_api::pnp::RegisterDmaBacking;
+use kernel_api::pnp::StartDevice;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpOp, PnpOps, driver_set_evt_device_add, io, pnp,
     pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::{DeviceControl, Flush, FlushDirty, Read, Write};
-use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 use kernel_api::{println, request_handler};
 use spin::Once;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -51,7 +50,9 @@ fn panic(info: &PanicInfo) -> ! {
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
+pub unsafe extern "C" fn DriverEntry(
+    driver: &Arc<DriverObject>,
+) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_device_add(driver, partmgr_device_add);
     Ok(())
 }
@@ -215,7 +216,9 @@ impl DeviceRead for PartitionPdoIo {
             Some(v) if *v != 0 => *v as u64,
             _ => {
                 cold_path();
-                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::InvalidParameter,
+                ));
             }
         };
 
@@ -223,7 +226,9 @@ impl DeviceRead for PartitionPdoIo {
             Some(bytes) => bytes,
             None => {
                 cold_path();
-                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::InvalidParameter,
+                ));
             }
         };
 
@@ -231,7 +236,9 @@ impl DeviceRead for PartitionPdoIo {
             Some(base) => base,
             None => {
                 cold_path();
-                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::InvalidParameter,
+                ));
             }
         };
 
@@ -270,7 +277,9 @@ impl DeviceWrite for PartitionPdoIo {
             Some(v) if *v != 0 => *v as u64,
             _ => {
                 cold_path();
-                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::InvalidParameter,
+                ));
             }
         };
 
@@ -278,7 +287,9 @@ impl DeviceWrite for PartitionPdoIo {
             Some(bytes) => bytes,
             None => {
                 cold_path();
-                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::InvalidParameter,
+                ));
             }
         };
 
@@ -286,7 +297,9 @@ impl DeviceWrite for PartitionPdoIo {
             Some(base) => base,
             None => {
                 cold_path();
-                return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::InvalidParameter));
+                return Err(kernel_api::error::error(
+                    kernel_api::error::DriverErrorKind::InvalidParameter,
+                ));
             }
         };
 
@@ -312,7 +325,10 @@ impl DeviceWrite for PartitionPdoIo {
 }
 impl DeviceFlush for PartitionPdoIo {
     #[request_handler]
-    async fn handler<'req, 'b>(device: &Arc<DeviceObject>, request: &'b mut Flush) -> Result<DriverStep, kernel_api::error::KernelError> {
+    async fn handler<'req, 'b>(
+        device: &Arc<DeviceObject>,
+        request: &'b mut Flush,
+    ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = ext::<PartDevExt>(&device);
         io::send_to_stack_top(dx.parent.get().unwrap().clone(), request)
             .await
@@ -363,7 +379,9 @@ pub async fn partition_pdo_register_dma_backing<'req, 'data, 'b>(
 
     let Some(parent) = dx.parent.get() else {
         cold_path();
-        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NoSuchDevice));
+        return Err(kernel_api::error::error(
+            kernel_api::error::DriverErrorKind::NoSuchDevice,
+        ));
     };
 
     pnp::send_to_stack_top(parent.clone(), request)
@@ -439,10 +457,16 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
 ) -> Result<DriverStep, kernel_api::error::KernelError> {
     let relation = request.relation;
     if relation != DeviceRelationType::BusRelations {
-        return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::NotImplemented));
+        return Err(kernel_api::error::error(
+            kernel_api::error::DriverErrorKind::NotImplemented,
+        ));
     }
 
     let pmx = ext::<PartMgrExt>(&device);
+
+    let Some(di) = pmx.disk_info.get() else {
+        return Ok(DriverStep::Continue);
+    };
 
     if pmx
         .enumerated
@@ -450,12 +474,6 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
     {
         return Ok(DriverStep::Continue);
     }
-
-    let di = if let Some(buf) = pmx.disk_info.get() {
-        buf
-    } else {
-        return Ok(DriverStep::Continue);
-    };
 
     let sec_sz_u32 = di.logical_block_size;
     if sec_sz_u32 == 0 {
@@ -500,7 +518,9 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
     let parent_dn = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            return Err(kernel_api::error::error(kernel_api::error::DriverErrorKind::DeviceNotReady));
+            return Err(kernel_api::error::error(
+                kernel_api::error::DriverErrorKind::DeviceNotReady,
+            ));
         }
     };
 

@@ -69,6 +69,10 @@ If there is a * it must be completed before user space is started
 1. [x] The benchmarks in the github actions are depend on the compute of the github container. This means we can detect regressions if github is under load assuming they don't guarntee some amount of compute for there containers. Determine if github provides compute guarntees and if they don't maybe find a diffrent service. 
 2. [ ] Actions were moved to a host computer but we still need some way for stable io and performance.
 
+## Known Bugs and Correctness Issues (BUG)
+1. on x86-64 we don't save the fpu stuff in the interrupt assembly it is therefore possible for fpu corruption before we reach the fpu guard. 
+2. The page table locking and sync is down right incorrect im lucky the kernel even boots. 
+
 # User Space 
 ## User Space DLL (USD)
 1. [x] Figure out a name for it.

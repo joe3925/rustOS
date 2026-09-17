@@ -1,15 +1,15 @@
 use core::arch::asm;
 
-use kernel_types::arch::VirtAddr;
-use kernel_types::memory::Module;
-
 use crate::arch::unwind::{
     PeUnwindModule, STATUS_BAD_STACK_READ, STATUS_BAD_UNWIND_INFO, STATUS_LEAF_FALLBACK,
     STATUS_NO_UNWIND_INFO, STATUS_PE_UNWIND, STATUS_UNKNOWN_FRAME, STATUS_UNSUPPORTED_OPCODE,
     backtrace_status, read_image_bytes, read_image_u32, read_stack_u64,
 };
 use crate::platform::UnwindPlatform;
+use crate::profiling::backtrace::BacktraceStatus;
 use crate::profiling::backtrace::{StackBounds, UnwindStart, UnwindStep};
+use kernel_types::arch::VirtAddr;
+use kernel_types::memory::Module;
 
 use super::platform::Aarch64Platform;
 use super::scheduling::state::TaskContext;
@@ -88,7 +88,7 @@ impl UnwindPlatform for Aarch64Platform {
         module: Option<PeUnwindModule>,
         stack_bounds: StackBounds,
     ) -> UnwindStep {
-        let before = (context.pc, context.sp);
+        let original = *context;
         let control_pc = context.control_pc();
 
         let status = match module {
@@ -101,15 +101,30 @@ impl UnwindPlatform for Aarch64Platform {
             None => fallback(context, true),
         };
 
+        let mapped_status = backtrace_status(status);
+
+        if mapped_status.intersects(
+            BacktraceStatus::BAD_STACK_READ
+                | BacktraceStatus::BAD_UNWIND_INFO
+                | BacktraceStatus::UNSUPPORTED_OPERATION,
+        ) {
+            *context = original;
+
+            return UnwindStep {
+                pc: None,
+                status: mapped_status,
+            };
+        }
+
         let pc = (context.pc != 0
             && context.pc & 3 == 0
             && valid_address(context.pc)
-            && (context.pc, context.sp) != before)
+            && (context.pc, context.sp) != (original.pc, original.sp))
             .then(|| VirtAddr::new(context.pc));
 
         UnwindStep {
             pc,
-            status: backtrace_status(status),
+            status: mapped_status,
         }
     }
 }
@@ -316,7 +331,9 @@ fn packed_code_count(
     let fp_size = if reg_f == 0 { 0 } else { (reg_f + 1) * 8 };
     let saves = (int_size + fp_size + homes * 64 + 15) & !15;
     let local = frame.checked_sub(saves).ok_or(STATUS_BAD_UNWIND_INFO)?;
-    let mut count = (reg_i + 1) / 2 + (reg_f + 2) / 2 + homes * 4;
+    let fp_count = if reg_f == 0 { 0 } else { (reg_f + 2) / 2 };
+
+    let mut count = (reg_i + 1) / 2 + fp_count + homes * 4;
     count += u32::from(chain == 1 && reg_i & 1 == 0) + u32::from(chain == 2);
     count += if chain >= 2 {
         2 + u32::from(local > 512) + u32::from(local > 4080)
@@ -348,8 +365,8 @@ fn code_count(codes: &[u8], start: usize) -> Result<usize, u32> {
 fn opcode_len(opcode: u8) -> usize {
     match opcode {
         0xc0..=0xdf | 0xe2 | 0xf8 => 2,
-        0xe0 | 0xe7 | 0xfa => 4,
-        0xf9 => 3,
+        0xe7 | 0xf9 => 3,
+        0xe0 | 0xfa => 4,
         0xfb => 5,
         _ => 1,
     }
@@ -429,9 +446,16 @@ fn execute_codes(
                 context.sp = add_sp(context.sp, ((bytes[1] & 31) as u64 + 1) * 8)?;
             }
             0xd6..=0xd7 => {
-                let reg = 19 + ((opcode & 1) << 2) + (bytes[1] >> 6) * 2;
-                let address = context.sp + (bytes[1] & 63) as u64 * 8;
+                let x = ((opcode & 1) << 2) | (bytes[1] >> 6);
+                let reg = 19 + x * 2;
+
+                let address = context
+                    .sp
+                    .checked_add((bytes[1] & 63) as u64 * 8)
+                    .ok_or(STATUS_BAD_STACK_READ)?;
+
                 restore_reg(context, bounds, reg, address)?;
+
                 context.lr = read_stack_u64(bounds, address + 8).ok_or(STATUS_BAD_STACK_READ)?;
             }
             0xd8..=0xd9 | 0xdc..=0xdd => {}
@@ -469,35 +493,60 @@ fn execute_save_any(
     bounds: StackBounds,
     bytes: &[u8],
 ) -> Result<(), u32> {
-    if bytes.len() != 4 || bytes[1] & 0x80 != 0 {
+    if bytes.len() != 3 || bytes[1] & 0x80 != 0 {
         return Err(STATUS_BAD_UNWIND_INFO);
     }
+
     let pair = bytes[1] & 0x40 != 0;
     let preindexed = bytes[1] & 0x20 != 0;
     let reg = bytes[1] & 0x1f;
+
     let kind = bytes[2] >> 6;
-    let scale = if kind == 2 || pair || preindexed {
-        16
-    } else {
-        8
+    let offset_field = bytes[2] & 0x3f;
+
+    let scale = match kind {
+        0 => {
+            if pair || preindexed {
+                16
+            } else {
+                8
+            }
+        }
+        1 => {
+            if pair || preindexed {
+                16
+            } else {
+                8
+            }
+        }
+        2 => 16,
+        3 => return Err(STATUS_UNSUPPORTED_OPCODE),
+        _ => unreachable!(),
     };
-    let offset = (bytes[2] & 63) as u64 * scale;
+
+    let offset = offset_field as u64 * scale;
+
     let address = if preindexed {
         context.sp
     } else {
-        context.sp + offset
+        context
+            .sp
+            .checked_add(offset)
+            .ok_or(STATUS_BAD_STACK_READ)?
     };
+
     if kind == 0 {
         restore_reg(context, bounds, reg, address)?;
+
         if pair {
-            restore_reg(context, bounds, reg + 1, address + 8)?
+            restore_reg(context, bounds, reg + 1, address + 8)?;
         }
-    } else if kind == 3 {
-        return Err(STATUS_UNSUPPORTED_OPCODE);
     }
+
     if preindexed {
-        context.sp = add_sp(context.sp, offset)?
+        context.sp = add_sp(context.sp, offset)?;
     }
+
     Ok(())
 }
 

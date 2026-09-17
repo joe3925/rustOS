@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use core::arch::global_asm;
+use core::sync::atomic::Ordering;
 
 use kernel_types::arch::VirtAddr;
 use kernel_types::runtime::BlockOnThreadState;
@@ -38,6 +39,7 @@ aarch64_save_fpu_state:
     stp q26, q27, [x0, #416]
     stp q28, q29, [x0, #448]
     stp q30, q31, [x0, #480]
+
     mrs x1, fpcr
     mrs x2, fpsr
     add x3, x0, #512
@@ -62,8 +64,10 @@ aarch64_restore_fpu_state:
     ldp q26, q27, [x0, #416]
     ldp q28, q29, [x0, #448]
     ldp q30, q31, [x0, #480]
+
     add x3, x0, #512
     ldp x1, x2, [x3]
+
     msr fpcr, x1
     msr fpsr, x2
     ret
@@ -101,12 +105,17 @@ impl TaskPlatform for Aarch64Platform {
         stack_top: VirtAddr,
     ) -> Self::TaskContext {
         let mut state = TaskContext::new();
+
         state.x[0] = context as u64;
+
         state.x[18] = Aarch64Platform::current_percpu() as *const _ as u64;
+
         state.x[30] = task_return_trampoline as *const () as u64;
+
         state.sp = stack_top.as_u64() & !(STACK_ALIGNMENT - 1);
         state.elr = entry_point as u64;
         state.spsr = SPSR_M_EL0T;
+
         state
     }
 
@@ -116,12 +125,17 @@ impl TaskPlatform for Aarch64Platform {
         stack_top: VirtAddr,
     ) -> Self::TaskContext {
         let mut state = TaskContext::new();
+
         state.x[0] = context as u64;
+
         state.x[18] = Aarch64Platform::current_percpu() as *const _ as u64;
+
         state.x[30] = task_return_trampoline as *const () as u64;
+
         state.sp = stack_top.as_u64() & !(STACK_ALIGNMENT - 1);
         state.elr = entry_point as u64;
         state.spsr = SPSR_M_EL1T;
+
         state
     }
 
@@ -132,21 +146,63 @@ impl TaskPlatform for Aarch64Platform {
 
     unsafe fn restore_task_context(context: &Self::TaskContext, target: *mut Self::TaskContext) {
         let mut context = *context;
+
         context.x[18] = Aarch64Platform::current_percpu() as *const _ as u64;
+
         let page_size = base_page_size();
         let stack_page = VirtAddr::new(context.sp.saturating_sub(1) & !(page_size - 1));
+
         <Aarch64Platform as PagingPlatform>::local_flush_tlb_range(
             stack_page, page_size, page_size,
         );
-        unsafe { target.write(context) };
+
+        unsafe {
+            target.write(context);
+        }
     }
 
     fn save_fpu_state(state: &mut Self::FpuState) {
-        unsafe { aarch64_save_fpu_state(state) };
+        let active_exception_fpu = Aarch64Platform::current_percpu()
+            .active_exception_fpu
+            .load(Ordering::Relaxed);
+
+        if active_exception_fpu != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    active_exception_fpu as *const FpuState,
+                    state as *mut FpuState,
+                    1,
+                );
+            }
+
+            return;
+        }
+
+        unsafe {
+            aarch64_save_fpu_state(state);
+        }
     }
 
     fn restore_fpu_state(state: &Self::FpuState) {
-        unsafe { aarch64_restore_fpu_state(state) };
+        let active_exception_fpu = Aarch64Platform::current_percpu()
+            .active_exception_fpu
+            .load(Ordering::Relaxed);
+
+        if active_exception_fpu != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    state as *const FpuState,
+                    active_exception_fpu as *mut FpuState,
+                    1,
+                );
+            }
+
+            return;
+        }
+
+        unsafe {
+            aarch64_restore_fpu_state(state);
+        }
     }
 
     fn new_kernel_tls() -> Option<Self::KernelTls> {
@@ -158,7 +214,9 @@ impl TaskPlatform for Aarch64Platform {
     }
 
     unsafe fn activate_kernel_tls(thread_pointer: u64) {
-        unsafe { tls::activate(thread_pointer) }
+        unsafe {
+            tls::activate(thread_pointer);
+        }
     }
 
     fn ensure_current_thread_runtime_initialized() {
@@ -171,6 +229,7 @@ impl TaskPlatform for Aarch64Platform {
 
     fn request_task_yield() {
         let target = platform::current_platform_cpu_id();
+
         let _ = platform::send_ipi(target, super::super::interrupts::controller::TASK_YIELD_SGI);
     }
 }

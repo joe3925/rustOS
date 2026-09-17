@@ -47,23 +47,26 @@ impl PeUnwindModule {
         let image_base = boot.kernel_image_base;
         let image_end = image_base.checked_add(boot.kernel_image_size)?;
 
-        let pdata = boot.kernel_sections.as_slice().iter().find(|section| {
-            let name = &section.name;
+        let pdata = boot
+            .kernel_sections
+            .as_slice()
+            .iter()
+            .find(|section| section.name == *b".pdata\0\0")?;
 
-            name[0] == b'.'
-                && name[1] == b'p'
-                && name[2] == b'd'
-                && name[3] == b'a'
-                && name[4] == b't'
-                && name[5] == b'a'
-                && name[6..].iter().all(|byte| *byte == 0)
-        })?;
+        let pdata_len = core::cmp::max(pdata.virtual_size, pdata.raw_size) as usize;
 
-        let pdata_base = image_base.checked_add(pdata.virtual_address as u64)?;
-        let pdata_len = core::cmp::min(pdata.virtual_size, pdata.raw_size) as usize;
+        if pdata_len < 8 {
+            return None;
+        }
+
+        let pdata_base = pdata.loaded_address;
         let pdata_end = pdata_base.checked_add(pdata_len as u64)?;
 
-        (pdata_end <= image_end).then_some(Self {
+        if pdata_base < image_base || pdata_end > image_end {
+            return None;
+        }
+
+        Some(Self {
             image_base,
             image_end,
             pdata_base,

@@ -78,13 +78,13 @@ kernel_abi = { path = "../libs/kernel_abi" }
 [profile.dev]
 opt-level = 3
 lto = true
-codegen-units = 256
+codegen-units = 1
 panic = "abort"
 debug = true
 
 [profile.release]
 opt-level = 3
 lto = true
-codegen-units = 1
+codegen-units = 256
 panic = "abort"
 debug = false

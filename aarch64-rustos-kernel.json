@@ -51,7 +51,8 @@
       "/DEBUG:SYMTAB"
     ]
   },
-  "requires-uwtable": false,
+  "requires-uwtable": true,
+  "frame-pointer": "non-leaf",
   "crt-static-respected": true,
   "crt-static-allows-dylibs": false,
   "plt-by-default": false,

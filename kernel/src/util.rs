@@ -287,6 +287,11 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     } else {
         Backtrace::capture_with_task(panic_task.as_deref())
     };
+    println!("Panic-site backtrace status: {:?}", backtrace.status());
+    println!("Panic-site backtrace:");
+    for trace in backtrace.iter() {
+        println!("{:#X}", trace.instruction_pointer().as_u64());
+    }
     crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
 
     println!("=== KERNEL PANIC [{}] ===", mod_name);

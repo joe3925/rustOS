@@ -12,10 +12,15 @@ pub struct PerCpu {
     pub is_in_interrupt: AtomicBool,
     pub reserved_interrupt_pad: [u8; 0x3],
     pub reserved0: [u8; 0x50],
+
     pub tls_array_pointer: AtomicU64,
     pub exception_stack_top: AtomicU64,
+
+    pub active_exception_fpu: AtomicU64,
+
     pub emergency_zero_address: Once<VirtAddr>,
     pub emergency_zero_in_use: AtomicBool,
+
     pub cpu_id: Once<usize>,
     pub platform_cpu_id: Once<PlatformCpuId>,
 }
@@ -23,9 +28,14 @@ pub struct PerCpu {
 pub const PERCPU_IS_IN_INTERRUPT_OFF: usize = offset_of!(PerCpu, is_in_interrupt);
 pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = offset_of!(PerCpu, tls_array_pointer);
 pub const PERCPU_EXCEPTION_STACK_TOP_OFF: usize = offset_of!(PerCpu, exception_stack_top);
+pub const PERCPU_ACTIVE_EXCEPTION_FPU_OFF: usize = offset_of!(PerCpu, active_exception_fpu);
 
-const _: () = assert!(PERCPU_IS_IN_INTERRUPT_OFF == 0);
-const _: () = assert!(PERCPU_TLS_ARRAY_POINTER_OFF == 0x58);
+const _: () = {
+    assert!(PERCPU_IS_IN_INTERRUPT_OFF == 0);
+    assert!(PERCPU_TLS_ARRAY_POINTER_OFF == 0x58);
+    assert!(PERCPU_EXCEPTION_STACK_TOP_OFF == 0x60);
+    assert!(PERCPU_ACTIVE_EXCEPTION_FPU_OFF == 0x68);
+};
 
 static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
 
@@ -45,16 +55,21 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
         is_in_interrupt: AtomicBool::new(false),
         reserved_interrupt_pad: [0; 0x3],
         reserved0: [0; 0x50],
+
         tls_array_pointer: AtomicU64::new(0),
         exception_stack_top: AtomicU64::new(0),
+        active_exception_fpu: AtomicU64::new(0),
+
         emergency_zero_address: Once::new(),
         emergency_zero_in_use: AtomicBool::new(false),
+
         cpu_id: Once::new(),
         platform_cpu_id: Once::new(),
     }));
 
     percpu.cpu_id.call_once(|| cpu_id);
     percpu.platform_cpu_id.call_once(|| platform_cpu_id);
+
     slots[cpu_id] = Some(percpu);
     percpu
 }

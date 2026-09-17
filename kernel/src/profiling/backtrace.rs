@@ -118,39 +118,86 @@ impl Backtrace {
         };
 
         let kernel_module = PeUnwindModule::kernel();
+        match kernel_module {
+            Some(module) => {
+                crate::println!(
+                    "kernel unwind: base={:#x} end={:#x} pdata={:#x} pdata_len={:#x} pc={:#x} contains={}",
+                    module.image_base,
+                    module.image_end,
+                    module.pdata_base,
+                    module.pdata_len,
+                    start.pc.as_u64(),
+                    module.contains(start.pc.as_u64()),
+                );
+            }
+            None => {
+                crate::println!("kernel unwind: failed to construct kernel module");
+
+                let boot = crate::util::boot_info();
+
+                crate::println!(
+                    "kernel image base={:#x} size={:#x} sections={}",
+                    boot.kernel_image_base,
+                    boot.kernel_image_size,
+                    boot.kernel_sections.len(),
+                );
+
+                for section in boot.kernel_sections.as_slice() {
+                    crate::println!(
+                        "section {:?} rva={:#x} vsize={:#x} raw={:#x} loaded={:#x}",
+                        section.name,
+                        section.virtual_address,
+                        section.virtual_size,
+                        section.raw_size,
+                        section.loaded_address,
+                    );
+                }
+            }
+        }
+        let boot = crate::util::boot_info();
+
+        let kernel_start = boot.kernel_image_base;
+        let kernel_end = kernel_start
+            .checked_add(boot.kernel_image_size)
+            .unwrap_or(kernel_start);
 
         while trace.frames().len() < max_depth {
             let current_pc = trace.frames[trace.depth as usize - 1].ip;
+            let current_address = current_pc.as_u64();
 
-            let unwind_module = match kernel_module {
-                Some(module) if module.contains(current_pc.as_u64()) => Some(module),
+            let unwind_module = if current_address >= kernel_start && current_address < kernel_end {
+                match kernel_module {
+                    Some(module) => Some(module),
+                    None => {
+                        trace.status |= BacktraceStatus::NO_UNWIND_INFO;
+                        None
+                    }
+                }
+            } else {
+                let pid = task
+                    .and_then(|task| task.inner.try_read().map(|inner| inner.parent_pid))
+                    .unwrap_or(0);
 
-                _ => {
-                    let pid = task
-                        .and_then(|task| task.inner.try_read().map(|inner| inner.parent_pid))
-                        .unwrap_or(0);
+                let program = PROGRAM_MANAGER.get(pid);
 
-                    let program = PROGRAM_MANAGER.get(pid);
+                let module = program
+                    .as_ref()
+                    .and_then(|program| program.try_read())
+                    .and_then(|program| program.module_containing(current_pc));
 
-                    let module = program
-                        .as_ref()
-                        .and_then(|program| program.try_read())
-                        .and_then(|program| program.module_containing(current_pc));
-
-                    match module.as_ref() {
-                        Some(module) => match module.try_read() {
-                            Some(module) => PeUnwindModule::from_module(&module),
-
-                            None => {
-                                trace.status |= BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE;
-                                None
-                            }
-                        },
+                match module.as_ref() {
+                    Some(module) => match module.try_read() {
+                        Some(module) => PeUnwindModule::from_module(&module),
 
                         None => {
-                            trace.status |= BacktraceStatus::UNKNOWN_FRAME;
+                            trace.status |= BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE;
                             None
                         }
+                    },
+
+                    None => {
+                        trace.status |= BacktraceStatus::UNKNOWN_FRAME;
+                        None
                     }
                 }
             };
