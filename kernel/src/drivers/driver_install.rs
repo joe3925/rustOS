@@ -384,19 +384,8 @@ async fn reg_append_class_member(class: &str, service: &str) -> Result<(), Kerne
 fn service_name_from_image(image: &str) -> &str {
     image.rsplit_once('.').map(|(n, _)| n).unwrap_or(image)
 }
-#[inline(never)]
-pub fn trigger_data_abort_write() -> ! {
-    unsafe {
-        let ptr = 0x0000_FFFF_FFFF_F000usize as *mut u64;
-        core::ptr::write_volatile(ptr, 0xDEAD_BEEF_DEAD_BEEF);
-    }
 
-    loop {
-        core::hint::spin_loop();
-    }
-}
 pub async fn install_driver_toml(toml_path: Path) -> Result<(), KernelError> {
-    trigger_data_abort_write();
     let driver = parse_driver_toml(&toml_path)
         .await
         .with_context(|| format!("parsing driver manifest `{toml_path:?}`"))?;
