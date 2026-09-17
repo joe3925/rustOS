@@ -35,8 +35,6 @@ use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use io::VirtioPdoIo;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::kernel_types::dma::implementation::IoBufferAccess;
-use kernel_api::kernel_types::dma::implementation::ToDevice;
 use kernel_api::error::{
     DriverErrorKind, KernelError, ResultErrorContext, error, error_with_message,
 };
@@ -45,6 +43,8 @@ use kernel_api::irq::{
     HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqHandleExt, bind_wired_interrupt,
     irq_wait_closed,
 };
+use kernel_api::kernel_types::dma::implementation::IoBufferAccess;
+use kernel_api::kernel_types::dma::implementation::ToDevice;
 use kernel_api::kernel_types::dma::implementation::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
@@ -378,7 +378,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     let mut mapped_bars = alloc::vec::Vec::new();
     for i in 0..6 {
         if let Some(bar) = (proto.get_bar)(&proto.provider(), i) {
-            println!("virtio BAR {} kind={:?} base={:#x} size={:#x}", i, bar.kind, bar.base, bar.size);
+            println!(
+                "virtio BAR {} kind={:?} base={:#x} size={:#x}",
+                i, bar.kind, bar.base, bar.size
+            );
             if bar.kind == BarKind::Mem32 || bar.kind == BarKind::Mem64 {
                 if bar.size > 0 {
                     match map_mmio_region(PhysAddr::new(bar.base), bar.size) {

@@ -71,6 +71,8 @@ pub trait ConsolePlatform: Platform {
 
 pub trait DebugTransportPlatform: Platform {
     fn init_debug_metadata_transport();
+
+    fn sync_debug_module_load(module_id: u32);
 }
 
 pub trait InterruptPlatform: CpuPlatform {
@@ -313,7 +315,9 @@ pub fn init_early_serial_mapping() -> Result<(), PageMapError> {
 pub fn init_debug_metadata_transport() {
     <ActivePlatform as DebugTransportPlatform>::init_debug_metadata_transport();
 }
-
+pub fn sync_debug_module_load(module_id: u32) {
+    <ActivePlatform as DebugTransportPlatform>::sync_debug_module_load(module_id);
+}
 pub fn start_secondary_cpus() -> Result<(), CpuStartupError> {
     <ActivePlatform as CpuPlatform>::start_secondary_cpus()
 }

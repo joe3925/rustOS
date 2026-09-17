@@ -1,6 +1,9 @@
 use aarch64_cpu::asm::barrier::{SY, dsb};
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
-use kernel_types::irq::{MsiBindingRequest, MsiMessage, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_REQUESTER_PCI, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU};
+use kernel_types::irq::{
+    IrqSafeMutex, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_REQUESTER_PCI, MSI_TARGET_ANY,
+    MSI_TARGET_PLATFORM_CPU, MsiBindingRequest, MsiMessage,
+};
 use kernel_types::memory::PhysicalMappingCache;
 use spin::Mutex;
 
@@ -89,7 +92,7 @@ pub(super) struct Its {
     property_table: Memory,
     itt_entry_size: u64,
     physical_targets: bool,
-    state: Mutex<State>,
+    state: IrqSafeMutex<State>,
 }
 
 unsafe impl Send for Its {}
@@ -106,11 +109,14 @@ impl Its {
         .as_u64() as usize;
         let command_queue = allocate_memory_aligned(GITS_CMD_QUEUE_SIZE, GITS_CMD_QUEUE_SIZE)?;
         let property_table = allocate_memory_aligned(LPI_PROPERTY_SIZE, 0x1_0000)?;
-        unsafe { core::ptr::write_bytes(property_table.virt as *mut u8, 0xa3, LPI_PROPERTY_SIZE as usize) };
-        crate::arch::aarch64::cpu::clean_to_poc(
-            property_table.virt,
-            LPI_PROPERTY_SIZE as usize,
-        );
+        unsafe {
+            core::ptr::write_bytes(
+                property_table.virt as *mut u8,
+                0xa3,
+                LPI_PROPERTY_SIZE as usize,
+            )
+        };
+        crate::arch::aarch64::cpu::clean_to_poc(property_table.virt, LPI_PROPERTY_SIZE as usize);
         let typer = unsafe { ((registers + GITS_TYPER) as *const u64).read_volatile() };
         let itt_entry_size = ((typer >> 4) & 0xf) + 1;
         let its = Self {
@@ -120,7 +126,7 @@ impl Its {
             property_table,
             itt_entry_size,
             physical_targets: typer & GITS_TYPER_PTA != 0,
-            state: Mutex::new(State {
+            state: IrqSafeMutex::new(State {
                 writer: 0,
                 devices: [None; ITS_MAX_DEVICES],
                 bindings: [None; ITS_MAX_BINDINGS],
@@ -185,7 +191,9 @@ impl Its {
         redistributor_phys: u64,
         platform_cpu_id: u32,
     ) -> bool {
-        let Ok(index) = usize::try_from(platform_cpu_id) else { return false };
+        let Ok(index) = usize::try_from(platform_cpu_id) else {
+            return false;
+        };
         if index >= 256 {
             return false;
         }
@@ -199,7 +207,10 @@ impl Its {
         let pending = match state.pending[index] {
             Some(memory) => memory,
             None => {
-                let Some(memory) = allocate_memory_aligned(LPI_PENDING_SIZE, LPI_PENDING_SIZE) else { return false };
+                let Some(memory) = allocate_memory_aligned(LPI_PENDING_SIZE, LPI_PENDING_SIZE)
+                else {
+                    return false;
+                };
                 state.pending[index] = Some(memory);
                 memory
             }
@@ -211,9 +222,8 @@ impl Its {
                     | GICR_BASER_SHARE_INNER
                     | LPI_ID_BITS,
             );
-            ((redistributor as u64 + GICR_PENDBASER) as *mut u64).write_volatile(
-                pending.phys | GICR_BASER_CACHE_WB | GICR_BASER_SHARE_INNER,
-            );
+            ((redistributor as u64 + GICR_PENDBASER) as *mut u64)
+                .write_volatile(pending.phys | GICR_BASER_CACHE_WB | GICR_BASER_SHARE_INNER);
             let ctlr = (redistributor as *mut u32).read_volatile();
             (redistributor as *mut u32).write_volatile(ctlr | GICR_CTLR_ENABLE_LPIS);
             while (redistributor as *const u32).read_volatile() & GICR_CTLR_RWP != 0 {
@@ -224,7 +234,12 @@ impl Its {
     }
 
     pub(super) fn bind(&self, request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
-        crate::println!("ITS bind start vector={} requester={:#x} event={}", vector, request.requester.requester_id, request.table_index);
+        crate::println!(
+            "ITS bind start vector={} requester={:#x} event={}",
+            vector,
+            request.requester.requester_id,
+            request.table_index
+        );
         if !matches!(request.kind, MSI_KIND_MSI | MSI_KIND_MSIX)
             || request.requester.kind != MSI_REQUESTER_PCI
         {
@@ -242,19 +257,33 @@ impl Its {
         let target = state.collection_targets[collection as usize]?;
         let binding_index = state.bindings.iter().position(Option::is_none)?;
         let lpi = LPI_BASE + binding_index as u32;
-        let device_index = match state.devices.iter().position(|slot| slot.is_some_and(|device| device.id == device_id)) {
+        let device_index = match state
+            .devices
+            .iter()
+            .position(|slot| slot.is_some_and(|device| device.id == device_id))
+        {
             Some(index) => index,
             None => {
                 let index = state.devices.iter().position(Option::is_none)?;
                 let entries = 256u64;
-                let itt = allocate_memory_aligned(
-                    (entries * self.itt_entry_size).max(4096),
-                    0x1_0000,
-                )?;
+                let itt =
+                    allocate_memory_aligned((entries * self.itt_entry_size).max(4096), 0x1_0000)?;
                 let size = entries.trailing_zeros() as u64 - 1;
-                self.command(&mut state, [GITS_CMD_MAPD | (device_id as u64) << 32, size, itt.phys | 1 << 63, 0])?;
+                self.command(
+                    &mut state,
+                    [
+                        GITS_CMD_MAPD | (device_id as u64) << 32,
+                        size,
+                        itt.phys | 1 << 63,
+                        0,
+                    ],
+                )?;
                 crate::println!("ITS MAPD complete");
-                state.devices[index] = Some(Device { id: device_id, itt, users: 0 });
+                state.devices[index] = Some(Device {
+                    id: device_id,
+                    itt,
+                    users: 0,
+                });
                 index
             }
         };
@@ -268,26 +297,64 @@ impl Its {
             crate::println!("ITS INVALL complete");
             state.collections[collection as usize] = true;
         }
-        self.command(&mut state, [GITS_CMD_MAPTI | (device_id as u64) << 32, event_id as u64 | (lpi as u64) << 32, collection as u64, 0])?;
+        self.command(
+            &mut state,
+            [
+                GITS_CMD_MAPTI | (device_id as u64) << 32,
+                event_id as u64 | (lpi as u64) << 32,
+                collection as u64,
+                0,
+            ],
+        )?;
         crate::println!("ITS MAPTI complete");
         self.command(&mut state, [GITS_CMD_SYNC, 0, target, 0])?;
         crate::println!("ITS SYNC complete");
         state.devices[device_index].as_mut()?.users += 1;
-        state.bindings[binding_index] = Some(Binding { vector, lpi, device: device_id, event: event_id, target });
-        Some(MsiMessage::new(self.physical_base + GITS_TRANSLATER, event_id))
+        state.bindings[binding_index] = Some(Binding {
+            vector,
+            lpi,
+            device: device_id,
+            event: event_id,
+            target,
+        });
+        Some(MsiMessage::new(
+            self.physical_base + GITS_TRANSLATER,
+            event_id,
+        ))
     }
 
     pub(super) fn unbind(&self, vector: u8) {
         let mut state = self.state.lock();
-        let Some(index) = state.bindings.iter().position(|slot| slot.is_some_and(|binding| binding.vector == vector)) else { return };
+        let Some(index) = state
+            .bindings
+            .iter()
+            .position(|slot| slot.is_some_and(|binding| binding.vector == vector))
+        else {
+            return;
+        };
         let binding = state.bindings[index].take().unwrap();
-        let _ = self.command(&mut state, [GITS_CMD_DISCARD | (binding.device as u64) << 32, binding.event as u64, 0, 0]);
+        let _ = self.command(
+            &mut state,
+            [
+                GITS_CMD_DISCARD | (binding.device as u64) << 32,
+                binding.event as u64,
+                0,
+                0,
+            ],
+        );
         let _ = self.command(&mut state, [GITS_CMD_SYNC, 0, binding.target, 0]);
-        if let Some(device_index) = state.devices.iter().position(|slot| slot.is_some_and(|device| device.id == binding.device)) {
+        if let Some(device_index) = state
+            .devices
+            .iter()
+            .position(|slot| slot.is_some_and(|device| device.id == binding.device))
+        {
             let device = state.devices[device_index].as_mut().unwrap();
             device.users = device.users.saturating_sub(1);
             if device.users == 0 {
-                let _ = self.command(&mut state, [GITS_CMD_MAPD | (binding.device as u64) << 32, 0, 0, 0]);
+                let _ = self.command(
+                    &mut state,
+                    [GITS_CMD_MAPD | (binding.device as u64) << 32, 0, 0, 0],
+                );
                 state.devices[device_index] = None;
             }
         }
@@ -323,10 +390,18 @@ impl Its {
         None
     }
 
-    fn read32(&self, offset: usize) -> u32 { unsafe { ((self.registers + offset) as *const u32).read_volatile() } }
-    fn write32(&self, offset: usize, value: u32) { unsafe { ((self.registers + offset) as *mut u32).write_volatile(value) } }
-    fn read64(&self, offset: usize) -> u64 { unsafe { ((self.registers + offset) as *const u64).read_volatile() } }
-    fn write64(&self, offset: usize, value: u64) { unsafe { ((self.registers + offset) as *mut u64).write_volatile(value) } }
+    fn read32(&self, offset: usize) -> u32 {
+        unsafe { ((self.registers + offset) as *const u32).read_volatile() }
+    }
+    fn write32(&self, offset: usize, value: u32) {
+        unsafe { ((self.registers + offset) as *mut u32).write_volatile(value) }
+    }
+    fn read64(&self, offset: usize) -> u64 {
+        unsafe { ((self.registers + offset) as *const u64).read_volatile() }
+    }
+    fn write64(&self, offset: usize, value: u64) {
+        unsafe { ((self.registers + offset) as *mut u64).write_volatile(value) }
+    }
 }
 
 fn allocate_memory_aligned(bytes: u64, alignment: u64) -> Option<Memory> {
@@ -341,5 +416,8 @@ fn allocate_memory_aligned(bytes: u64, alignment: u64) -> Option<Memory> {
     let aligned_virt = virt.as_u64() + aligned_phys - phys.as_u64();
     unsafe { core::ptr::write_bytes(aligned_virt as *mut u8, 0, bytes as usize) };
     crate::arch::aarch64::cpu::clean_to_poc(aligned_virt, bytes as usize);
-    Some(Memory { virt: aligned_virt, phys: aligned_phys })
+    Some(Memory {
+        virt: aligned_virt,
+        phys: aligned_phys,
+    })
 }

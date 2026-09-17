@@ -3,15 +3,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
-// Protocol (line-based UTF-8, \n terminated; COM2 sink adds \r before \n):
-//
-//   RUSTOS_MODULE_BEGIN id=<N> name="<name>" path="<path>" preferred=0x<HEX> loaded=0x<HEX>
-//   RUSTOS_MODULE_SECTION id=<N> name="<section>" addr=0x<HEX> size=0x<HEX>
-//   RUSTOS_MODULE_END id=<N>
-//
-//   RUSTOS_META_HELLO version=1          (host → kernel)
-//   RUSTOS_META_HELLO_ACK version=1      (kernel → host, followed by full snapshot)
-
 pub struct DebugLoadedSection<'a> {
     pub name: &'a str,
     pub runtime_addr: u64,
@@ -48,6 +39,8 @@ struct SnapshotModule {
 }
 
 static SNAPSHOT: Mutex<Vec<SnapshotModule>> = Mutex::new(Vec::new());
+static MODULE_EMIT_LOCK: Mutex<()> = Mutex::new(());
+
 static NEXT_MODULE_ID: AtomicU32 = AtomicU32::new(1);
 static HOST_HELLO_RECEIVED: AtomicBool = AtomicBool::new(false);
 
@@ -72,7 +65,7 @@ pub fn debug_metadata_host_ready() -> bool {
 
 #[inline(always)]
 fn debug_metadata_live_emit_allowed() -> bool {
-    debug_metadata_dev_build() || debug_metadata_host_ready()
+    debug_metadata_host_ready()
 }
 
 pub fn register_sink(sink: MetaSinkFn) {
@@ -80,11 +73,11 @@ pub fn register_sink(sink: MetaSinkFn) {
 }
 
 pub fn host_hello_received() {
-    HOST_HELLO_RECEIVED.store(true, Ordering::Release);
+    if HOST_HELLO_RECEIVED.swap(true, Ordering::AcqRel) {
+        return;
+    }
 
-    let mut buf = arrayfmt::ArrayFmt::<64>::new();
-    let _ = core::fmt::Write::write_str(&mut buf, "RUSTOS_META_HELLO_ACK version=1\n");
-    sink_write(buf.as_bytes());
+    sink_write(b"RUSTOS_META_HELLO_ACK version=1\n");
 
     replay_snapshot();
 }
@@ -122,6 +115,8 @@ fn emit_module(id: u32, module: &DebugLoadedModule<'_>) {
     if !debug_metadata_live_emit_allowed() {
         return;
     }
+
+    let _emit_guard = MODULE_EMIT_LOCK.lock();
 
     {
         let mut buf = arrayfmt::ArrayFmt::<512>::new();
@@ -210,11 +205,17 @@ pub fn module_loaded(module: &DebugLoadedModule<'_>) {
         }
     }
 
-    // Poll the transport even before a debugger has completed its handshake.
-    // Passing an empty slice lets transport implementations service receive
-    // data without transmitting module metadata to an absent host.
+    let host_was_ready = debug_metadata_host_ready();
+
     poll_sink();
-    emit_module(id, module);
+
+    if host_was_ready {
+        emit_module(id, module);
+    }
+
+    if debug_metadata_host_ready() {
+        crate::platform::sync_debug_module_load(id);
+    }
 }
 
 pub fn replay_snapshot() {
@@ -275,6 +276,7 @@ mod arrayfmt {
             let to_copy = s.len().min(remaining);
 
             self.buf[self.len..self.len + to_copy].copy_from_slice(&s.as_bytes()[..to_copy]);
+
             self.len += to_copy;
 
             Ok(())
