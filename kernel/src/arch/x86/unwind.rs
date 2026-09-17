@@ -1,6 +1,5 @@
-use core::arch::asm;
-
 use kernel_types::arch::VirtAddr;
+use kernel_types::memory::Module;
 
 use crate::arch::unwind::{
     PeUnwindModule, STATUS_BAD_STACK_READ, STATUS_BAD_UNWIND_INFO, STATUS_LEAF_FALLBACK,
@@ -8,109 +7,97 @@ use crate::arch::unwind::{
     backtrace_status, read_image_bytes, read_image_u32, read_stack_u64,
 };
 use crate::platform::UnwindPlatform;
-use crate::profiling::backtrace::{BacktraceStatus, StackBounds, UnwindStart, UnwindStep};
+use crate::profiling::backtrace::{StackBounds, UnwindStart, UnwindStep};
 
-use super::platform::Aarch64Platform;
-use super::scheduling::state::TaskContext;
+use super::platform::X86Platform;
+use super::scheduling::state::State;
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct UnwindContext {
-    pc: u64,
-    sp: u64,
-    registers: [u64; 12],
-    fp: u64,
-    lr: u64,
-    pc_is_return_address: bool,
-}
+const UNW_FLAG_EHANDLER: u8 = 0x1;
+const UNW_FLAG_UHANDLER: u8 = 0x2;
+const UNW_FLAG_CHAININFO: u8 = 0x4;
+
+const UWOP_PUSH_NONVOL: u8 = 0;
+const UWOP_ALLOC_LARGE: u8 = 1;
+const UWOP_ALLOC_SMALL: u8 = 2;
+const UWOP_SET_FPREG: u8 = 3;
+const UWOP_SAVE_NONVOL: u8 = 4;
+const UWOP_SAVE_NONVOL_FAR: u8 = 5;
+const UWOP_SAVE_XMM128: u8 = 8;
+const UWOP_SAVE_XMM128_FAR: u8 = 9;
+const UWOP_PUSH_MACHFRAME: u8 = 10;
 
 #[derive(Clone, Copy)]
 struct RuntimeFunction {
     begin_rva: u32,
-    unwind_data: u32,
+    end_rva: u32,
+    unwind_rva: u32,
 }
 
-#[derive(Clone, Copy)]
-enum SavedPairKind {
-    Integer,
-    Float64,
-    Float128,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnwindFinish {
+    NeedsReturnAddress,
+    ContextIsCaller,
 }
 
-#[derive(Clone, Copy)]
-struct SavedPair {
-    kind: SavedPairKind,
-    reg: u8,
-    address: u64,
-    stride: u64,
-}
-
-impl UnwindPlatform for Aarch64Platform {
+impl UnwindPlatform for X86Platform {
     type UnwindContext = UnwindContext;
 
     fn begin_current_unwind() -> UnwindStart<Self::UnwindContext> {
         let mut context = UnwindContext {
-            pc: 0,
-            sp: 0,
-            registers: [0; 12],
-            fp: 0,
-            lr: 0,
-            pc_is_return_address: false,
+            rip: 0,
+            rsp: 0,
+            rbx: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip_is_return_address: false,
         };
-
-        let pointer = &mut context as *mut UnwindContext;
+        let context_ptr = &mut context as *mut UnwindContext;
 
         unsafe {
-            asm!(
-                "adr x16, 2f",
-                "str x16, [x17, {pc}]",
-                "mov x16, sp",
-                "str x16, [x17, {sp}]",
-                "str x19, [x17, {x19}]",
-                "str x20, [x17, {x20}]",
-                "str x21, [x17, {x21}]",
-                "str x22, [x17, {x22}]",
-                "str x23, [x17, {x23}]",
-                "str x24, [x17, {x24}]",
-                "str x25, [x17, {x25}]",
-                "str x26, [x17, {x26}]",
-                "str x27, [x17, {x27}]",
-                "str x28, [x17, {x28}]",
-                "str x29, [x17, {fp}]",
-                "str x30, [x17, {lr}]",
+            core::arch::asm!(
+                "lea rax, [rip + 2f]",
+                "mov [rcx + {rip}], rax",
+                "mov [rcx + {rsp}], rsp",
+                "mov [rcx + {rbx}], rbx",
+                "mov [rcx + {rbp}], rbp",
+                "mov [rcx + {rsi}], rsi",
+                "mov [rcx + {rdi}], rdi",
+                "mov [rcx + {r12}], r12",
+                "mov [rcx + {r13}], r13",
+                "mov [rcx + {r14}], r14",
+                "mov [rcx + {r15}], r15",
                 "2:",
-                in("x17") pointer,
-                pc = const core::mem::offset_of!(UnwindContext, pc),
-                sp = const core::mem::offset_of!(UnwindContext, sp),
-                x19 = const core::mem::offset_of!(UnwindContext, registers),
-                x20 = const core::mem::offset_of!(UnwindContext, registers) + 8,
-                x21 = const core::mem::offset_of!(UnwindContext, registers) + 16,
-                x22 = const core::mem::offset_of!(UnwindContext, registers) + 24,
-                x23 = const core::mem::offset_of!(UnwindContext, registers) + 32,
-                x24 = const core::mem::offset_of!(UnwindContext, registers) + 40,
-                x25 = const core::mem::offset_of!(UnwindContext, registers) + 48,
-                x26 = const core::mem::offset_of!(UnwindContext, registers) + 56,
-                x27 = const core::mem::offset_of!(UnwindContext, registers) + 64,
-                x28 = const core::mem::offset_of!(UnwindContext, registers) + 72,
-                fp = const core::mem::offset_of!(UnwindContext, fp),
-                lr = const core::mem::offset_of!(UnwindContext, lr),
-                lateout("x16") _,
+                in("rcx") context_ptr,
+                rip = const core::mem::offset_of!(UnwindContext, rip),
+                rsp = const core::mem::offset_of!(UnwindContext, rsp),
+                rbx = const core::mem::offset_of!(UnwindContext, rbx),
+                rbp = const core::mem::offset_of!(UnwindContext, rbp),
+                rsi = const core::mem::offset_of!(UnwindContext, rsi),
+                rdi = const core::mem::offset_of!(UnwindContext, rdi),
+                r12 = const core::mem::offset_of!(UnwindContext, r12),
+                r13 = const core::mem::offset_of!(UnwindContext, r13),
+                r14 = const core::mem::offset_of!(UnwindContext, r14),
+                r15 = const core::mem::offset_of!(UnwindContext, r15),
+                lateout("rax") _,
                 options(nostack, preserves_flags),
             );
         }
 
         UnwindStart {
-            pc: VirtAddr::new(context.pc),
+            pc: VirtAddr::new(context.rip),
             context,
         }
     }
 
-    fn begin_unwind(state: &TaskContext) -> UnwindStart<Self::UnwindContext> {
-        let context = UnwindContext::from_state(state);
-
+    fn begin_unwind(state: &State) -> UnwindStart<Self::UnwindContext> {
         UnwindStart {
-            pc: VirtAddr::new(context.pc),
-            context,
+            context: UnwindContext::from_state(state),
+            pc: VirtAddr::new(state.rip),
         }
     }
 
@@ -119,771 +106,692 @@ impl UnwindPlatform for Aarch64Platform {
         module: Option<PeUnwindModule>,
         stack_bounds: StackBounds,
     ) -> UnwindStep {
-        let original = *context;
+        let before_rip = context.rip;
+        let before_rsp = context.rsp;
         let control_pc = context.control_pc();
 
         let status = match module {
-            Some(module) if module.pdata_len >= 8 => {
-                unwind_pe(context, stack_bounds, control_pc, &module)
+            Some(module) => unwind_pe_x64(context, stack_bounds, control_pc, &module),
+
+            None => {
+                let status = STATUS_UNKNOWN_FRAME | STATUS_NO_UNWIND_INFO | STATUS_LEAF_FALLBACK;
+
+                leaf_unwind(context, stack_bounds)
+                    .map_or(status | STATUS_BAD_STACK_READ, |_| status)
             }
-            Some(_) => fallback(context, false),
-            None => fallback(context, true),
         };
 
-        let mapped_status = backtrace_status(status);
-
-        if mapped_status.intersects(
-            BacktraceStatus::BAD_STACK_READ
-                | BacktraceStatus::BAD_UNWIND_INFO
-                | BacktraceStatus::UNSUPPORTED_OPERATION,
-        ) {
-            *context = original;
-
-            return UnwindStep {
-                pc: None,
-                status: mapped_status,
-            };
-        }
-
-        let pc = (context.pc != 0
-            && context.pc & 3 == 0
-            && valid_address(context.pc)
-            && (context.pc, context.sp) != (original.pc, original.sp))
-            .then(|| VirtAddr::new(context.pc));
+        let pc = (context.rip != 0
+            && is_canonical(context.rip)
+            && (context.rip != before_rip || context.rsp != before_rsp))
+            .then(|| VirtAddr::new(context.rip));
 
         UnwindStep {
             pc,
-            status: mapped_status,
+            status: backtrace_status(status),
         }
     }
 }
 
-fn fallback(context: &mut UnwindContext, unknown: bool) -> u32 {
-    context.pc = context.lr;
-    context.pc_is_return_address = true;
-
-    STATUS_NO_UNWIND_INFO | STATUS_LEAF_FALLBACK | if unknown { STATUS_UNKNOWN_FRAME } else { 0 }
-}
-
-fn unwind_pe(
-    context: &mut UnwindContext,
+fn unwind_pe_x64(
+    ctx: &mut UnwindContext,
     bounds: StackBounds,
-    pc: u64,
+    control_pc: u64,
     module: &PeUnwindModule,
 ) -> u32 {
-    if pc < module.image_base || pc >= module.image_end {
-        return fallback(context, false);
+    if control_pc < module.image_base || control_pc >= module.image_end {
+        let status = STATUS_NO_UNWIND_INFO | STATUS_LEAF_FALLBACK;
+        return leaf_unwind(ctx, bounds).map_or(status | STATUS_BAD_STACK_READ, |_| status);
     }
 
-    let rva = (pc - module.image_base) as u32;
-
-    let Some(function) = lookup_function(module, rva) else {
-        return fallback(context, false);
+    let rva = (control_pc - module.image_base) as u32;
+    let Some(mut rf) = lookup_runtime_function(module, rva) else {
+        let status = STATUS_NO_UNWIND_INFO | STATUS_LEAF_FALLBACK;
+        return leaf_unwind(ctx, bounds).map_or(status | STATUS_BAD_STACK_READ, |_| status);
     };
 
-    let offset = rva - function.begin_rva;
+    let mut status = STATUS_PE_UNWIND;
 
-    let result = if function.unwind_data & 3 == 0 {
-        unwind_full(context, bounds, module, function.unwind_data, offset)
-    } else {
-        unwind_packed(context, bounds, function.unwind_data, offset)
-    };
-
-    STATUS_PE_UNWIND | result.err().unwrap_or(0)
-}
-
-fn lookup_function(module: &PeUnwindModule, rva: u32) -> Option<RuntimeFunction> {
-    let mut low = 0usize;
-    let mut high = module.pdata_len / 8;
-
-    while low < high {
-        let middle = (low + high) / 2;
-
-        let begin = read_image_u32(module, module.pdata_base + (middle * 8) as u64)?;
-
-        if begin <= rva {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
+    if let Some(epilog_status) = try_unwind_epilog(module, control_pc, ctx, bounds) {
+        return status | epilog_status;
     }
 
-    let address = module.pdata_base + (low.checked_sub(1)? * 8) as u64;
+    for _ in 0..8 {
+        let (flags, chained, finish, op_status) = process_unwind_info(module, rf, rva, ctx, bounds);
 
-    let function = RuntimeFunction {
-        begin_rva: read_image_u32(module, address)?,
-        unwind_data: read_image_u32(module, address + 4)?,
-    };
+        status |= op_status;
 
-    let length = if function.unwind_data & 3 == 0 {
-        let header = read_image_u32(
-            module,
-            module.image_base + (function.unwind_data & !3) as u64,
-        )?;
-
-        (header & 0x3ffff) * 4
-    } else {
-        ((function.unwind_data >> 2) & 0x7ff) * 4
-    };
-
-    (length != 0 && rva < function.begin_rva.checked_add(length)?).then_some(function)
-}
-
-fn unwind_full(
-    context: &mut UnwindContext,
-    bounds: StackBounds,
-    module: &PeUnwindModule,
-    data: u32,
-    function_offset: u32,
-) -> Result<(), u32> {
-    let xdata = module
-        .image_base
-        .checked_add((data & !3) as u64)
-        .ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-    let header = read_image_u32(module, xdata).ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-    if (header >> 18) & 3 != 0 {
-        return Err(STATUS_BAD_UNWIND_INFO);
-    }
-
-    let packed_epilog = header & (1 << 21) != 0;
-    let mut epilogs = ((header >> 22) & 0x1f) as usize;
-    let mut words = ((header >> 27) & 0x1f) as usize;
-    let mut header_size = 4u64;
-
-    if epilogs == 0 && words == 0 {
-        let extension = read_image_u32(module, xdata + 4).ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-        if extension >> 24 != 0 {
-            return Err(STATUS_BAD_UNWIND_INFO);
-        }
-
-        epilogs = (extension & 0xffff) as usize;
-        words = ((extension >> 16) & 0xff) as usize;
-        header_size = 8;
-    }
-
-    if words == 0 {
-        return Err(STATUS_BAD_UNWIND_INFO);
-    }
-
-    let scope_count = if packed_epilog { 0 } else { epilogs };
-    let scopes = xdata + header_size;
-
-    let codes_address = scopes
-        .checked_add((scope_count * 4) as u64)
-        .ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-    let codes = read_image_bytes(module, codes_address, words * 4).ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-    let instruction = (function_offset / 4) as usize;
-
-    let mut start = 0usize;
-    let mut skip = 0usize;
-    let mut in_epilog = false;
-
-    if packed_epilog {
-        let count = code_count(codes, epilogs)?;
-        let function_length = (header & 0x3ffff) as usize;
-        let epilog_start = function_length.saturating_sub(count);
-
-        if instruction >= epilog_start {
-            start = epilogs;
-            skip = instruction - epilog_start;
-            in_epilog = true;
-        }
-    } else {
-        for index in 0..epilogs {
-            let scope = read_image_u32(module, scopes + (index * 4) as u64)
-                .ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-            if scope & 0x003c0000 != 0 {
-                return Err(STATUS_BAD_UNWIND_INFO);
-            }
-
-            let epilog_start = (scope & 0x3ffff) as usize;
-            let code_start = (scope >> 22) as usize;
-            let count = code_count(codes, code_start)?;
-
-            if instruction >= epilog_start && instruction - epilog_start < count {
-                start = code_start;
-                skip = instruction - epilog_start;
-                in_epilog = true;
-                break;
-            }
-        }
-    }
-
-    if !in_epilog {
-        let count = code_count(codes, 0)?;
-
-        if instruction < count {
-            skip = count - instruction;
-        }
-    }
-
-    execute_codes(context, bounds, codes, start, skip)
-}
-
-fn unwind_packed(
-    context: &mut UnwindContext,
-    bounds: StackBounds,
-    data: u32,
-    function_offset: u32,
-) -> Result<(), u32> {
-    let flag = data & 3;
-    let function_length = ((data >> 2) & 0x7ff) * 4;
-    let reg_f = (data >> 13) & 7;
-    let reg_i = (data >> 16) & 0xf;
-    let homes = (data >> 20) & 1;
-    let chain = (data >> 21) & 3;
-    let frame_size = ((data >> 23) & 0x1ff) * 16;
-
-    if flag == 3 || function_length == 0 || reg_i > 10 || frame_size == 0 {
-        return Err(STATUS_BAD_UNWIND_INFO);
-    }
-
-    let instruction_count = packed_code_count(reg_i, reg_f, homes, chain, frame_size)?;
-
-    if flag == 1 {
-        let instruction = function_offset / 4;
-
-        if instruction < instruction_count
-            || function_offset >= function_length - instruction_count * 4
+        if status & (STATUS_BAD_UNWIND_INFO | STATUS_BAD_STACK_READ | STATUS_UNSUPPORTED_OPCODE)
+            != 0
         {
-            return Err(STATUS_UNSUPPORTED_OPCODE);
+            return status;
+        }
+
+        if finish == UnwindFinish::ContextIsCaller {
+            return status;
+        }
+
+        if flags & UNW_FLAG_CHAININFO == 0 {
+            return leaf_unwind(ctx, bounds).map_or(status | STATUS_BAD_STACK_READ, |_| status);
+        }
+
+        let Some(next) = chained else {
+            return status | STATUS_BAD_UNWIND_INFO;
+        };
+
+        rf = next;
+    }
+
+    status | STATUS_BAD_UNWIND_INFO
+}
+
+fn lookup_runtime_function(module: &PeUnwindModule, rva: u32) -> Option<RuntimeFunction> {
+    let mut lo = 0usize;
+    let mut hi = module.pdata_len / 12;
+
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let address = module.pdata_base.checked_add((mid * 12) as u64)?;
+        let f = RuntimeFunction {
+            begin_rva: read_image_u32(module, address)?,
+            end_rva: read_image_u32(module, address.checked_add(4)?)?,
+            unwind_rva: read_image_u32(module, address.checked_add(8)?)?,
+        };
+        if f.end_rva <= f.begin_rva
+            || f.end_rva as u64 > module.image_end - module.image_base
+            || f.unwind_rva == 0
+            || f.unwind_rva as u64 >= module.image_end - module.image_base
+        {
+            return None;
+        }
+
+        if rva < f.begin_rva {
+            hi = mid;
+        } else if rva >= f.end_rva {
+            lo = mid + 1;
+        } else {
+            return Some(f);
         }
     }
 
-    let int_size = reg_i * 8 + u32::from(chain == 1) * 8;
-
-    let fp_size = if reg_f == 0 { 0 } else { (reg_f + 1) * 8 };
-
-    let save_size = (int_size + fp_size + homes * 64 + 15) & !15;
-
-    let local_size = frame_size
-        .checked_sub(save_size)
-        .ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-    let save_base = context
-        .sp
-        .checked_add(local_size as u64)
-        .ok_or(STATUS_BAD_STACK_READ)?;
-
-    for index in 0..reg_i {
-        restore_reg(
-            context,
-            bounds,
-            (19 + index) as u8,
-            save_base + (index * 8) as u64,
-        )?;
-    }
-
-    if chain == 1 {
-        context.lr =
-            read_stack_u64(bounds, save_base + (reg_i * 8) as u64).ok_or(STATUS_BAD_STACK_READ)?;
-    } else if chain >= 2 {
-        restore_fplr(context, bounds, context.sp)?;
-    }
-
-    context.sp = context
-        .sp
-        .checked_add(frame_size as u64)
-        .ok_or(STATUS_BAD_STACK_READ)?;
-
-    finish(context);
-
-    Ok(())
+    None
 }
 
-fn packed_code_count(
-    reg_i: u32,
-    reg_f: u32,
-    homes: u32,
-    chain: u32,
-    frame: u32,
-) -> Result<u32, u32> {
-    let int_size = reg_i * 8 + u32::from(chain == 1) * 8;
-
-    let fp_size = if reg_f == 0 { 0 } else { (reg_f + 1) * 8 };
-
-    let saves = (int_size + fp_size + homes * 64 + 15) & !15;
-
-    let local = frame.checked_sub(saves).ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-    let mut count = (reg_i + 1) / 2 + (reg_f + 2) / 2 + homes * 4;
-
-    count += u32::from(chain == 1 && reg_i & 1 == 0) + u32::from(chain == 2);
-
-    count += if chain >= 2 {
-        2 + u32::from(local > 512) + u32::from(local > 4080)
-    } else {
-        1 + u32::from(local > 4080)
+fn process_unwind_info(
+    module: &PeUnwindModule,
+    rf: RuntimeFunction,
+    rva: u32,
+    ctx: &mut UnwindContext,
+    bounds: StackBounds,
+) -> (u8, Option<RuntimeFunction>, UnwindFinish, u32) {
+    let info = module.image_base.saturating_add(rf.unwind_rva as u64);
+    let Some(header) = read_image_bytes(module, info, 4) else {
+        return (
+            0,
+            None,
+            UnwindFinish::NeedsReturnAddress,
+            STATUS_BAD_UNWIND_INFO,
+        );
     };
 
-    Ok(count)
-}
+    let version = header[0] & 0x7;
+    let flags = header[0] >> 3;
+    let prolog_size = header[1] as u32;
+    let code_count = header[2] as usize;
+    let frame_reg = header[3] & 0x0f;
+    let frame_off = (header[3] >> 4) as u64 * 16;
 
-fn code_count(codes: &[u8], start: usize) -> Result<usize, u32> {
-    let mut index = start;
-    let mut count = 0usize;
-
-    while index < codes.len() && count < 256 {
-        let opcode = codes[index];
-
-        if opcode == 0xe4 || opcode == 0xe5 {
-            return Ok(count);
-        }
-
-        index = index
-            .checked_add(opcode_len(opcode))
-            .ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-        if index > codes.len() {
-            return Err(STATUS_BAD_UNWIND_INFO);
-        }
-
-        count += 1;
+    if version != 1 {
+        return (
+            flags,
+            None,
+            UnwindFinish::NeedsReturnAddress,
+            STATUS_BAD_UNWIND_INFO,
+        );
     }
 
-    Err(STATUS_BAD_UNWIND_INFO)
-}
-
-fn opcode_len(opcode: u8) -> usize {
-    match opcode {
-        0xc0..=0xdf | 0xe2 | 0xf8 => 2,
-        0xe7 | 0xf9 => 3,
-        0xe0 | 0xfa => 4,
-        0xfb => 5,
-        _ => 1,
+    if flags & UNW_FLAG_CHAININFO != 0 && flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
+        return (
+            flags,
+            None,
+            UnwindFinish::NeedsReturnAddress,
+            STATUS_BAD_UNWIND_INFO,
+        );
     }
-}
 
-fn execute_codes(
-    context: &mut UnwindContext,
-    bounds: StackBounds,
-    codes: &[u8],
-    start: usize,
-    mut skip: usize,
-) -> Result<(), u32> {
-    let mut index = start;
-    let mut last_pair: Option<SavedPair> = None;
+    let function_offset = rva.saturating_sub(rf.begin_rva);
+    let in_prolog = function_offset < prolog_size;
+    let frame_base = if frame_reg != 0 {
+        ctx.get_reg(frame_reg)
+            .and_then(|v| v.checked_sub(frame_off))
+            .unwrap_or(ctx.rsp)
+    } else {
+        ctx.rsp
+    };
 
-    for _ in 0..256 {
-        let opcode = *codes.get(index).ok_or(STATUS_BAD_UNWIND_INFO)?;
+    let mut idx = 0usize;
+    let mut status = 0u32;
 
-        let length = opcode_len(opcode);
+    while idx < code_count {
+        let Some((code_offset, op, op_info)) = read_unwind_code(module, info, idx) else {
+            return (
+                flags,
+                None,
+                UnwindFinish::NeedsReturnAddress,
+                status | STATUS_BAD_UNWIND_INFO,
+            );
+        };
 
-        let bytes = codes
-            .get(index..index + length)
-            .ok_or(STATUS_BAD_UNWIND_INFO)?;
+        idx += 1;
 
-        index += length;
+        let apply = !in_prolog || code_offset as u32 <= function_offset;
 
-        if opcode == 0xe4 {
-            finish(context);
-            return Ok(());
-        }
-
-        if opcode == 0xe5 {
-            continue;
-        }
-
-        if skip != 0 {
-            skip -= 1;
-            continue;
-        }
-
-        match opcode {
-            0x00..=0x1f => {
-                context.sp = add_sp(context.sp, (opcode & 31) as u64 * 16)?;
-            }
-
-            0x20..=0x3f => {
-                let address = context.sp;
-
-                restore_pair(context, bounds, 19, address)?;
-
-                context.sp = add_sp(context.sp, (opcode & 31) as u64 * 8)?;
-
-                last_pair = Some(SavedPair {
-                    kind: SavedPairKind::Integer,
-                    reg: 19,
-                    address,
-                    stride: 16,
-                });
-            }
-
-            0x40..=0x7f => {
-                let address = context
-                    .sp
-                    .checked_add((opcode & 63) as u64 * 8)
-                    .ok_or(STATUS_BAD_STACK_READ)?;
-
-                restore_fplr(context, bounds, address)?;
-            }
-
-            0x80..=0xbf => {
-                restore_fplr(context, bounds, context.sp)?;
-
-                context.sp = add_sp(context.sp, ((opcode & 63) as u64 + 1) * 8)?;
-            }
-
-            0xc0..=0xc7 => {
-                let amount = ((((opcode & 7) as u64) << 8) | bytes[1] as u64) * 16;
-
-                context.sp = add_sp(context.sp, amount)?;
-            }
-
-            0xc8..=0xcb => {
-                let reg = 19 + ((opcode & 3) << 2) + (bytes[1] >> 6);
-
-                let address = context
-                    .sp
-                    .checked_add((bytes[1] & 63) as u64 * 8)
-                    .ok_or(STATUS_BAD_STACK_READ)?;
-
-                restore_pair(context, bounds, reg, address)?;
-
-                last_pair = Some(SavedPair {
-                    kind: SavedPairKind::Integer,
-                    reg,
-                    address,
-                    stride: 16,
-                });
-            }
-
-            0xcc..=0xcf => {
-                let reg = 19 + ((opcode & 3) << 2) + (bytes[1] >> 6);
-
-                let address = context.sp;
-
-                restore_pair(context, bounds, reg, address)?;
-
-                context.sp = add_sp(context.sp, ((bytes[1] & 63) as u64 + 1) * 8)?;
-
-                last_pair = Some(SavedPair {
-                    kind: SavedPairKind::Integer,
-                    reg,
-                    address,
-                    stride: 16,
-                });
-            }
-
-            0xd0..=0xd3 => {
-                let reg = 19 + ((opcode & 3) << 2) + (bytes[1] >> 6);
-
-                let address = context
-                    .sp
-                    .checked_add((bytes[1] & 63) as u64 * 8)
-                    .ok_or(STATUS_BAD_STACK_READ)?;
-
-                restore_reg(context, bounds, reg, address)?;
-            }
-
-            0xd4..=0xd5 => {
-                let reg = 19 + ((opcode & 1) << 3) + (bytes[1] >> 5);
-
-                restore_reg(context, bounds, reg, context.sp)?;
-
-                context.sp = add_sp(context.sp, ((bytes[1] & 31) as u64 + 1) * 8)?;
-            }
-
-            0xd6..=0xd7 => {
-                let x = ((opcode & 1) << 2) | (bytes[1] >> 6);
-
-                let reg = 19 + x * 2;
-
-                let address = context
-                    .sp
-                    .checked_add((bytes[1] & 63) as u64 * 8)
-                    .ok_or(STATUS_BAD_STACK_READ)?;
-
-                restore_reg(context, bounds, reg, address)?;
-
-                context.lr = read_stack_u64(bounds, address + 8).ok_or(STATUS_BAD_STACK_READ)?;
-            }
-
-            0xd8..=0xd9 => {
-                let x = ((opcode & 1) << 2) | (bytes[1] >> 6);
-
-                let reg = 8 + x;
-
-                let address = context
-                    .sp
-                    .checked_add((bytes[1] & 63) as u64 * 8)
-                    .ok_or(STATUS_BAD_STACK_READ)?;
-
-                last_pair = Some(SavedPair {
-                    kind: SavedPairKind::Float64,
-                    reg,
-                    address,
-                    stride: 16,
-                });
-            }
-
-            0xda..=0xdb => {
-                let x = ((opcode & 1) << 2) | (bytes[1] >> 6);
-
-                let reg = 8 + x;
-                let address = context.sp;
-
-                context.sp = add_sp(context.sp, ((bytes[1] & 63) as u64 + 1) * 8)?;
-
-                last_pair = Some(SavedPair {
-                    kind: SavedPairKind::Float64,
-                    reg,
-                    address,
-                    stride: 16,
-                });
-            }
-
-            0xdc..=0xdd => {}
-
-            0xde => {
-                context.sp = add_sp(context.sp, ((bytes[1] & 31) as u64 + 1) * 8)?;
-            }
-
-            0xdf => {
-                return Err(STATUS_UNSUPPORTED_OPCODE);
-            }
-
-            0xe0 => {
-                let amount = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]) as u64 * 16;
-
-                context.sp = add_sp(context.sp, amount)?;
-            }
-
-            0xe1 => {
-                context.sp = context.fp;
-            }
-
-            0xe2 => {
-                context.sp = context
-                    .fp
-                    .checked_sub(bytes[1] as u64 * 8)
-                    .ok_or(STATUS_BAD_STACK_READ)?;
-            }
-
-            0xe3 | 0xfc => {}
-
-            0xe6 => {
-                let previous = last_pair.ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-                let next_reg = previous.reg.checked_add(2).ok_or(STATUS_BAD_UNWIND_INFO)?;
-
-                let next_address = previous
-                    .address
-                    .checked_add(previous.stride)
-                    .ok_or(STATUS_BAD_STACK_READ)?;
-
-                if matches!(previous.kind, SavedPairKind::Integer) {
-                    restore_pair(context, bounds, next_reg, next_address)?;
-                }
-
-                last_pair = Some(SavedPair {
-                    kind: previous.kind,
-                    reg: next_reg,
-                    address: next_address,
-                    stride: previous.stride,
-                });
-            }
-
-            0xe7 => {
-                if let Some(pair) = execute_save_any(context, bounds, bytes)? {
-                    last_pair = Some(pair);
+        match op {
+            UWOP_PUSH_NONVOL => {
+                if apply {
+                    match read_stack_u64(bounds, ctx.rsp) {
+                        Some(value) => {
+                            ctx.set_reg(op_info, value);
+                            ctx.rsp = ctx.rsp.saturating_add(8);
+                        }
+                        None => status |= STATUS_BAD_STACK_READ,
+                    }
                 }
             }
+            UWOP_ALLOC_LARGE => {
+                let needed = if op_info == 0 { 1 } else { 2 };
+                if op_info > 1 || idx.checked_add(needed).is_none_or(|end| end > code_count) {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                }
 
+                let Some(size) = read_alloc_large_size(module, info, idx, op_info) else {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                };
+
+                idx += needed;
+
+                if apply {
+                    ctx.rsp = ctx.rsp.saturating_add(size as u64);
+                }
+            }
+            UWOP_ALLOC_SMALL => {
+                if apply {
+                    ctx.rsp = ctx.rsp.saturating_add((op_info as u64 * 8) + 8);
+                }
+            }
+            UWOP_SET_FPREG => {
+                if apply {
+                    ctx.rsp = frame_base;
+                }
+            }
+            UWOP_SAVE_NONVOL => {
+                if idx >= code_count {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                }
+
+                let Some(slot) = read_unwind_u16_slot(module, info, idx) else {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                };
+
+                idx += 1;
+
+                if apply {
+                    let addr = frame_base.saturating_add(slot as u64 * 8);
+                    match read_stack_u64(bounds, addr) {
+                        Some(value) => ctx.set_reg(op_info, value),
+                        None => status |= STATUS_BAD_STACK_READ,
+                    }
+                }
+            }
+            UWOP_SAVE_NONVOL_FAR => {
+                if idx.checked_add(2).is_none_or(|end| end > code_count) {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                }
+
+                let Some(slot) = read_unwind_u32_slot(module, info, idx) else {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                };
+
+                idx += 2;
+
+                if apply {
+                    let addr = frame_base.saturating_add(slot as u64);
+                    match read_stack_u64(bounds, addr) {
+                        Some(value) => ctx.set_reg(op_info, value),
+                        None => status |= STATUS_BAD_STACK_READ,
+                    }
+                }
+            }
+            UWOP_SAVE_XMM128 => {
+                if idx >= code_count {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                }
+
+                idx += 1;
+            }
+            UWOP_SAVE_XMM128_FAR => {
+                if idx.checked_add(2).is_none_or(|end| end > code_count) {
+                    return (
+                        flags,
+                        None,
+                        UnwindFinish::NeedsReturnAddress,
+                        status | STATUS_BAD_UNWIND_INFO,
+                    );
+                }
+
+                idx += 2;
+            }
+            UWOP_PUSH_MACHFRAME => {
+                if apply {
+                    let error_code = op_info != 0;
+                    match unwind_machine_frame(ctx, bounds, error_code) {
+                        Some(()) => {
+                            return (flags, None, UnwindFinish::ContextIsCaller, status);
+                        }
+                        None => status |= STATUS_BAD_STACK_READ,
+                    }
+                }
+            }
             _ => {
-                return Err(STATUS_UNSUPPORTED_OPCODE);
+                return (
+                    flags,
+                    None,
+                    UnwindFinish::NeedsReturnAddress,
+                    status | STATUS_UNSUPPORTED_OPCODE | STATUS_BAD_UNWIND_INFO,
+                );
             }
+        }
+
+        if status & STATUS_BAD_STACK_READ != 0 {
+            return (flags, None, UnwindFinish::NeedsReturnAddress, status);
         }
     }
 
-    Err(STATUS_BAD_UNWIND_INFO)
-}
-
-fn execute_save_any(
-    context: &mut UnwindContext,
-    bounds: StackBounds,
-    bytes: &[u8],
-) -> Result<Option<SavedPair>, u32> {
-    if bytes.len() != 3 || bytes[1] & 0x80 != 0 {
-        return Err(STATUS_BAD_UNWIND_INFO);
-    }
-
-    let pair = bytes[1] & 0x40 != 0;
-
-    let preindexed = bytes[1] & 0x20 != 0;
-
-    let reg = bytes[1] & 0x1f;
-
-    let kind = bytes[2] >> 6;
-
-    let offset_field = bytes[2] & 0x3f;
-
-    let scale = match kind {
-        0 | 1 => {
-            if pair || preindexed {
-                16
-            } else {
-                8
-            }
-        }
-        2 => 16,
-        3 => return Err(STATUS_UNSUPPORTED_OPCODE),
-        _ => unreachable!(),
-    };
-
-    let offset = offset_field as u64 * scale;
-
-    let address = if preindexed {
-        context.sp
+    let chained = if flags & UNW_FLAG_CHAININFO != 0 {
+        read_chained_runtime_function(module, info, code_count)
     } else {
-        context
-            .sp
-            .checked_add(offset)
-            .ok_or(STATUS_BAD_STACK_READ)?
+        None
     };
 
-    match kind {
-        0 => {
-            restore_reg(context, bounds, reg, address)?;
+    (flags, chained, UnwindFinish::NeedsReturnAddress, status)
+}
 
-            if pair {
-                let second_reg = reg.checked_add(1).ok_or(STATUS_BAD_UNWIND_INFO)?;
+fn try_unwind_epilog(
+    module: &PeUnwindModule,
+    control_pc: u64,
+    ctx: &mut UnwindContext,
+    bounds: StackBounds,
+) -> Option<u32> {
+    let bytes = read_image_bytes(module, control_pc, 32)?;
+    let mut tmp = *ctx;
+    let mut idx = 0usize;
+    let mut consumed_any = false;
 
-                restore_reg(context, bounds, second_reg, address + 8)?;
-            }
+    loop {
+        if idx >= bytes.len() {
+            return None;
         }
 
-        1 | 2 => {}
+        if let Some((new_rsp, consumed)) = decode_add_rsp(bytes, idx, tmp.rsp) {
+            tmp.rsp = new_rsp;
+            idx += consumed;
+            consumed_any = true;
+            continue;
+        }
 
-        _ => unreachable!(),
+        if let Some((new_rsp, consumed)) = decode_lea_rsp(bytes, idx, &tmp) {
+            tmp.rsp = new_rsp;
+            idx += consumed;
+            consumed_any = true;
+            continue;
+        }
+
+        if let Some((reg, consumed)) = decode_pop_reg(bytes, idx) {
+            let Some(value) = read_stack_u64(bounds, tmp.rsp) else {
+                return Some(STATUS_BAD_STACK_READ);
+            };
+
+            tmp.set_reg(reg, value);
+            tmp.rsp = tmp.rsp.saturating_add(8);
+            idx += consumed;
+            consumed_any = true;
+            continue;
+        }
+
+        if bytes[idx] == 0xc3 {
+            let Some(rip) = read_stack_u64(bounds, tmp.rsp) else {
+                return Some(STATUS_BAD_STACK_READ);
+            };
+
+            tmp.rsp = tmp.rsp.saturating_add(8);
+            tmp.rip = rip;
+            tmp.rip_is_return_address = true;
+            *ctx = tmp;
+            return Some(0);
+        }
+
+        if bytes[idx] == 0xc2 {
+            if idx + 2 >= bytes.len() {
+                return None;
+            }
+
+            let stack_adjust = u16::from_le_bytes([bytes[idx + 1], bytes[idx + 2]]) as u64;
+            let Some(rip) = read_stack_u64(bounds, tmp.rsp) else {
+                return Some(STATUS_BAD_STACK_READ);
+            };
+
+            tmp.rsp = tmp.rsp.saturating_add(8).saturating_add(stack_adjust);
+            tmp.rip = rip;
+            tmp.rip_is_return_address = true;
+            *ctx = tmp;
+            return Some(0);
+        }
+
+        return if consumed_any { None } else { None };
+    }
+}
+
+fn decode_add_rsp(bytes: &[u8], idx: usize, rsp: u64) -> Option<(u64, usize)> {
+    if idx + 3 < bytes.len()
+        && bytes[idx] == 0x48
+        && bytes[idx + 1] == 0x83
+        && bytes[idx + 2] == 0xc4
+    {
+        let imm = bytes[idx + 3] as i8 as i64;
+        return add_signed_u64(rsp, imm).map(|value| (value, 4));
     }
 
-    if preindexed {
-        context.sp = add_sp(context.sp, offset)?;
+    if idx + 6 < bytes.len()
+        && bytes[idx] == 0x48
+        && bytes[idx + 1] == 0x81
+        && bytes[idx + 2] == 0xc4
+    {
+        let imm = i32::from_le_bytes([
+            bytes[idx + 3],
+            bytes[idx + 4],
+            bytes[idx + 5],
+            bytes[idx + 6],
+        ]) as i64;
+
+        return add_signed_u64(rsp, imm).map(|value| (value, 7));
     }
 
-    if !pair {
-        return Ok(None);
+    None
+}
+
+fn decode_lea_rsp(bytes: &[u8], idx: usize, ctx: &UnwindContext) -> Option<(u64, usize)> {
+    if idx + 3 >= bytes.len() {
+        return None;
     }
 
-    let pair_kind = match kind {
-        0 => SavedPairKind::Integer,
-        1 => SavedPairKind::Float64,
-        2 => SavedPairKind::Float128,
-        _ => unreachable!(),
+    let rex = bytes[idx];
+    if rex & 0xf0 != 0x40 || rex & 0x08 == 0 || rex & 0x04 != 0 {
+        return None;
+    }
+
+    if bytes[idx + 1] != 0x8d {
+        return None;
+    }
+
+    let modrm = bytes[idx + 2];
+    let mode = modrm >> 6;
+    let reg = (modrm >> 3) & 0x7;
+    let rm = modrm & 0x7;
+
+    if reg != 4 || rm == 4 {
+        return None;
+    }
+
+    let base_reg = rm | ((rex & 0x01) << 3);
+    let base = ctx.get_reg(base_reg)?;
+
+    match mode {
+        1 => {
+            if idx + 3 >= bytes.len() {
+                return None;
+            }
+
+            let disp = bytes[idx + 3] as i8 as i64;
+            add_signed_u64(base, disp).map(|value| (value, 4))
+        }
+        2 => {
+            if idx + 6 >= bytes.len() {
+                return None;
+            }
+
+            let disp = i32::from_le_bytes([
+                bytes[idx + 3],
+                bytes[idx + 4],
+                bytes[idx + 5],
+                bytes[idx + 6],
+            ]) as i64;
+
+            add_signed_u64(base, disp).map(|value| (value, 7))
+        }
+        _ => None,
+    }
+}
+
+fn decode_pop_reg(bytes: &[u8], idx: usize) -> Option<(u8, usize)> {
+    if idx >= bytes.len() {
+        return None;
+    }
+
+    let byte = bytes[idx];
+    if (0x58..=0x5f).contains(&byte) {
+        return Some((byte - 0x58, 1));
+    }
+
+    if idx + 1 >= bytes.len() {
+        return None;
+    }
+
+    let rex = bytes[idx];
+    let next = bytes[idx + 1];
+
+    if rex & 0xf0 == 0x40 && rex & 0x01 != 0 && (0x58..=0x5f).contains(&next) {
+        return Some((8 + next - 0x58, 2));
+    }
+
+    None
+}
+
+fn unwind_machine_frame(
+    ctx: &mut UnwindContext,
+    bounds: StackBounds,
+    error_code: bool,
+) -> Option<()> {
+    let frame = if error_code {
+        ctx.rsp.checked_add(8)?
+    } else {
+        ctx.rsp
     };
 
-    let stride = match kind {
-        0 | 1 => 16,
-        2 => 32,
-        _ => unreachable!(),
-    };
+    let rip = read_stack_u64(bounds, frame)?;
+    let old_rsp = read_stack_u64(bounds, frame.checked_add(0x18)?)?;
 
-    Ok(Some(SavedPair {
-        kind: pair_kind,
-        reg,
-        address,
-        stride,
-    }))
+    ctx.rip = rip;
+    ctx.rsp = old_rsp;
+    ctx.rip_is_return_address = false;
+
+    Some(())
 }
 
-fn restore_pair(
-    context: &mut UnwindContext,
-    bounds: StackBounds,
-    reg: u8,
-    address: u64,
-) -> Result<(), u32> {
-    restore_reg(context, bounds, reg, address)?;
-    restore_reg(context, bounds, reg + 1, address + 8)
+fn add_signed_u64(value: u64, offset: i64) -> Option<u64> {
+    if offset >= 0 {
+        value.checked_add(offset as u64)
+    } else {
+        value.checked_sub(offset.unsigned_abs())
+    }
 }
 
-fn restore_reg(
-    context: &mut UnwindContext,
-    bounds: StackBounds,
-    reg: u8,
-    address: u64,
-) -> Result<(), u32> {
-    let value = read_stack_u64(bounds, address).ok_or(STATUS_BAD_STACK_READ)?;
+fn read_chained_runtime_function(
+    module: &PeUnwindModule,
+    info: u64,
+    code_count: usize,
+) -> Option<RuntimeFunction> {
+    let aligned_count = (code_count + 1) & !1;
+    let addr = info.checked_add(4 + (aligned_count * 2) as u64)?;
 
-    context.set_reg(reg, value);
+    let begin_rva = read_image_u32(module, addr)?;
+    let end_rva = read_image_u32(module, addr + 4)?;
+    let unwind_rva = read_image_u32(module, addr + 8)?;
 
-    Ok(())
+    if begin_rva == 0 || end_rva <= begin_rva || unwind_rva == 0 {
+        return None;
+    }
+
+    Some(RuntimeFunction {
+        begin_rva,
+        end_rva,
+        unwind_rva,
+    })
 }
 
-fn restore_fplr(context: &mut UnwindContext, bounds: StackBounds, address: u64) -> Result<(), u32> {
-    context.fp = read_stack_u64(bounds, address).ok_or(STATUS_BAD_STACK_READ)?;
-
-    context.lr = read_stack_u64(bounds, address + 8).ok_or(STATUS_BAD_STACK_READ)?;
-
-    Ok(())
+fn read_unwind_code(module: &PeUnwindModule, info: u64, idx: usize) -> Option<(u8, u8, u8)> {
+    let slot = info.checked_add(4 + (idx * 2) as u64)?;
+    let bytes = read_image_bytes(module, slot, 2)?;
+    Some((bytes[0], bytes[1] & 0x0f, bytes[1] >> 4))
 }
 
-fn add_sp(sp: u64, size: u64) -> Result<u64, u32> {
-    sp.checked_add(size).ok_or(STATUS_BAD_STACK_READ)
+fn read_alloc_large_size(
+    module: &PeUnwindModule,
+    info: u64,
+    idx: usize,
+    op_info: u8,
+) -> Option<u32> {
+    match op_info {
+        0 => read_unwind_u16_slot(module, info, idx).map(|v| v as u32 * 8),
+        1 => read_unwind_u32_slot(module, info, idx),
+        _ => None,
+    }
 }
 
-fn finish(context: &mut UnwindContext) {
-    context.pc = context.lr;
-    context.pc_is_return_address = true;
+fn read_unwind_u16_slot(module: &PeUnwindModule, info: u64, idx: usize) -> Option<u16> {
+    let slot = info.checked_add(4 + (idx * 2) as u64)?;
+    let bytes = read_image_bytes(module, slot, 2)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
-fn valid_address(address: u64) -> bool {
-    address >> 56 == 0 || address >> 56 == 0xff
+fn read_unwind_u32_slot(module: &PeUnwindModule, info: u64, idx: usize) -> Option<u32> {
+    let slot = info.checked_add(4 + (idx * 2) as u64)?;
+    read_image_u32(module, slot)
+}
+
+fn leaf_unwind(ctx: &mut UnwindContext, bounds: StackBounds) -> Option<()> {
+    let rip = read_stack_u64(bounds, ctx.rsp)?;
+    ctx.rsp = ctx.rsp.checked_add(8)?;
+    ctx.rip = rip;
+    ctx.rip_is_return_address = true;
+    Some(())
+}
+
+fn is_canonical(addr: u64) -> bool {
+    let high = addr >> 48;
+    let sign = (addr >> 47) & 1;
+    (sign == 0 && high == 0) || (sign == 1 && high == 0xffff)
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct UnwindContext {
+    rip: u64,
+    rsp: u64,
+    rbx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip_is_return_address: bool,
 }
 
 impl UnwindContext {
-    fn from_state(state: &TaskContext) -> Self {
+    fn from_state(state: &State) -> Self {
         Self {
-            pc: state.elr,
-            sp: state.sp,
-            registers: [
-                state.x[19],
-                state.x[20],
-                state.x[21],
-                state.x[22],
-                state.x[23],
-                state.x[24],
-                state.x[25],
-                state.x[26],
-                state.x[27],
-                state.x[28],
-                0,
-                0,
-            ],
-            fp: state.x[29],
-            lr: state.x[30],
-            pc_is_return_address: false,
+            rip: state.rip,
+            rsp: state.rsp,
+            rbx: state.rbx,
+            rbp: state.rbp,
+            rsi: state.rsi,
+            rdi: state.rdi,
+            r12: state.r12,
+            r13: state.r13,
+            r14: state.r14,
+            r15: state.r15,
+            rip_is_return_address: false,
         }
     }
 
     fn control_pc(&self) -> u64 {
-        if self.pc_is_return_address {
-            self.pc.saturating_sub(4)
+        if self.rip_is_return_address {
+            self.rip.saturating_sub(1)
         } else {
-            self.pc
+            self.rip
+        }
+    }
+
+    fn get_reg(&self, reg: u8) -> Option<u64> {
+        match reg {
+            3 => Some(self.rbx),
+            5 => Some(self.rbp),
+            6 => Some(self.rsi),
+            7 => Some(self.rdi),
+            12 => Some(self.r12),
+            13 => Some(self.r13),
+            14 => Some(self.r14),
+            15 => Some(self.r15),
+            _ => None,
         }
     }
 
     fn set_reg(&mut self, reg: u8, value: u64) {
         match reg {
-            19..=28 => {
-                self.registers[(reg - 19) as usize] = value;
-            }
-
-            29 => {
-                self.fp = value;
-            }
-
-            30 => {
-                self.lr = value;
-            }
-
+            3 => self.rbx = value,
+            5 => self.rbp = value,
+            6 => self.rsi = value,
+            7 => self.rdi = value,
+            12 => self.r12 = value,
+            13 => self.r13 = value,
+            14 => self.r14 = value,
+            15 => self.r15 = value,
             _ => {}
         }
     }
