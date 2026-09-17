@@ -53,7 +53,7 @@ const IORT_NODE_LENGTH_OFFSET: usize = 1;
 const IORT_NODE_MAPPING_COUNT_OFFSET: usize = 8;
 const IORT_NODE_MAPPING_OFFSET_OFFSET: usize = 12;
 const IORT_NODE_SMMU_V3: u8 = 4;
-const IORT_SMMU_V3_NODE_SIZE: usize = 72;
+const IORT_SMMU_V3_NODE_SIZE: usize = 68;
 const IORT_SMMU_V3_BASE_OFFSET: usize = 16;
 const IORT_SMMU_V3_FLAGS_OFFSET: usize = 24;
 const IORT_SMMU_V3_FLAGS_COHACC_OVERRIDE: u32 = 1 << 0;
@@ -1151,8 +1151,9 @@ impl DeviceMmuBackend for SmmuV3 {
                 .alloc_layout()
                 .map_err(|_| DeviceMmuError::InvalidDomain)?,
         )?;
-        let geometry = RootTableGeometry::<Format, Granule>::new(root, input_bits, self.output_bits)
-            .map_err(|_| DeviceMmuError::InvalidDomain)?;
+        let geometry =
+            RootTableGeometry::<Format, Granule>::new(root, input_bits, self.output_bits)
+                .map_err(|_| DeviceMmuError::InvalidDomain)?;
         let mapper = Mapper::new_offline(
             RootTable::<Format, NonSecureIpaStage2, Granule>::from_geometry(geometry),
             memory.clone(),

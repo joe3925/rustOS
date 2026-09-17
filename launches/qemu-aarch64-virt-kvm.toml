@@ -5,16 +5,18 @@ executable = "qemu-system-aarch64"
 compatible_platforms = ["aarch64-uefi"]
 supported_hosts = ["linux"]
 supported_host_arches = ["aarch64"]
+
 firmware_files = [
     "edk2-aarch64-code.fd",
     "edk2-arm-code.fd",
     "QEMU_EFI.fd",
     "QEMU_EFI-pflash.raw",
 ]
+
 args = [
     "-m", "{memory}",
     "-cpu", "host",
-    "-machine", "virt,gic-version=host",
+    "-machine", "virt,gic-version=host,iommu=smmuv3",
     "-accel", "kvm",
     "-smp", "{cpus}",
     "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",
@@ -26,8 +28,8 @@ args = [
 ]
 
 [defaults]
-memory = "12G"
-cpus = "1"
+memory = "1G"
+cpus = "3"
 
 [capabilities]
 debug = false

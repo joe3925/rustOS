@@ -82,22 +82,29 @@ impl GicV3 {
         unsafe {
             let waker = (frame + 0x14) as *mut u32;
             waker.write_volatile(waker.read_volatile() & !(1 << 1));
+
             while waker.read_volatile() & (1 << 2) != 0 {
                 core::hint::spin_loop();
             }
+
             let sgi = frame + 0x1_0000;
-            ((sgi + 0x80) as *mut u32).write_volatile(u32::MAX);
-            ((sgi + 0x180) as *mut u32).write_volatile(u32::MAX);
+
+            mmio_write32(sgi + 0x80, u32::MAX);
+            mmio_write32(sgi + 0x180, u32::MAX);
+
             for intid in (0..32).step_by(4) {
-                ((sgi + 0x400 + intid) as *mut u32).write_volatile(0xa0a0_a0a0);
+                mmio_write32(sgi + 0x400 + intid, 0xa0a0_a0a0);
             }
-            ((sgi + 0x100) as *mut u32).write_volatile(
+
+            mmio_write32(
+                sgi + 0x100,
                 (1 << SCHEDULER_SGI)
                     | (1 << TLB_SHOOTDOWN_SGI)
                     | (1 << PANIC_STOP_SGI)
                     | (1 << TASK_YIELD_SGI)
                     | (1 << VIRTUAL_TIMER_PPI),
             );
+
             write_icc_sre_el1(read_icc_sre_el1() | 1);
             isb(SY);
             write_icc_pmr_el1(0xff);
@@ -128,10 +135,7 @@ impl GicV3 {
             .and_then(|its| its.vector_for_lpi(intid))
             .map(u32::from)
             .unwrap_or(intid);
-        Some(InterruptToken {
-            raw,
-            interrupt_id,
-        })
+        Some(InterruptToken { raw, interrupt_id })
     }
 
     pub(super) fn end_interrupt(&self, token: InterruptToken) {
@@ -248,7 +252,17 @@ impl GicV3 {
         }
     }
 }
-
+#[inline(always)]
+unsafe fn mmio_write32(address: usize, value: u32) {
+    unsafe {
+        core::arch::asm!(
+            "str {value:w}, [{address}]",
+            address = in(reg) address,
+            value = in(reg) value,
+            options(nostack),
+        );
+    }
+}
 fn current_affinity() -> u64 {
     let mpidr = crate::arch::aarch64::cpu::current_hardware_id();
     ((mpidr >> 32) & 0xff) << 24
