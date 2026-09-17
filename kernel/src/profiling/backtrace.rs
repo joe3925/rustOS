@@ -118,42 +118,7 @@ impl Backtrace {
         };
 
         let kernel_module = PeUnwindModule::kernel();
-        match kernel_module {
-            Some(module) => {
-                crate::println!(
-                    "kernel unwind: base={:#x} end={:#x} pdata={:#x} pdata_len={:#x} pc={:#x} contains={}",
-                    module.image_base,
-                    module.image_end,
-                    module.pdata_base,
-                    module.pdata_len,
-                    start.pc.as_u64(),
-                    module.contains(start.pc.as_u64()),
-                );
-            }
-            None => {
-                crate::println!("kernel unwind: failed to construct kernel module");
 
-                let boot = crate::util::boot_info();
-
-                crate::println!(
-                    "kernel image base={:#x} size={:#x} sections={}",
-                    boot.kernel_image_base,
-                    boot.kernel_image_size,
-                    boot.kernel_sections.len(),
-                );
-
-                for section in boot.kernel_sections.as_slice() {
-                    crate::println!(
-                        "section {:?} rva={:#x} vsize={:#x} raw={:#x} loaded={:#x}",
-                        section.name,
-                        section.virtual_address,
-                        section.virtual_size,
-                        section.raw_size,
-                        section.loaded_address,
-                    );
-                }
-            }
-        }
         let boot = crate::util::boot_info();
 
         let kernel_start = boot.kernel_image_base;
