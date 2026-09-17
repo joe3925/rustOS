@@ -138,7 +138,6 @@ fn record_completion_fit_sample(byte_len: usize, elapsed_ns: u64) {
 
 #[inline]
 pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
-    return None;
     let x = completion_fit_x(byte_len);
 
     if x == 0 {
@@ -307,7 +306,6 @@ extern "C" fn virtio_isr(
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
-    println!("wired isr");
     let isr_va = ctx as *const u8;
     let isr_status = unsafe { core::ptr::read_volatile(isr_va) };
 
@@ -330,7 +328,6 @@ extern "C" fn virtio_msix_isr(
     handle: IrqBorrowedHandle,
     _ctx: usize,
 ) -> bool {
-    println!("msix isr");
     handle.signal_one(IrqMeta {
         tag: 0,
         data: [0; 3],

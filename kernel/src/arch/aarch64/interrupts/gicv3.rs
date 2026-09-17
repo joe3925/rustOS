@@ -122,19 +122,21 @@ impl GicV3 {
             );
         }
     }
-
     pub(super) fn acknowledge(&self) -> Option<InterruptToken> {
         let raw = unsafe { read_icc_iar1_el1() };
         let intid = raw & 0x00ff_ffff;
-        if intid >= 1020 {
+
+        if (1020..=1023).contains(&intid) {
             return None;
         }
+
         let interrupt_id = self
             .its
             .as_ref()
             .and_then(|its| its.vector_for_lpi(intid))
             .map(u32::from)
             .unwrap_or(intid);
+
         Some(InterruptToken { raw, interrupt_id })
     }
 
