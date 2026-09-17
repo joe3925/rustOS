@@ -135,19 +135,53 @@ fn function_base(bus_base: VirtAddr, dev: u8, func: u8) -> VirtAddr {
     VirtAddr::new(bus_base.as_u64() + ((dev as u64) << 15) + ((func as u64) << 12))
 }
 
-#[inline]
+#[inline(always)]
 unsafe fn cfg_read32(base: VirtAddr, off: u16) -> u32 {
-    unsafe {
-        let p = (base.as_u64() + off as u64) as *const u32;
-        core::ptr::read_volatile(p)
+    let address = base.as_u64() + off as u64;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let value: u32;
+
+        unsafe {
+            core::arch::asm!(
+                "ldr {value:w}, [{address}]",
+                value = lateout(reg) value,
+                address = in(reg) address,
+                options(nostack),
+            );
+        }
+
+        value
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        unsafe { core::ptr::read_volatile(address as *const u32) }
     }
 }
 
-#[inline]
-unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) {
-    unsafe {
-        let p = (base.as_u64() + off as u64) as *mut u32;
-        core::ptr::write_volatile(p, v);
+#[inline(always)]
+unsafe fn cfg_write32(base: VirtAddr, off: u16, value: u32) {
+    let address = base.as_u64() + off as u64;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            core::arch::asm!(
+                "str {value:w}, [{address}]",
+                value = in(reg) value,
+                address = in(reg) address,
+                options(nostack),
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        unsafe {
+            core::ptr::write_volatile(address as *mut u32, value);
+        }
     }
 }
 
