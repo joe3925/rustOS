@@ -121,6 +121,25 @@
     "allow_concurrent_runs": false,
   },
   {
+    "label": "run aarch64 Q35 (hvf)",
+    "command": "cargo",
+    "args": [
+      "run",
+      "-p",
+      "xtask",
+      "--",
+      "qemu",
+      "--platform",
+      "aarch64-uefi",
+      "--launch",
+      "qemu-aarch64-virt-hvf",
+      "--release",
+      "--console-serial"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false,
+  },
+  {
     "label": "run x86_64 Q35 (TCG)",
     "command": "cargo",
     "args": [
