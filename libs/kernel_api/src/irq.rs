@@ -7,8 +7,8 @@ use kernel_sys::{
 use kernel_types::irq::IRQ_RESCUE_WAKEUP;
 pub use kernel_types::irq::{
     HardwareInterruptId, IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK, IrqBorrowedHandle, IrqHandle,
-    IrqIsrFn, IrqMeta, IrqWaitResult, MsiBinding, MsiBindingRequest, MsiMessage, MsiRequester,
-    MsiTarget,
+    IrqIsrFn, IrqMeta, IrqWaitResult, MsiBinding, MsiBindingRequest, MsiMessage, MsiRequest,
+    MsiRequester, MsiTarget,
 };
 
 use kernel_types::async_ffi::AbiFuture;

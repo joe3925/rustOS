@@ -23,10 +23,10 @@ kernel_api = { path = "../libs/kernel_api", default-features = false }
 device_tree = { path = "../third_party/device_tree" }
 
 [profile.dev]
-opt-level = 3
+opt-level = "z"
 panic = "abort"
 lto = true
-codegen-units = 1
+codegen-units = 256
 debug = true
 
 [profile.release]

@@ -275,6 +275,16 @@ pub trait DeviceMmuBackend: Send + Sync {
         len: u64,
         permissions: DeviceMmuMapPermissions,
     ) -> DeviceMmuResult<()>;
+    fn map_mmio_range(
+        &self,
+        _domain: &DeviceMmuDomain,
+        _iova: u64,
+        _phys: u64,
+        _len: u64,
+        _permissions: DeviceMmuMapPermissions,
+    ) -> DeviceMmuResult<()> {
+        Err(DeviceMmuError::Unsupported)
+    }
 
     fn unmap_range(
         &self,
@@ -370,6 +380,31 @@ impl DeviceMmuSystem {
         }
 
         self.backend.map_range(domain, iova, phys, len, permissions)
+    }
+    pub fn map_mmio_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        permissions: DeviceMmuMapPermissions,
+    ) -> DeviceMmuResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let page_size = domain.device_page_size();
+
+        if page_size == 0 {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        if (iova % page_size) != 0 || (phys % page_size) != 0 || (len % page_size) != 0 {
+            return Err(DeviceMmuError::InvalidRange);
+        }
+
+        self.backend
+            .map_mmio_range(domain, iova, phys, len, permissions)
     }
 
     pub fn unmap_range(

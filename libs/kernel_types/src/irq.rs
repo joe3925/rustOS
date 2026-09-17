@@ -1,3 +1,4 @@
+use crate::dma::implementation::DmaDeviceHandle;
 use alloc::collections::VecDeque;
 use core::cell::UnsafeCell;
 use core::mem::{ManuallyDrop, MaybeUninit};
@@ -116,8 +117,7 @@ impl MsiMessage {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, kernel_macros::RequestPayload)]
-pub struct MsiBindingRequest {
-    pub requester: MsiRequester,
+pub struct MsiRequest {
     pub target: MsiTarget,
     pub table_index: u16,
     pub reserved0: u16,
@@ -125,15 +125,9 @@ pub struct MsiBindingRequest {
     pub flags: u32,
 }
 
-impl MsiBindingRequest {
-    pub const fn new(
-        requester: MsiRequester,
-        target: MsiTarget,
-        kind: u32,
-        table_index: u16,
-    ) -> Self {
+impl MsiRequest {
+    pub const fn new(target: MsiTarget, kind: u32, table_index: u16) -> Self {
         Self {
-            requester,
             target,
             table_index,
             reserved0: 0,
@@ -143,15 +137,47 @@ impl MsiBindingRequest {
     }
 
     pub const fn pci_msix(target: MsiTarget, table_index: u16) -> Self {
-        Self::new(MsiRequester::none(), target, MSI_KIND_MSIX, table_index)
-    }
-
-    pub const fn with_requester(mut self, requester: MsiRequester) -> Self {
-        self.requester = requester;
-        self
+        Self::new(target, MSI_KIND_MSIX, table_index)
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, kernel_macros::RequestPayload)]
+pub struct MsiBindingRequest {
+    pub requester: MsiRequester,
+    pub target: MsiTarget,
+    pub device: Option<DmaDeviceHandle>,
+    pub table_index: u16,
+    pub reserved0: u16,
+    pub kind: u32,
+    pub flags: u32,
+}
+
+impl MsiBindingRequest {
+    pub const fn new(
+        request: MsiRequest,
+        requester: MsiRequester,
+        device: Option<DmaDeviceHandle>,
+    ) -> Self {
+        Self {
+            requester,
+            target: request.target,
+            device,
+            table_index: request.table_index,
+            reserved0: request.reserved0,
+            kind: request.kind,
+            flags: request.flags,
+        }
+    }
+
+    pub const fn from_pci(
+        request: MsiRequest,
+        requester: MsiRequester,
+        device: DmaDeviceHandle,
+    ) -> Self {
+        Self::new(request, requester, Some(device))
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsiBinding {

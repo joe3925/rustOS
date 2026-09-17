@@ -1,7 +1,11 @@
+use crate::DriverErrorKind;
+use crate::KernelError;
 use alloc::sync::Arc;
 use core::ptr::{read_volatile, write_volatile};
-
 use kernel_api::device::DeviceObject;
+use kernel_api::dma::open_device_handle;
+use kernel_api::error::error_with_message;
+use kernel_api::irq::MsiRequest;
 use kernel_api::irq::{IrqHandleExt, bind_msi_interrupt};
 use kernel_api::kernel_types::irq::{
     IrqHandle, IrqIsrFn, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiBindingRequest,
@@ -29,96 +33,302 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 /// Program MSI-X table and enable MSI-X capability.
 pub extern "C" fn pci_setup_msix(
     dev: &Arc<DeviceObject>,
-    request: MsiBindingRequest,
+    request: MsiRequest,
     isr: IrqIsrFn,
     context: usize,
-) -> IrqHandle {
-    let ext = match dev.try_devext::<PciPdoExt>() {
-        Ok(e) => e,
-        Err(_) => return IrqHandle::null(),
-    };
-
-    let msix = match ext.msix.as_ref() {
-        Some(m) => m,
-        None => return IrqHandle::null(),
-    };
-
-    if request.kind != MSI_KIND_MSIX
-        || request.table_index >= msix.table_size
-        || !matches!(
-            request.target.mode,
-            MSI_TARGET_ANY | MSI_TARGET_PLATFORM_CPU
+) -> Result<IrqHandle, KernelError> {
+    let ext = dev.try_devext::<PciPdoExt>().map_err(|err| {
+        error_with_message(
+            DriverErrorKind::NoSuchDevice,
+            format_args!("failed to access PCI device extension while configuring MSI-X: {err:?}"),
         )
-    {
-        return IrqHandle::null();
+    })?;
+
+    let msix = ext.msix.as_ref().ok_or_else(|| {
+        error_with_message(
+            DriverErrorKind::NotImplemented,
+            format_args!(
+                "PCI device {:04x}:{:02x}:{:02x}.{} does not expose an MSI-X capability",
+                ext.seg, ext.bus, ext.dev, ext.func,
+            ),
+        )
+    })?;
+
+    if request.kind != MSI_KIND_MSIX {
+        return Err(error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!(
+                "invalid MSI request kind {} for PCI MSI-X setup on {:04x}:{:02x}:{:02x}.{}",
+                request.kind, ext.seg, ext.bus, ext.dev, ext.func,
+            ),
+        ));
     }
 
-    let table_bar = &ext.bars[msix.table_bar as usize];
+    if request.table_index >= msix.table_size {
+        return Err(error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!(
+                "MSI-X table index {} is out of range for PCI device \
+                 {:04x}:{:02x}:{:02x}.{}; table contains {} entries",
+                request.table_index, ext.seg, ext.bus, ext.dev, ext.func, msix.table_size,
+            ),
+        ));
+    }
+
+    if !matches!(
+        request.target.mode,
+        MSI_TARGET_ANY | MSI_TARGET_PLATFORM_CPU
+    ) {
+        return Err(error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!(
+                "unsupported MSI target mode {} for PCI device \
+                 {:04x}:{:02x}:{:02x}.{}",
+                request.target.mode, ext.seg, ext.bus, ext.dev, ext.func,
+            ),
+        ));
+    }
+
+    let dma_device = open_device_handle(dev).ok();
+
+    let request = MsiBindingRequest::new(
+        request,
+        MsiRequester::pci(ext.seg, ext.bus, ext.dev, ext.func),
+        dma_device,
+    );
+
+    let table_bar = ext.bars.get(msix.table_bar as usize).ok_or_else(|| {
+        error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!(
+                "MSI-X capability for PCI device {:04x}:{:02x}:{:02x}.{} \
+                     references invalid BAR {}",
+                ext.seg, ext.bus, ext.dev, ext.func, msix.table_bar,
+            ),
+        )
+    })?;
+
     if table_bar.kind == BarKind::None {
-        return IrqHandle::null();
+        return Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!(
+                "MSI-X capability for PCI device {:04x}:{:02x}:{:02x}.{} \
+                 references BAR {}, but that BAR is not present",
+                ext.seg, ext.bus, ext.dev, ext.func, msix.table_bar,
+            ),
+        ));
     }
 
-    let table_region_size = ((msix.table_size as u64 * 16) + 0xFFF) & !0xFFF;
-    let table_phys = table_bar.base + msix.table_offset as u64;
+    let table_region_size = (msix.table_size as u64)
+        .checked_mul(16)
+        .and_then(|size| size.checked_add(0xFFF))
+        .map(|size| size & !0xFFF)
+        .ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!(
+                    "MSI-X table size overflow for PCI device \
+                     {:04x}:{:02x}:{:02x}.{} with {} entries",
+                    ext.seg, ext.bus, ext.dev, ext.func, msix.table_size,
+                ),
+            )
+        })?;
 
-    let table_va = match map_mmio_region(PhysAddr::new(table_phys), table_region_size) {
-        Ok(va) => va,
-        Err(_) => return IrqHandle::null(),
-    };
-    kernel_api::println!("MSI-X table phys={:#x} va={:#x} size={:#x}", table_phys, table_va.as_u64(), table_region_size);
+    let table_phys = table_bar
+        .base
+        .checked_add(msix.table_offset as u64)
+        .ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!(
+                    "MSI-X table physical address overflow for PCI device \
+                     {:04x}:{:02x}:{:02x}.{}: BAR base {:#x}, table offset {:#x}",
+                    ext.seg, ext.bus, ext.dev, ext.func, table_bar.base, msix.table_offset,
+                ),
+            )
+        })?;
 
-    let request = request.with_requester(MsiRequester::pci(ext.seg, ext.bus, ext.dev, ext.func));
-    let Some(binding) = bind_msi_interrupt(&request, isr, context) else {
-        kernel_api::println!("MSI-X bind failed table va={:#x}", table_va.as_u64());
-        let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-        return IrqHandle::null();
-    };
-    let entry_offset = request.table_index as u64 * 16;
-    let entry_va = table_va.as_u64() + entry_offset;
+    let table_va =
+        map_mmio_region(PhysAddr::new(table_phys), table_region_size).map_err(|err| {
+            error_with_message(
+                DriverErrorKind::InsufficientResources,
+                format_args!(
+                    "failed to map MSI-X table for PCI device \
+                 {:04x}:{:02x}:{:02x}.{} at physical address {:#x}, \
+                 size {:#x}: {err:?}",
+                    ext.seg, ext.bus, ext.dev, ext.func, table_phys, table_region_size,
+                ),
+            )
+        })?;
 
-    // Vector Control: bit 0 = mask (0 = masked)
-    let vector_ctrl_masked: u32 = 1;
-    let vector_ctrl_unmasked: u32 = 0;
+    kernel_api::println!(
+        "MSI-X table phys={:#x} va={:#x} size={:#x}",
+        table_phys,
+        table_va.as_u64(),
+        table_region_size,
+    );
 
-    unsafe {
-        // Program entry while masked to avoid spurious interrupts on picky devices.
-        write_volatile((entry_va + 12) as *mut u32, vector_ctrl_masked);
-        write_volatile((entry_va + 0) as *mut u32, binding.message.address_lo());
-        write_volatile((entry_va + 4) as *mut u32, binding.message.address_hi());
-        write_volatile((entry_va + 8) as *mut u32, binding.message.data);
-        write_volatile((entry_va + 12) as *mut u32, vector_ctrl_unmasked);
-    }
+    let binding = match bind_msi_interrupt(&request, isr, context) {
+        Some(binding) => binding,
 
-    // Read back and verify
-    let _rb_addr = unsafe { read_volatile((entry_va + 0) as *const u32) };
-    let _rb_data = unsafe { read_volatile((entry_va + 8) as *const u32) };
-    let _rb_ctrl = unsafe { read_volatile((entry_va + 12) as *const u32) };
+        None => {
+            let unmap_result = unsafe { unmap_mmio_region(table_va, table_region_size) };
 
-    let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
-        Ok(va) => va,
-        Err(_) => {
-            let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-            binding.handle.unregister();
-            return IrqHandle::null();
+            let mut error = error_with_message(
+                DriverErrorKind::InsufficientResources,
+                format_args!(
+                    "failed to bind MSI-X interrupt for PCI device \
+                     {:04x}:{:02x}:{:02x}.{}, table index {}, target mode {}, target CPU {}",
+                    ext.seg,
+                    ext.bus,
+                    ext.dev,
+                    ext.func,
+                    request.table_index,
+                    request.target.mode,
+                    request.target.platform_cpu_id,
+                ),
+            );
+
+            if let Err(unmap_err) = unmap_result {
+                error = error.with_context(format_args!(
+                    "additionally failed to unmap MSI-X table VA {:#x}, size {:#x}: {unmap_err:?}",
+                    table_va.as_u64(),
+                    table_region_size,
+                ));
+            }
+
+            return Err(error);
         }
     };
 
-    // Enable Bus Master (bit 2) and Memory Space (bit 1) in PCI Command register.
-    // Bus Master is required for MSI-X since the device must perform memory writes.
+    let entry_offset = (request.table_index as u64)
+        .checked_mul(16)
+        .ok_or_else(|| {
+            binding.handle.unregister();
+
+            let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
+
+            error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!(
+                    "MSI-X table entry offset overflow for table index {}",
+                    request.table_index,
+                ),
+            )
+        })?;
+
+    let entry_va = table_va.as_u64().checked_add(entry_offset).ok_or_else(|| {
+        binding.handle.unregister();
+
+        let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
+
+        error_with_message(
+            DriverErrorKind::InvalidParameter,
+            format_args!(
+                "MSI-X table virtual address overflow: table VA {:#x}, entry offset {:#x}",
+                table_va.as_u64(),
+                entry_offset,
+            ),
+        )
+    })?;
+
+    const VECTOR_CTRL_MASKED: u32 = 1;
+    const VECTOR_CTRL_UNMASKED: u32 = 0;
+
+    unsafe {
+        write_volatile((entry_va + 12) as *mut u32, VECTOR_CTRL_MASKED);
+
+        write_volatile(entry_va as *mut u32, binding.message.address_lo());
+
+        write_volatile((entry_va + 4) as *mut u32, binding.message.address_hi());
+
+        write_volatile((entry_va + 8) as *mut u32, binding.message.data);
+
+        write_volatile((entry_va + 12) as *mut u32, VECTOR_CTRL_UNMASKED);
+    }
+
+    let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
+        Ok(va) => va,
+
+        Err(map_err) => {
+            unsafe {
+                write_volatile((entry_va + 12) as *mut u32, VECTOR_CTRL_MASKED);
+            }
+
+            binding.handle.unregister();
+
+            let unmap_result = unsafe { unmap_mmio_region(table_va, table_region_size) };
+
+            let mut error = error_with_message(
+                DriverErrorKind::InsufficientResources,
+                format_args!(
+                    "failed to map PCI configuration space while enabling MSI-X for \
+                     {:04x}:{:02x}:{:02x}.{} at physical address {:#x}: {map_err:?}",
+                    ext.seg, ext.bus, ext.dev, ext.func, ext.cfg_phys,
+                ),
+            );
+
+            if let Err(unmap_err) = unmap_result {
+                error = error.with_context(format_args!(
+                    "additionally failed to unmap MSI-X table VA {:#x}, size {:#x}: {unmap_err:?}",
+                    table_va.as_u64(),
+                    table_region_size,
+                ));
+            }
+
+            return Err(error);
+        }
+    };
+
     let cmd = unsafe { cfg_read16(cfg_va, 0x04) };
 
-    unsafe { cfg_write16(cfg_va, 0x04, cmd | 0x06) };
-    let _cmd_after = unsafe { cfg_read16(cfg_va, 0x04) };
+    unsafe {
+        cfg_write16(cfg_va, 0x04, cmd | 0x06);
+    }
 
     let msg_ctrl_offset = msix.cap_offset + 2;
+
     let msg_ctrl = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
+    let new_msg_ctrl = (msg_ctrl | (1 << 15)) & !(1 << 14);
 
-    let new_msg_ctrl = (msg_ctrl | (1 << 15)) & !(1 << 14); // Enable MSI-X, clear Function Mask
-    unsafe { cfg_write16(cfg_va, msg_ctrl_offset, new_msg_ctrl) };
-    let _msg_ctrl_after = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
+    unsafe {
+        cfg_write16(cfg_va, msg_ctrl_offset, new_msg_ctrl);
+    }
 
-    let _ = unsafe { unmap_mmio_region(cfg_va, 4096) };
-    let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
+    if let Err(err) = unsafe { unmap_mmio_region(cfg_va, 4096) } {
+        let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
 
-    binding.handle
+        return Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!(
+                "MSI-X was enabled for PCI device {:04x}:{:02x}:{:02x}.{}, \
+                 but unmapping its temporary configuration-space mapping \
+                 at VA {:#x} failed: {err:?}",
+                ext.seg,
+                ext.bus,
+                ext.dev,
+                ext.func,
+                cfg_va.as_u64(),
+            ),
+        ));
+    }
+
+    if let Err(err) = unsafe { unmap_mmio_region(table_va, table_region_size) } {
+        return Err(error_with_message(
+            DriverErrorKind::DeviceError,
+            format_args!(
+                "MSI-X was enabled for PCI device {:04x}:{:02x}:{:02x}.{}, \
+                 but unmapping its temporary MSI-X table mapping at VA {:#x}, \
+                 size {:#x} failed: {err:?}",
+                ext.seg,
+                ext.bus,
+                ext.dev,
+                ext.func,
+                table_va.as_u64(),
+                table_region_size,
+            ),
+        ));
+    }
+
+    Ok(binding.handle)
 }

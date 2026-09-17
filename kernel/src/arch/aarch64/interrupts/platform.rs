@@ -63,7 +63,9 @@ impl InterruptPlatform for Aarch64Platform {
         controller().broadcast_ipi(PANIC_STOP_SGI);
     }
     fn bind_msi(request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
-        controller().bind_msi(request, vector)
+        let message = controller().bind_msi(request, vector)?;
+
+        crate::arch::aarch64::memory::device_mmu::prepare_msi_message(request, message)
     }
     fn unbind_msi(vector: u8) {
         controller().unbind_msi(vector);

@@ -1,5 +1,6 @@
 use crate::device::{DeviceObject, Protocol, ProtocolId};
-use crate::irq::{IrqHandle, IrqIsrFn, MsiBindingRequest};
+use crate::error::KernelError;
+use crate::irq::{IrqHandle, IrqIsrFn, MsiBindingRequest, MsiRequest};
 use crate::pci::{Bar, MsixInfo};
 use alloc::sync::Arc;
 
@@ -10,8 +11,12 @@ pub struct PciProtocolVTable {
     pub get_gsi: extern "C" fn(&Arc<DeviceObject>) -> Option<u16>,
     pub get_interrupt_line: extern "C" fn(&Arc<DeviceObject>) -> Option<u8>,
     pub get_msix: extern "C" fn(&Arc<DeviceObject>) -> Option<MsixInfo>,
-    pub setup_msix:
-        extern "C" fn(&Arc<DeviceObject>, MsiBindingRequest, IrqIsrFn, usize) -> IrqHandle,
+    pub setup_msix: extern "C" fn(
+        &Arc<DeviceObject>,
+        MsiRequest,
+        IrqIsrFn,
+        usize,
+    ) -> Result<IrqHandle, KernelError>,
 }
 
 pub enum PciProtocol {}

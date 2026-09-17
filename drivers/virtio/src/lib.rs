@@ -18,6 +18,7 @@ use kernel_api::device::publish_stack_protocol;
 use kernel_api::device::register_protocol;
 use kernel_api::dma::map_buffer;
 use kernel_api::dma::map_persistent_contiguous_backing;
+use kernel_api::irq::MsiRequest;
 use kernel_api::irq::platform_cpu_ids;
 use kernel_api::kernel_types::pci::BarKind;
 
@@ -137,6 +138,7 @@ fn record_completion_fit_sample(byte_len: usize, elapsed_ns: u64) {
 
 #[inline]
 pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
+    return None;
     let x = completion_fit_x(byte_len);
 
     if x == 0 {
@@ -305,6 +307,7 @@ extern "C" fn virtio_isr(
     handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
+    println!("wired isr");
     let isr_va = ctx as *const u8;
     let isr_status = unsafe { core::ptr::read_volatile(isr_va) };
 
@@ -327,6 +330,7 @@ extern "C" fn virtio_msix_isr(
     handle: IrqBorrowedHandle,
     _ctx: usize,
 ) -> bool {
+    println!("msix isr");
     handle.signal_one(IrqMeta {
         tag: 0,
         data: [0; 3],
@@ -337,12 +341,12 @@ extern "C" fn virtio_msix_isr(
 
 async fn setup_msix_via_pci(
     dev: &Arc<DeviceObject>,
-    request: MsiBindingRequest,
+    request: MsiRequest,
     table_index: u16,
 ) -> Result<IrqHandle, KernelError> {
     let proto = open_protocol_to_next_lower::<PciProtocol>(dev)
         .map_err(|_| error(DriverErrorKind::NoSuchDevice))?;
-    let handle = (proto.setup_msix)(&proto.provider(), request, virtio_msix_isr, 0);
+    let handle = (proto.setup_msix)(&proto.provider(), request, virtio_msix_isr, 0)?;
     if !handle.is_null() {
         Ok(handle)
     } else {
@@ -505,8 +509,9 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         for queue_idx in 0..actual_queue_count {
             let target_cpu = cpu_ids[queue_idx % cpu_count];
             let table_index = queue_idx as u16;
-            let request =
-                MsiBindingRequest::pci_msix(MsiTarget::platform_cpu(target_cpu), table_index);
+
+            let request = MsiRequest::pci_msix(MsiTarget::platform_cpu(target_cpu), table_index);
+
             match setup_msix_via_pci(&dev, request, table_index).await {
                 Ok(handle) => {
                     unsafe {
@@ -515,6 +520,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                             pci::COMMON_QUEUE_SELECT,
                             queue_idx as u16,
                         );
+
                         pci::common_write_u16(
                             caps.common_cfg,
                             pci::COMMON_QUEUE_MSIX_VECTOR,
@@ -525,19 +531,23 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     let readback = unsafe {
                         pci::common_read_u16(caps.common_cfg, pci::COMMON_QUEUE_MSIX_VECTOR)
                     };
+
                     if readback == 0xFFFF {
                         println!("virtio-blk: device rejected MSI-X for queue {}", queue_idx);
+
                         handle.unregister();
                         break;
                     }
 
                     msix_allocations.push(Some((handle, table_index)));
                 }
+
                 Err(e) => {
                     println!(
-                        "virtio-blk: MSI-X setup failed for queue {}: {:?}",
-                        queue_idx, e
+                        "virtio-blk: MSI-X setup failed for queue {}: {}",
+                        queue_idx, e,
                     );
+
                     break;
                 }
             }

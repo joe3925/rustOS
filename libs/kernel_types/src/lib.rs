@@ -3,7 +3,6 @@
 #![allow(static_mut_refs)]
 #![feature(generic_const_exprs)]
 #![feature(specialization)]
-#![feature(lazy_type_alias)]
 #![feature(allocator_api)]
 extern crate alloc;
 extern crate self as kernel_types;

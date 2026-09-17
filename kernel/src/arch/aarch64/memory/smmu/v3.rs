@@ -1,9 +1,9 @@
 use aarch64_vmsa::attrs::{
-    AllocationHints, CachePolicy, Cacheability, DataRights, DirtyBitManagement, DirtyControl,
-    ExecuteRights, LiveVmsaConfig, MemoryAttributes, MemoryTransience, SemanticLeafAttrs,
-    SemanticTableAttrs, SemanticVmsa64Stage2LeafControls, Shareability, SoftwareMetadata,
-    Stage1PermissionSettings, Stage2MemoryAttributes, Stage2MemoryMode, Stage2PermissionSettings,
-    Stage2Permissions,
+    AllocationHints, CachePolicy, Cacheability, DataRights, DeviceMemoryType, DirtyBitManagement,
+    DirtyControl, ExecuteRights, LiveVmsaConfig, MemoryAttributes, MemoryTransience,
+    SemanticLeafAttrs, SemanticTableAttrs, SemanticVmsa64Stage2LeafControls, Shareability,
+    SoftwareMetadata, Stage1PermissionSettings, Stage2MemoryAttributes, Stage2MemoryMode,
+    Stage2PermissionSettings, Stage2Permissions,
 };
 use aarch64_vmsa::config::regime::smmu_v3::NonSecureIpaStage2;
 use aarch64_vmsa::granule::Level;
@@ -53,7 +53,7 @@ const IORT_NODE_LENGTH_OFFSET: usize = 1;
 const IORT_NODE_MAPPING_COUNT_OFFSET: usize = 8;
 const IORT_NODE_MAPPING_OFFSET_OFFSET: usize = 12;
 const IORT_NODE_SMMU_V3: u8 = 4;
-const IORT_SMMU_V3_NODE_SIZE: usize = 72;
+const IORT_SMMU_V3_NODE_SIZE: usize = 68;
 const IORT_SMMU_V3_BASE_OFFSET: usize = 16;
 const IORT_SMMU_V3_FLAGS_OFFSET: usize = 24;
 const IORT_SMMU_V3_FLAGS_COHACC_OVERRIDE: u32 = 1 << 0;
@@ -797,7 +797,6 @@ impl SmmuV3 {
     fn write64(&self, offset: usize, value: u64) {
         unsafe { core::ptr::write_volatile((self.registers + offset) as *mut u64, value) }
     }
-
     fn publish(&self, address: u64, bytes: u64) {
         fence(Ordering::Release);
         if !self.coherent {
@@ -1095,6 +1094,79 @@ impl SmmuV3 {
         Ok(())
     }
 
+    fn map_range_with_attributes(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        permissions: DeviceMmuMapPermissions,
+        memory: MemoryAttributes,
+        leaf_shareability: Shareability,
+    ) -> DeviceMmuResult<()> {
+        let raw = self.raw_domain(domain)?;
+        let attrs = SemanticLeafAttrs::<Format, NonSecureIpaStage2> {
+            memory: Stage2MemoryAttributes::Combined(memory),
+            permissions: Stage2Permissions::direct(
+                match permissions {
+                    DeviceMmuMapPermissions::Read => DataRights::Read,
+                    DeviceMmuMapPermissions::Write => DataRights::Write,
+                    DeviceMmuMapPermissions::ReadWrite => DataRights::ReadWrite,
+                },
+                ExecuteRights::Neither,
+            ),
+            output_address_space: (),
+            controls: SemanticVmsa64Stage2LeafControls {
+                shareability: leaf_shareability,
+                access_flag: true,
+                dirty: DirtyControl::Direct(DirtyBitManagement::SoftwareManaged),
+                contiguous: false,
+                software: SoftwareMetadata::new(0),
+            },
+        };
+        let table_attrs = SemanticTableAttrs::<Format, NonSecureIpaStage2>::default();
+        let config = LiveVmsaConfig {
+            mair: 0,
+            mair2: None,
+            smmu_v3_aie: false,
+            stage1_permissions: Stage1PermissionSettings::direct(),
+            stage2_permissions: Stage2PermissionSettings::direct(),
+            stage2_memory_mode: Stage2MemoryMode::FwbDisabled,
+            d128_stage1_alias: aarch64_vmsa::attrs::D128Stage1AliasKind::NonGlobal,
+            shareability: Shareability::InnerShareable,
+            output_pas: (),
+        };
+        let mut mapper = raw.mapper.lock();
+        let pages = len / PAGE_SIZE;
+        for page in 0..pages {
+            if mapper
+                .map_semantic_leaf(
+                    &config,
+                    WalkInputAddr::new(iova + page * PAGE_SIZE),
+                    WalkOutputAddr::new(phys + page * PAGE_SIZE),
+                    Level::L3,
+                    attrs,
+                    table_attrs,
+                )
+                .is_err()
+            {
+                for rollback_page in 0..page {
+                    let _ = unsafe {
+                        mapper.unmap(WalkInputAddr::new(iova + rollback_page * PAGE_SIZE))
+                    };
+                }
+                drop(mapper);
+                let _ = self.invalidate_range(domain, iova, page * PAGE_SIZE);
+                return Err(DeviceMmuError::HardwareError);
+            }
+        }
+        drop(mapper);
+        if !self.coherent {
+            self.stream_table.0.clean_allocated();
+        }
+        self.invalidate_range(domain, iova, len)
+    }
+
     fn disable_ats(control: u64) {
         if control != 0 {
             let value = unsafe { core::ptr::read_volatile(control as *const u32) };
@@ -1151,8 +1223,9 @@ impl DeviceMmuBackend for SmmuV3 {
                 .alloc_layout()
                 .map_err(|_| DeviceMmuError::InvalidDomain)?,
         )?;
-        let geometry = RootTableGeometry::<Format, Granule>::new(root, input_bits, self.output_bits)
-            .map_err(|_| DeviceMmuError::InvalidDomain)?;
+        let geometry =
+            RootTableGeometry::<Format, Granule>::new(root, input_bits, self.output_bits)
+                .map_err(|_| DeviceMmuError::InvalidDomain)?;
         let mapper = Mapper::new_offline(
             RootTable::<Format, NonSecureIpaStage2, Granule>::from_geometry(geometry),
             memory.clone(),
@@ -1352,75 +1425,43 @@ impl DeviceMmuBackend for SmmuV3 {
         len: u64,
         permissions: DeviceMmuMapPermissions,
     ) -> DeviceMmuResult<()> {
-        let raw = self.raw_domain(domain)?;
         let cache = Cacheability::Cacheable {
             policy: CachePolicy::WriteBack,
             transience: MemoryTransience::NonTransient,
             allocation: AllocationHints::ReadWriteAllocate,
         };
-        let attrs = SemanticLeafAttrs::<Format, NonSecureIpaStage2> {
-            memory: Stage2MemoryAttributes::Combined(MemoryAttributes::Normal {
+
+        self.map_range_with_attributes(
+            domain,
+            iova,
+            phys,
+            len,
+            permissions,
+            MemoryAttributes::Normal {
                 inner: cache,
                 outer: cache,
-            }),
-            permissions: Stage2Permissions::direct(
-                match permissions {
-                    DeviceMmuMapPermissions::Read => DataRights::Read,
-                    DeviceMmuMapPermissions::Write => DataRights::Write,
-                    DeviceMmuMapPermissions::ReadWrite => DataRights::ReadWrite,
-                },
-                ExecuteRights::Neither,
-            ),
-            output_address_space: (),
-            controls: SemanticVmsa64Stage2LeafControls {
-                shareability: Shareability::InnerShareable,
-                access_flag: true,
-                dirty: DirtyControl::Direct(DirtyBitManagement::SoftwareManaged),
-                contiguous: false,
-                software: SoftwareMetadata::new(0),
             },
-        };
-        let table_attrs = SemanticTableAttrs::<Format, NonSecureIpaStage2>::default();
-        let config = LiveVmsaConfig {
-            mair: 0,
-            mair2: None,
-            smmu_v3_aie: false,
-            stage1_permissions: Stage1PermissionSettings::direct(),
-            stage2_permissions: Stage2PermissionSettings::direct(),
-            stage2_memory_mode: Stage2MemoryMode::FwbDisabled,
-            d128_stage1_alias: aarch64_vmsa::attrs::D128Stage1AliasKind::NonGlobal,
-            shareability: Shareability::InnerShareable,
-            output_pas: (),
-        };
-        let mut mapper = raw.mapper.lock();
-        let pages = len / PAGE_SIZE;
-        for page in 0..pages {
-            if mapper
-                .map_semantic_leaf(
-                    &config,
-                    WalkInputAddr::new(iova + page * PAGE_SIZE),
-                    WalkOutputAddr::new(phys + page * PAGE_SIZE),
-                    Level::L3,
-                    attrs,
-                    table_attrs,
-                )
-                .is_err()
-            {
-                for rollback_page in 0..page {
-                    let _ = unsafe {
-                        mapper.unmap(WalkInputAddr::new(iova + rollback_page * PAGE_SIZE))
-                    };
-                }
-                drop(mapper);
-                let _ = self.invalidate_range(domain, iova, page * PAGE_SIZE);
-                return Err(DeviceMmuError::HardwareError);
-            }
-        }
-        drop(mapper);
-        if !self.coherent {
-            self.stream_table.0.clean_allocated();
-        }
-        self.invalidate_range(domain, iova, len)
+            Shareability::InnerShareable,
+        )
+    }
+
+    fn map_mmio_range(
+        &self,
+        domain: &DeviceMmuDomain,
+        iova: u64,
+        phys: u64,
+        len: u64,
+        permissions: DeviceMmuMapPermissions,
+    ) -> DeviceMmuResult<()> {
+        self.map_range_with_attributes(
+            domain,
+            iova,
+            phys,
+            len,
+            permissions,
+            MemoryAttributes::Device(DeviceMemoryType::NonGatheringNonReorderingNoEarlyAck),
+            Shareability::OuterShareable,
+        )
     }
 
     fn unmap_range(

@@ -49,6 +49,13 @@ pub fn open_device_handle(device: &Arc<DeviceObject>) -> Result<DmaDeviceHandle,
     manager().open_device_handle(device)
 }
 
+pub(crate) fn map_persistent_mmio(
+    device: DmaDeviceHandle,
+    physical_address: u64,
+) -> Result<u64, DeviceMmuError> {
+    manager().map_persistent_mmio(device, physical_address)
+}
+
 pub fn query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState> {
     manager().query_device_state(device)
 }
@@ -892,6 +899,113 @@ impl DmaManager {
         Ok(())
     }
 
+    fn ensure_domain(
+        &self,
+        registration: &RegisteredDmaDevice,
+        runtime: &mut RegisteredDmaRuntime,
+    ) -> Result<Arc<DeviceMmuDomain>, DeviceMmuError> {
+        if runtime.unregistering {
+            return Err(DeviceMmuError::InvalidDevice);
+        }
+
+        if let Some(domain) = runtime.domain.as_ref() {
+            return Ok(domain.clone());
+        }
+
+        let identity = registration.identity.device_mmu_identity();
+        let domain = self.device_mmu.create_domain(identity)?;
+
+        let attachment = match self.device_mmu.attach_device(&domain, identity) {
+            Ok(attachment) => attachment,
+            Err(err) => {
+                self.device_mmu.destroy_domain(&domain);
+                return Err(err);
+            }
+        };
+
+        runtime.domain = Some(domain.clone());
+        runtime.attachment = Some(attachment);
+
+        Ok(domain)
+    }
+
+    fn map_persistent_mmio(
+        &self,
+        device: DmaDeviceHandle,
+        physical_address: u64,
+    ) -> Result<u64, DeviceMmuError> {
+        if device.0 == 0 {
+            return Err(DeviceMmuError::InvalidDevice);
+        }
+
+        let key = usize::try_from(device.0).map_err(|_| DeviceMmuError::InvalidDevice)?;
+        let registration = {
+            let state = self.state.lock();
+            state
+                .devices
+                .get(&key)
+                .cloned()
+                .ok_or(DeviceMmuError::InvalidDevice)?
+        };
+
+        if registration.pdo.upgrade().is_none() {
+            return Err(DeviceMmuError::InvalidDevice);
+        }
+
+        let mut runtime = registration.runtime.lock();
+        let domain = self.ensure_domain(&registration, &mut runtime)?;
+        let page_size = domain.device_page_size();
+
+        if page_size == 0 || !page_size.is_power_of_two() {
+            return Err(DeviceMmuError::InvalidDomain);
+        }
+
+        let phys_page = physical_address & !(page_size - 1);
+        let page_offset = physical_address - phys_page;
+
+        if let Some(mapping) = runtime
+            .persistent_mmio
+            .iter()
+            .flatten()
+            .find(|mapping| mapping.phys_page == phys_page)
+        {
+            return mapping
+                .iova_page
+                .checked_add(page_offset)
+                .ok_or(DeviceMmuError::InvalidRange);
+        }
+
+        let slot = runtime
+            .persistent_mmio
+            .iter()
+            .position(Option::is_none)
+            .ok_or(DeviceMmuError::NoBackingFrame)?;
+
+        let iova_page = domain
+            .alloc_iova(page_size)
+            .ok_or(DeviceMmuError::IovaSpaceExhausted)?;
+
+        if let Err(err) = self.device_mmu.map_mmio_range(
+            &domain,
+            iova_page,
+            phys_page,
+            page_size,
+            DeviceMmuMapPermissions::Write,
+        ) {
+            domain.free_iova(iova_page, page_size);
+            return Err(err);
+        }
+
+        runtime.persistent_mmio[slot] = Some(PersistentMmioMapping {
+            phys_page,
+            iova_page,
+        });
+
+        iova_page
+            .checked_add(page_offset)
+            .ok_or(DeviceMmuError::InvalidRange)
+    }
+
     fn begin_mapping(&self, key: usize) -> Result<ActiveDmaMapping, DmaMapError> {
         let registration = {
             let state = self.state.lock();
@@ -905,37 +1019,16 @@ impl DmaManager {
         let pdo = registration.pdo.upgrade().ok_or(DmaMapError::NoIommu)?;
         let domain = {
             let mut runtime = registration.runtime.lock();
-
-            if runtime.unregistering {
-                return Err(DmaMapError::NoIommu);
-            }
-
-            if runtime.domain.is_none() {
-                let identity = registration.identity.device_mmu_identity();
-
-                let domain = self
-                    .device_mmu
-                    .create_domain(identity)
-                    .map_err(map_device_mmu_error)?;
-
-                let attachment = match self.device_mmu.attach_device(&domain, identity) {
-                    Ok(attachment) => attachment,
-                    Err(err) => {
-                        self.device_mmu.destroy_domain(&domain);
-                        return Err(map_device_mmu_error(err));
-                    }
-                };
-
-                runtime.domain = Some(domain);
-                runtime.attachment = Some(attachment);
-            }
+            let domain = self
+                .ensure_domain(&registration, &mut runtime)
+                .map_err(map_device_mmu_error)?;
 
             runtime.in_flight_maps = runtime
                 .in_flight_maps
                 .checked_add(1)
                 .ok_or(DmaMapError::InvalidSize)?;
 
-            runtime.domain.as_ref().unwrap().clone()
+            domain
         };
 
         Ok(ActiveDmaMapping {
@@ -977,7 +1070,10 @@ impl DmaManagerState {
     }
 
     fn alloc_cookie(&mut self) -> Option<u64> {
-        let index = self.reserved_cookies.iter().position(|reserved| !*reserved)?;
+        let index = self
+            .reserved_cookies
+            .iter()
+            .position(|reserved| !*reserved)?;
         self.reserved_cookies[index] = true;
         Some(index as u64 + 1)
     }
@@ -1010,9 +1106,18 @@ struct RegisteredDmaDevice {
     runtime: Mutex<RegisteredDmaRuntime>,
 }
 
+const MAX_PERSISTENT_MMIO_MAPPINGS: usize = 4;
+
+#[derive(Clone, Copy)]
+struct PersistentMmioMapping {
+    phys_page: u64,
+    iova_page: u64,
+}
+
 struct RegisteredDmaRuntime {
     domain: Option<Arc<DeviceMmuDomain>>,
     attachment: Option<DeviceMmuAttachment>,
+    persistent_mmio: [Option<PersistentMmioMapping>; MAX_PERSISTENT_MMIO_MAPPINGS],
     unregistering: bool,
     in_flight_maps: usize,
 }
@@ -1022,6 +1127,7 @@ impl RegisteredDmaRuntime {
         Self {
             domain: None,
             attachment: None,
+            persistent_mmio: [None; MAX_PERSISTENT_MMIO_MAPPINGS],
             unregistering: false,
             in_flight_maps: 0,
         }
