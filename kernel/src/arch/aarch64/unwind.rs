@@ -85,23 +85,28 @@ impl UnwindPlatform for Aarch64Platform {
 
     fn unwind_next(
         context: &mut Self::UnwindContext,
-        module: Option<&Module>,
+        module: Option<PeUnwindModule>,
         stack_bounds: StackBounds,
     ) -> UnwindStep {
         let before = (context.pc, context.sp);
         let control_pc = context.control_pc();
-        let status = match module.and_then(PeUnwindModule::from_module) {
+
+        let status = match module {
             Some(module) if module.pdata_len >= 8 => {
                 unwind_pe(context, stack_bounds, control_pc, &module)
             }
+
             Some(_) => fallback(context, false),
+
             None => fallback(context, true),
         };
+
         let pc = (context.pc != 0
             && context.pc & 3 == 0
             && valid_address(context.pc)
             && (context.pc, context.sp) != before)
             .then(|| VirtAddr::new(context.pc));
+
         UnwindStep {
             pc,
             status: backtrace_status(status),

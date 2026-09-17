@@ -79,7 +79,8 @@ static mut BOOT_KERNEL_SYMBOL_STRING_BYTES: [u8; MAX_KERNEL_SYMBOL_STRING_BYTES]
     [0; MAX_KERNEL_SYMBOL_STRING_BYTES];
 static mut BOOT_KERNEL_SYMBOL_STRING_LEN: usize = 0;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
-
+static mut BOOT_STUB_SECTIONS: [KernelSection; MAX_KERNEL_SECTIONS] =
+    [KernelSection::empty(); MAX_KERNEL_SECTIONS];
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -118,7 +119,17 @@ unsafe fn copy_boot_info(src: &ActiveBootInfo) -> ActiveBootInfo {
             addr_of_mut!(BOOT_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
             MAX_KERNEL_EXPORT_SYMBOLS,
         );
-        let kernel_sections = copy_kernel_sections(&src.kernel_sections);
+        let kernel_sections = copy_kernel_sections_into(
+            &src.kernel_sections,
+            addr_of_mut!(BOOT_KERNEL_SECTIONS).cast::<KernelSection>(),
+            MAX_KERNEL_SECTIONS,
+        );
+
+        let stub_sections = copy_kernel_sections_into(
+            &src.stub_sections,
+            addr_of_mut!(BOOT_STUB_SECTIONS).cast::<KernelSection>(),
+            MAX_KERNEL_SECTIONS,
+        );
         let framebuffer = copy_framebuffer(&src.framebuffer);
         if let Optional::Some(framebuffer) = framebuffer {
             *BOOT_FRAMEBUFFER.lock() = Some(framebuffer);
@@ -147,6 +158,7 @@ unsafe fn copy_boot_info(src: &ActiveBootInfo) -> ActiveBootInfo {
             boot_packages: src.boot_packages,
             stub_base: src.stub_base,
             stub_size: src.stub_size,
+            stub_sections,
         }
     }
 }
@@ -220,16 +232,20 @@ unsafe fn copy_kernel_symbol_string(src: KernelSymbolString) -> KernelSymbolStri
     }
 }
 
-unsafe fn copy_kernel_sections(src: &KernelSections) -> KernelSections {
+unsafe fn copy_kernel_sections_into(
+    src: &KernelSections,
+    dst: *mut KernelSection,
+    capacity: usize,
+) -> KernelSections {
     unsafe {
-        if src.len() > MAX_KERNEL_SECTIONS {
+        if src.len() > capacity {
             panic!("kernel_pe_entry received too many kernel sections");
         }
+
         if !src.is_empty() && src.as_ptr().is_null() {
             panic!("kernel_pe_entry received a null kernel section array");
         }
 
-        let dst = addr_of_mut!(BOOT_KERNEL_SECTIONS).cast::<KernelSection>();
         if !src.is_empty() {
             copy_nonoverlapping(src.as_ptr(), dst, src.len());
         }

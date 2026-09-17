@@ -46,7 +46,6 @@ type KernelWalker = Walker<Format, Regime, Granule, Access>;
 type LeafAttrs = SemanticLeafAttrs<Format, Regime>;
 type TableAttrs = SemanticTableAttrs<Format, Regime>;
 
-
 const AARCH64_MAPPING_SIZES: [MappingSize; 3] = [
     MappingSize {
         bytes: 1024 * 1024 * 1024,
@@ -583,7 +582,7 @@ impl PagingPlatform for Aarch64Platform {
             return Err(PageMapError::TranslationFailed());
         }
         let physical_address = PhysAddr::new(mapping.output_base().raw());
-        unsafe { mapper.unmap_reclaim(input) }.map_err(|_| PageMapError::TranslationFailed())?;
+        unsafe { mapper.unmap(input) }.map_err(|_| PageMapError::TranslationFailed())?;
 
         match disposition {
             UnmapFrameDisposition::FreeMappedFrame => unsafe {

@@ -475,9 +475,12 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     let mut virtqueues: Vec<Virtqueue> = Vec::with_capacity(target_queue_count);
     for queue_idx in 0..target_queue_count {
         match unsafe { Virtqueue::new(queue_idx as u16, caps.common_cfg, &dev) } {
-            Some(vq) => virtqueues.push(vq),
-            None => {
-                println!("virtio-blk: failed to create queue {}", queue_idx);
+            Ok(vq) => virtqueues.push(vq),
+            Err(e) => {
+                println!(
+                    "virtio-blk: failed to create queue {} with error {}",
+                    queue_idx, e
+                );
                 break;
             }
         }
@@ -584,8 +587,8 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             .expect("virtio-blk: virtqueue missing during init");
 
         let arena = match BlkIoSlots::new(vq.size as usize, &dev) {
-            Some(a) => a,
-            None => {
+            Ok(a) => a,
+            Err(err) => {
                 println!(
                     "virtio-blk: failed to create slots for queue {} with size {}",
                     i, vq.size
@@ -595,6 +598,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     if let Some(h) = qs.irq_handle.get() {
                         h.unregister();
                     }
+
                     qs.queue
                         .try_write()
                         .expect("queue not locked during cleanup")
@@ -608,20 +612,24 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 }
 
                 vq.destroy();
+
                 for mut remaining_vq in virtqueue_iter.by_ref() {
                     remaining_vq.destroy();
                 }
 
-                unsafe { blk::reset_device(caps.common_cfg) };
+                unsafe {
+                    blk::reset_device(caps.common_cfg);
+                }
+
                 for &(_idx, va, sz) in &mapped_bars {
                     let _ = unsafe { unmap_mmio_region(va, sz) };
                 }
-                return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
+
+                return Err(err).with_context(|| {
                     alloc::format!("allocating descriptor storage for virtio queue {i}")
                 });
             }
         };
-
         let irq_handle = if use_msix && i < msix_allocations.len() {
             match msix_allocations[i].take() {
                 Some((handle, _table_idx)) => Some(handle),

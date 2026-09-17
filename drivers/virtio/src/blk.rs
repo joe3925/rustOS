@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
+use kernel_api::error::KernelError;
 use kernel_api::kernel_types::dma::implementation::IoBufferDmaSegment;
 use kernel_api::memory::VirtAddr;
 use kernel_api::println;
@@ -233,7 +234,7 @@ unsafe impl Send for BlkIoSlots {}
 unsafe impl Sync for BlkIoSlots {}
 
 impl BlkIoSlots {
-    pub fn new(slot_count: usize, device: &Arc<DeviceObject>) -> Option<Self> {
+    pub fn new(slot_count: usize, device: &Arc<DeviceObject>) -> Result<Self, KernelError> {
         let slot_bytes = core::mem::size_of::<BlkSlot>();
         let mapped_bytes = slot_count * slot_bytes;
         let alloc_bytes = mapped_bytes.div_ceil(4096) * 4096;
@@ -248,7 +249,7 @@ impl BlkIoSlots {
             }
         }
 
-        Some(Self { pool, slot_count })
+        Ok(Self { pool, slot_count })
     }
 
     #[inline]

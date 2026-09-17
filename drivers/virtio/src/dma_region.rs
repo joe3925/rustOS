@@ -1,5 +1,6 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::ptr::NonNull;
+use kernel_api::error::{DriverErrorKind, KernelError, error_with_message};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::{self, dma_base_page_size};
@@ -8,8 +9,7 @@ use kernel_api::kernel_types::dma::implementation::{
     IoBufferBackingDesc,
 };
 use kernel_api::memory::{
-    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
-    unmap_range,
+    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous, unmap_range,
 };
 
 struct DmaChunk {
@@ -35,7 +35,7 @@ impl ContiguousDmaRegion {
         device: &Arc<DeviceObject>,
         mapped_bytes: usize,
         chunk_multiple: usize,
-    ) -> Option<Self> {
+    ) -> Result<Self, KernelError> {
         let page_size = dma_base_page_size();
         let alloc_bytes = mapped_bytes.div_ceil(page_size) * page_size;
 
@@ -47,27 +47,58 @@ impl ContiguousDmaRegion {
         mapped_bytes: usize,
         alloc_bytes: usize,
         chunk_multiple: usize,
-    ) -> Option<Self> {
+    ) -> Result<Self, KernelError> {
         if mapped_bytes == 0 || mapped_bytes > alloc_bytes {
-            return None;
+            return Err(error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!(
+                    "invalid virtio DMA region sizes: mapped_bytes={mapped_bytes:#x}, alloc_bytes={alloc_bytes:#x}"
+                ),
+            ));
         }
 
         let chunk_multiple = chunk_multiple.max(1);
         let max_segment_bytes = u32::MAX as usize;
 
         if chunk_multiple > max_segment_bytes {
-            return None;
+            return Err(error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!(
+                    "virtio DMA chunk multiple {chunk_multiple:#x} exceeds maximum segment size {max_segment_bytes:#x}"
+                ),
+            ));
         }
 
         let max_chunk_bytes = (max_segment_bytes / chunk_multiple) * chunk_multiple;
         if max_chunk_bytes == 0 {
-            return None;
+            return Err(error_with_message(
+                DriverErrorKind::InvalidParameter,
+                format_args!(
+                    "virtio DMA chunk multiple {chunk_multiple:#x} produced a zero maximum chunk size"
+                ),
+            ));
         }
 
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        let base_va =
-            allocate_auto_kernel_range_mapped_contiguous(alloc_bytes as u64, flags).ok()?;
-        kernel_api::println!("virtio DMA allocation va={:#x} bytes={:#x}", base_va.as_u64(), alloc_bytes);
+
+        let base_va = allocate_auto_kernel_range_mapped_contiguous(
+            alloc_bytes as u64,
+            flags,
+        )
+        .map_err(|error| {
+            error_with_message(
+                DriverErrorKind::InsufficientResources,
+                format_args!(
+                    "virtio DMA kernel allocation failed: bytes={alloc_bytes:#x}, error={error:?}"
+                ),
+            )
+        })?;
+
+        kernel_api::println!(
+            "virtio DMA allocation va={:#x} bytes={:#x}",
+            base_va.as_u64(),
+            alloc_bytes
+        );
 
         unsafe {
             core::ptr::write_bytes(base_va.as_u64() as *mut u8, 0, alloc_bytes);
@@ -88,9 +119,16 @@ impl ContiguousDmaRegion {
 
             if remaining > max_chunk_bytes && chunk_multiple > 1 {
                 byte_len -= byte_len % chunk_multiple;
+
                 if byte_len == 0 {
                     region.destroy();
-                    return None;
+
+                    return Err(error_with_message(
+                        DriverErrorKind::InvalidParameter,
+                        format_args!(
+                            "virtio DMA chunk calculation produced zero length: remaining={remaining:#x}, chunk_multiple={chunk_multiple:#x}"
+                        ),
+                    ));
                 }
             }
 
@@ -103,9 +141,14 @@ impl ContiguousDmaRegion {
             ) {
                 Ok(backing) => backing,
                 Err(error) => {
-                    kernel_api::println!("virtio DMA backing failed: {:?}", error);
                     region.destroy();
-                    return None;
+
+                    return Err(error_with_message(
+                        DriverErrorKind::InsufficientResources,
+                        format_args!(
+                            "virtio DMA backing creation failed: offset={byte_offset:#x}, bytes={byte_len:#x}, error={error:?}"
+                        ),
+                    ));
                 }
             };
 
@@ -115,13 +158,18 @@ impl ContiguousDmaRegion {
             let buffer = match backing_ref.create_bidirectional(0, byte_len) {
                 Ok(buffer) => buffer,
                 Err(error) => {
-                    kernel_api::println!("virtio DMA buffer failed: {:?}", error);
                     unsafe {
                         drop(Box::from_raw(backing_ptr.as_ptr()));
                     }
 
                     region.destroy();
-                    return None;
+
+                    return Err(error_with_message(
+                        DriverErrorKind::InsufficientResources,
+                        format_args!(
+                            "virtio DMA buffer creation failed: offset={byte_offset:#x}, bytes={byte_len:#x}, error={error:?}"
+                        ),
+                    ));
                 }
             };
 
@@ -129,7 +177,6 @@ impl ContiguousDmaRegion {
             {
                 Ok(mapped) => mapped,
                 Err((buffer, error)) => {
-                    kernel_api::println!("virtio DMA map failed: {:?}", error);
                     drop(buffer);
 
                     unsafe {
@@ -137,11 +184,18 @@ impl ContiguousDmaRegion {
                     }
 
                     region.destroy();
-                    return None;
+
+                    return Err(error_with_message(
+                        DriverErrorKind::InsufficientResources,
+                        format_args!(
+                            "virtio DMA mapping failed: offset={byte_offset:#x}, bytes={byte_len:#x}, error={error:?}"
+                        ),
+                    ));
                 }
             };
 
             let mut segments = mapped.dma_segments();
+
             let Some(segment) = segments.next() else {
                 drop(mapped);
 
@@ -150,10 +204,16 @@ impl ContiguousDmaRegion {
                 }
 
                 region.destroy();
-                return None;
+
+                return Err(error_with_message(
+                    DriverErrorKind::Unsuccessful,
+                    format_args!(
+                        "virtio DMA mapping returned no segments: offset={byte_offset:#x}, bytes={byte_len:#x}"
+                    ),
+                ));
             };
 
-            if segments.next().is_some() || segment.byte_len as usize != byte_len {
+            if segments.next().is_some() {
                 drop(mapped);
 
                 unsafe {
@@ -161,7 +221,32 @@ impl ContiguousDmaRegion {
                 }
 
                 region.destroy();
-                return None;
+
+                return Err(error_with_message(
+                    DriverErrorKind::Unsuccessful,
+                    format_args!(
+                        "virtio DMA SingleContiguous mapping returned multiple segments: offset={byte_offset:#x}, bytes={byte_len:#x}"
+                    ),
+                ));
+            }
+
+            if segment.byte_len as usize != byte_len {
+                let segment_len = segment.byte_len;
+
+                drop(mapped);
+
+                unsafe {
+                    drop(Box::from_raw(backing_ptr.as_ptr()));
+                }
+
+                region.destroy();
+
+                return Err(error_with_message(
+                    DriverErrorKind::Unsuccessful,
+                    format_args!(
+                        "virtio DMA segment length mismatch: expected={byte_len:#x}, actual={segment_len:#x}, offset={byte_offset:#x}"
+                    ),
+                ));
             }
 
             region.chunks.push(DmaChunk {
@@ -175,7 +260,7 @@ impl ContiguousDmaRegion {
             byte_offset += byte_len;
         }
 
-        Some(region)
+        Ok(region)
     }
 
     #[inline]
@@ -205,7 +290,11 @@ impl ContiguousDmaRegion {
     }
 
     pub fn destroy(&mut self) {
-        kernel_api::println!("virtio DMA destroy va={:#x} bytes={:#x}", self.base_va.as_u64(), self.alloc_bytes);
+        kernel_api::println!(
+            "virtio DMA destroy va={:#x} bytes={:#x}",
+            self.base_va.as_u64(),
+            self.alloc_bytes
+        );
         for chunk in &mut self.chunks {
             drop(chunk.buffer.take());
 

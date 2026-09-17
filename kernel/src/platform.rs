@@ -1,7 +1,3 @@
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::fmt::Debug;
-
 use crate::drivers::ACPI::ACPIImpl;
 use crate::machine::MachineInterruptInfo;
 use crate::machine::{CpuTopologyError, FirmwareResources, MachineCpuTopology, MachineInfo};
@@ -9,7 +5,12 @@ use crate::memory::device_mmu::{
     DeviceMmuDiscoveryError, DeviceMmuDiscoveryResult, DeviceMmuSystem,
 };
 use crate::memory::paging::types::UserVmLayout;
+use crate::profiling::backtrace::StackBounds;
+use crate::profiling::backtrace::UnwindStep;
 use acpi::AcpiTables;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::fmt::Debug;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{HardwareInterruptId, MsiBindingRequest, MsiMessage, PlatformCpuId};
 use kernel_types::memory::Module;
@@ -252,9 +253,9 @@ pub trait UnwindPlatform: TaskPlatform {
 
     fn unwind_next(
         context: &mut Self::UnwindContext,
-        module: Option<&Module>,
-        stack_bounds: crate::profiling::backtrace::StackBounds,
-    ) -> crate::profiling::backtrace::UnwindStep;
+        module: Option<crate::arch::unwind::PeUnwindModule>,
+        stack_bounds: StackBounds,
+    ) -> UnwindStep;
 }
 
 pub trait DebugPlatform: Platform {

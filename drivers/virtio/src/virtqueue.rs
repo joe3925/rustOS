@@ -1,11 +1,12 @@
+use crate::dma_region::ContiguousDmaRegion;
+use crate::pci;
 use alloc::sync::Arc;
 use core::hint::{cold_path, likely, unlikely};
 use core::sync::atomic::{AtomicU16, Ordering};
 use kernel_api::device::DeviceObject;
+use kernel_api::error::error_with_message;
+use kernel_api::error::{DriverErrorKind, KernelError};
 use kernel_api::memory::{PhysAddr, VirtAddr};
-
-use crate::dma_region::ContiguousDmaRegion;
-use crate::pci;
 
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
@@ -55,12 +56,15 @@ impl Virtqueue {
         queue_idx: u16,
         common_cfg: VirtAddr,
         device: &Arc<DeviceObject>,
-    ) -> Option<Self> {
+    ) -> Result<Self, KernelError> {
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, queue_idx) };
 
         let max_size = unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_SIZE) };
         if max_size == 0 {
-            return None;
+            return Err(error_with_message(
+                DriverErrorKind::DeviceError,
+                format_args!("cfg size from pcie is 0"),
+            ));
         }
         let size = max_size.min(crate::completion::MAX_COMPLETION_SLOTS as u16);
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
@@ -82,9 +86,26 @@ impl Virtqueue {
             }
         }
 
-        let desc_dma = desc.dma_addr_at(0)?;
-        let avail_dma = avail.dma_addr_at(0)?;
-        let used_dma = used.dma_addr_at(0)?;
+        let desc_dma = desc.dma_addr_at(0).ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::Unsuccessful,
+                format_args!("virtio descriptor DMA region has no mapping at offset 0"),
+            )
+        })?;
+
+        let avail_dma = avail.dma_addr_at(0).ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::Unsuccessful,
+                format_args!("virtio available-ring DMA region has no mapping at offset 0"),
+            )
+        })?;
+
+        let used_dma = used.dma_addr_at(0).ok_or_else(|| {
+            error_with_message(
+                DriverErrorKind::Unsuccessful,
+                format_args!("virtio used-ring DMA region has no mapping at offset 0"),
+            )
+        })?;
 
         let queue_notify_off =
             unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_NOTIFY_OFF) };
@@ -95,7 +116,7 @@ impl Virtqueue {
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DEVICE, used_dma);
         }
 
-        Some(Self {
+        Ok(Self {
             idx: queue_idx,
             size,
             desc,

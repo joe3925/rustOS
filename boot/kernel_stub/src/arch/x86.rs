@@ -1,15 +1,16 @@
-use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use bootloader_api::config::Mapping;
 use bootloader_api::info;
 use bootloader_api::info::MemoryRegionKind::{Bootloader, UnknownBios, UnknownUefi, Usable};
-use bootloader_api::info::PixelFormat::{Bgr, Rgb, Unknown, U8};
-use bootloader_api::{entry_point, BootloaderConfig};
+use bootloader_api::info::PixelFormat::{Bgr, Rgb, U8, Unknown};
+use bootloader_api::{BootloaderConfig, entry_point};
+use core::arch::asm;
+use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 use goblin::pe::header::COFF_MACHINE_X86_64;
+use kernel_abi::KernelSections;
 use kernel_abi::arch::{
-    PeTlsDirectory, X86BootArchInfo, KERNEL_PE_BASE, STUB_DYNAMIC_RANGE_END,
-    STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
+    KERNEL_PE_BASE, PeTlsDirectory, STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START,
+    STUB_IMAGE_BASE, X86BootArchInfo,
 };
 use kernel_abi::{
     BootInfo, FdtHeader, FrameBuffer, FrameBufferInfo, MemoryRegionKind, Optional, PixelFormat,
@@ -17,8 +18,8 @@ use kernel_abi::{
 };
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::{
-    mapper::RecursivePageTable, mapper::TranslateError, FrameAllocator, Mapper, Page, PageTable,
-    PageTableFlags, PageTableIndex, PhysFrame, Size4KiB,
+    FrameAllocator, Mapper, Page, PageTable, PageTableFlags, PageTableIndex, PhysFrame, Size4KiB,
+    mapper::RecursivePageTable, mapper::TranslateError,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -28,7 +29,6 @@ use crate::platform::{
 };
 
 pub struct X86Platform;
-
 
 const PAGE_SIZE: u64 = 0x1000;
 const LOW_RESERVED_END: u64 = 0x20_0000;
@@ -133,7 +133,7 @@ impl KernelImagePlatform for X86Platform {
                 Ok(_) => return Err("kernel_stub: kernel PE preferred base is already mapped"),
                 Err(TranslateError::PageNotMapped) => {}
                 Err(_) => {
-                    return Err("kernel_stub: kernel PE preferred base overlaps a huge mapping")
+                    return Err("kernel_stub: kernel PE preferred base overlaps a huge mapping");
                 }
             }
 
@@ -357,6 +357,7 @@ impl BootloaderPlatform for X86Platform {
             boot_packages: parts.boot_packages,
             stub_base: stub_image_base(),
             stub_size: stub_image_size(bootloader_info),
+            stub_sections: unsafe { KernelSections::from_raw_parts(ptr::null(), 0) },
         })
     }
 }

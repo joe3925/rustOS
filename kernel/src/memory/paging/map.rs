@@ -132,85 +132,87 @@ unsafe fn map_range_with_flush(
     flags: PageFlags,
     ignore_already_mapped: bool,
     flush: LocalTlbFlush,
-) -> Result<(), PageMapError> { unsafe {
-    let mut virt = addr.as_u64();
-    let mut remaining = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
-    let mut mapped_bytes = 0u64;
-    let mut allocator = KernelPageTableFrameAllocator;
+) -> Result<(), PageMapError> {
+    unsafe {
+        let mut virt = addr.as_u64();
+        let mut remaining = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
+        let mut mapped_bytes = 0u64;
+        let mut allocator = KernelPageTableFrameAllocator;
 
-    while remaining > 0 {
-        let mut mapped_this_leaf = false;
+        while remaining > 0 {
+            let mut mapped_this_leaf = false;
 
-        for mapping_size in supported_mapping_sizes() {
-            if !legal_mapping_size_for_virtual(*mapping_size, virt, remaining) {
-                continue;
-            }
-
-            let Some(phys) = KernelFrameAllocator::allocate_mapping_frame(*mapping_size) else {
-                continue;
-            };
-
-            match unsafe {
-                <ActivePlatform as PagingPlatform>::map_leaf(
-                    &mut allocator,
-                    VirtAddr::new(virt),
-                    phys,
-                    *mapping_size,
-                    flags,
-                    None,
-                    flush,
-                )
-            } {
-                Ok(()) => {
-                    virt += mapping_size.bytes;
-                    remaining -= mapping_size.bytes;
-                    mapped_bytes += mapping_size.bytes;
-                    mapped_this_leaf = true;
-                    break;
-                }
-                Err(err) if ignore_already_mapped && is_already_mapped(&err) => {
-                    KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
-                    virt += mapping_size.bytes;
-                    remaining -= mapping_size.bytes;
-                    mapped_this_leaf = true;
-                    break;
-                }
-                Err(err) if is_frame_allocation_failure(&err) => {
-                    KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
+            for mapping_size in supported_mapping_sizes() {
+                if !legal_mapping_size_for_virtual(*mapping_size, virt, remaining) {
                     continue;
                 }
-                Err(err) => {
-                    KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
-                    if !ignore_already_mapped {
-                        unsafe {
-                            rollback_mapped_range(
-                                &mut allocator,
-                                addr,
-                                mapped_bytes,
-                                UnmapFrameDisposition::FreeMappedFrame,
-                            );
-                        }
+
+                let Some(phys) = KernelFrameAllocator::allocate_mapping_frame(*mapping_size) else {
+                    continue;
+                };
+
+                match unsafe {
+                    <ActivePlatform as PagingPlatform>::map_leaf(
+                        &mut allocator,
+                        VirtAddr::new(virt),
+                        phys,
+                        *mapping_size,
+                        flags,
+                        None,
+                        flush,
+                    )
+                } {
+                    Ok(()) => {
+                        virt += mapping_size.bytes;
+                        remaining -= mapping_size.bytes;
+                        mapped_bytes += mapping_size.bytes;
+                        mapped_this_leaf = true;
+                        break;
                     }
-                    return Err(err);
+                    Err(err) if ignore_already_mapped && is_already_mapped(&err) => {
+                        KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
+                        virt += mapping_size.bytes;
+                        remaining -= mapping_size.bytes;
+                        mapped_this_leaf = true;
+                        break;
+                    }
+                    Err(err) if is_frame_allocation_failure(&err) => {
+                        KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
+                        continue;
+                    }
+                    Err(err) => {
+                        KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
+                        if !ignore_already_mapped {
+                            unsafe {
+                                rollback_mapped_range(
+                                    &mut allocator,
+                                    addr,
+                                    mapped_bytes,
+                                    UnmapFrameDisposition::FreeMappedFrame,
+                                );
+                            }
+                        }
+                        return Err(err);
+                    }
                 }
             }
-        }
 
-        if !mapped_this_leaf {
-            unsafe {
-                rollback_mapped_range(
-                    &mut allocator,
-                    addr,
-                    mapped_bytes,
-                    UnmapFrameDisposition::FreeMappedFrame,
-                );
+            if !mapped_this_leaf {
+                unsafe {
+                    rollback_mapped_range(
+                        &mut allocator,
+                        addr,
+                        mapped_bytes,
+                        UnmapFrameDisposition::FreeMappedFrame,
+                    );
+                }
+                return Err(PageMapError::NoMemory());
             }
-            return Err(PageMapError::NoMemory());
         }
-    }
 
-    Ok(())
-}}
+        Ok(())
+    }
+}
 
 pub unsafe fn map_contiguous_physical_range(
     virt_base: VirtAddr,
@@ -306,51 +308,56 @@ pub unsafe fn map_allocated_range(
 /// `addr..addr + size` must be a live kernel mapping owned by the caller and
 /// no references into it may survive this call.
 pub unsafe fn unmap_range(addr: VirtAddr, size: u64) {
-    unsafe { deallocate_kernel_range(addr, size) };
     unsafe {
-        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::FreeMappedFrame);
+        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::FreeMappedFrame)
+            .expect("failed to unmap owned kernel virtual range");
+    }
+
+    unsafe {
+        deallocate_kernel_range(addr, size);
     }
 }
 
 pub unsafe fn unmap_range_unchecked(addr: VirtAddr, size: u64) {
     unsafe {
-        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::FreeMappedFrame);
+        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::FreeMappedFrame)
+            .expect("failed to unmap unchecked kernel virtual range");
     }
 }
 
 pub unsafe fn unmap_range_keep_frames_unchecked(addr: VirtAddr, size: u64) {
     unsafe {
-        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::KeepFrame);
+        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::KeepFrame)
+            .expect("failed to unmap kernel virtual range while preserving mapped frames");
     }
 }
 
 pub unsafe fn unmap_reserved_range_unchecked(addr: VirtAddr, size: u64) {
     unsafe {
-        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::ReleaseReservedFrame);
+        unmap_range_with_disposition(addr, size, UnmapFrameDisposition::ReleaseReservedFrame)
+            .expect("failed to unmap reserved kernel virtual range");
     }
 }
-
 pub(crate) unsafe fn unmap_range_with_disposition(
     addr: VirtAddr,
     size: u64,
     disposition: UnmapFrameDisposition,
-) {
+) -> Result<(), PageMapError> {
     let mut virt = addr.as_u64();
-    let mut remaining = match align_up_to_base_page(size) {
-        Some(size) => size,
-        None => return,
-    };
+    let mut remaining = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
+
     let mut allocator = KernelPageTableFrameAllocator;
 
     while remaining > 0 {
         let mut unmapped = false;
+        let mut last_error = None;
 
         for mapping_size in supported_mapping_sizes() {
             if !legal_mapping_size_for_virtual(*mapping_size, virt, remaining) {
                 continue;
             }
 
-            if unsafe {
+            match unsafe {
                 <ActivePlatform as PagingPlatform>::unmap_leaf(
                     &mut allocator,
                     VirtAddr::new(virt),
@@ -358,22 +365,26 @@ pub(crate) unsafe fn unmap_range_with_disposition(
                     disposition,
                     LocalTlbFlush::Flush,
                 )
-            }
-            .is_ok()
-            {
-                virt += mapping_size.bytes;
-                remaining -= mapping_size.bytes;
-                unmapped = true;
-                break;
+            } {
+                Ok(_) => {
+                    virt += mapping_size.bytes;
+                    remaining -= mapping_size.bytes;
+                    unmapped = true;
+                    break;
+                }
+
+                Err(error) => {
+                    last_error = Some(error);
+                }
             }
         }
 
         if !unmapped {
-            let page = base_page_size();
-            virt += page;
-            remaining = remaining.saturating_sub(page);
+            return Err(last_error.unwrap_or(PageMapError::TranslationFailed()));
         }
     }
+
+    Ok(())
 }
 
 pub fn identity_map_page(

@@ -103,24 +103,29 @@ impl UnwindPlatform for X86Platform {
 
     fn unwind_next(
         context: &mut Self::UnwindContext,
-        module: Option<&Module>,
+        module: Option<PeUnwindModule>,
         stack_bounds: StackBounds,
     ) -> UnwindStep {
         let before_rip = context.rip;
         let before_rsp = context.rsp;
         let control_pc = context.control_pc();
-        let status = match module.and_then(PeUnwindModule::from_module) {
+
+        let status = match module {
             Some(module) => unwind_pe_x64(context, stack_bounds, control_pc, &module),
+
             None => {
                 let status = STATUS_UNKNOWN_FRAME | STATUS_NO_UNWIND_INFO | STATUS_LEAF_FALLBACK;
+
                 leaf_unwind(context, stack_bounds)
                     .map_or(status | STATUS_BAD_STACK_READ, |_| status)
             }
         };
+
         let pc = (context.rip != 0
             && is_canonical(context.rip)
             && (context.rip != before_rip || context.rsp != before_rsp))
             .then(|| VirtAddr::new(context.rip));
+
         UnwindStep {
             pc,
             status: backtrace_status(status),

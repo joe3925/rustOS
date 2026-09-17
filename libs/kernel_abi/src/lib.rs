@@ -53,6 +53,7 @@ pub struct BootInfo<A: BootArchInfo = EmptyArchInfo> {
     pub boot_packages: BootPackages,
     pub stub_base: u64,
     pub stub_size: u64,
+    pub stub_sections: KernelSections,
 }
 
 impl<A: BootArchInfo> BootInfo<A> {
@@ -92,6 +93,10 @@ impl<A: BootArchInfo> BootInfo<A> {
             boot_packages: BootPackages::empty(),
             stub_base: 0,
             stub_size: 0,
+            stub_sections: KernelSections {
+                ptr: core::ptr::null(),
+                len: 0,
+            },
         }
     }
 }
@@ -125,9 +130,9 @@ impl BootByteSlice {
         self.len == 0
     }
 
-    pub unsafe fn as_slice<'a>(&self) -> &'a [u8] { unsafe {
-        slice::from_raw_parts(self.ptr, self.len)
-    }}
+    pub unsafe fn as_slice<'a>(&self) -> &'a [u8] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
 }
 
 #[repr(C)]
@@ -185,9 +190,9 @@ impl BootPackages {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
-    pub unsafe fn as_slice<'a>(&self) -> &'a [BootPackage] { unsafe {
-        slice::from_raw_parts(self.ptr, self.len)
-    }}
+    pub unsafe fn as_slice<'a>(&self) -> &'a [BootPackage] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
+    }
 }
 
 #[repr(C)]
@@ -487,7 +492,7 @@ pub struct KernelTextSection {
     pub size: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct KernelSections {
     ptr: *const KernelSection,

@@ -3,6 +3,7 @@ use core::slice;
 use kernel_types::memory::Module;
 
 use crate::profiling::backtrace::{BacktraceStatus, StackBounds};
+use crate::util::boot_info;
 
 pub const STATUS_BAD_STACK_READ: u32 = 1 << 0;
 pub const STATUS_BAD_UNWIND_INFO: u32 = 1 << 1;
@@ -11,7 +12,7 @@ pub const STATUS_NO_UNWIND_INFO: u32 = 1 << 3;
 pub const STATUS_PE_UNWIND: u32 = 1 << 4;
 pub const STATUS_UNKNOWN_FRAME: u32 = 1 << 5;
 pub const STATUS_UNSUPPORTED_OPCODE: u32 = 1 << 6;
-
+#[derive(Copy, Clone)]
 pub struct PeUnwindModule {
     pub image_base: u64,
     pub image_end: u64,
@@ -26,11 +27,13 @@ impl PeUnwindModule {
             .sections
             .iter()
             .find(|section| section.name == ".pdata")?;
+
         let image_base = module.image_base.as_u64();
         let image_end = image_base.checked_add(module.image_size)?;
         let pdata_base = image_base.checked_add(pdata.virtual_address as u64)?;
         let pdata_len = core::cmp::min(pdata.virtual_size, pdata.raw_size) as usize;
         let pdata_end = pdata_base.checked_add(pdata_len as u64)?;
+
         (pdata_end <= image_end).then_some(Self {
             image_base,
             image_end,
@@ -38,8 +41,40 @@ impl PeUnwindModule {
             pdata_len,
         })
     }
-}
+    pub fn kernel() -> Option<Self> {
+        let boot = boot_info();
 
+        let image_base = boot.kernel_image_base;
+        let image_end = image_base.checked_add(boot.kernel_image_size)?;
+
+        let pdata = boot.kernel_sections.as_slice().iter().find(|section| {
+            let name = &section.name;
+
+            name[0] == b'.'
+                && name[1] == b'p'
+                && name[2] == b'd'
+                && name[3] == b'a'
+                && name[4] == b't'
+                && name[5] == b'a'
+                && name[6..].iter().all(|byte| *byte == 0)
+        })?;
+
+        let pdata_base = image_base.checked_add(pdata.virtual_address as u64)?;
+        let pdata_len = core::cmp::min(pdata.virtual_size, pdata.raw_size) as usize;
+        let pdata_end = pdata_base.checked_add(pdata_len as u64)?;
+
+        (pdata_end <= image_end).then_some(Self {
+            image_base,
+            image_end,
+            pdata_base,
+            pdata_len,
+        })
+    }
+    #[inline]
+    pub fn contains(&self, address: u64) -> bool {
+        address >= self.image_base && address < self.image_end
+    }
+}
 pub fn backtrace_status(status: u32) -> BacktraceStatus {
     let mut result = BacktraceStatus::empty();
     for (flag, mapped) in [
@@ -60,7 +95,6 @@ pub fn backtrace_status(status: u32) -> BacktraceStatus {
     }
     result
 }
-
 pub fn read_image_u32(module: &PeUnwindModule, addr: u64) -> Option<u32> {
     let bytes = read_image_bytes(module, addr, 4)?;
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))

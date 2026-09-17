@@ -147,7 +147,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         boot_usable_bytes()
     ));
     init_emergency_zero_mappings().expect("Failed to initialize emergency zero mappings");
-    start_zero_page_worker();
+    //start_zero_page_worker();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
@@ -356,7 +356,12 @@ impl Write for EarlyPanicWriter {
         Ok(())
     }
 }
-
+#[macro_export]
+macro_rules! panic_exception {
+    ($state:expr, $($message:tt)*) => {
+        exception_panic(format!($($message)*), $state)
+    };
+}
 pub fn exception_panic(message: String, state: &State) -> ! {
     if !current_cpu_owns_panic() {
         halt_loop()
@@ -423,15 +428,20 @@ fn reclaim_kernel_stub() {
     }
 
     let boot = boot_info();
-    if boot.stub_base == 0 || boot.stub_size == 0 {
-        return;
-    }
 
-    unsafe {
-        unmap_reserved_range_unchecked(VirtAddr::new(boot.stub_base).into(), boot.stub_size);
+    for section in boot.stub_sections.as_slice() {
+        if section.virtual_size == 0 {
+            continue;
+        }
+
+        unsafe {
+            unmap_reserved_range_unchecked(
+                VirtAddr::new(section.loaded_address),
+                section.virtual_size as u64,
+            );
+        }
     }
 }
-
 pub fn generate_guid() -> [u8; 16] {
     let start: [u8; 8] = random_number().to_le_bytes();
     let end: [u8; 8] = random_number().to_le_bytes();

@@ -4,18 +4,13 @@ use core::hint::black_box;
 use core::sync::atomic::Ordering;
 
 use super::super::memory::paging::tables::kernel_cr3;
+use crate::panic_exception;
 use crate::println;
 use crate::scheduling::task::{KernelStackFaultResolution, resolve_current_kernel_stack_fault};
 use crate::util::{PANIC_ACTIVE, exception_panic};
 use alloc::{fmt, format};
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
-
-macro_rules! panic_exception {
-    ($state:expr, $($message:tt)*) => {
-        exception_panic(format!($($message)*), $state)
-    };
-}
 
 #[kernel_macros::exception_handler]
 pub(crate) fn divide_by_zero_fault(stack_frame: &mut State) {

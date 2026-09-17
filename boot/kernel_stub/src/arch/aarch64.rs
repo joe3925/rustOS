@@ -1,8 +1,3 @@
-use core::arch::asm;
-use core::marker::PhantomData;
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use aarch64_vmsa::address::{TranslationGranule, VirtAddr};
 use aarch64_vmsa::attrs::{
     AllocationHints, CachePolicy, Cacheability, DataRights, DirtyBitManagement, DirtyControl,
@@ -21,11 +16,18 @@ use aarch64_vmsa::table::{
     TableReclaim,
 };
 use aarch64_vmsa::translation::{WalkInputAddr, WalkOutputAddr};
+use alloc::vec::Vec;
 use bootloader_api::{
     BootInfo as LoaderBootInfo, GranuleKind, Optional as LoaderOptional,
     PixelFormat as LoaderPixelFormat,
 };
+use core::arch::asm;
+use core::marker::PhantomData;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 use goblin::pe::header::COFF_MACHINE_ARM64;
+use kernel_abi::KernelSection;
+use kernel_abi::KernelSections;
 use kernel_abi::arch::{
     Aarch64BootArchInfo, Aarch64PeTlsDirectory, KERNEL_PE_BASE, RawTableFrameProvider,
     RecursiveFrameZeroProvider,
@@ -395,10 +397,35 @@ impl BootloaderPlatform for Aarch64Platform {
             boot_packages: parts.boot_packages,
             stub_base: bootloader_info.stub_virt_base,
             stub_size: bootloader_info.stub_virt_size,
+            stub_sections: translate_stub_sections(&bootloader_info.stub_sections).unwrap(),
         })
     }
 }
+fn translate_stub_sections(
+    sections: &bootloader_api::KernelSections,
+) -> Result<KernelSections, &'static str> {
+    if !sections.is_empty() && sections.as_ptr().is_null() {
+        return Err("kernel_stub: bootloader supplied null stub sections");
+    }
 
+    let mut out = Vec::with_capacity(sections.len());
+
+    for section in sections.as_slice() {
+        out.push(KernelSection {
+            name: section.name,
+            virtual_address: section.virtual_address,
+            virtual_size: section.virtual_size,
+            raw_offset: section.raw_offset,
+            raw_size: section.raw_size,
+            characteristics: section.characteristics,
+            loaded_address: section.loaded_address,
+        });
+    }
+
+    let sections = Vec::leak(out);
+
+    Ok(unsafe { KernelSections::from_raw_parts(sections.as_ptr(), sections.len()) })
+}
 fn init_mapper_for<G>(boot_info: &LoaderBootInfo) -> Result<GranuleMapper<G>, &'static str>
 where
     G: TranslationGranule,

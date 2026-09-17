@@ -1,12 +1,12 @@
 use core::sync::atomic::Ordering;
 
-use kernel_types::arch::VirtAddr;
-
+use crate::arch::unwind::PeUnwindModule;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::platform::{ActivePlatform, UnwindPlatform};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::scheduling::task::TaskRef;
+use kernel_types::arch::VirtAddr;
 
 pub const MAX_BACKTRACE_DEPTH: usize = 64;
 
@@ -99,6 +99,7 @@ impl Backtrace {
         max_depth: usize,
     ) -> Self {
         let stack_bounds = task.and_then(stack_bounds_for_task);
+
         let mut trace = Self {
             frames: [BacktraceFrame::default(); MAX_BACKTRACE_DEPTH],
             depth: 0,
@@ -108,6 +109,7 @@ impl Backtrace {
 
         let max_depth = max_depth.clamp(1, MAX_BACKTRACE_DEPTH);
         let mut context = start.context;
+
         trace.push(start.pc);
 
         let Some(bounds) = stack_bounds else {
@@ -115,37 +117,56 @@ impl Backtrace {
             return trace;
         };
 
+        let kernel_module = PeUnwindModule::kernel();
+
         while trace.frames().len() < max_depth {
             let current_pc = trace.frames[trace.depth as usize - 1].ip;
-            let pid = task
-                .and_then(|task| task.inner.try_read().map(|inner| inner.parent_pid))
-                .unwrap_or(0);
-            let program = PROGRAM_MANAGER.get(pid);
-            let module = program
-                .as_ref()
-                .and_then(|program| program.try_read())
-                .and_then(|program| program.module_containing(current_pc));
 
-            let step = match module.as_ref().and_then(|module| module.try_read()) {
-                Some(module) => <ActivePlatform as UnwindPlatform>::unwind_next(
-                    &mut context,
-                    Some(&module),
-                    bounds,
-                ),
-                None => {
-                    if module.is_none() {
-                        trace.status |= BacktraceStatus::UNKNOWN_FRAME;
-                    } else {
-                        trace.status |= BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE;
+            let unwind_module = match kernel_module {
+                Some(module) if module.contains(current_pc.as_u64()) => Some(module),
+
+                _ => {
+                    let pid = task
+                        .and_then(|task| task.inner.try_read().map(|inner| inner.parent_pid))
+                        .unwrap_or(0);
+
+                    let program = PROGRAM_MANAGER.get(pid);
+
+                    let module = program
+                        .as_ref()
+                        .and_then(|program| program.try_read())
+                        .and_then(|program| program.module_containing(current_pc));
+
+                    match module.as_ref() {
+                        Some(module) => match module.try_read() {
+                            Some(module) => PeUnwindModule::from_module(&module),
+
+                            None => {
+                                trace.status |= BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE;
+                                None
+                            }
+                        },
+
+                        None => {
+                            trace.status |= BacktraceStatus::UNKNOWN_FRAME;
+                            None
+                        }
                     }
-                    <ActivePlatform as UnwindPlatform>::unwind_next(&mut context, None, bounds)
                 }
             };
 
+            let step = <ActivePlatform as UnwindPlatform>::unwind_next(
+                &mut context,
+                unwind_module,
+                bounds,
+            );
+
             trace.status |= step.status;
+
             let Some(pc) = step.pc else {
                 break;
             };
+
             trace.push(pc);
 
             if step.status.intersects(
