@@ -33,7 +33,7 @@
     ],
 
     "processCreateCommands": [
-      "platform shell cargo run -p xtask -- qemu --platform aarch64-uefi --launch qemu-aarch64-virt-tcg --debug --detach --lldb-meta --file-serial target/rustos/aarch64-uefi/debug/qemu-com1.log",
+      "platform shell cargo run -p xtask -- qemu --platform aarch64-uefi --launch qemu-aarch64-virt-hvf --debug --detach --lldb-meta --file-serial target/rustos/aarch64-uefi/debug/qemu-com1.log",
       "gdb-remote localhost:1234"
     ],
 
