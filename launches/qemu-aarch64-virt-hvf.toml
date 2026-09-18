@@ -27,11 +27,15 @@ args = [
     "-device", "virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off,iommu_platform=on",
 
 ]
+debug_args = [
+    "-S",
+    "-gdb", "tcp::{gdb_port}",
+]
 
 [defaults]
 memory = "1G"
 cpus = "1"
 
 [capabilities]
-debug = false
-lldb_metadata = false
+debug = true
+lldb_metadata = true
