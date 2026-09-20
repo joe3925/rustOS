@@ -10,7 +10,7 @@
     ],
 
     "processCreateCommands": [
-      "platform shell cargo run -p xtask -- qemu --platform x86_64-uefi --launch qemu-x86_64-q35-whpx --debug --detach --lldb-meta --file-serial target/rustos/x86_64-uefi/debug/qemu-com1.log",
+      "platform shell cargo run -p xtask -- qemu --platform x86_64-uefi --launch qemu-x86_64-q35-tcg --debug --detach --lldb-meta --file-serial target/rustos/x86_64-uefi/debug/qemu-com1.log",
       "gdb-remote localhost:1234"
     ],
 
@@ -29,6 +29,7 @@
     "cwd": "$ZED_WORKTREE_ROOT",
 
     "targetCreateCommands": [
+      "settings set plugin.process.gdb-remote.packet-timeout 10000",
       "target create \"$ZED_WORKTREE_ROOT/target/rustos/aarch64-uefi/debug/kernel/kernel.exe\"",
     ],
 
@@ -43,5 +44,26 @@
 
     "stopOnEntry": true,
     "sourceLanguages": ["rust"]
-  }
+  },
+
+    {
+      "label": "Attach RustOS to existing QEMU",
+      "adapter": "CodeLLDB",
+      "request": "attach",
+
+      "program": "$ZED_WORKTREE_ROOT/target/rustos/x86_64-uefi/debug/kernel/kernel.exe",
+
+      "initCommands": [
+        "settings set plugin.process.gdb-remote.packet-timeout 10000",
+      ],
+
+      "processCreateCommands": [
+        "gdb-remote 127.0.0.1:1234"
+      ],
+
+      "sourceLanguages": [
+        "rust"
+      ]
+    }
+
 ]

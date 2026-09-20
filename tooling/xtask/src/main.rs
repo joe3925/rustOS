@@ -1550,12 +1550,13 @@ fn spawn_qemu_detached(
     gdb_port: u16,
 ) -> Result<(), String> {
     let mut command = Command::new(qemu);
+    let mut command = Command::new(qemu);
     command
         .args(args)
         .current_dir(root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     #[cfg(windows)]
     {

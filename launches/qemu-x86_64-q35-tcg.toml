@@ -28,11 +28,6 @@ debug_args = [
     "-S",
     "-gdb", "tcp::{gdb_port}",
 ]
-lldb_metadata_args = [
-    "-chardev", "socket,id=rustos_meta,host=127.0.0.1,port={meta_port},server=on,wait=off,nodelay=on",
-    "-serial", "chardev:rustos_meta",
-]
-
 [defaults]
 memory = "2"
 cpus = "3"
