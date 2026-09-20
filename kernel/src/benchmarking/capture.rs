@@ -37,7 +37,7 @@ use kernel_types::benchmark::{
     BENCH_SAMPLE_PROTO_SCHEMA_VERSION, BenchDroppedSampleCounterProto, BenchOverflowPolicy,
     BenchSampleChunkProto, BenchSampleProto, BenchWindowConfig,
 };
-use kernel_types::dma::implementation::{
+use kernel_types::dma::{
     IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
 };
 use kernel_types::error::KernelError;
@@ -2940,11 +2940,9 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
         passes
     );
 
-    let mut create_ns = 0u128;
+    let create_timer = Stopwatch::start();
     for _ in 0..DISK_BENCH_IOBUFFER_CREATE_OPS {
-        let timer = Stopwatch::start();
         let io_buffer = io_backing.create_bidirectional(0, max_size);
-        create_ns += timer.elapsed_nanos() as u128;
 
         let io_buffer = match io_buffer {
             Ok(buffer) => buffer,
@@ -2957,6 +2955,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
         black_box(&io_buffer);
         drop(io_buffer);
     }
+    let create_ns = create_timer.elapsed_nanos() as u128;
 
     let create_ops_per_sec = if create_ns == 0 {
         0.0
@@ -3037,7 +3036,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
         }
 
         for _ in 0..passes {
-            let write_ns_before = write_ns;
+            let write_timer = Stopwatch::start();
             let mut offset = 0u64;
             let mut ops = 0u64;
 
@@ -3069,9 +3068,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                     }
                 };
 
-                let timer = Stopwatch::start();
                 let result = file.write_iobuffer_at(offset, io_buffer).await;
-                write_ns += timer.elapsed_nanos() as u128;
                 if let Err(e) = result {
                     println!(
                         "[disk-bench] write failed size={} offset={}: {:?}",
@@ -3085,10 +3082,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                 ops += 1;
             }
 
+            let pass_write_ns = write_timer.elapsed_nanos() as u128;
+            write_ns += pass_write_ns;
             write_bytes += offset;
             write_ops += ops;
-            write_samples
-                .push((write_ns.saturating_sub(write_ns_before) / ops.max(1) as u128) as u64);
+            write_samples.push((pass_write_ns / ops.max(1) as u128) as u64);
 
             if let Err(e) = file.flush().await {
                 println!(
@@ -3099,7 +3097,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                 return None;
             }
 
-            let read_ns_before = read_ns;
+            let read_timer = Stopwatch::start();
             let mut offset = 0u64;
             let mut ops = 0u64;
             let mut checksum = 0u64;
@@ -3117,9 +3115,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                     }
                 };
 
-                let timer = Stopwatch::start();
                 let result = file.read_iobuffer_at(offset, io_buffer).await;
-                read_ns += timer.elapsed_nanos() as u128;
                 if let Err(e) = result {
                     println!(
                         "[disk-bench] read failed size={} offset={}: {:?}",
@@ -3143,9 +3139,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
 
             core::hint::black_box(checksum);
 
+            let pass_read_ns = read_timer.elapsed_nanos() as u128;
+            read_ns += pass_read_ns;
             read_bytes += offset;
             read_ops += ops;
-            read_samples.push((read_ns.saturating_sub(read_ns_before) / ops.max(1) as u128) as u64);
+            read_samples.push((pass_read_ns / ops.max(1) as u128) as u64);
         }
 
         let wr_ns_op = if write_ops == 0 {

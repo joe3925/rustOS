@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
-use kernel_types::dma::implementation::DeviceMmuPlatformDeviceIdentity;
-use kernel_types::dma::implementation::DmaPciDeviceIdentity;
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::DmaPciDeviceIdentity;
 use spin::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

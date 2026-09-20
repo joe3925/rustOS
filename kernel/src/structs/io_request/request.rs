@@ -6,7 +6,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use kernel_types::completion::TaskToken;
 
-use kernel_types::dma::implementation::{FromDevice, ToDevice};
+use kernel_types::dma::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;

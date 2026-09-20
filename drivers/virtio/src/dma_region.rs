@@ -4,7 +4,7 @@ use kernel_api::error::{DriverErrorKind, KernelError, error_with_message};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::dma::{self, dma_base_page_size};
-use kernel_api::kernel_types::dma::implementation::{
+use kernel_api::kernel_types::dma::{
     Bidirectional, DmaMappingStrategy, IoBuffer, IoBufferBacking, IoBufferBackingConfig,
     IoBufferBackingDesc,
 };

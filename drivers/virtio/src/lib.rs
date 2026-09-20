@@ -44,9 +44,9 @@ use kernel_api::irq::{
     HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqHandleExt, bind_wired_interrupt,
     irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::implementation::IoBufferAccess;
-use kernel_api::kernel_types::dma::implementation::ToDevice;
-use kernel_api::kernel_types::dma::implementation::{DmaMappingStrategy, IoBuffer};
+use kernel_api::kernel_types::dma::IoBufferAccess;
+use kernel_api::kernel_types::dma::ToDevice;
+use kernel_api::kernel_types::dma::{DmaMappingStrategy, IoBuffer};
 use kernel_api::kernel_types::io::{
     DeviceControlOp, DeviceFlushOp, DeviceReadOp, DeviceWriteOp, DiskInfo, ReadSlot,
 };

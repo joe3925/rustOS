@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_types::{arch::VirtAddr, dma::implementation::PhysicalFrameExtent};
+use kernel_types::{arch::VirtAddr, dma::PhysicalFrameExtent};
 use spin::{Mutex, MutexGuard};
 use toml::map::IntoIter;
 

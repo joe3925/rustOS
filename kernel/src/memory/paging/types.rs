@@ -1,7 +1,7 @@
 use acpi::PhysicalMapping;
 use hashbrown::hash_table::Iter;
 use kernel_types::arch::{PhysAddr, VirtAddr};
-use kernel_types::dma::implementation::PhysicalFrameExtent;
+use kernel_types::dma::PhysicalFrameExtent;
 
 use crate::memory::paging::address_space::AddressSpaceRoot;
 use crate::memory::paging::map::map_contiguous_physical_range;

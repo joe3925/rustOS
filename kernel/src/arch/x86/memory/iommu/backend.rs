@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use acpi::sdt::{SdtHeader, Signature};
 use acpi::{AcpiTable, AcpiTables, Handler, PhysicalMapping};
 use core::mem::size_of;
-use kernel_types::dma::implementation::{
+use kernel_types::dma::{
     DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR, DeviceMmuPlatformDeviceIdentity,
     DmaPciDeviceIdentity,
 };

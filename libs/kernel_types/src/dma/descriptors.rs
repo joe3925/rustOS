@@ -1,3 +1,5 @@
+use super::*;
+
 pub enum ToDevice {}
 pub enum FromDevice {}
 pub enum Bidirectional {}
@@ -311,14 +313,14 @@ pub enum IoBufferBackingDesc<'data> {
 
 pub type DmaUnmapFn = extern "C" fn(&Arc<DeviceObject>, usize);
 
-struct DmaDropContext {
-    mapped_by: Arc<DeviceObject>,
-    unmap: DmaUnmapFn,
-    cookie: usize,
+pub(super) struct DmaDropContext {
+    pub(super) mapped_by: Arc<DeviceObject>,
+    pub(super) unmap: DmaUnmapFn,
+    pub(super) cookie: usize,
 }
 
 impl DmaDropContext {
-    fn run(self) {
+    pub(super) fn run(self) {
         (self.unmap)(&self.mapped_by, self.cookie);
     }
 }
@@ -349,7 +351,7 @@ pub enum IoBufferDmaMappingLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DmaSegmentLayout {
+pub(super) enum DmaSegmentLayout {
     None,
     Contiguous {
         segment: IoBufferDmaSegment,
@@ -421,19 +423,19 @@ impl From<IoBufferDmaMappingLayout> for DmaSegmentLayout {
     }
 }
 
-struct DmaRecord {
-    active: bool,
-    persistent: bool,
-    ref_count: usize,
-    mapped_start: usize,
-    mapped_len: usize,
-    access: u8,
-    layout: DmaSegmentLayout,
-    drop_ctx: Option<DmaDropContext>,
+pub(super) struct DmaRecord {
+    pub(super) active: bool,
+    pub(super) persistent: bool,
+    pub(super) ref_count: usize,
+    pub(super) mapped_start: usize,
+    pub(super) mapped_len: usize,
+    pub(super) access: u8,
+    pub(super) layout: DmaSegmentLayout,
+    pub(super) drop_ctx: Option<DmaDropContext>,
 }
 
 impl DmaRecord {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             active: false,
             persistent: false,

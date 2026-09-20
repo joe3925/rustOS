@@ -7,8 +7,8 @@ use kernel_executor::runtime::runtime::{
     block_on as kernel_block_on, spawn_blocking as kernel_spawn_blocking,
     spawn_detached as kernel_spawn_detached, spawn_join_owned as kernel_spawn,
 };
-use kernel_types::dma::implementation::DeviceMmuPlatformDeviceIdentity;
-use kernel_types::dma::implementation::IoBufferBacking;
+use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
+use kernel_types::dma::IoBufferBacking;
 use kernel_types::object_manager::OmError;
 
 use crate::memory::heap::allocator::KernelAllocator;
@@ -53,7 +53,7 @@ use kernel_types::{
         BenchSpanId, BenchSuiteDescriptor, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
-    dma::implementation::{
+    dma::{
         DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappedBuffer,
         DmaMappingStrategy, DmaPciDeviceIdentity,
     },

@@ -15,7 +15,7 @@
   "target-pointer-width": 64,
   "target-endian": "little",
   "target-family": ["windows"],
-  "features": "+v8a,+neon",
+  "features": "+v8a,+neon,+lse",
   "has-thread-local": true,
   "max-atomic-width": 128,
   "dynamic-linking": false,

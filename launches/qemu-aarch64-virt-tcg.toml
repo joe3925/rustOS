@@ -14,7 +14,7 @@ firmware_files = [
 
 args = [
     "-m", "{memory}",
-    "-cpu", "cortex-a72",
+    "-cpu", "max",
     "-machine", "virt,gic-version=3,its=on,iommu=smmuv3",
     "-accel", "tcg",
     "-smp", "{cpus}",

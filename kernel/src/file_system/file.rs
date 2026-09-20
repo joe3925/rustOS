@@ -11,7 +11,7 @@ use alloc::{
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
 use kernel_types::{
-    dma::implementation::{FromDevice, IoBuffer, ToDevice},
+    dma::{FromDevice, IoBuffer, ToDevice},
     error::{ErrorKind, FileErrorKind, KernelError},
     fs::{OpenFlags, Path},
 };

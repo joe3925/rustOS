@@ -1,3 +1,11 @@
+use super::backing::{BackingMemory, LeaseHandle};
+use super::construction::{
+    checked_slice, checked_slice_mut, describe_virtual_buffer_to_frames,
+    validate_dma_mapping_layout,
+};
+use super::descriptors::{DmaDropContext, DmaSegmentLayout};
+use super::*;
+
 pub struct IoBuffer<'backing, 'data, Access: IoBufferAccess> {
     source: IoBufferSource<'backing, 'data>,
     offset: usize,
@@ -114,7 +122,7 @@ fn split_virt_phys(
 }
 
 impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> {
-    fn new(backing: &'backing IoBufferBacking<'data>, lease: LeaseHandle) -> Self {
+    pub(super) fn new(backing: &'backing IoBufferBacking<'data>, lease: LeaseHandle) -> Self {
         let snapshot = backing
             .lease_snapshot(lease)
             .expect("new IoBuffer requires an active lease");

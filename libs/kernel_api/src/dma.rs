@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 
 use kernel_types::device::DeviceObject;
-use kernel_types::dma::implementation::{
+use kernel_types::dma::{
     DeviceMmuPlatformDeviceIdentity, DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError,
     DmaMappedBuffer, DmaMappingStrategy, DmaPciDeviceIdentity, IoBuffer, IoBufferAccess,
     IoBufferBacking, IoBufferError,

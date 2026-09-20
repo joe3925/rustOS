@@ -13,7 +13,7 @@ use spin::Mutex;
 
 use super::request::{IO_STATUS_BUFFER_TOO_SMALL, IO_STATUS_CANCELLED, IoRequestOutput};
 use crate::memory::io_buffer::OwnedIoBuffer;
-use kernel_types::dma::implementation::FromDevice;
+use kernel_types::dma::FromDevice;
 
 struct DeliveryInner {
     completion: Option<IoRequestOutput>,

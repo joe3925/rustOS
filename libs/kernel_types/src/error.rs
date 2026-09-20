@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{self, Display, Write};
 
-use crate::dma::implementation::IoBufferError;
+use crate::dma::IoBufferError;
 
 pub const MAX_ERROR_BACKTRACE_DEPTH: usize = 64;
 

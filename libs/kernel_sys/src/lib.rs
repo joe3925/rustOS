@@ -15,8 +15,8 @@ use kernel_types::benchmark::{
     BenchCoreId, BenchMetricDirection, BenchMetricUnit, BenchObjectId, BenchRunHandle, BenchSpanId,
     BenchSuiteDescriptor, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
-use kernel_types::dma::implementation::IoBufferBacking;
-use kernel_types::dma::implementation::{
+use kernel_types::dma::IoBufferBacking;
+use kernel_types::dma::{
     DeviceMmuPlatformDeviceIdentity, DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError,
     DmaMappedBuffer, DmaMappingStrategy, DmaPciDeviceIdentity,
 };

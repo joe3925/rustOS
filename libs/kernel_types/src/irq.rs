@@ -1,4 +1,4 @@
-use crate::dma::implementation::DmaDeviceHandle;
+use crate::dma::DmaDeviceHandle;
 use alloc::collections::VecDeque;
 use core::cell::UnsafeCell;
 use core::mem::{ManuallyDrop, MaybeUninit};

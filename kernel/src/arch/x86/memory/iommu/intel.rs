@@ -3,7 +3,7 @@
 //!
 use alloc::vec::Vec;
 
-use kernel_types::dma::implementation::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
+use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 

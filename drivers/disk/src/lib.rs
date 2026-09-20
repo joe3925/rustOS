@@ -21,7 +21,7 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        dma::implementation::{FromDevice, IoBuffer, ToDevice},
+        dma::{FromDevice, IoBuffer, ToDevice},
         io::{DeviceControlHandler, DeviceControlOp, DeviceFlush, DeviceFlushOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp, DiskInfo},
         request::IoctlData,
     },

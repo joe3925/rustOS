@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
-use kernel_types::dma::implementation::{
+use kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferAccess, IoBufferBacking, IoBufferBackingConfig,
     IoBufferBackingDesc, IoBufferError, IoBufferExtent, PhysicalFrameExtent, ToDevice,
 };

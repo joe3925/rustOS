@@ -22,7 +22,7 @@ use kernel_executor::global_async::{
     ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor,
 };
 use kernel_types::arch::{PhysAddr, VirtAddr};
-use kernel_types::dma::implementation::{IoBufferError, PhysicalFrameExtent};
+use kernel_types::dma::{IoBufferError, PhysicalFrameExtent};
 use kernel_types::executor::{
     USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainUpdate,
 };

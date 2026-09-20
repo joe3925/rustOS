@@ -1,3 +1,7 @@
+use super::construction::{build_backing_into, validate_dma_mapping_layout, validate_snapshot};
+use super::descriptors::{DmaDropContext, DmaRecord, DmaSegmentLayout};
+use super::*;
+
 const LEASE_FREE: u8 = 0;
 const LEASE_ACTIVE: u8 = 1;
 const LEASE_RELEASING: u8 = 2;
@@ -7,7 +11,7 @@ const ACCESS_BIDIRECTIONAL: u8 = 3;
 const NO_DMA_RECORD: usize = usize::MAX;
 
 #[derive(Clone, Copy)]
-enum BackingMemory<'data> {
+pub(super) enum BackingMemory<'data> {
     /// No CPU-addressable backing is available through this object.
     /// Used for physical-only buffers described by frames/extents.
     None,
@@ -109,7 +113,7 @@ impl IoBufferBackingScratch {
     }
 }
 
-struct LeaseSlot {
+pub(super) struct LeaseSlot {
     state: AtomicU8,
     generation: AtomicU32,
     start: AtomicUsize,
@@ -130,7 +134,7 @@ impl LeaseSlot {
         }
     }
 
-    fn snapshot(&self) -> Option<LeaseSnapshot> {
+    pub(super) fn snapshot(&self) -> Option<LeaseSnapshot> {
         if self.state.load(Ordering::Acquire) != LEASE_ACTIVE {
             return None;
         }
@@ -204,25 +208,25 @@ impl LeaseSlot {
 }
 
 #[derive(Clone, Copy)]
-struct LeaseSnapshot {
-    generation: u32,
-    start: usize,
-    len: usize,
-    access: u8,
-    dma_record: usize,
+pub(super) struct LeaseSnapshot {
+    pub(super) generation: u32,
+    pub(super) start: usize,
+    pub(super) len: usize,
+    pub(super) access: u8,
+    pub(super) dma_record: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LeaseHandle {
-    index: usize,
-    generation: u32,
+pub(super) struct LeaseHandle {
+    pub(super) index: usize,
+    pub(super) generation: u32,
 }
 
 pub struct IoBufferBacking<'data> {
-    memory: BackingMemory<'data>,
+    pub(super) memory: BackingMemory<'data>,
     byte_len: usize,
-    extents: Vec<IoBufferExtent>,
-    frames: Vec<PhysicalFrameExtent>,
+    pub(super) extents: Vec<IoBufferExtent>,
+    pub(super) frames: Vec<PhysicalFrameExtent>,
     leases: RwLock<Box<[LeaseSlot]>>,
     lease_alloc_lock: Mutex<()>,
     dma_records: Mutex<Vec<DmaRecord>>,
@@ -578,7 +582,7 @@ impl<'data> IoBufferBacking<'data> {
 
         Ok(None)
     }
-    fn dma_record_snapshot_for_lease(
+    pub(super) fn dma_record_snapshot_for_lease(
         &self,
         snapshot: LeaseSnapshot,
     ) -> Result<Option<(usize, usize, DmaSegmentLayout)>, IoBufferError> {
@@ -591,7 +595,11 @@ impl<'data> IoBufferBacking<'data> {
 
         self.persistent_dma_record_snapshot_for_range(snapshot.start, snapshot.len, snapshot.access)
     }
-    fn split_lease(&self, handle: LeaseHandle, mid: usize) -> Result<LeaseHandle, IoBufferError> {
+    pub(super) fn split_lease(
+        &self,
+        handle: LeaseHandle,
+        mid: usize,
+    ) -> Result<LeaseHandle, IoBufferError> {
         let leases = self.leases.read();
         let _alloc_guard = self.lease_alloc_lock.lock();
         let parent = leases
@@ -637,7 +645,7 @@ impl<'data> IoBufferBacking<'data> {
         })
     }
 
-    fn release_lease(&self, handle: LeaseHandle) {
+    pub(super) fn release_lease(&self, handle: LeaseHandle) {
         let dma_record = {
             let leases = self.leases.read();
             leases
@@ -650,7 +658,7 @@ impl<'data> IoBufferBacking<'data> {
         }
     }
 
-    fn lease_snapshot(&self, handle: LeaseHandle) -> Result<LeaseSnapshot, IoBufferError> {
+    pub(super) fn lease_snapshot(&self, handle: LeaseHandle) -> Result<LeaseSnapshot, IoBufferError> {
         let leases = self.leases.read();
         let slot = leases
             .get(handle.index)
@@ -658,7 +666,7 @@ impl<'data> IoBufferBacking<'data> {
         validate_snapshot(slot, handle)
     }
 
-    fn set_lease_dma_record(
+    pub(super) fn set_lease_dma_record(
         &self,
         handle: LeaseHandle,
         record: usize,
@@ -676,7 +684,7 @@ impl<'data> IoBufferBacking<'data> {
         Ok(())
     }
 
-    fn clear_lease_dma_record(&self, handle: LeaseHandle) -> Result<(), IoBufferError> {
+    pub(super) fn clear_lease_dma_record(&self, handle: LeaseHandle) -> Result<(), IoBufferError> {
         let leases = self.leases.read();
         let slot = leases
             .get(handle.index)
@@ -690,7 +698,7 @@ impl<'data> IoBufferBacking<'data> {
         Ok(())
     }
 
-    fn allocate_dma_record(
+    pub(super) fn allocate_dma_record(
         &self,
         mapped_start: usize,
         mapped_len: usize,
@@ -740,7 +748,7 @@ impl<'data> IoBufferBacking<'data> {
         Ok(())
     }
 
-    fn release_dma_record(&self, index: usize) {
+    pub(super) fn release_dma_record(&self, index: usize) {
         let drop_ctx = {
             let mut records = self.dma_records.lock();
             let Some(record) = records.get_mut(index) else {

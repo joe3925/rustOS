@@ -1,3 +1,6 @@
+use super::descriptors::DmaSegmentLayout;
+use super::*;
+
 pub struct IoBufferRegion<'a> {
     virtual_addr: Option<usize>,
     frame_offset: usize,
@@ -41,7 +44,7 @@ pub struct IoBufferRegionIter<'a> {
 }
 
 impl<'a> IoBufferRegionIter<'a> {
-    fn new(
+    pub(super) fn new(
         extents: &'a [IoBufferExtent],
         frames: &'a [PhysicalFrameExtent],
         view_start: usize,
@@ -121,11 +124,11 @@ pub struct IoBufferDmaSegmentIter<'a> {
 }
 
 impl<'a> IoBufferDmaSegmentIter<'a> {
-    fn empty(extents: &'a [IoBufferExtent], frames: &'a [PhysicalFrameExtent]) -> Self {
+    pub(super) fn empty(extents: &'a [IoBufferExtent], frames: &'a [PhysicalFrameExtent]) -> Self {
         Self::new(DmaSegmentLayout::None, 0, 0, 0, 0, extents, frames)
     }
 
-    fn new(
+    pub(super) fn new(
         layout: DmaSegmentLayout,
         mapped_start: usize,
         mapped_len: usize,
@@ -604,7 +607,7 @@ pub struct DmaBufferView<'a> {
 }
 
 impl<'a> DmaBufferView<'a> {
-    const fn from_iobuffer_parts(
+    pub(super) const fn from_iobuffer_parts(
         byte_len: usize,
         extents: &'a [IoBufferExtent],
         frames: &'a [PhysicalFrameExtent],

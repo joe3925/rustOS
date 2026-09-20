@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{Ordering, fence};
 use device_tree::{DeviceTree, Node};
 use kernel_types::arch::PhysAddr;
-use kernel_types::dma::implementation::{
+use kernel_types::dma::{
     DMA_IOMMU_VENDOR_ARM_SMMU, DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity,
 };
 use kernel_types::irq::{HardwareInterruptId, IrqBorrowedHandle, IrqFrame, IrqHandle};

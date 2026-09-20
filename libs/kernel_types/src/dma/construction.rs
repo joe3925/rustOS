@@ -1,3 +1,6 @@
+use super::backing::{BackingMemory, LeaseHandle, LeaseSlot, LeaseSnapshot};
+use super::*;
+
 struct VirtualFrameTranslation {
     phys_addr: u64,
     byte_len: u64,
@@ -42,7 +45,7 @@ fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     Some((block.block_size, block.phys_addr))
 }
 
-fn build_backing_into<'data>(
+pub(super) fn build_backing_into<'data>(
     desc: IoBufferBackingDesc<'data>,
     extents: &mut Vec<IoBufferExtent>,
     frames: &mut Vec<PhysicalFrameExtent>,
@@ -225,7 +228,7 @@ fn build_physical_extent_backing_into(
     Ok(byte_len)
 }
 
-fn describe_virtual_buffer_to_frames(
+pub(super) fn describe_virtual_buffer_to_frames(
     virt_addr: usize,
     byte_len: usize,
     frames: &mut Vec<PhysicalFrameExtent>,
@@ -400,7 +403,9 @@ fn validate_physical_extents(
     Ok(total_len)
 }
 
-fn validate_dma_mapping_layout(layout: &IoBufferDmaMappingLayout) -> Result<(), IoBufferError> {
+pub(super) fn validate_dma_mapping_layout(
+    layout: &IoBufferDmaMappingLayout,
+) -> Result<(), IoBufferError> {
     match layout {
         IoBufferDmaMappingLayout::None => Ok(()),
         IoBufferDmaMappingLayout::Contiguous { byte_len, .. } => {
@@ -451,7 +456,7 @@ fn validate_dma_mapping_layout(layout: &IoBufferDmaMappingLayout) -> Result<(), 
     }
 }
 
-fn validate_snapshot(
+pub(super) fn validate_snapshot(
     slot: &LeaseSlot,
     handle: LeaseHandle,
 ) -> Result<LeaseSnapshot, IoBufferError> {
@@ -463,7 +468,7 @@ fn validate_snapshot(
     }
 }
 
-fn checked_slice<'a>(
+pub(super) fn checked_slice<'a>(
     ptr: *const u8,
     backing_len: usize,
     offset: usize,
@@ -476,7 +481,7 @@ fn checked_slice<'a>(
     Some(unsafe { slice::from_raw_parts(ptr.add(offset), len) })
 }
 
-fn checked_slice_mut<'a>(
+pub(super) fn checked_slice_mut<'a>(
     ptr: *mut u8,
     backing_len: usize,
     offset: usize,
