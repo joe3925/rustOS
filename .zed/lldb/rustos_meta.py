@@ -443,26 +443,19 @@ class _MetaProtocol:
 
             if not stop_error.Success():
                 self._print(
-                    "[rustos-meta] "
-                    "ERROR: failed to stop "
-                    "target before loading "
-                    f"'{module.name}': "
+                    "[rustos-meta] ERROR: "
+                    "failed to stop target "
+                    f"for '{module.name}': "
                     f"{stop_error.GetCString()}"
                 )
-
                 return False
 
-            if (
-                process.GetState()
-                != lldb.eStateStopped
-            ):
+            if process.GetState() != lldb.eStateStopped:
                 self._print(
-                    "[rustos-meta] "
-                    "ERROR: target did not "
-                    "enter stopped state for "
+                    "[rustos-meta] ERROR: "
+                    "target did not stop for "
                     f"'{module.name}'"
                 )
-
                 return False
 
         self._print(
@@ -496,19 +489,15 @@ class _MetaProtocol:
             return False
 
         if stopped_by_us:
-            continue_error = (
-                process.Continue()
-            )
+            continue_error = process.Continue()
 
             if not continue_error.Success():
                 self._print(
-                    "[rustos-meta] "
-                    "ERROR: failed to resume "
-                    "target after loading "
-                    f"'{module.name}': "
+                    "[rustos-meta] ERROR: "
+                    "failed to resume target "
+                    f"after '{module.name}': "
                     f"{continue_error.GetCString()}"
                 )
-
                 return False
 
         return True
@@ -536,99 +525,76 @@ class _MetaProtocol:
         self,
         module: _LoadedModule,
     ) -> bool:
+        try:
+            import lldb
+        except Exception as exc:
+            self._print(
+                "[rustos-meta] ERROR: "
+                "could not import LLDB "
+                f"Python module: {exc!r}"
+            )
+            return False
+
         with self._lldb_lock:
-            add_result = self._run_lldb(
-                "target modules add "
-                f"\"{module.abs_path}\""
+            target = (
+                self._debugger
+                .GetSelectedTarget()
             )
 
-            if (
-                add_result is None
-                or not add_result.Succeeded()
-            ):
+            module_spec = lldb.SBModuleSpec()
+            module_spec.SetFileSpec(
+                lldb.SBFileSpec(module.abs_path)
+            )
+
+            lldb_module = target.AddModule(
+                module_spec
+            )
+
+            if not lldb_module.IsValid():
+                self._print(
+                    "[rustos-meta] ERROR: "
+                    "LLDB rejected module "
+                    f"'{module.abs_path}'"
+                )
                 return False
-
-            if not module.sections:
-                return True
-
-            section_args = " ".join(
-                f"{section.name} "
-                f"{section.addr:#x}"
-                for section
-                in module.sections
-            )
-
-            load_result = self._run_lldb(
-                "target modules load "
-                "--file "
-                f"\"{module.abs_path}\" "
-                f"{section_args}"
-            )
-
-            if (
-                load_result is not None
-                and load_result.Succeeded()
-            ):
-                return True
 
             all_loaded = True
 
             for section in module.sections:
-                result = self._run_lldb(
-                    "target modules load "
-                    "--file "
-                    f"\"{module.abs_path}\" "
-                    f"{section.name} "
-                    f"{section.addr:#x}"
+                lldb_section = (
+                    lldb_module.FindSection(
+                        section.name
+                    )
                 )
 
-                if (
-                    result is None
-                    or not result.Succeeded()
-                ):
+                if not lldb_section.IsValid():
+                    self._print(
+                        "[rustos-meta] ERROR: "
+                        "could not find section "
+                        f"'{section.name}' in "
+                        f"'{module.name}'"
+                    )
+                    all_loaded = False
+                    continue
+
+                error = (
+                    target.SetSectionLoadAddress(
+                        lldb_section,
+                        section.addr,
+                    )
+                )
+
+                if not error.Success():
+                    self._print(
+                        "[rustos-meta] ERROR: "
+                        "could not load section "
+                        f"'{section.name}' for "
+                        f"'{module.name}': "
+                        f"{error.GetCString()}"
+                    )
                     all_loaded = False
 
             return all_loaded
-
-    def _run_lldb(
-        self,
-        command: str,
-    ):
-        try:
-            import lldb
-
-            result = (
-                lldb.SBCommandReturnObject()
-            )
-
-            interpreter = (
-                self._debugger
-                .GetCommandInterpreter()
-            )
-
-            interpreter.HandleCommand(
-                command,
-                result,
-            )
-
-            if not result.Succeeded():
-                self._print(
-                    "[rustos-meta] "
-                    "LLDB error for "
-                    f"`{command}`: "
-                    f"{result.GetError()}"
-                )
-
-            return result
-
-        except Exception as exc:
-            self._print(
-                "[rustos-meta] "
-                "exception running "
-                f"`{command}`: {exc!r}"
-            )
-
-            return None
 
     def _resolve_path(
         self,
@@ -733,210 +699,6 @@ class _MetaProtocol:
             self._debugger,
             message + "\n",
         )
-
-
-class _DirectMetaConnection:
-    def __init__(
-        self,
-        debugger,
-        host: str,
-        port: int,
-        protocol: _MetaProtocol,
-    ) -> None:
-        self._debugger = debugger
-        self._host = host
-        self._port = port
-        self._protocol = protocol
-
-        self._sock: Optional[
-            socket.socket
-        ] = None
-
-        self._stop = threading.Event()
-
-        self._thread: Optional[
-            threading.Thread
-        ] = None
-
-        self._send_lock = threading.Lock()
-        self._buf = bytearray()
-
-    def start(self) -> bool:
-        try:
-            sock = socket.create_connection(
-                (
-                    self._host,
-                    self._port,
-                ),
-                timeout=5.0,
-            )
-
-            sock.settimeout(
-                HELLO_RETRY_SECONDS
-            )
-
-            self._sock = sock
-
-            self._send(
-                META_HELLO
-            )
-
-        except OSError as exc:
-            _write_codelldb_console(
-                self._debugger,
-                "[rustos-meta] ERROR: "
-                "could not connect to "
-                f"{self._host}:"
-                f"{self._port}: {exc}\n",
-            )
-
-            self._close_socket()
-
-            return False
-
-        self._thread = threading.Thread(
-            target=self._reader_loop,
-            name="rustos-meta-reader",
-            daemon=True,
-        )
-
-        self._thread.start()
-
-        _write_codelldb_console(
-            self._debugger,
-            "[rustos-meta] connected to "
-            f"{self._host}:"
-            f"{self._port}, "
-            "driver dir: "
-            f"{self._protocol.driver_dir}\n",
-        )
-
-        return True
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._close_socket()
-
-        if (
-            self._thread is not None
-            and self._thread
-            is not threading.current_thread()
-        ):
-            self._thread.join(
-                timeout=2.0
-            )
-
-        self._thread = None
-
-    def send_module_ready(
-        self,
-        module_id: int,
-    ) -> bool:
-        return self._send(
-            (
-                "RUSTOS_MODULE_READY "
-                f"id={module_id}\n"
-            ).encode("ascii")
-        )
-
-    def _send(
-        self,
-        data: bytes,
-    ) -> bool:
-        sock = self._sock
-
-        if sock is None:
-            return False
-
-        try:
-            with self._send_lock:
-                sock.sendall(
-                    data
-                )
-
-            return True
-
-        except OSError:
-            return False
-
-    def _close_socket(self) -> None:
-        sock = self._sock
-        self._sock = None
-
-        if sock is None:
-            return
-
-        try:
-            sock.shutdown(
-                socket.SHUT_RDWR
-            )
-        except OSError:
-            pass
-
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-    def _reader_loop(self) -> None:
-        while not self._stop.is_set():
-            sock = self._sock
-
-            if sock is None:
-                return
-
-            try:
-                chunk = sock.recv(
-                    4096
-                )
-
-            except socket.timeout:
-                if self._protocol.hello_acked:
-                    try:
-                        sock.settimeout(
-                            None
-                        )
-                    except OSError:
-                        return
-
-                    continue
-
-                if not self._send(
-                    META_HELLO
-                ):
-                    return
-
-                continue
-
-            except OSError:
-                return
-
-            if not chunk:
-                return
-
-            self._buf.extend(
-                chunk
-            )
-
-            while True:
-                newline = self._buf.find(
-                    b"\n"
-                )
-
-                if newline < 0:
-                    break
-
-                line = bytes(
-                    self._buf[:newline]
-                )
-
-                del self._buf[
-                    : newline + 1
-                ]
-
-                self._protocol.process_line_bytes(
-                    line
-                )
 
 
 class _SerialConnection:
@@ -1300,15 +1062,9 @@ _active_protocol: Optional[
     _MetaProtocol
 ] = None
 
-_active_direct_meta: Optional[
-    _DirectMetaConnection
-] = None
-
 _active_serial: Optional[
     _SerialConnection
 ] = None
-
-_active_meta_uses_serial = False
 
 
 class _RustosSerialConnectCommand:
@@ -1374,10 +1130,7 @@ class _RustosSerialConnectCommand:
 
         _active_serial = connection
 
-        if (
-            _active_meta_uses_serial
-            and _active_protocol is not None
-        ):
+        if _active_protocol is not None:
             _active_protocol.set_ready_sender(
                 connection.send_module_ready
             )
@@ -1421,132 +1174,51 @@ class _RustosMetaConnectCommand:
         result,
     ) -> None:
         global _active_protocol
-        global _active_direct_meta
-        global _active_meta_uses_serial
 
         args = shlex.split(
             command
         )
 
-        if len(args) != 3:
+        if len(args) != 1:
             result.SetError(
                 "usage: "
                 "rustos-meta-connect "
-                "HOST PORT DRIVER_DIR"
+                "DRIVER_DIR"
             )
 
             return
 
-        (
-            host,
-            port_text,
-            driver_dir,
-        ) = args
-
-        try:
-            port = int(
-                port_text
-            )
-
-        except ValueError:
+        if _active_serial is None:
             result.SetError(
-                f"invalid port: {port_text!r}"
+                "rustos-serial-connect "
+                "must run first"
             )
-
             return
 
-        if _active_serial is not None:
-            _active_serial.detach_metadata()
-
-        if _active_direct_meta is not None:
-            _active_direct_meta.stop()
-            _active_direct_meta = None
+        _active_serial.detach_metadata()
 
         protocol = _MetaProtocol(
             debugger,
-            driver_dir,
+            args[0],
         )
 
         _active_protocol = protocol
 
-        target = (
-            debugger
-            .GetSelectedTarget()
-        )
-
-        triple = (
-            target.GetTriple()
-            if target.IsValid()
-            else ""
-        )
-
-        triple = (
-            triple or ""
-        ).lower()
-
-        if (
-            triple.startswith("aarch64")
-            or triple.startswith("arm64")
-        ):
-            if _active_serial is None:
-                _active_protocol = None
-
-                result.SetError(
-                    "AArch64 metadata uses "
-                    "UART0; "
-                    "rustos-serial-connect "
-                    "must run first"
-                )
-
-                return
-
-            _active_meta_uses_serial = True
-
-            protocol.set_ready_sender(
-                _active_serial.send_module_ready
-            )
-
-            _active_serial.attach_metadata(
-                protocol
-            )
-
-            _write_codelldb_console(
-                debugger,
-                "[rustos-meta] attached "
-                "to UART0 multiplex, "
-                "driver dir: "
-                f"{protocol.driver_dir}\n",
-            )
-
-            result.SetStatus(0)
-
-            return
-
-        _active_meta_uses_serial = False
-
-        connection = _DirectMetaConnection(
-            debugger,
-            host,
-            port,
-            protocol,
-        )
-
         protocol.set_ready_sender(
-            connection.send_module_ready
+            _active_serial.send_module_ready
         )
 
-        if not connection.start():
-            _active_protocol = None
+        _active_serial.attach_metadata(
+            protocol
+        )
 
-            result.SetError(
-                "failed to connect to "
-                "metadata transport "
-                f"{host}:{port}"
-            )
-
-            return
-
-        _active_direct_meta = connection
+        _write_codelldb_console(
+            debugger,
+            "[rustos-meta] attached "
+            "to primary serial, "
+            "driver dir: "
+            f"{protocol.driver_dir}\n",
+        )
 
         result.SetStatus(0)
 
@@ -1563,11 +1235,7 @@ class _RustosMetaConnectCommand:
     ) -> str:
         return (
             "rustos-meta-connect "
-            "HOST PORT DRIVER_DIR\n\n"
-            "AArch64 uses prefixed "
-            "metadata records on UART0.\n"
-            "x86_64 uses the dedicated "
-            "COM2 metadata socket."
+            "DRIVER_DIR"
         )
 
 
@@ -1595,6 +1263,6 @@ def __lldb_init_module(
         debugger,
         "[rustos-meta] loaded — use "
         "'rustos-meta-connect "
-        "HOST PORT DRIVER_DIR' "
+        "DRIVER_DIR' "
         "to start\n",
     )

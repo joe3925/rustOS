@@ -161,13 +161,6 @@ pub extern "C" fn pci_setup_msix(
             )
         })?;
 
-    kernel_api::println!(
-        "MSI-X table phys={:#x} va={:#x} size={:#x}",
-        table_phys,
-        table_va.as_u64(),
-        table_region_size,
-    );
-
     let binding = match bind_msi_interrupt(&request, isr, context) {
         Some(binding) => binding,
 

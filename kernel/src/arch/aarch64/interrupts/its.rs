@@ -234,12 +234,6 @@ impl Its {
     }
 
     pub(super) fn bind(&self, request: &MsiBindingRequest, vector: u8) -> Option<MsiMessage> {
-        crate::println!(
-            "ITS bind start vector={} requester={:#x} event={}",
-            vector,
-            request.requester.requester_id,
-            request.table_index
-        );
         if !matches!(request.kind, MSI_KIND_MSI | MSI_KIND_MSIX)
             || request.requester.kind != MSI_REQUESTER_PCI
         {
@@ -278,7 +272,6 @@ impl Its {
                         0,
                     ],
                 )?;
-                crate::println!("ITS MAPD complete");
                 state.devices[index] = Some(Device {
                     id: device_id,
                     itt,
@@ -292,9 +285,7 @@ impl Its {
                 &mut state,
                 [GITS_CMD_MAPC, 0, target | collection as u64 | 1 << 63, 0],
             )?;
-            crate::println!("ITS MAPC complete");
             self.command(&mut state, [GITS_CMD_INVALL, 0, collection as u64, 0])?;
-            crate::println!("ITS INVALL complete");
             state.collections[collection as usize] = true;
         }
         self.command(
@@ -306,9 +297,7 @@ impl Its {
                 0,
             ],
         )?;
-        crate::println!("ITS MAPTI complete");
         self.command(&mut state, [GITS_CMD_SYNC, 0, target, 0])?;
-        crate::println!("ITS SYNC complete");
         state.devices[device_index].as_mut()?.users += 1;
         state.bindings[binding_index] = Some(Binding {
             vector,

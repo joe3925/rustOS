@@ -31,7 +31,6 @@ debug_args = [
     "-gdb", "tcp::{gdb_port}",
 ]
 
-lldb_metadata_args = []
 
 [defaults]
 memory = "1G"

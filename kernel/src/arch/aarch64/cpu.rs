@@ -297,17 +297,7 @@ impl CpuPlatform for Aarch64Platform {
                 });
             }
             wait_for_handshake(processor.cpu_id, processor.platform_cpu_id)?;
-            crate::println!(
-                "AArch64 CPU {} with platform ID {} and MPIDR {:#x} is online",
-                processor.cpu_id,
-                processor.platform_cpu_id,
-                processor.hardware_id
-            );
         }
-        crate::println!(
-            "AArch64 started {} secondary CPUs",
-            topology.processors.len() - 1
-        );
         Ok(())
     }
 

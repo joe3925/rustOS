@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_GDB_PORT: u16 = 1234;
 const DEFAULT_SERIAL_PORT: u16 = 4321;
-const DEFAULT_META_PORT: u16 = 4322;
 
 fn main() {
     if let Err(err) = try_main() {
@@ -218,10 +217,7 @@ struct QemuOptions {
     dry_run: bool,
     console_serial: bool,
     gdb_port: u16,
-    /// Enable the COM2 LLDB metadata socket.
     lldb_meta: bool,
-    /// TCP port for the COM2 LLDB metadata socket.
-    meta_port: u16,
     platform: Option<String>,
     launch: Option<String>,
     host: Option<String>,
@@ -284,7 +280,6 @@ impl Cli {
                     console_serial: false,
                     gdb_port: DEFAULT_GDB_PORT,
                     lldb_meta: false,
-                    meta_port: DEFAULT_META_PORT,
                     platform: None,
                     launch: None,
                     host: None,
@@ -312,14 +307,6 @@ impl Cli {
                                 .map_err(|_| format!("invalid gdb port `{port}`"))?;
                         }
                         "--lldb-meta" => options.lldb_meta = true,
-                        "--meta-port" => {
-                            let port = args
-                                .next()
-                                .ok_or_else(|| "--meta-port requires a port".to_string())?;
-                            options.meta_port = port
-                                .parse()
-                                .map_err(|_| format!("invalid meta port `{port}`"))?;
-                        }
                         "--platform" => {
                             options.platform = Some(args.next().ok_or_else(|| {
                                 "--platform requires a name or TOML path".to_string()
@@ -405,7 +392,7 @@ fn usage() -> String {
     [
         "usage:",
         "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
-        "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta] [--meta-port PORT]",
+        "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta]",
         "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
@@ -423,12 +410,10 @@ fn usage() -> String {
         "  RUSTOS_QEMU_SERIAL QEMU serial backend override used unless --console-serial is passed",
         "",
         "serial ports:",
-        "  COM1 (0x3F8)  kernel logs; debug sessions stream to LLDB on TCP port 4321",
+        "  COM1/UART0  kernel logs and debugger metadata; debug sessions stream to LLDB on TCP port 4321",
         "                --file-serial PATH additionally records COM1 at PATH",
         "                other runs use RUSTOS_QEMU_SERIAL and default to no output",
-        "  COM2 (0x2F8)  structured debugger metadata, enabled with --lldb-meta",
-        "                host TCP port defaults to 4322 (override with --meta-port)",
-        "                connect with: .zed/lldb/rustos_meta.py via rustos-meta-connect",
+        "                --lldb-meta enables structured debugger metadata",
     ]
     .join("\n")
 }
@@ -1349,7 +1334,6 @@ fn qemu_args_inner(
         ("system_disk_format", system_disk.format.clone()),
         ("primary_serial", serial.primary),
         ("gdb_port", options.gdb_port.to_string()),
-        ("meta_port", options.meta_port.to_string()),
     ];
 
     let mut templates = serial.prefix_args;
@@ -1357,10 +1341,6 @@ fn qemu_args_inner(
 
     if options.debug {
         templates.extend(launch.debug_args.iter().cloned());
-    }
-
-    if options.lldb_meta {
-        templates.extend(launch.lldb_metadata_args.iter().cloned());
     }
 
     templates
@@ -1519,8 +1499,7 @@ fn write_lldb_commands(
 
     if options.lldb_meta {
         commands.push(format!(
-            "rustos-meta-connect 127.0.0.1 {} {}",
-            options.meta_port,
+            "rustos-meta-connect {}",
             lldb_quote_path(&driver_dir)?
         ));
     }
@@ -1549,7 +1528,6 @@ fn spawn_qemu_detached(
     debug: bool,
     gdb_port: u16,
 ) -> Result<(), String> {
-    let mut command = Command::new(qemu);
     let mut command = Command::new(qemu);
     command
         .args(args)

@@ -95,10 +95,6 @@ pub unsafe fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), Page
     let start = VirtAddr::new(base.as_u64() - off);
     let total = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
 
-    if base.as_u64() % base_page != 0 {
-        crate::println!("physical range free base={:#x} start={:#x} size={:#x} total={:#x}", base.as_u64(), start.as_u64(), size, total);
-    }
-
     unsafe {
         unmap_range_keep_frames_unchecked(start, total);
     }

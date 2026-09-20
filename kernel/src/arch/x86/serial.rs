@@ -8,10 +8,11 @@ use crate::platform::ConsolePlatform;
 use super::platform::X86Platform;
 
 const COM1: u16 = 0x3f8;
+const META_PREFIX: &[u8] = b"\x1eRUSTOS_META ";
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static WRITE_LOCK: IrqSafeMutex<()> = IrqSafeMutex::new(());
 
-fn init_once() {
+pub(crate) fn init_once() {
     if INITIALIZED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -49,12 +50,51 @@ fn write_byte(byte: u8) {
 
 impl ConsolePlatform for X86Platform {
     fn serial_write_bytes(bytes: &[u8]) {
+        super::debug::poll_rx_once();
         let _guard = WRITE_LOCK.lock();
         init_once();
         for &byte in bytes {
             if byte == b'\n' {
                 write_byte(b'\r');
             }
+            write_byte(byte);
+        }
+    }
+}
+
+pub(crate) fn try_read_byte() -> Option<u8> {
+    init_once();
+
+    if unsafe { Port::<u8>::new(COM1 + 5).read() & 0x01 != 0 } {
+        Some(unsafe { Port::<u8>::new(COM1).read() })
+    } else {
+        None
+    }
+}
+
+pub(crate) fn write_metadata_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let _guard = WRITE_LOCK.lock();
+    init_once();
+    let mut start = 0;
+
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte != b'\n' {
+            continue;
+        }
+
+        for &byte in META_PREFIX.iter().chain(bytes[start..=index].iter()) {
+            write_byte(byte);
+        }
+
+        start = index + 1;
+    }
+
+    if start < bytes.len() {
+        for &byte in META_PREFIX.iter().chain(bytes[start..].iter()) {
             write_byte(byte);
         }
     }

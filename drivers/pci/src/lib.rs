@@ -321,10 +321,6 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> Result<(), KernelError
     }
     for join in joins {
         for p in join.await {
-            println!(
-                "[PCI] {}:{}:{}.{} command={:#06x}",
-                p.seg, p.bus, p.dev, p.func, p.command,
-            );
             make_pdo_for_function(&devnode, &p);
         }
     }

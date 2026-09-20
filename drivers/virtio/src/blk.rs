@@ -87,10 +87,6 @@ pub(crate) unsafe fn init_device(
     unsafe { pci::common_write_u32(common_cfg, pci::COMMON_DEVICE_FEATURE_SELECT, 1) };
     let dev_features_hi = unsafe { pci::common_read_u32(common_cfg, pci::COMMON_DEVICE_FEATURE) };
     let dev_features = (dev_features_hi as u64) << 32 | dev_features_lo as u64;
-    println!(
-        "virtio features lo={:#010x} hi={:#010x}",
-        dev_features_lo, dev_features_hi
-    );
     // Modern virtio-pci requires VERSION_1; fail early if missing.
     if unlikely(dev_features & VIRTIO_F_VERSION_1 == 0) {
         cold_path();

@@ -366,7 +366,6 @@ fn run_topology(
         console_serial: false,
         gdb_port: crate::DEFAULT_GDB_PORT,
         lldb_meta: false,
-        meta_port: crate::DEFAULT_META_PORT,
         platform: Some(platform.id.clone()),
         launch: Some(launch.id.clone()),
         host: None,

@@ -142,8 +142,6 @@ struct LaunchFile {
     args: Vec<String>,
     #[serde(default)]
     debug_args: Vec<String>,
-    #[serde(default)]
-    lldb_metadata_args: Vec<String>,
     defaults: LaunchDefaults,
     capabilities: LaunchCapabilities,
 }
@@ -170,7 +168,6 @@ pub struct LaunchPlan {
     pub firmware_files: Vec<PathBuf>,
     pub args: Vec<String>,
     pub debug_args: Vec<String>,
-    pub lldb_metadata_args: Vec<String>,
     pub defaults: LaunchDefaults,
     pub capabilities: LaunchCapabilities,
 }
@@ -311,7 +308,6 @@ pub fn load_launch(root: &Path, selector: &str) -> Result<LaunchPlan, String> {
         firmware_files: parsed.firmware_files,
         args: parsed.args,
         debug_args: parsed.debug_args,
-        lldb_metadata_args: parsed.lldb_metadata_args,
         defaults: parsed.defaults,
         capabilities: parsed.capabilities,
     })

@@ -94,12 +94,6 @@ impl ContiguousDmaRegion {
             )
         })?;
 
-        kernel_api::println!(
-            "virtio DMA allocation va={:#x} bytes={:#x}",
-            base_va.as_u64(),
-            alloc_bytes
-        );
-
         unsafe {
             core::ptr::write_bytes(base_va.as_u64() as *mut u8, 0, alloc_bytes);
         }
@@ -290,11 +284,6 @@ impl ContiguousDmaRegion {
     }
 
     pub fn destroy(&mut self) {
-        kernel_api::println!(
-            "virtio DMA destroy va={:#x} bytes={:#x}",
-            self.base_va.as_u64(),
-            self.alloc_bytes
-        );
         for chunk in &mut self.chunks {
             drop(chunk.buffer.take());
 
