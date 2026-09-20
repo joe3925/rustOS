@@ -29,7 +29,7 @@ debug_args = [
     "-gdb", "tcp::{gdb_port}",
 ]
 [defaults]
-memory = "2"
+memory = "2G"
 cpus = "3"
 
 [capabilities]
