@@ -187,7 +187,7 @@ fn filtered_impl_generics_and_predicates(
         .intersection(&generic_lifetimes)
         .cloned()
         .collect();
-    let mut params = Vec::new();
+    let mut params = vec![quote! { '__request_payload_data }];
 
     for param in &generics.params {
         match param {
@@ -206,11 +206,7 @@ fn filtered_impl_generics_and_predicates(
         }
     }
 
-    let impl_generics = if params.is_empty() {
-        quote! {}
-    } else {
-        quote! { <#(#params),*> }
-    };
+    let impl_generics = quote! { <#(#params),*> };
 
     let filtered_predicates = predicates
         .iter()
@@ -250,22 +246,8 @@ fn request_view_case_items(
     let source = &spec.source;
     let target = &spec.target;
     let predicates = where_predicates(generics.where_clause.as_ref(), spec.where_clause.as_ref());
-    let (source_impl_generics, source_predicates) =
+    let (source_impl_generics_with_data, source_predicates) =
         filtered_impl_generics_and_predicates(generics, source, &predicates);
-
-    let source_impl_generics_with_data_str = source_impl_generics.to_string();
-    let source_impl_generics_with_data = if source_impl_generics_with_data_str.is_empty() {
-        quote! { <'__request_payload_data> }
-    } else {
-        if source_impl_generics_with_data_str.starts_with('<') {
-            let inner = &source_impl_generics_with_data_str
-                [1..source_impl_generics_with_data_str.len() - 1];
-            let inner_tokens: TokenStream2 = inner.parse().unwrap();
-            quote! { <'__request_payload_data, #inner_tokens> }
-        } else {
-            quote! { <'__request_payload_data> }
-        }
-    };
 
     let check_where = check_where_clause(&predicates);
     let case_ident = match spec.kind {
@@ -390,22 +372,8 @@ fn request_into_case_items(
     let source = &spec.source;
     let target = &spec.target;
     let predicates = where_predicates(generics.where_clause.as_ref(), spec.where_clause.as_ref());
-    let (source_impl_generics, source_predicates) =
+    let (source_impl_generics_with_data, source_predicates) =
         filtered_impl_generics_and_predicates(generics, source, &predicates);
-
-    let source_impl_generics_with_data_str = source_impl_generics.to_string();
-    let source_impl_generics_with_data = if source_impl_generics_with_data_str.is_empty() {
-        quote! { <'__request_payload_data> }
-    } else {
-        if source_impl_generics_with_data_str.starts_with('<') {
-            let inner = &source_impl_generics_with_data_str
-                [1..source_impl_generics_with_data_str.len() - 1];
-            let inner_tokens: TokenStream2 = inner.parse().unwrap();
-            quote! { <'__request_payload_data, #inner_tokens> }
-        } else {
-            quote! { <'__request_payload_data> }
-        }
-    };
 
     let check_where = check_where_clause(&predicates);
     let case_ident = format_ident!("__request_payload_into_case_for_{}_{}", ident, index);

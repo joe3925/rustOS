@@ -35,6 +35,7 @@ use kernel_api::kernel_types::io::{
     DeviceFlush, DeviceFlushDirty, DeviceFlushDirtyOp, DeviceFlushOp, DeviceFlushOwner,
     DeviceFlushOwnerOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp,
 };
+use kernel_api::kernel_types::guid_to_string;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::protocol::disk::PartitionInfoProtocol;
 use kernel_api::kernel_types::protocol::volmgr::{VolumeProtocol, VolumeProtocolVTable};
@@ -495,27 +496,6 @@ impl Default for VolPdoExt {
 }
 
 #[inline]
-fn guid_to_string(g: &[u8; 16]) -> String {
-    let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-    let d2 = u16::from_le_bytes([g[4], g[5]]);
-    let d3 = u16::from_le_bytes([g[6], g[7]]);
-    alloc::format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        d1,
-        d2,
-        d3,
-        g[8],
-        g[9],
-        g[10],
-        g[11],
-        g[12],
-        g[13],
-        g[14],
-        g[15]
-    )
-}
-
-#[inline]
 fn partition_len_bytes(pi: &PartitionInfo) -> Option<u64> {
     let sector_sz = pi.disk.logical_block_size as u64;
     let ent = pi.gpt_entry?;
@@ -751,43 +731,16 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
         )
     };
 
-    if unlikely(len_req == 0) {
-        cold_path();
+    let Some(len) = volume_request_len(
+        vol_len,
+        offset,
+        len_req,
+        no_buffer,
+        req_data_len,
+        "read",
+    )? else {
         return Ok(DriverStep::Complete);
-    }
-
-    if unlikely(offset >= vol_len) {
-        cold_path();
-        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
-            alloc::format!(
-                "volume read offset {offset} is outside volume length {vol_len}"
-            )
-        });
-    }
-
-    if unlikely(
-        offset
-            .checked_add(len_req as u64)
-            .map_or(true, |end| end > vol_len),
-    ) {
-        cold_path();
-        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
-            alloc::format!(
-                "volume read range offset {offset}, length {len_req} exceeds volume length {vol_len}"
-            )
-        });
-    }
-
-    let len = if no_buffer {
-        len_req
-    } else {
-        core::cmp::min(len_req, req_data_len)
     };
-
-    if unlikely(len == 0) {
-        cold_path();
-        return Ok(DriverStep::Complete);
-    }
 
     {
         let w = &mut *req;
@@ -837,43 +790,16 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
         )
     };
 
-    if unlikely(len_req == 0) {
-        cold_path();
+    let Some(len) = volume_request_len(
+        vol_len,
+        offset,
+        len_req,
+        no_buffer,
+        req_data_len,
+        "write",
+    )? else {
         return Ok(DriverStep::Complete);
-    }
-
-    if unlikely(offset >= vol_len) {
-        cold_path();
-        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
-            alloc::format!(
-                "volume write offset {offset} is outside volume length {vol_len}"
-            )
-        });
-    }
-
-    if unlikely(
-        offset
-            .checked_add(len_req as u64)
-            .map_or(true, |end| end > vol_len),
-    ) {
-        cold_path();
-        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
-            alloc::format!(
-                "volume write range offset {offset}, length {len_req} exceeds volume length {vol_len}"
-            )
-        });
-    }
-
-    let len = if no_buffer {
-        len_req
-    } else {
-        core::cmp::min(len_req, req_data_len)
     };
-
-    if unlikely(len == 0) {
-        cold_path();
-        return Ok(DriverStep::Complete);
-    }
 
     {
         let w = &mut *req;
@@ -896,6 +822,46 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
             Err(cache_error("servicing a cached volume write", err))
         }
     }
+}
+
+fn volume_request_len(
+    volume_len: u64,
+    offset: u64,
+    requested: usize,
+    no_buffer: bool,
+    buffer_len: usize,
+    operation: &str,
+) -> Result<Option<usize>, KernelError> {
+    if unlikely(requested == 0) {
+        cold_path();
+        return Ok(None);
+    }
+    if unlikely(offset >= volume_len) {
+        cold_path();
+        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+            alloc::format!(
+                "volume {operation} offset {offset} is outside volume length {volume_len}"
+            )
+        });
+    }
+    if unlikely(
+        offset
+            .checked_add(requested as u64)
+            .map_or(true, |end| end > volume_len),
+    ) {
+        cold_path();
+        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+            alloc::format!(
+                "volume {operation} range offset {offset}, length {requested} exceeds volume length {volume_len}"
+            )
+        });
+    }
+    let len = if no_buffer {
+        requested
+    } else {
+        core::cmp::min(requested, buffer_len)
+    };
+    Ok((len != 0).then_some(len))
 }
 
 async fn vol_pdo_flush_impl<'req, 'b>(dev: &Arc<DeviceObject>, req: &'b mut Flush) -> Result<DriverStep, kernel_api::error::KernelError> {

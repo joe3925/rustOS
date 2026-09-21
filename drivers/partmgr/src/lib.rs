@@ -27,6 +27,7 @@ use kernel_api::kernel_types::protocol::disk::{
     DiskInfoProtocol, DiskInfoProtocolVTable, PartitionInfoProtocol, PartitionInfoProtocolVTable,
 };
 use kernel_api::kernel_types::request::IoctlData;
+use kernel_api::kernel_types::guid_to_string;
 use kernel_api::pnp::InitComplete;
 use kernel_api::pnp::QueryDeviceRelations;
 use kernel_api::pnp::RegisterDmaBacking;
@@ -106,99 +107,48 @@ fn partition_len_bytes(start_lba: u64, end_lba: u64) -> Option<u64> {
         .checked_mul(512)
 }
 
-fn validate_partition_read_chain<'io>(
-    first: &Read<'io>,
+fn partition_geometry(dx: &PartDevExt) -> Result<(u64, u64, u64), DriverErrorKind> {
+    let start_lba = *dx.start_lba.get().ok_or(DriverErrorKind::InvalidParameter)?;
+    let end_lba = *dx.end_lba.get().ok_or(DriverErrorKind::InvalidParameter)?;
+    let block_size = *dx.block_size.get().ok_or(DriverErrorKind::InvalidParameter)? as u64;
+    if block_size == 0 {
+        return Err(DriverErrorKind::InvalidParameter);
+    }
+    let part_bytes = partition_len_bytes(start_lba, end_lba)
+        .ok_or(DriverErrorKind::InvalidParameter)?;
+    let base = start_lba
+        .checked_mul(512)
+        .ok_or(DriverErrorKind::InvalidParameter)?;
+    Ok((part_bytes, base, block_size))
+}
+
+fn validate_partition_chain(
+    requests: impl Iterator<Item = (u64, usize, bool, Option<usize>)>,
     part_bytes: u64,
     block_size: u64,
 ) -> Result<(), DriverErrorKind> {
-    for read in first.iter() {
-        if read.len == 0 {
+    for (offset, len, no_buffer, buffer_len) in requests {
+        if len == 0 {
             continue;
         }
-
-        if !read.no_buffer {
-            let Some(buffer) = read.buffer.as_ref() else {
+        if !no_buffer {
+            let Some(buffer_len) = buffer_len else {
                 return Err(DriverErrorKind::InvalidParameter);
             };
-
-            if buffer.len() < read.len {
+            if buffer_len < len {
                 return Err(DriverErrorKind::InvalidParameter);
             }
         }
-
-        let end = read
-            .offset
-            .checked_add(read.len as u64)
+        let end = offset
+            .checked_add(len as u64)
             .ok_or(DriverErrorKind::InvalidParameter)?;
-
         if end > part_bytes {
             return Err(DriverErrorKind::InvalidParameter);
         }
-
-        if read.offset % block_size != 0 || !(read.len as u64).is_multiple_of(block_size) {
+        if offset % block_size != 0 || !(len as u64).is_multiple_of(block_size) {
             return Err(DriverErrorKind::InvalidParameter);
         }
     }
-
-    Ok(())
-}
-
-fn validate_partition_write_chain<'io>(
-    first: &Write<'io>,
-    part_bytes: u64,
-    block_size: u64,
-) -> Result<(), DriverErrorKind> {
-    for write in first.iter() {
-        if write.len == 0 {
-            continue;
-        }
-
-        if !write.no_buffer {
-            let Some(buffer) = write.buffer.as_ref() else {
-                return Err(DriverErrorKind::InvalidParameter);
-            };
-
-            if buffer.len() < write.len {
-                return Err(DriverErrorKind::InvalidParameter);
-            }
-        }
-
-        let end = write
-            .offset
-            .checked_add(write.len as u64)
-            .ok_or(DriverErrorKind::InvalidParameter)?;
-
-        if end > part_bytes {
-            return Err(DriverErrorKind::InvalidParameter);
-        }
-
-        if write.offset % block_size != 0 || !(write.len as u64).is_multiple_of(block_size) {
-            return Err(DriverErrorKind::InvalidParameter);
-        }
-    }
-
-    Ok(())
-}
-
-fn translate_read_chain<'io>(first: &mut Read<'io>, base: u64) -> Result<(), DriverErrorKind> {
-    for read in first.iter_mut() {
-        read.offset = read
-            .offset
-            .checked_add(base)
-            .ok_or(DriverErrorKind::InvalidParameter)?;
-    }
-
-    Ok(())
-}
-
-fn translate_write_chain<'io>(first: &mut Write<'io>, base: u64) -> Result<(), DriverErrorKind> {
-    for write in first.iter_mut() {
-        write.offset = write
-            .offset
-            .checked_add(base)
-            .ok_or(DriverErrorKind::InvalidParameter)?;
-    }
-
     Ok(())
 }
 
@@ -209,52 +159,32 @@ impl DeviceRead for PartitionPdoIo {
         request: &'b mut Read<'data>,
     ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = ext::<PartDevExt>(&device);
-        let start_lba = *dx.start_lba.get().unwrap();
-        let end_lba = *dx.end_lba.get().unwrap();
-
-        let block_size = match dx.block_size.get() {
-            Some(v) if *v != 0 => *v as u64,
-            _ => {
-                cold_path();
-                return Err(kernel_api::error::error(
-                    kernel_api::error::DriverErrorKind::InvalidParameter,
-                ));
-            }
-        };
-
-        let part_bytes = match partition_len_bytes(start_lba, end_lba) {
-            Some(bytes) => bytes,
-            None => {
-                cold_path();
-                return Err(kernel_api::error::error(
-                    kernel_api::error::DriverErrorKind::InvalidParameter,
-                ));
-            }
-        };
-
-        let base = match start_lba.checked_mul(512) {
-            Some(base) => base,
-            None => {
-                cold_path();
-                return Err(kernel_api::error::error(
-                    kernel_api::error::DriverErrorKind::InvalidParameter,
-                ));
-            }
-        };
+        let (part_bytes, base, block_size) = partition_geometry(&dx).map_err(error)?;
 
         {
             let body = &request;
-            if let Err(kind) = validate_partition_read_chain(body, part_bytes, block_size) {
+            if let Err(kind) = validate_partition_chain(
+                body.iter().map(|read| {
+                    (
+                        read.offset,
+                        read.len,
+                        read.no_buffer,
+                        read.buffer.as_ref().map(|buffer| buffer.len()),
+                    )
+                }),
+                part_bytes,
+                block_size,
+            ) {
                 cold_path();
                 return Err(error(kind));
             }
         }
 
-        {
-            if let Err(kind) = translate_read_chain(request, base) {
-                cold_path();
-                return Err(error(kind));
-            }
+        for read in request.iter_mut() {
+            read.offset = read
+                .offset
+                .checked_add(base)
+                .ok_or_else(|| error(DriverErrorKind::InvalidParameter))?;
         }
 
         io::send_to_stack_top(dx.parent.get().unwrap().clone(), request)
@@ -270,52 +200,32 @@ impl DeviceWrite for PartitionPdoIo {
         request: &'b mut Write<'data>,
     ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let dx = ext::<PartDevExt>(&device);
-        let start_lba = *dx.start_lba.get().unwrap();
-        let end_lba = *dx.end_lba.get().unwrap();
-
-        let block_size = match dx.block_size.get() {
-            Some(v) if *v != 0 => *v as u64,
-            _ => {
-                cold_path();
-                return Err(kernel_api::error::error(
-                    kernel_api::error::DriverErrorKind::InvalidParameter,
-                ));
-            }
-        };
-
-        let part_bytes = match partition_len_bytes(start_lba, end_lba) {
-            Some(bytes) => bytes,
-            None => {
-                cold_path();
-                return Err(kernel_api::error::error(
-                    kernel_api::error::DriverErrorKind::InvalidParameter,
-                ));
-            }
-        };
-
-        let base = match start_lba.checked_mul(512) {
-            Some(base) => base,
-            None => {
-                cold_path();
-                return Err(kernel_api::error::error(
-                    kernel_api::error::DriverErrorKind::InvalidParameter,
-                ));
-            }
-        };
+        let (part_bytes, base, block_size) = partition_geometry(&dx).map_err(error)?;
 
         {
             let body = &request;
-            if let Err(kind) = validate_partition_write_chain(body, part_bytes, block_size) {
+            if let Err(kind) = validate_partition_chain(
+                body.iter().map(|write| {
+                    (
+                        write.offset,
+                        write.len,
+                        write.no_buffer,
+                        write.buffer.as_ref().map(|buffer| buffer.len()),
+                    )
+                }),
+                part_bytes,
+                block_size,
+            ) {
                 cold_path();
                 return Err(error(kind));
             }
         }
 
-        {
-            if let Err(kind) = translate_write_chain(request, base) {
-                cold_path();
-                return Err(error(kind));
-            }
+        for write in request.iter_mut() {
+            write.offset = write
+                .offset
+                .checked_add(base)
+                .ok_or_else(|| error(DriverErrorKind::InvalidParameter))?;
         }
 
         io::send_to_stack_top(dx.parent.get().unwrap().clone(), request)
@@ -606,27 +516,6 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
         _found_count += 1;
     }
     Ok(DriverStep::Continue)
-}
-
-#[inline]
-fn guid_to_string(g: &[u8; 16]) -> String {
-    let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-    let d2 = u16::from_le_bytes([g[4], g[5]]);
-    let d3 = u16::from_le_bytes([g[6], g[7]]);
-    alloc::format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        d1,
-        d2,
-        d3,
-        g[8],
-        g[9],
-        g[10],
-        g[11],
-        g[12],
-        g[13],
-        g[14],
-        g[15]
-    )
 }
 
 extern "C" fn part_partition_info(

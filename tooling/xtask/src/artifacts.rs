@@ -7,7 +7,7 @@ pub struct KernelArtifact {
     pub debug_info: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct KernelSdkArtifact {
     pub definition_file: PathBuf,
     pub import_library: PathBuf,
@@ -53,17 +53,11 @@ pub struct ArtifactManifest {
     pub platform: String,
     pub profile: String,
     pub kernel: PublishedKernel,
-    pub sdk: PublishedSdk,
+    pub sdk: KernelSdkArtifact,
     pub stub: PathBuf,
     pub boot_image: PathBuf,
     pub boot_packages: Vec<DriverPackageArtifact>,
     pub debug_search_paths: Vec<PathBuf>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct PublishedSdk {
-    pub definition_file: PathBuf,
-    pub import_library: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

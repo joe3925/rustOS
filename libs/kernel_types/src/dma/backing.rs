@@ -1,5 +1,5 @@
 use super::construction::{build_backing_into, validate_dma_mapping_layout, validate_snapshot};
-use super::descriptors::{DmaDropContext, DmaRecord, DmaSegmentLayout};
+use super::descriptors::{DmaDropContext, DmaRecord};
 use super::*;
 
 const LEASE_FREE: u8 = 0;
@@ -264,7 +264,7 @@ impl<'data> IoBufferBacking<'data> {
             record.mapped_start = mapped_start;
             record.mapped_len = mapped_len;
             record.access = access;
-            record.layout = DmaSegmentLayout::from(layout);
+            record.layout = layout;
             record.drop_ctx = Some(DmaDropContext {
                 mapped_by,
                 unmap,
@@ -548,7 +548,7 @@ impl<'data> IoBufferBacking<'data> {
         start: usize,
         len: usize,
         access: u8,
-    ) -> Result<Option<(usize, usize, DmaSegmentLayout)>, IoBufferError> {
+    ) -> Result<Option<(usize, usize, IoBufferDmaMappingLayout)>, IoBufferError> {
         let end = start
             .checked_add(len)
             .ok_or(IoBufferError::LengthOverflow)?;
@@ -585,7 +585,7 @@ impl<'data> IoBufferBacking<'data> {
     pub(super) fn dma_record_snapshot_for_lease(
         &self,
         snapshot: LeaseSnapshot,
-    ) -> Result<Option<(usize, usize, DmaSegmentLayout)>, IoBufferError> {
+    ) -> Result<Option<(usize, usize, IoBufferDmaMappingLayout)>, IoBufferError> {
         if snapshot.dma_record != NO_DMA_RECORD {
             let (mapped_start, mapped_len, layout) =
                 self.dma_record_snapshot(snapshot.dma_record)?;
@@ -721,7 +721,7 @@ impl<'data> IoBufferBacking<'data> {
             record.ref_count = 1;
             record.mapped_start = mapped_start;
             record.mapped_len = mapped_len;
-            record.layout = DmaSegmentLayout::from(layout);
+            record.layout = layout;
             record.drop_ctx = Some(DmaDropContext {
                 mapped_by,
                 unmap,
@@ -770,7 +770,7 @@ impl<'data> IoBufferBacking<'data> {
             record.mapped_start = 0;
             record.mapped_len = 0;
             record.access = 0;
-            record.layout = DmaSegmentLayout::None;
+            record.layout = IoBufferDmaMappingLayout::None;
             record.drop_ctx.take()
         };
 
@@ -782,7 +782,7 @@ impl<'data> IoBufferBacking<'data> {
     fn dma_record_snapshot(
         &self,
         index: usize,
-    ) -> Result<(usize, usize, DmaSegmentLayout), IoBufferError> {
+    ) -> Result<(usize, usize, IoBufferDmaMappingLayout), IoBufferError> {
         let records = self.dma_records.lock();
         let record = records.get(index).ok_or(IoBufferError::InvalidLease)?;
         if !record.active {
@@ -864,7 +864,7 @@ impl<'data> Drop for IoBufferBacking<'data> {
                     record.mapped_start = 0;
                     record.mapped_len = 0;
                     record.access = 0;
-                    record.layout = DmaSegmentLayout::None;
+                    record.layout = IoBufferDmaMappingLayout::None;
 
                     found = record.drop_ctx.take();
                     break;

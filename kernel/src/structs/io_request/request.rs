@@ -9,6 +9,7 @@ use kernel_types::completion::TaskToken;
 use kernel_types::dma::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
 use kernel_types::fs::{OpenFlags, Path};
+use kernel_types::guid_to_string;
 use kernel_types::object_manager::ObjectTag;
 use spin::{Mutex, RwLock};
 
@@ -876,26 +877,6 @@ fn alloc_user_bytes(owner: &ProgramHandle, bytes: &[u8]) -> Result<u64, u64> {
 }
 
 #[inline]
-fn guid_to_string(g: &[u8; 16]) -> String {
-    let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-    let d2 = u16::from_le_bytes([g[4], g[5]]);
-    let d3 = u16::from_le_bytes([g[6], g[7]]);
-    alloc::format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        d1,
-        d2,
-        d3,
-        g[8],
-        g[9],
-        g[10],
-        g[11],
-        g[12],
-        g[13],
-        g[14],
-        g[15]
-    )
-}
-
 fn create_file_handle(
     owner_pid: u64,
     owner: &ProgramHandle,

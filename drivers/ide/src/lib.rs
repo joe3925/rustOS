@@ -1128,10 +1128,6 @@ fn ata_identify_words_sync(ports: &mut Ports, dh: u8) -> Option<[u16; 256]> {
     Some(words)
 }
 
-fn ata_probe_drive_sync(ports: &mut Ports, dh: u8) -> bool {
-    ata_identify_words_sync(ports, dh).is_some()
-}
-
 async fn ata_pio_read_phys_async(
     ctrl: &mut ControllerState,
     irq: Option<&IrqHandle>,
@@ -1143,32 +1139,10 @@ async fn ata_pio_read_phys_async(
     let p = &mut ctrl.ports;
 
     while sectors > 0 {
-        let chunk = core::cmp::min(sectors, 256);
-        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
+        let Some(chunk) = ata_issue_pio(p, irq, dh, lba, sectors, ATA_CMD_READ_SECTORS).await
+        else {
             return false;
-        }
-
-        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-
-        unsafe {
-            p.drive_head.write(devsel);
-        }
-
-        io_wait_400ns(&mut p.control);
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
-            return false;
-        }
-
-        unsafe {
-            p.sector_count.write(sc);
-            p.lba_lo.write((lba & 0xFF) as u8);
-            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
-            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
-            p.command.write(ATA_CMD_READ_SECTORS);
-        }
+        };
 
         for _ in 0..chunk {
             if !wait_drq_async(p, irq, TIMEOUT_MS).await {
@@ -1208,32 +1182,10 @@ async fn ata_pio_write_phys_async(
     let p = &mut ctrl.ports;
 
     while sectors > 0 {
-        let chunk = core::cmp::min(sectors, 256);
-        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
+        let Some(chunk) = ata_issue_pio(p, irq, dh, lba, sectors, ATA_CMD_WRITE_SECTORS).await
+        else {
             return false;
-        }
-
-        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-
-        unsafe {
-            p.drive_head.write(devsel);
-        }
-
-        io_wait_400ns(&mut p.control);
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
-            return false;
-        }
-
-        unsafe {
-            p.sector_count.write(sc);
-            p.lba_lo.write((lba & 0xFF) as u8);
-            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
-            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
-            p.command.write(ATA_CMD_WRITE_SECTORS);
-        }
+        };
 
         for sec_idx in 0..chunk {
             if sec_idx == 0 {
@@ -1268,6 +1220,39 @@ async fn ata_pio_write_phys_async(
     }
 
     wait_not_busy_async(p, irq, TIMEOUT_MS).await
+}
+
+async fn ata_issue_pio(
+    ports: &mut Ports,
+    irq: Option<&IrqHandle>,
+    drive_head: u8,
+    lba: u32,
+    sectors: u32,
+    command: u8,
+) -> Option<u32> {
+    let chunk = core::cmp::min(sectors, 256);
+    if !wait_ready_async(ports, irq, TIMEOUT_MS).await {
+        return None;
+    }
+    unsafe {
+        ports
+            .drive_head
+            .write((drive_head & 0xF0) | ((lba >> 24) as u8 & 0x0F));
+    }
+    io_wait_400ns(&mut ports.control);
+    if !wait_ready_async(ports, irq, TIMEOUT_MS).await {
+        return None;
+    }
+    unsafe {
+        ports
+            .sector_count
+            .write(if chunk == 256 { 0 } else { chunk as u8 });
+        ports.lba_lo.write((lba & 0xFF) as u8);
+        ports.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+        ports.lba_hi.write(((lba >> 16) & 0xFF) as u8);
+        ports.command.write(command);
+    }
+    Some(chunk)
 }
 
 fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {

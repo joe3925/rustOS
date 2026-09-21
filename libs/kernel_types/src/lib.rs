@@ -53,6 +53,16 @@ use crate::request::{
     FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRemoveDir, FsRename, FsSeek, FsSetLen,
     FsWrite, FsZeroRange, Read, Write,
 };
+
+pub fn guid_to_string(guid: &[u8; 16]) -> alloc::string::String {
+    let d1 = u32::from_le_bytes([guid[0], guid[1], guid[2], guid[3]]);
+    let d2 = u16::from_le_bytes([guid[4], guid[5]]);
+    let d3 = u16::from_le_bytes([guid[6], guid[7]]);
+    alloc::format!(
+        "{d1:08x}-{d2:04x}-{d3:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]
+    )
+}
 pub type EvtDriverDeviceAdd = extern "C" fn(
     driver: &Arc<device::DriverObject>,
     init: &mut device::DeviceInit,

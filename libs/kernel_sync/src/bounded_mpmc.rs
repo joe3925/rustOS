@@ -118,16 +118,10 @@ impl<P: Platform, T> Drop for BoundedSender<P, T> {
 impl<P: Platform, T> BoundedReceiver<P, T> {
     pub fn recv(&self) -> Result<T, RecvError> {
         loop {
-            if let Some(value) = self.inner.queue.try_pop() {
-                return Ok(value);
-            }
-
-            if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-                if let Some(value) = self.inner.queue.try_pop() {
-                    return Ok(value);
-                }
-
-                return Err(RecvError);
+            match self.try_recv() {
+                Ok(value) => return Ok(value),
+                Err(TryRecvError::Disconnected) => return Err(RecvError),
+                Err(TryRecvError::Empty) => {}
             }
 
             match self.inner.receivers_waiting.enqueue_current() {
@@ -143,36 +137,26 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
                 }
                 Err(BoundedWaitQueueError::NoCurrentTask) => continue,
                 Err(BoundedWaitQueueError::Full | BoundedWaitQueueError::AllocationFailed) => {
-                    if let Some(value) = self.inner.queue.try_pop() {
-                        return Ok(value);
+                    match self.try_recv() {
+                        Ok(value) => return Ok(value),
+                        Err(TryRecvError::Disconnected) => return Err(RecvError),
+                        Err(TryRecvError::Empty) => {}
                     }
-
-                    if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-                        if let Some(value) = self.inner.queue.try_pop() {
-                            return Ok(value);
-                        }
-
-                        return Err(RecvError);
-                    }
-
                     P::spin_loop();
                     continue;
                 }
             }
 
-            if let Some(value) = self.inner.queue.try_pop() {
-                self.inner.receivers_waiting.clear_current_if_queued();
-                return Ok(value);
-            }
-
-            if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-                self.inner.receivers_waiting.clear_current_if_queued();
-
-                if let Some(value) = self.inner.queue.try_pop() {
+            match self.try_recv() {
+                Ok(value) => {
+                    self.inner.receivers_waiting.clear_current_if_queued();
                     return Ok(value);
                 }
-
-                return Err(RecvError);
+                Err(TryRecvError::Disconnected) => {
+                    self.inner.receivers_waiting.clear_current_if_queued();
+                    return Err(RecvError);
+                }
+                Err(TryRecvError::Empty) => {}
             }
 
             if !self.inner.receivers_waiting.is_current_enqueued() {
@@ -185,17 +169,16 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
     }
 
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        match self.inner.queue.try_pop() { Some(value) => {
+        if let Some(value) = self.inner.queue.try_pop() {
             Ok(value)
-        } _ => if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-            match self.inner.queue.try_pop() { Some(value) => {
-                Ok(value)
-            } _ => {
-                Err(TryRecvError::Disconnected)
-            }}
+        } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
+            self.inner
+                .queue
+                .try_pop()
+                .ok_or(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
-        }}
+        }
     }
 
     pub fn is_disconnected(&self) -> bool {

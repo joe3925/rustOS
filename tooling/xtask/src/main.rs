@@ -4,8 +4,7 @@ mod config;
 mod driver;
 
 use artifacts::{
-    ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel,
-    PublishedSdk, StubArtifact,
+    ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel, StubArtifact,
 };
 use config::{BootPackageSource, BuildPlan, HostPlan, LaunchPlan};
 use serde::Serialize;
@@ -839,7 +838,7 @@ fn publish_artifact_manifest(
             image: relative(&kernel.pe),
             debug: kernel.debug_info.as_deref().map(relative),
         },
-        sdk: PublishedSdk {
+        sdk: KernelSdkArtifact {
             definition_file: relative(&sdk.definition_file),
             import_library: relative(&sdk.import_library),
         },

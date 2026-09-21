@@ -116,8 +116,7 @@ impl RangeTracker {
     }
 
     pub fn alloc_auto(&self, size: u64) -> Option<VirtAddr> {
-        let aligned_size = self.align_size(size)?;
-        self.alloc_auto_aligned(aligned_size, self.granularity)
+        self.alloc_auto_aligned(size, self.granularity)
     }
 
     pub fn alloc_auto_aligned(&self, size: u64, alignment: u64) -> Option<VirtAddr> {

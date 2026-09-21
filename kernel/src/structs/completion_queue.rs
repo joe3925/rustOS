@@ -92,24 +92,18 @@ impl CompletionQueue {
         }
         let port_permit = self.reserve_completion_slot()?;
 
-        let request_id = match self.request_table.allocate() {
-            Ok(request_id) => request_id,
-            Err(RequestTableError::Full) => {
-                return Err(CompletionQueueError::RequestTableFull);
-            }
-            Err(_) => {
-                return Err(CompletionQueueError::RequestTableFull);
-            }
-        };
+        let request_id = self
+            .request_table
+            .allocate()
+            .map_err(|_| CompletionQueueError::RequestTableFull)?;
 
         let opcode = op.opcode();
         let user_token = op.user_token();
         let permit = IoCompletionPermit {
-            queue: self.clone(),
             port_permit: Some(port_permit),
+            queue: self.clone(),
             opcode,
             user_token,
-            consumed: false,
         };
         let task = match try_spawn_to_port_in_executor_domain(
             self.bound_executor_domain,
@@ -156,17 +150,9 @@ impl CompletionQueue {
 
         while count < out.len() {
             let completion = match self.completion_port.try_recv() {
-                Ok(completion) => match completion.outcome {
-                    TaskOutcome::Completed(completion) => completion,
-                    TaskOutcome::Cancelled => {
-                        unreachable!("mapped I/O permit emitted cancellation")
-                    }
-                },
+                Ok(completion) => self.consume_completion(completion),
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             };
-
-            self.request_table.reap(completion.request_id);
-            self.reclaim_completion_capacity();
             out[count] = completion;
             count += 1;
         }
@@ -186,17 +172,9 @@ impl CompletionQueue {
 
         if timeout_ns == u64::MAX {
             let first = match self.completion_port.recv() {
-                Ok(completion) => match completion.outcome {
-                    TaskOutcome::Completed(completion) => completion,
-                    TaskOutcome::Cancelled => {
-                        unreachable!("mapped I/O permit emitted cancellation")
-                    }
-                },
+                Ok(completion) => self.consume_completion(completion),
                 Err(_) => return 0,
             };
-
-            self.request_table.reap(first.request_id);
-            self.reclaim_completion_capacity();
             out[0] = first;
             return 1 + self.poll_completions(&mut out[1..]);
         }
@@ -293,19 +271,30 @@ impl CompletionQueue {
         self.resizing_completion_port
             .store(false, Ordering::Release);
     }
+
+    fn consume_completion(
+        &self,
+        completion: TaskCompletion<UserIoCompletion>,
+    ) -> UserIoCompletion {
+        let completion = match completion.outcome {
+            TaskOutcome::Completed(completion) => completion,
+            TaskOutcome::Cancelled => unreachable!("mapped I/O permit emitted cancellation"),
+        };
+        self.request_table.reap(completion.request_id);
+        self.reclaim_completion_capacity();
+        completion
+    }
 }
 
 struct IoCompletionPermit {
-    queue: Arc<CompletionQueue>,
     port_permit: Option<CompletionPortPermit<UserIoCompletion>>,
+    queue: Arc<CompletionQueue>,
     opcode: IoOpcode,
     user_token: u64,
-    consumed: bool,
 }
 
 impl CompletionPermit<IoRequestOutput> for IoCompletionPermit {
     fn complete(mut self, completion: TaskCompletion<IoRequestOutput>) {
-        self.consumed = true;
         let output = match completion.outcome {
             TaskOutcome::Completed(output) => output,
             TaskOutcome::Cancelled => IoRequestOutput::error(IO_STATUS_CANCELLED),
@@ -336,13 +325,5 @@ impl CompletionPermit<IoRequestOutput> for IoCompletionPermit {
                 key: completion.key,
                 outcome: TaskOutcome::Completed(user),
             });
-    }
-}
-
-impl Drop for IoCompletionPermit {
-    fn drop(&mut self) {
-        if !self.consumed {
-            self.port_permit.take();
-        }
     }
 }

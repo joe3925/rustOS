@@ -9,7 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use core::time::Duration;
-use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
+use kernel_executor::runtime::runtime::block_on;
 use kernel_types::{
     dma::{FromDevice, IoBuffer, ToDevice},
     error::{ErrorKind, FileErrorKind, KernelError},
@@ -359,42 +359,6 @@ impl Drop for File {
     }
 }
 
-async fn list(dir: &Path) -> Option<alloc::vec::Vec<alloc::string::String>> {
-    let res = provider().list_dir_path(dir).await.ok()?;
-    if res.error.is_none() {
-        res.names.clone()
-    } else {
-        None
-    }
-}
-
-async fn read_all(path: &Path) -> Option<alloc::vec::Vec<u8>> {
-    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
-        Ok(f) => {
-            let mut buf = alloc::vec![0u8; f.size as usize];
-            let n = f.read(&mut buf).await.ok()?;
-            buf.truncate(n);
-            Some(buf)
-        }
-        Err(_) => None,
-    }
-}
-
-async fn ensure_dir(path: &Path) -> Result<(), KernelError> {
-    let result = provider().make_dir_path(path).await?;
-    match result.error {
-        None => Ok(()),
-        Some(error) if error.kind() == ErrorKind::File(FileErrorKind::AlreadyExists) => Ok(()),
-        Some(error) => Err(error),
-    }
-}
-
-async fn file_exists(path: &Path) -> bool {
-    File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly])
-        .await
-        .is_ok()
-}
-
 pub async fn switch_to_vfs() -> Result<(), KernelError> {
     // The mount manager has already validated the boot volume directories.
     // The registry transition publishes VFS only after its durable merge.
@@ -404,8 +368,6 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
 
     let boot_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
     let secs = boot_ms as f64 / 1000 as f64;
-    let frac = boot_ms % 1000;
-
     let used_bytes = used_bytes();
     let used_mib = used_bytes as f64 / (1024 * 1024) as f64;
     let heap_mib = used_memory() as f64 / (1024.0 * 1024.0);
@@ -426,11 +388,5 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
             bench_c_drive_io_async(false).await;
         }
     });
-    // spawn_blocking(|| loop {});
-    // spawn_blocking(|| loop {});
-    // spawn_blocking(|| loop {});
     Ok(())
-}
-pub(crate) fn file_parser(path: &str) -> Vec<&str> {
-    path.trim_start_matches('\\').split('\\').collect()
 }

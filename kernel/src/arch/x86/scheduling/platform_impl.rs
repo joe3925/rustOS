@@ -21,6 +21,18 @@ const RETURN_ADDRESS_BYTES: u64 = 8;
 const C_ENTRY_FRAME_BYTES: u64 = RETURN_ADDRESS_BYTES + C_SHADOW_SPACE_BYTES;
 static BLOCK_ON_THREAD_STATE: Mutex<Option<Arc<BlockOnThreadState>>> = Mutex::new(None);
 
+fn new_task_context(entry_point: TaskEntry, context: usize, stack_top: VirtAddr) -> State {
+    let mut state = State::new(0);
+    state.rip = entry_point as u64;
+    state.rcx = context as u64;
+    state.rsp = initial_c_entry_rsp(stack_top.as_u64());
+    state.rflags = 0x0000_0202;
+    unsafe {
+        *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
+    }
+    state
+}
+
 impl TaskPlatform for X86Platform {
     type TaskEntry = TaskEntry;
     type TaskContext = State;
@@ -38,15 +50,7 @@ impl TaskPlatform for X86Platform {
     ) -> Self::TaskContext {
         let gdt = PER_CPU_GDT.lock();
         let platform_cpu_id = Self::current_platform_cpu_id() as usize;
-        let mut state = State::new(0);
-        state.rip = entry_point as u64;
-        state.rcx = context as u64;
-        state.rsp = initial_c_entry_rsp(stack_top.as_u64());
-        state.rflags = 0x0000_0202;
-
-        unsafe {
-            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
-        }
+        let mut state = new_task_context(entry_point, context, stack_top);
 
         let selectors = unsafe { gdt.selectors_per_cpu.get_by_id(platform_cpu_id) };
         state.cs = selectors.user_code_selector.0 as u64 | 3;
@@ -61,15 +65,7 @@ impl TaskPlatform for X86Platform {
     ) -> Self::TaskContext {
         let gdt = PER_CPU_GDT.lock();
         let platform_cpu_id = Self::current_platform_cpu_id() as usize;
-        let mut state = State::new(0);
-        state.rip = entry_point as u64;
-        state.rcx = context as u64;
-        state.rsp = initial_c_entry_rsp(stack_top.as_u64());
-        state.rflags = 0x0000_0202;
-
-        unsafe {
-            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
-        }
+        let mut state = new_task_context(entry_point, context, stack_top);
 
         let selectors = unsafe { gdt.selectors_per_cpu.get_by_id(platform_cpu_id) };
         state.cs = selectors.kernel_code_selector.0 as u64;

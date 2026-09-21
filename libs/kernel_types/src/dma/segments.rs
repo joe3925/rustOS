@@ -1,4 +1,3 @@
-use super::descriptors::DmaSegmentLayout;
 use super::*;
 
 pub struct IoBufferRegion<'a> {
@@ -101,7 +100,7 @@ impl<'a> Iterator for IoBufferRegionIter<'a> {
 
 #[derive(Clone)]
 pub struct IoBufferDmaSegmentIter<'a> {
-    layout: DmaSegmentLayout,
+    layout: IoBufferDmaMappingLayout,
     extents: &'a [IoBufferExtent],
     frames: &'a [PhysicalFrameExtent],
     mapped_start: usize,
@@ -125,11 +124,11 @@ pub struct IoBufferDmaSegmentIter<'a> {
 
 impl<'a> IoBufferDmaSegmentIter<'a> {
     pub(super) fn empty(extents: &'a [IoBufferExtent], frames: &'a [PhysicalFrameExtent]) -> Self {
-        Self::new(DmaSegmentLayout::None, 0, 0, 0, 0, extents, frames)
+        Self::new(IoBufferDmaMappingLayout::None, 0, 0, 0, 0, extents, frames)
     }
 
     pub(super) fn new(
-        layout: DmaSegmentLayout,
+        layout: IoBufferDmaMappingLayout,
         mapped_start: usize,
         mapped_len: usize,
         lease_start: usize,
@@ -196,9 +195,11 @@ impl<'a> Iterator for IoBufferDmaSegmentIter<'a> {
         }
 
         let upper = match self.layout {
-            DmaSegmentLayout::None => Some(0),
-            DmaSegmentLayout::Contiguous { .. } => Some(1),
-            DmaSegmentLayout::FixedChunks { count, .. } => Some(count.saturating_sub(self.index)),
+            IoBufferDmaMappingLayout::None => Some(0),
+            IoBufferDmaMappingLayout::Contiguous { .. } => Some(1),
+            IoBufferDmaMappingLayout::FixedChunks { count, .. } => {
+                Some(count.saturating_sub(self.index))
+            }
             _ => None,
         };
 
@@ -211,15 +212,19 @@ impl core::iter::FusedIterator for IoBufferDmaSegmentIter<'_> {}
 impl<'a> IoBufferDmaSegmentIter<'a> {
     fn next_uncropped(&mut self) -> Option<IoBufferDmaSegment> {
         match self.layout {
-            DmaSegmentLayout::None => None,
-            DmaSegmentLayout::Contiguous { segment } => {
-                if self.index != 0 {
+            IoBufferDmaMappingLayout::None => None,
+            IoBufferDmaMappingLayout::Contiguous { dma_addr, byte_len } => {
+                if self.index != 0 || byte_len == 0 {
                     return None;
                 }
                 self.index = 1;
-                Some(segment)
+                Some(IoBufferDmaSegment {
+                    dma_addr,
+                    byte_len: byte_len as u32,
+                    reserved: 0,
+                })
             }
-            DmaSegmentLayout::PageChunks {
+            IoBufferDmaMappingLayout::PageChunks {
                 iova_base,
                 page_offset,
                 byte_len,
@@ -240,7 +245,7 @@ impl<'a> IoBufferDmaSegmentIter<'a> {
                     &mut self.identity_remaining,
                 )
             }
-            DmaSegmentLayout::ScatterGather {
+            IoBufferDmaMappingLayout::ScatterGather {
                 iova_base,
                 page_size,
             } => {
@@ -263,7 +268,7 @@ impl<'a> IoBufferDmaSegmentIter<'a> {
                     &mut self.identity_remaining,
                 )
             }
-            DmaSegmentLayout::FixedChunks {
+            IoBufferDmaMappingLayout::FixedChunks {
                 dma_addr,
                 chunk_len,
                 count,
@@ -279,7 +284,7 @@ impl<'a> IoBufferDmaSegmentIter<'a> {
                 self.index += 1;
                 Some(segment)
             }
-            DmaSegmentLayout::IdentityExtents => next_identity_extent_segment_view(
+            IoBufferDmaMappingLayout::IdentityExtents => next_identity_extent_segment_view(
                 self.extents,
                 self.frames,
                 self.mapped_start,
@@ -592,18 +597,12 @@ impl<'frames> DmaBufferRegion<'frames> {
     }
 }
 
-enum DmaBufferRegionSource<'a> {
-    IoBuffer {
-        extents: &'a [IoBufferExtent],
-        frames: &'a [PhysicalFrameExtent],
-        start: usize,
-        len: usize,
-    },
-}
-
 pub struct DmaBufferView<'a> {
     byte_len: usize,
-    source: DmaBufferRegionSource<'a>,
+    extents: &'a [IoBufferExtent],
+    frames: &'a [PhysicalFrameExtent],
+    start: usize,
+    len: usize,
 }
 
 impl<'a> DmaBufferView<'a> {
@@ -616,12 +615,10 @@ impl<'a> DmaBufferView<'a> {
     ) -> Self {
         Self {
             byte_len,
-            source: DmaBufferRegionSource::IoBuffer {
-                extents,
-                frames,
-                start,
-                len,
-            },
+            extents,
+            frames,
+            start,
+            len,
         }
     }
 
@@ -634,12 +631,14 @@ impl<'a> DmaBufferView<'a> {
     }
 
     pub fn regions(&self) -> DmaBufferRegionIter<'a, '_> {
-        DmaBufferRegionIter::new(&self.source)
+        DmaBufferRegionIter::new(self.extents, self.frames, self.start, self.len)
     }
 }
 
 pub struct DmaBufferRegionIter<'a, 'view> {
-    source: &'view DmaBufferRegionSource<'a>,
+    extents: &'a [IoBufferExtent],
+    frames: &'a [PhysicalFrameExtent],
+    marker: core::marker::PhantomData<&'view ()>,
     extent_index: usize,
     logical_cursor: usize,
     view_start: usize,
@@ -647,19 +646,20 @@ pub struct DmaBufferRegionIter<'a, 'view> {
 }
 
 impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
-    fn new(source: &'view DmaBufferRegionSource<'a>) -> Self {
-        let (view_start, view_end) = match *source {
-            DmaBufferRegionSource::IoBuffer { start, len, .. } => {
-                (start, start.saturating_add(len))
-            }
-        };
-
+    fn new(
+        extents: &'a [IoBufferExtent],
+        frames: &'a [PhysicalFrameExtent],
+        view_start: usize,
+        len: usize,
+    ) -> Self {
         Self {
-            source,
+            extents,
+            frames,
+            marker: core::marker::PhantomData,
             extent_index: 0,
             logical_cursor: 0,
             view_start,
-            view_end,
+            view_end: view_start.saturating_add(len),
         }
     }
 }
@@ -668,11 +668,7 @@ impl<'a, 'view> Iterator for DmaBufferRegionIter<'a, 'view> {
     type Item = DmaBufferRegion<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match *self.source {
-            DmaBufferRegionSource::IoBuffer {
-                extents, frames, ..
-            } => self.next_iobuffer_region(extents, frames),
-        }
+        self.next_iobuffer_region(self.extents, self.frames)
     }
 }
 
@@ -701,12 +697,8 @@ impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
             let offset_in_extent = start.checked_sub(extent_start)?;
             let region_len = end.checked_sub(start)?;
 
-            let (first_frame, frame_count, frame_offset) = extent_subrange_frames_for_dma_region(
-                extent,
-                frames,
-                offset_in_extent,
-                region_len,
-            )?;
+            let (first_frame, frame_count, frame_offset) =
+                extent_subrange_frames(extent, frames, offset_in_extent, region_len)?;
 
             let frame_end = first_frame.checked_add(frame_count)?;
             let region_frames = frames.get(first_frame..frame_end)?;
@@ -718,52 +710,6 @@ impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
             ));
         }
 
-        None
-    }
-}
-
-fn extent_subrange_frames_for_dma_region(
-    extent: IoBufferExtent,
-    frames: &[PhysicalFrameExtent],
-    offset_in_extent: usize,
-    len: usize,
-) -> Option<(usize, usize, usize)> {
-    let mut frame_index = extent.first_frame;
-    let frame_end = extent.first_frame.checked_add(extent.frame_count)?;
-    let mut frame_offset = extent.frame_offset.checked_add(offset_in_extent)?;
-
-    while frame_index < frame_end {
-        let frame_len = frames.get(frame_index)?.byte_len as usize;
-
-        if frame_offset < frame_len {
-            break;
-        }
-
-        frame_offset -= frame_len;
-        frame_index += 1;
-    }
-
-    if frame_index >= frame_end {
-        return None;
-    }
-
-    let first_frame = frame_index;
-    let first_offset = frame_offset;
-    let mut remaining = len;
-
-    while frame_index < frame_end && remaining != 0 {
-        let frame_len = frames.get(frame_index)?.byte_len as usize;
-        let available = frame_len.saturating_sub(frame_offset);
-        let take = core::cmp::min(available, remaining);
-
-        remaining -= take;
-        frame_index += 1;
-        frame_offset = 0;
-    }
-
-    if remaining == 0 {
-        Some((first_frame, frame_index - first_frame, first_offset))
-    } else {
         None
     }
 }

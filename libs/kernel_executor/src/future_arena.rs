@@ -89,26 +89,8 @@ unsafe impl Send for FutureAllocation {}
 #[repr(C, align(64))]
 struct Block<const N: usize>([u8; N]);
 
-fn block64() -> Block<64> {
-    Block([0; 64])
-}
-fn block128() -> Block<128> {
-    Block([0; 128])
-}
-fn block256() -> Block<256> {
-    Block([0; 256])
-}
-fn block512() -> Block<512> {
-    Block([0; 512])
-}
-fn block1024() -> Block<1024> {
-    Block([0; 1024])
-}
-fn block2048() -> Block<2048> {
-    Block([0; 2048])
-}
-fn block4096() -> Block<4096> {
-    Block([0; 4096])
+fn block<const N: usize>() -> Block<N> {
+    Block([0; N])
 }
 
 pub struct FutureArena {
@@ -136,13 +118,13 @@ impl FutureArena {
         Self {
             owner,
             config,
-            c64: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block64),
-            c128: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block128),
-            c256: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block256),
-            c512: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block512),
-            c1024: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block1024),
-            c2048: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block2048),
-            c4096: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block4096),
+            c64: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block::<64>),
+            c128: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block::<128>),
+            c256: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block::<256>),
+            c512: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block::<512>),
+            c1024: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block::<1024>),
+            c2048: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block::<2048>),
+            c4096: GrowableSlab::new(DEFAULT_SLAB_SHARDS, slots, chunks, block::<4096>),
             live: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
             class_live: core::array::from_fn(|_| AtomicUsize::new(0)),

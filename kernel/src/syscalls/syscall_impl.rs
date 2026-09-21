@@ -27,6 +27,7 @@ use kernel_types::executor::{
     USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainUpdate,
 };
 use kernel_types::fs::{OpenFlags, Path};
+use kernel_types::guid_to_string;
 use kernel_types::object_manager::{ObjectInformationClass, ObjectTag, UserObjectBasicInfo};
 
 use crate::object_manager::manager::{
@@ -51,26 +52,6 @@ fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Obj
     obj
 }
 
-#[inline]
-pub fn guid_to_string(g: &[u8; 16]) -> String {
-    let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-    let d2 = u16::from_le_bytes([g[4], g[5]]);
-    let d3 = u16::from_le_bytes([g[6], g[7]]);
-    alloc::format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        d1,
-        d2,
-        d3,
-        g[8],
-        g[9],
-        g[10],
-        g[11],
-        g[12],
-        g[13],
-        g[14],
-        g[15]
-    )
-}
 
 fn ensure_default_queue_object(
     pid: u64,
@@ -239,6 +220,14 @@ pub fn make_err(class: ErrClass, code: u16, arg: u32) -> u64 {
     ERR_FLAG | ((class as u64) << 48) | ((code as u64) << 32) | (arg as u64)
 }
 
+fn invalid_handle(handle: UserHandle) -> u64 {
+    make_err(
+        ErrClass::Common,
+        CommonErr::InvalidHandle as u16,
+        handle as u32,
+    )
+}
+
 fn current_process() -> Result<(u64, ProgramHandle), u64> {
     let caller_pid = SCHEDULER
         .get_current_task(platform::current_cpu_id())
@@ -262,22 +251,15 @@ fn resolve_completion_queue(
     caller_pid: u64,
     caller: &ProgramHandle,
 ) -> Result<Arc<CompletionQueue>, u64> {
-    let obj = caller.read().resolve_handle(handle).ok_or_else(|| {
-        make_err(
-            ErrClass::Common,
-            CommonErr::InvalidHandle as u16,
-            handle as u32,
-        )
-    })?;
+    let obj = caller
+        .read()
+        .resolve_handle(handle)
+        .ok_or_else(|| invalid_handle(handle))?;
 
     let queue = match &obj.payload {
         ObjectPayload::CompletionQueue(queue) => queue.clone(),
         _ => {
-            return Err(make_err(
-                ErrClass::Common,
-                CommonErr::InvalidHandle as u16,
-                handle as u32,
-            ));
+            return Err(invalid_handle(handle));
         }
     };
 
@@ -293,21 +275,14 @@ fn resolve_completion_queue(
 }
 
 fn resolve_file_object(handle: UserHandle, caller: &ProgramHandle) -> Result<Arc<FileObject>, u64> {
-    let obj = caller.read().resolve_handle(handle).ok_or_else(|| {
-        make_err(
-            ErrClass::Common,
-            CommonErr::InvalidHandle as u16,
-            handle as u32,
-        )
-    })?;
+    let obj = caller
+        .read()
+        .resolve_handle(handle)
+        .ok_or_else(|| invalid_handle(handle))?;
 
     match &obj.payload {
         ObjectPayload::File(file) => Ok(file.clone()),
-        _ => Err(make_err(
-            ErrClass::Common,
-            CommonErr::InvalidHandle as u16,
-            handle as u32,
-        )),
+        _ => Err(invalid_handle(handle)),
     }
 }
 
@@ -315,13 +290,10 @@ fn resolve_io_buffer_backing(
     caller: &ProgramHandle,
     handle: UserHandle,
 ) -> Result<Arc<MappedIoBufferBacking>, u64> {
-    let entry = caller.read().resolve_handle_entry(handle).ok_or_else(|| {
-        make_err(
-            ErrClass::Common,
-            CommonErr::InvalidHandle as u16,
-            handle as u32,
-        )
-    })?;
+    let entry = caller
+        .read()
+        .resolve_handle_entry(handle)
+        .ok_or_else(|| invalid_handle(handle))?;
     if !entry
         .object
         .behavior()
@@ -335,11 +307,7 @@ fn resolve_io_buffer_backing(
     }
     match &entry.object.payload {
         ObjectPayload::IoBufferBacking(backing) => Ok(backing.clone()),
-        _ => Err(make_err(
-            ErrClass::Common,
-            CommonErr::InvalidHandle as u16,
-            handle as u32,
-        )),
+        _ => Err(invalid_handle(handle)),
     }
 }
 
@@ -414,13 +382,10 @@ fn resolve_executor_domain(
     caller: &ProgramHandle,
     operation: ObjectOperation,
 ) -> Result<Arc<UserExecutorDomain>, u64> {
-    let entry = caller.read().resolve_handle_entry(handle).ok_or_else(|| {
-        make_err(
-            ErrClass::Common,
-            CommonErr::InvalidHandle as u16,
-            handle as u32,
-        )
-    })?;
+    let entry = caller
+        .read()
+        .resolve_handle_entry(handle)
+        .ok_or_else(|| invalid_handle(handle))?;
     if !entry.object.behavior().matches(entry.interface, operation) {
         return Err(make_err(
             ErrClass::Common,
@@ -431,11 +396,7 @@ fn resolve_executor_domain(
     let domain = match &entry.object.payload {
         ObjectPayload::ExecutorDomain(domain) => domain.clone(),
         _ => {
-            return Err(make_err(
-                ErrClass::Common,
-                CommonErr::InvalidHandle as u16,
-                handle as u32,
-            ));
+            return Err(invalid_handle(handle));
         }
     };
     if domain.owner_pid() != caller_pid {
@@ -1277,29 +1238,7 @@ pub(crate) fn sys_completion_poll(
     out_completions: *mut UserIoCompletion,
     max: usize,
 ) -> u64 {
-    if max == 0 {
-        return 0;
-    }
-
-    let bytes = match max.checked_mul(core::mem::size_of::<UserIoCompletion>()) {
-        Some(bytes) => bytes,
-        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
-    };
-    if out_completions.is_null() || !user_ptr_ok(out_completions, bytes) {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-    }
-
-    let (caller_pid, caller) = match current_process() {
-        Ok(current) => current,
-        Err(err) => return err,
-    };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
-        Ok(queue) => queue,
-        Err(err) => return err,
-    };
-
-    let out = unsafe { slice::from_raw_parts_mut(out_completions, max) };
-    queue.poll_completions(out) as u64
+    sys_completion_wait(completion_queue_handle, out_completions, max, 0)
 }
 
 pub(crate) fn sys_completion_wait(

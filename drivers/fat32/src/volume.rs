@@ -279,40 +279,6 @@ fn map_fatfs_err(e: &FsError) -> KernelError {
     }
 }
 
-async fn create_entry(fs: &mut Fs, path: &Path, dir: bool) -> Result<(), FsError> {
-    let path_str = path.as_str();
-    if dir {
-        let _ = fs.root_dir().create_dir(path_str).await?;
-    } else {
-        let mut file = fs.root_dir().create_file(path_str).await?;
-        file.flush().await?;
-    }
-    Ok(())
-}
-
-async fn rename_entry(
-    fs: &mut Fs,
-    src: &Path,
-    dst: &Path,
-) -> Result<Option<RenamedFileState>, FsError> {
-    let dst_dir = fs.root_dir();
-    fs.root_dir()
-        .rename_with_cached_file_state(src.as_str(), &dst_dir, dst.as_str())
-        .await
-}
-
-async fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
-    let dir: FatDir = fs.root_dir().open_dir(path.as_str()).await?;
-    let mut out = Vec::new();
-    let mut iter = dir.iter();
-    while let Some(r) = iter.next().await {
-        let e = r?;
-        let name = e.file_name();
-        out.push(name);
-    }
-    Ok(out)
-}
-
 async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
     let old_size = file.seek(SeekFrom::End(0)).await?;
     if new_size > u32::MAX as u64 {
@@ -889,12 +855,18 @@ impl FileSystem for Fat32Fs {
             let mut fs = fs_arc.lock().await;
             let payload = &mut req.payload;
             let params = &payload.params;
-            let err = {
-                match create_entry(&mut *fs, &params.path, params.dir).await {
-                    Ok(()) => None,
-                    Err(e) => Some(map_fatfs_err(&e)),
+            let result = if params.dir {
+                fs.root_dir()
+                    .create_dir(params.path.as_str())
+                    .await
+                    .map(|_| ())
+            } else {
+                match fs.root_dir().create_file(params.path.as_str()).await {
+                    Ok(mut file) => file.flush().await,
+                    Err(error) => Err(error),
                 }
             };
+            let err = result.err().map(|error| map_fatfs_err(&error));
             flush_owner_blocking(&vdx, METADATA_OWNER_ID);
             payload.result = Some(FsCreateResult { error: err });
         }
@@ -995,7 +967,16 @@ impl FileSystem for Fat32Fs {
             let payload = &mut req.payload;
             let params = &payload.params;
             let err = {
-                match rename_entry(&mut *fs, &params.src, &params.dst).await {
+                let dst_dir = fs.root_dir();
+                match fs
+                    .root_dir()
+                    .rename_with_cached_file_state(
+                        params.src.as_str(),
+                        &dst_dir,
+                        params.dst.as_str(),
+                    )
+                    .await
+                {
                     Ok(renamed) => {
                         if let Some(renamed) = renamed {
                             vdx.handles.lock().update_renamed_file(&renamed);
@@ -1031,8 +1012,18 @@ impl FileSystem for Fat32Fs {
             let mut fs = fs_arc.lock().await;
             let payload = &mut req.payload;
             let params = &payload.params;
+            let names: Result<Vec<String>, FsError> = async {
+                let dir: FatDir = fs.root_dir().open_dir(params.path.as_str()).await?;
+                let mut names = Vec::new();
+                let mut iter = dir.iter();
+                while let Some(entry) = iter.next().await {
+                    names.push(entry?.file_name());
+                }
+                Ok(names)
+            }
+            .await;
             let res = {
-                match list_names(&mut *fs, &params.path).await {
+                match names {
                     Ok(names) => FsListDirResult {
                         names: Some(names),
                         error: None,

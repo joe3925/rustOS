@@ -21,7 +21,7 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        dma::{FromDevice, IoBuffer, ToDevice},
+        dma::IoBuffer,
         io::{DeviceControlHandler, DeviceControlOp, DeviceFlush, DeviceFlushOp, DeviceRead, DeviceReadOp, DeviceWrite, DeviceWriteOp, DiskInfo},
         request::IoctlData,
     },
@@ -44,97 +44,41 @@ fn panic(info: &PanicInfo) -> ! {
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 struct DiskIo;
-fn validate_disk_read_chain<'io>(
-    first: &Read<'io>,
+fn validate_disk_chain(
+    requests: impl Iterator<Item = (u64, usize, bool, Option<usize>)>,
     block_size: u64,
 ) -> Result<(u64, u64), DriverErrorKind> {
-    let mut requests = 0u64;
+    let mut request_count = 0u64;
     let mut bytes = 0u64;
 
-    for read in first.iter() {
-        if read.len == 0 {
+    for (offset, len, no_buffer, buffer_len) in requests {
+        if len == 0 {
             continue;
         }
-
-        if read.no_buffer {
+        if no_buffer {
             return Err(DriverErrorKind::InvalidParameter);
         }
-
-        let Some(buffer) = read.buffer.as_ref() else {
+        let Some(buffer_len) = buffer_len else {
             return Err(DriverErrorKind::InvalidParameter);
         };
-
-        if !has_from_device_buffer(buffer, read.len) {
+        if buffer_len < len {
             return Err(DriverErrorKind::InsufficientResources);
         }
-
-        let len = read.len as u64;
-
-        if read.offset % block_size != 0 || !len.is_multiple_of(block_size) {
+        let len = len as u64;
+        if offset % block_size != 0 || !len.is_multiple_of(block_size) {
             return Err(DriverErrorKind::InvalidParameter);
         }
-
-        read.offset
+        offset
             .checked_add(len)
             .ok_or(DriverErrorKind::InvalidParameter)?;
-
-        requests = requests
+        request_count = request_count
             .checked_add(1)
             .ok_or(DriverErrorKind::InvalidParameter)?;
-
         bytes = bytes
             .checked_add(len)
             .ok_or(DriverErrorKind::InvalidParameter)?;
     }
-
-    Ok((requests, bytes))
-}
-
-fn validate_disk_write_chain<'io>(
-    first: &Write<'io>,
-    block_size: u64,
-) -> Result<(u64, u64), DriverErrorKind> {
-    let mut requests = 0u64;
-    let mut bytes = 0u64;
-
-    for write in first.iter() {
-        if write.len == 0 {
-            continue;
-        }
-
-        if write.no_buffer {
-            return Err(DriverErrorKind::InvalidParameter);
-        }
-
-        let Some(buffer) = write.buffer.as_ref() else {
-            return Err(DriverErrorKind::InvalidParameter);
-        };
-
-        if !has_to_device_buffer(buffer, write.len) {
-            return Err(DriverErrorKind::InsufficientResources);
-        }
-
-        let len = write.len as u64;
-
-        if write.offset % block_size != 0 || !len.is_multiple_of(block_size) {
-            return Err(DriverErrorKind::InvalidParameter);
-        }
-
-        write
-            .offset
-            .checked_add(len)
-            .ok_or(DriverErrorKind::InvalidParameter)?;
-
-        requests = requests
-            .checked_add(1)
-            .ok_or(DriverErrorKind::InvalidParameter)?;
-
-        bytes = bytes
-            .checked_add(len)
-            .ok_or(DriverErrorKind::InvalidParameter)?;
-    }
-
-    Ok((requests, bytes))
+    Ok((request_count, bytes))
 }
 
 impl DeviceRead for DiskIo {
@@ -154,7 +98,17 @@ impl DeviceRead for DiskIo {
         let (requests, bytes) = {
             let body = &req;
 
-            match validate_disk_read_chain(body, bs) {
+            match validate_disk_chain(
+                body.iter().map(|read| {
+                    (
+                        read.offset,
+                        read.len,
+                        read.no_buffer,
+                        read.buffer.as_ref().map(IoBuffer::len),
+                    )
+                }),
+                bs,
+            ) {
                 Ok(v) => v,
                 Err(kind) => {
                     cold_path();
@@ -190,7 +144,17 @@ impl DeviceWrite for DiskIo {
         let (requests, bytes) = {
             let body = &req;
 
-            match validate_disk_write_chain(body, bs) {
+            match validate_disk_chain(
+                body.iter().map(|write| {
+                    (
+                        write.offset,
+                        write.len,
+                        write.no_buffer,
+                        write.buffer.as_ref().map(IoBuffer::len),
+                    )
+                }),
+                bs,
+            ) {
                 Ok(v) => v,
                 Err(kind) => {
                     cold_path();
@@ -242,14 +206,6 @@ impl DeviceControlHandler for DiskIo {
                 .with_context(|| "forwarding an unsupported disk control request"),
         }
     }
-}
-
-fn has_from_device_buffer(buffer: &IoBuffer<'_, '_, FromDevice>, len: usize) -> bool {
-    buffer.len() >= len
-}
-
-fn has_to_device_buffer(buffer: &IoBuffer<'_, '_, ToDevice>, len: usize) -> bool {
-    buffer.len() >= len
 }
 
 use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};

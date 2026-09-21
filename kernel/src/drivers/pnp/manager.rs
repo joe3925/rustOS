@@ -29,6 +29,44 @@ use kernel_types::pnp::{
 use kernel_types::status::Data;
 use spin::{Mutex, RwLock};
 
+#[derive(Clone)]
+struct FilterItem {
+    order: u32,
+    service: String,
+}
+
+async fn collect_filter_base(base: &str, target: &mut Vec<FilterItem>) {
+    if let Ok(children) = list_keys(base).await {
+        for svc_path in children {
+            let order = match get_value(&svc_path, "Order").await {
+                Some(Data::U32(value)) => value,
+                _ => 100,
+            };
+            let service = match get_value(&svc_path, "Service").await {
+                Some(Data::Str(service)) => service,
+                _ => svc_path
+                    .rsplit_once('/')
+                    .map(|(_, service)| service.to_string())
+                    .unwrap_or_else(|| svc_path.clone()),
+            };
+            target.push(FilterItem { order, service });
+        }
+    }
+}
+
+fn ordered_services(mut items: Vec<FilterItem>) -> Vec<String> {
+    items.sort_by(|a, b| {
+        a.order
+            .cmp(&b.order)
+            .then_with(|| a.service.cmp(&b.service))
+    });
+    let mut seen = alloc::collections::BTreeSet::new();
+    items
+        .into_iter()
+        .filter_map(|item| seen.insert(item.service.clone()).then_some(item.service))
+        .collect()
+}
+
 fn device_link_path(path: &str) -> String {
     let trimmed = path.trim_start_matches(['\\', '/']);
     let relative = trimmed
@@ -554,67 +592,32 @@ impl PnpManager {
         class_opt: Option<&str>,
         function_service: &str,
     ) -> Result<(Vec<Arc<DriverPackage>>, Vec<Arc<DriverPackage>>), KernelError> {
-        #[derive(Clone)]
-        struct Item {
-            order: u32,
-            service: String,
-        }
-
-        let mut lowers: Vec<Item> = Vec::new();
-        let mut uppers: Vec<Item> = Vec::new();
+        let mut lowers = Vec::new();
+        let mut uppers = Vec::new();
+        let mut bases = Vec::new();
 
         for id in ids {
             let key = driver_index::escape_key(id);
-            for pos in ["lower", "upper"] {
-                let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{key}/{pos}");
-                if let Ok(children) = list_keys(&base).await {
-                    for svc_path in children {
-                        let order = match get_value(&svc_path, "Order").await {
-                            Some(Data::U32(v)) => v,
-                            _ => 100,
-                        };
-                        let service = match get_value(&svc_path, "Service").await {
-                            Some(Data::Str(s)) => s,
-                            _ => svc_path
-                                .rsplit_once('/')
-                                .map(|(_, s)| s.to_string())
-                                .unwrap_or_else(|| svc_path.clone()),
-                        };
-                        if pos == "lower" {
-                            lowers.push(Item { order, service });
-                        } else {
-                            uppers.push(Item { order, service });
-                        }
-                    }
-                }
-            }
+            bases.push((
+                alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{key}/lower"),
+                false,
+            ));
+            bases.push((
+                alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{key}/upper"),
+                true,
+            ));
         }
 
         if let Some(class) = class_opt {
             let key = driver_index::escape_key(class);
-            for pos in ["lower", "upper"] {
-                let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{key}/{pos}");
-                if let Ok(children) = list_keys(&base).await {
-                    for svc_path in children {
-                        let order = match get_value(&svc_path, "Order").await {
-                            Some(Data::U32(v)) => v,
-                            _ => 100,
-                        };
-                        let service = match get_value(&svc_path, "Service").await {
-                            Some(Data::Str(s)) => s,
-                            _ => svc_path
-                                .rsplit_once('/')
-                                .map(|(_, s)| s.to_string())
-                                .unwrap_or_else(|| svc_path.clone()),
-                        };
-                        if pos == "lower" {
-                            lowers.push(Item { order, service });
-                        } else {
-                            uppers.push(Item { order, service });
-                        }
-                    }
-                }
-            }
+            bases.push((
+                alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{key}/lower"),
+                false,
+            ));
+            bases.push((
+                alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{key}/upper"),
+                true,
+            ));
 
             let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{class}");
             for (list_name, target_vec) in
@@ -630,7 +633,7 @@ impl PnpManager {
                     for i in 0..k.values.len() {
                         let idxs = alloc::format!("{}", i);
                         if let Some(Data::Str(svc)) = get_value(&list_key, &idxs).await {
-                            target_vec.push(Item {
+                            target_vec.push(FilterItem {
                                 order: base_order + (i as u32),
                                 service: svc,
                             });
@@ -640,62 +643,25 @@ impl PnpManager {
             }
         }
 
-        for pos in ["lower", "upper"] {
-            let base = alloc::format!(
-                "SYSTEM/CurrentControlSet/Filters/driver/{}/{}",
-                driver_index::escape_key(function_service),
-                pos
-            );
-            if let Ok(children) = list_keys(&base).await {
-                for svc_path in children {
-                    let order = match get_value(&svc_path, "Order").await {
-                        Some(Data::U32(v)) => v,
-                        _ => 100,
-                    };
-                    let service = match get_value(&svc_path, "Service").await {
-                        Some(Data::Str(s)) => s,
-                        _ => svc_path
-                            .rsplit_once('/')
-                            .map(|(_, s)| s.to_string())
-                            .unwrap_or_else(|| svc_path.clone()),
-                    };
-                    if pos == "lower" {
-                        lowers.push(Item { order, service });
-                    } else {
-                        uppers.push(Item { order, service });
-                    }
-                }
-            }
+        let function_key = driver_index::escape_key(function_service);
+        bases.push((
+            alloc::format!("SYSTEM/CurrentControlSet/Filters/driver/{function_key}/lower"),
+            false,
+        ));
+        bases.push((
+            alloc::format!("SYSTEM/CurrentControlSet/Filters/driver/{function_key}/upper"),
+            true,
+        ));
+        for (base, upper) in bases {
+            collect_filter_base(
+                &base,
+                if upper { &mut uppers } else { &mut lowers },
+            )
+            .await;
         }
 
-        lowers.sort_by(|a, b| {
-            a.order
-                .cmp(&b.order)
-                .then_with(|| a.service.cmp(&b.service))
-        });
-        uppers.sort_by(|a, b| {
-            a.order
-                .cmp(&b.order)
-                .then_with(|| a.service.cmp(&b.service))
-        });
-
-        let mut seen_l = BTreeMap::<String, u32>::new();
-        let mut seen_u = BTreeMap::<String, u32>::new();
-        let mut lower_svcs = Vec::new();
-        let mut upper_svcs = Vec::new();
-
-        for it in lowers {
-            if !seen_l.contains_key(&it.service) {
-                seen_l.insert(it.service.clone(), it.order);
-                lower_svcs.push(it.service);
-            }
-        }
-        for it in uppers {
-            if !seen_u.contains_key(&it.service) {
-                seen_u.insert(it.service.clone(), it.order);
-                upper_svcs.push(it.service);
-            }
-        }
+        let lower_svcs = ordered_services(lowers);
+        let upper_svcs = ordered_services(uppers);
 
         let mut lower_rts = Vec::new();
         for svc in lower_svcs {

@@ -932,21 +932,8 @@ impl ObjectManager {
         name: Arc<str>,
         obj: ObjRef,
     ) -> Result<Arc<Object>, OmError> {
-        let dir = Self::as_directory(&parent)?;
-        let mut map = dir.children.write();
-
-        let key = normalize_component(name.as_ref());
-        if map.contains_key(key.as_str()) {
-            return Err(OmError::AlreadyExists);
-        }
-
         let node = Object::new_generic_with_id(self.alloc_id(), obj);
-        *node.name.write() = Some(name.clone());
-        map.insert(Arc::<str>::from(key.into_boxed_str()), node.clone());
-        drop(map);
-
-        self.index_object(&node);
-        Ok(node)
+        self.insert_child_node(parent, name, node)
     }
 
     fn insert_child_symlink(
@@ -956,21 +943,28 @@ impl ObjectManager {
         target: Arc<Object>,
         exposed: InterfaceMask,
     ) -> Result<Arc<Object>, OmError> {
+        let sl = SymlinkBody::new(target.clone(), exposed);
+        let node = Object::new_symlink_with_id(self.alloc_id(), sl);
+        let node = self.insert_child_node(parent, name, node)?;
+        target.symlinks.lock().push(Arc::downgrade(&node));
+        Ok(node)
+    }
+
+    fn insert_child_node(
+        &self,
+        parent: Arc<Object>,
+        name: Arc<str>,
+        node: Arc<Object>,
+    ) -> Result<Arc<Object>, OmError> {
         let dir = Self::as_directory(&parent)?;
         let mut map = dir.children.write();
-
         let key = normalize_component(name.as_ref());
         if map.contains_key(key.as_str()) {
             return Err(OmError::AlreadyExists);
         }
-
-        let sl = SymlinkBody::new(target.clone(), exposed);
-        let node = Object::new_symlink_with_id(self.alloc_id(), sl);
-        *node.name.write() = Some(name.clone());
+        *node.name.write() = Some(name);
         map.insert(Arc::<str>::from(key.into_boxed_str()), node.clone());
         drop(map);
-
-        target.symlinks.lock().push(Arc::downgrade(&node));
         self.index_object(&node);
         Ok(node)
     }
@@ -1038,61 +1032,6 @@ impl ObjectManager {
         Ok(cur)
     }
 
-    fn walk_owned(
-        &self,
-        start: &Arc<Object>,
-        comps: &[Arc<str>],
-        mut budget: usize,
-    ) -> Result<Arc<Object>, OmError> {
-        let mut cur = start.clone();
-        let mut idx = 0usize;
-
-        while idx < comps.len() {
-            if budget == 0 {
-                return Err(OmError::LoopDetected);
-            }
-            budget -= 1;
-
-            let dir = Self::as_directory(&cur)?;
-            let next = {
-                let map = dir.children.read();
-                let key = normalize_component(comps[idx].as_ref());
-                map.get(key.as_str()).cloned()
-            }
-            .ok_or(OmError::NotFound)?;
-
-            match next.tag {
-                ObjectTag::Directory => {
-                    cur = next;
-                    idx += 1;
-                }
-                ObjectTag::Generic
-                | ObjectTag::Program
-                | ObjectTag::Thread
-                | ObjectTag::Queue
-                | ObjectTag::CompletionQueue
-                | ObjectTag::File
-                | ObjectTag::Module
-                | ObjectTag::Device
-                | ObjectTag::IoBufferBacking
-                | ObjectTag::ExecutorDomain => {
-                    if idx + 1 == comps.len() {
-                        return Ok(next);
-                    }
-                    return Err(OmError::NotDirectory);
-                }
-                ObjectTag::Symlink => match &next.payload {
-                    ObjectPayload::Symlink(s) if idx + 1 == comps.len() => {
-                        return Ok(s.target.clone());
-                    }
-                    ObjectPayload::Symlink(_) => return Err(OmError::NotDirectory),
-                    _ => unreachable!(),
-                },
-            }
-        }
-
-        Ok(cur)
-    }
 }
 
 #[inline]

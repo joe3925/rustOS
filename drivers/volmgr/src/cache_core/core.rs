@@ -375,13 +375,8 @@ where
     }
 
     #[inline]
-    fn granules_per_block() -> usize {
-        BLOCK_SIZE / CACHE_GRANULE
-    }
-
-    #[inline]
     fn full_granule_mask() -> u64 {
-        let granules = Self::granules_per_block();
+        let granules = BLOCK_SIZE / CACHE_GRANULE;
         if granules == 64 {
             u64::MAX
         } else {
@@ -415,11 +410,6 @@ where
             .ok_or(CacheError::OffsetOverflow)?;
 
         Ok(Self::granule_mask(granule_start, granule_count))
-    }
-
-    #[inline]
-    fn range_covers_whole_granules(block_off: usize, len: usize) -> bool {
-        block_off % CACHE_GRANULE == 0 && len % CACHE_GRANULE == 0
     }
 
     #[inline]
@@ -493,14 +483,6 @@ where
                 cold_path();
                 CacheError::InvalidIoBuffer(err)
             })
-    }
-
-    fn create_cache_to_device_buffer<'a>(
-        &'a self,
-        page: &CachePage,
-        len: usize,
-    ) -> Result<IoBuffer<'a, 'a, ToDevice>, CacheError<B::Error>> {
-        self.create_cache_to_device_buffer_at(page, 0, len)
     }
 
     async fn write_buffer_to_backend<'buffer>(
@@ -578,10 +560,6 @@ where
         Ok(())
     }
 
-    async fn wait_for_flush_slot(&self) {
-        FlushSlotWait { cache: self }.await
-    }
-
     fn mark_cached_page_dirty_range(&self, page: &CachePage, owner: u64, bits: u64) {
         if unlikely(bits == 0) {
             cold_path();
@@ -649,7 +627,7 @@ where
         (lba as usize) % self.shards.len()
     }
 
-    async fn try_get_page(&self, lba: u64) -> Option<Arc<CachePage>> {
+    fn try_get_page(&self, lba: u64) -> Option<Arc<CachePage>> {
         let idx = self.shard_index(lba);
         let mut shard = self.shards[idx].lock();
         shard.index.get(&lba).map(|page| Arc::clone(&*page))
@@ -845,7 +823,7 @@ where
         Err(CacheError::NoFreePages)
     }
 
-    async fn insert_page_or_get_existing(&self, lba: u64, page: Arc<CachePage>) -> Arc<CachePage> {
+    fn insert_page_or_get_existing(&self, lba: u64, page: Arc<CachePage>) -> Arc<CachePage> {
         let idx = self.shard_index(lba);
         let mut shard = self.shards[idx].lock();
 
@@ -902,39 +880,6 @@ where
         Ok(())
     }
 
-    async fn read_block_into_page(
-        &self,
-        lba: u64,
-        page: &Arc<CachePage>,
-    ) -> Result<(), CacheError<B::Error>> {
-        let bytes_read = {
-            let _data_guard = page.data_lock.write();
-            let io_buf = self.create_cache_from_device_buffer(page, BLOCK_SIZE)?;
-            self.backend
-                .read_phys_framed(lba, 1, io_buf)
-                .await
-                .map_err(CacheError::Backend)?
-        };
-
-        if unlikely(bytes_read > BLOCK_SIZE) {
-            cold_path();
-            return Err(CacheError::OffsetOverflow);
-        }
-
-        if unlikely(bytes_read < BLOCK_SIZE) {
-            cold_path();
-            let _data_guard = page.data_lock.write();
-            unsafe {
-                core::slice::from_raw_parts_mut(self.page_ptr(page), BLOCK_SIZE)[bytes_read..]
-                    .fill(0);
-            }
-        }
-
-        page.valid_mask
-            .store(Self::full_granule_mask(), Ordering::Release);
-        Ok(())
-    }
-
     async fn ensure_page_range_valid(
         &self,
         lba: u64,
@@ -973,7 +918,7 @@ where
     ) -> Result<Arc<CachePage>, CacheError<B::Error>> {
         let page = self.acquire_cache_page(lba).await?;
         match self.read_block_into_page(lba, &page).await {
-            Ok(()) => Ok(page),
+            Ok(_) => Ok(page),
             Err(e) => {
                 self.recycle_or_drop_page(page);
                 Err(e)
@@ -985,7 +930,7 @@ where
         &self,
         lba: u64,
     ) -> Result<Arc<CachePage>, CacheError<B::Error>> {
-        if let Some(page) = self.try_get_page(lba).await {
+        if let Some(page) = self.try_get_page(lba) {
             return Ok(page);
         }
 
@@ -997,14 +942,14 @@ where
         }
 
         let loaded = self.load_cache_page_from_backend(lba).await?;
-        Ok(self.insert_page_or_get_existing(lba, loaded).await)
+        Ok(self.insert_page_or_get_existing(lba, loaded))
     }
 
     async fn get_or_create_write_page(
         &self,
         lba: u64,
     ) -> Result<WriteAcquire, CacheError<B::Error>> {
-        if let Some(page) = self.try_get_page(lba).await {
+        if let Some(page) = self.try_get_page(lba) {
             return Ok(WriteAcquire::Cached(page));
         }
 
@@ -1015,11 +960,11 @@ where
         }
 
         let page = self.acquire_cache_page(lba).await?;
-        let page = self.insert_page_or_get_existing(lba, page).await;
+        let page = self.insert_page_or_get_existing(lba, page);
         Ok(WriteAcquire::Cached(page))
     }
 
-    async fn read_block_into_direct_page(
+    async fn read_block_into_page(
         &self,
         lba: u64,
         page: &Arc<CachePage>,
@@ -1058,21 +1003,9 @@ where
         page: &Arc<CachePage>,
         owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
-        let buffer = self.create_cache_to_device_buffer(page, BLOCK_SIZE)?;
-
-        let mut req = Write::new(
-            lba * BLOCK_SIZE as u64,
-            BLOCK_SIZE,
-            false,
-            owner,
-            Some(buffer),
-        );
-
-        let status = self.backend.write_request(&mut req).await;
-        drop(req);
-
-        status.map_err(CacheError::Backend)?;
-        Ok(())
+        let buffer = self.create_cache_to_device_buffer_at(page, 0, BLOCK_SIZE)?;
+        self.write_buffer_to_backend(lba * BLOCK_SIZE as u64, buffer, owner)
+            .await
     }
 
     fn take_direct_page(&self) -> Result<Arc<CachePage>, CacheError<B::Error>> {
@@ -1108,7 +1041,7 @@ where
             let block_off = (cur_off % bs_u64) as usize;
             let take = min(BLOCK_SIZE - block_off, out.len() - dst_pos);
 
-            if let Err(err) = self.read_block_into_direct_page(lba, &page).await {
+            if let Err(err) = self.read_block_into_page(lba, &page).await {
                 result = Err(err);
                 break;
             }
@@ -1197,7 +1130,7 @@ where
             let take = min(BLOCK_SIZE - block_off, len - written);
 
             if block_off != 0 || take != BLOCK_SIZE {
-                if let Err(err) = self.read_block_into_direct_page(lba, &page).await {
+                if let Err(err) = self.read_block_into_page(lba, &page).await {
                     result = Err(err);
                     break;
                 }
@@ -1852,18 +1785,13 @@ where
         }
     }
 
-    async fn flush_until_clean(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_filtered_clean(&FlushFilter::All, true)
-            .await
-    }
-
     async fn flush_internal_filtered(
         &self,
         filter: &FlushFilter,
         force_device_flush: bool,
     ) -> Result<(usize, usize), CacheError<B::Error>> {
         self.check_open()?;
-        self.wait_for_flush_slot().await;
+        FlushSlotWait { cache: self }.await;
 
         let _flush_guard = FlushActiveGuard {
             active: &self.flush_active,
@@ -2058,7 +1986,7 @@ where
     }
 
     pub async fn close_and_flush(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_until_clean().await?;
+        self.flush_internal_all().await?;
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -2075,7 +2003,7 @@ where
         while len < remaining_len {
             let lba = cur_off / bs_u64;
 
-            if len != 0 && cache.try_get_page(lba).await.is_some() {
+            if len != 0 && cache.try_get_page(lba).is_some() {
                 break;
             }
 
@@ -2144,7 +2072,7 @@ where
                         cache.wait_for_writeback_progress(&FlushFilter::All).await;
                     }
 
-                    if !Self::range_covers_whole_granules(block_off, take) {
+                    if block_off % CACHE_GRANULE != 0 || take % CACHE_GRANULE != 0 {
                         cache
                             .ensure_page_range_valid(lba, &page, block_off, take)
                             .await?;
@@ -2331,7 +2259,7 @@ where
             let mut lba = block_range.start;
 
             while lba < block_range.end {
-                if self.try_get_page(lba).await.is_some() {
+                if self.try_get_page(lba).is_some() {
                     has_cached_page = true;
                     break;
                 }
@@ -2420,7 +2348,7 @@ where
             let mut lba = block_range.start;
 
             while lba < block_range.end {
-                if self.try_get_page(lba).await.is_some() {
+                if self.try_get_page(lba).is_some() {
                     has_cached_page = true;
                     break;
                 }

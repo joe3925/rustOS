@@ -164,36 +164,13 @@ where
 
 macro_rules! impl_io_request {
     (for<$lt:lifetime> $ty:ty, $handler_ty:ty, $slot:ident) => {
-        impl<$lt> IoRequest for $ty {
-            type Handler = $handler_ty;
-
-            #[inline]
-            fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
-                ops.$slot.as_handler()
-            }
-
-            #[inline]
-            fn call<'a>(
-                handler: Self::Handler,
-                dev: &'a Arc<DeviceObject>,
-                req: &'a mut Self,
-            ) -> AbiFuture<Result<DriverStep, KernelError>> {
-                handler(dev, req)
-            }
-        }
-
-        impl<$lt> RoutedOperation for $ty {
-            #[inline]
-            fn invoke_at<'a>(
-                dev: &'a Arc<DeviceObject>,
-                req: &'a mut Self,
-            ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
-                invoke_io_handler::<Self>(dev, req)
-            }
-        }
+        impl_io_request!(@emit <$lt> $ty, $handler_ty, $slot);
     };
     ($ty:ty, $handler_ty:ty, $slot:ident) => {
-        impl IoRequest for $ty {
+        impl_io_request!(@emit $ty, $handler_ty, $slot);
+    };
+    (@emit $(<$lt:lifetime>)? $ty:ty, $handler_ty:ty, $slot:ident) => {
+        impl $(<$lt>)? IoRequest for $ty {
             type Handler = $handler_ty;
 
             #[inline]
@@ -211,7 +188,7 @@ macro_rules! impl_io_request {
             }
         }
 
-        impl RoutedOperation for $ty {
+        impl $(<$lt>)? RoutedOperation for $ty {
             #[inline]
             fn invoke_at<'a>(
                 dev: &'a Arc<DeviceObject>,

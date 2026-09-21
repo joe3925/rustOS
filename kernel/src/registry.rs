@@ -118,6 +118,37 @@ fn data_from_value(value: Value) -> Result<Data, KernelError> {
 }
 
 impl RegistryStore {
+    async fn commit<F>(
+        &self,
+        io: &mut RegistryIo,
+        delta: &Delta,
+        apply: F,
+    ) -> Result<(), KernelError>
+    where
+        F: FnOnce(&mut RegistryState) -> Result<(), KernelError>,
+    {
+        let seq = self
+            .state
+            .read()
+            .wal_seq
+            .checked_add(1)
+            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
+        if !self.state.read().bootstrap {
+            append_wal(io, seq, delta).await?;
+        }
+        {
+            let mut state = self.state.write();
+            apply(&mut state)?;
+            state.wal_seq = seq;
+            state.deltas_since_snapshot += 1;
+            if !state.bootstrap {
+                state.wal_bytes = io.wal.as_ref().map_or(0, |file| file.size);
+            }
+        }
+        self.checkpoint_if_needed(io).await;
+        Ok(())
+    }
+
     async fn create_key(&self, path: String) -> Result<(), KernelError> {
         let mut io = self.io.lock().await;
 
@@ -133,40 +164,16 @@ impl RegistryStore {
             }
         }
 
-        let seq = self
-            .state
-            .read()
-            .wal_seq
-            .checked_add(1)
-            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
-
         let delta = Delta {
-            delta: Some(registry_format::delta::Delta::CreateKey(CreateKey { path })),
+            delta: Some(registry_format::delta::Delta::CreateKey(CreateKey {
+                path: path.clone(),
+            })),
         };
-
-        if !self.state.read().bootstrap {
-            append_wal(&mut io, seq, &delta).await?;
-        }
-
-        let Some(registry_format::delta::Delta::CreateKey(delta)) = delta.delta else {
-            unreachable!();
-        };
-
-        {
-            let mut state = self.state.write();
-
-            create_key_inner(&mut state.registry, &delta.path);
-
-            state.wal_seq = seq;
-            state.deltas_since_snapshot += 1;
-            if !state.bootstrap {
-                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
-            }
-        }
-
-        self.checkpoint_if_needed(&mut io).await;
-
-        Ok(())
+        self.commit(&mut io, &delta, |state| {
+            create_key_inner(&mut state.registry, &path);
+            Ok(())
+        })
+        .await
     }
 
     async fn delete_key(&self, path: &str) -> Result<bool, KernelError> {
@@ -186,89 +193,48 @@ impl RegistryStore {
             return Ok(false);
         }
 
-        let seq = self
-            .state
-            .read()
-            .wal_seq
-            .checked_add(1)
-            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
-
         let delta = Delta {
             delta: Some(registry_format::delta::Delta::DeleteKey(DeleteKey {
                 path: path.to_string(),
             })),
         };
 
-        if !self.state.read().bootstrap {
-            append_wal(&mut io, seq, &delta).await?;
-        }
-
-        {
-            let mut state = self.state.write();
-
+        self.commit(&mut io, &delta, |state| {
             delete_key_inner(&mut state.registry, path);
-
-            state.wal_seq = seq;
-            state.deltas_since_snapshot += 1;
-            if !state.bootstrap {
-                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
-            }
-        }
-
-        self.checkpoint_if_needed(&mut io).await;
-
+            Ok(())
+        })
+        .await?;
         Ok(true)
     }
 
     async fn set_value(&self, key_path: &str, name: &str, data: Data) -> Result<(), KernelError> {
         let mut io = self.io.lock().await;
 
+        let value = value_from_data(&data);
         {
             let state = self.state.read();
             let key = walk(&state.registry, key_path)
                 .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
 
-            if key.values.get(name) == Some(&value_from_data(&data)) {
+            if key.values.get(name) == Some(&value) {
                 return Ok(());
             }
         }
-
-        let seq = self
-            .state
-            .read()
-            .wal_seq
-            .checked_add(1)
-            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
 
         let delta = Delta {
             delta: Some(registry_format::delta::Delta::SetValue(SetValue {
                 key_path: key_path.to_string(),
                 name: name.to_string(),
-                data: Some(value_from_data(&data)),
+                data: Some(value.clone()),
             })),
         };
-
-        if !self.state.read().bootstrap {
-            append_wal(&mut io, seq, &delta).await?;
-        }
-
-        {
-            let mut state = self.state.write();
+        self.commit(&mut io, &delta, |state| {
             let key = walk_mut(&mut state.registry, key_path)
                 .ok_or_else(|| error(RegistryErrorKind::KeyNotFound))?;
-
-            key.values.insert(name.to_string(), value_from_data(&data));
-
-            state.wal_seq = seq;
-            state.deltas_since_snapshot += 1;
-            if !state.bootstrap {
-                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
-            }
-        }
-
-        self.checkpoint_if_needed(&mut io).await;
-
-        Ok(())
+            key.values.insert(name.to_string(), value);
+            Ok(())
+        })
+        .await
     }
 
     async fn delete_value(&self, key_path: &str, name: &str) -> Result<bool, KernelError> {
@@ -296,13 +262,6 @@ impl RegistryStore {
             }
         }
 
-        let seq = self
-            .state
-            .read()
-            .wal_seq
-            .checked_add(1)
-            .ok_or_else(|| error(RegistryErrorKind::PersistenceFailed))?;
-
         let delta = Delta {
             delta: Some(registry_format::delta::Delta::DeleteValue(DeleteValue {
                 key_path: key_path.to_string(),
@@ -310,26 +269,13 @@ impl RegistryStore {
             })),
         };
 
-        if !self.state.read().bootstrap {
-            append_wal(&mut io, seq, &delta).await?;
-        }
-
-        {
-            let mut state = self.state.write();
-
+        self.commit(&mut io, &delta, |state| {
             if let Some(key) = walk_mut(&mut state.registry, key_path) {
                 key.values.remove(name);
             }
-
-            state.wal_seq = seq;
-            state.deltas_since_snapshot += 1;
-            if !state.bootstrap {
-                state.wal_bytes = io.wal.as_ref().map_or(0, |f| f.size);
-            }
-        }
-
-        self.checkpoint_if_needed(&mut io).await;
-
+            Ok(())
+        })
+        .await?;
         Ok(true)
     }
 
@@ -794,26 +740,17 @@ fn emit_created_tree(path: &str, key: &Key, out: &mut Vec<RegDelta>) {
 }
 
 fn diff_key(path: &str, from: &Key, to: &Key, out: &mut Vec<RegDelta>) {
-    for (name, value) in &from.values {
-        match to.values.get(name) {
-            None => out.push(RegDelta::DeleteValue {
+    for name in from.values.keys() {
+        if !to.values.contains_key(name) {
+            out.push(RegDelta::DeleteValue {
                 key_path: path.to_string(),
                 name: name.clone(),
-            }),
-
-            Some(next) if next != value => out.push(RegDelta::SetValue {
-                key_path: path.to_string(),
-                name: name.clone(),
-                data: data_from_value(next.clone())
-                    .expect("registry contains a value without a value kind"),
-            }),
-
-            Some(_) => {}
+            });
         }
     }
 
     for (name, value) in &to.values {
-        if !from.values.contains_key(name) {
+        if from.values.get(name) != Some(value) {
             out.push(RegDelta::SetValue {
                 key_path: path.to_string(),
                 name: name.clone(),

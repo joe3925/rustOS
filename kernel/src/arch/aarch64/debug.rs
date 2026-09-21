@@ -105,19 +105,7 @@ fn parse_rx_line(mut line: &[u8]) -> RxEvent {
 }
 
 fn mark_module_ready(module_id: u32) {
-    let mut current = LAST_READY_MODULE.load(Ordering::Acquire);
-
-    while module_id > current {
-        match LAST_READY_MODULE.compare_exchange_weak(
-            current,
-            module_id,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return,
-            Err(observed) => current = observed,
-        }
-    }
+    LAST_READY_MODULE.fetch_max(module_id, Ordering::AcqRel);
 }
 
 pub(crate) fn poll_rx_once() {

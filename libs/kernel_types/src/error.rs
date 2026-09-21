@@ -333,37 +333,9 @@ impl KernelError {
             instruction_pointer,
         };
 
-        if self.diagnostics.is_none() {
-            let diagnostics = ErrorDiagnostics {
-                message: None,
-                message_location: None,
-                contexts: Vec::new(),
-                related: Vec::new(),
-                backtrace: None,
-            };
-            self.diagnostics = Arc::try_new(diagnostics).ok();
-            if self.diagnostics.is_none() {
-                return self;
-            }
-        }
-
-        let Some(diagnostics) = self.diagnostics.as_mut() else {
+        let Some(diagnostics) = self.try_unique_diagnostics() else {
             return self;
         };
-
-        if Arc::get_mut(diagnostics).is_none() {
-            let Some(cloned) = try_clone_diagnostics(diagnostics) else {
-                self.diagnostics = None;
-                return self;
-            };
-            let Ok(cloned) = Arc::try_new(cloned) else {
-                self.diagnostics = None;
-                return self;
-            };
-            *diagnostics = cloned;
-        }
-
-        let diagnostics = Arc::get_mut(diagnostics).expect("diagnostics must be uniquely owned");
         if diagnostics.contexts.try_reserve(1).is_err() {
             self.diagnostics = None;
             return self;
@@ -381,37 +353,9 @@ impl KernelError {
             return self;
         };
 
-        if self.diagnostics.is_none() {
-            let diagnostics = ErrorDiagnostics {
-                message: None,
-                message_location: None,
-                contexts: Vec::new(),
-                related: Vec::new(),
-                backtrace: None,
-            };
-            self.diagnostics = Arc::try_new(diagnostics).ok();
-            if self.diagnostics.is_none() {
-                return self;
-            }
-        }
-
-        let Some(diagnostics) = self.diagnostics.as_mut() else {
+        let Some(diagnostics) = self.try_unique_diagnostics() else {
             return self;
         };
-
-        if Arc::get_mut(diagnostics).is_none() {
-            let Some(cloned) = try_clone_diagnostics(diagnostics) else {
-                self.diagnostics = None;
-                return self;
-            };
-            let Ok(cloned) = Arc::try_new(cloned) else {
-                self.diagnostics = None;
-                return self;
-            };
-            *diagnostics = cloned;
-        }
-
-        let diagnostics = Arc::get_mut(diagnostics).expect("diagnostics must be uniquely owned");
         if diagnostics.related.try_reserve(1).is_err() {
             self.diagnostics = None;
             return self;
@@ -421,6 +365,25 @@ impl KernelError {
             error: related_error,
         });
         self
+    }
+
+    fn try_unique_diagnostics(&mut self) -> Option<&mut ErrorDiagnostics> {
+        let mut diagnostics = match self.diagnostics.take() {
+            Some(diagnostics) => diagnostics,
+            None => Arc::try_new(ErrorDiagnostics {
+                message: None,
+                message_location: None,
+                contexts: Vec::new(),
+                related: Vec::new(),
+                backtrace: None,
+            })
+            .ok()?,
+        };
+        if Arc::get_mut(&mut diagnostics).is_none() {
+            diagnostics = Arc::try_new(try_clone_diagnostics(&diagnostics)?).ok()?;
+        }
+        self.diagnostics = Some(diagnostics);
+        Arc::get_mut(self.diagnostics.as_mut()?)
     }
 }
 

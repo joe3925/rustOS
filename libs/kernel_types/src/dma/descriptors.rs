@@ -350,79 +350,6 @@ pub enum IoBufferDmaMappingLayout {
     IdentityExtents,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DmaSegmentLayout {
-    None,
-    Contiguous {
-        segment: IoBufferDmaSegment,
-    },
-    PageChunks {
-        iova_base: u64,
-        page_offset: usize,
-        byte_len: usize,
-        page_size: usize,
-    },
-    ScatterGather {
-        iova_base: u64,
-        page_size: usize,
-    },
-    FixedChunks {
-        dma_addr: u64,
-        chunk_len: u32,
-        count: usize,
-    },
-    IdentityExtents,
-}
-
-impl From<IoBufferDmaMappingLayout> for DmaSegmentLayout {
-    fn from(layout: IoBufferDmaMappingLayout) -> Self {
-        match layout {
-            IoBufferDmaMappingLayout::None => Self::None,
-            IoBufferDmaMappingLayout::Contiguous { dma_addr, byte_len } => {
-                if byte_len == 0 {
-                    Self::None
-                } else {
-                    Self::Contiguous {
-                        segment: IoBufferDmaSegment {
-                            dma_addr,
-                            byte_len: byte_len as u32,
-                            reserved: 0,
-                        },
-                    }
-                }
-            }
-            IoBufferDmaMappingLayout::PageChunks {
-                iova_base,
-                page_offset,
-                byte_len,
-                page_size,
-            } => Self::PageChunks {
-                iova_base,
-                page_offset,
-                byte_len,
-                page_size,
-            },
-            IoBufferDmaMappingLayout::ScatterGather {
-                iova_base,
-                page_size,
-            } => Self::ScatterGather {
-                iova_base,
-                page_size,
-            },
-            IoBufferDmaMappingLayout::FixedChunks {
-                dma_addr,
-                chunk_len,
-                count,
-            } => Self::FixedChunks {
-                dma_addr,
-                chunk_len,
-                count,
-            },
-            IoBufferDmaMappingLayout::IdentityExtents => Self::IdentityExtents,
-        }
-    }
-}
-
 pub(super) struct DmaRecord {
     pub(super) active: bool,
     pub(super) persistent: bool,
@@ -430,7 +357,7 @@ pub(super) struct DmaRecord {
     pub(super) mapped_start: usize,
     pub(super) mapped_len: usize,
     pub(super) access: u8,
-    pub(super) layout: DmaSegmentLayout,
+    pub(super) layout: IoBufferDmaMappingLayout,
     pub(super) drop_ctx: Option<DmaDropContext>,
 }
 
@@ -443,7 +370,7 @@ impl DmaRecord {
             mapped_start: 0,
             mapped_len: 0,
             access: 0,
-            layout: DmaSegmentLayout::None,
+            layout: IoBufferDmaMappingLayout::None,
             drop_ctx: None,
         }
     }

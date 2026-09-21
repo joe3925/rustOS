@@ -1,5 +1,5 @@
 use crate::scheduling::domain::{
-    CpuSet, DomainOps, EnqueueReason, KERNEL_DOMAIN_ID, SchedulerClass, SwitchOutOutcome,
+    CpuSet, Domain, DomainOps, EnqueueReason, KERNEL_DOMAIN_ID, SchedulerClass, SwitchOutOutcome,
     TaskSchedBinding,
 };
 use crate::scheduling::scheduler::SCHEDULER;
@@ -77,43 +77,12 @@ pub fn build_fifo_domain(name: &'static str, cpus: CpuSet, cpu_count: usize) -> 
         per_cpu.push(Some(FifoCpuState::new()));
     }
 
-    Box::new(FifoDomain::new(
+    Box::new(Domain::new(
         name,
         cpus,
         FifoClass::new(),
         per_cpu.into_boxed_slice(),
     ))
-}
-
-pub struct FifoDomain {
-    name: &'static str,
-    cpus: CpuSet,
-    class: FifoClass,
-    per_cpu: Box<[Option<FifoCpuState>]>,
-}
-
-impl FifoDomain {
-    fn new(
-        name: &'static str,
-        cpus: CpuSet,
-        class: FifoClass,
-        per_cpu: Box<[Option<FifoCpuState>]>,
-    ) -> Self {
-        Self {
-            name,
-            cpus,
-            class,
-            per_cpu,
-        }
-    }
-
-    #[inline(always)]
-    fn cpu_state(&self, cpu_id: usize) -> &FifoCpuState {
-        self.per_cpu
-            .get(cpu_id)
-            .and_then(Option::as_ref)
-            .unwrap_or_else(|| panic!("domain {} has no cpu state for cpu {}", self.name, cpu_id))
-    }
 }
 
 #[inline(always)]
@@ -492,78 +461,3 @@ impl SchedulerClass for FifoClass {
     }
 }
 
-impl DomainOps for FifoDomain {
-    #[inline(always)]
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    #[inline(always)]
-    fn contains_cpu(&self, cpu_id: usize) -> bool {
-        self.cpus.contains(cpu_id)
-    }
-
-    fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize {
-        task.with_class_state(|task_state: &FifoTaskState| {
-            let cpu_id = self
-                .class
-                .select_cpu(
-                    &self.per_cpu,
-                    &self.cpus,
-                    &task,
-                    task_state,
-                    reason,
-                    hint_cpu,
-                )
-                .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name));
-
-            task.set_target_cpu(cpu_id);
-            self.class.enqueue(
-                cpu_id,
-                self.cpu_state(cpu_id),
-                task.clone(),
-                task_state,
-                reason,
-            );
-            cpu_id
-        })
-    }
-
-    fn on_switch_out(
-        &self,
-        task: &TaskHandle,
-        cpu_id: usize,
-        now_cycles: u64,
-        outcome: SwitchOutOutcome,
-    ) {
-        task.with_class_state(|task_state: &FifoTaskState| {
-            self.class.on_switch_out(
-                cpu_id,
-                self.cpu_state(cpu_id),
-                task,
-                task_state,
-                now_cycles,
-                outcome,
-            );
-
-            if outcome == SwitchOutOutcome::Terminated {
-                self.class.on_task_exit(task, task_state);
-            }
-        });
-    }
-
-    fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
-        self.class
-            .pick_next(cpu_id, self.cpu_state(cpu_id), now_cycles)
-    }
-
-    fn should_preempt(&self, task: &TaskHandle) -> bool {
-        task.with_class_state(|task_state: &FifoTaskState| {
-            self.class.should_preempt(task, task_state)
-        })
-    }
-
-    fn maybe_balance(&self, now_tick: usize) {
-        self.class.maybe_balance(&self.per_cpu, now_tick);
-    }
-}

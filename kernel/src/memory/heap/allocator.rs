@@ -183,7 +183,7 @@ extern "C" fn parallel_worker(ctx: usize) {
 
     let push_ms = push_sw.elapsed_millis() as usize;
     ctx.push_total_ms.fetch_add(push_ms, Ordering::Relaxed);
-    atomic_max(&ctx.push_max_ms, push_ms);
+    ctx.push_max_ms.fetch_max(push_ms, Ordering::Relaxed);
 
     {
         let mut worker_vecs = ctx.worker_vecs.lock();
@@ -354,13 +354,4 @@ fn print_parallel_heap_test_result(
         realloc_ms,
         dealloc_ms
     );
-}
-fn atomic_max(target: &AtomicUsize, value: usize) {
-    let mut current = target.load(Ordering::Relaxed);
-    while value > current {
-        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(next) => current = next,
-        }
-    }
 }

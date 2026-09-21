@@ -3,7 +3,7 @@ use super::construction::{
     checked_slice, checked_slice_mut, describe_virtual_buffer_to_frames,
     validate_dma_mapping_layout,
 };
-use super::descriptors::{DmaDropContext, DmaSegmentLayout};
+use super::descriptors::DmaDropContext;
 use super::*;
 
 pub struct IoBuffer<'backing, 'data, Access: IoBufferAccess> {
@@ -36,7 +36,7 @@ struct VirtPhys {
 struct VirtDma {
     mapped_start: usize,
     mapped_len: usize,
-    layout: DmaSegmentLayout,
+    layout: IoBufferDmaMappingLayout,
     drop_ctx: Option<DmaDropContext>,
 }
 
@@ -626,36 +626,15 @@ fn copy_from_io_buffer_frames(
     dst: *mut u8,
     len: usize,
 ) -> bool {
-    let mut done = 0usize;
-    let mut remaining = len;
-    let mut current_offset = buffer_offset;
-
-    for frame in frames {
-        if remaining == 0 {
-            break;
-        }
-
-        let frame_len = frame.byte_len as usize;
-        if current_offset >= frame_len {
-            current_offset -= frame_len;
-            continue;
-        }
-
-        let n = min(frame_len - current_offset, remaining);
+    visit_frame_chunks(frames, buffer_offset, len, |address, done, count| {
         unsafe {
             ptr::copy_nonoverlapping(
-                (frame.cpu_address().as_u64() + current_offset as u64) as *const u8,
+                address as *const u8,
                 dst.add(done),
-                n,
+                count,
             );
         }
-
-        done += n;
-        remaining -= n;
-        current_offset = 0;
-    }
-
-    remaining == 0
+    })
 }
 
 fn copy_to_io_buffer_frames(
@@ -663,6 +642,19 @@ fn copy_to_io_buffer_frames(
     buffer_offset: usize,
     src: *const u8,
     len: usize,
+) -> bool {
+    visit_frame_chunks(frames, buffer_offset, len, |address, done, count| {
+        unsafe {
+            ptr::copy_nonoverlapping(src.add(done), address as *mut u8, count);
+        }
+    })
+}
+
+fn visit_frame_chunks(
+    frames: &[PhysicalFrameExtent],
+    buffer_offset: usize,
+    len: usize,
+    mut visit: impl FnMut(u64, usize, usize),
 ) -> bool {
     let mut done = 0usize;
     let mut remaining = len;
@@ -680,14 +672,7 @@ fn copy_to_io_buffer_frames(
         }
 
         let n = min(frame_len - current_offset, remaining);
-        unsafe {
-            ptr::copy_nonoverlapping(
-                src.add(done),
-                (frame.cpu_address().as_u64() + current_offset as u64) as *mut u8,
-                n,
-            );
-        }
-
+        visit(frame.cpu_address().as_u64() + current_offset as u64, done, n);
         done += n;
         remaining -= n;
         current_offset = 0;

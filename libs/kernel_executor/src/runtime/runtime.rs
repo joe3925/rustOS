@@ -10,13 +10,13 @@ use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, Ta
 pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
 use crate::future_arena::FutureAllocation;
-use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
+use crate::global_async::{ExecutorDomain, ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{Job, platform};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, Ordering};
 
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
-use super::slab::task_slab::get_task_table;
+use super::slab::task_slab::{SlotHandle, TaskTable, get_task_table};
 
 pub(crate) fn submit_global_to_executor_domain(domain_id: ExecutorDomainId, ctx: usize) {
     GlobalAsyncExecutor::global().enqueue_task_to_executor_domain(domain_id, ctx);
@@ -145,6 +145,26 @@ where
     )
 }
 
+fn reserve_future<F>(
+    domain: &ExecutorDomain,
+    future: F,
+) -> (FutureAllocation, &'static TaskTable, SlotHandle) {
+    let allocation = domain
+        .future_arena()
+        .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+        .expect("future arena allocation failed");
+    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
+    let slab = get_task_table();
+    let slot_handle = match slab.allocate() {
+        Some(handle) => handle,
+        None => unsafe {
+            release_unpublished_future::<F>(domain, allocation);
+            panic!("task table allocation failed");
+        },
+    };
+    (allocation, slab, slot_handle)
+}
+
 pub fn spawn_in_executor_domain<'a, F, T>(
     domain_id: ExecutorDomainId,
     storage: Pin<&'a mut JoinStorage<T>>,
@@ -160,19 +180,7 @@ where
     );
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
-            let allocation = domain
-                .future_arena()
-                .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-                .expect("future arena allocation failed");
-            unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
-            let slab = get_task_table();
-            let slot_handle = match slab.allocate() {
-                Some(handle) => handle,
-                None => unsafe {
-                    release_unpublished_future::<F>(domain, allocation);
-                    panic!("task table allocation failed");
-                },
-            };
+            let (allocation, slab, slot_handle) = reserve_future(domain, future);
 
     let (shard_idx, local_idx, generation) = slot_handle.indices();
 
@@ -370,20 +378,7 @@ where
     );
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
-            let allocation = domain
-                .future_arena()
-                .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-                .expect("future arena allocation failed");
-            unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
-            let slab = get_task_table();
-
-            let slot_handle = match slab.allocate() {
-                Some(handle) => handle,
-                None => unsafe {
-                    release_unpublished_future::<F>(domain, allocation);
-                    panic!("task table allocation failed");
-                },
-            };
+            let (allocation, slab, slot_handle) = reserve_future(domain, future);
             let (shard_idx, local_idx, generation) = slot_handle.indices();
 
     let slot = slab

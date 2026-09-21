@@ -9,8 +9,8 @@ use kernel_api::{
     kernel_types::{
         async_ffi::{AbiFuture, FutureExt},
         dma::{
-            FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-            IoBufferBackingScratch, ToDevice,
+            FromDevice, IoBuffer, IoBufferAccess, IoBufferBacking, IoBufferBackingConfig,
+            IoBufferBackingDesc, IoBufferBackingScratch, ToDevice,
         },
         io::IoTarget,
     },
@@ -56,6 +56,20 @@ pub struct BlockDev {
 
 impl IoBase for BlockDev {
     type Error = FatIoError;
+}
+
+fn clip_iobuffer<'buffer, Access: IoBufferAccess>(
+    buffer: IoBuffer<'buffer, 'buffer, Access>,
+    len: usize,
+    context: &'static str,
+) -> Result<IoBuffer<'buffer, 'buffer, Access>, FatIoError> {
+    if len == buffer.len() {
+        Ok(buffer)
+    } else {
+        buffer.split_at(len).map(|parts| parts.0).map_err(|_| {
+            FatIoError(error(DriverErrorKind::InvalidParameter).with_context(context))
+        })
+    }
 }
 
 impl BlockDev {
@@ -299,13 +313,7 @@ impl Write for BlockDev {
         buf: &'a [u8],
         kind: IoKind,
     ) -> AbiFuture<Result<usize, Self::Error>> {
-        async move {
-            self.write_bytes(buf, kind)
-                .into_abi()
-                .await
-                .map_err(FatIoError)
-        }
-        .into_abi()
+        async move { self.write_bytes(buf, kind).await.map_err(FatIoError) }.into_abi()
     }
 
     fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
@@ -328,19 +336,7 @@ impl ReadIoBuffer for BlockDev {
                 return Ok(0);
             }
             let len = min(buffer.len(), (cap_bytes - self.pos) as usize);
-            let buffer = if len == buffer.len() {
-                buffer
-            } else {
-                buffer
-                    .split_at(len)
-                    .map_err(|_| {
-                        FatIoError(
-                            error(DriverErrorKind::InvalidParameter)
-                                .with_context("splitting a FAT32 read I/O buffer"),
-                        )
-                    })?
-                    .0
-            };
+            let buffer = clip_iobuffer(buffer, len, "splitting a FAT32 read I/O buffer")?;
             let read = self
                 .send_read_iobuffer(self.pos, buffer)
                 .await
@@ -368,19 +364,7 @@ impl WriteIoBuffer for BlockDev {
                 return Ok(0);
             }
             let len = min(buffer.len(), (cap_bytes - self.pos) as usize);
-            let buffer = if len == buffer.len() {
-                buffer
-            } else {
-                buffer
-                    .split_at(len)
-                    .map_err(|_| {
-                        FatIoError(
-                            error(DriverErrorKind::InvalidParameter)
-                                .with_context("splitting a FAT32 write I/O buffer"),
-                        )
-                    })?
-                    .0
-            };
+            let buffer = clip_iobuffer(buffer, len, "splitting a FAT32 write I/O buffer")?;
             let written = self
                 .send_write_iobuffer(self.pos, buffer)
                 .await
@@ -394,21 +378,20 @@ impl WriteIoBuffer for BlockDev {
 }
 
 pub fn flush(vdx: &VolCtrlDevExt) {
-    vdx.pending_flush_owner
-        .store(METADATA_OWNER_ID, Ordering::SeqCst);
-    vdx.pending_flush_block.store(false, Ordering::SeqCst);
-    vdx.should_flush.store(true, Ordering::SeqCst);
+    request_flush(vdx, METADATA_OWNER_ID, false);
 }
 
 pub fn flush_owner(vdx: &VolCtrlDevExt, owner: u64) {
-    vdx.pending_flush_owner.store(owner, Ordering::SeqCst);
-    vdx.pending_flush_block.store(false, Ordering::SeqCst);
-    vdx.should_flush.store(true, Ordering::SeqCst);
+    request_flush(vdx, owner, false);
 }
 
 pub fn flush_owner_blocking(vdx: &VolCtrlDevExt, owner: u64) {
+    request_flush(vdx, owner, true);
+}
+
+fn request_flush(vdx: &VolCtrlDevExt, owner: u64, blocking: bool) {
     vdx.pending_flush_owner.store(owner, Ordering::SeqCst);
-    vdx.pending_flush_block.store(true, Ordering::SeqCst);
+    vdx.pending_flush_block.store(blocking, Ordering::SeqCst);
     vdx.should_flush.store(true, Ordering::SeqCst);
 }
 

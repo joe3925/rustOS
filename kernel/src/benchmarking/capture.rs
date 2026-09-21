@@ -706,38 +706,31 @@ fn bench_spans_enabled() -> bool {
     SPAN_REFCOUNT.load(Ordering::Relaxed) != 0
 }
 
+fn bench_metrics_event(core_id: usize, timestamp_ns: u64) -> BenchEvent {
+    let heap_used_bytes = platform::with_interrupts_disabled(used_memory) as u64;
+    let used_bytes = physical_used_bytes().saturating_add(boot_info().kernel_len as u64);
+    BenchEvent {
+        seq: 0,
+        timestamp_ns,
+        core_id: core_id as u16,
+        kind: BenchEventKind::Metrics,
+        data: BenchEventData::Metrics(BenchMetricsEvent {
+            used_bytes,
+            total_bytes: total_usable_bytes(),
+            heap_used_bytes,
+            heap_total_bytes: heap_capacity_bytes(),
+            core_sched_ns: platform::scheduler_time_ns(core_id),
+            core_switches: platform::context_switch_count(core_id),
+        }),
+    }
+}
+
 fn bench_capture_metrics(core_id: usize, ts: u64) {
     if !BENCH_ENABLED || !bench_metrics_enabled() {
         return;
     }
 
-    let heap_used = platform::with_interrupts_disabled(used_memory) as u64;
-
-    let mut used_bytes = physical_used_bytes();
-    used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
-    let total_bytes = total_usable_bytes();
-
-    let heap_total_bytes = heap_capacity_bytes();
-
-    let core_sched_ns = platform::scheduler_time_ns(core_id);
-    let core_switches = platform::context_switch_count(core_id);
-
-    let event = BenchEvent {
-        seq: 0,
-        timestamp_ns: ts,
-        core_id: core_id as u16,
-        kind: BenchEventKind::Metrics,
-        data: BenchEventData::Metrics(BenchMetricsEvent {
-            used_bytes,
-            total_bytes,
-            heap_used_bytes: heap_used,
-            heap_total_bytes,
-            core_sched_ns,
-            core_switches,
-        }),
-    };
-
-    bench_log_event_for_core(core_id, event);
+    bench_log_event_for_core(core_id, bench_metrics_event(core_id, ts));
 }
 
 // ===== Global submission API =====
@@ -1018,33 +1011,7 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
         return;
     }
 
-    let heap_used = platform::with_interrupts_disabled(used_memory) as u64;
-
-    let mut used_bytes = physical_used_bytes();
-    used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
-    let total_bytes = total_usable_bytes();
-
-    let heap_total_bytes = heap_capacity_bytes();
-
-    let core_sched_ns = platform::scheduler_time_ns(core_id);
-    let core_switches = platform::context_switch_count(core_id);
-
-    let event = BenchEvent {
-        seq: 0,
-        timestamp_ns: ts,
-        core_id: core_id as u16,
-        kind: BenchEventKind::Metrics,
-        data: BenchEventData::Metrics(BenchMetricsEvent {
-            used_bytes,
-            total_bytes,
-            heap_used_bytes: heap_used,
-            heap_total_bytes,
-            core_sched_ns,
-            core_switches,
-        }),
-    };
-
-    bench_log_event_for_core_try(core_id, event);
+    bench_log_event_for_core_try(core_id, bench_metrics_event(core_id, ts));
 }
 
 pub fn bench_submit_rip_sample_current_core(rip: u64) {

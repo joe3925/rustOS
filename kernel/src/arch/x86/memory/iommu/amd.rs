@@ -237,7 +237,7 @@ impl AmdViBackend {
             return Err(IommuError::Unsupported);
         }
 
-        let end = platform_translation_id_end(identity)?;
+        let end = super::platform_translation_id_end(identity)?;
         for source_id in identity.iommu_id_base..end {
             attach_source_id(unit, domain, source_id as u16)?;
         }
@@ -314,23 +314,12 @@ impl AmdInner {
         &self,
         identity: DeviceMmuPlatformDeviceIdentity,
     ) -> Result<(usize, u16), IommuError> {
-        validate_platform_identity(identity)?;
-
-        let mut found = None;
-        for (idx, unit) in self.units.iter().enumerate() {
-            for route in &unit.platform_routes {
-                if !platform_route_matches(route, identity) {
-                    continue;
-                }
-
-                let source_id = route.translation_id_base as u16;
-                if found.replace((idx, source_id)).is_some() {
-                    return Err(IommuError::Unsupported);
-                }
-            }
-        }
-
-        found.ok_or(IommuError::Unsupported)
+        super::select_platform_route(
+            self.units.iter().enumerate().flat_map(|(index, unit)| {
+                unit.platform_routes.iter().map(move |route| (index, route))
+            }),
+            identity,
+        )
     }
 }
 
@@ -368,48 +357,10 @@ fn attach_source_id(
     submit_serialized(unit, &commands)
 }
 
-fn validate_platform_identity(identity: DeviceMmuPlatformDeviceIdentity) -> Result<(), IommuError> {
-    if identity.iommu_id_count == 0 {
-        return Err(IommuError::Unsupported);
-    }
-
-    let Some(last) = identity
-        .iommu_id_base
-        .checked_add(identity.iommu_id_count - 1)
-    else {
-        return Err(IommuError::Unsupported);
-    };
-
-    if last > u16::MAX as u32 {
-        return Err(IommuError::Unsupported);
-    }
-
-    Ok(())
-}
-
-fn platform_translation_id_end(
-    identity: DeviceMmuPlatformDeviceIdentity,
-) -> Result<u32, IommuError> {
-    validate_platform_identity(identity)?;
-    identity
-        .iommu_id_base
-        .checked_add(identity.iommu_id_count)
-        .ok_or(IommuError::Unsupported)
-}
-
 fn unit_has_platform_route(unit: &AmdUnit, identity: DeviceMmuPlatformDeviceIdentity) -> bool {
     unit.platform_routes
         .iter()
-        .any(|route| platform_route_matches(route, identity))
-}
-
-fn platform_route_matches(
-    route: &X86PlatformDeviceRoute,
-    identity: DeviceMmuPlatformDeviceIdentity,
-) -> bool {
-    route.firmware_node == identity.firmware_node
-        && route.translation_id_base == identity.iommu_id_base
-        && route.translation_id_count == identity.iommu_id_count
+        .any(|route| super::platform_route_matches(route, identity))
 }
 
 fn write_dte(dev_table_va: *mut u64, requester_id: u16, domain: &IommuDomain) {
