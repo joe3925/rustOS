@@ -163,14 +163,12 @@ where
 }
 
 macro_rules! impl_io_request {
-    (for<$lt:lifetime> $ty:ty, $handler_ty:ty, $slot:ident) => {
-        impl_io_request!(@emit <$lt> $ty, $handler_ty, $slot);
-    };
-    ($ty:ty, $handler_ty:ty, $slot:ident) => {
-        impl_io_request!(@emit $ty, $handler_ty, $slot);
-    };
-    (@emit $(<$lt:lifetime>)? $ty:ty, $handler_ty:ty, $slot:ident) => {
-        impl $(<$lt>)? IoRequest for $ty {
+    (
+        for<$lt:lifetime> $ty:ty,
+        $handler_ty:ty,
+        $slot:ident
+    ) => {
+        impl<$lt> IoRequest for $ty {
             type Handler = $handler_ty;
 
             #[inline]
@@ -188,7 +186,41 @@ macro_rules! impl_io_request {
             }
         }
 
-        impl $(<$lt>)? RoutedOperation for $ty {
+        impl<$lt> RoutedOperation for $ty {
+            #[inline]
+            fn invoke_at<'a>(
+                dev: &'a Arc<DeviceObject>,
+                req: &'a mut Self,
+            ) -> impl Future<Output = Option<Result<DriverStep, KernelError>>> + Send + 'a {
+                invoke_io_handler::<Self>(dev, req)
+            }
+        }
+    };
+
+    (
+        $ty:ty,
+        $handler_ty:ty,
+        $slot:ident
+    ) => {
+        impl IoRequest for $ty {
+            type Handler = $handler_ty;
+
+            #[inline]
+            fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+                ops.$slot.as_handler()
+            }
+
+            #[inline]
+            fn call<'a>(
+                handler: Self::Handler,
+                dev: &'a Arc<DeviceObject>,
+                req: &'a mut Self,
+            ) -> AbiFuture<Result<DriverStep, KernelError>> {
+                handler(dev, req)
+            }
+        }
+
+        impl RoutedOperation for $ty {
             #[inline]
             fn invoke_at<'a>(
                 dev: &'a Arc<DeviceObject>,
@@ -200,17 +232,41 @@ macro_rules! impl_io_request {
     };
 }
 
-impl_io_request!(for<'io> Read<'io>, kernel_types::EvtIoRead, read);
-impl_io_request!(for<'io> Write<'io>, kernel_types::EvtIoWrite, write);
-impl_io_request!(Flush, kernel_types::EvtIoFlush, flush);
-impl_io_request!(FlushDirty, kernel_types::EvtIoFlushDirty, flush_dirty);
-impl_io_request!(FlushOwner, kernel_types::EvtIoFlushOwner, flush_owner);
+impl_io_request!(
+    for<'io> Read<'io>,
+    kernel_types::EvtIoRead,
+    read
+);
+
+impl_io_request!(
+    for<'io> Write<'io>,
+    kernel_types::EvtIoWrite,
+    write
+);
+
+impl_io_request!(
+    Flush,
+    kernel_types::EvtIoFlush,
+    flush
+);
+
+impl_io_request!(
+    FlushDirty,
+    kernel_types::EvtIoFlushDirty,
+    flush_dirty
+);
+
+impl_io_request!(
+    FlushOwner,
+    kernel_types::EvtIoFlushOwner,
+    flush_owner
+);
+
 impl_io_request!(
     for<'data> DeviceControl<'data>,
     kernel_types::EvtIoDeviceControl,
     device_control
 );
-
 impl<'data, O> IoRequest for Fs<'data, O>
 where
     O: FsOperation + Send,
