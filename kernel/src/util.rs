@@ -147,7 +147,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         boot_usable_bytes()
     ));
     init_emergency_zero_mappings().expect("Failed to initialize emergency zero mappings");
-    //start_zero_page_worker();
+    start_zero_page_worker();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
