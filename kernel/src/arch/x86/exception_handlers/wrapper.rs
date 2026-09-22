@@ -1,3 +1,20 @@
+#[doc(hidden)]
+#[macro_export]
+macro_rules! x86_interrupt_call_template {
+    ($before_call:literal, $handler:literal) => {
+        concat!(
+            "push r15\npush r14\npush r13\npush r12\npush r11\npush r10\n",
+            "push r9\npush r8\npush rdi\npush rsi\npush rbp\npush rbx\n",
+            "push rdx\npush rcx\npush rax\n",
+            $before_call,
+            "\nmov rcx, rsp\nmov rbx, rsp\ncld\nand rsp, -16\nsub rsp, 32\n",
+            "call ", $handler, "\nmov rsp, rbx\n",
+            "pop rax\npop rcx\npop rdx\npop rbx\npop rbp\npop rsi\npop rdi\n",
+            "pop r8\npop r9\npop r10\npop r11\npop r12\npop r13\npop r14\npop r15\niretq"
+        )
+    };
+}
+
 #[allow(dead_code)]
 #[macro_export]
 macro_rules! platform_exception_handler_wrapper {
@@ -6,62 +23,10 @@ macro_rules! platform_exception_handler_wrapper {
         $vis extern "C" fn $wrapper() {
             ::core::arch::naked_asm!(
                 "cli",
-
-                "push r15",
-                "push r14",
-                "push r13",
-                "push r12",
-                "push r11",
-                "push r10",
-                "push r9",
-                "push r8",
-                "push rdi",
-                "push rsi",
-                "push rbp",
-                "push rbx",
-                "push rdx",
-                "push rcx",
-                "push rax",
-
-                "mov  rdx, [rsp + 120]",
-
-                "mov  rax, [rsp + 128]",
-                "mov  [rsp + 120], rax",
-                "mov  rax, [rsp + 136]",
-                "mov  [rsp + 128], rax",
-                "mov  rax, [rsp + 144]",
-                "mov  [rsp + 136], rax",
-                "mov  rax, [rsp + 152]",
-                "mov  [rsp + 144], rax",
-                "mov  rax, [rsp + 160]",
-                "mov  [rsp + 152], rax",
-
-                "mov  rcx, rsp",
-                "mov  rbx, rsp",
-                "cld",
-                "and  rsp, -16",
-                "sub  rsp, 32",
-                "call {handler}",
-                "mov  rsp, rbx",
-
-                "pop  rax",
-                "pop  rcx",
-                "pop  rdx",
-                "pop  rbx",
-                "pop  rbp",
-                "pop  rsi",
-                "pop  rdi",
-                "pop  r8",
-                "pop  r9",
-                "pop  r10",
-                "pop  r11",
-                "pop  r12",
-                "pop  r13",
-                "pop  r14",
-                "pop  r15",
-
-                "iretq",
-
+                $crate::x86_interrupt_call_template!(
+                    "mov rdx, [rsp + 120]\nmov rax, [rsp + 128]\nmov [rsp + 120], rax\nmov rax, [rsp + 136]\nmov [rsp + 128], rax\nmov rax, [rsp + 144]\nmov [rsp + 136], rax\nmov rax, [rsp + 152]\nmov [rsp + 144], rax\nmov rax, [rsp + 160]\nmov [rsp + 152], rax",
+                    "{handler}"
+                ),
                 handler = sym $handler,
             );
         }
@@ -71,49 +36,7 @@ macro_rules! platform_exception_handler_wrapper {
         $vis extern "C" fn $wrapper() {
             ::core::arch::naked_asm!(
                 "cli",
-
-                "push r15",
-                "push r14",
-                "push r13",
-                "push r12",
-                "push r11",
-                "push r10",
-                "push r9",
-                "push r8",
-                "push rdi",
-                "push rsi",
-                "push rbp",
-                "push rbx",
-                "push rdx",
-                "push rcx",
-                "push rax",
-
-                "mov  rcx, rsp",
-                "mov  rbx, rsp",
-                "cld",
-                "and  rsp, -16",
-                "sub  rsp, 32",
-                "call {handler}",
-                "mov  rsp, rbx",
-
-                "pop  rax",
-                "pop  rcx",
-                "pop  rdx",
-                "pop  rbx",
-                "pop  rbp",
-                "pop  rsi",
-                "pop  rdi",
-                "pop  r8",
-                "pop  r9",
-                "pop  r10",
-                "pop  r11",
-                "pop  r12",
-                "pop  r13",
-                "pop  r14",
-                "pop  r15",
-
-                "iretq",
-
+                $crate::x86_interrupt_call_template!("", "{handler}"),
                 handler = sym $handler,
             );
         }

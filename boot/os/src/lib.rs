@@ -277,7 +277,7 @@ fn find_cargo_executable(stdout: &str, package: &str) -> Option<PathBuf> {
         })
 }
 
-fn path_with_rust_linkers() -> Option<OsString> {
+pub fn path_with_rust_linkers() -> Option<OsString> {
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let output = Command::new(rustc)
         .args(["--print", "sysroot"])

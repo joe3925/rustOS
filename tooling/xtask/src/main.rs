@@ -898,41 +898,7 @@ fn cargo(dir: &Path) -> Command {
 }
 
 fn path_with_rust_linkers() -> Option<OsString> {
-    let mut paths = rust_linker_paths();
-    let current_path = env::var_os("PATH").unwrap_or_default();
-    paths.extend(env::split_paths(&current_path));
-
-    env::join_paths(paths).ok()
-}
-
-fn rust_linker_paths() -> Vec<PathBuf> {
-    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let output = match Command::new(rustc).args(["--print", "sysroot"]).output() {
-        Ok(output) if output.status.success() => output,
-        _ => return Vec::new(),
-    };
-    let sysroot = String::from_utf8_lossy(&output.stdout);
-    let rustlib = PathBuf::from(sysroot.trim()).join("lib").join("rustlib");
-    let entries = match fs::read_dir(rustlib) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
-    let mut paths = Vec::new();
-
-    for entry in entries.flatten() {
-        let bin = entry.path().join("bin");
-        let gcc_ld = bin.join("gcc-ld");
-
-        if gcc_ld.is_dir() {
-            paths.push(gcc_ld);
-        }
-
-        if bin.is_dir() {
-            paths.push(bin);
-        }
-    }
-
-    paths
+    rustos_boot_image::path_with_rust_linkers()
 }
 
 fn build_std_args() -> [&'static str; 4] {
@@ -1746,8 +1712,10 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         return Some(name_path.to_path_buf());
     }
 
-    let path = env::var_os("PATH")?;
+    find_executable(name, env::var_os("PATH")?)
+}
 
+fn find_executable(name: &str, path: OsString) -> Option<PathBuf> {
     for dir in env::split_paths(&path) {
         let candidate = dir.join(name);
 
@@ -1768,25 +1736,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 }
 
 fn find_tool_in_augmented_path(name: &str) -> Option<PathBuf> {
-    let path = path_with_rust_linkers()?;
-
-    for dir in env::split_paths(&path) {
-        let candidate = dir.join(name);
-
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-
-        if cfg!(windows) && candidate.extension().is_none() {
-            let exe = candidate.with_extension("exe");
-
-            if exe.is_file() {
-                return Some(exe);
-            }
-        }
-    }
-
-    None
+    find_executable(name, path_with_rust_linkers()?)
 }
 
 fn require_file(path: PathBuf, name: &str) -> Result<PathBuf, String> {

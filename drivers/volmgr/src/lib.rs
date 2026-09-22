@@ -9,7 +9,7 @@ extern crate alloc;
 use kernel_api::pnp::InitComplete;
 use kernel_api::pnp::QueryDeviceRelations;
 
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec};
 use core::hint::{cold_path, unlikely};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
@@ -39,7 +39,6 @@ use kernel_api::kernel_types::guid_to_string;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::protocol::disk::PartitionInfoProtocol;
 use kernel_api::kernel_types::protocol::volmgr::{VolumeProtocol, VolumeProtocolVTable};
-use kernel_api::pnp::DeviceRelationType;
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpOp;
 use kernel_api::pnp::PnpOps;
@@ -668,7 +667,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     init.ops.register::<DeviceFlushOwnerOp, VolPdoIo>();
     init.set_dev_ext_default::<VolPdoExt>();
 
-    let (dn_child, pdo) = pnp_create_child_devnode_and_pdo_with_init(
+    let (_, pdo) = pnp_create_child_devnode_and_pdo_with_init(
         &parent_dn,
         name,
         inst,

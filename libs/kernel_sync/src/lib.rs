@@ -11,6 +11,7 @@ pub mod platform;
 mod sync;
 pub mod thread_pool;
 pub mod wait_queue;
+mod wait_state;
 
 pub use async_mpmc::{AsyncMpmcQueue, AsyncRecvError, WaitRegistration};
 pub use bounded_mpmc::{bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender};
@@ -23,6 +24,7 @@ pub use thread_pool::{
     SubmitError, ThreadPool, ThreadPoolImpl, UnboundedJobs,
 };
 pub use wait_queue::WaitQueue;
+pub use wait_state::WaitState;
 
 #[cfg(all(test, feature = "std", not(any(loom, feature = "loom"))))]
 mod test;

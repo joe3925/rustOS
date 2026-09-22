@@ -84,6 +84,41 @@ const COMPLETION_FIT_FALLBACK_NS_PER_KIB: u64 = 1_250;
 const COMPLETION_FIT_MAX_SAMPLE_NS: u64 = 2_000_000;
 const COMPLETION_FIT_MAX_X_KIB: u64 = 1024 * 1024;
 
+fn cleanup_failed_queue_init(
+    queue_states: &[QueueState],
+    current: &mut Virtqueue,
+    remaining: &mut impl Iterator<Item = Virtqueue>,
+    msix_allocations: &mut [Option<(IrqHandle, u16)>],
+    common_cfg: VirtAddr,
+    mapped_bars: &[(u32, VirtAddr, u64)],
+) {
+    for state in queue_states {
+        if let Some(handle) = state.irq_handle.get() {
+            handle.unregister();
+        }
+        state
+            .queue
+            .try_write()
+            .expect("queue not locked during cleanup")
+            .destroy();
+    }
+    for allocation in msix_allocations {
+        if let Some((handle, _)) = allocation.take() {
+            handle.unregister();
+        }
+    }
+    current.destroy();
+    for mut queue in remaining {
+        queue.destroy();
+    }
+    unsafe {
+        blk::reset_device(common_cfg);
+    }
+    for &(_, address, size) in mapped_bars {
+        let _ = unsafe { unmap_mmio_region(address, size) };
+    }
+}
+
 static COMPLETION_FIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static COMPLETION_FIT_SUM_X: AtomicU64 = AtomicU64::new(0);
 static COMPLETION_FIT_SUM_Y: AtomicU64 = AtomicU64::new(0);
@@ -596,36 +631,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     i, vq.size
                 );
 
-                for qs in queue_states.iter() {
-                    if let Some(h) = qs.irq_handle.get() {
-                        h.unregister();
-                    }
-
-                    qs.queue
-                        .try_write()
-                        .expect("queue not locked during cleanup")
-                        .destroy();
-                }
-
-                for alloc in msix_allocations.iter().skip(i) {
-                    if let Some((handle, _)) = alloc {
-                        handle.unregister();
-                    }
-                }
-
-                vq.destroy();
-
-                for mut remaining_vq in virtqueue_iter.by_ref() {
-                    remaining_vq.destroy();
-                }
-
-                unsafe {
-                    blk::reset_device(caps.common_cfg);
-                }
-
-                for &(_idx, va, sz) in &mapped_bars {
-                    let _ = unsafe { unmap_mmio_region(va, sz) };
-                }
+                cleanup_failed_queue_init(
+                    &queue_states,
+                    &mut vq,
+                    &mut virtqueue_iter,
+                    &mut msix_allocations,
+                    caps.common_cfg,
+                    &mapped_bars,
+                );
 
                 return Err(err).with_context(|| {
                     alloc::format!("allocating descriptor storage for virtio queue {i}")
@@ -633,10 +646,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             }
         };
         let irq_handle = if use_msix && i < msix_allocations.len() {
-            match msix_allocations[i].take() {
-                Some((handle, _table_idx)) => Some(handle),
-                None => None,
-            }
+            msix_allocations[i].take().map(|(handle, _)| handle)
         } else if i == 0 && !use_msix {
             line_irq_handle.clone()
         } else {
@@ -653,22 +663,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     i, vq.size
                 );
 
-                for qs in queue_states.iter() {
-                    if let Some(h) = qs.irq_handle.get() {
-                        h.unregister();
-                    }
-                    qs.queue
-                        .try_write()
-                        .expect("queue not locked during cleanup")
-                        .destroy();
-                }
-                vq.destroy();
-                for mut remaining_vq in virtqueue_iter.by_ref() {
-                    remaining_vq.destroy();
-                }
-                for &(_idx, va, sz) in &mapped_bars {
-                    let _ = unsafe { unmap_mmio_region(va, sz) };
-                }
+                cleanup_failed_queue_init(
+                    &queue_states,
+                    &mut vq,
+                    &mut virtqueue_iter,
+                    &mut msix_allocations,
+                    caps.common_cfg,
+                    &mapped_bars,
+                );
                 return Err(error_with_message(
                     DriverErrorKind::DeviceError,
                     format_args!(
@@ -686,22 +688,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     i, vq.size
                 );
 
-                for qs in queue_states.iter() {
-                    if let Some(h) = qs.irq_handle.get() {
-                        h.unregister();
-                    }
-                    qs.queue
-                        .try_write()
-                        .expect("queue not locked during cleanup")
-                        .destroy();
-                }
-                vq.destroy();
-                for mut remaining_vq in virtqueue_iter.by_ref() {
-                    remaining_vq.destroy();
-                }
-                for &(_idx, va, sz) in &mapped_bars {
-                    let _ = unsafe { unmap_mmio_region(va, sz) };
-                }
+                cleanup_failed_queue_init(
+                    &queue_states,
+                    &mut vq,
+                    &mut virtqueue_iter,
+                    &mut msix_allocations,
+                    caps.common_cfg,
+                    &mapped_bars,
+                );
                 return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
                     alloc::format!(
                         "allocating {vq_capacity} outstanding read slots for virtio queue {i}"
@@ -718,22 +712,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     i, vq.size
                 );
 
-                for qs in queue_states.iter() {
-                    if let Some(h) = qs.irq_handle.get() {
-                        h.unregister();
-                    }
-                    qs.queue
-                        .try_write()
-                        .expect("queue not locked during cleanup")
-                        .destroy();
-                }
-                vq.destroy();
-                for mut remaining_vq in virtqueue_iter.by_ref() {
-                    remaining_vq.destroy();
-                }
-                for &(_idx, va, sz) in &mapped_bars {
-                    let _ = unsafe { unmap_mmio_region(va, sz) };
-                }
+                cleanup_failed_queue_init(
+                    &queue_states,
+                    &mut vq,
+                    &mut virtqueue_iter,
+                    &mut msix_allocations,
+                    caps.common_cfg,
+                    &mapped_bars,
+                );
                 return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
                     alloc::format!(
                         "allocating {vq_capacity} outstanding write slots for virtio queue {i}"
@@ -750,22 +736,14 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     i, vq.size
                 );
 
-                for qs in queue_states.iter() {
-                    if let Some(h) = qs.irq_handle.get() {
-                        h.unregister();
-                    }
-                    qs.queue
-                        .try_write()
-                        .expect("queue not locked during cleanup")
-                        .destroy();
-                }
-                vq.destroy();
-                for mut remaining_vq in virtqueue_iter.by_ref() {
-                    remaining_vq.destroy();
-                }
-                for &(_idx, va, sz) in &mapped_bars {
-                    let _ = unsafe { unmap_mmio_region(va, sz) };
-                }
+                cleanup_failed_queue_init(
+                    &queue_states,
+                    &mut vq,
+                    &mut virtqueue_iter,
+                    &mut msix_allocations,
+                    caps.common_cfg,
+                    &mapped_bars,
+                );
                 return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
                     alloc::format!(
                         "allocating {vq_capacity} submitted-completion slots for virtio queue {i}"

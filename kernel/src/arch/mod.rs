@@ -1,4 +1,6 @@
 pub(crate) mod unwind;
+pub(crate) mod debug_transport;
+pub(crate) mod tls;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86;

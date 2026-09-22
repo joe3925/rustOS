@@ -52,7 +52,7 @@ pub struct TaskRef {
 
     /// Intrusive wait queue link - holds task ID of next waiter (or WAIT_QUEUE_NONE)
     /// Used for mutex, condvar, channel wait queues
-    pub wait_next: AtomicU64,
+    pub wait_next: kernel_sync::WaitState,
 
     /// Intrusive wait queue link for IPI scheduling
     pub inbound_next: AtomicU64,
@@ -415,7 +415,7 @@ impl Task {
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
             permit: AtomicU8::new(0),
-            wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
+            wait_next: kernel_sync::WaitState::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(false),
@@ -487,7 +487,7 @@ impl Task {
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
             permit: AtomicU8::new(0),
-            wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
+            wait_next: kernel_sync::WaitState::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(true),

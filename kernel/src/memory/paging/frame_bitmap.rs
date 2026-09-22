@@ -835,10 +835,10 @@ impl RuntimeFrameBitmap {
             let candidate = if count <= WORD_BITS {
                 match self.find_subword_free_run_candidate(start, count) {
                     Some(candidate) => Some(candidate),
-                    None => self.find_free_run_candidate(start, count),
+                    None => self.find_free_run_candidate(start, count, 1),
                 }
             } else {
-                self.find_free_run_candidate(start, count)
+                self.find_free_run_candidate(start, count, 1)
             };
 
             let Some(candidate) = candidate else {
@@ -865,7 +865,7 @@ impl RuntimeFrameBitmap {
         let mut start = align_frame_index(0, align_frames)?;
 
         while start <= max_start {
-            let candidate = self.find_aligned_free_run_candidate(start, count, align_frames)?;
+            let candidate = self.find_free_run_candidate(start, count, align_frames)?;
 
             if candidate > max_start {
                 return None;
@@ -971,69 +971,7 @@ impl RuntimeFrameBitmap {
         None
     }
 
-    fn find_free_run_candidate(&self, start: usize, count: usize) -> Option<usize> {
-        if count == 0 {
-            return Some(start);
-        }
-
-        if start >= self.frames {
-            return None;
-        }
-
-        let mut word_index = start / WORD_BITS;
-        let mut first_allowed_bit = start & (WORD_BITS - 1);
-        let mut run_start = 0usize;
-        let mut run_len = 0usize;
-
-        while word_index < self.words.len() {
-            let word_start = word_index * WORD_BITS;
-
-            if word_start >= self.frames {
-                return None;
-            }
-
-            let valid_bits = self.frames.saturating_sub(word_start).min(WORD_BITS);
-            let valid_mask = low_bits_mask(valid_bits);
-            let mut free = !self.words[word_index].load(Ordering::Relaxed) & valid_mask;
-
-            free &= WORD_MAX << first_allowed_bit;
-
-            let mut scan = free;
-            let mut run_reaches_word_end = false;
-
-            while scan != 0 {
-                let first = scan.trailing_zeros() as usize;
-                let len = (scan >> first).trailing_ones() as usize;
-                let len = len.min(valid_bits - first);
-                let frame = word_start + first;
-
-                if run_len != 0 && run_start + run_len == frame {
-                    run_len += len;
-                } else {
-                    run_start = frame;
-                    run_len = len;
-                }
-
-                if run_len >= count {
-                    return Some(run_start);
-                }
-
-                run_reaches_word_end = first + len == valid_bits;
-                scan &= !bit_range_mask_from_len(first, len);
-            }
-
-            if !run_reaches_word_end {
-                run_len = 0;
-            }
-
-            word_index += 1;
-            first_allowed_bit = 0;
-        }
-
-        None
-    }
-
-    fn find_aligned_free_run_candidate(
+    fn find_free_run_candidate(
         &self,
         start: usize,
         count: usize,
@@ -1104,6 +1042,7 @@ impl RuntimeFrameBitmap {
 
         None
     }
+
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

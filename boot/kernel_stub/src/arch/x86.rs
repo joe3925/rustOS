@@ -223,39 +223,14 @@ impl KernelImagePlatform for X86Platform {
         image_size: u64,
         directory: &Self::TlsDirectory,
     ) -> Result<(), &'static str> {
-        let image_end = image_base
-            .checked_add(image_size)
-            .ok_or("kernel_stub: PE image range overflow")?;
-
-        if directory.start_address_of_raw_data != 0 || directory.end_address_of_raw_data != 0 {
-            if directory.start_address_of_raw_data > directory.end_address_of_raw_data {
-                return Err("kernel_stub: PE TLS raw data range is backwards");
-            }
-            if directory.start_address_of_raw_data < image_base
-                || directory.end_address_of_raw_data > image_end
-            {
-                return Err("kernel_stub: PE TLS raw data is outside the kernel image");
-            }
-        }
-
-        if directory.address_of_index != 0 {
-            let index_end = directory
-                .address_of_index
-                .checked_add(core::mem::size_of::<u32>() as u64)
-                .ok_or("kernel_stub: PE TLS index address overflow")?;
-            if directory.address_of_index < image_base || index_end > image_end {
-                return Err("kernel_stub: PE TLS index is outside the kernel image");
-            }
-        }
-
-        if directory.address_of_callbacks != 0
-            && (directory.address_of_callbacks < image_base
-                || directory.address_of_callbacks >= image_end)
-        {
-            return Err("kernel_stub: PE TLS callbacks pointer is outside the kernel image");
-        }
-
-        Ok(())
+        super::validate_tls_fields(
+            image_base,
+            image_size,
+            directory.start_address_of_raw_data,
+            directory.end_address_of_raw_data,
+            directory.address_of_index,
+            directory.address_of_callbacks,
+        )
     }
 
     fn prepare_tls_directory(directory: &Self::TlsDirectory) -> Result<(), &'static str> {

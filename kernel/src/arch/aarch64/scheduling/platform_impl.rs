@@ -206,7 +206,7 @@ impl TaskPlatform for Aarch64Platform {
     }
 
     fn new_kernel_tls() -> Option<Self::KernelTls> {
-        KernelTls::for_kernel_thread()
+        tls::for_kernel_thread()
     }
 
     fn kernel_tls_thread_pointer(tls: &Self::KernelTls) -> u64 {

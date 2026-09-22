@@ -3,14 +3,13 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::platform::contract::{Platform, ThreadEntry};
-
-const WAIT_QUEUE_NONE: u64 = 0;
+use crate::WaitState;
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct StdTask {
     id: u64,
-    wait_next: AtomicU64,
+    wait_next: WaitState,
     thread: ::std::thread::Thread,
 }
 
@@ -19,7 +18,7 @@ impl StdTask {
         ::std::thread_local! {
             static CURRENT_TASK: Arc<StdTask> = Arc::new(StdTask {
                 id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
-                wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
+                wait_next: WaitState::new(0),
                 thread: ::std::thread::current(),
             });
         }
@@ -50,31 +49,17 @@ impl Platform for StdPlatform {
 
     #[inline]
     fn mark_waiting(task: &Self::Task, wait_queue_id: u64) -> bool {
-        task.wait_next
-            .compare_exchange(
-                WAIT_QUEUE_NONE,
-                wait_queue_id,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        task.wait_next.mark(wait_queue_id)
     }
 
     #[inline]
     fn clear_waiting(task: &Self::Task, wait_queue_id: u64) -> bool {
-        task.wait_next
-            .compare_exchange(
-                wait_queue_id,
-                WAIT_QUEUE_NONE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        task.wait_next.clear(wait_queue_id)
     }
 
     #[inline]
     fn is_waiting(task: &Self::Task, wait_queue_id: u64) -> bool {
-        task.wait_next.load(Ordering::Acquire) == wait_queue_id
+        task.wait_next.is_marked(wait_queue_id)
     }
 
     #[inline]

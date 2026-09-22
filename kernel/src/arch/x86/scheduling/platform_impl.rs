@@ -91,7 +91,7 @@ impl TaskPlatform for X86Platform {
     }
 
     fn new_kernel_tls() -> Option<Self::KernelTls> {
-        tls::KernelTls::for_kernel_thread()
+        tls::for_kernel_thread()
     }
 
     fn kernel_tls_thread_pointer(tls: &Self::KernelTls) -> u64 {

@@ -651,28 +651,12 @@ fn validate_tls(
     size: u64,
     directory: &Aarch64PeTlsDirectory,
 ) -> Result<(), &'static str> {
-    let end = base
-        .checked_add(size)
-        .ok_or("kernel_stub: PE image range overflow")?;
-    if directory.start_address_of_raw_data > directory.end_address_of_raw_data
-        || (directory.start_address_of_raw_data != 0 && directory.start_address_of_raw_data < base)
-        || directory.end_address_of_raw_data > end
-    {
-        return Err("kernel_stub: invalid PE TLS raw data range");
-    }
-    if directory.address_of_index != 0
-        && (directory.address_of_index < base
-            || directory
-                .address_of_index
-                .checked_add(4)
-                .is_none_or(|value| value > end))
-    {
-        return Err("kernel_stub: PE TLS index is outside the kernel image");
-    }
-    if directory.address_of_callbacks != 0
-        && (directory.address_of_callbacks < base || directory.address_of_callbacks >= end)
-    {
-        return Err("kernel_stub: PE TLS callbacks pointer is outside the kernel image");
-    }
-    Ok(())
+    super::validate_tls_fields(
+        base,
+        size,
+        directory.start_address_of_raw_data,
+        directory.end_address_of_raw_data,
+        directory.address_of_index,
+        directory.address_of_callbacks,
+    )
 }

@@ -11,9 +11,9 @@ use fatfs::{
     LossyOemCpConverter, NullTimeProvider, RenamedFileState, SeekFrom, Write,
 };
 use kernel_api::device::DeviceObject;
-use kernel_api::error::{DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext, error};
+use kernel_api::error::{FileErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::kernel_types::async_types::AsyncMutex;
-use kernel_api::kernel_types::fs::Path;
+use kernel_api::kernel_types::dma::{IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, io};
 use kernel_api::request::{
@@ -300,6 +300,41 @@ async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsErro
     Ok(())
 }
 
+async fn write_cached_file<'buffer>(
+    vdx: &VolCtrlDevExt,
+    fs: &Fs,
+    fs_file_id: u64,
+    offset: u64,
+    buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+    write_through: bool,
+) -> Result<(usize, u64), KernelError> {
+    let state = take_cached_file_state(vdx, fs_file_id)?;
+    let mut file = state.into_file(fs);
+    let result = match file.seek(SeekFrom::Start(offset)).await {
+        Err(error) => Err(map_fatfs_err(&error)),
+        Ok(_) => file
+            .write_iobuffer(buffer, fatfs::IoKind::Data)
+            .await
+            .map(|written| (written, offset.saturating_add(written as u64)))
+            .map_err(|error| map_fatfs_err(&error)),
+    };
+    let lower_flush = if write_through && result.is_ok() {
+        LowerFlush::Blocking
+    } else {
+        LowerFlush::None
+    };
+    let flush_error = if write_through {
+        flush_cached_file(vdx, fs_file_id, file, lower_flush).await?
+    } else {
+        restore_cached_file(vdx, fs_file_id, file)?;
+        None
+    };
+    match flush_error {
+        Some(error) => Err(error),
+        None => result,
+    }
+}
+
 async fn write_file_zeros(file: &mut FatFile<'_>, mut len: u64) -> Result<(), FsError> {
     while len != 0 {
         let take = len.min(ZERO_CHUNK.len() as u64) as usize;
@@ -472,7 +507,7 @@ impl FileSystem for Fat32Fs {
             capture_fs_context(dev);
         {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            let mut fs = fs_arc.lock().await;
+            let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
             let params = &payload.params;
             let _ = (params.flags, params.write_through);
@@ -677,37 +712,9 @@ impl FileSystem for Fat32Fs {
                     "writing FAT32 file handle {fs_file_id} without a buffer"
                 ))),
                 Some(buffer) => {
-                    let state = take_cached_file_state(&vdx, fs_file_id);
-                    match state {
-                        Err(e) => Err(e),
-                        Ok(state) => {
-                            let mut file = state.into_file(&*fs);
-                            let res = match file.seek(SeekFrom::Start(offset)).await {
-                                Err(e) => Err(map_fatfs_err(&e)),
-                                Ok(_) => {
-                                    match file.write_iobuffer(buffer, fatfs::IoKind::Data).await {
-                                        Ok(n) => Ok(n),
-                                        Err(e) => Err(map_fatfs_err(&e)),
-                                    }
-                                }
-                            };
-                            let lower_flush = if write_through && res.is_ok() {
-                                LowerFlush::Blocking
-                            } else {
-                                LowerFlush::None
-                            };
-                            let flush_err = if write_through {
-                                flush_cached_file(&vdx, fs_file_id, file, lower_flush).await?
-                            } else {
-                                restore_cached_file(&vdx, fs_file_id, file)?;
-                                None
-                            };
-                            match flush_err {
-                                Some(e) => Err(e),
-                                None => res,
-                            }
-                        }
-                    }
+                    write_cached_file(&vdx, &fs, fs_file_id, offset, buffer, write_through)
+                        .await
+                        .map(|(written, _)| written)
                 }
             };
 
@@ -852,7 +859,7 @@ impl FileSystem for Fat32Fs {
             capture_fs_context(dev);
         {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            let mut fs = fs_arc.lock().await;
+            let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
             let params = &payload.params;
             let result = if params.dir {
@@ -891,7 +898,7 @@ impl FileSystem for Fat32Fs {
             capture_fs_context(dev);
         {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            let mut fs = fs_arc.lock().await;
+            let fs = fs_arc.lock().await;
             let path = req.payload.params.path.as_str();
             let root = fs.root_dir();
             let result = match root.open_dir(path).await {
@@ -927,7 +934,7 @@ impl FileSystem for Fat32Fs {
             capture_fs_context(dev);
         {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            let mut fs = fs_arc.lock().await;
+            let fs = fs_arc.lock().await;
             let path = req.payload.params.path.as_str();
             let root = fs.root_dir();
             let result = match root.open_file(path).await {
@@ -963,7 +970,7 @@ impl FileSystem for Fat32Fs {
             capture_fs_context(dev);
         {
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-            let mut fs = fs_arc.lock().await;
+            let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
             let params = &payload.params;
             let err = {
@@ -1009,7 +1016,7 @@ impl FileSystem for Fat32Fs {
         let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
             capture_fs_context(dev);
         {
-            let mut fs = fs_arc.lock().await;
+            let fs = fs_arc.lock().await;
             let payload = &mut req.payload;
             let params = &payload.params;
             let names: Result<Vec<String>, FsError> = async {
@@ -1188,41 +1195,15 @@ impl FileSystem for Fat32Fs {
                     match start_off {
                         Err(e) => Err(e),
                         Ok(start_off) => {
-                            let state = take_cached_file_state(&vdx, fs_file_id);
-                            match state {
-                                Err(e) => Err(e),
-                                Ok(state) => {
-                                    let mut file = state.into_file(&*fs);
-                                    let res = match file.seek(SeekFrom::Start(start_off)).await {
-                                        Ok(_) => {
-                                            match file
-                                                .write_iobuffer(buffer, fatfs::IoKind::Data)
-                                                .await
-                                            {
-                                                Ok(n) => Ok((n, start_off + n as u64)),
-                                                Err(e) => Err(map_fatfs_err(&e)),
-                                            }
-                                        }
-                                        Err(e) => Err(map_fatfs_err(&e)),
-                                    };
-                                    let lower_flush = if write_through && res.is_ok() {
-                                        LowerFlush::Blocking
-                                    } else {
-                                        LowerFlush::None
-                                    };
-                                    let flush_err = if write_through {
-                                        flush_cached_file(&vdx, fs_file_id, file, lower_flush)
-                                            .await?
-                                    } else {
-                                        restore_cached_file(&vdx, fs_file_id, file)?;
-                                        None
-                                    };
-                                    match flush_err {
-                                        Some(e) => Err(e),
-                                        None => res,
-                                    }
-                                }
-                            }
+                            write_cached_file(
+                                &vdx,
+                                &fs,
+                                fs_file_id,
+                                start_off,
+                                buffer,
+                                write_through,
+                            )
+                            .await
                         }
                     }
                 }

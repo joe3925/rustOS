@@ -1,13 +1,11 @@
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::sync::atomic::Ordering;
-
 use kernel_sync::{Platform, ThreadEntry};
 
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::scheduling::task::{Task, TaskHandle, WAIT_QUEUE_NONE};
+use crate::scheduling::task::{Task, TaskHandle};
 use crate::scheduling::tls;
 
 pub enum KernelPlatform {}
@@ -33,31 +31,17 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn mark_waiting(task: &Self::Task, wait_queue_id: u64) -> bool {
-        task.wait_next
-            .compare_exchange(
-                WAIT_QUEUE_NONE,
-                wait_queue_id,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        task.wait_next.mark(wait_queue_id)
     }
 
     #[inline]
     fn clear_waiting(task: &Self::Task, wait_queue_id: u64) -> bool {
-        task.wait_next
-            .compare_exchange(
-                wait_queue_id,
-                WAIT_QUEUE_NONE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        task.wait_next.clear(wait_queue_id)
     }
 
     #[inline]
     fn is_waiting(task: &Self::Task, wait_queue_id: u64) -> bool {
-        task.wait_next.load(Ordering::Acquire) == wait_queue_id
+        task.wait_next.is_marked(wait_queue_id)
     }
 
     #[inline]

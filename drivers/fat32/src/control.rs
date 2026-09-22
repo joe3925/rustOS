@@ -19,7 +19,7 @@ use kernel_api::{
     },
     request_handler,
 };
-use kernel_api::error::{error, DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext};
+use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 use spin::Mutex;
 
 use crate::{

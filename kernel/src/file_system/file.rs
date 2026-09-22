@@ -1,29 +1,17 @@
 use crate::benchmarking::{bench_c_drive_io_async, used_memory};
-use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::profiling::backtrace::Backtrace;
-use crate::static_handlers::print;
-use crate::util::trigger_triple_fault;
-use alloc::format;
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::time::Duration;
 use kernel_executor::runtime::runtime::block_on;
 use kernel_types::{
     dma::{FromDevice, IoBuffer, ToDevice},
     error::{ErrorKind, FileErrorKind, KernelError},
     fs::{OpenFlags, Path},
 };
-use rand_core::block;
-
-use crate::file_system::file_provider::provider;
-use kernel_executor::runtime::runtime::{JoinAll, spawn_join_owned as spawn};
-
 use crate::{
-    file_system::file_provider::{self, ProviderKind, install_file_provider},
+    file_system::file_provider,
     memory::paging::frame_alloc::used_bytes,
-    platform::wait_duration,
     println,
     registry::rebind_and_persist_after_provider_switch,
     util::TOTAL_TIME,
