@@ -5,11 +5,7 @@ use spin::{Mutex, MutexGuard};
 use toml::map::IntoIter;
 
 use crate::{
-    memory::paging::{
-        address_space::{AddressSpaceRoot, current_address_space_root, switch_address_space_root},
-        types::PhysicalMemoryIter,
-    },
-    platform,
+    memory::paging::{address_space::AddressSpaceRoot, types::PhysicalMemoryIter},
     structs::range_tracker::RangeTracker,
 };
 
@@ -313,12 +309,9 @@ impl Drop for UserRangePin {
 }
 
 fn teardown_user_mappings(root: AddressSpaceRoot, tracker: &RangeTracker) {
-    let old_root = current_address_space_root();
-    platform::with_interrupts_disabled(|| unsafe {
-        switch_address_space_root(root);
+    unsafe {
         for (start, size) in tracker.get_allocations() {
-            crate::memory::paging::map::unmap_range_unchecked(VirtAddr::new(start).into(), size);
+            crate::memory::paging::map::unmap_range_unchecked(root, VirtAddr::new(start), size);
         }
-        switch_address_space_root(old_root);
-    });
+    }
 }

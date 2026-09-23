@@ -1,4 +1,6 @@
-use crate::arch::{PageFlags, PagingPlatform, PhysAddr, PlatformInfo, TranslatedBlock, VirtAddr};
+use crate::arch::{
+    AddressSpaceRoot, PageFlags, PagingPlatform, PhysAddr, PlatformInfo, TranslatedBlock, VirtAddr,
+};
 use crate::port::PortAccess;
 use crate::status::{PageMapError, PageMapFailure};
 #[cfg(any(test, feature = "hosted-tests"))]
@@ -44,10 +46,14 @@ fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 #[cfg(not(any(test, feature = "hosted-tests")))]
 fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     unsafe extern "C" {
-        fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+        fn resolve_virtual_range_frame(
+            root: AddressSpaceRoot,
+            addr: VirtAddr,
+        ) -> Option<(u64, PhysAddr)>;
+        fn kernel_address_space_root() -> AddressSpaceRoot;
     }
 
-    unsafe { resolve_virtual_range_frame(addr) }
+    unsafe { resolve_virtual_range_frame(kernel_address_space_root(), addr) }
 }
 
 impl PortAccess for Platform {
@@ -167,10 +173,24 @@ macro_rules! chkstk {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
-                "test rax, rax", "jnz 2f", "mov rax, rcx", "2:", "mov r10, rax",
-                "mov r11, rsp", "cmp r10, 0x1000", "jb 4f", "3:", "sub r11, 0x1000",
-                "test byte ptr [r11], 0", "sub r10, 0x1000", "cmp r10, 0x1000",
-                "jae 3b", "4:", "sub r11, r10", "test byte ptr [r11], 0", "ret"
+                "test rax, rax",
+                "jnz 2f",
+                "mov rax, rcx",
+                "2:",
+                "mov r10, rax",
+                "mov r11, rsp",
+                "cmp r10, 0x1000",
+                "jb 4f",
+                "3:",
+                "sub r11, 0x1000",
+                "test byte ptr [r11], 0",
+                "sub r10, 0x1000",
+                "cmp r10, 0x1000",
+                "jae 3b",
+                "4:",
+                "sub r11, r10",
+                "test byte ptr [r11], 0",
+                "ret"
             );
         }
     };

@@ -21,7 +21,10 @@ use crate::memory::device_mmu::{
     DeviceMmuDeviceIdentity, DeviceMmuDomain, DeviceMmuDomainInfo, DeviceMmuError,
     DeviceMmuMapPermissions, DeviceMmuResult,
 };
-use crate::memory::paging::map::{allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
+use crate::memory::paging::map::{
+    allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous,
+    kernel_virt_to_phys,
+};
 use crate::println;
 
 use super::amd::AmdViBackend;
@@ -78,7 +81,7 @@ pub(crate) fn alloc_zeroed_pages_contiguous(
         core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, size as usize);
     }
 
-    let (_, phys) = virt_to_phys(va.into()).ok_or(IommuError::NoBackingFrame)?;
+    let (_, phys) = kernel_virt_to_phys(va.into()).ok_or(IommuError::NoBackingFrame)?;
     Ok((phys.into(), va))
 }
 
@@ -1185,7 +1188,10 @@ fn require_table<T: AcpiTable>(
 ) -> PhysicalMapping<ACPIImpl, T> {
     match tables.find_table::<T>() {
         Some(table) => table,
-        None => panic!("mandatory IOMMU policy: ACPI {} is missing or invalid", name),
+        None => panic!(
+            "mandatory IOMMU policy: ACPI {} is missing or invalid",
+            name
+        ),
     }
 }
 

@@ -44,7 +44,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
 use kernel_types::{
     ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
     async_ffi::{AbiFuture, FutureExt},
@@ -827,13 +827,18 @@ pub unsafe extern "C" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
-    unsafe { crate::memory::paging::map::unmap_range(virtual_addr, size) }
+pub unsafe extern "C" fn unmap_range(root: AddressSpaceRoot, virtual_addr: VirtAddr, size: u64) {
+    unsafe { crate::memory::paging::map::unmap_range(root, virtual_addr, size) }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags) {
+pub extern "C" fn identity_map_page(
+    root: AddressSpaceRoot,
+    frame_addr: PhysAddr,
+    flags: PageFlags,
+) {
     let _ = crate::memory::paging::map::identity_map_page(
+        root,
         frame_addr,
         crate::memory::paging::layout::base_page_size() as usize,
         flags,
@@ -858,14 +863,21 @@ pub unsafe extern "C" fn unmap_physical_pages(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    crate::memory::paging::map::virt_to_phys(addr)
+pub extern "C" fn virt_to_phys(root: AddressSpaceRoot, addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+    crate::memory::paging::map::virt_to_phys(root, addr)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    let result = crate::memory::paging::map::resolve_virtual_range_frame(addr);
-    result
+pub extern "C" fn resolve_virtual_range_frame(
+    root: AddressSpaceRoot,
+    addr: VirtAddr,
+) -> Option<(u64, PhysAddr)> {
+    crate::memory::paging::map::resolve_virtual_range_frame(root, addr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_address_space_root() -> AddressSpaceRoot {
+    crate::memory::paging::address_space::kernel_address_space_root()
 }
 
 // ============================================================================

@@ -12,7 +12,7 @@ pub fn mimalloc_thread_done() {
 use crate::memory::heap::allocator::KernelAllocator;
 use crate::memory::paging::frame_alloc::boot_usable_bytes;
 use crate::memory::paging::layout::{align_up_to_base_page, heap_range_end, heap_range_start};
-use crate::memory::paging::map::map_range;
+use crate::memory::paging::map::map_kernel_range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::arch::{PageFlags, VirtAddr};
 
@@ -101,7 +101,7 @@ pub(crate) fn init_heap() {
     let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
 
     unsafe {
-        map_range(heap_start.into(), heap_size, flags, false)
+        map_kernel_range(heap_start.into(), heap_size, flags, false)
             .expect("Heap creation failed, can't recover")
     };
 }

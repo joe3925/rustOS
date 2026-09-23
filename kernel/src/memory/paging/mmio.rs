@@ -4,9 +4,11 @@ use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::{PageMapError, PageMapFailure};
 
+use super::address_space::kernel_address_space_root;
 use super::layout::{align_down, align_up_to_base_page, base_page_size, largest_mapping_size_for};
-use super::map::{map_contiguous_physical_range, unmap_range_keep_frames_unchecked, virt_to_phys};
-use super::types::LocalTlbFlush;
+use super::map::{
+    kernel_virt_to_phys, map_contiguous_physical_range, unmap_kernel_range_keep_frames_unchecked,
+};
 use super::virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range};
 
 static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
@@ -55,12 +57,12 @@ pub fn map_physical_pages_aligned(
             .ok_or(PageMapError::NoMemory())?;
         match unsafe {
             map_contiguous_physical_range(
+                kernel_address_space_root(),
                 virtual_addr,
                 PhysAddr::new(aligned_phys),
                 total_size,
                 flags,
                 Some(cache),
-                LocalTlbFlush::Flush,
             )
         } {
             Ok(()) => return Ok(VirtAddr::new(virtual_addr.as_u64() + off)),
@@ -96,9 +98,9 @@ pub unsafe fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), Page
     let total = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
 
     unsafe {
-        unmap_range_keep_frames_unchecked(start, total);
+        unmap_kernel_range_keep_frames_unchecked(start, total);
     }
-    if virt_to_phys(start).is_none() {
+    if kernel_virt_to_phys(start).is_none() {
         unsafe { deallocate_kernel_range(start, total) };
     }
 

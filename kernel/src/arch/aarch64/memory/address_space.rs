@@ -1,6 +1,6 @@
 use aarch64_cpu::asm::barrier::{ISH, ISHST, SY, dsb, isb};
 use aarch64_cpu::registers::{Readable, TCR_EL1, TTBR0_EL1, TTBR1_EL1, Writeable};
-use kernel_types::arch::PhysAddr;
+use kernel_types::arch::AddressSpaceRoot;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 use spin::Once;
@@ -10,24 +10,13 @@ use crate::util::boot_info;
 
 use super::super::platform::Aarch64Platform;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Root(u64);
-
-impl Root {
-    pub(super) const fn physical_address(self) -> PhysAddr {
-        PhysAddr::new(self.0)
-    }
-}
-
-static KERNEL_ROOT: Once<Root> = Once::new();
+static KERNEL_ROOT: Once<AddressSpaceRoot> = Once::new();
 
 impl AddressSpacePlatform for Aarch64Platform {
-    type Root = Root;
-
     fn init_kernel_root() {
         assert_eq!(boot_info().arch_info.granule_shift, 12);
         assert!(boot_info().arch_info.output_addr_bits <= 48);
-        let root = Root(boot_info().arch_info.root_table);
+        let root = unsafe { AddressSpaceRoot::from_raw(boot_info().arch_info.root_table) };
         assert_eq!(root_from_ttbr(TTBR1_EL1.get()), root);
         let tcr = super::super::cpu::startup_tcr(TCR_EL1.get());
         let tcr_changed = TCR_EL1.get() != tcr;
@@ -41,24 +30,24 @@ impl AddressSpacePlatform for Aarch64Platform {
         KERNEL_ROOT.call_once(|| root);
     }
 
-    fn kernel_root() -> Self::Root {
+    fn kernel_root() -> AddressSpaceRoot {
         *KERNEL_ROOT
             .get()
             .expect("kernel address-space root is not initialized")
     }
 
-    fn current_root() -> Self::Root {
+    fn current_root() -> AddressSpaceRoot {
         root_from_ttbr(TTBR0_EL1.get())
     }
 
-    unsafe fn switch_root(root: Self::Root) {
-        assert_eq!(root.0 & (root_table_size() - 1), 0);
+    unsafe fn switch_root(root: AddressSpaceRoot) {
+        assert_eq!(root.as_u64() & (root_table_size() - 1), 0);
         let mask = ((1u64 << 48) - 1) & !(root_table_size() - 1);
         let ttbr0_controls = TTBR0_EL1.get() & !mask;
         let ttbr1_controls = TTBR1_EL1.get() & !mask;
         dsb(ISHST);
-        TTBR0_EL1.set(root.0 | ttbr0_controls);
-        TTBR1_EL1.set(root.0 | ttbr1_controls);
+        TTBR0_EL1.set(root.as_u64() | ttbr0_controls);
+        TTBR1_EL1.set(root.as_u64() | ttbr1_controls);
         isb(SY);
         unsafe {
             core::arch::asm!("tlbi vmalle1is", options(nostack, preserves_flags));
@@ -67,13 +56,9 @@ impl AddressSpacePlatform for Aarch64Platform {
         isb(SY);
     }
 
-    fn root_to_phys(root: Self::Root) -> PhysAddr {
-        root.physical_address()
-    }
-
     fn create_user_root<A: PageTableFrameAllocator>(
         allocator: &mut A,
-    ) -> Result<Self::Root, PageMapError> {
+    ) -> Result<AddressSpaceRoot, PageMapError> {
         let root_phys = allocator
             .allocate_page_table_frame()
             .ok_or(PageMapError::NoMemory())?;
@@ -125,23 +110,23 @@ impl AddressSpacePlatform for Aarch64Platform {
             return Err(error);
         }
 
-        Ok(Root(root_phys.as_u64()))
+        Ok(unsafe { AddressSpaceRoot::from_raw(root_phys.as_u64()) })
     }
 
     unsafe fn destroy_user_root<A: PageTableFrameAllocator>(
-        root: Self::Root,
+        root: AddressSpaceRoot,
         allocator: &mut A,
     ) -> Result<(), PageMapError> {
         if root == Self::current_root() || root == Self::kernel_root() {
             return Err(PageMapError::TranslationFailed());
         }
-        allocator.free_page_table_frame(PhysAddr::new(root.0));
+        allocator.free_page_table_frame(root.physical_address());
         Ok(())
     }
 }
 
-fn root_from_ttbr(ttbr: u64) -> Root {
-    Root(ttbr & root_address_mask())
+fn root_from_ttbr(ttbr: u64) -> AddressSpaceRoot {
+    unsafe { AddressSpaceRoot::from_raw(ttbr & root_address_mask()) }
 }
 
 fn root_table_size() -> u64 {

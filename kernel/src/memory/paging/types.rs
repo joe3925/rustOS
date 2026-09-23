@@ -46,12 +46,6 @@ pub struct ResolvedMapping {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalTlbFlush {
-    Flush,
-    Defer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnmapFrameDisposition {
     FreeMappedFrame,
     ReleaseReservedFrame,

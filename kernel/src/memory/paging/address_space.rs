@@ -1,11 +1,10 @@
+pub use kernel_types::arch::AddressSpaceRoot;
 use kernel_types::arch::PhysAddr;
 use kernel_types::status::PageMapError;
 
 use crate::platform::{ActivePlatform, AddressSpacePlatform};
 
 use super::frame_alloc::KernelPageTableFrameAllocator;
-
-pub type AddressSpaceRoot = <ActivePlatform as AddressSpacePlatform>::Root;
 
 pub fn init_kernel_address_space_root() {
     <ActivePlatform as AddressSpacePlatform>::init_kernel_root();
@@ -26,7 +25,7 @@ pub unsafe fn switch_address_space_root(root: AddressSpaceRoot) {
 }
 
 pub fn address_space_root_phys(root: AddressSpaceRoot) -> PhysAddr {
-    <ActivePlatform as AddressSpacePlatform>::root_to_phys(root)
+    root.physical_address()
 }
 
 pub fn create_user_address_space() -> Result<AddressSpaceRoot, PageMapError> {

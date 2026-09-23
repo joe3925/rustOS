@@ -2,9 +2,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_types::arch::VirtAddr;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{
-    PageTable, PageTableIndex, PhysFrame, RecursivePageTable, Size4KiB,
-};
+use x86_64::structures::paging::{PageTable, PageTableIndex, PhysFrame, Size4KiB};
 
 pub static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
 
@@ -15,15 +13,6 @@ pub fn init_kernel_cr3() {
 
 pub fn kernel_cr3() -> PhysFrame<Size4KiB> {
     PhysFrame::containing_address(x86_64::PhysAddr::new(KERNEL_CR3_U64.load(Ordering::SeqCst)))
-}
-
-/// # Safety
-/// `recursive_index` must describe the active recursive page-table mapping and
-/// the caller must prevent concurrent mutable page-table access.
-pub(super) unsafe fn init_mapper(recursive_index: u16) -> RecursivePageTable<'static> {
-    let recursive_index = PageTableIndex::new(recursive_index);
-    let level_4_table = unsafe { get_level4_page_table(recursive_index) };
-    unsafe { RecursivePageTable::new_unchecked(level_4_table, recursive_index) }
 }
 
 /// # Safety

@@ -1,6 +1,8 @@
 use super::domain::IommuError;
 use crate::memory::device_mmu::DeviceMmuMapPermissions;
-use crate::memory::paging::map::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
+use crate::memory::paging::map::{
+    allocate_auto_kernel_range_mapped_contiguous, kernel_virt_to_phys,
+};
 use x86_64::structures::paging::PageTableFlags;
 
 pub const PTE_P: u64 = 1 << 0;
@@ -32,7 +34,7 @@ pub fn init_table_arena() -> Result<(), IommuError> {
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
     let virt = allocate_auto_kernel_range_mapped_contiguous(IOMMU_TABLE_ARENA_SIZE, flags.into())
         .map_err(|_| IommuError::NoBackingFrame)?;
-    let (_, phys) = virt_to_phys(virt).ok_or(IommuError::NoBackingFrame)?;
+    let (_, phys) = kernel_virt_to_phys(virt).ok_or(IommuError::NoBackingFrame)?;
 
     IOMMU_TABLE_ARENA_INFO.call_once(|| IommuTableArenaInfo {
         phys_base: phys.as_u64(),
@@ -212,8 +214,7 @@ pub fn ensure_iommu_1gib_mapped(
 
         if entry & format.present_mask() == 0 {
             let new_table = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
-            let new_entry =
-                (new_table & PTE_ADDR_MASK) | format.interior_flags(permissions, lvl);
+            let new_entry = (new_table & PTE_ADDR_MASK) | format.interior_flags(permissions, lvl);
 
             write_entry(table_phys, idx, new_entry);
             table_phys = new_table;
@@ -267,12 +268,7 @@ pub fn map_4k<F: Fn(u32) -> u64>(
 
 /// Clear one 4 KiB leaf. Returns the physical address that was mapped, if any.
 #[inline]
-pub fn unmap_4k(
-    root_phys: u64,
-    iova: u64,
-    present_mask: u64,
-    root_level: u32,
-) -> Option<u64> {
+pub fn unmap_4k(root_phys: u64, iova: u64, present_mask: u64, root_level: u32) -> Option<u64> {
     debug_assert_eq!(iova & 0xFFF, 0);
 
     let mut table_phys = root_phys;

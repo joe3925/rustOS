@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 
@@ -11,17 +10,12 @@ use kernel_types::dma::{
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 
-use crate::memory::paging::frame_alloc::KernelPageTableFrameAllocator;
-
+use crate::memory::paging::address_space::kernel_address_space_root;
 use crate::memory::paging::layout::base_page_size;
-
-use crate::memory::paging::types::{
-    LocalTlbFlush, MappingSize, PhysicalMemoryIter, UnmapFrameDisposition,
-};
+use crate::memory::paging::types::PhysicalMemoryIter;
 
 use crate::memory::paging::virt_tracker::{allocate_auto_kernel_range, deallocate_kernel_range};
 use crate::memory::user_pins::UserRangePin;
-use crate::platform::{ActivePlatform, PagingPlatform};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +59,9 @@ impl KernelIoMapping {
             let Some(next_mapped) = mapped.checked_add(extent_len) else {
                 if mapped != 0 {
                     unsafe {
-                        crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                        crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(
+                            base, mapped,
+                        );
                     }
                 }
 
@@ -79,7 +75,9 @@ impl KernelIoMapping {
             if next_mapped > mapped_len {
                 if mapped != 0 {
                     unsafe {
-                        crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                        crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(
+                            base, mapped,
+                        );
                     }
                 }
 
@@ -92,17 +90,19 @@ impl KernelIoMapping {
 
             if let Err(error) = unsafe {
                 crate::memory::paging::map::map_contiguous_physical_range(
+                    kernel_address_space_root(),
                     base + mapped,
                     PhysAddr::new(extent.physical_address()),
                     extent_len,
                     flags,
                     Some(PhysicalMappingCache::Cached),
-                    LocalTlbFlush::Flush,
                 )
             } {
                 if mapped != 0 {
                     unsafe {
-                        crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                        crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(
+                            base, mapped,
+                        );
                     }
                 }
 
@@ -119,7 +119,9 @@ impl KernelIoMapping {
         if mapped != mapped_len {
             if mapped != 0 {
                 unsafe {
-                    crate::memory::paging::map::unmap_range_keep_frames_unchecked(base, mapped);
+                    crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(
+                        base, mapped,
+                    );
                 }
             }
 
@@ -136,23 +138,14 @@ impl KernelIoMapping {
 
 impl Drop for KernelIoMapping {
     fn drop(&mut self) {
-        let page_size = base_page_size();
-        let mut allocator = KernelPageTableFrameAllocator;
-        let mut offset = 0;
-        while offset < self.mapped_len {
-            let _ = unsafe {
-                <ActivePlatform as PagingPlatform>::unmap_leaf(
-                    &mut allocator,
-                    self.base + offset,
-                    MappingSize { bytes: page_size },
-                    UnmapFrameDisposition::KeepFrame,
-                    LocalTlbFlush::Flush,
-                )
-            };
-            offset += page_size;
-        }
         if self.mapped_len != 0 {
-            unsafe { deallocate_kernel_range(self.base, self.mapped_len) };
+            unsafe {
+                crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(
+                    self.base,
+                    self.mapped_len,
+                );
+                deallocate_kernel_range(self.base, self.mapped_len);
+            }
         }
     }
 }

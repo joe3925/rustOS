@@ -34,8 +34,9 @@ impl Drop for EmergencyZeroGuard<'_> {
 pub fn init_emergency_zero_mappings() -> Result<(), PageMapError> {
     let cpu_count = crate::platform::processor_count();
     let page_size = base_page_size();
+    let slot_count = cpu_count.checked_mul(2).ok_or(PageMapError::NoMemory())?;
     let range_size = page_size
-        .checked_mul(cpu_count as u64)
+        .checked_mul(slot_count as u64)
         .ok_or(PageMapError::NoMemory())?;
     let base =
         allocate_auto_kernel_range_aligned(range_size, page_size).ok_or(PageMapError::NoMemory())?;
@@ -52,10 +53,38 @@ pub fn init_emergency_zero_mappings() -> Result<(), PageMapError> {
         );
         unsafe { <ActivePlatform as PagingPlatform>::prepare_emergency_zero_mapping(address)? };
         percpu.emergency_zero_address.call_once(|| address);
+
+        let table_offset = page_size
+            .checked_mul((cpu_count + cpu_id) as u64)
+            .ok_or(PageMapError::NoMemory())?;
+        let table_address = kernel_types::arch::VirtAddr::new(
+            base.as_u64()
+                .checked_add(table_offset)
+                .ok_or(PageMapError::NoMemory())?,
+        );
+        unsafe {
+            <ActivePlatform as PagingPlatform>::prepare_emergency_zero_mapping(table_address)?
+        };
+        percpu
+            .page_table_scratch_address
+            .call_once(|| table_address);
     }
 
     EMERGENCY_ZERO_READY.store(true, Ordering::Release);
     Ok(())
+}
+
+pub fn page_table_scratch_address() -> Result<kernel_types::arch::VirtAddr, PageMapError> {
+    if !EMERGENCY_ZERO_READY.load(Ordering::Acquire) {
+        return <ActivePlatform as PagingPlatform>::bootstrap_emergency_zero_address()
+            .ok_or(PageMapError::NoMemoryMap());
+    }
+
+    crate::platform::current_percpu()
+        .page_table_scratch_address
+        .get()
+        .copied()
+        .ok_or(PageMapError::NoMemoryMap())
 }
 
 pub fn emergency_zero_physical_frame(physical_address: PhysAddr) -> Result<(), PageMapError> {

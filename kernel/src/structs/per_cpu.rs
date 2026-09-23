@@ -20,6 +20,7 @@ pub struct PerCpu {
 
     pub emergency_zero_address: Once<VirtAddr>,
     pub emergency_zero_in_use: AtomicBool,
+    pub page_table_scratch_address: Once<VirtAddr>,
 
     pub cpu_id: Once<usize>,
     pub platform_cpu_id: Once<PlatformCpuId>,
@@ -62,6 +63,7 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
 
         emergency_zero_address: Once::new(),
         emergency_zero_in_use: AtomicBool::new(false),
+        page_table_scratch_address: Once::new(),
 
         cpu_id: Once::new(),
         platform_cpu_id: Once::new(),

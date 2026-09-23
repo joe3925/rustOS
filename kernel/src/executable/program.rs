@@ -10,7 +10,9 @@ use core::task::{Context, Poll};
 use kernel_sync::{AsyncMpmcQueue, AsyncRecvError, WaitRegistration};
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::status::LoadError::NoSuchSymbol;
-use kernel_types::{device::ModuleHandle, fs::Path, guid_to_string, memory::PeInfo, status::PageMapError};
+use kernel_types::{
+    device::ModuleHandle, fs::Path, guid_to_string, memory::PeInfo, status::PageMapError,
+};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 
@@ -373,24 +375,19 @@ impl Program {
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
 
-        let old_address_space_root =
-            crate::memory::paging::address_space::current_address_space_root();
-
-        platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(
-                self.address_space_root,
-            );
-        });
-
         let res = (|| {
             let flags = self.private_mapping_flags();
 
-            unsafe { map_range(start.into(), end.as_u64() - start.as_u64(), flags, false) }
+            unsafe {
+                map_range(
+                    self.address_space_root,
+                    start.into(),
+                    end.as_u64() - start.as_u64(),
+                    flags,
+                    false,
+                )
+            }
         })();
-
-        unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
-        }
 
         res
     }
@@ -401,24 +398,16 @@ impl Program {
         if guard.is_pinned(start.as_u64(), end.as_u64()) {
             return Err(PageMapError::RangePinned());
         }
-        let old_address_space_root =
-            crate::memory::paging::address_space::current_address_space_root();
-
-        unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(
-                self.address_space_root,
-            );
-        }
-
         let flags = self.private_mapping_flags();
-        let result =
-            unsafe { map_range(start.into(), end.as_u64() - start.as_u64(), flags, false) };
-
         unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
+            map_range(
+                self.address_space_root,
+                start.into(),
+                end.as_u64() - start.as_u64(),
+                flags,
+                false,
+            )
         }
-
-        result
     }
     pub fn virtual_map_auto_alloc(&self, size: usize) -> Result<VirtAddr, PageMapError> {
         let _guard = self.user_memory.lock();
@@ -429,22 +418,16 @@ impl Program {
             .into();
         let end = start + size as u64;
 
-        let old_address_space_root =
-            crate::memory::paging::address_space::current_address_space_root();
-
-        platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(
-                self.address_space_root,
-            );
-        });
-
         let flags = self.private_mapping_flags();
 
         unsafe {
-            map_range(start.into(), end.as_u64() - start.as_u64(), flags, false)?;
-        }
-        unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
+            map_range(
+                self.address_space_root,
+                start.into(),
+                end.as_u64() - start.as_u64(),
+                flags,
+                false,
+            )?;
         }
 
         Ok(start)
@@ -488,16 +471,13 @@ impl Program {
 
         unsafe { self.tracker.dealloc(start, size) };
 
-        let old_address_space_root =
-            crate::memory::paging::address_space::current_address_space_root();
-
-        platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(
+        unsafe {
+            crate::memory::paging::map::unmap_range_unchecked(
                 self.address_space_root,
+                virt_addr.into(),
+                size,
             );
-            crate::memory::paging::map::unmap_range_unchecked(virt_addr.into(), size);
-            crate::memory::paging::address_space::switch_address_space_root(old_address_space_root);
-        });
+        }
 
         Ok(())
     }
@@ -606,14 +586,13 @@ impl Program {
         };
         self.modules.write().remove(index);
         unsafe { self.tracker.dealloc(base.as_u64(), size) };
-        let old_root = crate::memory::paging::address_space::current_address_space_root();
-        platform::with_interrupts_disabled(|| unsafe {
-            crate::memory::paging::address_space::switch_address_space_root(
+        unsafe {
+            crate::memory::paging::map::unmap_range_unchecked(
                 self.address_space_root,
+                base.into(),
+                size,
             );
-            crate::memory::paging::map::unmap_range_unchecked(base.into(), size);
-            crate::memory::paging::address_space::switch_address_space_root(old_root);
-        });
+        }
         Ok(())
     }
 

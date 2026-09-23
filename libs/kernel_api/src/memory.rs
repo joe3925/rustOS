@@ -3,20 +3,20 @@ use kernel_sys::{kernel_alloc, kernel_free};
 pub struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
     #[inline]
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
-        kernel_alloc(layout)
-    }}
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { kernel_alloc(layout) }
+    }
 
     #[inline]
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { unsafe {
-        kernel_free(ptr, layout)
-    }}
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { kernel_free(ptr, layout) }
+    }
 }
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 
-pub use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+pub use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
 pub use kernel_types::memory::PhysicalMappingCache;
 pub use kernel_types::status::PageMapError;
 
@@ -52,9 +52,21 @@ pub unsafe fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMap
 /// The range must be a live mapping owned by the caller and no references may
 /// survive this call.
 pub unsafe fn unmap_range(addr: VirtAddr, size: u64) {
+    unsafe { unmap_range_in(kernel_address_space_root(), addr, size) }
+}
+
+pub unsafe fn unmap_range_in(root: AddressSpaceRoot, addr: VirtAddr, size: u64) {
     unsafe {
-        kernel_sys::unmap_range(addr, size);
+        kernel_sys::unmap_range(root, addr, size);
     }
+}
+
+pub fn identity_map_page_in(root: AddressSpaceRoot, frame_addr: PhysAddr, flags: PageFlags) {
+    unsafe { kernel_sys::identity_map_page(root, frame_addr, flags) }
+}
+
+pub fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags) {
+    identity_map_page_in(kernel_address_space_root(), frame_addr, flags)
 }
 
 pub fn allocate_auto_kernel_range_mapped(
@@ -88,5 +100,20 @@ pub unsafe fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
 
 #[inline(always)]
 pub fn virt_to_phys(to_phys: VirtAddr) -> Option<(u64, PhysAddr)> {
-    unsafe { kernel_sys::virt_to_phys(to_phys) }
+    virt_to_phys_in(kernel_address_space_root(), to_phys)
+}
+
+pub fn virt_to_phys_in(root: AddressSpaceRoot, to_phys: VirtAddr) -> Option<(u64, PhysAddr)> {
+    unsafe { kernel_sys::virt_to_phys(root, to_phys) }
+}
+
+pub fn resolve_virtual_range_frame(
+    root: AddressSpaceRoot,
+    addr: VirtAddr,
+) -> Option<(u64, PhysAddr)> {
+    unsafe { kernel_sys::resolve_virtual_range_frame(root, addr) }
+}
+
+pub fn kernel_address_space_root() -> AddressSpaceRoot {
+    unsafe { kernel_sys::kernel_address_space_root() }
 }

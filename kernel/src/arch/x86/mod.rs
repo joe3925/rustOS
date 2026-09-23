@@ -12,7 +12,6 @@ pub mod instructions;
 pub mod interrupts;
 pub(crate) mod machine;
 pub mod memory;
-pub mod paging;
 pub(crate) mod pci;
 pub mod platform;
 pub(crate) mod scheduling;

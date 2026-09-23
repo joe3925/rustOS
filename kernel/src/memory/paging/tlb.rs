@@ -1,7 +1,7 @@
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use kernel_types::arch::VirtAddr;
+use kernel_types::arch::{AddressSpaceRoot, VirtAddr};
 
 use crate::KERNEL_INITIALIZED;
 use crate::platform::{ActivePlatform, PagingPlatform};
@@ -21,21 +21,23 @@ static TLB_SHOOTDOWN_ACKS: [AtomicU64; crate::platform::MAX_CPUS] =
 static TLB_SHOOTDOWN_MODE: AtomicUsize = AtomicUsize::new(TLB_SHOOTDOWN_MODE_FULL);
 static TLB_SHOOTDOWN_RANGES: AtomicPtr<TlbShootdownRange> = AtomicPtr::new(null_mut());
 static TLB_SHOOTDOWN_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_ROOT: AtomicU64 = AtomicU64::new(0);
+static TLB_SHOOTDOWN_KERNEL_SHARED: AtomicUsize = AtomicUsize::new(0);
 
-pub fn trigger_tlb_shootdown() {
-    trigger_tlb_shootdown_request(None);
+pub fn trigger_tlb_shootdown(root: AddressSpaceRoot) {
+    trigger_tlb_shootdown_request(root, None);
 }
 
-pub fn trigger_tlb_shootdown_range(start: VirtAddr, size: u64) {
+pub fn trigger_tlb_shootdown_range(root: AddressSpaceRoot, start: VirtAddr, size: u64) {
     let range = TlbShootdownRange::new(start, size);
-    trigger_tlb_shootdown_ranges(core::slice::from_ref(&range));
+    trigger_tlb_shootdown_ranges(root, core::slice::from_ref(&range));
 }
 
-pub fn trigger_tlb_shootdown_ranges(ranges: &[TlbShootdownRange]) {
+pub fn trigger_tlb_shootdown_ranges(root: AddressSpaceRoot, ranges: &[TlbShootdownRange]) {
     if matches!(tlb_ranges_page_count(ranges), Some(0)) {
         return;
     }
-    trigger_tlb_shootdown_request(Some(ranges));
+    trigger_tlb_shootdown_request(root, Some(ranges));
 }
 
 pub fn handle_remote_tlb_shootdown() {
@@ -48,10 +50,15 @@ pub fn handle_remote_tlb_shootdown() {
     }
 }
 
-fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
+fn trigger_tlb_shootdown_request(root: AddressSpaceRoot, ranges: Option<&[TlbShootdownRange]>) {
+    let kernel_shared = ranges.is_some_and(|ranges| {
+        ranges.iter().any(|range| {
+            range.start.as_u64() >= crate::memory::paging::layout::kernel_space_base().as_u64()
+        })
+    });
     let cpu_count = crate::platform::processor_count();
     if cpu_count <= 1 || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
-        flush_tlb_shootdown_request(ranges);
+        flush_tlb_shootdown_request(root, kernel_shared, ranges);
         return;
     }
 
@@ -67,20 +74,26 @@ fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
     );
 
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
+    TLB_SHOOTDOWN_ROOT.store(root.as_u64(), Ordering::SeqCst);
+    TLB_SHOOTDOWN_KERNEL_SHARED.store(kernel_shared as usize, Ordering::SeqCst);
     match ranges {
         Some(ranges) => {
             TLB_SHOOTDOWN_RANGES.store(ranges.as_ptr() as *mut TlbShootdownRange, Ordering::SeqCst);
             TLB_SHOOTDOWN_RANGE_COUNT.store(ranges.len(), Ordering::SeqCst);
             TLB_SHOOTDOWN_MODE.store(TLB_SHOOTDOWN_MODE_RANGES, Ordering::SeqCst);
         }
-        None => clear_tlb_shootdown_request(),
+        None => {
+            TLB_SHOOTDOWN_RANGES.store(null_mut(), Ordering::SeqCst);
+            TLB_SHOOTDOWN_RANGE_COUNT.store(0, Ordering::SeqCst);
+            TLB_SHOOTDOWN_MODE.store(TLB_SHOOTDOWN_MODE_FULL, Ordering::SeqCst);
+        }
     }
 
     let sequence = TLB_SHOOTDOWN_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
     let current_cpu = crate::platform::current_cpu_id();
 
     let sent = <ActivePlatform as PagingPlatform>::broadcast_tlb_shootdown();
-    flush_tlb_shootdown_request(ranges);
+    flush_tlb_shootdown_request(root, kernel_shared, ranges);
     if current_cpu < crate::platform::MAX_CPUS {
         TLB_SHOOTDOWN_ACKS[current_cpu].store(sequence, Ordering::SeqCst);
     }
@@ -103,16 +116,35 @@ fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
     clear_tlb_shootdown_request();
 }
 
-fn flush_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
+fn flush_tlb_shootdown_request(
+    root: AddressSpaceRoot,
+    kernel_shared: bool,
+    ranges: Option<&[TlbShootdownRange]>,
+) {
+    if !kernel_shared
+        && <ActivePlatform as crate::platform::AddressSpacePlatform>::current_root() != root
+    {
+        return;
+    }
+
     match ranges {
-        Some(ranges) => flush_tlb_ranges_or_all(ranges),
-        None => <ActivePlatform as PagingPlatform>::local_flush_tlb_all(),
+        Some(ranges) => flush_tlb_ranges_or_all(ranges, kernel_shared),
+        None => <ActivePlatform as PagingPlatform>::local_flush_tlb_all(kernel_shared),
     }
 }
 
 fn flush_current_tlb_shootdown_request() {
+    let root_raw = TLB_SHOOTDOWN_ROOT.load(Ordering::SeqCst);
+    let root = unsafe { AddressSpaceRoot::from_raw(root_raw) };
+    let kernel_shared = TLB_SHOOTDOWN_KERNEL_SHARED.load(Ordering::SeqCst) != 0;
+    if !kernel_shared
+        && <ActivePlatform as crate::platform::AddressSpacePlatform>::current_root() != root
+    {
+        return;
+    }
+
     if TLB_SHOOTDOWN_MODE.load(Ordering::SeqCst) != TLB_SHOOTDOWN_MODE_RANGES {
-        <ActivePlatform as PagingPlatform>::local_flush_tlb_all();
+        <ActivePlatform as PagingPlatform>::local_flush_tlb_all(kernel_shared);
         return;
     }
 
@@ -123,23 +155,23 @@ fn flush_current_tlb_shootdown_request() {
 
     let ptr = TLB_SHOOTDOWN_RANGES.load(Ordering::SeqCst);
     if ptr.is_null() {
-        <ActivePlatform as PagingPlatform>::local_flush_tlb_all();
+        <ActivePlatform as PagingPlatform>::local_flush_tlb_all(kernel_shared);
         return;
     }
 
     let ranges = unsafe { core::slice::from_raw_parts(ptr as *const TlbShootdownRange, count) };
-    flush_tlb_ranges_or_all(ranges);
+    flush_tlb_ranges_or_all(ranges, kernel_shared);
 }
 
-fn flush_tlb_ranges_or_all(ranges: &[TlbShootdownRange]) {
+fn flush_tlb_ranges_or_all(ranges: &[TlbShootdownRange], include_global: bool) {
     if should_flush_all_for_tlb_ranges(ranges) {
-        <ActivePlatform as PagingPlatform>::local_flush_tlb_all();
+        <ActivePlatform as PagingPlatform>::local_flush_tlb_all(include_global);
         return;
     }
 
     for range in ranges {
         if tlb_range_bounds(*range).is_none() {
-            <ActivePlatform as PagingPlatform>::local_flush_tlb_all();
+            <ActivePlatform as PagingPlatform>::local_flush_tlb_all(include_global);
             return;
         }
 
@@ -155,6 +187,8 @@ fn clear_tlb_shootdown_request() {
     TLB_SHOOTDOWN_MODE.store(TLB_SHOOTDOWN_MODE_FULL, Ordering::SeqCst);
     TLB_SHOOTDOWN_RANGES.store(null_mut(), Ordering::SeqCst);
     TLB_SHOOTDOWN_RANGE_COUNT.store(0, Ordering::SeqCst);
+    TLB_SHOOTDOWN_ROOT.store(0, Ordering::SeqCst);
+    TLB_SHOOTDOWN_KERNEL_SHARED.store(0, Ordering::SeqCst);
 }
 
 fn should_flush_all_for_tlb_ranges(ranges: &[TlbShootdownRange]) -> bool {

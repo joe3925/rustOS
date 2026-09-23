@@ -2,7 +2,7 @@ use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
 
 use super::layout::{align_up, base_page_size, supported_mapping_sizes};
-use super::map::{map_range, unmap_range};
+use super::map::{map_kernel_range, unmap_kernel_range};
 use super::virt_tracker::allocate_auto_kernel_range_aligned;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,8 +72,8 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
     let stack_top = VirtAddr::new(region_base.as_u64() + reserve_total);
     let map_start = VirtAddr::new(stack_top.as_u64() - map_bytes);
 
-    if let Err(err) = unsafe { map_range(map_start, map_bytes, flags, false) } {
-        unsafe { unmap_range(region_base, reserve_total) };
+    if let Err(err) = unsafe { map_kernel_range(map_start, map_bytes, flags, false) } {
+        unsafe { unmap_kernel_range(region_base, reserve_total) };
         return Err(err);
     }
 
@@ -86,5 +86,5 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
 pub unsafe fn deallocate_kernel_stack(stack_top: VirtAddr) {
     let reserve_total = kernel_stack_reservation_bytes();
     let region_base = VirtAddr::new(stack_top.as_u64() - reserve_total);
-    unsafe { unmap_range(region_base, reserve_total) };
+    unsafe { unmap_kernel_range(region_base, reserve_total) };
 }

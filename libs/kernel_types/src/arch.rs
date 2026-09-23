@@ -92,6 +92,24 @@ impl PhysAddr {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressSpaceRoot(u64);
+
+impl AddressSpaceRoot {
+    pub const unsafe fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub const fn physical_address(self) -> PhysAddr {
+        PhysAddr::new(self.0)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PageFlags(u64);
 
 impl PageFlags {
@@ -187,8 +205,12 @@ fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     unsafe extern "C" {
         #[link_name = "resolve_virtual_range_frame"]
-        fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+        fn sys_resolve_virtual_range_frame(
+            root: AddressSpaceRoot,
+            addr: VirtAddr,
+        ) -> Option<(u64, PhysAddr)>;
+        fn kernel_address_space_root() -> AddressSpaceRoot;
     }
 
-    unsafe { sys_resolve_virtual_range_frame(addr) }
+    unsafe { sys_resolve_virtual_range_frame(kernel_address_space_root(), addr) }
 }

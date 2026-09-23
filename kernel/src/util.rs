@@ -19,7 +19,7 @@ use crate::memory::paging::address_space::{
 use crate::memory::paging::frame_alloc::{
     KernelFrameAllocator, boot_usable_bytes, resize_bitmap_for_ram,
 };
-use crate::memory::paging::map::unmap_reserved_range_unchecked;
+use crate::memory::paging::map::unmap_kernel_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::memory::paging::zero::{init_emergency_zero_mappings, start_zero_page_worker};
@@ -147,7 +147,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         boot_usable_bytes()
     ));
     init_emergency_zero_mappings().expect("Failed to initialize emergency zero mappings");
-    start_zero_page_worker();
+   // start_zero_page_worker();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
@@ -185,6 +185,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
             .await
             .expect("failed to initialize PnP from the registry");
     });
+    yield_now();
     println!("");
 }
 
@@ -440,7 +441,7 @@ fn reclaim_kernel_stub() {
         }
 
         unsafe {
-            unmap_reserved_range_unchecked(
+            unmap_kernel_reserved_range_unchecked(
                 VirtAddr::new(section.loaded_address),
                 section.virtual_size as u64,
             );

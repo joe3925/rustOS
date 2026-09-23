@@ -12,7 +12,9 @@ use kernel_types::arch::PageFlags;
 use spin::Mutex;
 
 use crate::memory::device_mmu::DeviceMmuError;
-use crate::memory::paging::map::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
+use crate::memory::paging::map::{
+    allocate_auto_kernel_range_mapped_contiguous, kernel_virt_to_phys,
+};
 
 pub(super) type Format = Vmsa64<NativeEndian>;
 pub(super) type Granule = Granule4KiB;
@@ -46,7 +48,7 @@ impl TableArena {
         let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
         let virt = allocate_auto_kernel_range_mapped_contiguous(size, flags)
             .map_err(|_| DeviceMmuError::NoBackingFrame)?;
-        let (_, phys) = virt_to_phys(virt).ok_or(DeviceMmuError::NoBackingFrame)?;
+        let (_, phys) = kernel_virt_to_phys(virt).ok_or(DeviceMmuError::NoBackingFrame)?;
         unsafe { core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, size as usize) };
         Ok(Self {
             phys: phys.as_u64(),
@@ -93,7 +95,6 @@ impl TableArena {
     pub(super) fn virtual_address(&self, phys: u64) -> u64 {
         self.virt + (phys - self.phys)
     }
-
 
     pub(super) fn clean_allocated(&self) {
         let bytes = *self.next.lock() - self.phys;

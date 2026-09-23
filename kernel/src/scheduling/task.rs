@@ -1,5 +1,5 @@
 use crate::memory::paging::layout::base_page_size;
-use crate::memory::paging::map::map_range;
+use crate::memory::paging::map::map_kernel_range;
 use crate::memory::paging::stack::{
     StackSize, allocate_kernel_stack, deallocate_kernel_stack, kernel_stack_max_bytes,
 };
@@ -304,7 +304,7 @@ impl TaskRef {
         };
 
         unsafe {
-            map_range(VirtAddr::new(gp), page_size, flags, false)?;
+            map_kernel_range(VirtAddr::new(gp), page_size, flags, false)?;
         }
 
         let stack_top = self.stack_start.load(Ordering::Acquire);

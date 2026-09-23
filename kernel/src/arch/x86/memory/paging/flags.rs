@@ -1,9 +1,9 @@
 use kernel_types::arch::PageFlags;
 use kernel_types::memory::PhysicalMappingCache;
-use x86_64::structures::paging::PageTableFlags;
+use x86_64_paging::PageTableFlags;
 
 pub fn page_flags_to_x86(flags: PageFlags, cache: Option<PhysicalMappingCache>) -> PageTableFlags {
-    let mut native = PageTableFlags::from_bits_truncate(flags.bits());
+    let mut native = PageTableFlags::from_bits_retain(flags.bits());
     if let Some(cache) = cache {
         native |= cache_to_flags(cache);
     }
@@ -12,10 +12,10 @@ pub fn page_flags_to_x86(flags: PageFlags, cache: Option<PhysicalMappingCache>) 
 
 fn cache_to_flags(cache: PhysicalMappingCache) -> PageTableFlags {
     match cache {
-        PhysicalMappingCache::Cached => PageTableFlags::empty(),
+        PhysicalMappingCache::Cached => PageTableFlags::EMPTY,
         PhysicalMappingCache::WriteCombining => {
-            PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH
+            PageTableFlags::CACHE_DISABLE | PageTableFlags::WRITE_THROUGH
         }
-        PhysicalMappingCache::Uncached => PageTableFlags::NO_CACHE,
+        PhysicalMappingCache::Uncached => PageTableFlags::CACHE_DISABLE,
     }
 }

@@ -1,3 +1,4 @@
+use crate::arch::AddressSpaceRoot;
 use crate::arch::PagingPlatform;
 use crate::arch::PhysAddr;
 use crate::arch::PlatformInfo;
@@ -41,10 +42,14 @@ fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
 #[cfg(not(any(test, feature = "hosted-tests")))]
 fn sys_resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     unsafe extern "C" {
-        fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+        fn resolve_virtual_range_frame(
+            root: AddressSpaceRoot,
+            addr: VirtAddr,
+        ) -> Option<(u64, PhysAddr)>;
+        fn kernel_address_space_root() -> AddressSpaceRoot;
     }
 
-    unsafe { resolve_virtual_range_frame(addr) }
+    unsafe { resolve_virtual_range_frame(kernel_address_space_root(), addr) }
 }
 #[unsafe(naked)]
 #[unsafe(no_mangle)]

@@ -1,6 +1,9 @@
-use crate::memory::heap::heap::{mimalloc_arena_size, mimalloc_arena_start, mimalloc_heap_end, mimalloc_heap_start, mimalloc_os_heap_size};
+use crate::memory::heap::heap::{
+    mimalloc_arena_size, mimalloc_arena_start, mimalloc_heap_end, mimalloc_heap_start,
+    mimalloc_os_heap_size,
+};
 use crate::memory::paging::layout::{align_up_to_base_page, base_page_size};
-use crate::memory::paging::map::{map_fresh_kernel_range_no_flush, unmap_range_unchecked};
+use crate::memory::paging::map::{map_fresh_kernel_range_no_flush, unmap_kernel_range_unchecked};
 use crate::platform;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
@@ -150,33 +153,37 @@ unsafe extern "C" {
 
 static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocator::new(0, 0));
 
-pub unsafe fn enable_mimalloc_impl() { unsafe {
-    let arena_start = mimalloc_arena_start();
-    let arena_size = mimalloc_arena_size();
-    if arena_size < MIMALLOC_COMMIT_GRANULARITY {
-        panic!(
-            "mimalloc arena too small: start={:#x}, size={}",
-            arena_start, arena_size
-        );
+pub unsafe fn enable_mimalloc_impl() {
+    unsafe {
+        let arena_start = mimalloc_arena_start();
+        let arena_size = mimalloc_arena_size();
+        if arena_size < MIMALLOC_COMMIT_GRANULARITY {
+            panic!(
+                "mimalloc arena too small: start={:#x}, size={}",
+                arena_start, arena_size
+            );
+        }
+
+        MIMALLOC_OS_ALLOCATOR
+            .lock()
+            .configure(mimalloc_heap_start(), mimalloc_os_heap_size());
+        MIMALLOC_COMMIT_TRACKER.lock().init(arena_start, arena_size);
+        MIMALLOC_ARENA_COMMITTED.store(0, Ordering::Release);
+
+        mi_process_init();
+        rustos_mi_configure_options();
+        init_mimalloc_diagnostics();
+        if !rustos_mi_manage_arena(arena_start as *mut c_void, arena_size) {
+            panic!("failed to register rustOS mimalloc arena");
+        }
     }
+}
 
-    MIMALLOC_OS_ALLOCATOR
-        .lock()
-        .configure(mimalloc_heap_start(), mimalloc_os_heap_size());
-    MIMALLOC_COMMIT_TRACKER.lock().init(arena_start, arena_size);
-    MIMALLOC_ARENA_COMMITTED.store(0, Ordering::Release);
-
-    mi_process_init();
-    rustos_mi_configure_options();
-    init_mimalloc_diagnostics();
-    if !rustos_mi_manage_arena(arena_start as *mut c_void, arena_size) {
-        panic!("failed to register rustOS mimalloc arena");
+pub unsafe fn mimalloc_thread_done_impl() {
+    unsafe {
+        mi_thread_done();
     }
-}}
-
-pub unsafe fn mimalloc_thread_done_impl() { unsafe {
-    mi_thread_done();
-}}
+}
 
 pub fn mimalloc_collect(force: bool) {
     unsafe {
@@ -240,47 +247,55 @@ pub fn get_mimalloc_free_memory() -> usize {
     MIMALLOC_OS_ALLOCATOR.lock().free_memory()
 }
 
-pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 { unsafe {
-    let start = mimalloc_stats_start();
-    let size = layout.size().max(1);
-    let ptr = if layout.align() <= core::mem::align_of::<usize>() {
-        mi_malloc(size)
-    } else {
-        mi_malloc_aligned(size, layout.align())
-    } as *mut u8;
-    mimalloc_record_alloc(layout.size(), start);
-    ptr
-}}
+pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
+    unsafe {
+        let start = mimalloc_stats_start();
+        let size = layout.size().max(1);
+        let ptr = if layout.align() <= core::mem::align_of::<usize>() {
+            mi_malloc(size)
+        } else {
+            mi_malloc_aligned(size, layout.align())
+        } as *mut u8;
+        mimalloc_record_alloc(layout.size(), start);
+        ptr
+    }
+}
 
-pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 { unsafe {
-    let start = mimalloc_stats_start();
-    let size = layout.size().max(1);
-    let ptr = if layout.align() <= core::mem::align_of::<usize>() {
-        mi_zalloc(size)
-    } else {
-        mi_zalloc_aligned(size, layout.align())
-    } as *mut u8;
-    mimalloc_record_alloc(layout.size(), start);
-    ptr
-}}
+pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
+    unsafe {
+        let start = mimalloc_stats_start();
+        let size = layout.size().max(1);
+        let ptr = if layout.align() <= core::mem::align_of::<usize>() {
+            mi_zalloc(size)
+        } else {
+            mi_zalloc_aligned(size, layout.align())
+        } as *mut u8;
+        mimalloc_record_alloc(layout.size(), start);
+        ptr
+    }
+}
 
-pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
-    let start = mimalloc_stats_start();
-    mi_free(ptr.cast::<c_void>());
-    mimalloc_record_dealloc(layout.size(), start);
-}}
+pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
+    unsafe {
+        let start = mimalloc_stats_start();
+        mi_free(ptr.cast::<c_void>());
+        mimalloc_record_dealloc(layout.size(), start);
+    }
+}
 
-pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 { unsafe {
-    let start = mimalloc_stats_start();
-    let size = new_size.max(1);
-    let new_ptr = if layout.align() <= core::mem::align_of::<usize>() {
-        mi_realloc(ptr.cast::<c_void>(), size)
-    } else {
-        mi_realloc_aligned(ptr.cast::<c_void>(), size, layout.align())
-    } as *mut u8;
-    mimalloc_record_realloc(layout.size(), new_size, start);
-    new_ptr
-}}
+pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe {
+        let start = mimalloc_stats_start();
+        let size = new_size.max(1);
+        let new_ptr = if layout.align() <= core::mem::align_of::<usize>() {
+            mi_realloc(ptr.cast::<c_void>(), size)
+        } else {
+            mi_realloc_aligned(ptr.cast::<c_void>(), size, layout.align())
+        } as *mut u8;
+        mimalloc_record_realloc(layout.size(), new_size, start);
+        new_ptr
+    }
+}
 
 #[inline(always)]
 fn mimalloc_stats_start() -> u64 {
@@ -397,99 +412,105 @@ impl RangeAllocator {
         self.free_bytes
     }
 
-    unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 { unsafe {
-        self.ensure_init();
+    unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        unsafe {
+            self.ensure_init();
 
-        let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
-        if size == 0 {
-            return null_mut();
-        }
-        let align = align.max(base_page_size() as usize);
-
-        let Some((region, alloc_start)) = self.find_region(size, align) else {
-            return null_mut();
-        };
-
-        let region_start = region.start_addr();
-        let region_end = region.end_addr();
-        let alloc_end = alloc_start + size;
-
-        if alloc_start > region_start {
-            self.add_free_region(region_start, alloc_start - region_start);
-        }
-        if alloc_end < region_end {
-            self.add_free_region(alloc_end, region_end - alloc_end);
-        }
-
-        self.free_bytes = self.free_bytes.saturating_sub(size);
-        if MIMALLOC_OS_ALLOC_ZEROES {
-            core::ptr::write_bytes(alloc_start as *mut u8, 0, size);
-        }
-        alloc_start as *mut u8
-    }}
-
-    unsafe fn free(&mut self, ptr: *mut u8, size: usize) { unsafe {
-        if ptr.is_null() || size == 0 {
-            return;
-        }
-
-        self.ensure_init();
-
-        let addr = ptr as usize;
-        if addr < self.start || addr >= self.start + self.size {
-            return;
-        }
-
-        let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
-        self.add_free_region(addr, size);
-        self.free_bytes = self.free_bytes.saturating_add(size).min(self.size);
-    }}
-
-    unsafe fn add_free_region(&mut self, addr: usize, size: usize) { unsafe {
-        if size < core::mem::size_of::<ListNode>() || size < base_page_size() as usize {
-            return;
-        }
-
-        let node_ptr = addr as *mut ListNode;
-        node_ptr.write(ListNode::new(size));
-
-        let mut prev: *mut ListNode = &mut self.free_list.head as *mut ListNode;
-        while let Some(next_ref) = (*prev).next.as_mut() {
-            let next_ptr = &mut **next_ref as *mut ListNode;
-            if (*next_ptr).start_addr() < addr {
-                prev = next_ptr;
-            } else {
-                break;
+            let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
+            if size == 0 {
+                return null_mut();
             }
-        }
+            let align = align.max(base_page_size() as usize);
 
-        let prev_ref = &mut *prev;
-        let old_next = prev_ref.next.take();
+            let Some((region, alloc_start)) = self.find_region(size, align) else {
+                return null_mut();
+            };
 
-        (*node_ptr).next = old_next;
-        prev_ref.next = Some(&mut *node_ptr);
+            let region_start = region.start_addr();
+            let region_end = region.end_addr();
+            let alloc_end = alloc_start + size;
 
-        let cur_ptr: *mut ListNode = node_ptr;
-
-        if let Some(next_ref) = (*cur_ptr).next.as_mut() {
-            let next_ptr = &mut **next_ref as *mut ListNode;
-            if (*cur_ptr).end_addr() == (*next_ptr).start_addr() {
-                let next_next = (*next_ptr).next.take();
-                (*cur_ptr).size += (*next_ptr).size;
-                (*cur_ptr).next = next_next;
+            if alloc_start > region_start {
+                self.add_free_region(region_start, alloc_start - region_start);
             }
-        }
+            if alloc_end < region_end {
+                self.add_free_region(alloc_end, region_end - alloc_end);
+            }
 
-        let head_ptr = &mut self.free_list.head as *mut ListNode;
-        if prev != head_ptr {
+            self.free_bytes = self.free_bytes.saturating_sub(size);
+            if MIMALLOC_OS_ALLOC_ZEROES {
+                core::ptr::write_bytes(alloc_start as *mut u8, 0, size);
+            }
+            alloc_start as *mut u8
+        }
+    }
+
+    unsafe fn free(&mut self, ptr: *mut u8, size: usize) {
+        unsafe {
+            if ptr.is_null() || size == 0 {
+                return;
+            }
+
+            self.ensure_init();
+
+            let addr = ptr as usize;
+            if addr < self.start || addr >= self.start + self.size {
+                return;
+            }
+
+            let size = align_up_to_base_page(size as u64).unwrap_or(0) as usize;
+            self.add_free_region(addr, size);
+            self.free_bytes = self.free_bytes.saturating_add(size).min(self.size);
+        }
+    }
+
+    unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
+        unsafe {
+            if size < core::mem::size_of::<ListNode>() || size < base_page_size() as usize {
+                return;
+            }
+
+            let node_ptr = addr as *mut ListNode;
+            node_ptr.write(ListNode::new(size));
+
+            let mut prev: *mut ListNode = &mut self.free_list.head as *mut ListNode;
+            while let Some(next_ref) = (*prev).next.as_mut() {
+                let next_ptr = &mut **next_ref as *mut ListNode;
+                if (*next_ptr).start_addr() < addr {
+                    prev = next_ptr;
+                } else {
+                    break;
+                }
+            }
+
             let prev_ref = &mut *prev;
-            if prev_ref.end_addr() == (*cur_ptr).start_addr() {
-                let cur_next = (*cur_ptr).next.take();
-                prev_ref.size += (*cur_ptr).size;
-                prev_ref.next = cur_next;
+            let old_next = prev_ref.next.take();
+
+            (*node_ptr).next = old_next;
+            prev_ref.next = Some(&mut *node_ptr);
+
+            let cur_ptr: *mut ListNode = node_ptr;
+
+            if let Some(next_ref) = (*cur_ptr).next.as_mut() {
+                let next_ptr = &mut **next_ref as *mut ListNode;
+                if (*cur_ptr).end_addr() == (*next_ptr).start_addr() {
+                    let next_next = (*next_ptr).next.take();
+                    (*cur_ptr).size += (*next_ptr).size;
+                    (*cur_ptr).next = next_next;
+                }
+            }
+
+            let head_ptr = &mut self.free_list.head as *mut ListNode;
+            if prev != head_ptr {
+                let prev_ref = &mut *prev;
+                if prev_ref.end_addr() == (*cur_ptr).start_addr() {
+                    let cur_next = (*cur_ptr).next.take();
+                    prev_ref.size += (*cur_ptr).size;
+                    prev_ref.next = cur_next;
+                }
             }
         }
-    }}
+    }
 
     fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
         let mut prev: *mut ListNode = &mut self.free_list.head as *mut ListNode;
@@ -585,109 +606,112 @@ pub fn init_mimalloc_diagnostics() {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool { unsafe {
-    let start_cycles = mimalloc_stats_start();
+pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
+    unsafe {
+        let start_cycles = mimalloc_stats_start();
 
-    if MIMALLOC_STATS_ENABLED {
-        MIMALLOC_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-        MIMALLOC_COMMIT_REQUESTED.fetch_add(size, Ordering::Relaxed);
-    }
-
-    let addr_usize = addr as usize;
-    let Some(end_usize) = addr_usize.checked_add(size) else {
-        crate::println!(
-            "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Address overflow",
-            addr,
-            size
-        );
-        mimalloc_record_commit_cycles(start_cycles);
-        return false;
-    };
-
-    let arena_start = mimalloc_arena_start();
-    let Some(arena_end) = arena_start.checked_add(mimalloc_arena_size()) else {
-        crate::println!(
-            "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Arena bounds overflow",
-            addr,
-            size
-        );
-        mimalloc_record_commit_cycles(start_cycles);
-        return false;
-    };
-
-    if addr_usize < arena_start || end_usize > arena_end {
-        crate::println!(
-            "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Address out of arena bounds",
-            addr,
-            size
-        );
-        mimalloc_record_commit_cycles(start_cycles);
-        return false;
-    }
-
-    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-
-    let mut tracker = MIMALLOC_COMMIT_TRACKER.lock();
-    let commit_start =
-        align_down_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY).max(tracker.track_start);
-    let commit_end = align_up_const(end_usize, MIMALLOC_COMMIT_GRANULARITY).min(tracker.track_end);
-
-    let Some((first_chunk, last_chunk)) = tracker.chunk_range(commit_start, commit_end) else {
-        crate::println!(
-            "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Commit tracker not initialized",
-            addr,
-            size
-        );
-        mimalloc_record_commit_cycles(start_cycles);
-        return false;
-    };
-
-    let mut chunk = first_chunk;
-    while chunk < last_chunk {
-        if tracker.chunk_is_set(chunk) {
-            chunk += 1;
-            continue;
+        if MIMALLOC_STATS_ENABLED {
+            MIMALLOC_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+            MIMALLOC_COMMIT_REQUESTED.fetch_add(size, Ordering::Relaxed);
         }
 
-        let run_start = chunk;
-        chunk += 1;
-        while chunk < last_chunk && !tracker.chunk_is_set(chunk) {
-            chunk += 1;
-        }
-
-        let run_addr = tracker.track_start + run_start * MIMALLOC_COMMIT_GRANULARITY;
-        let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
-        let start_addr = VirtAddr::new(run_addr as u64);
-
-        let res = platform::with_interrupts_disabled(|| {
-            map_fresh_kernel_range_no_flush(start_addr.into(), run_size as u64, flags, true)
-        });
-
-        if let Err(e) = res {
+        let addr_usize = addr as usize;
+        let Some(end_usize) = addr_usize.checked_add(size) else {
             crate::println!(
-                "MIMALLOC COMMIT FAILED: address={:p}, size={}, commit_start={:#x}, commit_size={}, flags={:?}, reason=Page mapping failed ({:?})",
+                "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Address overflow",
                 addr,
-                size,
-                run_addr,
-                run_size,
-                flags,
-                e
+                size
+            );
+            mimalloc_record_commit_cycles(start_cycles);
+            return false;
+        };
+
+        let arena_start = mimalloc_arena_start();
+        let Some(arena_end) = arena_start.checked_add(mimalloc_arena_size()) else {
+            crate::println!(
+                "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Arena bounds overflow",
+                addr,
+                size
+            );
+            mimalloc_record_commit_cycles(start_cycles);
+            return false;
+        };
+
+        if addr_usize < arena_start || end_usize > arena_end {
+            crate::println!(
+                "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Address out of arena bounds",
+                addr,
+                size
             );
             mimalloc_record_commit_cycles(start_cycles);
             return false;
         }
 
-        tracker.mark_range(run_start, chunk);
-        MIMALLOC_ARENA_COMMITTED.fetch_add(run_size, Ordering::Relaxed);
-        if MIMALLOC_STATS_ENABLED {
-            MIMALLOC_COMMIT_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
-            MIMALLOC_COMMIT_MAPPED.fetch_add(run_size, Ordering::Relaxed);
-        }
-    }
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
 
-    mimalloc_record_commit_cycles(start_cycles);
-    true
-}}
+        let mut tracker = MIMALLOC_COMMIT_TRACKER.lock();
+        let commit_start =
+            align_down_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY).max(tracker.track_start);
+        let commit_end =
+            align_up_const(end_usize, MIMALLOC_COMMIT_GRANULARITY).min(tracker.track_end);
+
+        let Some((first_chunk, last_chunk)) = tracker.chunk_range(commit_start, commit_end) else {
+            crate::println!(
+                "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Commit tracker not initialized",
+                addr,
+                size
+            );
+            mimalloc_record_commit_cycles(start_cycles);
+            return false;
+        };
+
+        let mut chunk = first_chunk;
+        while chunk < last_chunk {
+            if tracker.chunk_is_set(chunk) {
+                chunk += 1;
+                continue;
+            }
+
+            let run_start = chunk;
+            chunk += 1;
+            while chunk < last_chunk && !tracker.chunk_is_set(chunk) {
+                chunk += 1;
+            }
+
+            let run_addr = tracker.track_start + run_start * MIMALLOC_COMMIT_GRANULARITY;
+            let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
+            let start_addr = VirtAddr::new(run_addr as u64);
+
+            let res = platform::with_interrupts_disabled(|| {
+                map_fresh_kernel_range_no_flush(start_addr.into(), run_size as u64, flags, true)
+            });
+
+            if let Err(e) = res {
+                crate::println!(
+                    "MIMALLOC COMMIT FAILED: address={:p}, size={}, commit_start={:#x}, commit_size={}, flags={:?}, reason=Page mapping failed ({:?})",
+                    addr,
+                    size,
+                    run_addr,
+                    run_size,
+                    flags,
+                    e
+                );
+                mimalloc_record_commit_cycles(start_cycles);
+                return false;
+            }
+
+            tracker.mark_range(run_start, chunk);
+            MIMALLOC_ARENA_COMMITTED.fetch_add(run_size, Ordering::Relaxed);
+            if MIMALLOC_STATS_ENABLED {
+                MIMALLOC_COMMIT_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
+                MIMALLOC_COMMIT_MAPPED.fetch_add(run_size, Ordering::Relaxed);
+            }
+        }
+
+        mimalloc_record_commit_cycles(start_cycles);
+        true
+    }
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -> bool {
@@ -757,7 +781,7 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
 
         platform::with_interrupts_disabled(|| unsafe {
-            unmap_range_unchecked(VirtAddr::new(run_addr as u64).into(), run_size as u64);
+            unmap_kernel_range_unchecked(VirtAddr::new(run_addr as u64).into(), run_size as u64);
         });
 
         tracker.clear_range(run_start, chunk);
@@ -778,33 +802,37 @@ fn mimalloc_record_commit_cycles(start: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void { unsafe {
-    let ptr = platform::with_interrupts_disabled(|| {
-        MIMALLOC_OS_ALLOCATOR
-            .lock()
-            .alloc(size, alignment)
-            .cast::<c_void>()
-    });
+pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void {
+    unsafe {
+        let ptr = platform::with_interrupts_disabled(|| {
+            MIMALLOC_OS_ALLOCATOR
+                .lock()
+                .alloc(size, alignment)
+                .cast::<c_void>()
+        });
 
-    if ptr.is_null() {
-        crate::println!(
-            "MIMALLOC ALLOC FAILED: size={}, alignment={}, reason=Out of OS allocator memory",
-            size,
-            alignment
-        );
+        if ptr.is_null() {
+            crate::println!(
+                "MIMALLOC ALLOC FAILED: size={}, alignment={}, reason=Out of OS allocator memory",
+                size,
+                alignment
+            );
+        }
+
+        ptr
     }
-
-    ptr
-}}
+}
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) { unsafe {
-    if !addr.is_null() {
-        platform::with_interrupts_disabled(|| {
-            MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size)
-        });
+pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
+    unsafe {
+        if !addr.is_null() {
+            platform::with_interrupts_disabled(|| {
+                MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size)
+            });
+        }
     }
-}}
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
@@ -831,21 +859,23 @@ pub extern "C" fn rustos_mi_clock_now() -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> bool { unsafe {
-    if buf.is_null() {
-        return false;
-    }
+pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> bool {
+    unsafe {
+        if buf.is_null() {
+            return false;
+        }
 
-    let mut state = platform::cycle_counter()
-        ^ (buf as u64).rotate_left(17)
-        ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let bytes = core::slice::from_raw_parts_mut(buf.cast::<u8>(), len);
-    for byte in bytes {
-        state = splitmix64(state);
-        *byte = (state >> 56) as u8;
+        let mut state = platform::cycle_counter()
+            ^ (buf as u64).rotate_left(17)
+            ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let bytes = core::slice::from_raw_parts_mut(buf.cast::<u8>(), len);
+        for byte in bytes {
+            state = splitmix64(state);
+            *byte = (state >> 56) as u8;
+        }
+        true
     }
-    true
-}}
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}

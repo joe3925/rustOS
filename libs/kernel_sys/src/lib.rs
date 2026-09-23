@@ -29,7 +29,7 @@ use kernel_types::object_manager::OmError;
 use kernel_types::pci::PciConfigAddress;
 use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
 
-use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fdt::FdtHeader;
 use kernel_types::fs::{File, OpenFlags, Path};
@@ -138,16 +138,20 @@ unsafe extern "C" {
         flags: PageFlags,
     ) -> Result<VirtAddr, PageMapError>;
     pub fn deallocate_kernel_range(addr: VirtAddr, size: u64);
-    pub fn unmap_range(virtual_addr: VirtAddr, size: u64);
-    pub fn identity_map_page(frame_addr: PhysAddr, flags: PageFlags);
+    pub fn unmap_range(root: AddressSpaceRoot, virtual_addr: VirtAddr, size: u64);
+    pub fn identity_map_page(root: AddressSpaceRoot, frame_addr: PhysAddr, flags: PageFlags);
     pub fn map_physical_pages(
         phys: PhysAddr,
         size: u64,
         cache: kernel_types::memory::PhysicalMappingCache,
     ) -> Result<VirtAddr, PageMapError>;
     pub fn unmap_physical_pages(virt: VirtAddr, size: u64) -> Result<(), PageMapError>;
-    pub fn virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
-    pub fn resolve_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+    pub fn virt_to_phys(root: AddressSpaceRoot, addr: VirtAddr) -> Option<(u64, PhysAddr)>;
+    pub fn resolve_virtual_range_frame(
+        root: AddressSpaceRoot,
+        addr: VirtAddr,
+    ) -> Option<(u64, PhysAddr)>;
+    pub fn kernel_address_space_root() -> AddressSpaceRoot;
     // Registry (async FFI)
     pub fn reg_get_value(key_path: &str, name: &str) -> AbiFuture<Option<Data>>;
     pub fn reg_set_value(

@@ -7,7 +7,9 @@ use kernel_types::irq::{
 use kernel_types::memory::PhysicalMappingCache;
 use spin::Mutex;
 
-use crate::memory::paging::map::{allocate_auto_kernel_range_mapped_contiguous, virt_to_phys};
+use crate::memory::paging::map::{
+    allocate_auto_kernel_range_mapped_contiguous, kernel_virt_to_phys,
+};
 use crate::memory::paging::mmio::map_physical_pages;
 use crate::platform::CpuPlatform;
 
@@ -400,7 +402,7 @@ fn allocate_memory_aligned(bytes: u64, alignment: u64) -> Option<Memory> {
         PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE,
     )
     .ok()?;
-    let (_, phys) = virt_to_phys(VirtAddr::new(virt.as_u64()))?;
+    let (_, phys) = kernel_virt_to_phys(VirtAddr::new(virt.as_u64()))?;
     let aligned_phys = phys.as_u64().checked_add(alignment - 1)? & !(alignment - 1);
     let aligned_virt = virt.as_u64() + aligned_phys - phys.as_u64();
     unsafe { core::ptr::write_bytes(aligned_virt as *mut u8, 0, bytes as usize) };

@@ -1,4 +1,8 @@
 use core::arch::asm;
+use core::convert::Infallible;
+use core::ptr::NonNull;
+
+use alloc::vec::Vec;
 
 use aarch64_vmsa::address::{Level, TranslationGranule};
 use aarch64_vmsa::attrs::{
@@ -12,31 +16,28 @@ use aarch64_vmsa::config::format::{NativeEndian, Vmsa64};
 use aarch64_vmsa::config::granule::Granule4KiB;
 use aarch64_vmsa::config::regime::NonSecureEl1Stage1;
 use aarch64_vmsa::descriptor::{DescriptorFormat, DescriptorLayout, HasLayout};
-use aarch64_vmsa::mapper::{
-    Mapper, MapperError, MapperInvalidation, SemanticMapperError, decode_semantic_leaf,
-};
+use aarch64_vmsa::mapper::{Mapper, MapperError, SemanticMapperError, decode_semantic_leaf};
 use aarch64_vmsa::regime::TranslationRegime;
 use aarch64_vmsa::table::{
-    RecursiveTableAccess, RootTable, RootTableGeometry, TableAccessLocation, TableAddr,
-    TableAllocLayout, TableFrameProvider, TableGeometry, TableReclaim,
+    RecursiveTableAccess, RootTable, RootTableGeometry, TableAccess, TableAccessLocation,
+    TableAccessMut, TableAddr, TableAllocLayout, TableFrameProvider, TableGeometry, TableReclaim,
+    TranslationTable, TranslationTableMut,
 };
 use aarch64_vmsa::translation::Stage1;
 use aarch64_vmsa::translation::{WalkInputAddr, WalkOutcome, WalkOutputAddr, Walker};
-use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::{PageMapError, PageMapFailure};
 
 use crate::memory::paging::frame_alloc::{KernelFrameAllocator, KernelPageTableFrameAllocator};
 use crate::memory::paging::types::UserVmLayout;
 use crate::memory::paging::types::{
-    KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
-    UnmapFrameDisposition,
+    KernelVirtualLayout, MappingSize, PagingCapabilities, ResolvedMapping,
 };
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator, PagingPlatform};
 use crate::util::boot_info;
 
 use super::super::platform::Aarch64Platform;
-use super::address_space::Root;
 
 type Regime = NonSecureEl1Stage1;
 type Granule = Granule4KiB;
@@ -73,6 +74,7 @@ impl Stage1PermissionConfig for MapperConfig {}
 
 struct Aarch64TableFrames<'a, A: PageTableFrameAllocator> {
     allocator: &'a mut A,
+    reclaims: &'a mut Vec<PhysAddr>,
 }
 
 unsafe impl<A: PageTableFrameAllocator> TableFrameProvider<Granule> for Aarch64TableFrames<'_, A> {
@@ -95,49 +97,22 @@ unsafe impl<A: PageTableFrameAllocator> TableFrameProvider<Granule> for Aarch64T
             return Err(PageMapError::TranslationFailed());
         }
 
-        TableAddr::new(physical_address.as_u64()).map_err(|_| PageMapError::TranslationFailed())
+        match TableAddr::new(physical_address.as_u64()) {
+            Ok(address) => Ok(address),
+            Err(_) => {
+                self.allocator.free_page_table_frame(physical_address);
+                Err(PageMapError::TranslationFailed())
+            }
+        }
     }
 
     fn reclaim_table(&mut self, reclaim: TableReclaim<Granule>) -> Result<(), Self::Error> {
-        self.allocator
-            .free_page_table_frame(PhysAddr::new(reclaim.addr().raw()));
+        self.reclaims.push(PhysAddr::new(reclaim.addr().raw()));
         Ok(())
     }
 }
 
-struct Aarch64Invalidation;
-
-unsafe impl MapperInvalidation<Format, Granule> for Aarch64Invalidation {
-    fn leaf_inserted(&mut self, _: TableAccessLocation<Format, Granule>, _: usize, _: u64, _: u64) {
-    }
-
-    fn leaf_removed(&mut self, _: TableAccessLocation<Format, Granule>, _: usize, _: u64) {}
-
-    fn table_descriptor_inserted(
-        &mut self,
-        _: TableAccessLocation<Format, Granule>,
-        _: usize,
-        _: u64,
-        _: u64,
-    ) {
-    }
-
-    fn table_descriptor_removed(
-        &mut self,
-        _: TableAccessLocation<Format, Granule>,
-        _: usize,
-        _: u64,
-    ) {
-    }
-
-    fn before_table_frame_reclaim(&mut self, _: TableAddr<Granule>, _: TableAllocLayout) {}
-
-    fn synchronize(&mut self) {
-        synchronize_all();
-    }
-}
-
-fn root_table(root: Root) -> Result<RootTable<Format, Regime, Granule>, PageMapError> {
+fn root_table(root: AddressSpaceRoot) -> Result<RootTable<Format, Regime, Granule>, PageMapError> {
     let info = &boot_info().arch_info;
     let address = TableAddr::new(root.physical_address().as_u64())
         .map_err(|_| PageMapError::TranslationFailed())?;
@@ -173,7 +148,7 @@ fn input_address(
     root: RootTable<Format, Regime, Granule>,
     address: u64,
 ) -> Result<WalkInputAddr, PageMapError> {
-    WalkInputAddr::from_canonical(address, root.addr_bits())
+    aarch64_vmsa::translation::from_canonical(address, root.addr_bits())
         .map_err(|_| PageMapError::TranslationFailed())
 }
 
@@ -191,6 +166,74 @@ fn page_error(size: MappingSize, failure: PageMapFailure) -> PageMapError {
         0x4000_0000 => PageMapError::Page1GiB(failure),
         0x20_0000 => PageMapError::Page2MiB(failure),
         _ => PageMapError::Page4KiB(failure),
+    }
+}
+
+
+struct ScratchTableAccess {
+    scratch: VirtAddr,
+}
+
+impl ScratchTableAccess {
+    fn new() -> Result<Self, PageMapError> {
+        Ok(Self {
+            scratch: crate::memory::paging::zero::page_table_scratch_address()?,
+        })
+    }
+
+    fn map_table(
+        &self,
+        location: TableAccessLocation<'_, Format, Granule>,
+    ) -> Result<NonNull<u64>, PageMapError> {
+        unsafe {
+            replace_leaf_with_walker(self.scratch, Some(PhysAddr::new(location.addr().raw())))?;
+        }
+        NonNull::new(self.scratch.as_mut_ptr::<u64>()).ok_or(PageMapError::NoMemoryMap())
+    }
+}
+
+impl Drop for ScratchTableAccess {
+    fn drop(&mut self) {
+        let _ = unsafe { replace_leaf_with_walker(self.scratch, None) };
+    }
+}
+
+unsafe impl TableAccess<Format, Granule> for ScratchTableAccess {
+    type Error = PageMapError;
+
+    fn table_at<'a>(
+        &'a self,
+        location: TableAccessLocation<'a, Format, Granule>,
+    ) -> Result<TranslationTable<'a, Format, Granule>, Self::Error> {
+        let base = self.map_table(location)?;
+        Ok(unsafe { TranslationTable::from_raw_parts(base, location.shape()) })
+    }
+}
+
+unsafe impl TableAccessMut<Format, Granule> for ScratchTableAccess {
+    fn table_at_mut<'a>(
+        &'a mut self,
+        location: TableAccessLocation<'a, Format, Granule>,
+    ) -> Result<TranslationTableMut<'a, Format, Granule>, Self::Error> {
+        let base = self.map_table(location)?;
+        Ok(unsafe { TranslationTableMut::from_raw_parts(base, location.shape()) })
+    }
+}
+
+struct NoTableFrames;
+
+unsafe impl TableFrameProvider<Granule> for NoTableFrames {
+    type Error = Infallible;
+
+    fn allocate_zeroed_table(
+        &mut self,
+        _: TableAllocLayout,
+    ) -> Result<TableAddr<Granule>, Self::Error> {
+        unreachable!()
+    }
+
+    fn reclaim_table(&mut self, _: TableReclaim<Granule>) -> Result<(), Self::Error> {
+        unreachable!()
     }
 }
 
@@ -255,24 +298,12 @@ fn leaf_attributes(flags: PageFlags, cache: Option<PhysicalMappingCache>) -> Lea
     }
 }
 
-fn synchronize_all() {
-    unsafe {
-        asm!(
-            "dsb ishst",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            options(nostack, preserves_flags)
-        );
-    }
-}
-
 fn synchronize_address(address: VirtAddr) {
     let operand = (address.as_u64() >> Granule::SHIFT) & ((1u64 << 44) - 1);
     unsafe {
         asm!(
             "dsb ishst",
-            "tlbi vaae1is, {operand}",
+            "tlbi vaae1, {operand}",
             "dsb ish",
             "isb",
             operand = in(reg) operand,
@@ -301,7 +332,7 @@ unsafe fn replace_leaf_with_walker(
             }
             (invalid.cursor(), invalid.entry_index(), None)
         }
-        WalkOutcome::Leaf(leaf) if physical_address.is_none() => {
+        WalkOutcome::Leaf(leaf) => {
             if leaf.level() != Format::FINAL_LEVEL {
                 return Err(PageMapError::TranslationFailed());
             }
@@ -310,9 +341,6 @@ unsafe fn replace_leaf_with_walker(
                 leaf.entry_index(),
                 Some(PhysAddr::new(leaf.output_base().raw())),
             )
-        }
-        WalkOutcome::Leaf(_) => {
-            return Err(PageMapError::Page4KiB(PageMapFailure::PageAlreadyMapped));
         }
         WalkOutcome::Invalid(_) => return Err(PageMapError::TranslationFailed()),
     };
@@ -359,7 +387,7 @@ unsafe fn replace_leaf_with_walker(
         <<Format as HasLayout<
             <Regime as TranslationRegime>::Stage,
             Granule,
-        >>::Layout as DescriptorLayout<<Regime as TranslationRegime>::Stage, Granule>>::leaf_descriptor(
+        >>::Layout as DescriptorLayout<Granule>>::leaf_descriptor(
             aarch64_vmsa::address::PhysAddr(physical_address.as_u64()),
             Format::FINAL_LEVEL,
             fields,
@@ -398,25 +426,28 @@ unsafe fn zero_frame_with_walker(
     Ok(())
 }
 
-fn resolve_in_current_root(virtual_address: VirtAddr) -> Option<ResolvedMapping> {
-    let walker = current_walker().ok()?;
-    let root = root_table(<Aarch64Platform as AddressSpacePlatform>::current_root()).ok()?;
+fn resolve_in_root(
+    address_space_root: AddressSpaceRoot,
+    virtual_address: VirtAddr,
+) -> Option<ResolvedMapping> {
+    let root = root_table(address_space_root).ok()?;
     let input = input_address(root, virtual_address.as_u64()).ok()?;
-    let leaf = walker.translate(input).ok()??;
-    let mapping_size = TableGeometry::<Format, Granule>::level_span(leaf.level())?;
+    let access = ScratchTableAccess::new().ok()?;
+    let mapper = Mapper::new_offline(root, access, NoTableFrames).ok()?;
+    let mapping = mapper.translate(input).ok()??;
     let config = MapperConfig {
         mair: boot_info().arch_info.mair_el1,
     };
     let attrs = decode_semantic_leaf::<Format, Regime, Granule, MapperConfig>(
         &config,
-        leaf.level(),
-        *leaf.fields(),
+        mapping.level(),
+        *mapping.fields(),
     )
     .ok()?;
 
     Some(ResolvedMapping {
-        mapping_size,
-        phys_addr: PhysAddr::new(leaf.output().raw()),
+        mapping_size: mapping.covered_size(),
+        phys_addr: PhysAddr::new(mapping.output().raw()),
         user_accessible: attrs.permissions.data.unprivileged != DataRights::None
             || attrs.permissions.execute.unprivileged(),
         writable: attrs.permissions.data.privileged == DataRights::ReadWrite,
@@ -471,6 +502,7 @@ impl PagingPlatform for Aarch64Platform {
         let mut allocator = KernelPageTableFrameAllocator;
         if let Err(error) = unsafe {
             Self::map_leaf(
+                Self::kernel_root(),
                 &mut allocator,
                 virtual_address,
                 physical_address,
@@ -480,7 +512,6 @@ impl PagingPlatform for Aarch64Platform {
                     | PageFlags::NO_EXECUTE
                     | PageFlags::GLOBAL,
                 None,
-                LocalTlbFlush::Flush,
             )
         } {
             unsafe { KernelFrameAllocator::release_reserved_mapping_frame(physical_address, size) };
@@ -502,117 +533,125 @@ impl PagingPlatform for Aarch64Platform {
     }
 
     unsafe fn map_leaf<A: PageTableFrameAllocator>(
+        address_space_root: AddressSpaceRoot,
         allocator: &mut A,
         virt: VirtAddr,
         phys: PhysAddr,
         size: MappingSize,
         flags: PageFlags,
         cache: Option<PhysicalMappingCache>,
-        _flush: LocalTlbFlush,
     ) -> Result<(), PageMapError> {
-        let root = root_table(<Self as AddressSpacePlatform>::current_root())?;
-        let input = input_address(root, virt.as_u64())?;
-        let level = mapping_level(size)?;
-        let access = recursive_access(root)?;
-        let frames = Aarch64TableFrames { allocator };
-        let mut mapper = Mapper::new_live(root, access, frames, Aarch64Invalidation)
-            .map_err(|_| PageMapError::TranslationFailed())?;
-        let config = MapperConfig {
-            mair: boot_info().arch_info.mair_el1,
-        };
-        let table_attrs = TableAttrs {
-            restrictions: TwoPrivilegeTableRestrictions {
-                privileged_data_limit: DataRights::ReadWrite,
-                unprivileged_data_limit: DataRights::ReadWrite,
-                privileged_execute_limit: true,
-                unprivileged_execute_limit: true,
-            },
-            pas: (),
-            controls: SemanticVmsa64Stage1TableControls {
-                access_flag: true,
-                software: SoftwareMetadata::new(0),
-            },
-        };
+        crate::platform::with_interrupts_disabled(|| {
+            let root = root_table(address_space_root)?;
+            let input = input_address(root, virt.as_u64())?;
+            let level = mapping_level(size)?;
+            let mut reclaims = Vec::new();
+            let config = MapperConfig {
+                mair: boot_info().arch_info.mair_el1,
+            };
+            let table_attrs = TableAttrs {
+                restrictions: TwoPrivilegeTableRestrictions {
+                    privileged_data_limit: DataRights::ReadWrite,
+                    unprivileged_data_limit: DataRights::ReadWrite,
+                    privileged_execute_limit: true,
+                    unprivileged_execute_limit: true,
+                },
+                pas: (),
+                controls: SemanticVmsa64Stage1TableControls {
+                    access_flag: true,
+                    software: SoftwareMetadata::new(0),
+                },
+            };
 
-        mapper
-            .map_semantic_leaf(
-                &config,
-                input,
-                WalkOutputAddr::new(phys.as_u64()),
-                level,
-                leaf_attributes(flags, cache),
-                table_attrs,
-            )
-            .map(|_| ())
-            .map_err(|error| match error {
-                SemanticMapperError::Mapper(MapperError::Frame(_)) => {
-                    page_error(size, PageMapFailure::FrameAllocationFailed)
-                }
-                SemanticMapperError::Mapper(MapperError::AlreadyMapped {
-                    level: existing, ..
-                }) if existing.is_before(level) => {
-                    page_error(size, PageMapFailure::ParentEntryHugePage)
-                }
-                SemanticMapperError::Mapper(MapperError::AlreadyMapped { .. }) => {
-                    page_error(size, PageMapFailure::PageAlreadyMapped)
-                }
-                _ => PageMapError::TranslationFailed(),
-            })
+            let result = {
+                let access = ScratchTableAccess::new()?;
+                let frames = Aarch64TableFrames {
+                    allocator,
+                    reclaims: &mut reclaims,
+                };
+                let mut mapper = Mapper::new_offline(root, access, frames)
+                    .map_err(|_| PageMapError::TranslationFailed())?;
+                mapper
+                    .map_semantic_leaf(
+                        &config,
+                        input,
+                        WalkOutputAddr::new(phys.as_u64()),
+                        level,
+                        leaf_attributes(flags, cache),
+                        table_attrs,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| match error {
+                        SemanticMapperError::Mapper(MapperError::Frame(
+                            PageMapError::NoMemory(),
+                        )) => page_error(size, PageMapFailure::FrameAllocationFailed),
+                        SemanticMapperError::Mapper(MapperError::AlreadyMapped {
+                            level: existing,
+                            ..
+                        }) if existing.is_before(level) => {
+                            page_error(size, PageMapFailure::ParentEntryHugePage)
+                        }
+                        SemanticMapperError::Mapper(MapperError::AlreadyMapped { .. }) => {
+                            page_error(size, PageMapFailure::PageAlreadyMapped)
+                        }
+                        SemanticMapperError::Mapper(MapperError::Access(error))
+                        | SemanticMapperError::Mapper(MapperError::Frame(error)) => error,
+                        _ => PageMapError::TranslationFailed(),
+                    })
+            };
+            for physical_address in reclaims {
+                allocator.free_page_table_frame(physical_address);
+            }
+            unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+            result
+        })
     }
 
     unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
+        address_space_root: AddressSpaceRoot,
         allocator: &mut A,
         virt: VirtAddr,
         size: MappingSize,
-        disposition: UnmapFrameDisposition,
-        _flush: LocalTlbFlush,
+        table_reclaims: &mut Vec<PhysAddr>,
     ) -> Result<Option<PhysAddr>, PageMapError> {
-        let root = root_table(<Self as AddressSpacePlatform>::current_root())?;
-        let input = input_address(root, virt.as_u64())?;
-        let level = mapping_level(size)?;
-        let access = recursive_access(root)?;
-        let frames = Aarch64TableFrames { allocator };
-        let mut mapper = Mapper::new_live(root, access, frames, Aarch64Invalidation)
-            .map_err(|_| PageMapError::TranslationFailed())?;
-        let mapping = mapper
-            .translate(input)
-            .map_err(|_| PageMapError::TranslationFailed())?
-            .ok_or(PageMapError::TranslationFailed())?;
-        if mapping.level() != level || mapping.covered_size() != size.bytes {
-            return Err(PageMapError::TranslationFailed());
-        }
-        let physical_address = PhysAddr::new(mapping.output_base().raw());
-        unsafe { mapper.unmap(input) }.map_err(|_| PageMapError::TranslationFailed())?;
-
-        match disposition {
-            UnmapFrameDisposition::FreeMappedFrame => unsafe {
-                KernelFrameAllocator::free_mapping_frame(physical_address, size)
-            },
-            UnmapFrameDisposition::ReleaseReservedFrame => unsafe {
-                KernelFrameAllocator::release_reserved_mapping_frame(physical_address, size)
-            },
-            UnmapFrameDisposition::KeepFrame => {}
-        }
-        Ok(Some(physical_address))
+        crate::platform::with_interrupts_disabled(|| {
+            let root = root_table(address_space_root)?;
+            let input = input_address(root, virt.as_u64())?;
+            let level = mapping_level(size)?;
+            let access = ScratchTableAccess::new()?;
+            let frames = Aarch64TableFrames {
+                allocator,
+                reclaims: table_reclaims,
+            };
+            let mut mapper = Mapper::new_offline(root, access, frames)
+                .map_err(|_| PageMapError::TranslationFailed())?;
+            let mapping = mapper
+                .translate(input)
+                .map_err(|_| PageMapError::TranslationFailed())?
+                .ok_or(PageMapError::TranslationFailed())?;
+            if mapping.level() != level
+                || mapping.covered_input_base() != input.raw()
+                || mapping.covered_size() != size.bytes
+            {
+                return Err(PageMapError::TranslationFailed());
+            }
+            let physical_address = PhysAddr::new(mapping.output_base().raw());
+            unsafe { mapper.unmap_reclaim(input) }
+                .map_err(|_| PageMapError::TranslationFailed())?;
+            Ok(Some(physical_address))
+        })
     }
 
-    fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping> {
-        resolve_in_current_root(virt)
+    fn resolve_mapping(
+        address_space_root: AddressSpaceRoot,
+        virt: VirtAddr,
+    ) -> Option<ResolvedMapping> {
+        crate::platform::with_interrupts_disabled(|| {
+            resolve_in_root(address_space_root, virt)
+        })
     }
 
-    fn resolve_mapping_in_root(root: Self::Root, virt: VirtAddr) -> Option<ResolvedMapping> {
-        let previous = <Self as AddressSpacePlatform>::current_root();
-        if previous != root {
-            unsafe { <Self as AddressSpacePlatform>::switch_root(root) };
-        }
-        let resolved = resolve_in_current_root(virt);
-        if previous != root {
-            unsafe { <Self as AddressSpacePlatform>::switch_root(previous) };
-        }
-        resolved
-    }
-
-    fn local_flush_tlb_all() {
+    fn local_flush_tlb_all(_include_global: bool) {
         unsafe {
             asm!(
                 "dsb ishst",
@@ -627,7 +666,7 @@ impl PagingPlatform for Aarch64Platform {
     fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64) {
         let stride = if stride == 0 { Granule::SIZE } else { stride };
         if !stride.is_power_of_two() {
-            Self::local_flush_tlb_all();
+            Self::local_flush_tlb_all(false);
             return;
         }
         let mut address = start.as_u64() & !(stride - 1);
@@ -637,7 +676,7 @@ impl PagingPlatform for Aarch64Platform {
             .and_then(|value| value.checked_add(stride - 1))
             .map(|value| value & !(stride - 1))
         else {
-            Self::local_flush_tlb_all();
+            Self::local_flush_tlb_all(false);
             return;
         };
 
@@ -652,7 +691,7 @@ impl PagingPlatform for Aarch64Platform {
                 );
             }
             let Some(next) = address.checked_add(stride) else {
-                Self::local_flush_tlb_all();
+                Self::local_flush_tlb_all(false);
                 return;
             };
             address = next;
@@ -663,7 +702,6 @@ impl PagingPlatform for Aarch64Platform {
     }
 
     fn broadcast_tlb_shootdown() -> bool {
-        synchronize_all();
         super::super::interrupts::init::controller()
             .broadcast_ipi(crate::platform::tlb_shootdown_vector());
         true

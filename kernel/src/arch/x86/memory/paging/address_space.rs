@@ -1,10 +1,11 @@
 use core::mem::size_of;
 
+use kernel_types::arch::AddressSpaceRoot;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 use x86_64::PhysAddr;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{PageTable, PageTableIndex, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{PageTable, PageTableFlags, PageTableIndex, PhysFrame};
 
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator};
 use crate::util::boot_info;
@@ -12,36 +13,31 @@ use crate::util::boot_info;
 use super::super::super::platform::X86Platform;
 use super::tables::{get_level4_page_table, init_kernel_cr3, kernel_cr3};
 
-pub type Root = PhysFrame<Size4KiB>;
-
 impl AddressSpacePlatform for X86Platform {
-    type Root = Root;
-
     fn init_kernel_root() {
         init_kernel_cr3();
     }
 
-    fn kernel_root() -> Self::Root {
-        kernel_cr3()
+    fn kernel_root() -> AddressSpaceRoot {
+        unsafe { AddressSpaceRoot::from_raw(kernel_cr3().start_address().as_u64()) }
     }
 
-    fn current_root() -> Self::Root {
-        Cr3::read().0
+    fn current_root() -> AddressSpaceRoot {
+        unsafe { AddressSpaceRoot::from_raw(Cr3::read().0.start_address().as_u64()) }
     }
 
-    unsafe fn switch_root(root: Self::Root) {
+    unsafe fn switch_root(root: AddressSpaceRoot) {
         unsafe {
-            Cr3::write(root, Cr3::read().1);
+            Cr3::write(
+                PhysFrame::containing_address(PhysAddr::new(root.as_u64())),
+                Cr3::read().1,
+            );
         }
-    }
-
-    fn root_to_phys(root: Self::Root) -> kernel_types::arch::PhysAddr {
-        kernel_types::arch::PhysAddr::new(root.start_address().as_u64())
     }
 
     fn create_user_root<A: PageTableFrameAllocator>(
         allocator: &mut A,
-    ) -> Result<Self::Root, PageMapError> {
+    ) -> Result<AddressSpaceRoot, PageMapError> {
         let root_phys = allocator
             .allocate_page_table_frame()
             .ok_or(PageMapError::NoMemory())?;
@@ -64,21 +60,29 @@ impl AddressSpacePlatform for X86Platform {
         for idx in 256..512 {
             new_table[idx] = kernel_pml4[idx].clone();
         }
+        new_table[usize::from(recursive_index)].set_addr(
+            PhysAddr::new(root_phys.as_u64()),
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        );
 
         let _ = unsafe {
-            crate::memory::paging::mmio::unmap_physical_pages(root_virt, size_of::<PageTable>() as u64)
+            crate::memory::paging::mmio::unmap_physical_pages(
+                root_virt,
+                size_of::<PageTable>() as u64,
+            )
         };
 
-        Ok(PhysFrame::containing_address(PhysAddr::new(
-            root_phys.as_u64(),
-        )))
+        Ok(unsafe { AddressSpaceRoot::from_raw(root_phys.as_u64()) })
     }
 
     unsafe fn destroy_user_root<A: PageTableFrameAllocator>(
-        root: Self::Root,
+        root: AddressSpaceRoot,
         allocator: &mut A,
     ) -> Result<(), PageMapError> {
-        allocator.free_page_table_frame(root.start_address().into());
+        if root == Self::current_root() || root == Self::kernel_root() {
+            return Err(PageMapError::TranslationFailed());
+        }
+        allocator.free_page_table_frame(root.physical_address());
         Ok(())
     }
 }

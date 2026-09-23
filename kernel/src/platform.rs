@@ -11,7 +11,7 @@ use acpi::AcpiTables;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{HardwareInterruptId, MsiBindingRequest, MsiMessage, PlatformCpuId};
 use kernel_types::memory::Module;
 use kernel_types::memory::PhysicalMappingCache;
@@ -20,8 +20,7 @@ use kernel_types::runtime::BlockOnThreadState;
 use kernel_types::status::PageMapError;
 
 use crate::memory::paging::types::{
-    KernelVirtualLayout, LocalTlbFlush, MappingSize, PagingCapabilities, ResolvedMapping,
-    UnmapFrameDisposition,
+    KernelVirtualLayout, MappingSize, PagingCapabilities, ResolvedMapping,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -125,22 +124,18 @@ pub trait TimerPlatform: Platform {
 }
 
 pub trait AddressSpacePlatform: Platform {
-    type Root: Copy + Eq;
-
     fn init_kernel_root();
-    fn kernel_root() -> Self::Root;
-    fn current_root() -> Self::Root;
+    fn kernel_root() -> AddressSpaceRoot;
+    fn current_root() -> AddressSpaceRoot;
 
-    unsafe fn switch_root(root: Self::Root);
-
-    fn root_to_phys(root: Self::Root) -> PhysAddr;
+    unsafe fn switch_root(root: AddressSpaceRoot);
 
     fn create_user_root<A: PageTableFrameAllocator>(
         allocator: &mut A,
-    ) -> Result<Self::Root, PageMapError>;
+    ) -> Result<AddressSpaceRoot, PageMapError>;
 
     unsafe fn destroy_user_root<A: PageTableFrameAllocator>(
-        root: Self::Root,
+        root: AddressSpaceRoot,
         allocator: &mut A,
     ) -> Result<(), PageMapError>;
 }
@@ -164,27 +159,26 @@ pub trait PagingPlatform: AddressSpacePlatform {
         physical_address: PhysAddr,
     ) -> Result<(), PageMapError>;
     unsafe fn map_leaf<A: PageTableFrameAllocator>(
+        root: AddressSpaceRoot,
         allocator: &mut A,
         virt: VirtAddr,
         phys: PhysAddr,
         size: MappingSize,
         flags: PageFlags,
         cache: Option<PhysicalMappingCache>,
-        flush: LocalTlbFlush,
     ) -> Result<(), PageMapError>;
 
     unsafe fn unmap_leaf<A: PageTableFrameAllocator>(
+        root: AddressSpaceRoot,
         allocator: &mut A,
         virt: VirtAddr,
         size: MappingSize,
-        disposition: UnmapFrameDisposition,
-        flush: LocalTlbFlush,
+        table_reclaims: &mut Vec<PhysAddr>,
     ) -> Result<Option<PhysAddr>, PageMapError>;
 
-    fn resolve_mapping(virt: VirtAddr) -> Option<ResolvedMapping>;
-    fn resolve_mapping_in_root(root: Self::Root, virt: VirtAddr) -> Option<ResolvedMapping>;
+    fn resolve_mapping(root: AddressSpaceRoot, virt: VirtAddr) -> Option<ResolvedMapping>;
 
-    fn local_flush_tlb_all();
+    fn local_flush_tlb_all(include_global: bool);
     fn local_flush_tlb_range(start: VirtAddr, size: u64, stride: u64);
 
     fn broadcast_tlb_shootdown() -> bool;
@@ -269,12 +263,9 @@ pub fn user_vm_layout() -> UserVmLayout {
     <ActivePlatform as PagingPlatform>::user_virtual_layout()
 }
 
-pub fn resolve_mapping_in_root(
-    root: <ActivePlatform as AddressSpacePlatform>::Root,
-    virt: VirtAddr,
-) -> Option<ResolvedMapping> {
+pub fn resolve_mapping_in_root(root: AddressSpaceRoot, virt: VirtAddr) -> Option<ResolvedMapping> {
     <ActivePlatform as InterruptPlatform>::with_interrupts_disabled(|| {
-        <ActivePlatform as PagingPlatform>::resolve_mapping_in_root(root, virt)
+        <ActivePlatform as PagingPlatform>::resolve_mapping(root, virt)
     })
 }
 pub fn current_cpu_id() -> usize {
