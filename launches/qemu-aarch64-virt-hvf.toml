@@ -16,8 +16,8 @@ firmware_files = [
 args = [
     "-m", "{memory}",
     "-cpu", "host",
-    "-machine", "virt,gic-version=3,its=off,msi=off,iommu=smmuv3",
-    "-accel", "hvf,kernel-irqchip=off",
+    "-machine", "virt,gic-version=3,msi=gicv2m,iommu=smmuv3",
+    "-accel", "hvf,kernel-irqchip=on",
     "-smp", "{cpus}",
     "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",
     "-serial", "{primary_serial}",

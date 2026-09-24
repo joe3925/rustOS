@@ -224,13 +224,17 @@ where
     let profile_timer = KernelStopwatch::start();
     let mut completion = core::pin::pin!(completion);
 
-    let Some(poll_ns) = virtio_completion_should_poll(byte_len) else {
-        let result = completion.await;
+    let poll_ns = match virtio_completion_should_poll(byte_len) {
+        Some(poll_ns) => poll_ns,
+        None if qs.irq_handle.get().is_none() => 0,
+        None => {
+            let result = completion.await;
 
-        let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
 
-        record_completion_fit_sample(byte_len, elapsed_ns);
-        return result;
+            record_completion_fit_sample(byte_len, elapsed_ns);
+            return result;
+        }
     };
 
     let poll_timer = KernelStopwatch::start();
@@ -257,6 +261,35 @@ where
         }
 
         core::hint::spin_loop();
+    }
+
+    if qs.irq_handle.get().is_none() {
+        loop {
+            drain_queue_completions(qs);
+
+            if let Some(result) = poll_fn(|cx| match completion.as_mut().poll(cx) {
+                Poll::Ready(result) => Poll::Ready(Some(result)),
+                Poll::Pending => Poll::Ready(None),
+            })
+            .await
+            {
+                let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                record_completion_fit_sample(byte_len, elapsed_ns);
+                return result;
+            }
+
+            let mut yielded = false;
+            poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
     }
 
     let result = completion.await;
@@ -603,12 +636,20 @@ async fn virtio_init_complete<'req, 'data, 'b>(
 
     let line_irq_handle: Option<IrqHandle> = if !use_msix {
         if let Some(g) = gsi {
-            bind_wired_interrupt(
+            let handle = bind_wired_interrupt(
                 HardwareInterruptId(g as u32),
                 virtio_isr,
                 caps.isr_cfg.as_u64() as usize,
-            )
+            );
+            if handle.is_none() {
+                println!("virtio-blk: failed to bind INTx GSI {g}; using polling");
+            }
+            handle
         } else {
+            println!(
+                "virtio-blk: no interrupt route (PCI line {:?}); using polling",
+                int_line
+            );
             None
         }
     } else {
