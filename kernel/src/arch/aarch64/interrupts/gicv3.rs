@@ -15,7 +15,7 @@ use super::controller::{
 };
 use super::discovery::GicDescription;
 use super::entry::InterruptToken;
-use super::its::Its;
+use super::msi::MsiInterruptController;
 
 pub(crate) struct GicV3 {
     distributor_mapping: KernelMapping,
@@ -24,7 +24,7 @@ pub(crate) struct GicV3 {
     redistributor: usize,
     redistributor_phys: u64,
     redistributor_size: usize,
-    its: Option<Its>,
+    msi: Option<MsiInterruptController>,
     distributor_lock: Mutex<()>,
 }
 
@@ -45,7 +45,7 @@ impl GicV3 {
             PhysicalMappingCache::Uncached,
         )
         .expect("failed to map GICv3 redistributor range");
-        let its = description.its.and_then(Its::new);
+        let msi = description.msi.and_then(MsiInterruptController::new);
         Self {
             distributor: distributor.address().as_u64() as usize,
             redistributor: redistributor.address().as_u64() as usize,
@@ -53,7 +53,7 @@ impl GicV3 {
             redistributor_mapping: redistributor,
             redistributor_phys: description.redistributor,
             redistributor_size: description.redistributor_size as usize,
-            its,
+            msi,
             distributor_lock: Mutex::new(()),
         }
     }
@@ -117,9 +117,9 @@ impl GicV3 {
         }
         dsb(SY);
         isb(SY);
-        if let Some(its) = &self.its {
+        if let Some(msi) = &self.msi {
             let frame_phys = self.redistributor_phys + (frame - self.redistributor) as u64;
-            let _ = its.init_cpu(
+            let _ = msi.init_cpu(
                 frame,
                 frame_phys,
                 crate::platform::current_platform_cpu_id(),
@@ -135,9 +135,9 @@ impl GicV3 {
         }
 
         let interrupt_id = self
-            .its
+            .msi
             .as_ref()
-            .and_then(|its| its.vector_for_lpi(intid))
+            .and_then(|msi| msi.vector_for_interrupt(intid))
             .map(u32::from)
             .unwrap_or(intid);
 
@@ -209,13 +209,43 @@ impl GicV3 {
         request: &kernel_types::irq::MsiBindingRequest,
         vector: u8,
     ) -> Option<kernel_types::irq::MsiMessage> {
-        self.its.as_ref()?.bind(request, vector)
+        let msi = self.msi.as_ref()?;
+        let binding = msi.bind(request, vector)?;
+        if let Some((intid, target)) = binding.spi {
+            let Some(route) = route_affinity(target) else {
+                msi.unbind(vector);
+                return None;
+            };
+            self.configure_msi_spi(intid, route);
+        }
+        Some(binding.message)
     }
 
     pub(super) fn unbind_msi(&self, vector: u8) {
-        if let Some(its) = &self.its {
-            its.unbind(vector);
+        if let Some(msi) = &self.msi {
+            if let Some(intid) = msi.spi_for_vector(vector) {
+                self.mask_spi(intid);
+            }
+            msi.unbind(vector);
         }
+    }
+
+    fn configure_msi_spi(&self, intid: u32, route: u64) {
+        assert!((SPI_START..=SPI_END).contains(&intid));
+        let _lock = self.distributor_lock.lock();
+        unsafe {
+            self.write32(0x180 + (intid / 32) * 4, 1 << (intid % 32));
+            self.wait_rwp();
+            self.write64(0x6100 + (intid - 32) * 8, route);
+            let offset = 0xc00 + (intid / 16) * 4;
+            let shift = (intid % 16) * 2;
+            let config = self.read32(offset) | 0b10 << shift;
+            self.write32(offset, config);
+            self.write32(0x280 + (intid / 32) * 4, 1 << (intid % 32));
+            self.write32(0x100 + (intid / 32) * 4, 1 << (intid % 32));
+            self.wait_rwp();
+        }
+        dsb(SY);
     }
 
     fn current_redistributor(&self) -> usize {
@@ -283,6 +313,21 @@ fn current_route_affinity() -> u64 {
         | ((mpidr >> 16) & 0xff) << 16
         | ((mpidr >> 8) & 0xff) << 8
         | mpidr & 0xff
+}
+
+fn route_affinity(target: PlatformCpuId) -> Option<u64> {
+    let mpidr = machine_info()
+        .cpu_topology()
+        .processors
+        .iter()
+        .find(|processor| processor.platform_cpu_id == target)?
+        .hardware_id;
+    Some(
+        ((mpidr >> 32) & 0xff) << 32
+            | ((mpidr >> 16) & 0xff) << 16
+            | ((mpidr >> 8) & 0xff) << 8
+            | mpidr & 0xff,
+    )
 }
 
 unsafe fn read_icc_iar1_el1() -> u32 {
