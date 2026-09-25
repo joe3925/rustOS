@@ -626,14 +626,8 @@ fn copy_from_io_buffer_frames(
     dst: *mut u8,
     len: usize,
 ) -> bool {
-    visit_frame_chunks(frames, buffer_offset, len, |address, done, count| {
-        unsafe {
-            ptr::copy_nonoverlapping(
-                address as *const u8,
-                dst.add(done),
-                count,
-            );
-        }
+    visit_frame_chunks(frames, buffer_offset, len, |address, done, count| unsafe {
+        ptr::copy_nonoverlapping(address as *const u8, dst.add(done), count);
     })
 }
 
@@ -643,10 +637,8 @@ fn copy_to_io_buffer_frames(
     src: *const u8,
     len: usize,
 ) -> bool {
-    visit_frame_chunks(frames, buffer_offset, len, |address, done, count| {
-        unsafe {
-            ptr::copy_nonoverlapping(src.add(done), address as *mut u8, count);
-        }
+    visit_frame_chunks(frames, buffer_offset, len, |address, done, count| unsafe {
+        ptr::copy_nonoverlapping(src.add(done), address as *mut u8, count);
     })
 }
 
@@ -672,7 +664,11 @@ fn visit_frame_chunks(
         }
 
         let n = min(frame_len - current_offset, remaining);
-        visit(frame.cpu_address().as_u64() + current_offset as u64, done, n);
+        visit(
+            frame.cpu_address().as_u64() + current_offset as u64,
+            done,
+            n,
+        );
         done += n;
         remaining -= n;
         current_offset = 0;

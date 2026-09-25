@@ -1,14 +1,14 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::cmp::{max, min};
 use core::fmt;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr;
 use core::slice;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
-use spin::{Mutex, RwLock};
 
 #[cfg(not(any(test, feature = "hosted-tests")))]
 use crate::arch::{PagingPlatform, Platform};

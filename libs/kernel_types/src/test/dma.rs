@@ -199,3 +199,164 @@ fn virtual_iobuffer_split_preserves_ranges() {
     right.copy_from_slice(0, &[4, 5, 6, 7, 8]).unwrap();
     assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
 }
+
+#[test]
+fn backing_leases_enforce_chunk_overlap_and_release() {
+    let bytes = [0u8; 1024];
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&bytes),
+        IoBufferBackingConfig::default(),
+    )
+    .unwrap();
+    let first = backing.create_to_device(0, 256).unwrap();
+    assert_eq!(
+        backing.create_to_device(128, 128).unwrap_err(),
+        IoBufferError::LeaseConflict {
+            start: 128,
+            len: 128
+        }
+    );
+    let adjacent = backing.create_to_device(256, 128).unwrap();
+    drop(first);
+    let reused = backing.create_to_device(0, 256).unwrap();
+    drop(reused);
+    drop(adjacent);
+}
+
+#[test]
+fn backing_split_materializes_coarse_claims() {
+    let bytes = [0u8; 32768];
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&bytes),
+        IoBufferBackingConfig::default(),
+    )
+    .unwrap();
+    let whole = backing.create_to_device(0, bytes.len()).unwrap();
+    let (left, right) = whole.split_at(16384).unwrap();
+    let (first, left_rest) = left.split_at(128).unwrap();
+    drop(first);
+    let reclaimed = backing.create_to_device(0, 128).unwrap();
+    assert!(matches!(
+        backing.create_to_device(128, 128),
+        Err(IoBufferError::LeaseConflict { .. })
+    ));
+    drop(reclaimed);
+    drop(right);
+    assert!(matches!(
+        backing.create_to_device(128, 16256),
+        Err(IoBufferError::LeaseConflict { .. })
+    ));
+    drop(left_rest);
+    let restored = backing.create_to_device(0, bytes.len()).unwrap();
+    drop(restored);
+}
+
+#[test]
+fn backing_validates_and_applies_overlap_granularity() {
+    for granularity in [16, 64, 128, 512, 4096] {
+        let bytes = [0u8; 8192];
+        let config =
+            IoBufferBackingConfig::worst_case_for_len_with_granularity(bytes.len(), granularity);
+        let backing = IoBufferBacking::new(IoBufferBackingDesc::Slice(&bytes), config).unwrap();
+        let first = backing.create_to_device(0, granularity).unwrap();
+        assert!(matches!(
+            backing.create_to_device(0, granularity),
+            Err(IoBufferError::LeaseConflict { .. })
+        ));
+        let adjacent = backing.create_to_device(granularity, granularity).unwrap();
+        drop(first);
+        drop(adjacent);
+    }
+
+    let bytes = [0u8; 64];
+    let mut config = IoBufferBackingConfig::default();
+    config.overlap_granularity = 3;
+    assert!(matches!(
+        IoBufferBacking::new(IoBufferBackingDesc::Slice(&bytes), config),
+        Err(IoBufferError::InvalidOverlapGranularity)
+    ));
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&bytes),
+        IoBufferBackingConfig::default(),
+    )
+    .unwrap();
+    let full = backing.create_to_device(0, bytes.len()).unwrap();
+    drop(full);
+}
+
+#[test]
+fn exhausted_lease_table_does_not_retain_overlap() {
+    let bytes = [0u8; 512];
+    let mut config = IoBufferBackingConfig::default();
+    config.lease_capacity = 1;
+    let backing = IoBufferBacking::new(IoBufferBackingDesc::Slice(&bytes), config).unwrap();
+    let first = backing.create_to_device(0, 128).unwrap();
+    assert!(matches!(
+        backing.create_to_device(128, 128),
+        Err(IoBufferError::LeaseCapacityExceeded { capacity: 1 })
+    ));
+    drop(first);
+    let second = backing.create_to_device(128, 128).unwrap();
+    drop(second);
+}
+
+#[test]
+fn redescribe_replaces_overlap_state_with_an_empty_map() {
+    let first_bytes = [0u8; 512];
+    let second_bytes = [0u8; 1024];
+    let mut backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&first_bytes),
+        IoBufferBackingConfig::default(),
+    )
+    .unwrap();
+    let lease = backing.create_to_device(0, 512).unwrap();
+    drop(lease);
+    backing
+        .redescribe(IoBufferBackingDesc::Slice(&second_bytes))
+        .unwrap();
+    let lease = backing.create_to_device(0, 1024).unwrap();
+    drop(lease);
+}
+
+#[test]
+fn concurrent_overlap_and_disjoint_claims_are_exclusive() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let bytes = [0u8; 2048];
+    let backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&bytes),
+        IoBufferBackingConfig::default(),
+    )
+    .unwrap();
+    let barrier = Arc::new(Barrier::new(8));
+    let successes = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..8 {
+            let barrier = barrier.clone();
+            let successes = &successes;
+            let backing = &backing;
+            scope.spawn(move || {
+                barrier.wait();
+                let lease = backing.create_to_device(0, 128).ok();
+                if lease.is_some() {
+                    successes.fetch_add(1, Ordering::AcqRel);
+                }
+                barrier.wait();
+                drop(lease);
+            });
+        }
+    });
+    assert_eq!(successes.load(Ordering::Acquire), 1);
+
+    thread::scope(|scope| {
+        for index in 0..8 {
+            let backing = &backing;
+            scope.spawn(move || {
+                let lease = backing.create_to_device(index * 128, 128).unwrap();
+                std::thread::yield_now();
+                drop(lease);
+            });
+        }
+    });
+}

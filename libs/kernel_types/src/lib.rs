@@ -5,6 +5,8 @@
 #![feature(specialization)]
 #![feature(allocator_api)]
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 extern crate self as kernel_types;
 
 pub use prost::Message;
@@ -30,8 +32,10 @@ pub mod pci;
 pub mod pnp;
 pub mod port;
 pub mod protocol;
+pub mod radix_map;
 pub mod request;
 pub mod runtime;
+pub mod state_map;
 pub mod status;
 
 #[cfg(test)]

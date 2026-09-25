@@ -1,14 +1,22 @@
 use super::construction::{build_backing_into, validate_dma_mapping_layout, validate_snapshot};
-use super::descriptors::{DmaDropContext, DmaRecord};
+use super::descriptors::{DmaDropContext, DmaRecord, DmaRecordPayload};
 use super::*;
+use crate::radix_map::{RadixMap, RadixMapError};
 
 const LEASE_FREE: u8 = 0;
 const LEASE_ACTIVE: u8 = 1;
 const LEASE_RELEASING: u8 = 2;
+const LEASE_RESERVED: u8 = 3;
 const ACCESS_TO_DEVICE: u8 = 1;
 const ACCESS_FROM_DEVICE: u8 = 2;
 const ACCESS_BIDIRECTIONAL: u8 = 3;
 const NO_DMA_RECORD: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
+pub(super) struct LeaseChunkRange {
+    pub(super) first: usize,
+    pub(super) count: usize,
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum BackingMemory<'data> {
@@ -46,6 +54,7 @@ pub struct IoBufferBackingScratch {
     frames: Vec<PhysicalFrameExtent>,
     leases: Box<[LeaseSlot]>,
     dma_records: Vec<DmaRecord>,
+    overlap: Option<RadixMap>,
 }
 
 impl Default for IoBufferBackingScratch {
@@ -55,6 +64,7 @@ impl Default for IoBufferBackingScratch {
             frames: Vec::new(),
             leases: Vec::<LeaseSlot>::new().into_boxed_slice(),
             dma_records: Vec::new(),
+            overlap: None,
         }
     }
 }
@@ -84,6 +94,7 @@ impl IoBufferBackingScratch {
     }
 
     pub fn ensure_capacity(&mut self, config: IoBufferBackingConfig) -> Result<(), IoBufferError> {
+        validate_overlap_granularity(config.overlap_granularity)?;
         if self.leases.len() < config.lease_capacity {
             let mut leases = Vec::new();
             leases
@@ -116,8 +127,8 @@ impl IoBufferBackingScratch {
 pub(super) struct LeaseSlot {
     state: AtomicU8,
     generation: AtomicU32,
-    start: AtomicUsize,
-    len: AtomicUsize,
+    first_chunk: AtomicUsize,
+    chunk_count: AtomicUsize,
     access: AtomicU8,
     dma_record: AtomicUsize,
 }
@@ -127,53 +138,65 @@ impl LeaseSlot {
         Self {
             state: AtomicU8::new(LEASE_FREE),
             generation: AtomicU32::new(1),
-            start: AtomicUsize::new(0),
-            len: AtomicUsize::new(0),
+            first_chunk: AtomicUsize::new(0),
+            chunk_count: AtomicUsize::new(0),
             access: AtomicU8::new(0),
             dma_record: AtomicUsize::new(NO_DMA_RECORD),
         }
     }
 
-    pub(super) fn snapshot(&self) -> Option<LeaseSnapshot> {
+    pub(super) fn snapshot(&self) -> Option<LeaseSlotSnapshot> {
         if self.state.load(Ordering::Acquire) != LEASE_ACTIVE {
             return None;
         }
 
-        Some(LeaseSnapshot {
-            generation: self.generation.load(Ordering::Acquire),
-            start: self.start.load(Ordering::Acquire),
-            len: self.len.load(Ordering::Acquire),
+        let generation = self.generation.load(Ordering::Acquire);
+
+        let snapshot = LeaseSlotSnapshot {
+            generation,
+            range: LeaseChunkRange {
+                first: self.first_chunk.load(Ordering::Acquire),
+                count: self.chunk_count.load(Ordering::Acquire),
+            },
             access: self.access.load(Ordering::Acquire),
             dma_record: self.dma_record.load(Ordering::Acquire),
-        })
+        };
+
+        if self.state.load(Ordering::Acquire) != LEASE_ACTIVE
+            || self.generation.load(Ordering::Acquire) != generation
+        {
+            return None;
+        }
+
+        Some(snapshot)
     }
 
-    fn activate(
-        &self,
-        start: usize,
-        len: usize,
-        access: u8,
-        dma_record: usize,
-    ) -> Result<u32, IoBufferError> {
+    fn try_reserve(&self) -> Option<u32> {
         self.state
             .compare_exchange(
                 LEASE_FREE,
-                LEASE_RELEASING,
+                LEASE_RESERVED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map_err(|_| IoBufferError::InvalidLease)?;
+            .ok()?;
 
-        let generation = self.generation.load(Ordering::Relaxed);
-        self.start.store(start, Ordering::Relaxed);
-        self.len.store(len, Ordering::Relaxed);
+        Some(self.generation.load(Ordering::Relaxed))
+    }
+
+    fn publish(&self, range: LeaseChunkRange, access: u8, dma_record: usize) {
+        self.first_chunk.store(range.first, Ordering::Relaxed);
+        self.chunk_count.store(range.count, Ordering::Relaxed);
         self.access.store(access, Ordering::Relaxed);
         self.dma_record.store(dma_record, Ordering::Relaxed);
         self.state.store(LEASE_ACTIVE, Ordering::Release);
-        Ok(generation)
     }
 
-    fn release(&self, generation: u32) -> Option<usize> {
+    fn cancel_reservation(&self) {
+        self.state.store(LEASE_FREE, Ordering::Release);
+    }
+
+    fn begin_release(&self, generation: u32) -> Option<LeaseSlotSnapshot> {
         let snapshot = self.snapshot()?;
         if snapshot.generation != generation {
             return None;
@@ -192,24 +215,29 @@ impl LeaseSlot {
             return None;
         }
 
-        self.start.store(0, Ordering::Relaxed);
-        self.len.store(0, Ordering::Relaxed);
+        Some(snapshot)
+    }
+
+    fn finish_release(&self) {
+        self.first_chunk.store(0, Ordering::Relaxed);
+        self.chunk_count.store(0, Ordering::Relaxed);
         self.access.store(0, Ordering::Relaxed);
-        let dma_record = self.dma_record.swap(NO_DMA_RECORD, Ordering::AcqRel);
+        self.dma_record.store(NO_DMA_RECORD, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.state.store(LEASE_FREE, Ordering::Release);
-
-        if dma_record == NO_DMA_RECORD {
-            None
-        } else {
-            Some(dma_record)
-        }
     }
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct LeaseSnapshot {
+pub(super) struct LeaseSlotSnapshot {
     pub(super) generation: u32,
+    pub(super) range: LeaseChunkRange,
+    pub(super) access: u8,
+    pub(super) dma_record: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LeaseSnapshot {
     pub(super) start: usize,
     pub(super) len: usize,
     pub(super) access: u8,
@@ -227,9 +255,13 @@ pub struct IoBufferBacking<'data> {
     byte_len: usize,
     pub(super) extents: Vec<IoBufferExtent>,
     pub(super) frames: Vec<PhysicalFrameExtent>,
-    leases: RwLock<Box<[LeaseSlot]>>,
-    lease_alloc_lock: Mutex<()>,
-    dma_records: Mutex<Vec<DmaRecord>>,
+    leases: Box<[LeaseSlot]>,
+    lease_alloc_cursor: AtomicUsize,
+    dma_records: Box<[DmaRecord]>,
+    dma_alloc_cursor: AtomicUsize,
+
+    overlap: RadixMap,
+    overlap_granularity: usize,
 }
 
 impl<'data> IoBufferBacking<'data> {
@@ -252,47 +284,57 @@ impl<'data> IoBufferBacking<'data> {
         self.validate_range(mapped_start, mapped_len)?;
         validate_dma_mapping_layout(&layout)?;
 
-        let mut records = self.dma_records.lock();
-        for record in records.iter_mut() {
-            if record.active {
-                continue;
-            }
-
-            record.active = true;
-            record.persistent = true;
-            record.ref_count = 1;
-            record.mapped_start = mapped_start;
-            record.mapped_len = mapped_len;
-            record.access = access;
-            record.layout = layout;
-            record.drop_ctx = Some(DmaDropContext {
+        let capacity = self.dma_records.len();
+        let start = self.dma_alloc_cursor.fetch_add(1, Ordering::Relaxed);
+        let mut payload = DmaRecordPayload {
+            mapped_start,
+            mapped_len,
+            access,
+            layout,
+            drop_ctx: DmaDropContext {
                 mapped_by,
                 unmap,
                 cookie,
-            });
-            return Ok(());
+            },
+        };
+        for offset in 0..capacity {
+            let index = start.wrapping_add(offset) % capacity;
+            match self.dma_records[index].try_initialize(true, payload) {
+                Ok(()) => return Ok(()),
+                Err(returned) => payload = returned,
+            }
         }
 
-        Err(IoBufferError::DmaRecordCapacityExceeded {
-            capacity: records.len(),
-        })
+        Err(IoBufferError::DmaRecordCapacityExceeded { capacity })
     }
     pub fn from_scratch(
         desc: IoBufferBackingDesc<'data>,
         config: IoBufferBackingConfig,
         mut scratch: IoBufferBackingScratch,
     ) -> Result<Self, IoBufferError> {
+        validate_overlap_granularity(config.overlap_granularity)?;
         scratch.clear();
         scratch.ensure_capacity(config)?;
 
         let (memory, byte_len) =
             build_backing_into(desc, &mut scratch.extents, &mut scratch.frames)?;
+        let overlap = match scratch.overlap.take() {
+            Some(overlap)
+                if overlap.len() == byte_len
+                    && overlap.granularity() == config.overlap_granularity =>
+            {
+                overlap
+            }
+            _ => RadixMap::try_new(byte_len, config.overlap_granularity)
+                .map_err(|error| map_radix_construction_error(error))?,
+        };
 
         let IoBufferBackingScratch {
             extents,
             frames,
             leases,
             dma_records,
+            overlap: _,
         } = scratch;
 
         Ok(Self {
@@ -300,19 +342,19 @@ impl<'data> IoBufferBacking<'data> {
             byte_len,
             extents,
             frames,
-            leases: RwLock::new(leases),
-            lease_alloc_lock: Mutex::new(()),
-            dma_records: Mutex::new(dma_records),
+            leases,
+            lease_alloc_cursor: AtomicUsize::new(0),
+            dma_records: dma_records.into_boxed_slice(),
+            dma_alloc_cursor: AtomicUsize::new(0),
+            overlap,
+            overlap_granularity: config.overlap_granularity,
         })
     }
 
     pub fn into_scratch(self) -> IoBufferBackingScratch {
         debug_assert_eq!(self.active_lease_count(), 0);
 
-        debug_assert!({
-            let records = self.dma_records.lock();
-            !records.iter().any(|record| record.active)
-        });
+        debug_assert!({ !self.dma_records.iter().any(DmaRecord::is_active) });
 
         let this = ManuallyDrop::new(self);
 
@@ -321,25 +363,27 @@ impl<'data> IoBufferBacking<'data> {
             let mut frames = ptr::read(&this.frames);
             let leases = ptr::read(&this.leases);
             let dma_records = ptr::read(&this.dma_records);
+            let overlap = ptr::read(&this.overlap);
 
             extents.clear();
             frames.clear();
 
-            let mut leases = leases.into_inner();
+            let mut leases = leases;
             for slot in leases.iter_mut() {
                 *slot = LeaseSlot::free();
             }
 
-            let mut dma_records = dma_records.into_inner();
+            let mut dma_records = dma_records.into_vec();
             for record in dma_records.iter_mut() {
+                debug_assert!(!record.is_active());
                 *record = DmaRecord::empty();
             }
-
             IoBufferBackingScratch {
                 extents,
                 frames,
                 leases,
                 dma_records,
+                overlap: Some(overlap),
             }
         }
     }
@@ -353,12 +397,11 @@ impl<'data> IoBufferBacking<'data> {
     }
 
     pub fn lease_capacity(&self) -> usize {
-        self.leases.read().len()
+        self.leases.len()
     }
 
     pub fn active_lease_count(&self) -> usize {
         self.leases
-            .read()
             .iter()
             .filter(|slot| slot.state.load(Ordering::Acquire) == LEASE_ACTIVE)
             .count()
@@ -367,6 +410,7 @@ impl<'data> IoBufferBacking<'data> {
     pub fn redescribe(&mut self, desc: IoBufferBackingDesc<'data>) -> Result<(), IoBufferError> {
         self.reject_active_leases()?;
         self.reject_active_dma_records()?;
+        let old_byte_len = self.byte_len;
 
         self.memory = BackingMemory::None;
         self.byte_len = 0;
@@ -374,9 +418,20 @@ impl<'data> IoBufferBacking<'data> {
         self.frames.clear();
 
         let (memory, byte_len) = build_backing_into(desc, &mut self.extents, &mut self.frames)?;
+        let overlap = if byte_len == old_byte_len {
+            None
+        } else {
+            Some(
+                RadixMap::try_new(byte_len, self.overlap_granularity)
+                    .map_err(|error| map_radix_construction_error(error))?,
+            )
+        };
 
         self.memory = memory;
         self.byte_len = byte_len;
+        if let Some(overlap) = overlap {
+            self.overlap = overlap;
+        }
         self.clear_dma_records();
 
         Ok(())
@@ -465,43 +520,39 @@ impl<'data> IoBufferBacking<'data> {
         len: usize,
         access: u8,
     ) -> Result<LeaseHandle, IoBufferError> {
-        self.validate_range(start, len)?;
+        let range = self.lease_chunk_range(start, len)?;
 
-        let dma_record =
-            match self.try_retain_persistent_dma_record_for_range(start, len, access)? {
-                Some(record) => record,
-                None => NO_DMA_RECORD,
-            };
-
-        let leases = self.leases.read();
-        let _alloc_guard = self.lease_alloc_lock.lock();
-
-        for (index, slot) in leases.iter().enumerate() {
-            if slot.state.load(Ordering::Acquire) != LEASE_FREE {
-                continue;
-            }
-
-            match slot.activate(start, len, access, dma_record) {
-                Ok(generation) => {
-                    return Ok(LeaseHandle { index, generation });
-                }
-                Err(err) => {
-                    if dma_record != NO_DMA_RECORD {
-                        self.release_dma_record(dma_record);
-                    }
-
-                    return Err(err);
-                }
+        let capacity = self.leases.len();
+        let start_index = self.lease_alloc_cursor.fetch_add(1, Ordering::Relaxed);
+        let mut reserved = None;
+        for offset in 0..capacity {
+            let index = start_index.wrapping_add(offset) % capacity;
+            if let Some(generation) = self.leases[index].try_reserve() {
+                reserved = Some((index, generation));
+                break;
             }
         }
+        let (index, generation) =
+            reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
+        let slot = &self.leases[index];
 
-        if dma_record != NO_DMA_RECORD {
-            self.release_dma_record(dma_record);
+        if let Err(error) = self.overlap.try_claim_chunks(range.first, range.count) {
+            slot.cancel_reservation();
+            return Err(self.map_radix_error(error, range));
         }
 
-        Err(IoBufferError::LeaseCapacityExceeded {
-            capacity: leases.len(),
-        })
+        let dma_record = match self.try_retain_persistent_dma_record_for_range(start, len, access) {
+            Ok(Some(record)) => record,
+            Ok(None) => NO_DMA_RECORD,
+            Err(error) => {
+                unsafe { self.overlap.release_chunks(range.first, range.count) };
+                slot.cancel_reservation();
+                return Err(error);
+            }
+        };
+
+        slot.publish(range, access, dma_record);
+        Ok(LeaseHandle { index, generation })
     }
     fn try_retain_persistent_dma_record_for_range(
         &self,
@@ -513,32 +564,28 @@ impl<'data> IoBufferBacking<'data> {
             .checked_add(len)
             .ok_or(IoBufferError::LengthOverflow)?;
 
-        let mut records = self.dma_records.lock();
-
-        for (index, record) in records.iter_mut().enumerate() {
-            if !record.active || !record.persistent {
+        for (index, record) in self.dma_records.iter().enumerate() {
+            if !record.try_retain_persistent()? {
                 continue;
             }
+            let payload = unsafe { record.payload() };
 
-            let mapped_end = record
-                .mapped_start
-                .checked_add(record.mapped_len)
-                .ok_or(IoBufferError::LengthOverflow)?;
+            let Some(mapped_end) = payload.mapped_start.checked_add(payload.mapped_len) else {
+                if let Some(ctx) = record.release() {
+                    ctx.run();
+                }
+                return Err(IoBufferError::LengthOverflow);
+            };
 
-            if start < record.mapped_start || end > mapped_end {
-                continue;
+            let matches = start >= payload.mapped_start
+                && end <= mapped_end
+                && dma_access_allows(payload.access, access);
+            if matches {
+                return Ok(Some(index));
             }
-
-            if !dma_access_allows(record.access, access) {
-                continue;
+            if let Some(ctx) = record.release() {
+                ctx.run();
             }
-
-            record.ref_count = record
-                .ref_count
-                .checked_add(1)
-                .ok_or(IoBufferError::LengthOverflow)?;
-
-            return Ok(Some(index));
         }
 
         Ok(None)
@@ -553,31 +600,33 @@ impl<'data> IoBufferBacking<'data> {
             .checked_add(len)
             .ok_or(IoBufferError::LengthOverflow)?;
 
-        let records = self.dma_records.lock();
-
-        for record in records.iter() {
-            if !record.active || !record.persistent {
+        for record in self.dma_records.iter() {
+            if !record.try_retain_persistent()? {
                 continue;
             }
+            let payload = unsafe { record.payload() };
 
-            let mapped_end = record
-                .mapped_start
-                .checked_add(record.mapped_len)
-                .ok_or(IoBufferError::LengthOverflow)?;
+            let Some(mapped_end) = payload.mapped_start.checked_add(payload.mapped_len) else {
+                if let Some(ctx) = record.release() {
+                    ctx.run();
+                }
+                return Err(IoBufferError::LengthOverflow);
+            };
 
-            if start < record.mapped_start || end > mapped_end {
-                continue;
+            let result = if start >= payload.mapped_start
+                && end <= mapped_end
+                && dma_access_allows(payload.access, access)
+            {
+                Some((payload.mapped_start, payload.mapped_len, payload.layout))
+            } else {
+                None
+            };
+            if let Some(ctx) = record.release() {
+                ctx.run();
             }
-
-            if !dma_access_allows(record.access, access) {
-                continue;
+            if result.is_some() {
+                return Ok(result);
             }
-
-            return Ok(Some((
-                record.mapped_start,
-                record.mapped_len,
-                record.layout,
-            )));
         }
 
         Ok(None)
@@ -600,70 +649,91 @@ impl<'data> IoBufferBacking<'data> {
         handle: LeaseHandle,
         mid: usize,
     ) -> Result<LeaseHandle, IoBufferError> {
-        let leases = self.leases.read();
-        let _alloc_guard = self.lease_alloc_lock.lock();
-        let parent = leases
+        let parent = self
+            .leases
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
-        let snapshot = validate_snapshot(parent, handle)?;
+        let snapshot = validate_snapshot(parent, handle, self.overlap_granularity, self.byte_len)?;
+        let slot_snapshot = parent.snapshot().ok_or(IoBufferError::InvalidLease)?;
 
         if mid > snapshot.len {
             return Err(IoBufferError::InvalidRange);
         }
+        if mid % self.overlap_granularity != 0 {
+            return Err(IoBufferError::InvalidRange);
+        }
 
-        let right_start = snapshot
-            .start
-            .checked_add(mid)
-            .ok_or(IoBufferError::LengthOverflow)?;
-        let right_len = snapshot.len - mid;
-
-        for (index, slot) in leases.iter().enumerate() {
-            if slot.state.load(Ordering::Acquire) != LEASE_FREE {
-                continue;
+        let left_count = mid / self.overlap_granularity;
+        let right_range = LeaseChunkRange {
+            first: slot_snapshot
+                .range
+                .first
+                .checked_add(left_count)
+                .ok_or(IoBufferError::LengthOverflow)?,
+            count: slot_snapshot.range.count - left_count,
+        };
+        let capacity = self.leases.len();
+        let start_index = self.lease_alloc_cursor.fetch_add(1, Ordering::Relaxed);
+        let mut reserved = None;
+        for offset in 0..capacity {
+            let index = start_index.wrapping_add(offset) % capacity;
+            if let Some(generation) = self.leases[index].try_reserve() {
+                reserved = Some((index, generation));
+                break;
             }
+        }
+        let (index, generation) =
+            reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
+        let slot = &self.leases[index];
+        if let Err(error) = unsafe {
+            self.overlap.split_claim(
+                slot_snapshot.range.first,
+                slot_snapshot.range.count,
+                left_count,
+            )
+        } {
+            slot.cancel_reservation();
+            return Err(self.map_radix_error(error, slot_snapshot.range));
+        }
 
-            if snapshot.dma_record != NO_DMA_RECORD {
-                self.retain_dma_record(snapshot.dma_record)?;
-            }
-
-            match slot.activate(right_start, right_len, snapshot.access, snapshot.dma_record) {
-                Ok(generation) => {
-                    parent.len.store(mid, Ordering::Release);
-                    return Ok(LeaseHandle { index, generation });
-                }
-                Err(err) => {
-                    if snapshot.dma_record != NO_DMA_RECORD {
-                        self.release_dma_record(snapshot.dma_record);
-                    }
-                    return Err(err);
-                }
+        if snapshot.dma_record != NO_DMA_RECORD {
+            if let Err(error) = self.retain_dma_record(snapshot.dma_record) {
+                slot.cancel_reservation();
+                return Err(error);
             }
         }
 
-        Err(IoBufferError::LeaseCapacityExceeded {
-            capacity: leases.len(),
-        })
+        slot.publish(right_range, snapshot.access, snapshot.dma_record);
+        parent.chunk_count.store(left_count, Ordering::Release);
+        Ok(LeaseHandle { index, generation })
     }
 
     pub(super) fn release_lease(&self, handle: LeaseHandle) {
-        let dma_record = {
-            let leases = self.leases.read();
-            leases
-                .get(handle.index)
-                .and_then(|slot| slot.release(handle.generation))
+        let Some(slot) = self.leases.get(handle.index) else {
+            return;
         };
-
-        if let Some(record) = dma_record {
-            self.release_dma_record(record);
+        let Some(snapshot) = slot.begin_release(handle.generation) else {
+            return;
+        };
+        if snapshot.dma_record != NO_DMA_RECORD {
+            self.release_dma_record(snapshot.dma_record);
         }
+        unsafe {
+            self.overlap
+                .release_chunks(snapshot.range.first, snapshot.range.count)
+        };
+        slot.finish_release();
     }
 
-    pub(super) fn lease_snapshot(&self, handle: LeaseHandle) -> Result<LeaseSnapshot, IoBufferError> {
-        let leases = self.leases.read();
-        let slot = leases
+    pub(super) fn lease_snapshot(
+        &self,
+        handle: LeaseHandle,
+    ) -> Result<LeaseSnapshot, IoBufferError> {
+        let slot = self
+            .leases
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
-        validate_snapshot(slot, handle)
+        validate_snapshot(slot, handle, self.overlap_granularity, self.byte_len)
     }
 
     pub(super) fn set_lease_dma_record(
@@ -671,11 +741,11 @@ impl<'data> IoBufferBacking<'data> {
         handle: LeaseHandle,
         record: usize,
     ) -> Result<(), IoBufferError> {
-        let leases = self.leases.read();
-        let slot = leases
+        let slot = self
+            .leases
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
-        validate_snapshot(slot, handle)?;
+        validate_snapshot(slot, handle, self.overlap_granularity, self.byte_len)?;
 
         let old = slot.dma_record.swap(record, Ordering::AcqRel);
         if old != NO_DMA_RECORD {
@@ -685,11 +755,11 @@ impl<'data> IoBufferBacking<'data> {
     }
 
     pub(super) fn clear_lease_dma_record(&self, handle: LeaseHandle) -> Result<(), IoBufferError> {
-        let leases = self.leases.read();
-        let slot = leases
+        let slot = self
+            .leases
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
-        validate_snapshot(slot, handle)?;
+        validate_snapshot(slot, handle, self.overlap_granularity, self.byte_len)?;
 
         let old = slot.dma_record.swap(NO_DMA_RECORD, Ordering::AcqRel);
         if old != NO_DMA_RECORD {
@@ -709,72 +779,46 @@ impl<'data> IoBufferBacking<'data> {
     ) -> Result<usize, IoBufferError> {
         validate_dma_mapping_layout(&layout)?;
 
-        let mut records = self.dma_records.lock();
-        for (index, record) in records.iter_mut().enumerate() {
-            if record.active {
-                continue;
-            }
-
-            record.active = true;
-            record.persistent = false;
-            record.access = ACCESS_BIDIRECTIONAL;
-            record.ref_count = 1;
-            record.mapped_start = mapped_start;
-            record.mapped_len = mapped_len;
-            record.layout = layout;
-            record.drop_ctx = Some(DmaDropContext {
+        let capacity = self.dma_records.len();
+        let start = self.dma_alloc_cursor.fetch_add(1, Ordering::Relaxed);
+        let mut payload = DmaRecordPayload {
+            mapped_start,
+            mapped_len,
+            access: ACCESS_BIDIRECTIONAL,
+            layout,
+            drop_ctx: DmaDropContext {
                 mapped_by,
                 unmap,
                 cookie,
-            });
-            return Ok(index);
+            },
+        };
+        for offset in 0..capacity {
+            let index = start.wrapping_add(offset) % capacity;
+            match self.dma_records[index].try_initialize(false, payload) {
+                Ok(()) => return Ok(index),
+                Err(returned) => payload = returned,
+            }
         }
 
-        Err(IoBufferError::DmaRecordCapacityExceeded {
-            capacity: records.len(),
-        })
+        Err(IoBufferError::DmaRecordCapacityExceeded { capacity })
     }
 
     fn retain_dma_record(&self, index: usize) -> Result<(), IoBufferError> {
-        let mut records = self.dma_records.lock();
-        let record = records.get_mut(index).ok_or(IoBufferError::InvalidLease)?;
-        if !record.active {
+        let record = self
+            .dma_records
+            .get(index)
+            .ok_or(IoBufferError::InvalidLease)?;
+        if !record.try_retain()? {
             return Err(IoBufferError::InvalidLease);
         }
-        record.ref_count = record
-            .ref_count
-            .checked_add(1)
-            .ok_or(IoBufferError::LengthOverflow)?;
         Ok(())
     }
 
     pub(super) fn release_dma_record(&self, index: usize) {
-        let drop_ctx = {
-            let mut records = self.dma_records.lock();
-            let Some(record) = records.get_mut(index) else {
-                return;
-            };
-
-            if !record.active || record.ref_count == 0 {
-                return;
-            }
-
-            record.ref_count -= 1;
-            if record.ref_count != 0 {
-                return;
-            }
-
-            record.active = false;
-            record.persistent = false;
-            record.ref_count = 0;
-            record.mapped_start = 0;
-            record.mapped_len = 0;
-            record.access = 0;
-            record.layout = IoBufferDmaMappingLayout::None;
-            record.drop_ctx.take()
+        let Some(record) = self.dma_records.get(index) else {
+            return;
         };
-
-        if let Some(ctx) = drop_ctx {
+        if let Some(ctx) = record.release() {
             ctx.run();
         }
     }
@@ -783,12 +827,19 @@ impl<'data> IoBufferBacking<'data> {
         &self,
         index: usize,
     ) -> Result<(usize, usize, IoBufferDmaMappingLayout), IoBufferError> {
-        let records = self.dma_records.lock();
-        let record = records.get(index).ok_or(IoBufferError::InvalidLease)?;
-        if !record.active {
+        let record = self
+            .dma_records
+            .get(index)
+            .ok_or(IoBufferError::InvalidLease)?;
+        if !record.try_retain()? {
             return Err(IoBufferError::InvalidLease);
         }
-        Ok((record.mapped_start, record.mapped_len, record.layout))
+        let payload = unsafe { record.payload() };
+        let snapshot = (payload.mapped_start, payload.mapped_len, payload.layout);
+        if let Some(ctx) = record.release() {
+            ctx.run();
+        }
+        Ok(snapshot)
     }
 
     fn reject_active_leases(&self) -> Result<(), IoBufferError> {
@@ -800,15 +851,16 @@ impl<'data> IoBufferBacking<'data> {
     }
 
     fn reject_active_dma_records(&self) -> Result<(), IoBufferError> {
-        if self.dma_records.lock().iter().any(|record| record.active) {
+        if self.dma_records.iter().any(DmaRecord::is_active) {
             Err(IoBufferError::ActiveLeases)
         } else {
             Ok(())
         }
     }
 
-    fn clear_dma_records(&self) {
-        for record in self.dma_records.lock().iter_mut() {
+    fn clear_dma_records(&mut self) {
+        for record in self.dma_records.iter_mut() {
+            debug_assert!(!record.is_active());
             *record = DmaRecord::empty();
         }
     }
@@ -845,37 +897,76 @@ impl<'data> IoBufferBacking<'data> {
             Ok(())
         }
     }
+
+    fn lease_chunk_range(
+        &self,
+        start: usize,
+        len: usize,
+    ) -> Result<LeaseChunkRange, IoBufferError> {
+        self.validate_range(start, len)?;
+        let end = start
+            .checked_add(len)
+            .ok_or(IoBufferError::LengthOverflow)?;
+        if start % self.overlap_granularity != 0
+            || (len % self.overlap_granularity != 0 && end != self.byte_len)
+        {
+            return Err(IoBufferError::InvalidRange);
+        }
+        let count = if len == 0 {
+            0
+        } else {
+            len.checked_add(self.overlap_granularity - 1)
+                .ok_or(IoBufferError::LengthOverflow)?
+                / self.overlap_granularity
+        };
+        Ok(LeaseChunkRange {
+            first: start / self.overlap_granularity,
+            count,
+        })
+    }
+
+    fn map_radix_error(&self, error: RadixMapError, range: LeaseChunkRange) -> IoBufferError {
+        match error {
+            RadixMapError::Conflict => {
+                let start = range
+                    .first
+                    .checked_mul(self.overlap_granularity)
+                    .unwrap_or(usize::MAX);
+                let len = range
+                    .count
+                    .checked_mul(self.overlap_granularity)
+                    .unwrap_or(usize::MAX);
+                IoBufferError::LeaseConflict { start, len }
+            }
+            RadixMapError::AllocationFailed => IoBufferError::AllocationFailed,
+            RadixMapError::LengthOverflow => IoBufferError::LengthOverflow,
+            RadixMapError::InvalidGranularity => IoBufferError::InvalidOverlapGranularity,
+            RadixMapError::InvalidRange => IoBufferError::InvalidRange,
+        }
+    }
+}
+
+fn validate_overlap_granularity(granularity: usize) -> Result<(), IoBufferError> {
+    if granularity == 0 || !granularity.is_power_of_two() {
+        Err(IoBufferError::InvalidOverlapGranularity)
+    } else {
+        Ok(())
+    }
+}
+
+fn map_radix_construction_error(error: RadixMapError) -> IoBufferError {
+    match error {
+        RadixMapError::AllocationFailed => IoBufferError::AllocationFailed,
+        RadixMapError::LengthOverflow => IoBufferError::LengthOverflow,
+        RadixMapError::InvalidGranularity => IoBufferError::InvalidOverlapGranularity,
+        RadixMapError::InvalidRange | RadixMapError::Conflict => IoBufferError::InvalidRange,
+    }
 }
 impl<'data> Drop for IoBufferBacking<'data> {
     fn drop(&mut self) {
-        loop {
-            let drop_ctx = {
-                let mut records = self.dma_records.lock();
-                let mut found = None;
-
-                for record in records.iter_mut() {
-                    if !record.active {
-                        continue;
-                    }
-
-                    record.active = false;
-                    record.persistent = false;
-                    record.ref_count = 0;
-                    record.mapped_start = 0;
-                    record.mapped_len = 0;
-                    record.access = 0;
-                    record.layout = IoBufferDmaMappingLayout::None;
-
-                    found = record.drop_ctx.take();
-                    break;
-                }
-
-                found
-            };
-
-            match drop_ctx {
-                Some(ctx) => ctx.run(),
-                None => break,
+        for record in self.dma_records.iter_mut() {
+            if let Some(ctx) = record.take_exclusive() {
+                ctx.run();
             }
         }
     }

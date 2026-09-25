@@ -72,13 +72,13 @@ pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED: u32 = 1 << 1;
 pub const IOBUFFER_INLINE_SEGMENT_CAPACITY: usize = 32;
 pub const IOBUFFER_DEFAULT_LEASE_CAPACITY: usize = 32;
 pub const IOBUFFER_DEFAULT_DMA_RECORD_CAPACITY: usize = 8;
-pub const IOBUFFER_WORST_CASE_LEASE_GRANULARITY: usize = 4096;
+pub const IOBUFFER_DEFAULT_OVERLAP_GRANULARITY: usize = 128;
 
-pub const fn iobuffer_worst_case_lease_count(byte_len: usize) -> usize {
-    if byte_len == 0 {
+pub const fn iobuffer_worst_case_lease_count(byte_len: usize, granularity: usize) -> usize {
+    if byte_len == 0 || granularity == 0 {
         0
     } else {
-        let chunks = ((byte_len - 1) / IOBUFFER_WORST_CASE_LEASE_GRANULARITY) + 1;
+        let chunks = ((byte_len - 1) / granularity) + 1;
         // A consumer that owns a buffer must be able to retain a remainder
         // while forwarding a split prefix.
         if chunks < 2 { 2 } else { chunks }
@@ -243,6 +243,7 @@ pub enum IoBufferError {
     InvalidLease,
     InvalidBackingKind,
     InvalidRange,
+    InvalidOverlapGranularity,
     InvalidFrameSize {
         byte_len: u64,
     },
@@ -275,6 +276,7 @@ pub enum IoBufferError {
 pub struct IoBufferBackingConfig {
     pub lease_capacity: usize,
     pub dma_record_capacity: usize,
+    pub overlap_granularity: usize,
 }
 
 impl Default for IoBufferBackingConfig {
@@ -282,6 +284,7 @@ impl Default for IoBufferBackingConfig {
         Self {
             lease_capacity: IOBUFFER_DEFAULT_LEASE_CAPACITY,
             dma_record_capacity: IOBUFFER_DEFAULT_DMA_RECORD_CAPACITY,
+            overlap_granularity: IOBUFFER_DEFAULT_OVERLAP_GRANULARITY,
         }
     }
 }
@@ -289,8 +292,20 @@ impl Default for IoBufferBackingConfig {
 impl IoBufferBackingConfig {
     pub const fn worst_case_for_len(byte_len: usize) -> Self {
         Self {
-            lease_capacity: iobuffer_worst_case_lease_count(byte_len),
+            lease_capacity: iobuffer_worst_case_lease_count(
+                byte_len,
+                IOBUFFER_DEFAULT_OVERLAP_GRANULARITY,
+            ),
             dma_record_capacity: IOBUFFER_DEFAULT_DMA_RECORD_CAPACITY,
+            overlap_granularity: IOBUFFER_DEFAULT_OVERLAP_GRANULARITY,
+        }
+    }
+
+    pub const fn worst_case_for_len_with_granularity(byte_len: usize, granularity: usize) -> Self {
+        Self {
+            lease_capacity: iobuffer_worst_case_lease_count(byte_len, granularity),
+            dma_record_capacity: IOBUFFER_DEFAULT_DMA_RECORD_CAPACITY,
+            overlap_granularity: granularity,
         }
     }
 }
@@ -350,31 +365,164 @@ pub enum IoBufferDmaMappingLayout {
     IdentityExtents,
 }
 
-pub(super) struct DmaRecord {
-    pub(super) active: bool,
-    pub(super) persistent: bool,
-    pub(super) ref_count: usize,
+const DMA_RECORD_FREE: usize = 0;
+const DMA_RECORD_INITIALIZING: usize = 1;
+const DMA_RECORD_RECLAIMING: usize = 2;
+const DMA_RECORD_ACTIVE: usize = 3;
+const DMA_RECORD_STATE_MASK: usize = 3;
+const DMA_RECORD_PERSISTENT: usize = 4;
+const DMA_RECORD_REF_SHIFT: u32 = 3;
+const DMA_RECORD_REF_ONE: usize = 1 << DMA_RECORD_REF_SHIFT;
+
+pub(super) struct DmaRecordPayload {
     pub(super) mapped_start: usize,
     pub(super) mapped_len: usize,
     pub(super) access: u8,
     pub(super) layout: IoBufferDmaMappingLayout,
-    pub(super) drop_ctx: Option<DmaDropContext>,
+    pub(super) drop_ctx: DmaDropContext,
+}
+
+pub(super) struct DmaRecord {
+    control: AtomicUsize,
+    payload: UnsafeCell<MaybeUninit<DmaRecordPayload>>,
 }
 
 impl DmaRecord {
     pub(super) fn empty() -> Self {
         Self {
-            active: false,
-            persistent: false,
-            ref_count: 0,
-            mapped_start: 0,
-            mapped_len: 0,
-            access: 0,
-            layout: IoBufferDmaMappingLayout::None,
-            drop_ctx: None,
+            control: AtomicUsize::new(DMA_RECORD_FREE),
+            payload: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.control.load(Ordering::Acquire) & DMA_RECORD_STATE_MASK == DMA_RECORD_ACTIVE
+    }
+
+    pub(super) fn try_initialize(
+        &self,
+        persistent: bool,
+        payload: DmaRecordPayload,
+    ) -> Result<(), DmaRecordPayload> {
+        if self
+            .control
+            .compare_exchange(
+                DMA_RECORD_FREE,
+                DMA_RECORD_INITIALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(payload);
+        }
+
+        unsafe { (*self.payload.get()).write(payload) };
+        let persistent = if persistent { DMA_RECORD_PERSISTENT } else { 0 };
+        self.control.store(
+            DMA_RECORD_ACTIVE | persistent | DMA_RECORD_REF_ONE,
+            Ordering::Release,
+        );
+        Ok(())
+    }
+
+    pub(super) fn try_retain(&self) -> Result<bool, IoBufferError> {
+        let mut control = self.control.load(Ordering::Acquire);
+        loop {
+            if control & DMA_RECORD_STATE_MASK != DMA_RECORD_ACTIVE {
+                return Ok(false);
+            }
+            let Some(next) = control.checked_add(DMA_RECORD_REF_ONE) else {
+                return Err(IoBufferError::LengthOverflow);
+            };
+            match self.control.compare_exchange_weak(
+                control,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(actual) => control = actual,
+            }
+        }
+    }
+
+    pub(super) fn try_retain_persistent(&self) -> Result<bool, IoBufferError> {
+        let mut control = self.control.load(Ordering::Acquire);
+        loop {
+            if control & DMA_RECORD_STATE_MASK != DMA_RECORD_ACTIVE
+                || control & DMA_RECORD_PERSISTENT == 0
+            {
+                return Ok(false);
+            }
+            let Some(next) = control.checked_add(DMA_RECORD_REF_ONE) else {
+                return Err(IoBufferError::LengthOverflow);
+            };
+            match self.control.compare_exchange_weak(
+                control,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(true),
+                Err(actual) => control = actual,
+            }
+        }
+    }
+
+    pub(super) unsafe fn payload(&self) -> &DmaRecordPayload {
+        unsafe { (&*self.payload.get()).assume_init_ref() }
+    }
+
+    pub(super) fn release(&self) -> Option<DmaDropContext> {
+        let mut control = self.control.load(Ordering::Acquire);
+        loop {
+            if control & DMA_RECORD_STATE_MASK != DMA_RECORD_ACTIVE {
+                return None;
+            }
+            let refs = control >> DMA_RECORD_REF_SHIFT;
+            if refs > 1 {
+                match self.control.compare_exchange_weak(
+                    control,
+                    control - DMA_RECORD_REF_ONE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return None,
+                    Err(actual) => control = actual,
+                }
+                continue;
+            }
+            if refs != 1 {
+                return None;
+            }
+            match self.control.compare_exchange_weak(
+                control,
+                DMA_RECORD_RECLAIMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let payload = unsafe { (&mut *self.payload.get()).assume_init_read() };
+                    self.control.store(DMA_RECORD_FREE, Ordering::Release);
+                    return Some(payload.drop_ctx);
+                }
+                Err(actual) => control = actual,
+            }
+        }
+    }
+
+    pub(super) fn take_exclusive(&mut self) -> Option<DmaDropContext> {
+        if *self.control.get_mut() & DMA_RECORD_STATE_MASK != DMA_RECORD_ACTIVE {
+            return None;
+        }
+        *self.control.get_mut() = DMA_RECORD_FREE;
+        let payload = unsafe { self.payload.get_mut().assume_init_read() };
+        Some(payload.drop_ctx)
+    }
 }
+
+unsafe impl Sync for DmaRecord {}
 
 #[repr(C)]
 #[derive(Clone)]

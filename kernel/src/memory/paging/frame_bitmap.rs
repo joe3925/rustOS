@@ -1,7 +1,8 @@
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_abi::{MemoryRegion, MemoryRegionKind};
+use kernel_types::state_map::AtomicStateMap;
 
 use super::layout::{align_up, base_page_size, low_physical_reserve_bytes};
 
@@ -9,7 +10,6 @@ const EARLY_BOOT_BITMAP_STORAGE_BYTES: usize = 128 * 1024;
 const EARLY_BOOT_FRAME_BITMAP_WORDS: usize =
     EARLY_BOOT_BITMAP_STORAGE_BYTES / core::mem::size_of::<BitmapWord>();
 type BitmapWord = u64;
-type AtomicBitmapWord = AtomicU64;
 
 const WORD_BITS: usize = BitmapWord::BITS as usize;
 const WORD_MAX: BitmapWord = BitmapWord::MAX;
@@ -88,7 +88,7 @@ impl FrameBitmap {
 }
 
 pub struct RuntimeFrameBitmap {
-    words: Vec<AtomicBitmapWord>,
+    words: AtomicStateMap<1>,
     frames: usize,
     next_word: AtomicUsize,
     hierarchy: HierarchyLayout,
@@ -98,7 +98,7 @@ pub struct RuntimeFrameBitmap {
 
 pub struct RuntimeFrameBitmapBuilder {
     frames: usize,
-    words: Vec<AtomicBitmapWord>,
+    words: AtomicStateMap<1>,
     hierarchy: HierarchyLayout,
     dirty_free: HierarchicalFrameIndex,
     zeroed_free: HierarchicalFrameIndex,
@@ -106,25 +106,28 @@ pub struct RuntimeFrameBitmapBuilder {
 
 impl RuntimeFrameBitmapBuilder {
     /// Populates preallocated storage without performing any heap allocation.
-    pub fn build(
-        mut self,
-        storage: &[BitmapWord],
-    ) -> Result<RuntimeFrameBitmap, BitmapResizeError> {
+    pub fn build(self, storage: &[BitmapWord]) -> Result<RuntimeFrameBitmap, BitmapResizeError> {
         let needed_words =
             bitmap_words_for_frames(self.frames).ok_or(BitmapResizeError::RamTooLarge)?;
         if storage.len() < needed_words {
             return Err(BitmapResizeError::AllocatedFramesWouldBeTruncated);
         }
-        if self.words.capacity() < needed_words {
+        if self.words.word_len() < needed_words {
             return Err(BitmapResizeError::AllocationFailed);
         }
 
-        for &word in &storage[..needed_words] {
-            self.words.push(AtomicBitmapWord::new(word));
+        for (word_index, word) in storage[..needed_words].iter().copied().enumerate() {
+            if self
+                .words
+                .compare_exchange_word(word_index, 0, word, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                return Err(BitmapResizeError::AllocationFailed);
+            }
         }
 
-        for (word_index, word) in self.words.iter().enumerate() {
-            let mut free = !word.load(Ordering::Relaxed);
+        for word_index in 0..self.words.word_len() {
+            let mut free = !self.words.load_word(word_index, Ordering::Relaxed);
 
             while free != 0 {
                 let bit = free.trailing_zeros() as usize;
@@ -197,18 +200,19 @@ impl HierarchyLayout {
 }
 
 struct HierarchicalFrameIndex {
-    storage: Vec<AtomicBitmapWord>,
+    storage: AtomicStateMap<1>,
     indexed_count: AtomicUsize,
     next_frame: AtomicUsize,
 }
 
 impl HierarchicalFrameIndex {
     fn empty(layout: &HierarchyLayout) -> Result<Self, BitmapResizeError> {
-        let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(layout.total_words)
-            .map_err(|_| BitmapResizeError::AllocationFailed)?;
-        storage.resize_with(layout.total_words, || AtomicBitmapWord::new(0));
+        let entries = layout
+            .total_words
+            .checked_mul(WORD_BITS)
+            .ok_or(BitmapResizeError::RamTooLarge)?;
+        let storage =
+            AtomicStateMap::try_new(entries).map_err(|_| BitmapResizeError::AllocationFailed)?;
         Ok(Self {
             storage,
             indexed_count: AtomicUsize::new(0),
@@ -227,8 +231,8 @@ impl HierarchicalFrameIndex {
             let word_index = child_index / WORD_BITS;
             let bit = child_index & (WORD_BITS - 1);
             let mask = BitmapWord::from(1u8) << bit;
-            let word = &self.storage[level.word_offset + word_index];
-            let old = word.fetch_or(mask, Ordering::AcqRel);
+            let word = level.word_offset + word_index;
+            let old = self.storage.fetch_or_word(word, mask, Ordering::AcqRel);
 
             if old & mask != 0 {
                 if level_index == 0 {
@@ -256,8 +260,10 @@ impl HierarchicalFrameIndex {
         let leaf = layout.levels[0];
         let leaf_word_index = frame / WORD_BITS;
         let leaf_mask = BitmapWord::from(1u8) << (frame & (WORD_BITS - 1));
-        let leaf_word = &self.storage[leaf.word_offset + leaf_word_index];
-        let old = leaf_word.fetch_and(!leaf_mask, Ordering::AcqRel);
+        let leaf_word = leaf.word_offset + leaf_word_index;
+        let old = self
+            .storage
+            .fetch_and_word(leaf_word, !leaf_mask, Ordering::AcqRel);
 
         if old & leaf_mask == 0 {
             return false;
@@ -275,15 +281,11 @@ impl HierarchicalFrameIndex {
             let level = layout.levels[level_index];
             let word_index = child_index / WORD_BITS;
             let mask = BitmapWord::from(1u8) << (child_index & (WORD_BITS - 1));
-            let word = &self.storage[level.word_offset + word_index];
-            let old = word.fetch_and(!mask, Ordering::AcqRel);
+            let word = level.word_offset + word_index;
+            let old = self.storage.fetch_and_word(word, !mask, Ordering::AcqRel);
 
-            if self
-                .level_word(layout, level_index - 1, child_index)
-                .load(Ordering::Acquire)
-                != 0
-            {
-                word.fetch_or(mask, Ordering::Release);
+            if self.level_word(layout, level_index - 1, child_index, Ordering::Acquire) != 0 {
+                self.storage.fetch_or_word(word, mask, Ordering::Release);
                 break;
             }
 
@@ -330,7 +332,9 @@ impl HierarchicalFrameIndex {
 
         let word_index = start_bit / WORD_BITS;
         let first_bit = start_bit & (WORD_BITS - 1);
-        let first_word = self.storage[level.word_offset + word_index].load(Ordering::Acquire)
+        let first_word = self
+            .storage
+            .load_word(level.word_offset + word_index, Ordering::Acquire)
             & (WORD_MAX << first_bit);
 
         if first_word != 0 {
@@ -347,7 +351,9 @@ impl HierarchicalFrameIndex {
             return None;
         }
 
-        let word = self.storage[level.word_offset + child_word].load(Ordering::Acquire);
+        let word = self
+            .storage
+            .load_word(level.word_offset + child_word, Ordering::Acquire);
         if word == 0 {
             return None;
         }
@@ -372,8 +378,8 @@ impl HierarchicalFrameIndex {
 
         while word_index <= last_word {
             let mask = range_word_mask(start, end - start, word_index);
-            let word = &self.storage[leaf.word_offset + word_index];
-            let old = word.fetch_and(!mask, Ordering::AcqRel);
+            let word = leaf.word_offset + word_index;
+            let old = self.storage.fetch_and_word(word, !mask, Ordering::AcqRel);
             removed = removed.saturating_add((old & mask).count_ones() as usize);
 
             if old != 0 && old & !mask == 0 {
@@ -393,15 +399,11 @@ impl HierarchicalFrameIndex {
             let level = layout.levels[level_index];
             let word_index = child_index / WORD_BITS;
             let mask = BitmapWord::from(1u8) << (child_index & (WORD_BITS - 1));
-            let word = &self.storage[level.word_offset + word_index];
-            let old = word.fetch_and(!mask, Ordering::AcqRel);
+            let word = level.word_offset + word_index;
+            let old = self.storage.fetch_and_word(word, !mask, Ordering::AcqRel);
 
-            if self
-                .level_word(layout, level_index - 1, child_index)
-                .load(Ordering::Acquire)
-                != 0
-            {
-                word.fetch_or(mask, Ordering::Release);
+            if self.level_word(layout, level_index - 1, child_index, Ordering::Acquire) != 0 {
+                self.storage.fetch_or_word(word, mask, Ordering::Release);
                 break;
             }
 
@@ -418,8 +420,12 @@ impl HierarchicalFrameIndex {
         layout: &HierarchyLayout,
         level_index: usize,
         word_index: usize,
-    ) -> &AtomicBitmapWord {
-        &self.storage[layout.levels[level_index].word_offset + word_index]
+        ordering: Ordering,
+    ) -> u64 {
+        self.storage.load_word(
+            layout.levels[level_index].word_offset + word_index,
+            ordering,
+        )
     }
 }
 
@@ -428,15 +434,20 @@ impl RuntimeFrameBitmap {
         let frame = index.find_candidate(&self.hierarchy)?;
         let word_index = frame / WORD_BITS;
         let mask = BitmapWord::from(1u8) << (frame & (WORD_BITS - 1));
-        let word = &self.words[word_index];
-        let mut old = word.load(Ordering::Acquire);
+        let mut old = self.words.load_word(word_index, Ordering::Acquire);
 
         loop {
             if old & mask != 0 {
                 return None;
             }
 
-            match word.compare_exchange_weak(old, old | mask, Ordering::AcqRel, Ordering::Acquire) {
+            match self.words.compare_exchange_weak_word(
+                word_index,
+                old,
+                old | mask,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => {
                     self.dirty_free.remove(&self.hierarchy, frame);
                     self.zeroed_free.remove(&self.hierarchy, frame);
@@ -456,10 +467,11 @@ impl RuntimeFrameBitmap {
     /// Allocates every component needed to build a runtime bitmap.
     pub fn prepare(frames: usize) -> Result<RuntimeFrameBitmapBuilder, BitmapResizeError> {
         let needed_words = bitmap_words_for_frames(frames).ok_or(BitmapResizeError::RamTooLarge)?;
-        let mut words = Vec::new();
-        words
-            .try_reserve_exact(needed_words)
-            .map_err(|_| BitmapResizeError::AllocationFailed)?;
+        let words =
+            AtomicStateMap::try_new(frames).map_err(|_| BitmapResizeError::AllocationFailed)?;
+        if words.word_len() != needed_words {
+            return Err(BitmapResizeError::RamTooLarge);
+        }
 
         let hierarchy = HierarchyLayout::for_frames(frames)?;
         let dirty_free = HierarchicalFrameIndex::empty(&hierarchy)?;
@@ -501,18 +513,18 @@ impl RuntimeFrameBitmap {
 
     /// Returns the number of atomic bitmap words used by this allocator.
     pub fn word_len(&self) -> usize {
-        self.words.len()
+        self.words.word_len()
     }
 
     /// Returns a diagnostic snapshot of the runtime bitmap words.
     pub fn snapshot_words(&self) -> Result<Vec<BitmapWord>, BitmapResizeError> {
         let mut out = Vec::new();
 
-        out.try_reserve_exact(self.words.len())
+        out.try_reserve_exact(self.words.word_len())
             .map_err(|_| BitmapResizeError::AllocationFailed)?;
 
-        for word in &self.words {
-            out.push(word.load(Ordering::Acquire));
+        for word in 0..self.words.word_len() {
+            out.push(self.words.load_word(word, Ordering::Acquire));
         }
 
         Ok(out)
@@ -541,7 +553,9 @@ impl RuntimeFrameBitmap {
         let mask = BitmapWord::from(1u8) << (frame & (WORD_BITS - 1));
         self.dirty_free.remove(&self.hierarchy, frame);
         self.zeroed_free.insert(&self.hierarchy, frame);
-        let old = self.words[word_index].fetch_and(!mask, Ordering::Release);
+        let old = self
+            .words
+            .fetch_and_word(word_index, !mask, Ordering::Release);
         debug_assert!(old & mask != 0);
     }
 
@@ -566,7 +580,9 @@ impl RuntimeFrameBitmap {
 
         self.zeroed_free.remove(&self.hierarchy, frame);
         self.dirty_free.insert(&self.hierarchy, frame);
-        let old = self.words[word_index].fetch_and(!mask, Ordering::Release);
+        let old = self
+            .words
+            .fetch_and_word(word_index, !mask, Ordering::Release);
         debug_assert!(old & mask != 0);
     }
 
@@ -711,7 +727,8 @@ impl RuntimeFrameBitmap {
 
         while word_index <= last_word {
             let mask = range_word_mask(start, count, word_index);
-            self.words[word_index].fetch_and(!mask, Ordering::Release);
+            self.words
+                .fetch_and_word(word_index, !mask, Ordering::Release);
 
             word_index += 1;
         }
@@ -720,7 +737,7 @@ impl RuntimeFrameBitmap {
     fn alloc_contiguous_zero_word_fast(&self, count: usize) -> Option<usize> {
         let needed_words = count.div_ceil(WORD_BITS);
 
-        if needed_words == 0 || needed_words > self.words.len() {
+        if needed_words == 0 || needed_words > self.words.word_len() {
             return None;
         }
 
@@ -728,8 +745,8 @@ impl RuntimeFrameBitmap {
         let mut run_len = 0usize;
         let mut word_index = 0usize;
 
-        while word_index < self.words.len() {
-            let word = self.words[word_index].load(Ordering::Relaxed);
+        while word_index < self.words.word_len() {
+            let word = self.words.load_word(word_index, Ordering::Relaxed);
 
             if word == 0 {
                 if run_len == 0 {
@@ -766,7 +783,7 @@ impl RuntimeFrameBitmap {
     ) -> Option<usize> {
         let needed_words = count.div_ceil(WORD_BITS);
 
-        if needed_words == 0 || needed_words > self.words.len() {
+        if needed_words == 0 || needed_words > self.words.word_len() {
             return None;
         }
 
@@ -774,8 +791,8 @@ impl RuntimeFrameBitmap {
         let mut run_len = 0usize;
         let mut word_index = 0usize;
 
-        while word_index < self.words.len() {
-            let word = self.words[word_index].load(Ordering::Relaxed);
+        while word_index < self.words.word_len() {
+            let word = self.words.load_word(word_index, Ordering::Relaxed);
 
             if word == 0 {
                 if run_len == 0 {
@@ -905,7 +922,7 @@ impl RuntimeFrameBitmap {
         while word_index <= last_word {
             let mask = range_word_mask(start, count, word_index);
 
-            if try_claim_word_mask(&self.words[word_index], mask) {
+            if try_claim_word_mask(&self.words, word_index, mask) {
                 word_index += 1;
                 continue;
             }
@@ -928,7 +945,8 @@ impl RuntimeFrameBitmap {
 
         while word_index < failed_word {
             let mask = range_word_mask(start, count, word_index);
-            self.words[word_index].fetch_and(!mask, Ordering::AcqRel);
+            self.words
+                .fetch_and_word(word_index, !mask, Ordering::AcqRel);
             word_index += 1;
         }
     }
@@ -941,7 +959,7 @@ impl RuntimeFrameBitmap {
         let mut word_index = start / WORD_BITS;
         let mut first_allowed_bit = start & (WORD_BITS - 1);
 
-        while word_index < self.words.len() {
+        while word_index < self.words.word_len() {
             let word_start = word_index * WORD_BITS;
 
             if word_start >= self.frames {
@@ -950,7 +968,7 @@ impl RuntimeFrameBitmap {
 
             let valid_bits = self.frames.saturating_sub(word_start).min(WORD_BITS);
             let valid_mask = low_bits_mask(valid_bits);
-            let mut free = !self.words[word_index].load(Ordering::Relaxed) & valid_mask;
+            let mut free = !self.words.load_word(word_index, Ordering::Relaxed) & valid_mask;
 
             free &= WORD_MAX << first_allowed_bit;
 
@@ -990,7 +1008,7 @@ impl RuntimeFrameBitmap {
         let mut run_start = 0usize;
         let mut run_len = 0usize;
 
-        while word_index < self.words.len() {
+        while word_index < self.words.word_len() {
             let word_start = word_index * WORD_BITS;
 
             if word_start >= self.frames {
@@ -999,7 +1017,7 @@ impl RuntimeFrameBitmap {
 
             let valid_bits = self.frames.saturating_sub(word_start).min(WORD_BITS);
             let valid_mask = low_bits_mask(valid_bits);
-            let mut free = !self.words[word_index].load(Ordering::Relaxed) & valid_mask;
+            let mut free = !self.words.load_word(word_index, Ordering::Relaxed) & valid_mask;
 
             free &= WORD_MAX << first_allowed_bit;
 
@@ -1042,7 +1060,6 @@ impl RuntimeFrameBitmap {
 
         None
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1555,18 +1572,18 @@ fn bitmap_words_for_frames(frames: usize) -> Option<usize> {
     frames.checked_add(WORD_BITS - 1).map(|v| v / WORD_BITS)
 }
 
-fn try_claim_word_mask(word: &AtomicBitmapWord, mask: BitmapWord) -> bool {
+fn try_claim_word_mask(words: &AtomicStateMap<1>, word_index: usize, mask: BitmapWord) -> bool {
     if mask == 0 {
         return true;
     }
 
     if mask == WORD_MAX {
-        return word
-            .compare_exchange(0, WORD_MAX, Ordering::AcqRel, Ordering::Relaxed)
+        return words
+            .compare_exchange_word(word_index, 0, WORD_MAX, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok();
     }
 
-    let mut old = word.load(Ordering::Relaxed);
+    let mut old = words.load_word(word_index, Ordering::Relaxed);
 
     loop {
         if old & mask != 0 {
@@ -1575,7 +1592,13 @@ fn try_claim_word_mask(word: &AtomicBitmapWord, mask: BitmapWord) -> bool {
 
         let new = old | mask;
 
-        match word.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed) {
+        match words.compare_exchange_weak_word(
+            word_index,
+            old,
+            new,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => return true,
             Err(actual) => old = actual,
         }

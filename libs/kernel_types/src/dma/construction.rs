@@ -459,13 +459,30 @@ pub(super) fn validate_dma_mapping_layout(
 pub(super) fn validate_snapshot(
     slot: &LeaseSlot,
     handle: LeaseHandle,
+    granularity: usize,
+    backing_len: usize,
 ) -> Result<LeaseSnapshot, IoBufferError> {
     let snapshot = slot.snapshot().ok_or(IoBufferError::InvalidLease)?;
-    if snapshot.generation == handle.generation {
-        Ok(snapshot)
-    } else {
-        Err(IoBufferError::InvalidLease)
+    if snapshot.generation != handle.generation {
+        return Err(IoBufferError::InvalidLease);
     }
+    let start = snapshot
+        .range
+        .first
+        .checked_mul(granularity)
+        .ok_or(IoBufferError::LengthOverflow)?;
+    let represented_len = snapshot
+        .range
+        .count
+        .checked_mul(granularity)
+        .ok_or(IoBufferError::LengthOverflow)?;
+    let len = represented_len.min(backing_len.saturating_sub(start));
+    Ok(LeaseSnapshot {
+        start,
+        len,
+        access: snapshot.access,
+        dma_record: snapshot.dma_record,
+    })
 }
 
 pub(super) fn checked_slice<'a>(
