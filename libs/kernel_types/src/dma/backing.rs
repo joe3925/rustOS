@@ -12,7 +12,7 @@ const ACCESS_FROM_DEVICE: u8 = 2;
 const ACCESS_BIDIRECTIONAL: u8 = 3;
 const NO_DMA_RECORD: usize = usize::MAX;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LeaseChunkRange {
     pub(super) first: usize,
     pub(super) count: usize,
@@ -196,9 +196,10 @@ impl LeaseSlot {
         self.state.store(LEASE_FREE, Ordering::Release);
     }
 
-    fn begin_release(&self, generation: u32) -> Option<LeaseSlotSnapshot> {
-        let snapshot = self.snapshot()?;
-        if snapshot.generation != generation {
+    fn begin_release(&self, generation: u32) -> Option<usize> {
+        if self.state.load(Ordering::Acquire) != LEASE_ACTIVE
+            || self.generation.load(Ordering::Acquire) != generation
+        {
             return None;
         }
 
@@ -215,7 +216,7 @@ impl LeaseSlot {
             return None;
         }
 
-        Some(snapshot)
+        Some(self.dma_record.load(Ordering::Acquire))
     }
 
     fn finish_release(&self) {
@@ -248,6 +249,7 @@ pub(super) struct LeaseSnapshot {
 pub(super) struct LeaseHandle {
     pub(super) index: usize,
     pub(super) generation: u32,
+    pub(super) range: LeaseChunkRange,
 }
 
 pub struct IoBufferBacking<'data> {
@@ -256,9 +258,10 @@ pub struct IoBufferBacking<'data> {
     pub(super) extents: Vec<IoBufferExtent>,
     pub(super) frames: Vec<PhysicalFrameExtent>,
     leases: Box<[LeaseSlot]>,
-    lease_alloc_cursor: AtomicUsize,
+    lease_alloc_hint: AtomicUsize,
     dma_records: Box<[DmaRecord]>,
     dma_alloc_cursor: AtomicUsize,
+    persistent_dma_count: AtomicUsize,
 
     overlap: RadixMap,
     overlap_granularity: usize,
@@ -300,7 +303,10 @@ impl<'data> IoBufferBacking<'data> {
         for offset in 0..capacity {
             let index = start.wrapping_add(offset) % capacity;
             match self.dma_records[index].try_initialize(true, payload) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.persistent_dma_count.fetch_add(1, Ordering::Release);
+                    return Ok(());
+                }
                 Err(returned) => payload = returned,
             }
         }
@@ -343,9 +349,10 @@ impl<'data> IoBufferBacking<'data> {
             extents,
             frames,
             leases,
-            lease_alloc_cursor: AtomicUsize::new(0),
+            lease_alloc_hint: AtomicUsize::new(0),
             dma_records: dma_records.into_boxed_slice(),
             dma_alloc_cursor: AtomicUsize::new(0),
+            persistent_dma_count: AtomicUsize::new(0),
             overlap,
             overlap_granularity: config.overlap_granularity,
         })
@@ -447,7 +454,7 @@ impl<'data> IoBufferBacking<'data> {
     {
         self.ensure_writable_virtual_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE)?;
-        Ok(IoBuffer::new(self, handle))
+        Ok(IoBuffer::new(self, handle, offset, len))
     }
 
     pub fn create_to_device<'backing>(
@@ -460,7 +467,7 @@ impl<'data> IoBufferBacking<'data> {
     {
         self.ensure_virtual_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE)?;
-        Ok(IoBuffer::new(self, handle))
+        Ok(IoBuffer::new(self, handle, offset, len))
     }
 
     pub fn create_bidirectional<'backing>(
@@ -473,7 +480,7 @@ impl<'data> IoBufferBacking<'data> {
     {
         self.ensure_writable_virtual_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL)?;
-        Ok(IoBuffer::new(self, handle))
+        Ok(IoBuffer::new(self, handle, offset, len))
     }
 
     pub fn create_phys_to_device<'backing>(
@@ -486,7 +493,7 @@ impl<'data> IoBufferBacking<'data> {
     {
         self.ensure_phys_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_TO_DEVICE)?;
-        Ok(IoBuffer::new(self, handle))
+        Ok(IoBuffer::new(self, handle, offset, len))
     }
 
     pub fn create_phys_from_device<'backing>(
@@ -499,7 +506,7 @@ impl<'data> IoBufferBacking<'data> {
     {
         self.ensure_phys_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_FROM_DEVICE)?;
-        Ok(IoBuffer::new(self, handle))
+        Ok(IoBuffer::new(self, handle, offset, len))
     }
 
     pub fn create_phys_bidirectional<'backing>(
@@ -512,7 +519,7 @@ impl<'data> IoBufferBacking<'data> {
     {
         self.ensure_phys_backed()?;
         let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL)?;
-        Ok(IoBuffer::new(self, handle))
+        Ok(IoBuffer::new(self, handle, offset, len))
     }
     fn create_lease(
         &self,
@@ -523,13 +530,21 @@ impl<'data> IoBufferBacking<'data> {
         let range = self.lease_chunk_range(start, len)?;
 
         let capacity = self.leases.len();
-        let start_index = self.lease_alloc_cursor.fetch_add(1, Ordering::Relaxed);
+        if capacity == 0 {
+            return Err(IoBufferError::LeaseCapacityExceeded { capacity });
+        }
+        let start_index = self.lease_alloc_hint.load(Ordering::Relaxed);
+        debug_assert!(start_index < capacity);
         let mut reserved = None;
-        for offset in 0..capacity {
-            let index = start_index.wrapping_add(offset) % capacity;
+        let mut index = start_index;
+        for _ in 0..capacity {
             if let Some(generation) = self.leases[index].try_reserve() {
                 reserved = Some((index, generation));
                 break;
+            }
+            index += 1;
+            if index == capacity {
+                index = 0;
             }
         }
         let (index, generation) =
@@ -552,7 +567,11 @@ impl<'data> IoBufferBacking<'data> {
         };
 
         slot.publish(range, access, dma_record);
-        Ok(LeaseHandle { index, generation })
+        Ok(LeaseHandle {
+            index,
+            generation,
+            range,
+        })
     }
     fn try_retain_persistent_dma_record_for_range(
         &self,
@@ -560,6 +579,9 @@ impl<'data> IoBufferBacking<'data> {
         len: usize,
         access: u8,
     ) -> Result<Option<usize>, IoBufferError> {
+        if self.persistent_dma_count.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
         let end = start
             .checked_add(len)
             .ok_or(IoBufferError::LengthOverflow)?;
@@ -596,6 +618,9 @@ impl<'data> IoBufferBacking<'data> {
         len: usize,
         access: u8,
     ) -> Result<Option<(usize, usize, IoBufferDmaMappingLayout)>, IoBufferError> {
+        if self.persistent_dma_count.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
         let end = start
             .checked_add(len)
             .ok_or(IoBufferError::LengthOverflow)?;
@@ -673,13 +698,21 @@ impl<'data> IoBufferBacking<'data> {
             count: slot_snapshot.range.count - left_count,
         };
         let capacity = self.leases.len();
-        let start_index = self.lease_alloc_cursor.fetch_add(1, Ordering::Relaxed);
+        if capacity == 0 {
+            return Err(IoBufferError::LeaseCapacityExceeded { capacity });
+        }
+        let start_index = self.lease_alloc_hint.load(Ordering::Relaxed);
+        debug_assert!(start_index < capacity);
         let mut reserved = None;
-        for offset in 0..capacity {
-            let index = start_index.wrapping_add(offset) % capacity;
+        let mut index = start_index;
+        for _ in 0..capacity {
             if let Some(generation) = self.leases[index].try_reserve() {
                 reserved = Some((index, generation));
                 break;
+            }
+            index += 1;
+            if index == capacity {
+                index = 0;
             }
         }
         let (index, generation) =
@@ -705,24 +738,29 @@ impl<'data> IoBufferBacking<'data> {
 
         slot.publish(right_range, snapshot.access, snapshot.dma_record);
         parent.chunk_count.store(left_count, Ordering::Release);
-        Ok(LeaseHandle { index, generation })
+        Ok(LeaseHandle {
+            index,
+            generation,
+            range: right_range,
+        })
     }
 
     pub(super) fn release_lease(&self, handle: LeaseHandle) {
         let Some(slot) = self.leases.get(handle.index) else {
             return;
         };
-        let Some(snapshot) = slot.begin_release(handle.generation) else {
+        let Some(dma_record) = slot.begin_release(handle.generation) else {
             return;
         };
-        if snapshot.dma_record != NO_DMA_RECORD {
-            self.release_dma_record(snapshot.dma_record);
+        if dma_record != NO_DMA_RECORD {
+            self.release_dma_record(dma_record);
         }
         unsafe {
             self.overlap
-                .release_chunks(snapshot.range.first, snapshot.range.count)
+                .release_chunks(handle.range.first, handle.range.count)
         };
         slot.finish_release();
+        self.lease_alloc_hint.store(handle.index, Ordering::Relaxed);
     }
 
     pub(super) fn lease_snapshot(
@@ -863,6 +901,7 @@ impl<'data> IoBufferBacking<'data> {
             debug_assert!(!record.is_active());
             *record = DmaRecord::empty();
         }
+        self.persistent_dma_count.store(0, Ordering::Relaxed);
     }
 
     fn ensure_virtual_backed(&self) -> Result<(), IoBufferError> {

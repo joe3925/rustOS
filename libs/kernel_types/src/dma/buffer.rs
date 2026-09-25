@@ -122,14 +122,16 @@ fn split_virt_phys(
 }
 
 impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> {
-    pub(super) fn new(backing: &'backing IoBufferBacking<'data>, lease: LeaseHandle) -> Self {
-        let snapshot = backing
-            .lease_snapshot(lease)
-            .expect("new IoBuffer requires an active lease");
+    pub(super) fn new(
+        backing: &'backing IoBufferBacking<'data>,
+        lease: LeaseHandle,
+        offset: usize,
+        len: usize,
+    ) -> Self {
         Self {
             source: IoBufferSource::Backing { backing, lease },
-            offset: snapshot.start,
-            len: snapshot.len,
+            offset,
+            len,
             _access: PhantomData,
         }
     }
@@ -168,7 +170,20 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
         let this = ManuallyDrop::new(self);
         match &this.source {
             IoBufferSource::Backing { backing, lease } => match backing.split_lease(*lease, mid) {
-                Ok(right) => Ok((Self::new(backing, *lease), Self::new(backing, right))),
+                Ok(right) => {
+                    let left = LeaseHandle {
+                        index: lease.index,
+                        generation: lease.generation,
+                        range: super::backing::LeaseChunkRange {
+                            first: lease.range.first,
+                            count: right.range.first - lease.range.first,
+                        },
+                    };
+                    Ok((
+                        Self::new(backing, left, this.offset, mid),
+                        Self::new(backing, right, this.offset + mid, this.len - mid),
+                    ))
+                }
                 Err(err) => Err((ManuallyDrop::into_inner(this), err)),
             },
             IoBufferSource::Virt(_) => {

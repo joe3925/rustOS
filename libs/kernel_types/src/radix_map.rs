@@ -216,8 +216,24 @@ impl RadixMap {
         let mut cursor = first;
         while cursor < end {
             let (target, units) = self.chunk(cursor, end);
-            unsafe { self.release_chunk(cursor, target) };
+            unsafe { self.release_target(cursor, target) };
             cursor += units;
+        }
+        for level_index in (0..self.levels.len()).rev() {
+            let mut previous = usize::MAX;
+            let mut cursor = first;
+            while cursor < end {
+                let (target, units) = self.chunk(cursor, end);
+                let ancestor_end = target.unwrap_or(self.levels.len());
+                if level_index < ancestor_end {
+                    let index = cursor / self.levels[level_index].span_units;
+                    if index != previous {
+                        self.repair_entry(level_index, index);
+                        previous = index;
+                    }
+                }
+                cursor += units;
+            }
         }
     }
 
@@ -293,8 +309,14 @@ impl RadixMap {
 
     fn chunk(&self, cursor: usize, end: usize) -> (Option<usize>, usize) {
         for (level_index, level) in self.levels.iter().enumerate() {
-            if cursor % level.span_units == 0 && level.span_units <= end - cursor {
-                return (Some(level_index), level.span_units);
+            let index = cursor / level.span_units;
+            let first = index * level.span_units;
+            let entry_end = first
+                .saturating_add(level.span_units)
+                .min(self.terminal.len());
+            let units = entry_end - first;
+            if cursor == first && units <= end - cursor {
+                return (Some(level_index), units);
             }
         }
         (None, 1)
@@ -407,19 +429,23 @@ impl RadixMap {
     fn repair_ancestors(&self, terminal_index: usize, ancestor_end: usize) {
         for level_index in (0..ancestor_end).rev() {
             let index = terminal_index / self.levels[level_index].span_units;
-            if self.levels[level_index]
-                .states
-                .compare_exchange(
-                    index,
-                    RadixState::Partial as usize,
-                    RadixState::Updating as usize,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                self.help_update(level_index, index);
-            }
+            self.repair_entry(level_index, index);
+        }
+    }
+
+    fn repair_entry(&self, level_index: usize, index: usize) {
+        if self.levels[level_index]
+            .states
+            .compare_exchange(
+                index,
+                RadixState::Partial as usize,
+                RadixState::Updating as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.help_update(level_index, index);
         }
     }
 
@@ -468,12 +494,7 @@ impl RadixMap {
             .ok_or(RadixMapError::LengthOverflow)?;
         if level_index + 1 < self.levels.len() {
             let children = &self.levels[level_index + 1].states;
-            let end = first_child
-                .checked_add(RADIX)
-                .ok_or(RadixMapError::LengthOverflow)?;
-            if end > children.len() {
-                return Err(RadixMapError::InvalidRange);
-            }
+            let end = first_child.saturating_add(RADIX).min(children.len());
             for child in first_child..end {
                 children
                     .compare_exchange(
@@ -486,12 +507,7 @@ impl RadixMap {
                     .map_err(|_| RadixMapError::Conflict)?;
             }
         } else {
-            let end = first_child
-                .checked_add(RADIX)
-                .ok_or(RadixMapError::LengthOverflow)?;
-            if end > self.terminal.len() {
-                return Err(RadixMapError::InvalidRange);
-            }
+            let end = first_child.saturating_add(RADIX).min(self.terminal.len());
             for child in first_child..end {
                 self.terminal
                     .compare_exchange(child, 0, 1, Ordering::AcqRel, Ordering::Acquire)
