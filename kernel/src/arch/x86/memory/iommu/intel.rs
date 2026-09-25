@@ -4,13 +4,14 @@
 use alloc::vec::Vec;
 
 use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
+use kernel_types::memory::KernelMapping;
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
 use super::domain::{IommuDomain, IommuError};
 use super::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
 use super::backend::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo, X86PlatformDeviceRoute};
-use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
+use crate::memory::paging::mmio::map_physical_pages;
 use crate::println;
 
 const VER_REG: usize = 0x00;
@@ -53,6 +54,7 @@ struct VtdInner {
 }
 
 struct VtdUnit {
+    register_mapping: KernelMapping,
     register_base: u64,
     reg_base_va: *mut u8,
     root_table_phys: u64,
@@ -68,6 +70,7 @@ struct VtdUnit {
     agaw: u64,
     page_table_levels: u32,
     inv_queue_va: *mut u64,
+    inv_queue_mapping: Option<KernelMapping>,
     inv_queue_tail: u16,
     queued_invalidation: bool,
 }
@@ -79,13 +82,13 @@ impl IntelVtdBackend {
     pub fn init(info: &IntelPlatformIommuInfo) -> Result<Self, IommuError> {
         let mut units = Vec::with_capacity(info.remapper_units.len());
         for unit in &info.remapper_units {
-            let reg_va = map_physical_pages(
+            let register_mapping = map_physical_pages(
                 PhysAddr::new(unit.register_base).into(),
                 0x1000,
                 kernel_types::memory::PhysicalMappingCache::Uncached,
             )
-            .map_err(|_| IommuError::HardwareError)?
-            .as_mut_ptr::<u8>();
+            .map_err(|_| IommuError::HardwareError)?;
+            let reg_va = register_mapping.address().as_mut_ptr::<u8>();
 
             let cap = unsafe { read_reg64(reg_va, CAP_REG) };
             let ecap = unsafe { read_reg64(reg_va, ECAP_REG) };
@@ -111,11 +114,12 @@ impl IntelVtdBackend {
 
             let root_phys = page_table::alloc_root_table()?;
             let queued_invalidation = (ver >> 4) >= 6;
-            let (inv_queue_phys, inv_queue_va) = if queued_invalidation {
-                let (phys, va) = super::backend::alloc_zeroed_pages_contiguous(1)?;
-                (phys.as_u64(), va.as_mut_ptr::<u64>())
+            let (inv_queue_phys, inv_queue_va, inv_queue_mapping) = if queued_invalidation {
+                let (phys, mapping) = super::backend::alloc_zeroed_pages_contiguous(1)?;
+                let address = mapping.address().as_mut_ptr::<u64>();
+                (phys.as_u64(), address, Some(mapping))
             } else {
-                (0, core::ptr::null_mut())
+                (0, core::ptr::null_mut(), None)
             };
             let mut inv_queue_tail = 0u16;
 
@@ -170,6 +174,7 @@ impl IntelVtdBackend {
             );
 
             units.push(VtdUnit {
+                register_mapping,
                 register_base: unit.register_base,
                 reg_base_va: reg_va,
                 root_table_phys: root_phys,
@@ -185,6 +190,7 @@ impl IntelVtdBackend {
                 agaw,
                 page_table_levels,
                 inv_queue_va,
+                inv_queue_mapping,
                 inv_queue_tail,
                 queued_invalidation,
             });
@@ -551,8 +557,7 @@ fn find_parent_bridge(ecam_base: u64, start_bus: u8, target_bus: u8) -> Option<P
             continue;
         };
 
-        let candidate = scan_bus_for_parent_bridge(bus_va.into(), target_bus);
-        let _ = unsafe { unmap_physical_pages(bus_va, 1 << 20) };
+        let candidate = scan_bus_for_parent_bridge(bus_va.address().into(), target_bus);
 
         if let Some(parent) = candidate {
             if found.is_some() {

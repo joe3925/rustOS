@@ -7,6 +7,7 @@ use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::dma::{FromDevice, ToDevice};
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::memory::VirtAddr;
+use kernel_api::memory::KernelMapping;
 use spin::{Mutex, Once, RwLock};
 
 use crate::blk::BlkIoSlots;
@@ -57,7 +58,7 @@ pub struct DevExtInner {
     pub queue_strategy: QueueSelectionStrategy,
     pub rr_counter: AtomicUsize,
     pub capacity: u64,
-    pub mapped_bars: Mutex<Vec<(u32, VirtAddr, u64)>>,
+    pub mapped_bars: Mutex<Vec<(u32, KernelMapping, u64)>>,
 }
 
 impl DevExtInner {

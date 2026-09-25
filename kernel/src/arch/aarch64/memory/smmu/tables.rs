@@ -9,11 +9,12 @@ use aarch64_vmsa::table::{
 use alloc::boxed::Box;
 use core::ptr::NonNull;
 use kernel_types::arch::PageFlags;
+use kernel_types::memory::KernelMapping;
 use spin::Mutex;
 
 use crate::memory::device_mmu::DeviceMmuError;
 use crate::memory::paging::map::{
-    allocate_auto_kernel_range_mapped_contiguous, kernel_virt_to_phys,
+    allocate_auto_contiguous_kernel_mapping, kernel_virt_to_phys,
 };
 
 pub(super) type Format = Vmsa64<NativeEndian>;
@@ -22,6 +23,7 @@ pub(super) type Granule = Granule4KiB;
 pub(super) const MIN_TABLE_ARENA_SIZE: u64 = 32 * 1024 * 1024;
 
 pub(super) struct TableArena {
+    mapping: KernelMapping,
     phys: u64,
     virt: u64,
     end: u64,
@@ -46,11 +48,13 @@ const VMSA64_TABLE_BYTES: u64 = 4096;
 impl TableArena {
     pub(super) fn new(size: u64) -> Result<Self, DeviceMmuError> {
         let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
-        let virt = allocate_auto_kernel_range_mapped_contiguous(size, flags)
+        let mapping = allocate_auto_contiguous_kernel_mapping(size, flags)
             .map_err(|_| DeviceMmuError::NoBackingFrame)?;
+        let virt = mapping.address();
         let (_, phys) = kernel_virt_to_phys(virt).ok_or(DeviceMmuError::NoBackingFrame)?;
         unsafe { core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, size as usize) };
         Ok(Self {
+            mapping,
             phys: phys.as_u64(),
             virt: virt.as_u64(),
             end: phys.as_u64() + size,

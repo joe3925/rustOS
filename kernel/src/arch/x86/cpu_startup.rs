@@ -1,4 +1,5 @@
 use super::cpu::{self, current_cpu_id, init_percpu_gs, platform_cpu_id};
+use alloc::boxed::Box;
 use super::drivers::timer_driver::set_num_cores;
 use super::gdt::PER_CPU_GDT;
 use super::idt::table::load_idt;
@@ -334,9 +335,11 @@ impl ApicImpl {
                     "AP real-mode temporary stack does not fit in 16-bit SP"
                 );
 
-                let stack_top = allocate_kernel_stack(StackSize::Medium)
-                    .expect("AP stack")
-                    .as_u64();
+                let stack_top = Box::leak(Box::new(
+                    allocate_kernel_stack(StackSize::Medium).expect("AP stack"),
+                ))
+                .top()
+                .as_u64();
                 assert!(stack_top != 0, "AP stack top is null");
                 assert!(
                     virt_to_phys(VirtAddr::new(stack_top - 1)).is_some(),
@@ -415,7 +418,7 @@ impl ApicImpl {
         }
 
         unsafe {
-            crate::memory::paging::map::unmap_kernel_range(
+            crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(
                 VirtAddr::new(map_start).into(),
                 map_len as u64,
             )

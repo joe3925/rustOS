@@ -1,21 +1,22 @@
-use x86_64::{PhysAddr, VirtAddr};
+use kernel_types::memory::KernelMapping;
+use x86_64::PhysAddr;
 
 pub(crate) struct Ioapic {
-    base_addr: VirtAddr,
+    mapping: KernelMapping,
     gsi_base: u32,
     entry_count: u32,
 }
 
 impl Ioapic {
     pub fn new(phys: PhysAddr, gsi_base: u32) -> Result<Self, ()> {
-        let virt = crate::memory::paging::mmio::map_physical_pages(
+        let mapping = crate::memory::paging::mmio::map_physical_pages(
             phys.into(),
-            0x2048,
+            0x3000,
             kernel_types::memory::PhysicalMappingCache::Uncached,
         )
         .map_err(|_| ())?;
         let mut result = Self {
-            base_addr: virt.into(),
+            mapping,
             gsi_base,
             entry_count: 0,
         };
@@ -24,12 +25,12 @@ impl Ioapic {
     }
 
     fn ptr(&self) -> *mut u32 {
-        self.base_addr.as_mut_ptr()
+        self.mapping.address().as_mut_ptr()
     }
     fn read_register(&self, register: u32) -> u32 {
         unsafe {
             let ioregsel = self.ptr();
-            let iowin = (self.base_addr.as_u64() + 0x10) as *const u32;
+            let iowin = (self.mapping.address().as_u64() + 0x10) as *const u32;
             ioregsel.write_volatile(register);
             iowin.read_volatile()
         }
@@ -53,7 +54,7 @@ impl Ioapic {
 
         unsafe {
             let ioregsel = self.ptr();
-            let iowin = (self.base_addr.as_u64() + 0x10) as *mut u32;
+            let iowin = (self.mapping.address().as_u64() + 0x10) as *mut u32;
 
             ioregsel.write_volatile(reg_high);
             iowin.write_volatile(high);
@@ -68,7 +69,7 @@ impl Ioapic {
         let reg_low = 0x10 + (irq as u32) * 2;
         unsafe {
             let ioregsel = self.ptr();
-            let iowin = (self.base_addr.as_u64() + 0x10) as *mut u32;
+            let iowin = (self.mapping.address().as_u64() + 0x10) as *mut u32;
             ioregsel.write_volatile(reg_low);
             let low = iowin.read_volatile();
             ioregsel.write_volatile(reg_low);

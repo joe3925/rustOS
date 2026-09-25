@@ -24,10 +24,9 @@ use crate::{
     util::generate_guid,
 };
 use crate::{
-    memory::paging::{address_space::AddressSpaceRoot, map::map_range},
+    memory::paging::address_space::AddressSpaceRoot,
     memory::user_pins::UserMemoryPins,
     scheduling::scheduler::SCHEDULER,
-    structs::range_tracker::RangeTracker,
 };
 use kernel_types::arch::{PageFlags, VirtAddr};
 
@@ -322,7 +321,7 @@ pub struct Program {
     pub managed_threads: Mutex<Vec<TaskHandle>>,
     pub modules: RwLock<Vec<ModuleHandle>>,
     pub address_space_root: AddressSpaceRoot,
-    pub tracker: Arc<RangeTracker>,
+    pub tracker: Arc<kernel_types::memory::RangeManager>,
 
     pub handle_table: RwLock<HandleTable>,
     pub working_dir: Path,
@@ -339,7 +338,7 @@ impl Program {
         image_path: Path,
         image_base: VirtAddr,
         address_space_root: AddressSpaceRoot,
-        tracker: Arc<RangeTracker>,
+        tracker: Arc<kernel_types::memory::RangeManager>,
     ) -> Self {
         let working_dir = image_path.parent().unwrap_or(image_path.clone());
         Self {
@@ -379,16 +378,13 @@ impl Program {
             let flags = self.private_mapping_flags();
 
             unsafe {
-                map_range(
-                    self.address_space_root,
-                    start.into(),
-                    end.as_u64() - start.as_u64(),
-                    flags,
-                    false,
-                )
+                _guard.map_range(start.into(), end.as_u64() - start.as_u64(), flags)
             }
         })();
 
+        if res.is_err() {
+            unsafe { self.tracker.dealloc(start.as_u64(), size as u64) };
+        }
         res
     }
     pub unsafe fn virtual_map(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
@@ -400,13 +396,7 @@ impl Program {
         }
         let flags = self.private_mapping_flags();
         unsafe {
-            map_range(
-                self.address_space_root,
-                start.into(),
-                end.as_u64() - start.as_u64(),
-                flags,
-                false,
-            )
+            guard.map_range(start.into(), end.as_u64() - start.as_u64(), flags)
         }
     }
     pub fn virtual_map_auto_alloc(&self, size: usize) -> Result<VirtAddr, PageMapError> {
@@ -421,13 +411,12 @@ impl Program {
         let flags = self.private_mapping_flags();
 
         unsafe {
-            map_range(
-                self.address_space_root,
-                start.into(),
-                end.as_u64() - start.as_u64(),
-                flags,
-                false,
-            )?;
+            if let Err(error) =
+                _guard.map_range(start.into(), end.as_u64() - start.as_u64(), flags)
+            {
+                self.tracker.dealloc(start.as_u64(), size as u64);
+                return Err(error);
+            }
         }
 
         Ok(start)
@@ -472,11 +461,7 @@ impl Program {
         unsafe { self.tracker.dealloc(start, size) };
 
         unsafe {
-            crate::memory::paging::map::unmap_range_unchecked(
-                self.address_space_root,
-                virt_addr.into(),
-                size,
-            );
+            guard.unmap_range(virt_addr.into(), size)?;
         }
 
         Ok(())
@@ -584,14 +569,13 @@ impl Program {
             let module = target.read();
             (module.image_base, module.image_size)
         };
+        let _guard = self.user_memory.lock();
         self.modules.write().remove(index);
         unsafe { self.tracker.dealloc(base.as_u64(), size) };
         unsafe {
-            crate::memory::paging::map::unmap_range_unchecked(
-                self.address_space_root,
-                base.into(),
-                size,
-            );
+            _guard
+                .unmap_range(base.into(), size)
+                .map_err(LoadError::from)?;
         }
         Ok(())
     }

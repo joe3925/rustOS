@@ -6,6 +6,7 @@
 use alloc::vec::Vec;
 
 use kernel_types::dma::{DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity};
+use kernel_types::memory::KernelMapping;
 use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::instructions::port::Port;
@@ -57,6 +58,10 @@ struct AmdInner {
 }
 
 struct AmdUnit {
+    register_mapping: KernelMapping,
+    dev_table_mapping: KernelMapping,
+    cmd_buf_mapping: KernelMapping,
+    evt_log_mapping: KernelMapping,
     register_base: u64,
     reg_base_va: *mut u8,
     dev_table_va: *mut u64,
@@ -94,18 +99,18 @@ impl AmdViBackend {
                 }
             }
 
-            let reg_va = map_physical_pages(
+            let register_mapping = map_physical_pages(
                 PhysAddr::new(unit.register_base).into(),
                 0x3000,
                 kernel_types::memory::PhysicalMappingCache::Uncached,
             )
-            .map_err(|_| IommuError::HardwareError)?
-            .as_mut_ptr::<u8>();
+            .map_err(|_| IommuError::HardwareError)?;
+            let reg_va = register_mapping.address().as_mut_ptr::<u8>();
             let ext_features = unsafe { read_reg64(reg_va, EXT_FEATURE_REG) };
 
-            let (dev_table_phys, dev_table_va) = alloc_zeroed_pages_contiguous(DEV_TABLE_PAGES)?;
-            let (cmd_buf_phys, cmd_buf_va) = alloc_zeroed_pages_contiguous(1)?;
-            let (evt_log_phys, evt_log_va) = alloc_zeroed_pages_contiguous(1)?;
+            let (dev_table_phys, dev_table_mapping) = alloc_zeroed_pages_contiguous(DEV_TABLE_PAGES)?;
+            let (cmd_buf_phys, cmd_buf_mapping) = alloc_zeroed_pages_contiguous(1)?;
+            let (evt_log_phys, evt_log_mapping) = alloc_zeroed_pages_contiguous(1)?;
 
             unsafe {
                 write_reg64(reg_va, DEV_TAB_BAR, dev_table_phys.as_u64() | 511);
@@ -135,11 +140,15 @@ impl AmdViBackend {
             );
 
             units.push(AmdUnit {
+                register_mapping,
+                dev_table_va: dev_table_mapping.address().as_mut_ptr::<u64>(),
+                cmd_buf_va: cmd_buf_mapping.address().as_mut_ptr::<u8>(),
+                evt_log_va: evt_log_mapping.address().as_mut_ptr::<u8>(),
+                dev_table_mapping,
+                cmd_buf_mapping,
+                evt_log_mapping,
                 register_base: unit.register_base,
                 reg_base_va: reg_va,
-                dev_table_va: dev_table_va.as_mut_ptr::<u64>(),
-                cmd_buf_va: cmd_buf_va.as_mut_ptr::<u8>(),
-                evt_log_va: evt_log_va.as_mut_ptr::<u8>(),
                 cmd_tail: 0,
                 evt_head: 0,
                 iova_end,

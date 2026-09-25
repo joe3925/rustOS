@@ -39,7 +39,6 @@ use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::port::Port;
 use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::kernel_types::protocol::pci::PciProtocol;
-use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::InitComplete;
 use kernel_api::pnp::QueryDeviceRelations;
 use kernel_api::pnp::QueryId;

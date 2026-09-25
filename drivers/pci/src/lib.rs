@@ -29,7 +29,7 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
     kernel_types::pnp::DeviceIds,
-    memory::{VirtAddr, unmap_mmio_region},
+    memory::{KernelMapping, VirtAddr},
     pnp::{
         DeviceRelationType, DriverStep, PnpOp, PnpOps, QueryIdType, QueryResources, ResourceSet,
         driver_set_evt_device_add, pnp, pnp_create_child_devnode_and_pdo_with_init,
@@ -199,12 +199,6 @@ fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
 }
 
 #[derive(Clone, Copy)]
-struct MapToUnmap {
-    base: VirtAddr,
-    size: u64,
-}
-
-#[derive(Clone, Copy)]
 struct BusWork {
     seg: McfgSegment,
     bus: u8,
@@ -259,20 +253,17 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> Result<(), KernelError
         return Ok(());
     }
 
-    let mut unmaps: Vec<MapToUnmap> = Vec::new();
+    let mut mappings: Vec<KernelMapping> = Vec::new();
     let mut work: Vec<BusWork> = Vec::new();
 
     for seg in segments.unwrap() {
         match map_ecam_segment_range(&seg) {
             Ok(map) => {
-                unmaps.push(MapToUnmap {
-                    base: map.base,
-                    size: map.size,
-                });
                 for bus in seg.start_bus..=seg.end_bus {
-                    let bus_base = ecam_bus_base_from_segment(map, bus);
+                    let bus_base = ecam_bus_base_from_segment(&map, seg.start_bus, bus);
                     work.push(BusWork { seg, bus, bus_base });
                 }
+                mappings.push(map);
             }
             Err(e) => {
                 println!(
@@ -281,12 +272,10 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> Result<(), KernelError
                 );
                 for bus in seg.start_bus..=seg.end_bus {
                     match map_ecam_bus(&seg, bus) {
-                        Ok((bus_base, sz)) => {
-                            unmaps.push(MapToUnmap {
-                                base: bus_base,
-                                size: sz,
-                            });
+                        Ok(mapping) => {
+                            let bus_base = mapping.address();
                             work.push(BusWork { seg, bus, bus_base });
+                            mappings.push(mapping);
                         }
                         Err(be) => {
                             println!(
@@ -325,9 +314,7 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> Result<(), KernelError
         }
     }
 
-    for m in unmaps {
-        let _ = unsafe { unmap_mmio_region(m.base, m.size) };
-    }
+    drop(mappings);
     Ok(())
 }
 

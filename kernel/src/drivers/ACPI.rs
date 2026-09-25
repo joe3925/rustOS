@@ -1,11 +1,13 @@
-use crate::memory::paging::mmio::{map_physical_pages, unmap_physical_pages};
+use crate::memory::paging::layout::base_page_size;
+use crate::memory::paging::mmio::map_physical_pages;
 use crate::util::boot_info;
 use acpi;
 use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping};
-use alloc::sync::Arc;
+use alloc::{collections::btree_map::BTreeMap, sync::Arc};
 use core::ptr::NonNull;
+use spin::Mutex;
 
-use kernel_types::arch::{PhysAddr, VirtAddr};
+use kernel_types::arch::PhysAddr;
 
 unsafe impl Send for AcpiFirmware {}
 unsafe impl Sync for AcpiFirmware {}
@@ -33,10 +35,14 @@ impl AcpiFirmware {
 unsafe impl Send for ACPIImpl {}
 unsafe impl Sync for ACPIImpl {}
 #[derive(Clone)]
-pub struct ACPIImpl {}
+pub struct ACPIImpl {
+    mappings: Arc<Mutex<BTreeMap<usize, kernel_types::memory::KernelMapping>>>,
+}
 impl ACPIImpl {
     pub fn new() -> Self {
-        ACPIImpl {}
+        ACPIImpl {
+            mappings: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 }
 
@@ -46,22 +52,23 @@ impl Handler for ACPIImpl {
         physical_address: usize,
         size: usize,
     ) -> PhysicalMapping<Self, T> { unsafe {
-        let virt_addr = map_physical_pages(
-            PhysAddr::new(physical_address as u64).into(),
-            size as u64,
+        let page_size = base_page_size();
+        let offset = physical_address as u64 % page_size;
+        let physical = physical_address as u64 - offset;
+        let mapped_length = (size as u64 + offset + page_size - 1) & !(page_size - 1);
+        let mapping = map_physical_pages(
+            PhysAddr::new(physical).into(),
+            mapped_length,
             kernel_types::memory::PhysicalMappingCache::Cached,
         )
         .expect("Failed to map physical region for ACPI");
-        PhysicalMapping { physical_start: physical_address, virtual_start: NonNull::new(virt_addr.as_mut_ptr()).unwrap(), region_length: size, mapped_length: size, handler: self.clone() }
+        let virtual_address = mapping.address().as_u64() + offset;
+        self.mappings.lock().insert(virtual_address as usize, mapping);
+        PhysicalMapping { physical_start: physical_address, virtual_start: NonNull::new(virtual_address as *mut T).unwrap(), region_length: size, mapped_length: mapped_length as usize, handler: self.clone() }
     }}
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        let _ = unsafe {
-            unmap_physical_pages(
-                VirtAddr::new(region.virtual_start.as_ptr() as u64).into(),
-                region.mapped_length as u64,
-            )
-        };
+        region.handler.mappings.lock().remove(&(region.virtual_start.as_ptr() as usize));
     }
 
     fn read_u8(&self, address: usize) -> u8 { unsafe { (address as *const u8).read_volatile() } }

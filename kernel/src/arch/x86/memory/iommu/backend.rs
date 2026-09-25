@@ -10,6 +10,7 @@ use kernel_types::dma::{
     DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR, DeviceMmuPlatformDeviceIdentity,
     DmaPciDeviceIdentity,
 };
+use kernel_types::memory::KernelMapping;
 use raw_cpuid::CpuId;
 use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
@@ -22,7 +23,7 @@ use crate::memory::device_mmu::{
     DeviceMmuMapPermissions, DeviceMmuResult,
 };
 use crate::memory::paging::map::{
-    allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_contiguous,
+    allocate_auto_contiguous_kernel_mapping, allocate_auto_kernel_mapping,
     kernel_virt_to_phys,
 };
 use crate::println;
@@ -54,35 +55,33 @@ fn x86_iommu_capabilities() -> DeviceMmuCapabilities {
     }
 }
 
-pub(crate) fn alloc_zeroed_pages(num_pages: usize) -> Result<VirtAddr, IommuError> {
+pub(crate) fn alloc_zeroed_pages(num_pages: usize) -> Result<KernelMapping, IommuError> {
     let size = (num_pages * PAGE_SIZE) as u64;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let va: VirtAddr = allocate_auto_kernel_range_mapped(size, flags.into())
-        .map_err(|_| IommuError::NoBackingFrame)?
-        .into();
+    let mapping = allocate_auto_kernel_mapping(size, flags.into())
+        .map_err(|_| IommuError::NoBackingFrame)?;
 
     unsafe {
-        core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, size as usize);
+        core::ptr::write_bytes(mapping.address().as_mut_ptr::<u8>(), 0, size as usize);
     }
 
-    Ok(va)
+    Ok(mapping)
 }
 
 pub(crate) fn alloc_zeroed_pages_contiguous(
     num_pages: usize,
-) -> Result<(PhysAddr, VirtAddr), IommuError> {
+) -> Result<(PhysAddr, KernelMapping), IommuError> {
     let size = (num_pages * PAGE_SIZE) as u64;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let va: VirtAddr = allocate_auto_kernel_range_mapped_contiguous(size, flags.into())
-        .map_err(|_| IommuError::NoBackingFrame)?
-        .into();
+    let mapping = allocate_auto_contiguous_kernel_mapping(size, flags.into())
+        .map_err(|_| IommuError::NoBackingFrame)?;
 
     unsafe {
-        core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, size as usize);
+        core::ptr::write_bytes(mapping.address().as_mut_ptr::<u8>(), 0, size as usize);
     }
 
-    let (_, phys) = kernel_virt_to_phys(va.into()).ok_or(IommuError::NoBackingFrame)?;
-    Ok((phys.into(), va))
+    let (_, phys) = kernel_virt_to_phys(mapping.address()).ok_or(IommuError::NoBackingFrame)?;
+    Ok((phys.into(), mapping))
 }
 
 pub enum X86DeviceMmu {

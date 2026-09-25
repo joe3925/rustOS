@@ -1,8 +1,9 @@
 use super::domain::IommuError;
 use crate::memory::device_mmu::DeviceMmuMapPermissions;
 use crate::memory::paging::map::{
-    allocate_auto_kernel_range_mapped_contiguous, kernel_virt_to_phys,
+    allocate_auto_contiguous_kernel_mapping, kernel_virt_to_phys,
 };
+use kernel_types::memory::KernelMapping;
 use x86_64::structures::paging::PageTableFlags;
 
 pub const PTE_P: u64 = 1 << 0;
@@ -18,6 +19,7 @@ const IOMMU_TABLE_ARENA_SIZE: u64 = 8 * 1024 * 1024;
 const IOMMU_TABLE_PAGE_SIZE: u64 = 0x1000;
 
 struct IommuTableArenaInfo {
+    mapping: KernelMapping,
     phys_base: u64,
     virt_base: u64,
     size: u64,
@@ -32,13 +34,14 @@ pub fn init_table_arena() -> Result<(), IommuError> {
     }
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let virt = allocate_auto_kernel_range_mapped_contiguous(IOMMU_TABLE_ARENA_SIZE, flags.into())
+    let mapping = allocate_auto_contiguous_kernel_mapping(IOMMU_TABLE_ARENA_SIZE, flags.into())
         .map_err(|_| IommuError::NoBackingFrame)?;
-    let (_, phys) = kernel_virt_to_phys(virt).ok_or(IommuError::NoBackingFrame)?;
+    let (_, phys) = kernel_virt_to_phys(mapping.address()).ok_or(IommuError::NoBackingFrame)?;
 
     IOMMU_TABLE_ARENA_INFO.call_once(|| IommuTableArenaInfo {
+        virt_base: mapping.address().as_u64(),
+        mapping,
         phys_base: phys.as_u64(),
-        virt_base: virt.as_u64(),
         size: IOMMU_TABLE_ARENA_SIZE,
     });
 

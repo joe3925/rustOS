@@ -3,7 +3,7 @@ use crate::memory::heap::heap::{
     mimalloc_os_heap_size,
 };
 use crate::memory::paging::layout::{align_up_to_base_page, base_page_size};
-use crate::memory::paging::map::{map_fresh_kernel_range_no_flush, unmap_kernel_range_unchecked};
+use crate::memory::paging::map::{commit_heap_range, decommit_heap_range};
 use crate::platform;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
@@ -683,7 +683,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
             let start_addr = VirtAddr::new(run_addr as u64);
 
             let res = platform::with_interrupts_disabled(|| {
-                map_fresh_kernel_range_no_flush(start_addr.into(), run_size as u64, flags, true)
+                commit_heap_range(start_addr.into(), run_size as u64, flags, true)
             });
 
             if let Err(e) = res {
@@ -781,7 +781,8 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
         let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
 
         platform::with_interrupts_disabled(|| unsafe {
-            unmap_kernel_range_unchecked(VirtAddr::new(run_addr as u64).into(), run_size as u64);
+            decommit_heap_range(VirtAddr::new(run_addr as u64).into(), run_size as u64)
+                .expect("mimalloc failed to decommit heap range");
         });
 
         tracker.clear_range(run_start, chunk);

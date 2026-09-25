@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -227,9 +228,12 @@ impl CpuPlatform for Aarch64Platform {
         percpu.tls_array_pointer.store(0, Ordering::Relaxed);
         unsafe { set_per_cpu(percpu as *const PerCpu) };
         super::interrupts::init::init_current_cpu_interrupts();
-        let exception_stack_top = allocate_kernel_stack(StackSize::Medium)
-            .expect("failed to allocate AArch64 exception stack")
-            .as_u64();
+        let exception_stack_top = Box::leak(Box::new(
+            allocate_kernel_stack(StackSize::Medium)
+                .expect("failed to allocate AArch64 exception stack"),
+        ))
+        .top()
+        .as_u64();
         percpu
             .exception_stack_top
             .store(exception_stack_top, Ordering::Release);
@@ -264,12 +268,13 @@ impl CpuPlatform for Aarch64Platform {
             .iter()
             .filter(|processor| !processor.is_boot_processor)
         {
-            let stack_top =
+            let stack_top = Box::leak(Box::new(
                 allocate_kernel_stack(StackSize::Medium).map_err(|_| CpuStartupError {
                     platform_cpu_id: Some(processor.platform_cpu_id),
                     reason: "secondary CPU stack allocation failed",
                     status: -1,
-                })?;
+                })?,
+            ));
             let boot = crate::util::boot_info();
             unsafe {
                 AP_STARTUP_RECORD.0.get().write(ApStartupRecord {
@@ -278,7 +283,7 @@ impl CpuPlatform for Aarch64Platform {
                     tcr_el1: startup_tcr(boot.arch_info.tcr_el1),
                     mair_el1: boot.arch_info.mair_el1,
                     sctlr_el1: current_sctlr() | 1 | (1 << 2) | (1 << 12),
-                    stack_top: stack_top.as_u64(),
+                    stack_top: stack_top.top().as_u64(),
                     entry_point: aarch64_secondary_entry as *const () as u64,
                     cpu_id: processor.cpu_id as u64,
                 });

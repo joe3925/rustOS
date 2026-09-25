@@ -22,7 +22,7 @@ use kernel_types::dma::{
     DMA_IOMMU_VENDOR_ARM_SMMU, DeviceMmuPlatformDeviceIdentity, DmaPciDeviceIdentity,
 };
 use kernel_types::irq::{HardwareInterruptId, IrqBorrowedHandle, IrqFrame, IrqHandle};
-use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::memory::{KernelMapping, PhysicalMappingCache};
 use spin::Mutex;
 
 use crate::machine::MachineInfo;
@@ -258,6 +258,7 @@ enum StreamTableFormat {
 }
 
 pub(super) struct SmmuV3 {
+    register_mapping: KernelMapping,
     registers: usize,
     sid_bits: u8,
     output_bits: u8,
@@ -280,6 +281,7 @@ pub(super) struct SmmuV3 {
     pri_consumer: Mutex<u32>,
     interrupt_handles: Mutex<[Option<IrqHandle>; SMMU_INTERRUPT_COUNT]>,
     command_producer: Mutex<u32>,
+    ats_mappings: Mutex<BTreeMap<u64, KernelMapping>>,
     state: Mutex<State>,
 }
 
@@ -590,13 +592,13 @@ fn collect_fdt_mappings(node: &Node, smmu_phandle: u32, mappings: &mut [Option<I
 
 impl SmmuV3 {
     fn new(description: FirmwareDescription) -> DeviceMmuResult<Self> {
-        let registers = map_physical_pages(
+        let register_mapping = map_physical_pages(
             PhysAddr::new(description.base),
             REGISTER_SIZE,
             PhysicalMappingCache::Uncached,
         )
-        .map_err(|_| DeviceMmuError::HardwareError)?
-        .as_u64() as usize;
+        .map_err(|_| DeviceMmuError::HardwareError)?;
+        let registers = register_mapping.address().as_u64() as usize;
         let idr0 = unsafe { core::ptr::read_volatile((registers + IDR0) as *const u32) };
         let idr1 = unsafe { core::ptr::read_volatile((registers + IDR1) as *const u32) };
         let idr5 = unsafe { core::ptr::read_volatile((registers + IDR5) as *const u32) };
@@ -665,6 +667,7 @@ impl SmmuV3 {
             None
         };
         let smmu = Self {
+            register_mapping,
             registers,
             sid_bits,
             output_bits,
@@ -687,6 +690,7 @@ impl SmmuV3 {
             pri_consumer: Mutex::new(0),
             interrupt_handles: Mutex::new([None; SMMU_INTERRUPT_COUNT]),
             command_producer: Mutex::new(0),
+            ats_mappings: Mutex::new(BTreeMap::new()),
             state: Mutex::new(State {
                 next_domain: 1,
                 next_vmid: 1,
@@ -1047,13 +1051,13 @@ impl SmmuV3 {
         else {
             return Ok(0);
         };
-        let config = map_physical_pages(
+        let config_mapping = map_physical_pages(
             PhysAddr::new(config_space_phys),
             PCI_CONFIG_SPACE_SIZE,
             PhysicalMappingCache::Uncached,
         )
-        .map_err(|_| DeviceMmuError::HardwareError)?
-        .as_u64();
+        .map_err(|_| DeviceMmuError::HardwareError)?;
+        let config = config_mapping.address().as_u64();
         let mut offset = PCI_EXTENDED_CAPABILITIES_OFFSET;
         while offset < PCI_EXTENDED_CAPABILITIES_END {
             let header = unsafe { core::ptr::read_volatile((config + offset) as *const u32) };
@@ -1066,6 +1070,7 @@ impl SmmuV3 {
                 unsafe {
                     core::ptr::write_volatile(control as *mut u32, value | PCI_ATS_CONTROL_ENABLE)
                 };
+                self.ats_mappings.lock().insert(control, config_mapping);
                 return Ok(control);
             }
             let next =
@@ -1167,12 +1172,13 @@ impl SmmuV3 {
         self.invalidate_range(domain, iova, len)
     }
 
-    fn disable_ats(control: u64) {
+    fn disable_ats(&self, control: u64) {
         if control != 0 {
             let value = unsafe { core::ptr::read_volatile(control as *const u32) };
             unsafe {
                 core::ptr::write_volatile(control as *mut u32, value & !PCI_ATS_CONTROL_ENABLE)
             };
+            self.ats_mappings.lock().remove(&control);
         }
     }
 }
@@ -1275,7 +1281,7 @@ impl DeviceMmuBackend for SmmuV3 {
                     CMDQ_0_OP_ATC_INV | (attached.sid as u64) << CMDQ_0_SID_SHIFT,
                     CMDQ_1_ATC_INV_SIZE_ALL,
                 );
-                Self::disable_ats(attached.ats_control);
+                self.disable_ats(attached.ats_control);
             }
             if let Ok(Some(ste)) = self.stream_entry(attached.sid, false) {
                 unsafe { core::ptr::write_volatile((ste + STE_0) as *mut u64, 0) };
@@ -1318,11 +1324,11 @@ impl DeviceMmuBackend for SmmuV3 {
                 .flatten()
                 .any(|attached| attached.sid == sid)
             {
-                Self::disable_ats(ats_control);
+                self.disable_ats(ats_control);
                 return Err(DeviceMmuError::InvalidDevice);
             }
             let Some(slot) = state.attached.iter_mut().find(|slot| slot.is_none()) else {
-                Self::disable_ats(ats_control);
+                self.disable_ats(ats_control);
                 return Err(DeviceMmuError::NoBackingFrame);
             };
             *slot = Some(AttachedStream {
@@ -1369,7 +1375,7 @@ impl DeviceMmuBackend for SmmuV3 {
         if let Err(error) = self.invalidate_stream(sid) {
             unsafe { core::ptr::write_volatile((ste + STE_0) as *mut u64, 0) };
             self.publish(ste, STE_BYTES);
-            Self::disable_ats(ats_control);
+            self.disable_ats(ats_control);
             let mut state = self.state.lock();
             if let Some(slot) = state
                 .attached
@@ -1406,7 +1412,7 @@ impl DeviceMmuBackend for SmmuV3 {
                 CMDQ_0_OP_ATC_INV | (sid as u64) << CMDQ_0_SID_SHIFT,
                 CMDQ_1_ATC_INV_SIZE_ALL,
             );
-            Self::disable_ats(ats_control);
+            self.disable_ats(ats_control);
         }
         let Ok(Some(ste)) = self.stream_entry(attachment.attachment_id as u32, false) else {
             return;

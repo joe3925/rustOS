@@ -54,7 +54,7 @@ impl AddressSpacePlatform for X86Platform {
             .into_option()
             .ok_or(PageMapError::NoMemoryMap())?;
         let kernel_pml4 = unsafe { get_level4_page_table(PageTableIndex::new(recursive_index)) };
-        let new_table: &mut PageTable = unsafe { &mut *(root_virt.as_mut_ptr()) };
+        let new_table: &mut PageTable = unsafe { &mut *(root_virt.address().as_mut_ptr()) };
         new_table.zero();
 
         for idx in 256..512 {
@@ -64,13 +64,6 @@ impl AddressSpacePlatform for X86Platform {
             PhysAddr::new(root_phys.as_u64()),
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
         );
-
-        let _ = unsafe {
-            crate::memory::paging::mmio::unmap_physical_pages(
-                root_virt,
-                size_of::<PageTable>() as u64,
-            )
-        };
 
         Ok(unsafe { AddressSpaceRoot::from_raw(root_phys.as_u64()) })
     }

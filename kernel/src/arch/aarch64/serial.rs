@@ -107,7 +107,8 @@ impl ConsolePlatform for Aarch64Platform {
             PhysicalMappingCache::Uncached,
         )?;
 
-        UART_VIRT_BASE.store(mapped.as_u64() as usize, Ordering::Release);
+        UART_VIRT_BASE.store(mapped.address().as_u64() as usize, Ordering::Release);
+        core::mem::forget(mapped);
 
         Ok(())
     }

@@ -1,6 +1,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::{PhysAddr, VirtAddr};
+use kernel_types::memory::KernelMapping;
 
 use crate::arch::x86::timer::TIMER_FREQ;
 
@@ -14,18 +15,20 @@ pub(crate) trait LocalApic {
 
 pub(crate) struct Lapic {
     pub(super) base_addr: VirtAddr,
+    mapping: KernelMapping,
 }
 
 impl Lapic {
     pub(crate) fn new(phys: PhysAddr) -> Result<Self, ()> {
-        let virt = crate::memory::paging::mmio::map_physical_pages(
+        let mapping = crate::memory::paging::mmio::map_physical_pages(
             phys.into(),
             0x1000,
             kernel_types::memory::PhysicalMappingCache::Uncached,
         )
         .map_err(|_| ())?;
         Ok(Self {
-            base_addr: virt.into(),
+            base_addr: mapping.address().into(),
+            mapping,
         })
     }
 

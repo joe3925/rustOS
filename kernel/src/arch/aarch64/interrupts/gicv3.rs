@@ -3,7 +3,7 @@ use core::arch::asm;
 use aarch64_cpu::asm::barrier::{SY, dsb, isb};
 use kernel_types::arch::PhysAddr;
 use kernel_types::irq::PlatformCpuId;
-use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::memory::{KernelMapping, PhysicalMappingCache};
 use spin::Mutex;
 
 use crate::machine::machine_info;
@@ -18,6 +18,8 @@ use super::entry::InterruptToken;
 use super::its::Its;
 
 pub(crate) struct GicV3 {
+    distributor_mapping: KernelMapping,
+    redistributor_mapping: KernelMapping,
     distributor: usize,
     redistributor: usize,
     redistributor_phys: u64,
@@ -45,8 +47,10 @@ impl GicV3 {
         .expect("failed to map GICv3 redistributor range");
         let its = description.its.and_then(Its::new);
         Self {
-            distributor: distributor.as_u64() as usize,
-            redistributor: redistributor.as_u64() as usize,
+            distributor: distributor.address().as_u64() as usize,
+            redistributor: redistributor.address().as_u64() as usize,
+            distributor_mapping: distributor,
+            redistributor_mapping: redistributor,
             redistributor_phys: description.redistributor,
             redistributor_size: description.redistributor_size as usize,
             its,

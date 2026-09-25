@@ -5,6 +5,5 @@ pub mod io_request;
 pub(crate) mod linked_list;
 pub(crate) mod per_cpu;
 pub(crate) mod per_cpu_vec;
-pub mod range_tracker;
 pub(crate) mod stopwatch;
 //pub mod treiber_stack;

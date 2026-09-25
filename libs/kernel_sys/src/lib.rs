@@ -4,6 +4,7 @@ extern crate alloc;
 
 use acpi::PhysicalMapping;
 use alloc::string::String;
+use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::alloc::Layout;
@@ -124,28 +125,19 @@ unsafe extern "C" {
         backing: &IoBufferBacking<'_>,
     ) -> Result<(), DmaMapError>;
     // Paging / VMM
-    pub fn allocate_auto_kernel_range_mapped(
+    pub fn allocate_auto_kernel_mapping(
         size: u64,
         flags: PageFlags,
-    ) -> Result<VirtAddr, PageMapError>;
-    pub fn allocate_auto_kernel_range_mapped_contiguous(
+    ) -> Result<kernel_types::memory::KernelMapping, PageMapError>;
+    pub fn allocate_auto_contiguous_kernel_mapping(
         size: u64,
         flags: PageFlags,
-    ) -> Result<VirtAddr, PageMapError>;
-    pub fn allocate_kernel_range_mapped(
-        base: u64,
-        size: u64,
-        flags: PageFlags,
-    ) -> Result<VirtAddr, PageMapError>;
-    pub fn deallocate_kernel_range(addr: VirtAddr, size: u64);
-    pub fn unmap_range(root: AddressSpaceRoot, virtual_addr: VirtAddr, size: u64);
-    pub fn identity_map_page(root: AddressSpaceRoot, frame_addr: PhysAddr, flags: PageFlags);
+    ) -> Result<kernel_types::memory::KernelMapping, PageMapError>;
     pub fn map_physical_pages(
         phys: PhysAddr,
         size: u64,
         cache: kernel_types::memory::PhysicalMappingCache,
-    ) -> Result<VirtAddr, PageMapError>;
-    pub fn unmap_physical_pages(virt: VirtAddr, size: u64) -> Result<(), PageMapError>;
+    ) -> Result<kernel_types::memory::KernelMapping, PageMapError>;
     pub fn virt_to_phys(root: AddressSpaceRoot, addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     pub fn resolve_virtual_range_frame(
         root: AddressSpaceRoot,
@@ -286,8 +278,16 @@ unsafe extern "C" {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
-pub struct KernelAcpiHandler;
+#[derive(Clone)]
+pub struct KernelAcpiHandler {
+    mappings: Arc<spin::Mutex<BTreeMap<usize, kernel_types::memory::KernelMapping>>>,
+}
+
+impl core::fmt::Debug for KernelAcpiHandler {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("KernelAcpiHandler").finish()
+    }
+}
 
 impl acpi::Handler for KernelAcpiHandler {
     unsafe fn map_physical_region<T>(
@@ -295,31 +295,32 @@ impl acpi::Handler for KernelAcpiHandler {
         physical_address: usize,
         size: usize,
     ) -> PhysicalMapping<Self, T> {
-        let virt_addr = unsafe {
+        let page_size = 4096u64;
+        let offset = physical_address as u64 % page_size;
+        let physical = physical_address as u64 - offset;
+        let mapped_length = (size as u64 + offset + page_size - 1) & !(page_size - 1);
+        let mapping = unsafe {
             crate::map_physical_pages(
-                PhysAddr::new(physical_address as u64),
-                size as u64,
+                PhysAddr::new(physical),
+                mapped_length,
                 kernel_types::memory::PhysicalMappingCache::Cached,
             )
             .expect("failed to map io space for ACPI")
         };
+        let virtual_address = mapping.address().as_u64() + offset;
+        self.mappings.lock().insert(virtual_address as usize, mapping);
 
         PhysicalMapping {
             physical_start: physical_address,
-            virtual_start: NonNull::new(virt_addr.as_mut_ptr()).unwrap(),
+            virtual_start: NonNull::new(virtual_address as *mut T).unwrap(),
             region_length: size,
-            mapped_length: size,
+            mapped_length: mapped_length as usize,
             handler: self.clone(),
         }
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        let _ = unsafe {
-            crate::unmap_physical_pages(
-                VirtAddr::new(region.virtual_start.as_ptr() as u64),
-                region.region_length as u64,
-            )
-        };
+        region.handler.mappings.lock().remove(&(region.virtual_start.as_ptr() as usize));
     }
     fn read_u8(&self, _: usize) -> u8 {
         0

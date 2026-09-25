@@ -33,7 +33,7 @@ debug_args = [
 ]
 [defaults]
 memory = "700M"
-cpus = "1"
+cpus = "3"
 
 [capabilities]
 debug = true

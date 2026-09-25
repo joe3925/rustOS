@@ -1,7 +1,7 @@
 use crate::memory::paging::layout::base_page_size;
 use crate::memory::paging::map::map_kernel_range;
 use crate::memory::paging::stack::{
-    StackSize, allocate_kernel_stack, deallocate_kernel_stack, kernel_stack_max_bytes,
+    KernelStack, StackSize, allocate_kernel_stack, kernel_stack_max_bytes,
 };
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
@@ -73,6 +73,8 @@ pub struct TaskRef {
 
     /// Total reserved stack bytes (write-once, read lock-free)
     pub stack_size: AtomicU64,
+
+    kernel_stack: Mutex<Option<KernelStack>>,
 
     /// Scheduler-restored kernel TLS pointer for this task.
     pub tls_thread_pointer: AtomicU64,
@@ -331,7 +333,7 @@ impl TaskRef {
 
         self.guard_page.store(0, Ordering::Release);
         self.stack_size.store(0, Ordering::Release);
-        unsafe { deallocate_kernel_stack(VirtAddr::new(stack_top)) };
+        self.kernel_stack.lock().take();
     }
 }
 
@@ -422,6 +424,7 @@ impl Task {
             stack_start: AtomicU64::new(stack_top),
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size),
+            kernel_stack: Mutex::new(None),
             tls_thread_pointer: AtomicU64::new(0),
             sched_binding: RwLock::new(sched_binding),
             active_domain_id: AtomicU32::new(active_domain_id.0 as u32),
@@ -456,7 +459,8 @@ impl Task {
         sched_binding: TaskSchedBinding,
     ) -> TaskHandle {
         let cpu_id = platform::current_cpu_id();
-        let stack_top = allocate_kernel_stack(stack_size).expect("Failed to allocate stack");
+        let kernel_stack = allocate_kernel_stack(stack_size).expect("Failed to allocate stack");
+        let stack_top = kernel_stack.top();
         let stack_top_u64 = stack_top.as_u64();
         let guard_page = initial_guard_page(stack_top_u64, stack_size.as_bytes());
         let state = platform::new_kernel_task_context(entry_point, context, stack_top);
@@ -494,6 +498,7 @@ impl Task {
             stack_start: AtomicU64::new(stack_top_u64),
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size.as_bytes()),
+            kernel_stack: Mutex::new(Some(kernel_stack)),
             tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
             sched_binding: RwLock::new(sched_binding),
             active_domain_id: AtomicU32::new(active_domain_id.0 as u32),

@@ -1,13 +1,14 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_types::{arch::VirtAddr, dma::PhysicalFrameExtent};
+use kernel_types::{
+    arch::{PageFlags, VirtAddr},
+    dma::PhysicalFrameExtent,
+    status::PageMapError,
+};
 use spin::{Mutex, MutexGuard};
 use toml::map::IntoIter;
 
-use crate::{
-    memory::paging::{address_space::AddressSpaceRoot, types::PhysicalMemoryIter},
-    structs::range_tracker::RangeTracker,
-};
+use crate::memory::paging::{address_space::AddressSpaceRoot, types::PhysicalMemoryIter};
 
 #[derive(Debug)]
 struct PinNode {
@@ -168,7 +169,7 @@ impl Default for PinTree {
 #[derive(Debug)]
 struct DeferredTeardown {
     root: AddressSpaceRoot,
-    tracker: Arc<RangeTracker>,
+    tracker: Arc<kernel_types::memory::RangeManager>,
 }
 
 impl PinTree {
@@ -214,14 +215,17 @@ impl UserMemoryPins {
 
     /// Tears down immediately when there are no pins, otherwise transfers
     /// teardown ownership to the final `UserRangePin`.
-    pub fn teardown_or_defer(&self, root: AddressSpaceRoot, tracker: Arc<RangeTracker>) {
+    pub fn teardown_or_defer(
+        &self,
+        root: AddressSpaceRoot,
+        tracker: Arc<kernel_types::memory::RangeManager>,
+    ) {
         let mut tree = self.tree.lock();
         if tree.root.is_some() {
             debug_assert!(tree.deferred_teardown.is_none());
             tree.deferred_teardown = Some(DeferredTeardown { root, tracker });
             return;
         }
-        drop(tree);
         teardown_user_mappings(root, &tracker);
     }
 }
@@ -247,6 +251,37 @@ impl UserMemoryLock<'_> {
             end,
             id,
         })
+    }
+
+    pub unsafe fn map_range(
+        &self,
+        addr: VirtAddr,
+        size: u64,
+        flags: PageFlags,
+    ) -> Result<(), PageMapError> {
+        unsafe {
+            crate::memory::paging::map::map_user_range_locked(
+                self.owner.address_space_root,
+                addr,
+                size,
+                flags,
+                false,
+            )
+        }
+    }
+
+    pub unsafe fn unmap_range(
+        &self,
+        addr: VirtAddr,
+        size: u64,
+    ) -> Result<(), PageMapError> {
+        unsafe {
+            crate::memory::paging::map::unmap_user_range_locked(
+                self.owner.address_space_root,
+                addr,
+                size,
+            )
+        }
     }
 }
 
@@ -293,25 +328,21 @@ impl IntoIterator for &UserRangePin {
 }
 impl Drop for UserRangePin {
     fn drop(&mut self) {
-        let teardown = {
-            let mut tree = self.owner.tree.lock();
-            tree.remove(self.start, self.id);
-            if tree.root.is_none() {
-                tree.deferred_teardown.take()
-            } else {
-                None
+        let mut tree = self.owner.tree.lock();
+        tree.remove(self.start, self.id);
+        if tree.root.is_none() {
+            if let Some(teardown) = tree.deferred_teardown.take() {
+                teardown_user_mappings(teardown.root, &teardown.tracker);
             }
-        };
-        if let Some(teardown) = teardown {
-            teardown_user_mappings(teardown.root, &teardown.tracker);
         }
     }
 }
 
-fn teardown_user_mappings(root: AddressSpaceRoot, tracker: &RangeTracker) {
+fn teardown_user_mappings(root: AddressSpaceRoot, tracker: &kernel_types::memory::RangeManager) {
     unsafe {
         for (start, size) in tracker.get_allocations() {
-            crate::memory::paging::map::unmap_range_unchecked(root, VirtAddr::new(start), size);
+            crate::memory::paging::map::unmap_user_range_locked(root, VirtAddr::new(start), size)
+                .expect("failed to tear down user mapping");
         }
     }
 }

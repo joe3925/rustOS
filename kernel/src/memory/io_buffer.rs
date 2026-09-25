@@ -2,19 +2,19 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 
-use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+use kernel_types::arch::{PageFlags, PhysAddr};
 use kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferAccess, IoBufferBacking, IoBufferBackingConfig,
     IoBufferBackingDesc, IoBufferError, IoBufferExtent, PhysicalFrameExtent, ToDevice,
 };
-use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::memory::{KernelMapping, PhysicalMappingCache};
 use kernel_types::status::PageMapError;
 
 use crate::memory::paging::address_space::kernel_address_space_root;
 use crate::memory::paging::layout::base_page_size;
 use crate::memory::paging::types::PhysicalMemoryIter;
 
-use crate::memory::paging::virt_tracker::{allocate_auto_kernel_range, deallocate_kernel_range};
+use crate::memory::paging::virt_tracker::reserve_auto_kernel_range;
 use crate::memory::user_pins::UserRangePin;
 
 #[repr(u32)]
@@ -36,8 +36,7 @@ impl UserBufferAccess {
 
 #[derive(Debug)]
 pub struct KernelIoMapping {
-    base: VirtAddr,
-    mapped_len: u64,
+    mapping: KernelMapping,
 }
 
 impl KernelIoMapping {
@@ -49,7 +48,8 @@ impl KernelIoMapping {
             return Err(PageMapError::NoMemory());
         }
 
-        let base = allocate_auto_kernel_range(mapped_len).ok_or(PageMapError::NoMemory())?;
+        let reservation = reserve_auto_kernel_range(mapped_len).map_err(|_| PageMapError::NoMemory())?;
+        let base = reservation.start();
         let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::GLOBAL;
         let mut mapped = 0u64;
 
@@ -65,10 +65,6 @@ impl KernelIoMapping {
                     }
                 }
 
-                unsafe {
-                    deallocate_kernel_range(base, mapped_len);
-                }
-
                 return Err(PageMapError::NoMemory());
             };
 
@@ -79,10 +75,6 @@ impl KernelIoMapping {
                             base, mapped,
                         );
                     }
-                }
-
-                unsafe {
-                    deallocate_kernel_range(base, mapped_len);
                 }
 
                 return Err(PageMapError::TranslationFailed());
@@ -106,10 +98,6 @@ impl KernelIoMapping {
                     }
                 }
 
-                unsafe {
-                    deallocate_kernel_range(base, mapped_len);
-                }
-
                 return Err(error);
             }
 
@@ -125,28 +113,12 @@ impl KernelIoMapping {
                 }
             }
 
-            unsafe {
-                deallocate_kernel_range(base, mapped_len);
-            }
-
             return Err(PageMapError::TranslationFailed());
         }
 
-        Ok(Self { base, mapped_len })
-    }
-}
-
-impl Drop for KernelIoMapping {
-    fn drop(&mut self) {
-        if self.mapped_len != 0 {
-            unsafe {
-                crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(
-                    self.base,
-                    self.mapped_len,
-                );
-                deallocate_kernel_range(self.base, self.mapped_len);
-            }
-        }
+        let mapping = reservation.into_borrowed_mapping(0, mapped_len)
+            .map_err(|_| PageMapError::TranslationFailed())?;
+        Ok(Self { mapping })
     }
 }
 
@@ -189,7 +161,7 @@ impl MappedIoBufferBacking {
         let mapped_offset =
             usize::try_from(page_offset).map_err(|_| IoBufferError::InvalidRange)?;
         let mapped_len =
-            usize::try_from(mapping.mapped_len).map_err(|_| IoBufferError::InvalidRange)?;
+            usize::try_from(mapping.mapping.size()).map_err(|_| IoBufferError::InvalidRange)?;
 
         let end = mapped_offset
             .checked_add(length)
@@ -199,7 +171,7 @@ impl MappedIoBufferBacking {
             return Err(IoBufferError::InvalidRange);
         }
 
-        let data = mapping.base + page_offset;
+        let data = mapping.mapping.address() + page_offset;
 
         let backing = match access {
             UserBufferAccess::Read => {

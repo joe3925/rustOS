@@ -9,7 +9,7 @@ use kernel_api::kernel_types::dma::{
     IoBufferBackingDesc,
 };
 use kernel_api::memory::{
-    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous, unmap_range,
+    KernelMapping, PageTableFlags, VirtAddr, allocate_auto_contiguous_kernel_mapping,
 };
 
 struct DmaChunk {
@@ -21,7 +21,7 @@ struct DmaChunk {
 }
 
 pub struct ContiguousDmaRegion {
-    base_va: VirtAddr,
+    mapping: Option<KernelMapping>,
     alloc_bytes: usize,
     mapped_bytes: usize,
     chunks: Vec<DmaChunk>,
@@ -81,7 +81,7 @@ impl ContiguousDmaRegion {
 
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
-        let base_va = allocate_auto_kernel_range_mapped_contiguous(
+        let mapping = allocate_auto_contiguous_kernel_mapping(
             alloc_bytes as u64,
             flags,
         )
@@ -93,13 +93,14 @@ impl ContiguousDmaRegion {
                 ),
             )
         })?;
+        let base_va = mapping.address();
 
         unsafe {
             core::ptr::write_bytes(base_va.as_u64() as *mut u8, 0, alloc_bytes);
         }
 
         let mut region = Self {
-            base_va,
+            mapping: Some(mapping),
             alloc_bytes,
             mapped_bytes,
             chunks: Vec::new(),
@@ -259,12 +260,12 @@ impl ContiguousDmaRegion {
 
     #[inline]
     pub fn base_va(&self) -> VirtAddr {
-        self.base_va
+        self.mapping.as_ref().map_or(VirtAddr::new(0), KernelMapping::address)
     }
 
     #[inline]
     pub fn as_ptr<T>(&self) -> *mut T {
-        self.base_va.as_u64() as *mut T
+        self.base_va().as_u64() as *mut T
     }
 
     pub fn dma_addr_at(&self, byte_offset: usize) -> Option<u64> {
@@ -300,11 +301,7 @@ impl ContiguousDmaRegion {
             return;
         }
 
-        unsafe {
-            unmap_range(self.base_va, self.alloc_bytes as u64);
-        }
-
-        self.base_va = VirtAddr::new(0);
+        drop(self.mapping.take());
         self.alloc_bytes = 0;
         self.mapped_bytes = 0;
     }

@@ -1,15 +1,13 @@
 use spin::Mutex;
 
-use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
+use kernel_types::arch::{PageFlags, PhysAddr};
+use kernel_types::memory::KernelMapping;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::{PageMapError, PageMapFailure};
 
-use super::address_space::kernel_address_space_root;
-use super::layout::{align_down, align_up_to_base_page, base_page_size, largest_mapping_size_for};
-use super::map::{
-    kernel_virt_to_phys, map_contiguous_physical_range, unmap_kernel_range_keep_frames_unchecked,
-};
-use super::virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range};
+use super::layout::{base_page_size, largest_mapping_size_for};
+use super::map::map_physical_into_reservation;
+use super::virt_tracker::reserve_auto_kernel_range_aligned;
 
 static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
 
@@ -17,14 +15,8 @@ pub fn map_physical_pages(
     phys: PhysAddr,
     size: u64,
     cache: PhysicalMappingCache,
-) -> Result<VirtAddr, PageMapError> {
-    let base_page = base_page_size();
-    let phys_addr = phys.as_u64();
-    let off = phys_addr % base_page;
-    let aligned_phys = phys_addr - off;
-    let total_size = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
-
-    let va_alignment = largest_mapping_size_for(total_size, Some(aligned_phys));
+) -> Result<KernelMapping, PageMapError> {
+    let va_alignment = largest_mapping_size_for(size, Some(phys.as_u64()));
     map_physical_pages_aligned(phys, size, va_alignment, cache)
 }
 
@@ -33,7 +25,7 @@ pub fn map_physical_pages_aligned(
     size: u64,
     va_alignment: u64,
     cache: PhysicalMappingCache,
-) -> Result<VirtAddr, PageMapError> {
+) -> Result<KernelMapping, PageMapError> {
     let _lock = MMIO_MAP_LOCK.lock();
 
     if size == 0 {
@@ -46,63 +38,26 @@ pub fn map_physical_pages_aligned(
         return Err(PageMapError::TranslationFailed());
     }
 
-    let phys_addr = phys.as_u64();
-    let off = phys_addr % base_page;
-    let aligned_phys = align_down(phys_addr, base_page).ok_or(PageMapError::TranslationFailed())?;
-    let total_size = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
+    if phys.as_u64() % base_page != 0 || size % base_page != 0 {
+        return Err(PageMapError::TranslationFailed());
+    }
 
     let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
     loop {
-        let virtual_addr = allocate_auto_kernel_range_aligned(total_size, va_alignment)
-            .ok_or(PageMapError::NoMemory())?;
-        match unsafe {
-            map_contiguous_physical_range(
-                kernel_address_space_root(),
-                virtual_addr,
-                PhysAddr::new(aligned_phys),
-                total_size,
-                flags,
-                Some(cache),
-            )
-        } {
-            Ok(()) => return Ok(VirtAddr::new(virtual_addr.as_u64() + off)),
-            Err(
+        let reservation = reserve_auto_kernel_range_aligned(size, va_alignment)
+            .map_err(|_| PageMapError::NoMemory())?;
+        match map_physical_into_reservation(reservation, 0, phys, size, flags, Some(cache)) {
+            Ok(mapping) => return Ok(mapping),
+            Err((
+                _,
                 PageMapError::Page4KiB(PageMapFailure::PageAlreadyMapped)
                 | PageMapError::Page2MiB(PageMapFailure::PageAlreadyMapped)
                 | PageMapError::Page1GiB(PageMapFailure::PageAlreadyMapped)
                 | PageMapError::Page4KiB(PageMapFailure::ParentEntryHugePage)
                 | PageMapError::Page2MiB(PageMapFailure::ParentEntryHugePage)
                 | PageMapError::Page1GiB(PageMapFailure::ParentEntryHugePage),
-            ) => {}
-            Err(err) => {
-                unsafe { deallocate_kernel_range(virtual_addr, total_size) };
-                return Err(err);
-            }
+            )) => {}
+            Err((_, err)) => return Err(err),
         }
     }
-}
-
-/// # Safety
-/// The range must be an MMIO mapping owned by the caller and must not be used
-/// after this call.
-pub unsafe fn unmap_physical_pages(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
-    let _lock = MMIO_MAP_LOCK.lock();
-
-    if size == 0 {
-        return Ok(());
-    }
-
-    let base_page = base_page_size();
-    let off = base.as_u64() % base_page;
-    let start = VirtAddr::new(base.as_u64() - off);
-    let total = align_up_to_base_page(size + off).ok_or(PageMapError::TranslationFailed())?;
-
-    unsafe {
-        unmap_kernel_range_keep_frames_unchecked(start, total);
-    }
-    if kernel_virt_to_phys(start).is_none() {
-        unsafe { deallocate_kernel_range(start, total) };
-    }
-
-    Ok(())
 }

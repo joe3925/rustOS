@@ -21,7 +21,7 @@ use crate::memory::paging::frame_alloc::{
 };
 use crate::memory::paging::map::unmap_kernel_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
-use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
+use crate::memory::paging::virt_tracker::KERNEL_RANGE_MANAGER;
 use crate::memory::paging::zero::{init_emergency_zero_mappings, start_zero_page_worker};
 use crate::platform::{
     ActivePlatform, ConsolePlatform, breakpoint, broadcast_panic_stop, calibrate_boot_timer,
@@ -159,7 +159,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         Path::from_string(""),
         VirtAddr::new(kernel_image_base),
         kernel_address_space_root(),
-        KERNEL_RANGE_TRACKER.clone(),
+        KERNEL_RANGE_MANAGER.clone(),
     );
     program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
 

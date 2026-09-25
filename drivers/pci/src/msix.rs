@@ -11,7 +11,7 @@ use kernel_api::kernel_types::irq::{
     IrqHandle, IrqIsrFn, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU, MsiBindingRequest,
     MsiRequester,
 };
-use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region, unmap_mmio_region};
+use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region};
 
 use crate::dev_ext::PciPdoExt;
 use kernel_api::kernel_types::pci::BarKind;
@@ -148,7 +148,7 @@ pub extern "C" fn pci_setup_msix(
             )
         })?;
 
-    let table_va =
+    let table_mapping =
         map_mmio_region(PhysAddr::new(table_phys), table_region_size).map_err(|err| {
             error_with_message(
                 DriverErrorKind::InsufficientResources,
@@ -160,14 +160,13 @@ pub extern "C" fn pci_setup_msix(
                 ),
             )
         })?;
+    let table_va = table_mapping.address();
 
     let binding = match bind_msi_interrupt(&request, isr, context) {
         Some(binding) => binding,
 
         None => {
-            let unmap_result = unsafe { unmap_mmio_region(table_va, table_region_size) };
-
-            let mut error = error_with_message(
+            return Err(error_with_message(
                 DriverErrorKind::InsufficientResources,
                 format_args!(
                     "failed to bind MSI-X interrupt for PCI device \
@@ -180,17 +179,7 @@ pub extern "C" fn pci_setup_msix(
                     request.target.mode,
                     request.target.platform_cpu_id,
                 ),
-            );
-
-            if let Err(unmap_err) = unmap_result {
-                error = error.with_context(format_args!(
-                    "additionally failed to unmap MSI-X table VA {:#x}, size {:#x}: {unmap_err:?}",
-                    table_va.as_u64(),
-                    table_region_size,
-                ));
-            }
-
-            return Err(error);
+            ));
         }
     };
 
@@ -198,9 +187,6 @@ pub extern "C" fn pci_setup_msix(
         .checked_mul(16)
         .ok_or_else(|| {
             binding.handle.unregister();
-
-            let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-
             error_with_message(
                 DriverErrorKind::InvalidParameter,
                 format_args!(
@@ -212,9 +198,6 @@ pub extern "C" fn pci_setup_msix(
 
     let entry_va = table_va.as_u64().checked_add(entry_offset).ok_or_else(|| {
         binding.handle.unregister();
-
-        let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-
         error_with_message(
             DriverErrorKind::InvalidParameter,
             format_args!(
@@ -240,8 +223,8 @@ pub extern "C" fn pci_setup_msix(
         write_volatile((entry_va + 12) as *mut u32, VECTOR_CTRL_UNMASKED);
     }
 
-    let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
-        Ok(va) => va,
+    let config_mapping = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
+        Ok(mapping) => mapping,
 
         Err(map_err) => {
             unsafe {
@@ -249,29 +232,17 @@ pub extern "C" fn pci_setup_msix(
             }
 
             binding.handle.unregister();
-
-            let unmap_result = unsafe { unmap_mmio_region(table_va, table_region_size) };
-
-            let mut error = error_with_message(
+            return Err(error_with_message(
                 DriverErrorKind::InsufficientResources,
                 format_args!(
                     "failed to map PCI configuration space while enabling MSI-X for \
                      {:04x}:{:02x}:{:02x}.{} at physical address {:#x}: {map_err:?}",
                     ext.seg, ext.bus, ext.dev, ext.func, ext.cfg_phys,
                 ),
-            );
-
-            if let Err(unmap_err) = unmap_result {
-                error = error.with_context(format_args!(
-                    "additionally failed to unmap MSI-X table VA {:#x}, size {:#x}: {unmap_err:?}",
-                    table_va.as_u64(),
-                    table_region_size,
-                ));
-            }
-
-            return Err(error);
+            ));
         }
     };
+    let cfg_va = config_mapping.address();
 
     let cmd = unsafe { cfg_read16(cfg_va, 0x04) };
 
@@ -286,41 +257,6 @@ pub extern "C" fn pci_setup_msix(
 
     unsafe {
         cfg_write16(cfg_va, msg_ctrl_offset, new_msg_ctrl);
-    }
-
-    if let Err(err) = unsafe { unmap_mmio_region(cfg_va, 4096) } {
-        let _ = unsafe { unmap_mmio_region(table_va, table_region_size) };
-
-        return Err(error_with_message(
-            DriverErrorKind::DeviceError,
-            format_args!(
-                "MSI-X was enabled for PCI device {:04x}:{:02x}:{:02x}.{}, \
-                 but unmapping its temporary configuration-space mapping \
-                 at VA {:#x} failed: {err:?}",
-                ext.seg,
-                ext.bus,
-                ext.dev,
-                ext.func,
-                cfg_va.as_u64(),
-            ),
-        ));
-    }
-
-    if let Err(err) = unsafe { unmap_mmio_region(table_va, table_region_size) } {
-        return Err(error_with_message(
-            DriverErrorKind::DeviceError,
-            format_args!(
-                "MSI-X was enabled for PCI device {:04x}:{:02x}:{:02x}.{}, \
-                 but unmapping its temporary MSI-X table mapping at VA {:#x}, \
-                 size {:#x} failed: {err:?}",
-                ext.seg,
-                ext.bus,
-                ext.dev,
-                ext.func,
-                table_va.as_u64(),
-                table_region_size,
-            ),
-        ));
     }
 
     Ok(binding.handle)

@@ -63,7 +63,9 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     let Some(rsdp) = get_rsdp() else { return Ok(DriverStep::Continue); };
 
     let parsed = spawn_blocking(move || -> Result<AmlContext, ()> {
-        let handler = KernelAmlHandler;
+        let handler = KernelAmlHandler {
+            mappings: Arc::new(spin::Mutex::new(alloc::collections::BTreeMap::new())),
+        };
         let tables = unsafe { ::aml::AcpiTables::from_rsdp(handler.clone(), rsdp as usize) }.map_err(|e| { println!("[ACPI] ERROR: parse tables: {:?}", e); })?;
         let platform = ::aml::platform::AcpiPlatform::new(tables, handler).map_err(|e| { println!("[ACPI] ERROR: create platform: {:?}", e); })?;
         let aml_ctx = Interpreter::new_from_platform(&platform).map_err(|e| { println!("[ACPI] ERROR: parse AML: {:?}", e); })?;

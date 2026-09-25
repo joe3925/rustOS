@@ -6,7 +6,7 @@ use crate::memory::paging::layout::base_page_size;
 use crate::platform;
 use crate::println;
 use crate::scheduling::task::Task;
-use crate::structs::range_tracker::RangeTracker;
+use kernel_types::memory::RangeManager;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -370,7 +370,11 @@ impl PELoader {
         }
 
         let layout = self.process_layout()?;
-        let range_tracker = Arc::new(RangeTracker::new(base_page_size(), 0x00007FFFFFFFFFFFu64));
+        let range_tracker = Arc::new(RangeManager::new(
+            base_page_size(),
+            0x00007FFFFFFFFFFFu64,
+            base_page_size(),
+        ));
 
         let preferred_image_base = opt_hdr.windows_fields.image_base;
         let has_relocs = self.reloc_table().is_some();
@@ -610,7 +614,7 @@ impl PELoader {
 
     pub fn allocate_relocation_base(
         &mut self,
-        range_tracker: &RangeTracker,
+        range_tracker: &Arc<RangeManager>,
     ) -> Result<VirtAddr, LoadError> {
         let alloc_size = if self.pe.is_lib {
             self.image_allocation_size()?
@@ -623,7 +627,7 @@ impl PELoader {
 
     fn allocate_relocation_base_for_size(
         &mut self,
-        range_tracker: &RangeTracker,
+        range_tracker: &Arc<RangeManager>,
         alloc_size: u64,
     ) -> Result<VirtAddr, LoadError> {
         let alloc_size = align_up(alloc_size, base_page_size()).ok_or(LoadError::NoMemory)?;

@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::pci::{Bar, BarKind, EcamSegment, MsixInfo, PciConfigAddress};
-use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region};
+use kernel_api::memory::{KernelMapping, PhysAddr, VirtAddr, map_mmio_region};
 use kernel_api::pci::{pci_read_config_u32, pci_write_config_u32};
 use kernel_api::pnp::{QueryResources, ResourceSet};
 use kernel_api::status::PageMapError;
@@ -55,13 +55,6 @@ pub struct PciPdoExt {
     pub bars: [Bar; 6],
 
     pub msix: Option<MsixInfo>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct EcamSegmentMap {
-    pub base: VirtAddr,
-    pub size: u64,
-    pub start_bus: u8,
 }
 
 #[inline]
@@ -186,13 +179,13 @@ unsafe fn cfg_write32(base: VirtAddr, off: u16, value: u32) {
 }
 
 #[inline]
-pub fn map_ecam_bus(seg: &McfgSegment, bus: u8) -> Result<(VirtAddr, u64), PageMapError> {
+pub fn map_ecam_bus(seg: &McfgSegment, bus: u8) -> Result<KernelMapping, PageMapError> {
     let pa = PhysAddr::new(seg.base + ((bus as u64) << 20));
     let sz = 1u64 << 20;
-    map_mmio_region(pa, sz).map(|va| (va, sz))
+    map_mmio_region(pa, sz)
 }
 
-pub fn map_ecam_segment_range(seg: &McfgSegment) -> Result<EcamSegmentMap, PageMapError> {
+pub fn map_ecam_segment_range(seg: &McfgSegment) -> Result<KernelMapping, PageMapError> {
     let start = seg.start_bus as u64;
     let end = seg.end_bus as u64;
     if end < start {
@@ -202,18 +195,17 @@ pub fn map_ecam_segment_range(seg: &McfgSegment) -> Result<EcamSegmentMap, PageM
     let sz = bus_count << 20;
 
     let pa = PhysAddr::new(seg.base + (start << 20));
-    let base = map_mmio_region(pa, sz)?;
-    Ok(EcamSegmentMap {
-        base,
-        size: sz,
-        start_bus: seg.start_bus,
-    })
+    map_mmio_region(pa, sz)
 }
 
 #[inline]
-pub fn ecam_bus_base_from_segment(map: EcamSegmentMap, bus: u8) -> VirtAddr {
-    let delta = (bus.wrapping_sub(map.start_bus)) as u64;
-    VirtAddr::new(map.base.as_u64() + (delta << 20))
+pub fn ecam_bus_base_from_segment(
+    mapping: &KernelMapping,
+    start_bus: u8,
+    bus: u8,
+) -> VirtAddr {
+    let delta = (bus.wrapping_sub(start_bus)) as u64;
+    VirtAddr::new(mapping.address().as_u64() + (delta << 20))
 }
 
 #[inline]

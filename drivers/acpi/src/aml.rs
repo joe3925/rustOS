@@ -5,6 +5,7 @@ use kernel_api::pnp::StartDevice;
 use crate::alloc::format;
 use crate::pdo::AcpiPdoExt;
 use alloc::{
+    collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -21,7 +22,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::pci::EcamSegment;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::memory::{
-    PhysAddr, PhysicalMappingCache, VirtAddr, map_physical_pages, unmap_mmio_region,
+    KernelMapping, PhysAddr, PhysicalMappingCache, map_physical_pages,
 };
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpOp;
@@ -34,7 +35,9 @@ use kernel_api::request_handler;
 pub const PAGE_SIZE: usize = 4096;
 #[derive(Clone)]
 #[repr(C)]
-pub struct KernelAmlHandler;
+pub struct KernelAmlHandler {
+    pub mappings: Arc<spin::Mutex<BTreeMap<usize, KernelMapping>>>,
+}
 pub type AmlContext = Interpreter<KernelAmlHandler>;
 
 pub type McfgSeg = EcamSegment;
@@ -60,54 +63,43 @@ fn round_up(n: usize, align: usize) -> usize {
 }
 
 #[inline]
-unsafe fn map_phys_window(
+fn map_phys_window(
     paddr: usize,
     bytes: usize,
     cache: PhysicalMappingCache,
-) -> (VirtAddr, usize, usize) {
+) -> (KernelMapping, usize) {
     let off = paddr & (PAGE_SIZE - 1);
     let base = paddr - off;
     let size = round_up(off + bytes, PAGE_SIZE);
-    let va = map_physical_pages(PhysAddr::new(base as u64), size as u64, cache).unwrap_or_else(|e| {
+    let mapping = map_physical_pages(PhysAddr::new(base as u64), size as u64, cache).unwrap_or_else(|e| {
         kernel_api::println!("[ACPI] map_phys_window failed: {:?}", e);
         panic!("map_phys_window failed");
     });
 
-    (va, off, size)
-}
-
-#[inline]
-unsafe fn unmap_phys_window(va: VirtAddr, size: usize) {
-    let _ = unsafe { unmap_mmio_region(va, size as u64) };
+    (mapping, off)
 }
 
 #[inline]
 unsafe fn mmio_read<T: Copy>(paddr: usize) -> T {
-    let (va, off, size) = unsafe {
-        map_phys_window(
-            paddr,
-            core::mem::size_of::<T>(),
-            PhysicalMappingCache::Uncached,
-        )
-    };
-    let ptr = (va.as_u64() as usize + off) as *const u8;
+    let (mapping, off) = map_phys_window(
+        paddr,
+        core::mem::size_of::<T>(),
+        PhysicalMappingCache::Uncached,
+    );
+    let ptr = (mapping.address().as_u64() as usize + off) as *const u8;
     let v = unsafe { read_volatile_unaligned::<T>(ptr) };
-    unsafe { unmap_phys_window(va, size) };
     v
 }
 
 #[inline]
 unsafe fn mmio_write<T: Copy>(paddr: usize, val: T) {
-    let (va, off, size) = unsafe {
-        map_phys_window(
-            paddr,
-            core::mem::size_of::<T>(),
-            PhysicalMappingCache::Uncached,
-        )
-    };
-    let ptr = (va.as_u64() as usize + off) as *mut u8;
+    let (mapping, off) = map_phys_window(
+        paddr,
+        core::mem::size_of::<T>(),
+        PhysicalMappingCache::Uncached,
+    );
+    let ptr = (mapping.address().as_u64() as usize + off) as *mut u8;
     unsafe { write_volatile_unaligned::<T>(ptr, val) };
-    unsafe { unmap_phys_window(va, size) };
 }
 
 #[inline]
@@ -129,12 +121,14 @@ fn ecam_cfg_phys_addr(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Option<
 
 impl Handler for KernelAmlHandler {
     unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
-        let (va, offset, mapped_length) = unsafe {
-            map_phys_window(physical_address, size, PhysicalMappingCache::Cached)
-        };
+        let (mapping, offset) =
+            map_phys_window(physical_address, size, PhysicalMappingCache::Cached);
+        let mapped_length = mapping.size() as usize;
+        let virtual_start = mapping.address().as_u64() as usize + offset;
+        self.mappings.lock().insert(virtual_start, mapping);
         PhysicalMapping {
             physical_start: physical_address,
-            virtual_start: core::ptr::NonNull::new((va.as_u64() as usize + offset) as *mut T).unwrap(),
+            virtual_start: core::ptr::NonNull::new(virtual_start as *mut T).unwrap(),
             region_length: size,
             mapped_length,
             handler: self.clone(),
@@ -142,9 +136,11 @@ impl Handler for KernelAmlHandler {
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        let offset = region.physical_start & (PAGE_SIZE - 1);
-        let base = region.virtual_start.as_ptr() as usize - offset;
-        unsafe { unmap_phys_window(VirtAddr::new(base as u64), region.mapped_length) };
+        region
+            .handler
+            .mappings
+            .lock()
+            .remove(&(region.virtual_start.as_ptr() as usize));
     }
 
     #[inline]

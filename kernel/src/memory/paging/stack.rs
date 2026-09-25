@@ -1,9 +1,32 @@
 use kernel_types::arch::{PageFlags, VirtAddr};
+use kernel_types::memory::RangeReservation;
 use kernel_types::status::PageMapError;
 
 use super::layout::{align_up, base_page_size, supported_mapping_sizes};
-use super::map::{map_kernel_range, unmap_kernel_range};
-use super::virt_tracker::allocate_auto_kernel_range_aligned;
+use super::map::{map_kernel_range, unmap_kernel_reserved_range_unchecked};
+use super::virt_tracker::reserve_auto_kernel_range_aligned;
+
+#[derive(Debug)]
+pub struct KernelStack {
+    reservation: RangeReservation,
+}
+
+impl KernelStack {
+    pub fn top(&self) -> VirtAddr {
+        self.reservation.end()
+    }
+}
+
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        unsafe {
+            unmap_kernel_reserved_range_unchecked(
+                self.reservation.start(),
+                self.reservation.size(),
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StackSize {
@@ -55,7 +78,7 @@ pub fn kernel_stack_reservation_bytes() -> u64 {
     kernel_stack_max_bytes() + base_page_size()
 }
 
-pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> {
+pub fn allocate_kernel_stack(size: StackSize) -> Result<KernelStack, PageMapError> {
     let max_stack = kernel_stack_max_bytes();
     let reserve_total = kernel_stack_reservation_bytes();
 
@@ -66,25 +89,18 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
 
     let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
 
-    let region_base =
-        allocate_auto_kernel_range_aligned(reserve_total, required_alignment_for_bytes(max_stack))
-            .ok_or(PageMapError::NoMemory())?;
-    let stack_top = VirtAddr::new(region_base.as_u64() + reserve_total);
+    let reservation = reserve_auto_kernel_range_aligned(
+        reserve_total,
+        required_alignment_for_bytes(max_stack),
+    )
+    .map_err(|_| PageMapError::NoMemory())?;
+    let region_base = reservation.start();
+    let stack_top = reservation.end();
     let map_start = VirtAddr::new(stack_top.as_u64() - map_bytes);
 
     if let Err(err) = unsafe { map_kernel_range(map_start, map_bytes, flags, false) } {
-        unsafe { unmap_kernel_range(region_base, reserve_total) };
         return Err(err);
     }
 
-    Ok(stack_top)
-}
-
-/// # Safety
-/// `stack_top` must identify a live kernel stack allocation that is no longer
-/// executing or referenced and has not already been deallocated.
-pub unsafe fn deallocate_kernel_stack(stack_top: VirtAddr) {
-    let reserve_total = kernel_stack_reservation_bytes();
-    let region_base = VirtAddr::new(stack_top.as_u64() - reserve_total);
-    unsafe { unmap_kernel_range(region_base, reserve_total) };
+    Ok(KernelStack { reservation })
 }

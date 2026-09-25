@@ -1,7 +1,7 @@
 use acpi::sdt::mcfg::Mcfg;
 use alloc::vec::Vec;
 use kernel_types::arch::PhysAddr;
-use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::memory::{KernelMapping, PhysicalMappingCache};
 use kernel_types::pci::PciConfigAddress;
 use spin::Once;
 
@@ -17,6 +17,7 @@ const PCI_FUNCTION_CONFIG_SPACE_SIZE: u16 = 4096;
 const PCI_BUS_CONFIG_SPACE_SIZE: u64 = 1 << 20;
 
 struct EcamMapping {
+    mapping: KernelMapping,
     base: usize,
     segment: u16,
     start_bus: u8,
@@ -55,7 +56,8 @@ fn config_address(address: PciConfigAddress) -> Option<*mut u32> {
                 continue;
             };
             mappings.push(EcamMapping {
-                base: base.as_u64() as usize,
+                base: base.address().as_u64() as usize,
+                mapping: base,
                 segment: entry.pci_segment_group,
                 start_bus,
                 end_bus,

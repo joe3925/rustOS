@@ -797,52 +797,19 @@ pub extern "C" fn get_current_cpu_id() -> usize {
     crate::platform::current_cpu_id()
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn allocate_auto_kernel_range_mapped(
+pub extern "C" fn allocate_auto_kernel_mapping(
     size: u64,
     flags: PageFlags,
-) -> Result<VirtAddr, PageMapError> {
-    crate::memory::paging::map::allocate_auto_kernel_range_mapped(size, flags)
+) -> Result<kernel_types::memory::KernelMapping, PageMapError> {
+    crate::memory::paging::map::allocate_auto_kernel_mapping(size, flags)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn allocate_auto_kernel_range_mapped_contiguous(
+pub extern "C" fn allocate_auto_contiguous_kernel_mapping(
     size: u64,
     flags: PageFlags,
-) -> Result<VirtAddr, PageMapError> {
-    crate::memory::paging::map::allocate_auto_kernel_range_mapped_contiguous(size, flags)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn allocate_kernel_range_mapped(
-    base: u64,
-    size: u64,
-    flags: PageFlags,
-) -> Result<VirtAddr, PageMapError> {
-    crate::memory::paging::map::allocate_kernel_range_mapped(base, size, flags)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
-    unsafe { crate::memory::paging::virt_tracker::deallocate_kernel_range(addr, size) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn unmap_range(root: AddressSpaceRoot, virtual_addr: VirtAddr, size: u64) {
-    unsafe { crate::memory::paging::map::unmap_range(root, virtual_addr, size) }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn identity_map_page(
-    root: AddressSpaceRoot,
-    frame_addr: PhysAddr,
-    flags: PageFlags,
-) {
-    let _ = crate::memory::paging::map::identity_map_page(
-        root,
-        frame_addr,
-        crate::memory::paging::layout::base_page_size() as usize,
-        flags,
-    );
+) -> Result<kernel_types::memory::KernelMapping, PageMapError> {
+    crate::memory::paging::map::allocate_auto_contiguous_kernel_mapping(size, flags)
 }
 
 #[unsafe(no_mangle)]
@@ -850,16 +817,21 @@ pub extern "C" fn map_physical_pages(
     phys: PhysAddr,
     size: u64,
     cache: kernel_types::memory::PhysicalMappingCache,
-) -> Result<VirtAddr, PageMapError> {
+) -> Result<kernel_types::memory::KernelMapping, PageMapError> {
     crate::memory::paging::mmio::map_physical_pages(phys, size, cache)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn unmap_physical_pages(
-    base: VirtAddr,
-    size: u64,
-) -> Result<(), PageMapError> {
-    unsafe { crate::memory::paging::mmio::unmap_physical_pages(base, size) }
+pub unsafe extern "C" fn kernel_mapping_drop(base: VirtAddr, size: u64, owns_frames: bool) {
+    if owns_frames {
+        unsafe {
+            crate::memory::paging::map::unmap_kernel_range_unchecked(base, size);
+        }
+    } else {
+        unsafe {
+            crate::memory::paging::map::unmap_kernel_range_keep_frames_unchecked(base, size);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -872,7 +844,7 @@ pub extern "C" fn resolve_virtual_range_frame(
     root: AddressSpaceRoot,
     addr: VirtAddr,
 ) -> Option<(u64, PhysAddr)> {
-    crate::memory::paging::map::resolve_virtual_range_frame(root, addr)
+    crate::memory::paging::map::virt_to_phys(root, addr)
 }
 
 #[unsafe(no_mangle)]

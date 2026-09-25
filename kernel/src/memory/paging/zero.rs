@@ -17,7 +17,7 @@ use crate::structs::per_cpu::percpu_by_id;
 use crate::sync_platform::{KernelPlatform, WaitQueue};
 
 use super::layout::base_page_size;
-use super::virt_tracker::allocate_auto_kernel_range_aligned;
+use super::virt_tracker::reserve_auto_kernel_range_aligned;
 
 static ZERO_PAGE_WAIT_QUEUE: Once<WaitQueue> = Once::new();
 static BOOTSTRAP_ZERO_LOCK: Mutex<()> = Mutex::new(());
@@ -38,8 +38,9 @@ pub fn init_emergency_zero_mappings() -> Result<(), PageMapError> {
     let range_size = page_size
         .checked_mul(slot_count as u64)
         .ok_or(PageMapError::NoMemory())?;
-    let base =
-        allocate_auto_kernel_range_aligned(range_size, page_size).ok_or(PageMapError::NoMemory())?;
+    let reservation = reserve_auto_kernel_range_aligned(range_size, page_size)
+        .map_err(|_| PageMapError::NoMemory())?;
+    let base = reservation.start();
 
     for cpu_id in 0..cpu_count {
         let percpu = percpu_by_id(cpu_id).ok_or(PageMapError::NoMemoryMap())?;
@@ -70,6 +71,7 @@ pub fn init_emergency_zero_mappings() -> Result<(), PageMapError> {
             .call_once(|| table_address);
     }
 
+    core::mem::forget(reservation);
     EMERGENCY_ZERO_READY.store(true, Ordering::Release);
     Ok(())
 }

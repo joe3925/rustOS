@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::memory::{KernelMapping, RangeReservation};
 use kernel_types::status::{PageMapError, PageMapFailure};
 
 use crate::platform::{ActivePlatform, PageTableFrameAllocator, PagingPlatform};
@@ -8,35 +9,27 @@ use crate::platform::{ActivePlatform, PageTableFrameAllocator, PagingPlatform};
 use super::address_space::{AddressSpaceRoot, kernel_address_space_root};
 use super::frame_alloc::{KernelFrameAllocator, KernelPageTableFrameAllocator};
 use super::layout::{
-    align_up_to_base_page, base_page_size, is_aligned, largest_mapping_size_for,
-    supported_mapping_sizes,
+    align_up_to_base_page, base_page_size, heap_range_end, heap_range_start, is_aligned,
+    largest_mapping_size_for, supported_mapping_sizes,
 };
 use super::tlb::trigger_tlb_shootdown_range;
 use super::types::{MappingSize, UnmapFrameDisposition};
-use super::virt_tracker::{
-    allocate_auto_kernel_range, allocate_auto_kernel_range_aligned, allocate_kernel_range,
-    deallocate_kernel_range,
-};
+use super::virt_tracker::{reserve_auto_kernel_range, reserve_auto_kernel_range_aligned};
 
-pub fn allocate_auto_kernel_range_mapped(
+pub(crate) fn allocate_auto_kernel_mapping(
     size: u64,
     flags: PageFlags,
-) -> Result<VirtAddr, PageMapError> {
+) -> Result<KernelMapping, PageMapError> {
     let aligned_size = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
-    let addr = allocate_auto_kernel_range(aligned_size).ok_or(PageMapError::NoMemory())?;
-
-    if let Err(err) = unsafe { map_kernel_range(addr, aligned_size, flags, false) } {
-        unsafe { deallocate_kernel_range(addr, aligned_size) };
-        return Err(err);
-    }
-
-    Ok(addr)
+    let reservation =
+        reserve_auto_kernel_range(aligned_size).map_err(|_| PageMapError::NoMemory())?;
+    allocate_kernel_mapping(reservation, 0, aligned_size, flags).map_err(|(_, error)| error)
 }
 
-pub fn allocate_auto_kernel_range_mapped_contiguous(
+pub(crate) fn allocate_auto_contiguous_kernel_mapping(
     size: u64,
     flags: PageFlags,
-) -> Result<VirtAddr, PageMapError> {
+) -> Result<KernelMapping, PageMapError> {
     let aligned_size = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
     if aligned_size == 0 {
         return Err(PageMapError::NoMemory());
@@ -46,8 +39,9 @@ pub fn allocate_auto_kernel_range_mapped_contiguous(
     let mapping_size = largest_mapping_size_for(aligned_size, None);
     let phys_align_frames = frame_count_for_bytes(mapping_size).ok_or(PageMapError::NoMemory())?;
 
-    let addr = allocate_auto_kernel_range_aligned(aligned_size, mapping_size)
-        .ok_or(PageMapError::NoMemory())?;
+    let reservation = reserve_auto_kernel_range_aligned(aligned_size, mapping_size)
+        .map_err(|_| PageMapError::NoMemory())?;
+    let addr = reservation.start();
 
     let phys_base =
         KernelFrameAllocator::allocate_contiguous_frames_aligned(frame_count, phys_align_frames)
@@ -70,48 +64,37 @@ pub fn allocate_auto_kernel_range_mapped_contiguous(
                     bytes: aligned_size,
                 },
             );
-            deallocate_kernel_range(addr, aligned_size);
         }
         return Err(err);
     }
 
-    Ok(addr)
-}
-
-pub fn allocate_kernel_range_mapped(
-    base: u64,
-    size: u64,
-    flags: PageFlags,
-) -> Result<VirtAddr, PageMapError> {
-    let aligned_size = align_up_to_base_page(size).ok_or(PageMapError::NoMemory())?;
-    let addr = allocate_kernel_range(base, aligned_size).map_err(|_| PageMapError::NoMemory())?;
-
-    if let Err(err) = unsafe { map_kernel_range(addr, aligned_size, flags, false) } {
-        unsafe { deallocate_kernel_range(addr, aligned_size) };
-        return Err(err);
+    match reservation.into_allocated_mapping(0, aligned_size) {
+        Ok(mapping) => Ok(mapping),
+        Err(reservation) => {
+            unsafe { unmap_kernel_range_unchecked(addr, aligned_size) };
+            Err({
+                drop(reservation);
+                PageMapError::TranslationFailed()
+            })
+        }
     }
-
-    Ok(addr)
 }
 
-pub unsafe fn map_range(
-    root: AddressSpaceRoot,
+pub(crate) unsafe fn commit_heap_range(
     addr: VirtAddr,
     size: u64,
     flags: PageFlags,
     ignore_already_mapped: bool,
 ) -> Result<(), PageMapError> {
-    unsafe { map_range_inner(root, addr, size, flags, ignore_already_mapped) }
-}
-
-pub unsafe fn map_kernel_range(
-    addr: VirtAddr,
-    size: u64,
-    flags: PageFlags,
-    ignore_already_mapped: bool,
-) -> Result<(), PageMapError> {
+    let end = addr
+        .as_u64()
+        .checked_add(size)
+        .ok_or(PageMapError::NoMemory())?;
+    if addr.as_u64() < heap_range_start().as_u64() || end > heap_range_end().as_u64() {
+        return Err(PageMapError::NoMemory());
+    }
     unsafe {
-        map_range(
+        map_range_inner(
             kernel_address_space_root(),
             addr,
             size,
@@ -121,13 +104,52 @@ pub unsafe fn map_kernel_range(
     }
 }
 
-pub unsafe fn map_fresh_kernel_range_no_flush(
+pub(crate) unsafe fn decommit_heap_range(
+    addr: VirtAddr,
+    size: u64,
+) -> Result<(), PageMapError> {
+    let end = addr
+        .as_u64()
+        .checked_add(size)
+        .ok_or(PageMapError::NoMemory())?;
+    if addr.as_u64() < heap_range_start().as_u64() || end > heap_range_end().as_u64() {
+        return Err(PageMapError::NoMemory());
+    }
+    unsafe {
+        unmap_range_with_disposition(
+            kernel_address_space_root(),
+            addr,
+            size,
+            UnmapFrameDisposition::FreeMappedFrame,
+        )
+    }
+}
+
+pub(in crate::memory) unsafe fn map_user_range_locked(
+    root: AddressSpaceRoot,
     addr: VirtAddr,
     size: u64,
     flags: PageFlags,
     ignore_already_mapped: bool,
 ) -> Result<(), PageMapError> {
-    unsafe { map_kernel_range(addr, size, flags, ignore_already_mapped) }
+    unsafe { map_range_inner(root, addr, size, flags, ignore_already_mapped) }
+}
+
+pub(crate) unsafe fn map_kernel_range(
+    addr: VirtAddr,
+    size: u64,
+    flags: PageFlags,
+    ignore_already_mapped: bool,
+) -> Result<(), PageMapError> {
+    unsafe {
+        map_range_inner(
+            kernel_address_space_root(),
+            addr,
+            size,
+            flags,
+            ignore_already_mapped,
+        )
+    }
 }
 
 unsafe fn map_range_inner(
@@ -218,7 +240,7 @@ unsafe fn map_range_inner(
     }
 }
 
-pub unsafe fn map_contiguous_physical_range(
+pub(crate) unsafe fn map_contiguous_physical_range(
     root: AddressSpaceRoot,
     virt_base: VirtAddr,
     phys_base: PhysAddr,
@@ -290,59 +312,102 @@ pub unsafe fn map_contiguous_physical_range(
     Ok(())
 }
 
-pub unsafe fn map_allocated_range(
-    root: AddressSpaceRoot,
-    virt_base: VirtAddr,
-    phys_base: PhysAddr,
+pub(crate) fn map_physical_into_reservation(
+    reservation: RangeReservation,
+    offset: u64,
+    physical: PhysAddr,
     size: u64,
     flags: PageFlags,
-) -> Result<(), PageMapError> {
-    unsafe { map_contiguous_physical_range(root, virt_base, phys_base, size, flags, None) }
+    cache: Option<PhysicalMappingCache>,
+) -> Result<KernelMapping, (RangeReservation, PageMapError)> {
+    if !reservation.contains(offset, size) {
+        return Err((reservation, PageMapError::TranslationFailed()));
+    }
+    let virtual_address = VirtAddr::new(reservation.start().as_u64() + offset);
+    if let Err(error) = unsafe {
+        map_contiguous_physical_range(
+            kernel_address_space_root(),
+            virtual_address,
+            physical,
+            size,
+            flags,
+            cache,
+        )
+    } {
+        return Err((reservation, error));
+    }
+    match reservation.into_borrowed_mapping(offset, size) {
+        Ok(mapping) => Ok(mapping),
+        Err(reservation) => {
+            unsafe { unmap_kernel_range_keep_frames_unchecked(virtual_address, size) };
+            Err((reservation, PageMapError::TranslationFailed()))
+        }
+    }
+}
+
+pub(crate) fn allocate_kernel_mapping(
+    reservation: RangeReservation,
+    offset: u64,
+    size: u64,
+    flags: PageFlags,
+) -> Result<KernelMapping, (RangeReservation, PageMapError)> {
+    if !reservation.contains(offset, size) {
+        return Err((reservation, PageMapError::TranslationFailed()));
+    }
+    let virtual_address = VirtAddr::new(reservation.start().as_u64() + offset);
+    if let Err(error) = unsafe { map_kernel_range(virtual_address, size, flags, false) } {
+        return Err((reservation, error));
+    }
+    match reservation.into_allocated_mapping(offset, size) {
+        Ok(mapping) => Ok(mapping),
+        Err(reservation) => {
+            unsafe { unmap_kernel_range_unchecked(virtual_address, size) };
+            Err((reservation, PageMapError::TranslationFailed()))
+        }
+    }
 }
 
 /// # Safety
 /// `addr..addr + size` must be a live kernel mapping owned by the caller and
 /// no references into it may survive this call.
-pub unsafe fn unmap_range(root: AddressSpaceRoot, addr: VirtAddr, size: u64) {
+pub(in crate::memory) unsafe fn unmap_user_range_locked(
+    root: AddressSpaceRoot,
+    addr: VirtAddr,
+    size: u64,
+) -> Result<(), PageMapError> {
     unsafe {
         unmap_range_with_disposition(root, addr, size, UnmapFrameDisposition::FreeMappedFrame)
-            .expect("failed to unmap owned kernel virtual range");
     }
 }
 
-pub unsafe fn unmap_kernel_range(addr: VirtAddr, size: u64) {
-    unsafe {
-        unmap_range(kernel_address_space_root(), addr, size);
-        deallocate_kernel_range(addr, size);
-    }
-}
-
-pub unsafe fn unmap_range_unchecked(root: AddressSpaceRoot, addr: VirtAddr, size: u64) {
-    unsafe {
-        unmap_range_with_disposition(root, addr, size, UnmapFrameDisposition::FreeMappedFrame)
-            .expect("failed to unmap unchecked kernel virtual range");
-    }
-}
-
-pub unsafe fn unmap_kernel_range_unchecked(addr: VirtAddr, size: u64) {
-    unsafe { unmap_range_unchecked(kernel_address_space_root(), addr, size) }
-}
-
-pub unsafe fn unmap_range_keep_frames_unchecked(root: AddressSpaceRoot, addr: VirtAddr, size: u64) {
-    unsafe {
-        unmap_range_with_disposition(root, addr, size, UnmapFrameDisposition::KeepFrame)
-            .expect("failed to unmap kernel virtual range while preserving mapped frames");
-    }
-}
-
-pub unsafe fn unmap_kernel_range_keep_frames_unchecked(addr: VirtAddr, size: u64) {
-    unsafe { unmap_range_keep_frames_unchecked(kernel_address_space_root(), addr, size) }
-}
-
-pub unsafe fn unmap_reserved_range_unchecked(root: AddressSpaceRoot, addr: VirtAddr, size: u64) {
+pub(crate) unsafe fn unmap_kernel_range_unchecked(addr: VirtAddr, size: u64) {
     unsafe {
         unmap_range_with_disposition(
-            root,
+            kernel_address_space_root(),
+            addr,
+            size,
+            UnmapFrameDisposition::FreeMappedFrame,
+        )
+        .expect("failed to unmap unchecked kernel virtual range");
+    }
+}
+
+pub(crate) unsafe fn unmap_kernel_range_keep_frames_unchecked(addr: VirtAddr, size: u64) {
+    unsafe {
+        unmap_range_with_disposition(
+            kernel_address_space_root(),
+            addr,
+            size,
+            UnmapFrameDisposition::KeepFrame,
+        )
+        .expect("failed to unmap kernel virtual range while preserving mapped frames");
+    }
+}
+
+pub(crate) unsafe fn unmap_kernel_reserved_range_unchecked(addr: VirtAddr, size: u64) {
+    unsafe {
+        unmap_range_with_disposition(
+            kernel_address_space_root(),
             addr,
             size,
             UnmapFrameDisposition::ReleaseReservedFrame,
@@ -351,11 +416,7 @@ pub unsafe fn unmap_reserved_range_unchecked(root: AddressSpaceRoot, addr: VirtA
     }
 }
 
-pub unsafe fn unmap_kernel_reserved_range_unchecked(addr: VirtAddr, size: u64) {
-    unsafe { unmap_reserved_range_unchecked(kernel_address_space_root(), addr, size) }
-}
-
-pub(crate) unsafe fn unmap_range_with_disposition(
+unsafe fn unmap_range_with_disposition(
     root: AddressSpaceRoot,
     addr: VirtAddr,
     size: u64,
@@ -440,15 +501,14 @@ pub(crate) unsafe fn unmap_range_with_disposition(
     Ok(())
 }
 
-pub fn identity_map_page(
-    root: AddressSpaceRoot,
+pub(crate) fn identity_map_kernel_page(
     phys: PhysAddr,
     range: usize,
     flags: PageFlags,
 ) -> Result<(), PageMapError> {
     unsafe {
         map_contiguous_physical_range(
-            root,
+            kernel_address_space_root(),
             VirtAddr::new(phys.as_u64()),
             phys,
             range as u64,
@@ -458,32 +518,13 @@ pub fn identity_map_page(
     }
 }
 
-pub fn identity_map_kernel_page(
-    phys: PhysAddr,
-    range: usize,
-    flags: PageFlags,
-) -> Result<(), PageMapError> {
-    identity_map_page(kernel_address_space_root(), phys, range, flags)
-}
-
-pub fn virt_to_phys(root: AddressSpaceRoot, addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+pub(crate) fn virt_to_phys(root: AddressSpaceRoot, addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     let resolved = <ActivePlatform as PagingPlatform>::resolve_mapping(root, addr)?;
     Some((resolved.mapping_size, resolved.phys_addr))
 }
 
-pub fn kernel_virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
+pub(crate) fn kernel_virt_to_phys(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
     virt_to_phys(kernel_address_space_root(), addr)
-}
-
-pub fn resolve_virtual_range_frame(
-    root: AddressSpaceRoot,
-    addr: VirtAddr,
-) -> Option<(u64, PhysAddr)> {
-    virt_to_phys(root, addr)
-}
-
-pub fn resolve_kernel_virtual_range_frame(addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    resolve_virtual_range_frame(kernel_address_space_root(), addr)
 }
 
 fn finish_unmap(

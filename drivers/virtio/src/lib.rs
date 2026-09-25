@@ -55,7 +55,7 @@ use kernel_api::kernel_types::irq::{MsiBindingRequest, MsiTarget};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::protocol::disk::{DiskInfoProtocol, DiskInfoProtocolVTable};
 use kernel_api::memory::map_mmio_region;
-use kernel_api::memory::{PhysAddr, VirtAddr, unmap_mmio_region};
+use kernel_api::memory::{PhysAddr, VirtAddr};
 use kernel_api::pnp::InitComplete;
 use kernel_api::pnp::QueryDeviceRelations;
 use kernel_api::pnp::QueryId;
@@ -90,7 +90,7 @@ fn cleanup_failed_queue_init(
     remaining: &mut impl Iterator<Item = Virtqueue>,
     msix_allocations: &mut [Option<(IrqHandle, u16)>],
     common_cfg: VirtAddr,
-    mapped_bars: &[(u32, VirtAddr, u64)],
+    _mapped_bars: &[(u32, VirtAddr, u64)],
 ) {
     for state in queue_states {
         if let Some(handle) = state.irq_handle.get() {
@@ -113,9 +113,6 @@ fn cleanup_failed_queue_init(
     }
     unsafe {
         blk::reset_device(common_cfg);
-    }
-    for &(_, address, size) in mapped_bars {
-        let _ = unsafe { unmap_mmio_region(address, size) };
     }
 }
 
@@ -224,14 +221,15 @@ where
     let profile_timer = KernelStopwatch::start();
     let mut completion = core::pin::pin!(completion);
 
-    let Some(poll_ns) = virtio_completion_should_poll(byte_len) else {
+    let poll_ns = virtio_completion_should_poll(byte_len);
+    if poll_ns.is_none() && qs.irq_handle.get().is_some() {
         let result = completion.await;
 
         let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
 
         record_completion_fit_sample(byte_len, elapsed_ns);
         return result;
-    };
+    }
 
     let poll_timer = KernelStopwatch::start();
 
@@ -252,8 +250,10 @@ where
 
         let poll_elapsed_ns = poll_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
 
-        if poll_elapsed_ns >= poll_ns as u64 {
-            break;
+        if let Some(poll_ns) = poll_ns {
+            if poll_elapsed_ns >= poll_ns as u64 && qs.irq_handle.get().is_some() {
+                break;
+            }
         }
 
         core::hint::spin_loop();
@@ -431,6 +431,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             format_args!("virtio-blk: no memory BARs found"),
         ));
     }
+    let mapped_bar_addresses: Vec<(u32, VirtAddr, u64)> = mapped_bars
+        .iter()
+        .map(|(index, mapping, size)| (*index, mapping.address(), *size))
+        .collect();
 
     let gsi = (proto.get_gsi)(&proto.provider());
     let int_line = (proto.get_interrupt_line)(&proto.provider());
@@ -439,9 +443,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         Some(v) => v,
         None => {
             println!("virtio-blk: no PCI config space resource");
-            for &(_idx, va, sz) in &mapped_bars {
-                let _ = unsafe { unmap_mmio_region(va, sz) };
-            }
             return Err(error_with_message(
                 DriverErrorKind::DeviceError,
                 format_args!("virtio-blk: no PCI config space resource"),
@@ -453,9 +454,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         Ok(va) => va,
         Err(_) => {
             println!("virtio-blk: failed to map PCI config space");
-            for &(_idx, va, sz) in &mapped_bars {
-                let _ = unsafe { unmap_mmio_region(va, sz) };
-            }
             return Err(error_with_message(
                 DriverErrorKind::DeviceError,
                 format_args!(
@@ -465,14 +463,10 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         }
     };
 
-    let caps = match unsafe { pci::parse_virtio_caps(cfg_base, &mapped_bars) } {
+    let caps = match unsafe { pci::parse_virtio_caps(cfg_base.address(), &mapped_bar_addresses) } {
         Some(c) => c,
         None => {
             println!("virtio-blk: failed to parse virtio PCI capabilities");
-            let _ = unsafe { unmap_mmio_region(cfg_base, cfg_len) };
-            for &(_idx, va, sz) in &mapped_bars {
-                let _ = unsafe { unmap_mmio_region(va, sz) };
-            }
             return Err(error_with_message(
                 DriverErrorKind::DeviceError,
                 format_args!("virtio-blk: failed to parse virtio PCI capabilities"),
@@ -480,7 +474,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         }
     };
 
-    let _ = unsafe { unmap_mmio_region(cfg_base, cfg_len) };
+    drop(cfg_base);
 
     let init_result = match unsafe { blk::init_device(caps.common_cfg, caps.device_cfg) } {
         Ok(r) => r,
@@ -489,9 +483,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 "virtio-blk: device init / feature negotiation failed: {}",
                 message
             );
-            for &(_idx, va, sz) in &mapped_bars {
-                let _ = unsafe { unmap_mmio_region(va, sz) };
-            }
             return Err(error_with_message(
                 DriverErrorKind::DeviceError,
                 format_args!("virtio-blk: device init / feature negotiation failed: {message}"),
@@ -520,9 +511,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     if virtqueues.is_empty() {
         println!("virtio-blk: no queues created");
         unsafe { blk::reset_device(caps.common_cfg) };
-        for &(_idx, va, sz) in &mapped_bars {
-            let _ = unsafe { unmap_mmio_region(va, sz) };
-        }
         return Err(error_with_message(
             DriverErrorKind::DeviceError,
             format_args!("virtio-blk: no queues created; requested {target_queue_count}"),
@@ -615,6 +603,15 @@ async fn virtio_init_complete<'req, 'data, 'b>(
         None
     };
 
+    for allocation in &mut msix_allocations {
+        if let Some((handle, _)) = allocation.take() {
+            handle.unregister();
+        }
+    }
+    if let Some(handle) = line_irq_handle {
+        handle.unregister();
+    }
+
     let mut queue_states: Vec<QueueState> = Vec::with_capacity(final_queue_count);
     let mut virtqueue_iter = virtqueues.into_iter();
 
@@ -637,7 +634,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut virtqueue_iter,
                     &mut msix_allocations,
                     caps.common_cfg,
-                    &mapped_bars,
+                    &mapped_bar_addresses,
                 );
 
                 return Err(err).with_context(|| {
@@ -669,7 +666,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut virtqueue_iter,
                     &mut msix_allocations,
                     caps.common_cfg,
-                    &mapped_bars,
+                    &mapped_bar_addresses,
                 );
                 return Err(error_with_message(
                     DriverErrorKind::DeviceError,
@@ -694,7 +691,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut virtqueue_iter,
                     &mut msix_allocations,
                     caps.common_cfg,
-                    &mapped_bars,
+                    &mapped_bar_addresses,
                 );
                 return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
                     alloc::format!(
@@ -718,7 +715,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut virtqueue_iter,
                     &mut msix_allocations,
                     caps.common_cfg,
-                    &mapped_bars,
+                    &mapped_bar_addresses,
                 );
                 return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
                     alloc::format!(
@@ -742,7 +739,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut virtqueue_iter,
                     &mut msix_allocations,
                     caps.common_cfg,
-                    &mapped_bars,
+                    &mapped_bar_addresses,
                 );
                 return Err(error(DriverErrorKind::InsufficientResources)).with_context(|| {
                     alloc::format!(
@@ -798,9 +795,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 .expect("queue not locked during cleanup")
                 .destroy();
         }
-        for &(_idx, va, sz) in &mapped_bars {
-            let _ = unsafe { unmap_mmio_region(va, sz) };
-        }
         return Err(error_with_message(
             DriverErrorKind::DeviceError,
             format_args!("virtio-blk: device status bad after DRIVER_OK: status={status:#x}"),
@@ -808,8 +802,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     }
 
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
-    let bar_list: Vec<(u32, VirtAddr, u64)> = mapped_bars.iter().copied().collect();
-
     dx.inner.call_once(|| {
         Arc::new(DevExtInner {
             common_cfg: caps.common_cfg,
@@ -820,7 +812,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
             queue_strategy: QueueSelectionStrategy::RoundRobin,
             rr_counter: AtomicUsize::new(0),
             capacity: init_result.capacity,
-            mapped_bars: Mutex::new(bar_list),
+            mapped_bars: Mutex::new(mapped_bars),
         })
     });
 
@@ -868,10 +860,7 @@ async fn virtio_pnp_remove<'req, 'data, 'b>(
             }
 
             {
-                let bars = inner.mapped_bars.lock();
-                for &(_, va, sz) in bars.iter() {
-                    let _ = unsafe { unmap_mmio_region(va, sz) };
-                }
+                inner.mapped_bars.lock().clear();
             }
         }
     }

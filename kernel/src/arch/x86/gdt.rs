@@ -51,31 +51,37 @@ impl GDTTracker {
         } else {
             StackSize::Medium
         };
-        let timer_stack =
-            allocate_kernel_stack(timer_stack_size).expect("Failed to alloc timer stack");
+        let timer_stack = Box::leak(Box::new(
+            allocate_kernel_stack(timer_stack_size).expect("Failed to alloc timer stack"),
+        ));
 
-        let yield_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc yield stack");
+        let yield_stack = Box::leak(Box::new(
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc yield stack"),
+        ));
 
-        let sched_ipi_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc sched ipi stack");
+        let sched_ipi_stack = Box::leak(Box::new(
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc sched ipi stack"),
+        ));
 
-        let privilege_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc privilege stack");
+        let privilege_stack = Box::leak(Box::new(
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc privilege stack"),
+        ));
 
-        let double_fault_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc double fault stack");
+        let double_fault_stack = Box::leak(Box::new(
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc double fault stack"),
+        ));
 
-        let page_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack");
+        let page_stack = Box::leak(Box::new(
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack"),
+        ));
 
-        tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack.into();
+        tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack.top().into();
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            double_fault_stack.into();
-        tss_static.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = page_stack.into();
-        tss_static.interrupt_stack_table[YIELD_IST_INDEX as usize] = yield_stack.into();
-        tss_static.interrupt_stack_table[SCHED_IPI_IST_INDEX as usize] = sched_ipi_stack.into();
-        tss_static.privilege_stack_table[0] = privilege_stack.into();
+            double_fault_stack.top().into();
+        tss_static.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = page_stack.top().into();
+        tss_static.interrupt_stack_table[YIELD_IST_INDEX as usize] = yield_stack.top().into();
+        tss_static.interrupt_stack_table[SCHED_IPI_IST_INDEX as usize] = sched_ipi_stack.top().into();
+        tss_static.privilege_stack_table[0] = privilege_stack.top().into();
 
         let gdt: &'static mut GlobalDescriptorTable =
             Box::leak(Box::new(GlobalDescriptorTable::new()));

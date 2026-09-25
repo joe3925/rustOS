@@ -1,14 +1,15 @@
 use aarch64_cpu::asm::barrier::{SY, dsb};
+use alloc::vec::Vec;
 use kernel_types::arch::{PageFlags, PhysAddr, VirtAddr};
 use kernel_types::irq::{
     IrqSafeMutex, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_REQUESTER_PCI, MSI_TARGET_ANY,
     MSI_TARGET_PLATFORM_CPU, MsiBindingRequest, MsiMessage,
 };
-use kernel_types::memory::PhysicalMappingCache;
+use kernel_types::memory::{KernelMapping, PhysicalMappingCache};
 use spin::Mutex;
 
 use crate::memory::paging::map::{
-    allocate_auto_kernel_range_mapped_contiguous, kernel_virt_to_phys,
+    allocate_auto_contiguous_kernel_mapping, kernel_virt_to_phys,
 };
 use crate::memory::paging::mmio::map_physical_pages;
 use crate::platform::CpuPlatform;
@@ -88,6 +89,8 @@ struct State {
 }
 
 pub(super) struct Its {
+    register_mapping: KernelMapping,
+    mapping_owners: Mutex<Vec<KernelMapping>>,
     registers: usize,
     physical_base: u64,
     command_queue: Memory,
@@ -102,15 +105,17 @@ unsafe impl Sync for Its {}
 
 impl Its {
     pub(super) fn new(physical_base: u64) -> Option<Self> {
-        let registers = map_physical_pages(
+        let register_mapping = map_physical_pages(
             PhysAddr::new(physical_base),
             ITS_REGISTER_SIZE,
             PhysicalMappingCache::Uncached,
         )
-        .ok()?
-        .as_u64() as usize;
-        let command_queue = allocate_memory_aligned(GITS_CMD_QUEUE_SIZE, GITS_CMD_QUEUE_SIZE)?;
-        let property_table = allocate_memory_aligned(LPI_PROPERTY_SIZE, 0x1_0000)?;
+        .ok()?;
+        let registers = register_mapping.address().as_u64() as usize;
+        let (command_queue, command_queue_mapping) =
+            allocate_memory_aligned(GITS_CMD_QUEUE_SIZE, GITS_CMD_QUEUE_SIZE)?;
+        let (property_table, property_table_mapping) =
+            allocate_memory_aligned(LPI_PROPERTY_SIZE, 0x1_0000)?;
         unsafe {
             core::ptr::write_bytes(
                 property_table.virt as *mut u8,
@@ -122,6 +127,8 @@ impl Its {
         let typer = unsafe { ((registers + GITS_TYPER) as *const u64).read_volatile() };
         let itt_entry_size = ((typer >> 4) & 0xf) + 1;
         let its = Self {
+            register_mapping,
+            mapping_owners: Mutex::new(alloc::vec![command_queue_mapping, property_table_mapping]),
             registers,
             physical_base,
             command_queue,
@@ -170,7 +177,8 @@ impl Its {
             if table_type == 0 {
                 continue;
             }
-            let memory = allocate_memory_aligned(ITS_TABLE_SIZE, ITS_TABLE_SIZE)?;
+            let (memory, mapping) = allocate_memory_aligned(ITS_TABLE_SIZE, ITS_TABLE_SIZE)?;
+            self.mapping_owners.lock().push(mapping);
             let value = memory.phys
                 | GITS_BASER_VALID
                 | GITS_CACHE_WB
@@ -209,10 +217,11 @@ impl Its {
         let pending = match state.pending[index] {
             Some(memory) => memory,
             None => {
-                let Some(memory) = allocate_memory_aligned(LPI_PENDING_SIZE, LPI_PENDING_SIZE)
+                let Some((memory, mapping)) = allocate_memory_aligned(LPI_PENDING_SIZE, LPI_PENDING_SIZE)
                 else {
                     return false;
                 };
+                self.mapping_owners.lock().push(mapping);
                 state.pending[index] = Some(memory);
                 memory
             }
@@ -262,8 +271,9 @@ impl Its {
             None => {
                 let index = state.devices.iter().position(Option::is_none)?;
                 let entries = 256u64;
-                let itt =
+                let (itt, mapping) =
                     allocate_memory_aligned((entries * self.itt_entry_size).max(4096), 0x1_0000)?;
+                self.mapping_owners.lock().push(mapping);
                 let size = entries.trailing_zeros() as u64 - 1;
                 self.command(
                     &mut state,
@@ -395,20 +405,24 @@ impl Its {
     }
 }
 
-fn allocate_memory_aligned(bytes: u64, alignment: u64) -> Option<Memory> {
+fn allocate_memory_aligned(bytes: u64, alignment: u64) -> Option<(Memory, KernelMapping)> {
     let allocation_bytes = bytes.checked_add(alignment)?;
-    let virt = allocate_auto_kernel_range_mapped_contiguous(
+    let mapping = allocate_auto_contiguous_kernel_mapping(
         allocation_bytes,
         PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE,
     )
     .ok()?;
-    let (_, phys) = kernel_virt_to_phys(VirtAddr::new(virt.as_u64()))?;
+    let virt = mapping.address();
+    let (_, phys) = kernel_virt_to_phys(virt)?;
     let aligned_phys = phys.as_u64().checked_add(alignment - 1)? & !(alignment - 1);
     let aligned_virt = virt.as_u64() + aligned_phys - phys.as_u64();
     unsafe { core::ptr::write_bytes(aligned_virt as *mut u8, 0, bytes as usize) };
     crate::arch::aarch64::cpu::clean_to_poc(aligned_virt, bytes as usize);
-    Some(Memory {
-        virt: aligned_virt,
-        phys: aligned_phys,
-    })
+    Some((
+        Memory {
+            virt: aligned_virt,
+            phys: aligned_phys,
+        },
+        mapping,
+    ))
 }

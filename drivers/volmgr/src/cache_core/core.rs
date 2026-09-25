@@ -19,8 +19,7 @@ use kernel_api::kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, ToDevice,
 };
 use kernel_api::memory::{
-    PageTableFlags, VirtAddr, allocate_auto_kernel_range_mapped_contiguous,
-    deallocate_kernel_range, unmap_range,
+    KernelMapping, PageTableFlags, VirtAddr, allocate_auto_contiguous_kernel_mapping,
 };
 use kernel_api::println;
 use kernel_api::request::Read;
@@ -175,6 +174,7 @@ where
     cache_base: VirtAddr,
     cache_bytes: usize,
     cache_backing: Option<IoBufferBacking<'static>>,
+    cache_mapping: Option<KernelMapping>,
     cfg: CacheConfig,
     dirty_pages: Arc<AtomicUsize>,
     writeback_notifier: WritebackNotifier,
@@ -243,8 +243,9 @@ where
             .ok_or(CacheError::InvalidConfig)?;
 
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        let cache_base = allocate_auto_kernel_range_mapped_contiguous(cache_bytes as u64, flags)
+        let cache_mapping = allocate_auto_contiguous_kernel_mapping(cache_bytes as u64, flags)
             .map_err(|_| CacheError::InsufficientResources)?;
+        let cache_base = cache_mapping.address();
 
         unsafe {
             core::ptr::write_bytes(cache_base.as_u64() as *mut u8, 0, cache_bytes);
@@ -261,11 +262,6 @@ where
             match IoBufferBacking::new(IoBufferBackingDesc::SliceMut(cache_slice), backing_cfg) {
                 Ok(backing) => backing,
                 Err(e) => {
-                    unsafe {
-                        unmap_range(cache_base, cache_bytes as u64);
-                    }
-
-                    unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
                     return Err(CacheError::InvalidIoBuffer(e));
                 }
             };
@@ -274,11 +270,6 @@ where
             if let Err(e) = backend.dma_map_cache(&mut cache_backing).await {
                 drop(cache_backing);
 
-                unsafe {
-                    unmap_range(cache_base, cache_bytes as u64);
-                }
-
-                unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
                 return Err(CacheError::Backend(e));
             }
         }
@@ -291,11 +282,6 @@ where
         if shards.try_reserve_exact(shard_count).is_err() {
             drop(cache_backing);
 
-            unsafe {
-                unmap_range(cache_base, cache_bytes as u64);
-            }
-
-            unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
             return Err(CacheError::InsufficientResources);
         }
 
@@ -312,11 +298,6 @@ where
             drop(shards);
             drop(cache_backing);
 
-            unsafe {
-                unmap_range(cache_base, cache_bytes as u64);
-            }
-
-            unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
             return Err(CacheError::InsufficientResources);
         }
 
@@ -336,11 +317,6 @@ where
                 drop(shards);
                 drop(cache_backing);
 
-                unsafe {
-                    unmap_range(cache_base, cache_bytes as u64);
-                }
-
-                unsafe { deallocate_kernel_range(cache_base, cache_bytes as u64) };
                 return Err(CacheError::InsufficientResources);
             }
         };
@@ -354,6 +330,7 @@ where
             cache_base,
             cache_bytes,
             cache_backing: Some(cache_backing),
+            cache_mapping: Some(cache_mapping),
             cfg,
             dirty_pages: Arc::new(AtomicUsize::new(0)),
             writeback_notifier: WritebackNotifier::new(),
@@ -2196,14 +2173,8 @@ where
     fn drop(&mut self) {
         drop(self.cache_backing.take());
 
-        if self.cache_bytes != 0 {
-            unsafe {
-                unmap_range(self.cache_base, self.cache_bytes as u64);
-            }
-
-            unsafe { deallocate_kernel_range(self.cache_base, self.cache_bytes as u64) };
-            self.cache_bytes = 0;
-        }
+        drop(self.cache_mapping.take());
+        self.cache_bytes = 0;
     }
 }
 

@@ -82,7 +82,7 @@ impl AddressSpacePlatform for Aarch64Platform {
         };
 
         unsafe {
-            root_virt
+            root_virt.address()
                 .as_mut_ptr::<u8>()
                 .write_bytes(0, table_size as usize);
         }
@@ -90,25 +90,17 @@ impl AddressSpacePlatform for Aarch64Platform {
         let entries = table_size as usize / core::mem::size_of::<u64>();
         let recursive_index = usize::from(boot_info().arch_info.recursive_index);
         if recursive_index >= entries {
-            let _ =
-                unsafe { crate::memory::paging::mmio::unmap_physical_pages(root_virt, table_size) };
             allocator.free_page_table_frame(root_phys);
             return Err(PageMapError::TranslationFailed());
         }
         let kernel_table = boot_info().arch_info.recursive_base as *const u64;
-        let new_table = root_virt.as_mut_ptr::<u64>();
+        let new_table = root_virt.address().as_mut_ptr::<u64>();
         for index in entries / 2..entries {
             unsafe { new_table.add(index).write(kernel_table.add(index).read()) };
         }
         let recursive = unsafe { kernel_table.add(recursive_index).read() };
         let recursive = (recursive & !root_address_mask()) | root_phys.as_u64();
         unsafe { new_table.add(recursive_index).write(recursive) };
-
-        if let Err(error) =
-            unsafe { crate::memory::paging::mmio::unmap_physical_pages(root_virt, table_size) }
-        {
-            return Err(error);
-        }
 
         Ok(unsafe { AddressSpaceRoot::from_raw(root_phys.as_u64()) })
     }
