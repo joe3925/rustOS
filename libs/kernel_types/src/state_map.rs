@@ -135,6 +135,30 @@ impl<const BITS: usize> AtomicStateMap<BITS> {
         self.words[index].load(ordering)
     }
 
+    pub fn any_nonzero(&self, first: usize, count: usize, ordering: Ordering) -> bool {
+        let end = first.checked_add(count).expect("state range overflow");
+        assert!(end <= self.len);
+        let entries_per_word = 64 / BITS;
+        let mut cursor = first;
+        while cursor < end {
+            let word_index = cursor / entries_per_word;
+            let entry_offset = cursor % entries_per_word;
+            let entries = (end - cursor).min(entries_per_word - entry_offset);
+            let shift = entry_offset * BITS;
+            let bits = entries * BITS;
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << bits) - 1) << shift
+            };
+            if self.words[word_index].load(ordering) & mask != 0 {
+                return true;
+            }
+            cursor += entries;
+        }
+        false
+    }
+
     pub fn fetch_or_word(&self, index: usize, value: u64, ordering: Ordering) -> u64 {
         self.words[index].fetch_or(value, ordering)
     }
