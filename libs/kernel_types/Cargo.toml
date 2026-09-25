@@ -14,6 +14,7 @@ kernel_macros = { path = "../kernel_macros" }
 
 acpi = { git = "https://github.com/rust-osdev/acpi", rev = "09d5c67" }
 spin = "0.10.0"
+portable-atomic = "1"
 prost = { version = "0.14.3", default-features = false, features = ["derive"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

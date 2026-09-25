@@ -1,12 +1,10 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::mem::ManuallyDrop;
 
-use spin::{Mutex, MutexGuard};
-
 use crate::arch::VirtAddr;
 use crate::fs::Path;
 
-const MAX_RANGE_ALLOCATIONS: usize = 4096;
+use crate::sparse_range_radix::{SparseRangeRadix, SparseRangeRadixError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RangeAllocationError {
@@ -15,45 +13,41 @@ pub enum RangeAllocationError {
     Unaligned,
 }
 
-#[derive(Debug)]
-struct RangeAllocations {
-    entries: [(u64, u64); MAX_RANGE_ALLOCATIONS],
-    len: usize,
-}
-
 pub struct RangeAllocationIter<'a> {
-    guard: MutexGuard<'a, RangeAllocations>,
-    index: usize,
+    manager: &'a RangeManager,
+    cursor: u64,
 }
 
 impl Iterator for RangeAllocationIter<'_> {
     type Item = (u64, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.guard.len {
-            return None;
-        }
-        let entry = self.guard.entries[self.index];
-        self.index += 1;
-        Some(entry)
+        let (first, count) = self.manager.ranges.next_allocation(self.cursor)?;
+        self.cursor = first.checked_add(count)?;
+        Some((
+            self.manager.start + first * self.manager.granularity,
+            count * self.manager.granularity,
+        ))
     }
 }
 
 #[derive(Debug)]
 pub struct RangeManager {
-    allocations: Mutex<RangeAllocations>,
+    ranges: SparseRangeRadix,
     start: u64,
     end: u64,
     granularity: u64,
 }
 
 impl RangeManager {
-    pub const fn new(start: u64, end: u64, granularity: u64) -> Self {
+    pub fn new(start: u64, end: u64, granularity: u64) -> Self {
+        let units = if granularity == 0 || end <= start {
+            1
+        } else {
+            ((end - start) / granularity).max(1)
+        };
         Self {
-            allocations: Mutex::new(RangeAllocations {
-                entries: [(0, 0); MAX_RANGE_ALLOCATIONS],
-                len: 0,
-            }),
+            ranges: SparseRangeRadix::try_new(units).expect("failed to create sparse range radix"),
             start,
             end,
             granularity,
@@ -94,8 +88,8 @@ impl RangeManager {
 
     pub fn get_allocations(&self) -> RangeAllocationIter<'_> {
         RangeAllocationIter {
-            guard: self.allocations.lock(),
-            index: 0,
+            manager: self,
+            cursor: 0,
         }
     }
 
@@ -107,31 +101,20 @@ impl RangeManager {
         let size = self
             .align_size(size)
             .ok_or(RangeAllocationError::OutOfRange)?;
-        if base % self.granularity != 0 {
+        if base % self.granularity != 0 || self.start % self.granularity != 0 {
             return Err(RangeAllocationError::Unaligned);
         }
         let end = base
             .checked_add(size)
             .ok_or(RangeAllocationError::OutOfRange)?;
-        let mut allocations = self.allocations.lock();
         if base < self.start || end > self.end {
             return Err(RangeAllocationError::OutOfRange);
         }
-        if allocations.entries[..allocations.len]
-            .iter()
-            .any(|&(allocated_base, allocated_size)| {
-                let allocated_end = allocated_base + allocated_size;
-                base < allocated_end && end > allocated_base
-            })
-        {
-            return Err(RangeAllocationError::Overlap);
-        }
-        if allocations.len == MAX_RANGE_ALLOCATIONS {
-            return Err(RangeAllocationError::OutOfRange);
-        }
-        let index = allocations.len;
-        allocations.entries[index] = (base, size);
-        allocations.len += 1;
+        let first = (base - self.start) / self.granularity;
+        let count = size / self.granularity;
+        self.ranges
+            .try_claim(first, count)
+            .map_err(map_range_error)?;
         Ok(RangeReservation {
             manager: self.clone(),
             base: VirtAddr::new(base),
@@ -154,53 +137,34 @@ impl RangeManager {
         let size = self
             .align_size(size)
             .ok_or(RangeAllocationError::OutOfRange)?;
-        if size == 0
+        if size == 0 || self.start >= self.end || size > self.end.saturating_sub(self.start) {
+            return Err(RangeAllocationError::OutOfRange);
+        }
+        if self.granularity == 0
+            || self.start % self.granularity != 0
             || alignment < self.granularity
             || !alignment.is_power_of_two()
             || alignment % self.granularity != 0
         {
             return Err(RangeAllocationError::Unaligned);
         }
-        let mut allocations = self.allocations.lock();
-        if allocations.len == MAX_RANGE_ALLOCATIONS {
-            return Err(RangeAllocationError::OutOfRange);
-        }
-        let len = allocations.len;
-        allocations.entries[..len].sort_unstable_by_key(|&(base, _)| base);
-        let mut current =
-            align_up(self.start, alignment).ok_or(RangeAllocationError::OutOfRange)?;
-        for index in 0..len {
-            let (allocated_base, allocated_size) = allocations.entries[index];
-            if current
-                .checked_add(size)
-                .is_some_and(|end| end <= allocated_base)
-            {
-                allocations.entries[len] = (current, size);
-                allocations.len += 1;
-                return Ok(RangeReservation {
-                    manager: self.clone(),
-                    base: VirtAddr::new(current),
-                    size,
-                });
-            }
-            let allocated_end = allocated_base
-                .checked_add(allocated_size)
-                .ok_or(RangeAllocationError::OutOfRange)?;
-            if allocated_end > current {
-                current =
-                    align_up(allocated_end, alignment).ok_or(RangeAllocationError::OutOfRange)?;
-            }
-        }
-        if current.checked_add(size).is_some_and(|end| end <= self.end) {
-            allocations.entries[len] = (current, size);
-            allocations.len += 1;
-            return Ok(RangeReservation {
-                manager: self.clone(),
-                base: VirtAddr::new(current),
-                size,
-            });
-        }
-        Err(RangeAllocationError::OutOfRange)
+        let first = self
+            .ranges
+            .try_claim_auto(size / self.granularity, alignment / self.granularity)
+            .map_err(map_range_error)?;
+        let base = self
+            .start
+            .checked_add(
+                first
+                    .checked_mul(self.granularity)
+                    .ok_or(RangeAllocationError::OutOfRange)?,
+            )
+            .ok_or(RangeAllocationError::OutOfRange)?;
+        Ok(RangeReservation {
+            manager: self.clone(),
+            base: VirtAddr::new(base),
+            size,
+        })
     }
 
     fn align_size(&self, size: u64) -> Option<u64> {
@@ -208,13 +172,23 @@ impl RangeManager {
     }
 
     fn release(&self, base: u64, size: u64) {
-        let mut allocations = self.allocations.lock();
-        if let Some(index) = allocations.entries[..allocations.len].iter().position(
-            |&(allocated_base, allocated_size)| allocated_base == base && allocated_size == size,
-        ) {
-            allocations.len -= 1;
-            let last = allocations.len;
-            allocations.entries[index] = allocations.entries[last];
+        if self.granularity != 0
+            && base >= self.start
+            && size % self.granularity == 0
+            && base.checked_add(size).is_some_and(|end| end <= self.end)
+        {
+            let first = (base - self.start) / self.granularity;
+            let count = size / self.granularity;
+            unsafe { self.ranges.release(first, count) };
+        }
+    }
+}
+
+fn map_range_error(error: SparseRangeRadixError) -> RangeAllocationError {
+    match error {
+        SparseRangeRadixError::Conflict => RangeAllocationError::Overlap,
+        SparseRangeRadixError::OutOfRange | SparseRangeRadixError::AllocationFailed => {
+            RangeAllocationError::OutOfRange
         }
     }
 }

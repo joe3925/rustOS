@@ -45,9 +45,8 @@ impl GicV2m {
             FRAME_SIZE,
             PhysicalMappingCache::Uncached,
         )
-        .ok()?
-        .as_u64() as usize;
-        let typer = unsafe { ((registers + MSI_TYPER) as *const u32).read_volatile() };
+        .ok()?;
+        let typer = unsafe { ((registers.address().as_u64() as usize + MSI_TYPER) as *const u32).read_volatile() };
         let spi_base = described_spi_base.unwrap_or((typer >> 16) & 0x3ff);
         let spi_count = described_spi_count.unwrap_or(typer & 0x3ff);
         let last = spi_base.checked_add(spi_count.checked_sub(1)?)?;

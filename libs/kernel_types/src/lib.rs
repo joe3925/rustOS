@@ -36,6 +36,7 @@ pub mod radix_map;
 pub mod request;
 pub mod runtime;
 pub mod state_map;
+pub mod sparse_range_radix;
 pub mod status;
 
 #[cfg(test)]
