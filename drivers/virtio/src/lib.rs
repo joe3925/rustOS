@@ -89,6 +89,7 @@ fn cleanup_failed_queue_init(
     current: &mut Virtqueue,
     remaining: &mut impl Iterator<Item = Virtqueue>,
     msix_allocations: &mut [Option<(IrqHandle, u16)>],
+    line_irq_handle: &mut Option<IrqHandle>,
     common_cfg: VirtAddr,
     _mapped_bars: &[(u32, VirtAddr, u64)],
 ) {
@@ -106,6 +107,9 @@ fn cleanup_failed_queue_init(
         if let Some((handle, _)) = allocation.take() {
             handle.unregister();
         }
+    }
+    if let Some(handle) = line_irq_handle.take() {
+        handle.unregister();
     }
     current.destroy();
     for mut queue in remaining {
@@ -618,7 +622,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
 
     virtqueues.truncate(final_queue_count);
 
-    let line_irq_handle: Option<IrqHandle> = if !use_msix {
+    let mut line_irq_handle: Option<IrqHandle> = if !use_msix {
         if let Some(g) = gsi {
             let handle = bind_wired_interrupt(
                 HardwareInterruptId(g as u32),
@@ -639,15 +643,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
     } else {
         None
     };
-
-    for allocation in &mut msix_allocations {
-        if let Some((handle, _)) = allocation.take() {
-            handle.unregister();
-        }
-    }
-    if let Some(handle) = line_irq_handle {
-        handle.unregister();
-    }
 
     let mut queue_states: Vec<QueueState> = Vec::with_capacity(final_queue_count);
     let mut virtqueue_iter = virtqueues.into_iter();
@@ -670,6 +665,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut vq,
                     &mut virtqueue_iter,
                     &mut msix_allocations,
+                    &mut line_irq_handle,
                     caps.common_cfg,
                     &mapped_bar_addresses,
                 );
@@ -679,14 +675,6 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                 });
             }
         };
-        let irq_handle = if use_msix && i < msix_allocations.len() {
-            msix_allocations[i].take().map(|(handle, _)| handle)
-        } else if i == 0 && !use_msix {
-            line_irq_handle.clone()
-        } else {
-            None
-        };
-
         let vq_capacity = vq.size as usize;
 
         let completion_slots = match completion::CompletionTable::new(vq_capacity) {
@@ -702,6 +690,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut vq,
                     &mut virtqueue_iter,
                     &mut msix_allocations,
+                    &mut line_irq_handle,
                     caps.common_cfg,
                     &mapped_bar_addresses,
                 );
@@ -727,6 +716,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut vq,
                     &mut virtqueue_iter,
                     &mut msix_allocations,
+                    &mut line_irq_handle,
                     caps.common_cfg,
                     &mapped_bar_addresses,
                 );
@@ -751,6 +741,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut vq,
                     &mut virtqueue_iter,
                     &mut msix_allocations,
+                    &mut line_irq_handle,
                     caps.common_cfg,
                     &mapped_bar_addresses,
                 );
@@ -775,6 +766,7 @@ async fn virtio_init_complete<'req, 'data, 'b>(
                     &mut vq,
                     &mut virtqueue_iter,
                     &mut msix_allocations,
+                    &mut line_irq_handle,
                     caps.common_cfg,
                     &mapped_bar_addresses,
                 );
@@ -788,6 +780,13 @@ async fn virtio_init_complete<'req, 'data, 'b>(
 
         let used_idx = vq.used_idx_ptr();
 
+        let irq_handle = if use_msix && i < msix_allocations.len() {
+            msix_allocations[i].take().map(|(handle, _)| handle)
+        } else if i == 0 && !use_msix {
+            line_irq_handle.take()
+        } else {
+            None
+        };
         let irq_handle_once = Once::new();
         if let Some(handle) = irq_handle {
             irq_handle_once.call_once(|| handle);

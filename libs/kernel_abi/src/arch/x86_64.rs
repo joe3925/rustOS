@@ -11,16 +11,16 @@ pub const STUB_DYNAMIC_RANGE_END: u64 = BOOT_VIRTUAL_LAYOUT.stub_dynamic_range_e
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct X86BootArchInfo {
-    pub recursive_index: Optional<u16>,
-    pub scratch_page: u64,
+    pub physical_memory_offset: u64,
+    pub physical_memory_len: u64,
     pub pe_tls_directory: Optional<PeTlsDirectory>,
 }
 
 impl X86BootArchInfo {
     pub const fn empty() -> Self {
         Self {
-            recursive_index: Optional::None,
-            scratch_page: 0,
+            physical_memory_offset: 0,
+            physical_memory_len: 0,
             pe_tls_directory: Optional::None,
         }
     }

@@ -5,13 +5,13 @@ use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 use x86_64::PhysAddr;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{PageTable, PageTableFlags, PageTableIndex, PhysFrame};
+use x86_64::structures::paging::{PageTable, PhysFrame};
 
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator};
 use crate::util::boot_info;
 
 use super::super::super::platform::X86Platform;
-use super::tables::{get_level4_page_table, init_kernel_cr3, kernel_cr3};
+use super::tables::{init_kernel_cr3, kernel_cr3};
 
 impl AddressSpacePlatform for X86Platform {
     fn init_kernel_root() {
@@ -48,23 +48,18 @@ impl AddressSpacePlatform for X86Platform {
             PhysicalMappingCache::Cached,
         )?;
 
-        let recursive_index = boot_info()
-            .arch_info
-            .recursive_index
-            .into_option()
-            .ok_or(PageMapError::NoMemoryMap())?;
-        let kernel_pml4 = unsafe { get_level4_page_table(PageTableIndex::new(recursive_index)) };
+        let info = &boot_info().arch_info;
+        let kernel_pml4_address = info
+            .physical_memory_offset
+            .checked_add(Self::kernel_root().as_u64())
+            .ok_or(PageMapError::TranslationFailed())?;
+        let kernel_pml4 = unsafe { &*(kernel_pml4_address as *const PageTable) };
         let new_table: &mut PageTable = unsafe { &mut *(root_virt.address().as_mut_ptr()) };
         new_table.zero();
 
         for idx in 256..512 {
             new_table[idx] = kernel_pml4[idx].clone();
         }
-        new_table[usize::from(recursive_index)].set_addr(
-            PhysAddr::new(root_phys.as_u64()),
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        );
-
         Ok(unsafe { AddressSpaceRoot::from_raw(root_phys.as_u64()) })
     }
 

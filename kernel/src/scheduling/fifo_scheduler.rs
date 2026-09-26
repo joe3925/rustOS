@@ -247,11 +247,6 @@ impl SchedulerClass for FifoClass {
         reason: EnqueueReason,
         hint_cpu: usize,
     ) -> Option<usize> {
-        const LOAD_WEIGHT: isize = 100;
-        const IDLE_BONUS: isize = 150;
-        const HINT_CPU_BONUS: isize = 40;
-        const NEW_TASK_IDLE_BONUS: isize = 80;
-
         let n = SCHEDULER.num_cores();
 
         if matches!(
@@ -259,7 +254,6 @@ impl SchedulerClass for FifoClass {
             EnqueueReason::Preempted
                 | EnqueueReason::Yielded
                 | EnqueueReason::Migrated
-                | EnqueueReason::Wakeup
         ) {
             if hint_cpu < n
                 && cpus.contains(hint_cpu)
@@ -270,8 +264,8 @@ impl SchedulerClass for FifoClass {
         }
 
         let mut best_cpu = None;
-        let mut best_score = isize::MAX;
-        let mut best_load = usize::MAX;
+        let mut best_weight = 0u128;
+        let mut best_total_tasks = 1u128;
 
         for cpu_id in 0..n {
             if !cpus.contains(cpu_id) {
@@ -282,32 +276,18 @@ impl SchedulerClass for FifoClass {
                 continue;
             };
 
-            let load = cpu.load.load(Ordering::Acquire);
-            let idle = SCHEDULER.cpu_is_idle(cpu_id);
+            let total_tasks = self.effective_load(cpu_id, cpu) as u128 + 1;
+            let weight = if cpu_id == hint_cpu { 9u128 } else { 8u128 };
+            let candidate_score = weight * best_total_tasks;
+            let selected_score = best_weight * total_tasks;
 
-            let mut score = load as isize * LOAD_WEIGHT;
-
-            if idle {
-                score -= IDLE_BONUS;
-            }
-
-            match reason {
-                EnqueueReason::New => {
-                    if idle {
-                        score -= NEW_TASK_IDLE_BONUS;
-                    }
-                }
-                _ => {}
-            }
-
-            if cpu_id == hint_cpu {
-                score -= HINT_CPU_BONUS;
-            }
-
-            if score < best_score || (score == best_score && load < best_load) {
+            if best_cpu.is_none()
+                || candidate_score > selected_score
+                || (candidate_score == selected_score && cpu_id == hint_cpu)
+            {
                 best_cpu = Some(cpu_id);
-                best_score = score;
-                best_load = load;
+                best_weight = weight;
+                best_total_tasks = total_tasks;
             }
         }
 

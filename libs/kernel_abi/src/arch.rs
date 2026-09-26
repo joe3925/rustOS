@@ -14,7 +14,7 @@ pub mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
-    Aarch64BootArchInfo, Aarch64PeTlsDirectory, RawTableFrameProvider, RecursiveFrameZeroProvider,
+    Aarch64BootArchInfo, Aarch64PeTlsDirectory,
     KERNEL_PE_BASE, STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
 };
 

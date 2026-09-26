@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU64};
 
-use kernel_types::arch::VirtAddr;
 use kernel_types::irq::PlatformCpuId;
 use spin::{Mutex, Once};
 
@@ -17,10 +16,6 @@ pub struct PerCpu {
     pub exception_stack_top: AtomicU64,
 
     pub active_exception_fpu: AtomicU64,
-
-    pub emergency_zero_address: Once<VirtAddr>,
-    pub emergency_zero_in_use: AtomicBool,
-    pub page_table_scratch_address: Once<VirtAddr>,
 
     pub cpu_id: Once<usize>,
     pub platform_cpu_id: Once<PlatformCpuId>,
@@ -60,10 +55,6 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
         tls_array_pointer: AtomicU64::new(0),
         exception_stack_top: AtomicU64::new(0),
         active_exception_fpu: AtomicU64::new(0),
-
-        emergency_zero_address: Once::new(),
-        emergency_zero_in_use: AtomicBool::new(false),
-        page_table_scratch_address: Once::new(),
 
         cpu_id: Once::new(),
         platform_cpu_id: Once::new(),

@@ -1,4 +1,4 @@
-use aarch64_vmsa::address::{TranslationGranule, VirtAddr};
+use aarch64_vmsa::address::TranslationGranule;
 use aarch64_vmsa::attrs::{
     AllocationHints, CachePolicy, Cacheability, DataRights, DirtyBitManagement, DirtyControl,
     MemoryAttributes, MemoryTransience, SemanticLeafAttrs, SemanticTableAttrs,
@@ -12,8 +12,8 @@ use aarch64_vmsa::config::regime::NonSecureEl1Stage1;
 use aarch64_vmsa::descriptor::{DescriptorFormat, HasLayout};
 use aarch64_vmsa::mapper::{Live, Mapper, MapperInvalidation};
 use aarch64_vmsa::table::{
-    RecursiveTableAccess, RootTableGeometry, TableAccessLocation, TableAddr, TableAllocLayout,
-    TableReclaim,
+    RootTableGeometry, TableAccess, TableAccessLocation, TableAccessMut, TableAddr,
+    TableAllocLayout, TableFrameProvider, TableReclaim, TranslationTable, TranslationTableMut,
 };
 
 use aarch64_vmsa::translation::{WalkInputAddr, WalkOutputAddr};
@@ -29,10 +29,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use goblin::pe::header::COFF_MACHINE_ARM64;
 use kernel_abi::KernelSection;
 use kernel_abi::KernelSections;
-use kernel_abi::arch::{
-    Aarch64BootArchInfo, Aarch64PeTlsDirectory, KERNEL_PE_BASE, RawTableFrameProvider,
-    RecursiveFrameZeroProvider,
-};
+use kernel_abi::arch::{Aarch64BootArchInfo, Aarch64PeTlsDirectory, KERNEL_PE_BASE};
 use kernel_abi::{
     BootInfo, FdtHeader, FrameBuffer, FrameBufferInfo, MemoryRegionKind, Optional, PixelFormat,
     RUSTOS_BOOT_INFO_MAGIC,
@@ -54,8 +51,8 @@ type GranuleMapper<G> = Mapper<
     Format,
     NonSecureEl1Stage1,
     G,
-    RecursiveTableAccess<Format, G>,
-    RecursiveFrameZeroProvider<TableFrameSource<G>, G>,
+    OffsetTableAccess,
+    TableFrameSource<G>,
     Live<StubInvalidation>,
 >;
 
@@ -78,13 +75,15 @@ impl FrameAllocator {
 
 pub struct TableFrameSource<G: TranslationGranule> {
     source: BootFrameSource<Aarch64Platform>,
+    physical_memory_offset: u64,
+    physical_memory_len: u64,
     granule: PhantomData<G>,
 }
 
-unsafe impl<G: TranslationGranule> RawTableFrameProvider<G> for TableFrameSource<G> {
+unsafe impl<G: TranslationGranule> TableFrameProvider<G> for TableFrameSource<G> {
     type Error = ();
 
-    fn allocate_table_frame(
+    fn allocate_zeroed_table(
         &mut self,
         layout: TableAllocLayout,
     ) -> Result<TableAddr<G>, Self::Error> {
@@ -92,11 +91,62 @@ unsafe impl<G: TranslationGranule> RawTableFrameProvider<G> for TableFrameSource
             return Err(());
         }
         let frame = self.source.allocate(G::SIZE).ok_or(())?;
+        let end = frame.checked_add(layout.bytes()).ok_or(())?;
+        if end > self.physical_memory_len {
+            return Err(());
+        }
+        let address = self.physical_memory_offset.checked_add(frame).ok_or(())?;
+        unsafe { core::ptr::write_bytes(address as *mut u8, 0, layout.bytes() as usize) };
         TableAddr::new(frame).map_err(|_| ())
     }
 
-    fn reclaim_table_frame(&mut self, _reclaim: TableReclaim<G>) -> Result<(), Self::Error> {
+    fn reclaim_table(&mut self, _reclaim: TableReclaim<G>) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+pub struct OffsetTableAccess {
+    physical_memory_offset: u64,
+    physical_memory_len: u64,
+}
+
+impl OffsetTableAccess {
+    fn pointer<G: TranslationGranule>(
+        &self,
+        location: TableAccessLocation<'_, Format, G>,
+    ) -> Result<NonNull<u64>, ()> {
+        let bytes = location.shape().alloc_layout().map_err(|_| ())?.bytes();
+        let end = location.addr().raw().checked_add(bytes).ok_or(())?;
+        if end > self.physical_memory_len {
+            return Err(());
+        }
+        let address = self
+            .physical_memory_offset
+            .checked_add(location.addr().raw())
+            .ok_or(())?;
+        NonNull::new(address as *mut u64).ok_or(())
+    }
+}
+
+unsafe impl<G: TranslationGranule> TableAccess<Format, G> for OffsetTableAccess {
+    type Error = ();
+
+    fn table_at<'a>(
+        &'a self,
+        location: TableAccessLocation<'a, Format, G>,
+    ) -> Result<TranslationTable<'a, Format, G>, Self::Error> {
+        let pointer = self.pointer(location)?;
+        Ok(unsafe { TranslationTable::from_raw_parts(pointer, location.shape()) })
+    }
+}
+
+unsafe impl<G: TranslationGranule> TableAccessMut<Format, G> for OffsetTableAccess {
+    fn table_at_mut<'a>(
+        &'a mut self,
+        location: TableAccessLocation<'a, Format, G>,
+    ) -> Result<TranslationTableMut<'a, Format, G>, Self::Error> {
+        let pointer = self.pointer(location)?;
+        Ok(unsafe { TranslationTableMut::from_raw_parts(pointer, location.shape()) })
     }
 }
 
@@ -272,19 +322,6 @@ impl BootloaderPlatform for Aarch64Platform {
             Ordering::Relaxed,
         );
         MAIR.store(bootloader_info.translation.mair_el1, Ordering::Relaxed);
-        unsafe {
-            bootloader_info
-                .translation
-                .scratch_descriptor
-                .write_volatile(0);
-            asm!(
-                "dsb ishst",
-                "tlbi vmalle1is",
-                "dsb ish",
-                "isb",
-                options(nostack, preserves_flags)
-            );
-        }
         match bootloader_info.translation.granule_kind {
             GranuleKind::Size4KiB => {
                 init_mapper_for::<Granule4KiB>(bootloader_info).map(ImageMapper::Size4KiB)
@@ -338,12 +375,8 @@ impl BootloaderPlatform for Aarch64Platform {
         let translation = bootloader_info.translation;
         let arch_info = Aarch64BootArchInfo {
             root_table: translation.root_table,
-            recursive_base: translation.recursive_base,
-            scratch_page: translation.scratch_page,
-            recursive_index: translation
-                .recursive_index
-                .try_into()
-                .map_err(|_| "kernel_stub: recursive index overflow")?,
+            physical_memory_offset: translation.recursive_base,
+            physical_memory_len: translation.scratch_page,
             granule_shift: translation.granule_kind.shift(),
             input_addr_bits: translation.input_addr_bits,
             output_addr_bits: translation.output_addr_bits,
@@ -442,26 +475,15 @@ where
     )
     .map_err(|_| "kernel_stub: invalid translation geometry")?;
     let root = geometry.with_regime::<NonSecureEl1Stage1>();
-    let access = unsafe {
-        RecursiveTableAccess::new(
-            translation.recursive_index,
-            VirtAddr(translation.recursive_base),
-            root_addr,
-            root.level(),
-        )
-    }
-    .map_err(|_| "kernel_stub: invalid recursive mapping")?;
-    let source = TableFrameSource::<G> {
-        source: BootFrameSource::new(boot_info, 0),
-        granule: PhantomData,
+    let access = OffsetTableAccess {
+        physical_memory_offset: translation.recursive_base,
+        physical_memory_len: translation.scratch_page,
     };
-    let provider = unsafe {
-        RecursiveFrameZeroProvider::new(
-            source,
-            translation.scratch_page,
-            NonNull::new(translation.scratch_descriptor)
-                .ok_or("kernel_stub: missing scratch descriptor")?,
-        )
+    let provider = TableFrameSource::<G> {
+        source: BootFrameSource::new(boot_info, 0),
+        physical_memory_offset: translation.recursive_base,
+        physical_memory_len: translation.scratch_page,
+        granule: PhantomData,
     };
     Mapper::new_live(root, access, provider, StubInvalidation)
         .map_err(|_| "kernel_stub: failed to initialize mapper")

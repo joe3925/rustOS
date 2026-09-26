@@ -8,7 +8,8 @@ use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const AARCH64_BOOTLOADER_MANIFEST: &str = "third_party/aarch64-bootloader/bootloader/Cargo.toml";
+const AARCH64_BOOTLOADER_REPOSITORY: &str = "https://github.com/joe3925/aarch64-bootloader.git";
+const AARCH64_BOOTLOADER_BRANCH: &str = "main";
 const AARCH64_BOOTLOADER_PACKAGE: &str = "aarch64-bootloader";
 const AARCH64_BOOTLOADER_TARGET: &str = "aarch64-unknown-uefi";
 const AARCH64_EFI_PATH: &str = "/EFI/BOOT/BOOTAA64.EFI";
@@ -135,7 +136,7 @@ impl Aarch64ImageLayout {
 
     fn config(&self) -> Vec<u8> {
         format!(
-            "kernel={}\nframebuffer_width={}\nframebuffer_height={}\n",
+            "kernel={}\nframebuffer_width={}\nframebuffer_height={}\nphysical_memory=dynamic\n",
             self.payload_path.as_uefi_path(),
             self.framebuffer_width,
             self.framebuffer_height
@@ -191,13 +192,65 @@ fn build_aarch64_bootloader(
     request: &ImageRequest<'_>,
     layout: &Aarch64ImageLayout,
 ) -> Result<PathBuf, String> {
-    let manifest = request.workspace_root.join(AARCH64_BOOTLOADER_MANIFEST);
-    if !manifest.is_file() {
+    let source_dir = env::temp_dir()
+        .join("rustos-aarch64-bootloader")
+        .join(AARCH64_BOOTLOADER_BRANCH);
+    if !source_dir.join(".git").is_dir() {
+        if request.offline {
+            return Err(format!(
+                "AArch64 bootloader source is not available offline: {}",
+                source_dir.display()
+            ));
+        }
+        if let Some(parent) = source_dir.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create AArch64 bootloader source directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        let output = Command::new("git")
+            .args(["clone", "--no-checkout", AARCH64_BOOTLOADER_REPOSITORY])
+            .arg(&source_dir)
+            .output()
+            .map_err(|err| format!("failed to clone AArch64 bootloader: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cloning AArch64 bootloader failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    if !request.offline {
+        let output = Command::new("git")
+            .current_dir(&source_dir)
+            .args(["fetch", "origin", AARCH64_BOOTLOADER_BRANCH])
+            .output()
+            .map_err(|err| format!("failed to fetch AArch64 bootloader: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "fetching AArch64 bootloader failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    let output = Command::new("git")
+        .current_dir(&source_dir)
+        .args(["checkout", "--detach", "--force"])
+        .arg(format!("origin/{AARCH64_BOOTLOADER_BRANCH}"))
+        .output()
+        .map_err(|err| format!("failed to select AArch64 bootloader revision: {err}"))?;
+    if !output.status.success() {
         return Err(format!(
-            "AArch64 bootloader manifest does not exist: {}",
-            manifest.display()
+            "selecting AArch64 bootloader revision failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    let manifest = source_dir.join("bootloader/Cargo.toml");
 
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let target_dir = request

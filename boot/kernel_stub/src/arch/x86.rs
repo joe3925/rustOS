@@ -5,7 +5,6 @@ use bootloader_api::info::PixelFormat::{Bgr, Rgb, U8, Unknown};
 use bootloader_api::{BootloaderConfig, entry_point};
 use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
 use goblin::pe::header::COFF_MACHINE_X86_64;
 use kernel_abi::KernelSections;
 use kernel_abi::arch::{
@@ -18,8 +17,8 @@ use kernel_abi::{
 };
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, Page, PageTable, PageTableFlags, PageTableIndex, PhysFrame, Size4KiB,
-    mapper::RecursivePageTable, mapper::TranslateError,
+    FrameAllocator, Mapper, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    mapper::OffsetPageTable, mapper::TranslateError,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -32,12 +31,11 @@ pub struct X86Platform;
 
 const PAGE_SIZE: u64 = 0x1000;
 const LOW_RESERVED_END: u64 = 0x20_0000;
-static BOOTSTRAP_SCRATCH_PAGE: AtomicU64 = AtomicU64::new(0);
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = None;
-    config.mappings.page_table_recursive = Some(Mapping::Dynamic);
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.mappings.page_table_recursive = None;
     config.kernel_stack_size = 1 * 1024 * 1024;
     config.mappings.kernel_stack = Mapping::Dynamic;
     config.mappings.framebuffer = Mapping::Dynamic;
@@ -94,7 +92,7 @@ impl Platform for X86Platform {
 }
 
 impl KernelImagePlatform for X86Platform {
-    type ImageMapper = RecursivePageTable<'static>;
+    type ImageMapper = OffsetPageTable<'static>;
     type FrameAllocator = BootFrameAllocator;
     type TlsDirectory = PeTlsDirectory;
 
@@ -180,33 +178,6 @@ impl KernelImagePlatform for X86Platform {
         Ok(())
     }
 
-    fn prepare_bootstrap_zero_mapping(
-        mapper: &mut Self::ImageMapper,
-        frame_allocator: &mut Self::FrameAllocator,
-    ) -> Result<(), &'static str> {
-        let address = STUB_DYNAMIC_RANGE_END - PAGE_SIZE;
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(address));
-        match mapper.translate_page(page) {
-            Err(TranslateError::PageNotMapped) => {}
-            _ => return Err("kernel_stub: bootstrap scratch page is unavailable"),
-        }
-        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(0));
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-        unsafe {
-            mapper
-                .map_to(page, frame, flags, frame_allocator)
-                .map_err(|_| "kernel_stub: failed to build bootstrap scratch mapping")?
-                .flush();
-            mapper
-                .unmap(page)
-                .map_err(|_| "kernel_stub: failed to clear bootstrap scratch mapping")?
-                .1
-                .flush();
-        }
-        BOOTSTRAP_SCRATCH_PAGE.store(address, Ordering::Release);
-        Ok(())
-    }
-
     fn tls_directory_from_pe(directory: goblin::pe::tls::ImageTlsDirectory) -> Self::TlsDirectory {
         PeTlsDirectory {
             start_address_of_raw_data: directory.start_address_of_raw_data,
@@ -264,11 +235,11 @@ impl BootloaderPlatform for X86Platform {
     fn init_mapper(
         bootloader_info: &Self::BootloaderInfo,
     ) -> Result<Self::ImageMapper, &'static str> {
-        let recursive_index = bootloader_info
-            .recursive_index
+        let physical_memory_offset = bootloader_info
+            .physical_memory_offset
             .into_option()
-            .ok_or("kernel_stub: bootloader did not map page tables recursively")?;
-        Ok(unsafe { init_recursive_mapper(recursive_index) })
+            .ok_or("kernel_stub: bootloader did not map physical memory")?;
+        Ok(unsafe { init_offset_mapper(physical_memory_offset) })
     }
 
     fn init_frame_allocator(bootloader_info: &Self::BootloaderInfo) -> Self::FrameAllocator {
@@ -303,8 +274,16 @@ impl BootloaderPlatform for X86Platform {
         parts: BootInfoParts<Self::TlsDirectory>,
     ) -> Result<BootInfo<Self::BootArchInfo>, &'static str> {
         let arch_info = X86BootArchInfo {
-            recursive_index: translate_optional(bootloader_info.recursive_index),
-            scratch_page: BOOTSTRAP_SCRATCH_PAGE.load(Ordering::Acquire),
+            physical_memory_offset: bootloader_info
+                .physical_memory_offset
+                .into_option()
+                .ok_or("kernel_stub: bootloader did not map physical memory")?,
+            physical_memory_len: bootloader_info
+                .memory_regions
+                .iter()
+                .map(|region| region.end)
+                .max()
+                .ok_or("kernel_stub: bootloader memory map is empty")?,
             pe_tls_directory: parts.tls_directory,
         };
         let (ramdisk_addr, ramdisk_len) = ramdisk(bootloader_info);
@@ -437,26 +416,13 @@ fn translate_optional<T>(value: info::Optional<T>) -> Optional<T> {
     }
 }
 
-unsafe fn init_recursive_mapper(recursive_index: u16) -> RecursivePageTable<'static> {
-    let recursive_index = PageTableIndex::new(recursive_index);
-    let level_4_table = unsafe { active_level_4_table(recursive_index) };
-    unsafe { RecursivePageTable::new_unchecked(level_4_table, recursive_index) }
+unsafe fn init_offset_mapper(physical_memory_offset: u64) -> OffsetPageTable<'static> {
+    let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
+    unsafe { OffsetPageTable::new(level_4_table, VirtAddr::new(physical_memory_offset)) }
 }
 
-unsafe fn active_level_4_table(recursive_index: PageTableIndex) -> &'static mut PageTable {
-    let virt = recursive_level_4_table_addr(u64::from(recursive_index) as u16);
-    unsafe { &mut *virt.as_mut_ptr() }
-}
-
-const fn recursive_table_addr(p4: u64, p3: u64, p2: u64, p1: u64) -> u64 {
-    let mut addr = (p4 << 39) | (p3 << 30) | (p2 << 21) | (p1 << 12);
-    if addr & (1 << 47) != 0 {
-        addr |= 0xFFFF_0000_0000_0000;
-    }
-    addr
-}
-
-const fn recursive_level_4_table_addr(recursive_index: u16) -> VirtAddr {
-    let idx = recursive_index as u64;
-    VirtAddr::new(recursive_table_addr(idx, idx, idx, idx))
+unsafe fn active_level_4_table(physical_memory_offset: u64) -> &'static mut PageTable {
+    let (frame, _) = x86_64::registers::control::Cr3::read();
+    let address = physical_memory_offset + frame.start_address().as_u64();
+    unsafe { &mut *(address as *mut PageTable) }
 }

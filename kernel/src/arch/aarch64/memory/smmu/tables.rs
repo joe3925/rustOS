@@ -1,7 +1,7 @@
+use aarch64_vmsa::address::TranslationGranule;
 use aarch64_vmsa::config::format::{NativeEndian, Vmsa64};
 use aarch64_vmsa::config::granule::Granule4KiB;
-use aarch64_vmsa::format::DescriptorFormat;
-use aarch64_vmsa::granule::TranslationGranule;
+use aarch64_vmsa::descriptor::DescriptorFormat;
 use aarch64_vmsa::table::{
     AccessError, TableAccess, TableAccessLocation, TableAccessMut, TableAddr, TableAllocLayout,
     TableFrameProvider, TableReclaim, TranslationTable, TranslationTableMut,

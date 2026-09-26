@@ -8,7 +8,6 @@ use x86_64_paging::PageTableFlags;
 use x86_64_paging::paging::mapper::{Mapper, MapperError};
 use x86_64_paging::paging::translation::walk::WalkOutputAddr;
 
-use crate::memory::paging::frame_alloc::{KernelFrameAllocator, KernelPageTableFrameAllocator};
 use crate::memory::paging::types::{
     KernelVirtualLayout, MappingSize, PagingCapabilities, ResolvedMapping,
 };
@@ -24,7 +23,6 @@ use super::mapper::{
     NoTableFrames,  X86TableAccess, X86TableFrames, input_address,
     mapping_level, page_error, root_table,
 };
-use super::tables;
 
 const X86_MAPPING_SIZES_WITH_1G: [MappingSize; 3] = [
     MappingSize { bytes: 0x4000_0000 },
@@ -75,95 +73,6 @@ impl PagingPlatform for X86Platform {
             base_page_size: 0x1000,
             stack_alignment: 16,
         }
-    }
-
-    fn bootstrap_emergency_zero_address() -> Option<VirtAddr> {
-        let address = boot_info().arch_info.scratch_page;
-        (address != 0).then_some(VirtAddr::new(address))
-    }
-
-    unsafe fn prepare_emergency_zero_mapping(
-        virtual_address: VirtAddr,
-    ) -> Result<(), PageMapError> {
-        let size = MappingSize { bytes: 0x1000 };
-        let physical_address =
-            KernelFrameAllocator::allocate_mapping_frame(size).ok_or(PageMapError::NoMemory())?;
-        let mut allocator = KernelPageTableFrameAllocator;
-        let result = unsafe {
-            Self::map_leaf(
-                Self::kernel_root(),
-                &mut allocator,
-                virtual_address,
-                physical_address,
-                size,
-                PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXECUTE,
-                None,
-            )
-        };
-        if result.is_ok() {
-            let recursive_index = boot_info()
-                .arch_info
-                .recursive_index
-                .into_option()
-                .ok_or(PageMapError::NoMemoryMap())?;
-            let raw = virtual_address.as_u64();
-            let rec = u64::from(recursive_index);
-            let table = tables::recursive_table_addr(
-                rec,
-                (raw >> 39) & 0x1ff,
-                (raw >> 30) & 0x1ff,
-                (raw >> 21) & 0x1ff,
-            );
-            unsafe {
-                (table as *mut u64)
-                    .add(((raw >> 12) & 0x1ff) as usize)
-                    .write_volatile(0)
-            };
-        }
-        unsafe { KernelFrameAllocator::release_reserved_mapping_frame(physical_address, size) };
-        result
-    }
-
-    unsafe fn emergency_zero_physical_frame(
-        virtual_address: VirtAddr,
-        physical_address: PhysAddr,
-    ) -> Result<(), PageMapError> {
-        if virtual_address.as_u64() % 0x1000 != 0 || physical_address.as_u64() % 0x1000 != 0 {
-            return Err(PageMapError::TranslationFailed());
-        }
-
-        let recursive_index = boot_info()
-            .arch_info
-            .recursive_index
-            .into_option()
-            .ok_or(PageMapError::NoMemoryMap())?;
-        let raw = virtual_address.as_u64();
-        let rec = u64::from(recursive_index);
-        let table = tables::recursive_table_addr(
-            rec,
-            (raw >> 39) & 0x1ff,
-            (raw >> 30) & 0x1ff,
-            (raw >> 21) & 0x1ff,
-        );
-        let entry = unsafe { (table as *mut u64).add(((raw >> 12) & 0x1ff) as usize) };
-        if unsafe { entry.read_volatile() } != 0 {
-            return Err(PageMapError::Page4KiB(PageMapFailure::PageAlreadyMapped));
-        }
-
-        unsafe {
-            entry.write_volatile(
-                physical_address.as_u64()
-                    | (PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::NO_EXECUTE)
-                        .bits(),
-            )
-        };
-        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(virtual_address.as_u64()));
-        unsafe { core::ptr::write_bytes(virtual_address.as_mut_ptr::<u8>(), 0, 0x1000) };
-        unsafe { entry.write_volatile(0) };
-        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(virtual_address.as_u64()));
-        Ok(())
     }
 
     unsafe fn map_leaf<A: PageTableFrameAllocator>(

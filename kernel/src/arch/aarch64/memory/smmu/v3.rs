@@ -1,3 +1,4 @@
+use aarch64_vmsa::address::Level;
 use aarch64_vmsa::attrs::{
     AllocationHints, CachePolicy, Cacheability, DataRights, DeviceMemoryType, DirtyBitManagement,
     DirtyControl, ExecuteRights, LiveVmsaConfig, MemoryAttributes, MemoryTransience,
@@ -6,7 +7,6 @@ use aarch64_vmsa::attrs::{
     Stage2PermissionSettings, Stage2Permissions,
 };
 use aarch64_vmsa::config::regime::smmu_v3::NonSecureIpaStage2;
-use aarch64_vmsa::granule::Level;
 use aarch64_vmsa::mapper::{Mapper, Offline};
 use aarch64_vmsa::table::{RootTable, RootTableGeometry, TableFrameProvider, TableShape};
 use aarch64_vmsa::translation::{WalkInputAddr, WalkOutputAddr};

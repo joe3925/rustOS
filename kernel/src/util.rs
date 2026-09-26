@@ -22,7 +22,6 @@ use crate::memory::paging::frame_alloc::{
 use crate::memory::paging::map::unmap_kernel_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_MANAGER;
-use crate::memory::paging::zero::{init_emergency_zero_mappings, start_zero_page_worker};
 use crate::platform::{
     ActivePlatform, ConsolePlatform, breakpoint, broadcast_panic_stop, calibrate_boot_timer,
     current_cpu_id, current_is_in_interrupt, current_platform_cpu_id, cycle_counter,
@@ -146,8 +145,6 @@ pub extern "C" fn kernel_main(ctx: usize) {
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
     ));
-    init_emergency_zero_mappings().expect("Failed to initialize emergency zero mappings");
-   // start_zero_page_worker();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
