@@ -20,11 +20,11 @@ pub(super) type X86RootTable = RootTable<Amd64, LongMode4Level, Granule4KiB>;
 
 pub(super) fn root_table(root: AddressSpaceRoot) -> Result<X86RootTable, PageMapError> {
     let address = TableAddr::new(root.as_u64()).map_err(|_| PageMapError::TranslationFailed())?;
-    let output_address_bits = super::super::super::cpu::get_cpu_info()
-        .get_processor_capacity_feature_info()
-        .map(|capacity| capacity.physical_address_bits())
-        .unwrap_or(48);
-    RootTableGeometry::<Amd64, Granule4KiB>::new(address, 48, output_address_bits)
+    RootTableGeometry::<Amd64, Granule4KiB>::new(
+        address,
+        48,
+        super::tables::paging_properties().output_address_bits,
+    )
         .map(|geometry| geometry.with_regime())
         .map_err(|_| PageMapError::TranslationFailed())
 }

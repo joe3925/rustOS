@@ -37,13 +37,9 @@ const X86_MAPPING_SIZES_WITHOUT_1G: [MappingSize; 2] = [
 
 impl PagingPlatform for X86Platform {
     fn paging_capabilities() -> PagingCapabilities {
-        let supports_1g = super::super::super::cpu::get_cpu_info()
-            .get_extended_processor_and_feature_identifiers()
-            .is_some_and(|features| features.has_1gib_pages());
-
         PagingCapabilities {
             base_page_size: 0x1000,
-            leaf_mapping_sizes: if supports_1g {
+            leaf_mapping_sizes: if super::tables::paging_properties().supports_1g_pages {
                 &X86_MAPPING_SIZES_WITH_1G
             } else {
                 &X86_MAPPING_SIZES_WITHOUT_1G
