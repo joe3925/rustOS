@@ -224,7 +224,9 @@ impl LeaseSlot {
         self.chunk_count.store(0, Ordering::Relaxed);
         self.access.store(0, Ordering::Relaxed);
         self.dma_record.store(NO_DMA_RECORD, Ordering::Relaxed);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self.generation.load(Ordering::Relaxed);
+        self.generation
+            .store(generation.wrapping_add(1), Ordering::Relaxed);
         self.state.store(LEASE_FREE, Ordering::Release);
     }
 }
@@ -319,7 +321,6 @@ impl<'data> IoBufferBacking<'data> {
         mut scratch: IoBufferBackingScratch,
     ) -> Result<Self, IoBufferError> {
         validate_overlap_granularity(config.overlap_granularity)?;
-        scratch.clear();
         scratch.ensure_capacity(config)?;
 
         let (memory, byte_len) =

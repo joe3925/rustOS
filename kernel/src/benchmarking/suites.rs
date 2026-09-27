@@ -13,6 +13,10 @@ use kernel_types::{
         BenchMetricDirection, BenchMetricUnit, BenchRunHandle, BenchSuiteDescriptor,
         BenchSuiteStatus,
     },
+    dma::{
+        IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
+        IoBufferBackingScratch,
+    },
 };
 use spin::Mutex;
 
@@ -42,6 +46,10 @@ const QUEUE_THROUGHPUT_TOLERANCE_PERCENT: f64 = 8.0;
 /// Largest disk slowdown treated as practically unchanged. Lower values catch smaller changes but
 /// warn more often; 5–10% is recommended for end-to-end virtual-disk benchmarks.
 const DISK_TOLERANCE_PERCENT: f64 = 8.0;
+const IOBUFFER_TOLERANCE_PERCENT: f64 = 2.0;
+const IOBUFFER_TRIALS: usize = 15;
+const IOBUFFER_LEASE_OPS: usize = 20_000;
+const IOBUFFER_SPLIT_OPS: usize = 1_000;
 
 struct YieldOnce(bool);
 
@@ -79,7 +87,179 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
             c_drive_suite,
         )
         .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
+            "io.iobuffer",
+            "I/O buffer lease and scratch performance",
+            vec!["ci".to_string(), "io".to_string()],
+            iobuffer_suite,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
     ]
+}
+
+extern "C" fn iobuffer_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {
+    async move {
+        if !bench_case_start(handle, "lease-create-drop".to_string()) {
+            return BenchSuiteStatus::Failed;
+        }
+
+        let mut bytes = vec![0u8; 2 * 1024 * 1024];
+        let backing = match IoBufferBacking::new(
+            IoBufferBackingDesc::SliceMut(&mut bytes),
+            IoBufferBackingConfig::worst_case_for_len(2 * 1024 * 1024),
+        ) {
+            Ok(backing) => backing,
+            Err(error) => {
+                bench_case_fail(
+                    handle,
+                    alloc::format!("backing construction failed: {error:?}"),
+                );
+                bench_case_end(handle);
+                return BenchSuiteStatus::Failed;
+            }
+        };
+
+        for _ in 0..1_000 {
+            drop(black_box(backing.create_to_device(0, 16 * 1024).unwrap()));
+        }
+
+        for _ in 0..IOBUFFER_TRIALS {
+            for (offset, len, metric) in [
+                (0, 1024, "create_drop.1k"),
+                (0, 16 * 1024, "create_drop.16k"),
+                (0, 64 * 1024, "create_drop.64k"),
+                (0, 256 * 1024, "create_drop.256k"),
+                (0, 2 * 1024 * 1024, "create_drop.2m"),
+                (128, 64 * 1024, "create_drop.unaligned_64k"),
+            ] {
+                let timer = Stopwatch::start();
+                for _ in 0..IOBUFFER_LEASE_OPS {
+                    drop(black_box(
+                        backing
+                            .create_to_device(black_box(offset), black_box(len))
+                            .unwrap(),
+                    ));
+                }
+                bench_measure_with_tolerance(
+                    handle,
+                    metric.to_string(),
+                    timer.elapsed_nanos() as f64 / IOBUFFER_LEASE_OPS as f64,
+                    BenchMetricUnit::Nanoseconds,
+                    BenchMetricDirection::LowerIsBetter,
+                    Some(IOBUFFER_TOLERANCE_PERCENT),
+                );
+            }
+        }
+        bench_case_end(handle);
+
+        if !bench_case_start(handle, "split-drop".to_string()) {
+            return BenchSuiteStatus::Failed;
+        }
+        for _ in 0..100 {
+            let mut tail = backing.create_to_device(0, 2 * 1024 * 1024).unwrap();
+            while tail.len() > 64 * 1024 {
+                let (piece, rest) = tail.split_at(64 * 1024).unwrap();
+                drop(piece);
+                tail = rest;
+            }
+            drop(tail);
+        }
+        for _ in 0..IOBUFFER_TRIALS {
+            let timer = Stopwatch::start();
+            for _ in 0..IOBUFFER_SPLIT_OPS {
+                let mut tail = backing.create_to_device(0, 2 * 1024 * 1024).unwrap();
+                while tail.len() > 64 * 1024 {
+                    let (piece, rest) = tail.split_at(black_box(64 * 1024)).unwrap();
+                    drop(black_box(piece));
+                    tail = rest;
+                }
+                drop(black_box(tail));
+            }
+            bench_measure_with_tolerance(
+                handle,
+                "split_drop.2m_by_64k".to_string(),
+                timer.elapsed_nanos() as f64 / IOBUFFER_SPLIT_OPS as f64,
+                BenchMetricUnit::Nanoseconds,
+                BenchMetricDirection::LowerIsBetter,
+                Some(IOBUFFER_TOLERANCE_PERCENT),
+            );
+        }
+        drop(backing);
+        bench_case_end(handle);
+
+        if !bench_case_start(handle, "scratch-reuse".to_string()) {
+            return BenchSuiteStatus::Failed;
+        }
+        let mut scratch_bytes = vec![0u8; 64 * 1024];
+        let mut scratch = IoBufferBackingScratch::new();
+        let high_water = IoBufferBacking::from_scratch(
+            IoBufferBackingDesc::SliceMut(&mut scratch_bytes),
+            IoBufferBackingConfig::worst_case_for_len(64 * 1024),
+            scratch,
+        )
+        .unwrap();
+        scratch = high_water.into_scratch();
+        for _ in 0..1_000 {
+            let backing = IoBufferBacking::from_scratch(
+                IoBufferBackingDesc::SliceMut(&mut scratch_bytes[..4]),
+                IoBufferBackingConfig::worst_case_for_len(4),
+                scratch,
+            )
+            .unwrap();
+            drop(backing.create_from_device(0, 4).unwrap());
+            scratch = backing.into_scratch();
+        }
+        for _ in 0..IOBUFFER_TRIALS {
+            let timer = Stopwatch::start();
+            for _ in 0..IOBUFFER_LEASE_OPS {
+                let backing = IoBufferBacking::from_scratch(
+                    IoBufferBackingDesc::SliceMut(&mut scratch_bytes[..4]),
+                    IoBufferBackingConfig::worst_case_for_len(4),
+                    scratch,
+                )
+                .unwrap();
+                drop(black_box(backing.create_from_device(0, 4).unwrap()));
+                scratch = backing.into_scratch();
+            }
+            bench_measure_with_tolerance(
+                handle,
+                "high_water_64k_then_4b".to_string(),
+                timer.elapsed_nanos() as f64 / IOBUFFER_LEASE_OPS as f64,
+                BenchMetricUnit::Nanoseconds,
+                BenchMetricDirection::LowerIsBetter,
+                Some(IOBUFFER_TOLERANCE_PERCENT),
+            );
+        }
+        bench_case_end(handle);
+
+        if !bench_case_start(handle, "virtual-create-drop".to_string()) {
+            return BenchSuiteStatus::Failed;
+        }
+        for _ in 0..IOBUFFER_TRIALS {
+            let timer = Stopwatch::start();
+            for _ in 0..IOBUFFER_LEASE_OPS {
+                let mut buffer = unsafe {
+                    IoBuffer::from_virt_from_device(
+                        black_box(scratch_bytes.as_mut_ptr() as usize),
+                        black_box(4),
+                    )
+                };
+                black_box(buffer.try_as_mut_slice().unwrap());
+                drop(black_box(buffer));
+            }
+            bench_measure_with_tolerance(
+                handle,
+                "create_drop.4b".to_string(),
+                timer.elapsed_nanos() as f64 / IOBUFFER_LEASE_OPS as f64,
+                BenchMetricUnit::Nanoseconds,
+                BenchMetricDirection::LowerIsBetter,
+                Some(IOBUFFER_TOLERANCE_PERCENT),
+            );
+        }
+        bench_case_end(handle);
+        BenchSuiteStatus::Passed
+    }
+    .into_abi()
 }
 
 extern "C" fn executor_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {

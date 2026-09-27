@@ -171,14 +171,18 @@ impl RadixMap {
         }
         let mut cursor = first;
         while cursor < end {
-            let (target, units) = self.chunk(cursor, end);
+            let (target, units) = self.batch_chunk(cursor, end);
             let units = if target.is_none() {
                 units.max((end - cursor).min(RADIX - cursor % RADIX))
             } else {
                 units
             };
             let result = match target {
-                Some(_) => self.claim_chunk(cursor, target),
+                Some(level_index) => self.claim_chunk(
+                    cursor,
+                    target,
+                    (units >> self.levels[level_index].shift).max(1),
+                ),
                 None => self.claim_terminal_range(cursor, units),
             };
             if result.is_err() {
@@ -224,37 +228,38 @@ impl RadixMap {
         }
         let mut cursor = first;
         while cursor < end {
-            let (target, units) = self.chunk(cursor, end);
+            let (target, units) = self.batch_chunk(cursor, end);
             let units = if target.is_none() {
                 units.max((end - cursor).min(RADIX - cursor % RADIX))
             } else {
                 units
             };
             match target {
-                Some(_) => unsafe { self.release_target(cursor, target) },
+                Some(level_index) => unsafe {
+                    self.release_target(
+                        cursor,
+                        target,
+                        (units >> self.levels[level_index].shift).max(1),
+                    )
+                },
                 None => unsafe { self.release_terminal_range(cursor, units) },
             }
             cursor += units;
         }
+        if first == 0 && end == self.terminal.len() {
+            return;
+        }
         for level_index in (0..self.levels.len()).rev() {
-            let mut previous = usize::MAX;
-            let mut cursor = first;
-            while cursor < end {
-                let (target, units) = self.chunk(cursor, end);
-                let units = if target.is_none() {
-                    units.max((end - cursor).min(RADIX - cursor % RADIX))
-                } else {
-                    units
-                };
-                let ancestor_end = target.unwrap_or(self.levels.len());
-                if level_index < ancestor_end {
-                    let index = cursor >> self.levels[level_index].shift;
-                    if index != previous {
-                        self.repair_entry(level_index, index);
-                        previous = index;
-                    }
-                }
-                cursor += units;
+            let shift = self.levels[level_index].shift;
+            let mask = (1usize << shift) - 1;
+            let left = first >> shift;
+            let right = (end - 1) >> shift;
+            let repair_left = first & mask != 0;
+            if repair_left {
+                self.repair_entry(level_index, left);
+            }
+            if end & mask != 0 && (!repair_left || right != left) {
+                self.repair_entry(level_index, right);
             }
         }
     }
@@ -356,7 +361,28 @@ impl RadixMap {
         (None, 1)
     }
 
-    fn claim_chunk(&self, terminal_index: usize, target: Option<usize>) -> Result<(), ()> {
+    fn batch_chunk(&self, cursor: usize, end: usize) -> (Option<usize>, usize) {
+        let (target, units) = self.chunk(cursor, end);
+        let Some(level_index) = target else {
+            return (target, units);
+        };
+        if cursor == 0 && end == self.terminal.len() {
+            return (target, units);
+        }
+        let index = cursor >> self.levels[level_index].shift;
+        let state_index = self.levels[level_index].entry_offset + index;
+        let entries = ((end - cursor) / units)
+            .min(RADIX - index % RADIX)
+            .min(32 - state_index % 32);
+        (target, units * entries)
+    }
+
+    fn claim_chunk(
+        &self,
+        terminal_index: usize,
+        target: Option<usize>,
+        count: usize,
+    ) -> Result<(), ()> {
         let ancestor_end = target.unwrap_or(self.levels.len());
         if ancestor_end != 0 {
             let level_index = 0;
@@ -375,13 +401,27 @@ impl RadixMap {
         let claimed = match target {
             Some(level_index) => {
                 let index = terminal_index >> self.levels[level_index].shift;
-                self.internal.compare_exchange(
-                    self.levels[level_index].entry_offset + index,
-                    RadixState::Empty as usize,
-                    RadixState::Full as usize,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                let state_index = self.levels[level_index].entry_offset + index;
+                let word_index = state_index / 32;
+                let shift = (state_index % 32) * 2;
+                let mask = ((1u64 << (count * 2)) - 1) << shift;
+                let full = mask & 0xaaaa_aaaa_aaaa_aaaa;
+                let mut observed = self.internal.load_word(word_index, Ordering::Acquire);
+                loop {
+                    if observed & mask != 0 {
+                        break Err(0);
+                    }
+                    match self.internal.compare_exchange_weak_word(
+                        word_index,
+                        observed,
+                        observed | full,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break Ok(0),
+                        Err(next) => observed = next,
+                    }
+                }
             }
             None => self.terminal.compare_exchange(
                 terminal_index,
@@ -403,7 +443,7 @@ impl RadixMap {
                     break;
                 }
                 if state == RadixState::Full as usize {
-                    unsafe { self.release_target(terminal_index, target) };
+                    unsafe { self.release_target(terminal_index, target, count) };
                     self.repair_ancestors(terminal_index, ancestor_end);
                     return Err(());
                 }
@@ -506,17 +546,31 @@ impl RadixMap {
         debug_assert_eq!(previous & mask, mask);
     }
 
-    unsafe fn release_target(&self, terminal_index: usize, target: Option<usize>) {
+    unsafe fn release_target(&self, terminal_index: usize, target: Option<usize>, count: usize) {
         let result = match target {
             Some(level_index) => {
                 let index = terminal_index >> self.levels[level_index].shift;
-                self.internal.compare_exchange(
-                    self.levels[level_index].entry_offset + index,
-                    RadixState::Full as usize,
-                    RadixState::Empty as usize,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                let state_index = self.levels[level_index].entry_offset + index;
+                let word_index = state_index / 32;
+                let shift = (state_index % 32) * 2;
+                let mask = ((1u64 << (count * 2)) - 1) << shift;
+                let full = mask & 0xaaaa_aaaa_aaaa_aaaa;
+                let mut observed = self.internal.load_word(word_index, Ordering::Acquire);
+                loop {
+                    if observed & mask != full {
+                        break Err(0);
+                    }
+                    match self.internal.compare_exchange_weak_word(
+                        word_index,
+                        observed,
+                        observed & !mask,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break Ok(0),
+                        Err(next) => observed = next,
+                    }
+                }
             }
             None => self.terminal.compare_exchange(
                 terminal_index,
