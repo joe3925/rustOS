@@ -442,7 +442,7 @@ impl PagingPlatform for Aarch64Platform {
                 return Err(PageMapError::TranslationFailed());
             }
             let physical_address = PhysAddr::new(mapping.output_base().raw());
-            unsafe { mapper.unmap_reclaim(input) }
+            unsafe { mapper.unmap(input) }
                 .map_err(|_| PageMapError::TranslationFailed())?;
             Ok(Some(physical_address))
         })

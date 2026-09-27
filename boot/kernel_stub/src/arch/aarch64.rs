@@ -16,7 +16,7 @@ use aarch64_vmsa::table::{
     TableAllocLayout, TableFrameProvider, TableReclaim, TranslationTable, TranslationTableMut,
 };
 
-use aarch64_vmsa::translation::{WalkInputAddr, WalkOutputAddr};
+use aarch64_vmsa::translation::{WalkOutputAddr, from_canonical};
 use alloc::vec::Vec;
 use bootloader_api::{
     BootInfo as LoaderBootInfo, GranuleKind, Optional as LoaderOptional,
@@ -152,7 +152,11 @@ unsafe impl<G: TranslationGranule> TableAccessMut<Format, G> for OffsetTableAcce
 
 pub struct StubInvalidation;
 
-unsafe impl<G: TranslationGranule> MapperInvalidation<Format, G> for StubInvalidation {
+unsafe impl<G: TranslationGranule> MapperInvalidation<Format, NonSecureEl1Stage1, G>
+    for StubInvalidation
+where
+    Format: HasLayout<<NonSecureEl1Stage1 as aarch64_vmsa::regime::TranslationRegime>::Stage, G>,
+{
     fn leaf_inserted(&mut self, _: TableAccessLocation<Format, G>, _: usize, _: u64, _: u64) {}
     fn leaf_removed(&mut self, _: TableAccessLocation<Format, G>, _: usize, _: u64) {}
     fn table_descriptor_inserted(
@@ -375,8 +379,8 @@ impl BootloaderPlatform for Aarch64Platform {
         let translation = bootloader_info.translation;
         let arch_info = Aarch64BootArchInfo {
             root_table: translation.root_table,
-            physical_memory_offset: translation.recursive_base,
-            physical_memory_len: translation.scratch_page,
+            physical_memory_offset: translation.physical_memory_offset,
+            physical_memory_len: translation.physical_memory_len,
             granule_shift: translation.granule_kind.shift(),
             input_addr_bits: translation.input_addr_bits,
             output_addr_bits: translation.output_addr_bits,
@@ -476,13 +480,13 @@ where
     .map_err(|_| "kernel_stub: invalid translation geometry")?;
     let root = geometry.with_regime::<NonSecureEl1Stage1>();
     let access = OffsetTableAccess {
-        physical_memory_offset: translation.recursive_base,
-        physical_memory_len: translation.scratch_page,
+        physical_memory_offset: translation.physical_memory_offset,
+        physical_memory_len: translation.physical_memory_len,
     };
     let provider = TableFrameSource::<G> {
         source: BootFrameSource::new(boot_info, 0),
-        physical_memory_offset: translation.recursive_base,
-        physical_memory_len: translation.scratch_page,
+        physical_memory_offset: translation.physical_memory_offset,
+        physical_memory_len: translation.physical_memory_len,
         granule: PhantomData,
     };
     Mapper::new_live(root, access, provider, StubInvalidation)
@@ -508,7 +512,7 @@ where
     let mut offset = 0;
     while offset < size {
         let address = base + offset;
-        let input = WalkInputAddr::from_canonical(address, mapper.root().addr_bits())
+        let input = from_canonical(address, mapper.root().addr_bits())
             .map_err(|_| "kernel_stub: non-canonical PE address")?;
         if mapper
             .translate(input)
@@ -556,7 +560,7 @@ where
     };
     let mut address = start;
     while address < end {
-        let input = WalkInputAddr::from_canonical(address, mapper.root().addr_bits())
+        let input = from_canonical(address, mapper.root().addr_bits())
             .map_err(|_| "kernel_stub: non-canonical PE address")?;
         let mapping = mapper
             .translate(input)

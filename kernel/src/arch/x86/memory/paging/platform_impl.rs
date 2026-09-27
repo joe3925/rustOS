@@ -154,7 +154,7 @@ impl PagingPlatform for X86Platform {
                 return Err(PageMapError::TranslationFailed());
             }
             let physical = PhysAddr::new(mapping.output_base().raw());
-            unsafe { page_mapper.unmap_reclaim(input) }
+            unsafe { page_mapper.unmap(input) }
                 .map_err(|_| PageMapError::TranslationFailed())?;
             Ok(Some(physical))
         })

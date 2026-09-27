@@ -141,7 +141,7 @@ impl AtomicRangeEntry {
         }
     }
 
-    fn release_acquired_node(&self, ptr: *mut (), delta: i32) -> u16 {
+    fn release_or_detach_node(&self, ptr: *mut (), delta: i32) -> bool {
         loop {
             let old = self.load();
             let RangeEntry::Node {
@@ -158,29 +158,22 @@ impl AtomicRangeEntry {
                 core::hint::spin_loop();
                 continue;
             }
-            let next = adjusted as u16;
-            if self
-                .compare_exchange(
-                    old,
-                    RangeEntry::Node {
-                        ptr,
-                        occupancy: next,
-                    },
-                )
-                .is_ok()
-            {
-                return next;
+            let next = if adjusted == 0 {
+                RangeEntry::Empty
+            } else {
+                RangeEntry::Node {
+                    ptr,
+                    occupancy: adjusted as u16,
+                }
+            };
+            if self.compare_exchange(old, next).is_ok() {
+                return adjusted == 0;
             }
         }
     }
 
     fn try_publish_node(&self, old: RangeEntry, ptr: *mut (), occupancy: u16) -> bool {
         self.compare_exchange(old, RangeEntry::Node { ptr, occupancy })
-            .is_ok()
-    }
-
-    fn try_detach_empty_node(&self, ptr: *mut ()) -> bool {
-        self.compare_exchange(RangeEntry::Node { ptr, occupancy: 0 }, RangeEntry::Empty)
             .is_ok()
     }
 }
@@ -228,8 +221,6 @@ pub struct SparseRangeRadix {
     root: RangeRadixNode,
     units: u64,
     levels: u8,
-    root_occupancy: AtomicU64,
-    needs_prune: AtomicBool,
 }
 
 impl core::fmt::Debug for SparseRangeRadix {
@@ -262,8 +253,6 @@ impl SparseRangeRadix {
             root: RangeRadixNode::new(false),
             units,
             levels,
-            root_occupancy: AtomicU64::new(0),
-            needs_prune: AtomicBool::new(false),
         })
     }
 
@@ -296,29 +285,22 @@ impl SparseRangeRadix {
         let end = first + count;
         while cursor < end {
             let chunk = Self::next_chunk(cursor, end - cursor, self.root_child_span());
-            self.root_occupancy.fetch_add(1, Ordering::AcqRel);
             match self.claim_node(
                 &self.root,
                 self.root_child_span(),
                 cursor as u128,
                 chunk as u128,
             ) {
-                Ok(delta) => {
-                    self.root_occupancy
-                        .fetch_sub(1 - delta as u64, Ordering::AcqRel);
-                }
+                Ok(_) => {}
                 Err(error) => {
-                    self.root_occupancy.fetch_sub(1, Ordering::AcqRel);
                     if cursor > first {
                         unsafe { self.release(first, cursor - first) };
                     }
-                    self.prune_if_needed();
                     return Err(error);
                 }
             }
             cursor += chunk;
         }
-        self.prune_if_needed();
         Ok(())
     }
 
@@ -379,10 +361,17 @@ impl SparseRangeRadix {
                     };
                     let result = self.claim_child(ptr, child_span, first, count);
                     let delta = result.as_ref().copied().unwrap_or(0);
-                    if entry.release_acquired_node(ptr, delta - 1) == 0 {
-                        self.needs_prune.store(true, Ordering::Release);
+                    let detached = entry.release_or_detach_node(ptr, delta - 1);
+                    match result {
+                        Ok(_) => {
+                            assert!(!detached);
+                            return Ok(0);
+                        }
+                        Err(_) if detached => {
+                            unsafe { free_child(ptr, child_span == RADIX as u128) };
+                        }
+                        Err(error) => return Err(error),
                     }
-                    return result.map(|_| 0);
                 }
             }
         }
@@ -431,18 +420,14 @@ impl SparseRangeRadix {
         let end = first + count;
         while cursor < end {
             let chunk = Self::next_chunk(cursor, end - cursor, self.root_child_span());
-            self.root_occupancy.fetch_add(1, Ordering::AcqRel);
-            let delta = self.release_node(
+            self.release_node(
                 &self.root,
                 self.root_child_span(),
                 cursor as u128,
                 chunk as u128,
             );
-            self.root_occupancy
-                .fetch_sub(1 + delta as u64, Ordering::AcqRel);
             cursor += chunk;
         }
-        self.prune_if_needed();
     }
 
     fn release_node(
@@ -496,8 +481,7 @@ impl SparseRangeRadix {
                         continue;
                     };
                     let removed = self.release_child(ptr, child_span, first, count);
-                    let remaining = entry.release_acquired_node(ptr, -removed - 1);
-                    if remaining == 0 && entry.try_detach_empty_node(ptr) {
+                    if entry.release_or_detach_node(ptr, -removed - 1) {
                         unsafe { free_child(ptr, child_span == RADIX as u128) };
                         return 1;
                     }
@@ -559,12 +543,18 @@ impl SparseRangeRadix {
         }
     }
 
-    fn repair_node(&self, node: &RangeRadixNode, base: u128, child_span: u128) -> RangeSummary {
+    fn repair_node(
+        &self,
+        node: &RangeRadixNode,
+        base: u128,
+        child_span: u128,
+    ) -> (RangeSummary, i32) {
         let mut prefix = 0u64;
         let mut suffix = 0u64;
         let mut maximum = 0u64;
         let mut run = 0u64;
         let mut all_prefix = true;
+        let mut removed = 0;
         for index in 0..RADIX {
             let child_base = base + index as u128 * child_span;
             let valid = (self.units as u128)
@@ -588,17 +578,32 @@ impl SparseRangeRadix {
                         let Ok((ptr, _)) = entry.try_acquire_node() else {
                             continue;
                         };
-                        let result = if child_span == RADIX as u128 {
+                        let (result, child_removed) = if child_span == RADIX as u128 {
                             let child = unsafe { &*(ptr as *mut RangeTerminalNode) };
-                            let result = Self::terminal_summary(child, valid as usize);
-                            child.summary.store(result);
-                            result
+                            if child.summary.dirty.load(Ordering::Acquire) {
+                                let result = Self::terminal_summary(child, valid as usize);
+                                child.summary.store(result);
+                                (result, 0)
+                            } else {
+                                (child.summary.load(), 0)
+                            }
                         } else {
                             let child = unsafe { &*(ptr as *mut RangeRadixNode) };
-                            self.repair_node(child, child_base, child_span / RADIX as u128)
+                            if child.summary.dirty.load(Ordering::Acquire) {
+                                self.repair_node(child, child_base, child_span / RADIX as u128)
+                            } else {
+                                (child.summary.load(), 0)
+                            }
                         };
-                        if entry.release_acquired_node(ptr, -1) == 0 {
-                            self.needs_prune.store(true, Ordering::Release);
+                        if entry.release_or_detach_node(ptr, -child_removed - 1) {
+                            unsafe { free_child(ptr, child_span == RADIX as u128) };
+                            removed += 1;
+                            node.summary.dirty.store(true, Ordering::Release);
+                            break RangeSummary {
+                                prefix_free: valid,
+                                suffix_free: valid,
+                                max_free: valid,
+                            };
                         }
                         break result;
                     }
@@ -624,7 +629,7 @@ impl SparseRangeRadix {
             max_free: maximum,
         };
         node.summary.store(result);
-        result
+        (result, removed)
     }
 
     fn find_free(
@@ -635,14 +640,15 @@ impl SparseRangeRadix {
         start: u128,
         summarized: bool,
         needed: u64,
-    ) -> Option<u64> {
+    ) -> (Option<u64>, i32) {
         if start >= self.units as u128 {
-            return None;
+            return (None, 0);
         }
+        let mut removed = 0;
         for index in 0..RADIX {
             let child_base = base + index as u128 * child_span;
             if child_base >= self.units as u128 {
-                return None;
+                return (None, removed);
             }
             let child_end = child_base + child_span;
             if child_end <= start {
@@ -651,18 +657,25 @@ impl SparseRangeRadix {
             let entry = &node.entries[index];
             loop {
                 match entry.load() {
-                    RangeEntry::Empty => return Some(start.max(child_base) as u64),
+                    RangeEntry::Empty => {
+                        return (Some(start.max(child_base) as u64), removed);
+                    }
                     RangeEntry::Full => break,
                     RangeEntry::Node { .. } => {
                         let Ok((ptr, _)) = entry.try_acquire_node() else {
                             continue;
                         };
-                        let result = if child_span == RADIX as u128 {
+                        let (mut result, child_removed) = if child_span == RADIX as u128 {
                             let terminal = unsafe { &*(ptr as *mut RangeTerminalNode) };
-                            ((start.max(child_base) - child_base) as usize
-                                ..(self.units as u128 - child_base).min(child_span) as usize)
-                                .find(|&bit| terminal.allocations.load(bit, Ordering::Acquire) == 0)
-                                .map(|bit| (child_base + bit as u128) as u64)
+                            (
+                                ((start.max(child_base) - child_base) as usize
+                                    ..(self.units as u128 - child_base).min(child_span) as usize)
+                                    .find(|&bit| {
+                                        terminal.allocations.load(bit, Ordering::Acquire) == 0
+                                    })
+                                    .map(|bit| (child_base + bit as u128) as u64),
+                                0,
+                            )
                         } else {
                             let child = unsafe { &*(ptr as *mut RangeRadixNode) };
                             let summary = child.summary.load();
@@ -672,7 +685,7 @@ impl SparseRangeRadix {
                                 && summary.prefix_free == 0
                                 && summary.suffix_free == 0
                             {
-                                None
+                                (None, 0)
                             } else {
                                 self.find_free(
                                     child,
@@ -684,18 +697,21 @@ impl SparseRangeRadix {
                                 )
                             }
                         };
-                        if entry.release_acquired_node(ptr, -1) == 0 {
-                            self.needs_prune.store(true, Ordering::Release);
+                        if entry.release_or_detach_node(ptr, -child_removed - 1) {
+                            unsafe { free_child(ptr, child_span == RADIX as u128) };
+                            removed += 1;
+                            node.summary.dirty.store(true, Ordering::Release);
+                            result = Some(start.max(child_base) as u64);
                         }
                         if result.is_some_and(|unit| unit < self.units) {
-                            return result;
+                            return (result, removed);
                         }
                         break;
                     }
                 }
             }
         }
-        None
+        (None, removed)
     }
 
     fn find_allocated(
@@ -704,14 +720,15 @@ impl SparseRangeRadix {
         base: u128,
         child_span: u128,
         start: u128,
-    ) -> Option<u64> {
+    ) -> (Option<u64>, i32) {
         if start >= self.units as u128 {
-            return None;
+            return (None, 0);
         }
+        let mut removed = 0;
         for index in 0..RADIX {
             let child_base = base + index as u128 * child_span;
             if child_base >= self.units as u128 {
-                return None;
+                return (None, removed);
             }
             if child_base + child_span <= start {
                 continue;
@@ -720,17 +737,24 @@ impl SparseRangeRadix {
             loop {
                 match entry.load() {
                     RangeEntry::Empty => break,
-                    RangeEntry::Full => return Some(start.max(child_base) as u64),
+                    RangeEntry::Full => {
+                        return (Some(start.max(child_base) as u64), removed);
+                    }
                     RangeEntry::Node { .. } => {
                         let Ok((ptr, _)) = entry.try_acquire_node() else {
                             continue;
                         };
-                        let result = if child_span == RADIX as u128 {
+                        let (mut result, child_removed) = if child_span == RADIX as u128 {
                             let terminal = unsafe { &*(ptr as *mut RangeTerminalNode) };
-                            ((start.max(child_base) - child_base) as usize
-                                ..(self.units as u128 - child_base).min(child_span) as usize)
-                                .find(|&bit| terminal.allocations.load(bit, Ordering::Acquire) != 0)
-                                .map(|bit| (child_base + bit as u128) as u64)
+                            (
+                                ((start.max(child_base) - child_base) as usize
+                                    ..(self.units as u128 - child_base).min(child_span) as usize)
+                                    .find(|&bit| {
+                                        terminal.allocations.load(bit, Ordering::Acquire) != 0
+                                    })
+                                    .map(|bit| (child_base + bit as u128) as u64),
+                                0,
+                            )
                         } else {
                             let child = unsafe { &*(ptr as *mut RangeRadixNode) };
                             self.find_allocated(
@@ -740,92 +764,47 @@ impl SparseRangeRadix {
                                 start,
                             )
                         };
-                        if entry.release_acquired_node(ptr, -1) == 0 {
-                            self.needs_prune.store(true, Ordering::Release);
+                        if entry.release_or_detach_node(ptr, -child_removed - 1) {
+                            unsafe { free_child(ptr, child_span == RADIX as u128) };
+                            removed += 1;
+                            node.summary.dirty.store(true, Ordering::Release);
+                            result = None;
                         }
                         if result.is_some() {
-                            return result;
+                            return (result, removed);
                         }
                         break;
                     }
                 }
             }
         }
-        None
-    }
-
-    fn prune_node(&self, node: &RangeRadixNode, child_span: u128) -> u64 {
-        let mut removed = 0;
-        for entry in &node.entries {
-            loop {
-                match entry.load() {
-                    RangeEntry::Empty | RangeEntry::Full => break,
-                    RangeEntry::Node { ptr, occupancy: 0 } => {
-                        if entry.try_detach_empty_node(ptr) {
-                            node.summary.dirty.store(true, Ordering::Release);
-                            unsafe { free_child(ptr, child_span == RADIX as u128) };
-                            removed += 1;
-                            break;
-                        }
-                    }
-                    RangeEntry::Node { .. } => {
-                        let Ok((ptr, _)) = entry.try_acquire_node() else {
-                            continue;
-                        };
-                        let child_removed = if child_span == RADIX as u128 {
-                            0
-                        } else {
-                            let child = unsafe { &*(ptr as *mut RangeRadixNode) };
-                            self.prune_node(child, child_span / RADIX as u128)
-                        };
-                        let remaining =
-                            entry.release_acquired_node(ptr, -(child_removed as i32) - 1);
-                        if remaining == 0 && entry.try_detach_empty_node(ptr) {
-                            node.summary.dirty.store(true, Ordering::Release);
-                            unsafe { free_child(ptr, child_span == RADIX as u128) };
-                            removed += 1;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        removed
-    }
-
-    fn prune_if_needed(&self) {
-        if self.needs_prune.swap(false, Ordering::AcqRel) {
-            self.root_occupancy.fetch_add(1, Ordering::AcqRel);
-            let removed = self.prune_node(&self.root, self.root_child_span());
-            self.root_occupancy.fetch_sub(removed + 1, Ordering::AcqRel);
-        }
+        (None, removed)
     }
 
     fn find_free_root(&self, start: u128, summarized: bool, needed: u64) -> Option<u64> {
-        let result = self.find_free(
+        self.find_free(
             &self.root,
             0,
             self.root_child_span(),
             start,
             summarized,
             needed,
-        );
-        self.prune_if_needed();
-        result
+        )
+        .0
     }
 
     fn find_allocated_root(&self, start: u128) -> Option<u64> {
-        let result = self.find_allocated(&self.root, 0, self.root_child_span(), start);
-        self.prune_if_needed();
-        result
+        self.find_allocated(&self.root, 0, self.root_child_span(), start)
+            .0
     }
 
     pub fn try_claim_auto(&self, count: u64, alignment: u64) -> Result<u64, SparseRangeRadixError> {
         if count == 0 || count > self.units || alignment == 0 || !alignment.is_power_of_two() {
             return Err(SparseRangeRadixError::OutOfRange);
         }
-        self.repair_node(&self.root, 0, self.root_child_span());
-        self.prune_if_needed();
+        if self.root.summary.dirty.load(Ordering::Acquire) {
+            self.repair_node(&self.root, 0, self.root_child_span());
+        }
         let mut summarized = true;
         let mut cursor = 0u128;
         loop {
@@ -906,16 +885,8 @@ impl Drop for SparseRangeRadix {
 
 unsafe fn free_descendants(node: &RangeRadixNode, child_span: u128) {
     for entry in &node.entries {
-        if let Ok((ptr, _)) = entry.try_acquire_node() {
-            if child_span != RADIX as u128 {
-                unsafe {
-                    free_descendants(&*(ptr as *mut RangeRadixNode), child_span / RADIX as u128);
-                }
-            }
-            entry.release_acquired_node(ptr, -1);
-            unsafe {
-                free_child(ptr, child_span == RADIX as u128);
-            }
+        if let RangeEntry::Node { ptr, .. } = entry.load() {
+            unsafe { free_tree(ptr, child_span) };
         }
     }
 }
