@@ -146,14 +146,18 @@ impl BlockDev {
                 return Err(error(DriverErrorKind::DeviceError)
                     .with_context("the FAT32 scratch read completed with an incorrect length"));
             }
-            let buffer = backing.create_to_device(0, backing.len()).map_err(|_| {
-                error(DriverErrorKind::InsufficientResources)
-                    .with_context("leasing the completed FAT32 read scratch buffer")
-            })?;
-            buffer.copy_to_slice(0, chunk).map_err(|_| {
-                error(DriverErrorKind::InvalidParameter)
-                    .with_context("copying the FAT32 read scratch buffer")
-            })?;
+            // SAFETY: Access to this BlockDev is serial. The exclusive self borrow
+            // prevents another request from using its private scratch memory.
+            // The read has completed, and dropping req releases any retained lease.
+            // No device access remains. The copy does not suspend execution.
+            // Both ranges are valid for len bytes and do not overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.scratch_memory as *const u8,
+                    chunk.as_mut_ptr(),
+                    len,
+                );
+            }
         }
         Ok(())
     }
