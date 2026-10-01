@@ -484,51 +484,6 @@ where
         Ok(())
     }
 
-    fn take_to_device_buffer_range<'buffer>(
-        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
-        offset: usize,
-        len: usize,
-    ) -> Result<
-        (
-            IoBuffer<'buffer, 'buffer, ToDevice>,
-            Option<IoBuffer<'buffer, 'buffer, ToDevice>>,
-        ),
-        CacheError<B::Error>,
-    > {
-        let end = offset.checked_add(len).ok_or(CacheError::OffsetOverflow)?;
-        if unlikely(end > buffer.len()) {
-            cold_path();
-            return Err(CacheError::InvalidConfig);
-        }
-
-        let range_and_tail = if offset == 0 {
-            buffer
-        } else {
-            match buffer.split_at(offset) {
-                Ok((prefix, range_and_tail)) => {
-                    drop(prefix);
-                    range_and_tail
-                }
-                Err((_buffer, err)) => {
-                    cold_path();
-                    return Err(CacheError::InvalidIoBuffer(err));
-                }
-            }
-        };
-
-        if len == range_and_tail.len() {
-            return Ok((range_and_tail, None));
-        }
-
-        match range_and_tail.split_at(len) {
-            Ok((range, tail)) => Ok((range, Some(tail))),
-            Err((_buffer, err)) => {
-                cold_path();
-                Err(CacheError::InvalidIoBuffer(err))
-            }
-        }
-    }
-
     fn check_open(&self) -> Result<(), CacheError<B::Error>> {
         if unlikely(self.closed.load(Ordering::Acquire)) {
             cold_path();
@@ -1045,7 +1000,8 @@ where
     async fn direct_write_at<'buffer>(
         &self,
         offset: u64,
-        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+        remaining: &mut Option<IoBuffer<'buffer, 'buffer, ToDevice>>,
+        buffer_offset: &mut usize,
         len: usize,
         owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
@@ -1053,15 +1009,16 @@ where
             cold_path();
             return Ok(());
         }
-        if unlikely(buffer.len() < len) {
+        let end = buffer_offset
+            .checked_add(len)
+            .ok_or(CacheError::OffsetOverflow)?;
+        if unlikely(remaining.as_ref().is_none_or(|buffer| buffer.len() < end)) {
             cold_path();
             return Err(CacheError::InvalidConfig);
         }
 
         let page = self.take_direct_page()?;
         let mut result = Ok(());
-        let mut remaining = Some(buffer);
-        let mut buffer_offset = 0usize;
         let mut written = 0usize;
         let mut cur_off = offset;
         let bs_u64 = Self::block_size_u64();
@@ -1075,31 +1032,48 @@ where
 
                 if direct_len != 0 {
                     let source = remaining.take().expect("direct write buffer disappeared");
-                    let (direct_buffer, tail) = match Self::take_to_device_buffer_range(
-                        source,
-                        buffer_offset,
-                        direct_len,
-                    ) {
-                        Ok(parts) => parts,
-                        Err(err) => {
+                    let source = if *buffer_offset == 0 {
+                        Some(source)
+                    } else {
+                        match source.split_at(*buffer_offset) {
+                            Ok((prefix, source)) => {
+                                drop(prefix);
+                                *buffer_offset = 0;
+                                Some(source)
+                            }
+                            Err((source, _)) => {
+                                *remaining = Some(source);
+                                None
+                            }
+                        }
+                    };
+                    let direct_buffer = match source {
+                        Some(source) if source.len() == direct_len => Some(source),
+                        Some(source) => match source.split_at(direct_len) {
+                            Ok((direct_buffer, tail)) => {
+                                *remaining = Some(tail);
+                                Some(direct_buffer)
+                            }
+                            Err((source, _)) => {
+                                *remaining = Some(source);
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    if let Some(direct_buffer) = direct_buffer {
+                        if let Err(err) = self
+                            .write_buffer_to_backend(cur_off, direct_buffer, owner)
+                            .await
+                        {
                             result = Err(err);
                             break;
                         }
-                    };
-
-                    if let Err(err) = self
-                        .write_buffer_to_backend(cur_off, direct_buffer, owner)
-                        .await
-                    {
-                        result = Err(err);
-                        break;
+                        *buffer_offset = 0;
+                        written += direct_len;
+                        cur_off += direct_len as u64;
+                        continue;
                     }
-
-                    remaining = tail;
-                    buffer_offset = 0;
-                    written += direct_len;
-                    cur_off += direct_len as u64;
-                    continue;
                 }
             }
 
@@ -1123,7 +1097,7 @@ where
                 if let Err(err) = remaining
                     .as_ref()
                     .expect("direct write buffer disappeared")
-                    .copy_to_slice(buffer_offset, destination)
+                    .copy_to_slice(*buffer_offset, destination)
                 {
                     result = Err(CacheError::InvalidIoBuffer(err));
                     break;
@@ -1135,7 +1109,7 @@ where
                 break;
             }
 
-            buffer_offset += take;
+            *buffer_offset += take;
             written += take;
             cur_off += take as u64;
         }
@@ -2077,15 +2051,16 @@ where
                     let direct_len =
                         Self::direct_write_miss_len(cache, cur_off, len - written).await?;
 
-                    let source = remaining.take().expect("write buffer disappeared");
-                    let (direct_buffer, tail) =
-                        Self::take_to_device_buffer_range(source, buffer_offset, direct_len)?;
                     cache
-                        .direct_write_at(cur_off, direct_buffer, direct_len, owner)
+                        .direct_write_at(
+                            cur_off,
+                            &mut remaining,
+                            &mut buffer_offset,
+                            direct_len,
+                            owner,
+                        )
                         .await?;
 
-                    remaining = tail;
-                    buffer_offset = 0;
                     written += direct_len;
                     cur_off += direct_len as u64;
                     continue;

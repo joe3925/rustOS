@@ -1,14 +1,17 @@
 use core::cmp::min;
 use core::hint::{cold_path, unlikely};
 
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, IoKind, Read, ReadIoBuffer, Seek, SeekFrom, Write, WriteIoBuffer};
 use kernel_api::error::{DriverErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::{
     kernel_types::{
         async_ffi::{AbiFuture, FutureExt},
-        dma::{FromDevice, IoBuffer, IoBufferAccess, ToDevice},
+        dma::{
+            FromDevice, IoBuffer, IoBufferAccess, IoBufferBacking, IoBufferBackingConfig,
+            IoBufferBackingDesc, ToDevice,
+        },
         io::IoTarget,
     },
     pnp::io,
@@ -46,6 +49,8 @@ pub struct BlockDev {
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
+    scratch_backing: Option<IoBufferBacking<'static>>,
+    scratch_memory: usize,
     pub(crate) should_flush: Arc<AtomicBool>,
     pub(crate) current_owner: Arc<AtomicU64>,
 }
@@ -75,15 +80,36 @@ impl BlockDev {
         total_sectors: u64,
         should_flush: Arc<AtomicBool>,
         current_owner: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, KernelError> {
+        let scratch_memory = Box::into_raw(Box::new([0u8; 512]));
+        let scratch_slice =
+            unsafe { core::slice::from_raw_parts_mut(scratch_memory.cast::<u8>(), 512) };
+        let scratch_backing = match IoBufferBacking::new(
+            IoBufferBackingDesc::SliceMut(scratch_slice),
+            IoBufferBackingConfig {
+                lease_capacity: 1,
+                ..IoBufferBackingConfig::default()
+            },
+        ) {
+            Ok(backing) => backing,
+            Err(_) => {
+                unsafe {
+                    drop(Box::from_raw(scratch_memory));
+                }
+                return Err(error(DriverErrorKind::InsufficientResources)
+                    .with_context("creating the FAT32 scratch backing"));
+            }
+        };
+        Ok(Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
+            scratch_backing: Some(scratch_backing),
+            scratch_memory: scratch_memory as usize,
             should_flush,
             current_owner,
-        }
+        })
     }
 
     #[inline]
@@ -97,17 +123,39 @@ impl BlockDev {
         dst: &mut [u8],
         _kind: IoKind,
     ) -> Result<(), KernelError> {
-        let volume = self.volume.clone();
-        let len = dst.len();
-        let buffer = unsafe { IoBuffer::from_virt_from_device(dst.as_mut_ptr() as usize, len) };
-
-        let mut req = ReadRequest::new(offset, len, false, Some(buffer));
-
-        let result = io::send_down_stack(volume, &mut req).await;
-
-        result.map(|_| ()).with_context(|| {
-            alloc::format!("reading FAT32 volume at offset {offset} for {len} bytes")
-        })
+        let backing = self
+            .scratch_backing
+            .as_ref()
+            .expect("FAT32 scratch backing is present");
+        for (index, chunk) in dst.chunks_mut(backing.len()).enumerate() {
+            let len = chunk.len();
+            let offset = offset + (index * backing.len()) as u64;
+            let buffer = backing.create_from_device(0, backing.len()).map_err(|_| {
+                error(DriverErrorKind::InsufficientResources)
+                    .with_context("leasing the FAT32 read scratch buffer")
+            })?;
+            let mut req = ReadRequest::new(offset, len, false, Some(buffer));
+            io::send_down_stack(self.volume.clone(), &mut req)
+                .await
+                .with_context(|| {
+                    alloc::format!("reading FAT32 volume at offset {offset} for {len} bytes")
+                })?;
+            let completed = req.len;
+            drop(req);
+            if completed != len {
+                return Err(error(DriverErrorKind::DeviceError)
+                    .with_context("the FAT32 scratch read completed with an incorrect length"));
+            }
+            let buffer = backing.create_to_device(0, backing.len()).map_err(|_| {
+                error(DriverErrorKind::InsufficientResources)
+                    .with_context("leasing the completed FAT32 read scratch buffer")
+            })?;
+            buffer.copy_to_slice(0, chunk).map_err(|_| {
+                error(DriverErrorKind::InvalidParameter)
+                    .with_context("copying the FAT32 read scratch buffer")
+            })?;
+        }
+        Ok(())
     }
 
     async fn send_read_iobuffer<'buffer>(
@@ -130,26 +178,46 @@ impl BlockDev {
         src: &[u8],
         _kind: IoKind,
     ) -> Result<(), KernelError> {
-        let no_buffer = false;
-
-        let volume = self.volume.clone();
-        let len = src.len();
-
-        let buffer = unsafe { IoBuffer::from_virt_to_device(src.as_ptr() as usize, len) };
-
-        let mut req = WriteRequest::new(
-            offset,
-            len,
-            no_buffer,
-            self.current_owner.load(Ordering::Acquire),
-            Some(buffer),
-        );
-
-        let result = io::send_down_stack(volume, &mut req).await;
-
-        result.map(|_| ()).with_context(|| {
-            alloc::format!("writing FAT32 volume at offset {offset} for {len} bytes")
-        })
+        let backing = self
+            .scratch_backing
+            .as_ref()
+            .expect("FAT32 scratch backing is present");
+        for (index, chunk) in src.chunks(backing.len()).enumerate() {
+            let len = chunk.len();
+            let offset = offset + (index * backing.len()) as u64;
+            let mut edit = backing
+                .create_bidirectional(0, backing.len())
+                .map_err(|_| {
+                    error(DriverErrorKind::InsufficientResources)
+                        .with_context("leasing the FAT32 write scratch buffer")
+                })?;
+            edit.copy_from_slice(0, chunk).map_err(|_| {
+                error(DriverErrorKind::InvalidParameter)
+                    .with_context("copying the FAT32 write scratch buffer")
+            })?;
+            drop(edit);
+            let buffer = backing.create_to_device(0, backing.len()).map_err(|_| {
+                error(DriverErrorKind::InsufficientResources)
+                    .with_context("leasing the prepared FAT32 write scratch buffer")
+            })?;
+            let mut req = WriteRequest::new(
+                offset,
+                len,
+                false,
+                self.current_owner.load(Ordering::Acquire),
+                Some(buffer),
+            );
+            io::send_down_stack(self.volume.clone(), &mut req)
+                .await
+                .with_context(|| {
+                    alloc::format!("writing FAT32 volume at offset {offset} for {len} bytes")
+                })?;
+            if req.len != len {
+                return Err(error(DriverErrorKind::DeviceError)
+                    .with_context("the FAT32 scratch write completed with an incorrect length"));
+            }
+        }
+        Ok(())
     }
 
     async fn send_write_iobuffer<'buffer>(
@@ -213,6 +281,15 @@ impl BlockDev {
         self.pos += len as u64;
 
         Ok(len)
+    }
+}
+
+impl Drop for BlockDev {
+    fn drop(&mut self) {
+        drop(self.scratch_backing.take());
+        unsafe {
+            drop(Box::from_raw(self.scratch_memory as *mut [u8; 512]));
+        }
     }
 }
 
