@@ -10,6 +10,7 @@ use kernel_types::benchmark::{
 use serde_json::json;
 use spin::{Mutex, Once};
 
+#[cfg(feature = "kernel-bench")]
 use super::{boot_state, suites};
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -35,12 +36,12 @@ fn runs() -> &'static Mutex<BTreeMap<u32, RunState>> {
 }
 
 fn emit(kind: &str, payload: serde_json::Value) {
-    let record = alloc::format!(
-        "RUSTOS_BENCH\t{}\t{}\t{}\n",
-        PROTOCOL_VERSION,
-        kind,
-        payload
-    );
+    let prefix = if cfg!(feature = "kernel-correctness") {
+        "RUSTOS_CORRECTNESS"
+    } else {
+        "RUSTOS_BENCH"
+    };
+    let record = alloc::format!("{}\t{}\t{}\t{}\n", prefix, PROTOCOL_VERSION, kind, payload);
     crate::console::_print_atomic(&record);
 }
 
@@ -68,7 +69,16 @@ pub fn register_suite(descriptor: BenchSuiteDescriptor) -> bool {
 }
 
 pub fn register_builtin_suites() {
-    for descriptor in suites::descriptors() {
+    #[cfg(feature = "kernel-correctness")]
+    let descriptors = alloc::vec![BenchSuiteDescriptor::new(
+        "executor.runtime",
+        "Executor checksum correctness",
+        alloc::vec!["ci".to_string(), "executor".to_string()],
+        super::correctness::executor_suite,
+    )];
+    #[cfg(not(feature = "kernel-correctness"))]
+    let descriptors = suites::descriptors();
+    for descriptor in descriptors {
         assert!(
             register_suite(descriptor),
             "duplicate or invalid built-in benchmark suite"
@@ -217,14 +227,17 @@ async fn run_selected_suites_for_repetition(
             "suite_count": selected.len(),
             "cpu_count": crate::platform::processor_count(),
             "repetition": repetition,
-            "suites": selected.iter().map(|suite| json!({
-                "name": suite.name,
-                "independent_boots": suite.independent_boots,
-            })).collect::<Vec<_>>(),
+            "suites": selected.iter().map(|suite| {
+                if cfg!(feature = "kernel-correctness") {
+                    json!({ "name": suite.name })
+                } else {
+                    json!({ "name": suite.name, "independent_boots": suite.independent_boots })
+                }
+            }).collect::<Vec<_>>(),
         }),
     );
 
-    let mut passed = true;
+    let mut passed = !selected.is_empty();
     for suite in selected {
         let handle = BenchRunHandle(NEXT_RUN.fetch_add(1, Ordering::Relaxed));
         runs().lock().insert(
@@ -253,9 +266,12 @@ async fn run_selected_suites_for_repetition(
         );
     }
 
+    #[cfg(feature = "kernel-bench")]
     if persist_repetition {
         passed &= boot_state::persist_next_repetition(repetition).await;
     }
+    #[cfg(not(feature = "kernel-bench"))]
+    let _ = persist_repetition;
 
     emit(
         "run_end",
@@ -269,18 +285,33 @@ pub async fn run_selected_suites(names: &[String], tags: &[String]) -> bool {
 }
 
 pub async fn run_configured_suites() -> bool {
-    let names = option_env!("RUSTOS_BENCH_SUITES")
-        .unwrap_or("")
-        .split(',')
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let tags = option_env!("RUSTOS_BENCH_TAGS")
-        .unwrap_or("")
-        .split(',')
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let repetition = boot_state::current_repetition().await;
-    run_selected_suites_for_repetition(&names, &tags, repetition, true).await
+    let names = if cfg!(feature = "kernel-correctness") {
+        option_env!("RUSTOS_CORRECTNESS_SUITES")
+    } else {
+        option_env!("RUSTOS_BENCH_SUITES")
+    }
+    .unwrap_or("")
+    .split(',')
+    .filter(|value| !value.is_empty())
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    let tags = if cfg!(feature = "kernel-correctness") {
+        option_env!("RUSTOS_CORRECTNESS_TAGS")
+    } else {
+        option_env!("RUSTOS_BENCH_TAGS")
+    }
+    .unwrap_or("")
+    .split(',')
+    .filter(|value| !value.is_empty())
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    #[cfg(feature = "kernel-correctness")]
+    {
+        run_selected_suites_for_repetition(&names, &tags, 1, false).await
+    }
+    #[cfg(not(feature = "kernel-correctness"))]
+    {
+        let repetition = boot_state::current_repetition().await;
+        run_selected_suites_for_repetition(&names, &tags, repetition, true).await
+    }
 }

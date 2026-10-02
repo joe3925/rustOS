@@ -6,11 +6,17 @@
 
 #[cfg(feature = "kernel-bench")]
 mod boot_state;
+#[cfg(all(feature = "kernel-bench", feature = "kernel-correctness"))]
+compile_error!("kernel-bench and kernel-correctness require separate builds");
 mod capture;
-#[cfg(feature = "kernel-bench")]
+#[cfg(feature = "kernel-correctness")]
+mod correctness;
+#[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod runner;
 #[cfg(feature = "kernel-bench")]
 mod suites;
+#[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
+mod task_batch;
 
 pub use capture::{
     BENCH_ENABLED, BenchSpanGuard, BenchWindow, bench_c_drive_io_async, bench_log_span_end,
@@ -18,13 +24,13 @@ pub use capture::{
     bench_submit_rip_sample_current_core, used_memory,
 };
 
-#[cfg(feature = "kernel-bench")]
+#[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 pub use runner::{
     bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_tolerance,
     register_builtin_suites, register_suite, run_configured_suites, run_selected_suites,
 };
 
-#[cfg(feature = "kernel-bench")]
+#[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 pub fn exit_benchmark_vm(success: bool) -> ! {
     #[cfg(target_arch = "x86_64")]
     unsafe {

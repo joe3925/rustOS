@@ -339,9 +339,9 @@ impl Cli {
                     },
                 })
             }
-            Some("bench") => {
-                args.next();
-                bench::parse(args).map(|command| Self {
+            Some("bench" | "correctness") => {
+                let correctness = args.next().as_deref() == Some("correctness");
+                bench::parse(args, correctness).map(|command| Self {
                     command: CliCommand::Bench(command),
                 })
             }
@@ -394,6 +394,7 @@ fn usage() -> String {
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta]",
         "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
+        "  cargo run -p xtask -- correctness [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE]",
         "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
         "",
         "environment:",

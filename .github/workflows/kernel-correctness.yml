@@ -1,0 +1,109 @@
+name: Kernel correctness
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: [self-hosted, linux, x64, rustos-bench]
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out proposed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Enable KVM access
+        shell: bash
+        run: |
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+
+      - name: Verify correctness host
+        shell: bash
+        run: |
+          qemu-system-x86_64 --version
+          if [[ ! -c /dev/kvm || ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo "::error::The runner account must have read and write access to /dev/kvm."
+            exit 1
+          fi
+          printf 'quit\n' | timeout 15s qemu-system-x86_64 \
+            -machine q35,kernel-irqchip=on \
+            -accel kvm \
+            -cpu host \
+            -smp 4 \
+            -m 128M \
+            -device amd-iommu,intremap=off \
+            -display none -serial none -monitor stdio -S
+          sgdisk --version
+          dpkg-query --show --showformat='dosfstools ${Version}\n' dosfstools
+          clang --version
+          gh --version
+          jq --version
+          rustc --version
+          cargo --version
+
+      - name: Create C drive seed image
+        shell: bash
+        run: |
+          image="$RUNNER_TEMP/rustos-ci-seed.img"
+          mount_dir="$RUNNER_TEMP/rustos-ci-mount"
+          loop_device=""
+
+          cleanup() {
+            if mountpoint -q "$mount_dir"; then
+              sudo umount "$mount_dir"
+            fi
+            if [[ -n "$loop_device" ]]; then
+              sudo losetup --detach "$loop_device"
+            fi
+          }
+          trap cleanup EXIT
+
+          truncate -s 2G "$image"
+          sgdisk --new=1:2048:0 --typecode=1:0700 --change-name=1:rustOS "$image"
+
+          loop_device="$(sudo losetup --find --show --partscan "$image")"
+          partition="${loop_device}p1"
+          for _ in {1..10}; do
+            [[ -b "$partition" ]] && break
+            sleep 0.2
+          done
+          [[ -b "$partition" ]]
+
+          sudo mkfs.vfat -F 32 -n RUSTOS "$partition"
+          mkdir -p "$mount_dir"
+          sudo mount "$partition" "$mount_dir"
+          sudo mkdir -p \
+            "$mount_dir/system/registry" \
+            "$mount_dir/system/toml" \
+            "$mount_dir/system/mod"
+          sync
+
+          cleanup
+          trap - EXIT
+
+
+      - name: Run correctness at 1, 2, and 4 vCPUs
+        env:
+          RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
+          RUSTOS_DISK_FORMAT: raw
+        run: cargo run --release -p xtask -- correctness --cpus 1,2,4
+
+      - name: Upload correctness results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-correctness
+          path: |
+            target/correctness/**/*.json
+            target/correctness/**/*.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [features]
 kernel-bench = []
+kernel-correctness = ["kernel-self-tests"]
 kernel-self-tests = []
 boot-timings = []
 

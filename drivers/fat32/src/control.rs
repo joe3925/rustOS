@@ -91,13 +91,16 @@ extern "C" fn fat32_probe(
         };
         let should_flush = Arc::new(AtomicBool::new(false));
         let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
-        let mut probe_block = BlockDev::new(
+        let mut probe_block = match BlockDev::new(
             context.lower_target.clone(),
             sector_size,
             sectors,
             should_flush.clone(),
             current_owner.clone(),
-        );
+        ) {
+            Ok(block) => block,
+            Err(err) => return ProbeOutcome::Error(err),
+        };
         let mut boot_sector = [0_u8; 512];
         if let Err(probe_error) = probe_block
             .read_exact(&mut boot_sector, IoKind::Metadata)
@@ -121,13 +124,16 @@ extern "C" fn fat32_probe(
         if !fat32_signature {
             return ProbeOutcome::NoMatch;
         }
-        let block = BlockDev::new(
+        let block = match BlockDev::new(
             context.lower_target,
             sector_size,
             sectors,
             should_flush,
             current_owner,
-        );
+        ) {
+            Ok(block) => block,
+            Err(err) => return ProbeOutcome::Error(err),
+        };
         match FileSystem::new(
             block,
             FsOptions::new().update_accessed_date(false).strict(false),
@@ -190,7 +196,7 @@ async fn fat32_start(
         sectors,
         should_flush.clone(),
         current_owner.clone(),
-    );
+    )?;
     let filesystem = match FileSystem::new(
         block,
         FsOptions::new().update_accessed_date(false).strict(false),
