@@ -2,13 +2,13 @@ use crate::scheduling::domain::{
     CpuSet, Domain, DomainOps, EnqueueReason, KERNEL_DOMAIN_ID, SchedulerClass, SwitchOutOutcome,
     TaskSchedBinding,
 };
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::{RunQueueAccess, SCHEDULER};
 use crate::scheduling::state::SchedState;
-use crate::scheduling::task::TaskHandle;
+use crate::scheduling::task::{TaskHandle, TaskUpdate};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
+use kernel_types::bounded_mpmc::BoundedMpmcQueue;
 use spin::Mutex;
 
 pub const RUNQ_CAP: usize = 4096;
@@ -35,12 +35,6 @@ pub(crate) fn fifo_task_sched_binding(priority: FifoPriority) -> TaskSchedBindin
     TaskSchedBinding::new(KERNEL_DOMAIN_ID, FifoTaskState::new(priority))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InboundDrain {
-    Available,
-    Contended,
-}
-
 pub struct FifoClass {
     last_balance_tick: AtomicUsize,
     balance_lock: Mutex<()>,
@@ -56,14 +50,16 @@ impl FifoClass {
 }
 
 pub struct FifoCpuState {
-    pub run_queue: BoundedMpmcQueue<TaskHandle>,
-    pub inbound_queue: BoundedMpmcQueue<TaskHandle>,
-    pub load: AtomicUsize,
+    cpu_id: usize,
+    run_queue: BoundedMpmcQueue<TaskHandle>,
+    inbound_queue: BoundedMpmcQueue<TaskHandle>,
+    load: AtomicUsize,
 }
 
 impl FifoCpuState {
-    fn new() -> Self {
+    fn new(cpu_id: usize) -> Self {
         Self {
+            cpu_id,
             run_queue: BoundedMpmcQueue::new(RUNQ_CAP),
             inbound_queue: BoundedMpmcQueue::new(RUNQ_CAP),
             load: AtomicUsize::new(0),
@@ -73,8 +69,8 @@ impl FifoCpuState {
 
 pub fn build_fifo_domain(name: &'static str, cpus: CpuSet, cpu_count: usize) -> Box<dyn DomainOps> {
     let mut per_cpu = Vec::with_capacity(cpu_count);
-    for _ in 0..cpu_count {
-        per_cpu.push(Some(FifoCpuState::new()));
+    for cpu_id in 0..cpu_count {
+        per_cpu.push(Some(FifoCpuState::new(cpu_id)));
     }
 
     Box::new(Domain::new(
@@ -85,138 +81,65 @@ pub fn build_fifo_domain(name: &'static str, cpus: CpuSet, cpu_count: usize) -> 
     ))
 }
 
-#[inline(always)]
-fn reserve_queue_load_or_panic(cpu: usize, load: &AtomicUsize, queue_name: &str) {
-    if load
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
-        .is_err()
-    {
-        panic!("{queue_name} load overflow on cpu {cpu}");
-    }
-}
-
-#[inline(always)]
-fn push_runqueue_or_panic(cpu: usize, cpu_state: &FifoCpuState, task: TaskHandle) {
-    reserve_queue_load_or_panic(cpu, &cpu_state.load, "run queue");
-
-    if cpu_state.run_queue.try_push(task).is_err() {
-        cpu_state.load.fetch_sub(1, Ordering::Release);
-        panic!("run queue overflow on cpu {cpu}");
-    }
-}
-
-fn enqueue_inbound(cpu: usize, cpu_state: &FifoCpuState, task: TaskHandle) {
-    reserve_queue_load_or_panic(cpu, &cpu_state.load, "inbound queue");
-
-    if cpu_state.inbound_queue.try_push(task).is_err() {
+fn enqueue_inbound(cpu: usize, cpu_state: &FifoCpuState, task: &mut TaskUpdate) {
+    assert_eq!(cpu, cpu_state.cpu_id);
+    cpu_state.load.fetch_add(1, Ordering::AcqRel);
+    if cpu_state.inbound_queue.try_push((**task).clone()).is_err() {
         cpu_state.load.fetch_sub(1, Ordering::Release);
         panic!("inbound queue overflow on cpu {}", cpu);
     }
+    task.set_target_cpu(cpu);
+    task.notify_after_update(cpu);
 }
 
-fn drain_inbound_to_runqueue(cpu_id: usize, cpu: &FifoCpuState) -> InboundDrain {
-    loop {
-        if cpu.run_queue.len() >= RUNQ_CAP {
-            return InboundDrain::Available;
-        }
-
+fn drain_inbound_to_runqueue(access: &RunQueueAccess<'_>, cpu: &FifoCpuState) {
+    assert_eq!(access.cpu_id(), cpu.cpu_id);
+    let available = RUNQ_CAP - cpu.run_queue.len();
+    for _ in 0..available {
         let Ok(task) = cpu.inbound_queue.try_pop_wait_free() else {
-            return InboundDrain::Available;
-        };
-
-        match cpu.run_queue.try_push(task) {
-            Ok(()) => {}
-            Err(BoundedMpmcPushError::Full(task)) => {
-                if cpu.inbound_queue.try_push(task).is_err() {
-                    panic!("failed to restore inbound task on cpu {}", cpu_id);
-                }
-
-                return InboundDrain::Available;
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[inline(always)]
-fn pop_queued_task(cpu: &FifoCpuState, inbound_drain: InboundDrain) -> Option<TaskHandle> {
-    let queued = cpu.run_queue.len();
-
-    for _ in 0..queued {
-        let Ok(task) = cpu.run_queue.try_pop_wait_free() else {
             break;
         };
-        let priority = task.with_class_state(|state: &FifoTaskState| state.priority);
-
-        if priority != FifoPriority::Low {
-            cpu.load.fetch_sub(1, Ordering::Release);
-            return Some(task);
-        }
-
         if cpu.run_queue.try_push(task).is_err() {
-            panic!("run queue rotation overflow");
+            panic!("run queue overflow on cpu {}", cpu.cpu_id);
         }
-    }
-
-    if queued != 0 {
-        if let Ok(task) = cpu.run_queue.try_pop_wait_free() {
-            cpu.load.fetch_sub(1, Ordering::Release);
-            return Some(task);
-        }
-    }
-
-    if inbound_drain == InboundDrain::Contended {
-        return None;
-    }
-
-    if let Ok(task) = cpu.inbound_queue.try_pop_wait_free() {
-        cpu.load.fetch_sub(1, Ordering::Release);
-        Some(task)
-    } else {
-        None
     }
 }
 
-fn steal_youngest_runnable(src_cpu_id: usize, src_cpu: &FifoCpuState) -> Option<TaskHandle> {
-    SCHEDULER.with_core_sched_lock(src_cpu_id, || {
-        loop {
-            let len = src_cpu.run_queue.len();
-
-            if len == 0 {
-                return None;
-            }
-
-            let mut rotated = 0usize;
-
-            while rotated + 1 < len {
-                let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
-                    return None;
-                };
-
-                if src_cpu.run_queue.try_push(task).is_err() {
-                    panic!("run queue rotation overflow on cpu {}", src_cpu_id);
-                }
-
-                rotated += 1;
-            }
-
-            let Ok(task) = src_cpu.run_queue.try_pop_wait_free() else {
+fn pop_queued_task(
+    access: &RunQueueAccess<'_>,
+    cpu: &FifoCpuState,
+    youngest: bool,
+) -> Option<TaskUpdate> {
+    assert_eq!(access.cpu_id(), cpu.cpu_id);
+    let queued = cpu.run_queue.len();
+    if youngest {
+        for _ in 1..queued {
+            let Ok(task) = cpu.run_queue.try_pop_wait_free() else {
                 return None;
             };
-
-            src_cpu.load.fetch_sub(1, Ordering::Release);
-
-            match task.sched_state() {
-                SchedState::Terminated => {
-                    SCHEDULER.unregister_task_from_domain(&task);
-                }
-                SchedState::Parking | SchedState::Blocked => {}
-                SchedState::Runnable | SchedState::Running => {
-                    return Some(task);
-                }
+            if cpu.run_queue.try_push(task).is_err() {
+                panic!("run queue rotation overflow");
             }
         }
-    })?
+    }
+    for allow_low in [false, true] {
+        for _ in 0..queued {
+            let Ok(task) = cpu.run_queue.try_pop_wait_free() else {
+                return None;
+            };
+            if let Some(update) = task.try_update() {
+                let priority = update.with_class_state(|state: &FifoTaskState| state.priority);
+                if allow_low || priority != FifoPriority::Low {
+                    cpu.load.fetch_sub(1, Ordering::Release);
+                    return Some(update);
+                }
+            }
+            if cpu.run_queue.try_push(task).is_err() {
+                panic!("run queue rotation overflow");
+            }
+        }
+    }
+    None
 }
 
 impl SchedulerClass for FifoClass {
@@ -227,16 +150,10 @@ impl SchedulerClass for FifoClass {
         &self,
         cpu_id: usize,
         cpu: &Self::CpuState,
-        task: TaskHandle,
-        _task_state: &Self::TaskState,
-        reason: EnqueueReason,
+        task: &mut TaskUpdate,
+        _reason: EnqueueReason,
     ) {
-        match reason {
-            EnqueueReason::Preempted | EnqueueReason::Yielded | EnqueueReason::Migrated => {
-                push_runqueue_or_panic(cpu_id, cpu, task);
-            }
-            EnqueueReason::New | EnqueueReason::Wakeup => enqueue_inbound(cpu_id, cpu, task),
-        }
+        enqueue_inbound(cpu_id, cpu, task);
     }
     fn select_cpu(
         &self,
@@ -251,9 +168,7 @@ impl SchedulerClass for FifoClass {
 
         if matches!(
             reason,
-            EnqueueReason::Preempted
-                | EnqueueReason::Yielded
-                | EnqueueReason::Migrated
+            EnqueueReason::Preempted | EnqueueReason::Yielded | EnqueueReason::Migrated
         ) {
             if hint_cpu < n
                 && cpus.contains(hint_cpu)
@@ -295,32 +210,24 @@ impl SchedulerClass for FifoClass {
     }
     fn pick_next(
         &self,
-        cpu_id: usize,
+        access: &RunQueueAccess<'_>,
         cpu: &Self::CpuState,
         _now_cycles: u64,
-    ) -> Option<TaskHandle> {
-        let inbound_drain = drain_inbound_to_runqueue(cpu_id, cpu);
-        pop_queued_task(cpu, inbound_drain)
+    ) -> Option<TaskUpdate> {
+        drain_inbound_to_runqueue(access, cpu);
+        pop_queued_task(access, cpu, false)
     }
 
     fn on_switch_out(
         &self,
         cpu_id: usize,
         cpu: &Self::CpuState,
-        task: &TaskHandle,
-        task_state: &Self::TaskState,
+        task: &mut TaskUpdate,
         _now_cycles: u64,
         outcome: SwitchOutOutcome,
     ) {
         if outcome == SwitchOutOutcome::StillRunnable {
-            drain_inbound_to_runqueue(cpu_id, cpu);
-            self.enqueue(
-                cpu_id,
-                cpu,
-                task.clone(),
-                task_state,
-                EnqueueReason::Preempted,
-            );
+            self.enqueue(cpu_id, cpu, task, EnqueueReason::Preempted);
         }
     }
 
@@ -340,11 +247,23 @@ impl SchedulerClass for FifoClass {
         src_cpu: &Self::CpuState,
         _dst_cpu_id: usize,
         _dst_cpu: &Self::CpuState,
-    ) -> Option<TaskHandle> {
-        steal_youngest_runnable(src_cpu_id, src_cpu)
+    ) -> Option<TaskUpdate> {
+        let access = SCHEDULER.try_core_scheduler(src_cpu_id)?;
+        drain_inbound_to_runqueue(&access, src_cpu);
+        for _ in 0..src_cpu.run_queue.len() {
+            let task = pop_queued_task(&access, src_cpu, true)?;
+            match task.sched_state() {
+                SchedState::Runnable => return Some(task),
+                SchedState::Terminated => SCHEDULER.unregister_task_from_domain(&task),
+                SchedState::Running | SchedState::Parking | SchedState::Blocked => {
+                    panic!("non-runnable task in run queue");
+                }
+            }
+        }
+        None
     }
 
-    fn on_task_exit(&self, _task: &TaskHandle, _task_state: &Self::TaskState) {}
+    fn on_task_exit(&self, _task: &TaskUpdate) {}
 
     fn should_preempt(&self, _task: &TaskHandle, task_state: &Self::TaskState) -> bool {
         task_state.priority != FifoPriority::Realtime
@@ -368,13 +287,7 @@ impl SchedulerClass for FifoClass {
             return;
         }
 
-        for i in 0..n {
-            if let Some(Some(cpu)) = per_cpu.get(i) {
-                drain_inbound_to_runqueue(i, cpu);
-            }
-        }
-
-        loop {
+        for _ in 0..RUNQ_CAP {
             let mut min_idx = 0;
             let mut min_load = usize::MAX;
 
@@ -406,7 +319,7 @@ impl SchedulerClass for FifoClass {
                     continue;
                 };
 
-                let stealable = cpu.run_queue.len();
+                let stealable = cpu.load.load(Ordering::Acquire);
 
                 if stealable > max_stealable {
                     max_stealable = stealable;
@@ -431,13 +344,11 @@ impl SchedulerClass for FifoClass {
                 break;
             };
 
-            let Some(task) = self.steal_one(max_idx, max_cpu, min_idx, min_cpu) else {
+            let Some(mut task) = self.steal_one(max_idx, max_cpu, min_idx, min_cpu) else {
                 break;
             };
 
-            push_runqueue_or_panic(min_idx, min_cpu, task);
-            SCHEDULER.kick_remote_core(min_idx);
+            enqueue_inbound(min_idx, min_cpu, &mut task);
         }
     }
 }
-

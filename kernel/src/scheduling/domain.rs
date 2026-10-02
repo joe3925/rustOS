@@ -1,4 +1,8 @@
-use crate::{platform::MAX_CPUS, scheduling::task::TaskHandle};
+use crate::scheduling::scheduler::RunQueueAccess;
+use crate::{
+    platform::MAX_CPUS,
+    scheduling::task::{TaskHandle, TaskUpdate},
+};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
@@ -94,19 +98,19 @@ pub trait DomainOps: Send + Sync {
     fn name(&self) -> &'static str;
     fn contains_cpu(&self, cpu_id: usize) -> bool;
 
-    fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize;
+    fn enqueue(&self, task: &mut TaskUpdate, reason: EnqueueReason, hint_cpu: usize) -> usize;
 
     fn on_switch_out(
         &self,
-        task: &TaskHandle,
+        task: &mut TaskUpdate,
         cpu_id: usize,
         now_cycles: u64,
         outcome: SwitchOutOutcome,
     );
 
-    fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle>;
+    fn pick_next(&self, access: &RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate>;
 
-    fn should_preempt(&self, task: &TaskHandle) -> bool;
+    fn should_preempt(&self, task: &TaskUpdate) -> bool;
 
     fn maybe_balance(&self, now_tick: usize);
 }
@@ -129,20 +133,22 @@ pub trait SchedulerClass: Send + Sync + 'static {
         &self,
         cpu_id: usize,
         cpu: &Self::CpuState,
-        task: TaskHandle,
-        task_state: &Self::TaskState,
+        task: &mut TaskUpdate,
         reason: EnqueueReason,
     );
 
-    fn pick_next(&self, cpu_id: usize, cpu: &Self::CpuState, now_cycles: u64)
-    -> Option<TaskHandle>;
+    fn pick_next(
+        &self,
+        access: &RunQueueAccess<'_>,
+        cpu: &Self::CpuState,
+        now_cycles: u64,
+    ) -> Option<TaskUpdate>;
 
     fn on_switch_out(
         &self,
         cpu_id: usize,
         cpu: &Self::CpuState,
-        task: &TaskHandle,
-        task_state: &Self::TaskState,
+        task: &mut TaskUpdate,
         now_cycles: u64,
         outcome: SwitchOutOutcome,
     );
@@ -155,9 +161,9 @@ pub trait SchedulerClass: Send + Sync + 'static {
         src_cpu: &Self::CpuState,
         dst_cpu_id: usize,
         dst_cpu: &Self::CpuState,
-    ) -> Option<TaskHandle>;
+    ) -> Option<TaskUpdate>;
 
-    fn on_task_exit(&self, task: &TaskHandle, task_state: &Self::TaskState);
+    fn on_task_exit(&self, task: &TaskUpdate);
 
     fn should_preempt(&self, _task: &TaskHandle, _task_state: &Self::TaskState) -> bool {
         true
@@ -208,10 +214,9 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
         self.cpus.contains(cpu_id)
     }
 
-    fn enqueue(&self, task: TaskHandle, reason: EnqueueReason, hint_cpu: usize) -> usize {
-        task.with_class_state(|task_state: &C::TaskState| {
-            let cpu_id = self
-                .class
+    fn enqueue(&self, task: &mut TaskUpdate, reason: EnqueueReason, hint_cpu: usize) -> usize {
+        let cpu_id = task.with_class_state(|task_state: &C::TaskState| {
+            self.class
                 .select_cpu(
                     &self.per_cpu,
                     &self.cpus,
@@ -220,49 +225,36 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
                     reason,
                     hint_cpu,
                 )
-                .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name));
-
-            task.set_target_cpu(cpu_id);
-            self.class.enqueue(
-                cpu_id,
-                self.cpu_state(cpu_id),
-                task.clone(),
-                task_state,
-                reason,
-            );
-            cpu_id
-        })
+                .unwrap_or_else(|| panic!("domain {} has no eligible cpu", self.name))
+        });
+        task.set_target_cpu(cpu_id);
+        self.class
+            .enqueue(cpu_id, self.cpu_state(cpu_id), task, reason);
+        task.notify_after_update(cpu_id);
+        cpu_id
     }
 
     fn on_switch_out(
         &self,
-        task: &TaskHandle,
+        task: &mut TaskUpdate,
         cpu_id: usize,
         now_cycles: u64,
         outcome: SwitchOutOutcome,
     ) {
-        task.with_class_state(|task_state: &C::TaskState| {
-            self.class.on_switch_out(
-                cpu_id,
-                self.cpu_state(cpu_id),
-                task,
-                task_state,
-                now_cycles,
-                outcome,
-            );
-
-            if outcome == SwitchOutOutcome::Terminated {
-                self.class.on_task_exit(task, task_state);
-            }
-        });
-    }
-
-    fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
         self.class
-            .pick_next(cpu_id, self.cpu_state(cpu_id), now_cycles)
+            .on_switch_out(cpu_id, self.cpu_state(cpu_id), task, now_cycles, outcome);
+
+        if outcome == SwitchOutOutcome::Terminated {
+            self.class.on_task_exit(task);
+        }
     }
 
-    fn should_preempt(&self, task: &TaskHandle) -> bool {
+    fn pick_next(&self, access: &RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate> {
+        self.class
+            .pick_next(access, self.cpu_state(access.cpu_id()), now_cycles)
+    }
+
+    fn should_preempt(&self, task: &TaskUpdate) -> bool {
         task.with_class_state(|task_state: &C::TaskState| {
             self.class.should_preempt(task, task_state)
         })
@@ -278,9 +270,9 @@ pub trait DomainAlgorithm: Send + Sync {
         &self,
         domains: &[DomainEntry],
         per_cpu_cursor: &[AtomicUsize],
-        cpu_id: usize,
+        access: &RunQueueAccess<'_>,
         now_cycles: u64,
-    ) -> Option<TaskHandle>;
+    ) -> Option<TaskUpdate>;
 }
 #[derive(Default)]
 pub struct RoundRobinDomainAlgorithm;
@@ -290,9 +282,10 @@ impl DomainAlgorithm for RoundRobinDomainAlgorithm {
         &self,
         domains: &[DomainEntry],
         per_cpu_cursor: &[AtomicUsize],
-        cpu_id: usize,
+        access: &RunQueueAccess<'_>,
         now_cycles: u64,
-    ) -> Option<TaskHandle> {
+    ) -> Option<TaskUpdate> {
+        let cpu_id = access.cpu_id();
         if domains.is_empty() {
             return None;
         }
@@ -311,7 +304,7 @@ impl DomainAlgorithm for RoundRobinDomainAlgorithm {
                 continue;
             }
 
-            if let Some(task) = domain.pick_next(cpu_id, now_cycles) {
+            if let Some(task) = domain.pick_next(access, now_cycles) {
                 cursor.store((idx + 1) % domains.len(), Ordering::Relaxed);
                 return Some(task);
             }
@@ -369,7 +362,7 @@ where
     pub fn enqueue(
         &self,
         id: DomainId,
-        task: TaskHandle,
+        task: &mut TaskUpdate,
         reason: EnqueueReason,
         hint_cpu: usize,
     ) -> usize {
@@ -379,7 +372,7 @@ where
     pub fn on_switch_out(
         &self,
         id: DomainId,
-        task: &TaskHandle,
+        task: &mut TaskUpdate,
         cpu_id: usize,
         now_cycles: u64,
         outcome: SwitchOutOutcome,
@@ -388,12 +381,12 @@ where
             .on_switch_out(task, cpu_id, now_cycles, outcome);
     }
 
-    pub fn pick_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
+    pub fn pick_next(&self, access: &RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate> {
         self.algorithm
-            .pick_next(&self.domains, &self.per_cpu_cursor, cpu_id, now_cycles)
+            .pick_next(&self.domains, &self.per_cpu_cursor, access, now_cycles)
     }
 
-    pub fn should_preempt(&self, id: DomainId, task: &TaskHandle) -> bool {
+    pub fn should_preempt(&self, id: DomainId, task: &TaskUpdate) -> bool {
         self.get(id).should_preempt(task)
     }
 
@@ -416,9 +409,11 @@ unsafe impl Sync for TaskSchedBinding {}
 
 impl TaskSchedBinding {
     pub fn new<T: Send + Sync + 'static>(domain: DomainId, class_state: T) -> Self {
-        unsafe fn drop_state<T>(ptr: NonNull<()>) { unsafe {
-            drop(Box::from_raw(ptr.cast::<T>().as_ptr()));
-        }}
+        unsafe fn drop_state<T>(ptr: NonNull<()>) {
+            unsafe {
+                drop(Box::from_raw(ptr.cast::<T>().as_ptr()));
+            }
+        }
 
         let raw = Box::into_raw(Box::new(class_state));
         let class_state = NonNull::new(raw.cast::<()>()).expect("class state allocation failed");

@@ -854,6 +854,11 @@ impl ProgramManager {
         self.programs.read().get(&pid).map(Arc::clone)
     }
 
+    pub(crate) fn try_get(&self, pid: u64) -> Result<Option<ProgramHandle>, ()> {
+        let programs = self.programs.try_read().ok_or(())?;
+        Ok(programs.get(&pid).map(Arc::clone))
+    }
+
     pub fn start_pid(&self, pid: u64) -> Option<TaskHandle> {
         let handle = self.get(pid)?;
         let task_arc = {

@@ -7,7 +7,7 @@ use aarch64_cpu::asm::barrier::{SY, isb};
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 use crate::idt::interrupt_impl::InterruptGuard;
 use crate::platform::{self, TimerPlatform};
-use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::KERNEL_INITIALIZED;
@@ -65,7 +65,7 @@ pub(super) unsafe fn handle_interrupt(state: *mut State) {
     }
 
     let _interrupt_guard = InterruptGuard::new();
-    let Some(_fpu_guard) = KernelFpuGuard::try_new() else {
+    let Some(mut scheduling) = SCHEDULER.try_local_scheduler() else {
         return;
     };
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -73,7 +73,7 @@ pub(super) unsafe fn handle_interrupt(state: *mut State) {
     bench_submit_interrupt_sample_current_core(unsafe { &*state });
 
     let stopwatch = Stopwatch::start();
-    let previous = unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };
+    let previous = unsafe { scheduling.on_timer_tick(state) };
     TIMER_TIME_SCHED[cpu_id].fetch_add(stopwatch.elapsed_nanos() as usize, Ordering::Relaxed);
     if previous.is_some() {
         PER_CORE_SWITCHES[cpu_id].fetch_add(1, Ordering::Relaxed);

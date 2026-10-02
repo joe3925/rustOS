@@ -10,20 +10,19 @@ use crate::scheduling::domain::{
 };
 use crate::scheduling::fifo_scheduler::{FifoPriority, build_fifo_domain, fifo_task_sched_binding};
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::state::{SchedState, State};
+use crate::scheduling::state::{FpuState, SchedState, State};
 use crate::scheduling::task::Task;
 use crate::scheduling::task::TaskError;
 use crate::scheduling::task::TaskHandle;
-use crate::scheduling::task::TaskTable;
+use crate::scheduling::task::{TaskTable, TaskUpdate};
 use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::hint::spin_loop;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
+use spin::{Mutex, MutexGuard};
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
 
 pub(crate) fn kernel_task_sched_binding() -> TaskSchedBinding {
@@ -88,7 +87,8 @@ impl Drop for KernelFpuGuard {
 }
 
 pub struct CoreScheduler {
-    sched_lock: IrqSafeRwLock<SchedulerState>,
+    scheduling: Mutex<SchedulerState>,
+    current_task_id: AtomicU64,
     idle_task: TaskHandle,
     current_is_idle: AtomicBool,
     platform_cpu_id: kernel_types::irq::PlatformCpuId,
@@ -96,6 +96,40 @@ pub struct CoreScheduler {
 
 struct SchedulerState {
     current: Option<TaskHandle>,
+}
+
+pub struct RunQueueAccess<'a> {
+    cpu_id: usize,
+    state: MutexGuard<'a, SchedulerState>,
+}
+
+impl RunQueueAccess<'_> {
+    pub(crate) fn cpu_id(&self) -> usize {
+        self.cpu_id
+    }
+}
+
+pub struct LocalScheduler<'a> {
+    current: Option<TaskUpdate>,
+    return_fpu: Option<FpuState>,
+    access: Option<RunQueueAccess<'a>>,
+}
+
+impl LocalScheduler<'_> {
+    pub(crate) unsafe fn on_timer_tick(&mut self, state: *mut State) -> Option<TaskHandle> {
+        unsafe { SCHEDULER.schedule_next(self, state) }
+    }
+}
+
+impl Drop for LocalScheduler<'_> {
+    fn drop(&mut self) {
+        drop(self.current.take());
+        drop(self.access.take());
+        SCHEDULER.maybe_balance();
+        if let Some(fpu) = self.return_fpu.as_ref() {
+            platform::restore_fpu_state(fpu);
+        }
+    }
 }
 
 pub struct Scheduler {
@@ -158,10 +192,11 @@ impl Scheduler {
         platform::mark_idle_task_context(&mut idle.inner.write().context);
 
         let _idle_id = self.register_task_no_reap(idle.clone());
-        idle.set_target_cpu(cpu_id);
+        idle.try_update().unwrap().set_target_cpu(cpu_id);
 
         Box::new(CoreScheduler {
-            sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
+            scheduling: Mutex::new(SchedulerState { current: None }),
+            current_task_id: AtomicU64::new(0),
             idle_task: idle.clone(),
             current_is_idle: AtomicBool::new(false),
             platform_cpu_id,
@@ -254,15 +289,19 @@ impl Scheduler {
             return 0;
         }
 
+        let mut update = loop {
+            if let Some(update) = task.try_update() {
+                break update;
+            }
+            yield_now();
+        };
         let id = self.register_task(task.clone());
-        let domain_id = task.domain_id();
-        let target_cpu = self.domains.enqueue(
-            domain_id,
-            task,
+        self.domains.enqueue(
+            update.domain_id(),
+            &mut update,
             EnqueueReason::New,
             self.new_task_placement_start(),
         );
-        self.kick_remote_core(target_cpu);
         id
     }
 
@@ -281,18 +320,69 @@ impl Scheduler {
         self.all_tasks.get(id)
     }
 
-    #[inline(always)]
     pub fn get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
         let core = self.core(cpu_id)?;
-        let state = core.sched_lock.read();
-        state.current.clone()
+        loop {
+            let id = core.current_task_id.load(Ordering::Acquire);
+            let task = self.all_tasks.get(id);
+            if core.current_task_id.load(Ordering::Acquire) == id {
+                return task;
+            }
+        }
     }
 
-    #[inline(always)]
+    pub fn get_local_current_task(&self) -> Option<TaskHandle> {
+        loop {
+            let cpu_id = platform::current_cpu_id();
+            let task = self.get_current_task(cpu_id);
+            if platform::current_cpu_id() == cpu_id {
+                return task;
+            }
+        }
+    }
+
     pub fn try_get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
         let core = self.core(cpu_id)?;
-        let state = core.sched_lock.try_read()?;
-        state.current.clone()
+        let id = core.current_task_id.load(Ordering::Acquire);
+        let task = self.all_tasks.get(id);
+        if core.current_task_id.load(Ordering::Acquire) == id {
+            task
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn try_core_scheduler(&self, cpu_id: usize) -> Option<RunQueueAccess<'_>> {
+        let core = self.core(cpu_id)?;
+        Some(RunQueueAccess {
+            cpu_id,
+            state: core.scheduling.try_lock()?,
+        })
+    }
+
+    pub(crate) fn try_local_scheduler(&self) -> Option<LocalScheduler<'_>> {
+        if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+            return None;
+        }
+        let cpu_id = platform::current_cpu_id();
+        let access = self.try_core_scheduler(cpu_id)?;
+        let (current, return_fpu) = match access.state.current.as_ref() {
+            Some(task) => {
+                let update = task.try_update()?;
+                let fpu = {
+                    let mut inner = task.inner.try_write()?;
+                    inner.save_fpu_state();
+                    inner.fpu_state.clone()
+                };
+                (Some(update), Some(fpu))
+            }
+            None => (None, None),
+        };
+        Some(LocalScheduler {
+            current,
+            return_fpu,
+            access: Some(access),
+        })
     }
 
     pub fn delete_task(&self, id: u64) -> Result<(), TaskError> {
@@ -313,341 +403,277 @@ impl Scheduler {
             return Err(TaskMigrationError::TaskNotFound(id));
         };
 
-        if task.set_pending_sched_binding(sched_binding).is_err() {
+        let mut update = loop {
+            if let Some(update) = task.try_update() {
+                break update;
+            }
+            yield_now();
+        };
+        if update.set_pending_sched_binding(sched_binding).is_err() {
             return Err(TaskMigrationError::PendingMigration(id));
         }
-
-        if task.sched_state() == SchedState::Blocked {
+        if update.sched_state() == SchedState::Blocked {
             self.commit_pending_migration(
-                &task,
+                &mut update,
                 platform::current_cpu_id(),
                 platform::cycle_counter(),
             );
         }
-
+        update.notify_after_update(task.target_cpu());
         Ok(())
+    }
+
+    pub(crate) fn enqueue_woken_task(&self, task: &mut TaskUpdate) {
+        let hint = task.target_cpu();
+        self.domains
+            .enqueue(task.domain_id(), task, EnqueueReason::Wakeup, hint);
     }
 
     pub fn unpark(&self, task: &TaskHandle) {
         task.grant_permit();
-
-        let n = self.num_cores();
-        if n == 0 {
-            return;
-        }
-
-        let in_interrupt = platform::current_is_in_interrupt();
-        loop {
-            match task.sched_state() {
-                SchedState::Blocked => {
-                    if task
-                        .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    let hint_cpu = task.target_cpu();
-                    if task.has_pending_sched_binding() && !in_interrupt {
-                        self.commit_pending_migration(
-                            task,
-                            platform::current_cpu_id(),
-                            platform::cycle_counter(),
-                        );
-                    }
-
-                    let target_cpu = self.domains.enqueue(
-                        task.domain_id(),
-                        task.clone(),
-                        EnqueueReason::Wakeup,
-                        hint_cpu,
-                    );
-                    self.kick_remote_core(target_cpu);
-
-                    return;
-                }
-
-                SchedState::Parking => {
-                    if in_interrupt {
-                        return;
-                    }
-                    spin_loop();
-                }
-
-                SchedState::Runnable | SchedState::Running | SchedState::Terminated => {
-                    return;
-                }
-            }
-        }
+        drop(task.try_update());
     }
 
     pub fn park_current(&self) {
-        if !platform::interrupts_enabled() {
-            panic!("Attempt to park with interrupts disabled, this will always cause a deadlock");
+        if !platform::interrupts_enabled() || platform::current_is_in_interrupt() {
+            panic!("cannot park in interrupt context");
         }
-
+        let Some(current) = self.get_local_current_task() else {
+            return;
+        };
+        let mut update = loop {
+            if let Some(update) = current.try_update() {
+                break update;
+            }
+            yield_now();
+        };
         let cpu_id = platform::current_cpu_id();
-        let Some(core) = self.core(cpu_id) else {
-            return;
-        };
-
-        let current = {
-            let state = core.sched_lock.read();
-            match state.current.as_ref() {
-                Some(t) => t.clone(),
-                None => return,
-            }
-        };
-
-        if Arc::ptr_eq(&current, &core.idle_task) {
-            return;
-        }
-
-        if current.consume_permit() {
-            return;
-        }
-
+        if self
+            .core(cpu_id)
+            .is_some_and(|core| Arc::ptr_eq(&current, &core.idle_task))
         {
-            let _state = core.sched_lock.write();
-
-            if current.consume_permit() {
-                return;
-            }
-
-            current.set_sched_state(SchedState::Parking);
+            return;
         }
-
-        yield_now();
+        if update.consume_permit() {
+            return;
+        }
+        if !update.set_sched_state(SchedState::Parking) {
+            return;
+        }
+        drop(update);
+        while current.sched_state() == SchedState::Parking {
+            yield_now();
+        }
     }
 
-    #[inline(always)]
-    /// # Safety
-    /// `state` must be the live interrupt frame for `cpu_id` and remain valid
-    /// for the duration of this scheduling operation.
-    pub unsafe fn on_timer_tick(&self, state: *mut State, cpu_id: usize) -> Option<TaskHandle> {
-        if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
-            return None;
-        }
-
-        let Some(core) = self.core(cpu_id) else {
-            return None;
-        };
-
-        let now_cycles = platform::cycle_counter();
-
-        let mut prev_task = None;
-
-        {
-            let sched_state = core.sched_lock.read();
-
-            if let Some(ref cur) = sched_state.current {
-                let Some(mut guard) = cur.inner.try_write() else {
-                    return None;
-                };
-
-                unsafe { guard.update_from_context(state) };
-
-                if !Arc::ptr_eq(cur, &core.idle_task) {
-                    prev_task = Some(cur.clone());
-                }
-            }
-        }
-
-        let next = match self.schedule_next(cpu_id, core, now_cycles, true) {
-            Some(task) => task,
-            None => return prev_task,
-        };
-
-        self.maybe_balance();
-
-        self.restore_page_table(&next);
-        self.restore_thread_local_storage(&next);
-
-        let ctx_guard = next.inner.read();
-        unsafe { platform::restore_task_context(&ctx_guard.context, state) };
-
-        prev_task
-    }
-
-    fn schedule_next(
+    unsafe fn schedule_next(
         &self,
-        cpu_id: usize,
-        core: &CoreScheduler,
-        now_cycles: u64,
-        prev_fpu_already_saved: bool,
+        local: &mut LocalScheduler<'_>,
+        state: *mut State,
     ) -> Option<TaskHandle> {
-        let mut sched_state = core.sched_lock.write();
-        let previous = sched_state.current.take();
-        let mut switch_out_previous = None;
-
-        if let Some(prev) = previous {
-            let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
-
-            if !prev_is_idle
-                && prev.sched_state() == SchedState::Running
-                && !self.domains.should_preempt(prev.domain_id(), &prev)
+        let access = local.access.as_mut()?;
+        let cpu_id = access.cpu_id();
+        let core = self.core(cpu_id)?;
+        let now_cycles = platform::cycle_counter();
+        let previous_handle = local.current.as_ref().map(|task| (**task).clone());
+        if let Some(previous) = local.current.as_ref() {
+            let mut inner = previous.inner.try_write()?;
+            unsafe { inner.update_from_context(state) };
+            if previous.sched_state() == SchedState::Running
+                && !Arc::ptr_eq(previous, &core.idle_task)
+                && !self.domains.should_preempt(previous.domain_id(), previous)
             {
-                sched_state.current = Some(prev.clone());
-                core.current_is_idle.store(false, Ordering::Release);
-                return Some(prev);
+                return previous_handle;
             }
+        }
 
-            let mut lock_failed = false;
-
-            if let Some(mut guard) = prev.inner.try_write() {
-                if !prev_fpu_already_saved {
-                    guard.save_fpu_state();
+        let mut selected = None;
+        let mut selected_context = None;
+        let mut selected_fpu = None;
+        let mut selected_root = None;
+        for _ in 0..TASK_TABLE_INITIAL_SLOTS {
+            let Some(mut candidate) = self.domains.pick_next(access, now_cycles) else {
+                break;
+            };
+            match candidate.sched_state() {
+                SchedState::Terminated => {
+                    self.handle_switch_out(
+                        &mut candidate,
+                        cpu_id,
+                        now_cycles,
+                        SwitchOutOutcome::Terminated,
+                    );
+                    continue;
                 }
-
-                if !prev_is_idle {
-                    guard.account_switched_out(now_cycles);
-                }
+                SchedState::Runnable => {}
+                _ => panic!("non-runnable task selected"),
+            }
+            if self.commit_pending_migration(&mut candidate, cpu_id, now_cycles) {
+                let hint = candidate.target_cpu();
+                self.domains.enqueue(
+                    candidate.domain_id(),
+                    &mut candidate,
+                    EnqueueReason::Migrated,
+                    hint,
+                );
+                continue;
+            }
+            let prepared = if let Some(inner) = candidate.inner.try_read() {
+                let root = if candidate.is_kernel_mode() {
+                    Some(kernel_address_space_root())
+                } else {
+                    match PROGRAM_MANAGER.try_get(inner.parent_pid) {
+                        Ok(Some(program)) => {
+                            program.try_read().map(|program| program.address_space_root)
+                        }
+                        Ok(None) => {
+                            candidate.terminate();
+                            None
+                        }
+                        Err(()) => None,
+                    }
+                };
+                root.map(|root| (inner.context, inner.fpu_state.clone(), root))
             } else {
-                lock_failed = true;
-            }
+                None
+            };
+            let Some((context, fpu, root)) = prepared else {
+                let hint = candidate.target_cpu();
+                self.domains.enqueue(
+                    candidate.domain_id(),
+                    &mut candidate,
+                    EnqueueReason::Preempted,
+                    hint,
+                );
+                continue;
+            };
+            selected_context = Some(context);
+            selected_fpu = Some(fpu);
+            selected_root = Some(root);
+            selected = Some(candidate);
+            break;
+        }
 
-            if lock_failed {
-                sched_state.current = Some(prev.clone());
-                core.current_is_idle.store(prev_is_idle, Ordering::Release);
-                return Some(prev);
-            }
-
-            if !prev_is_idle {
-                match prev.sched_state() {
+        if selected.is_none() {
+            if let Some(previous) = local.current.as_mut() {
+                let resume = match previous.sched_state() {
                     SchedState::Running | SchedState::Runnable => {
-                        prev.set_sched_state(SchedState::Runnable);
-                        switch_out_previous = Some((prev.clone(), SwitchOutOutcome::StillRunnable));
+                        !previous.has_pending_sched_binding()
+                    }
+                    SchedState::Parking => previous.consume_permit(),
+                    _ => false,
+                };
+                if resume && previous.set_sched_state(SchedState::Running) {
+                    return previous_handle;
+                }
+                if Arc::ptr_eq(previous, &core.idle_task) {
+                    return previous_handle;
+                }
+            }
+            let idle = core.idle_task.try_update()?;
+            {
+                let inner = idle.inner.try_read()?;
+                selected_context = Some(inner.context);
+                selected_fpu = Some(inner.fpu_state.clone());
+                selected_root = Some(kernel_address_space_root());
+            }
+            selected = Some(idle);
+        }
+
+        let mut next = selected.unwrap();
+        if !next.set_sched_state(SchedState::Running) {
+            self.handle_switch_out(&mut next, cpu_id, now_cycles, SwitchOutOutcome::Terminated);
+            return previous_handle;
+        }
+        if let Some(inner) = next.inner.try_read() {
+            inner.mark_scheduled_in(cpu_id, now_cycles);
+        }
+
+        let mut previous = local.current.take();
+        if let Some(prev) = previous.as_mut() {
+            if !Arc::ptr_eq(prev, &core.idle_task) {
+                if let Some(inner) = prev.inner.try_read() {
+                    inner.account_switched_out(now_cycles);
+                }
+                let outcome = match prev.sched_state() {
+                    SchedState::Running | SchedState::Runnable => {
+                        if prev.set_sched_state(SchedState::Runnable) {
+                            SwitchOutOutcome::StillRunnable
+                        } else {
+                            SwitchOutOutcome::Terminated
+                        }
                     }
                     SchedState::Parking => {
                         if prev.consume_permit() {
-                            prev.set_sched_state(SchedState::Runnable);
-                            switch_out_previous =
-                                Some((prev.clone(), SwitchOutOutcome::StillRunnable));
-                        } else if prev
-                            .cas_sched_state(SchedState::Parking, SchedState::Blocked)
-                            .is_ok()
-                        {
-                            if prev.consume_permit()
-                                && prev
-                                    .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
-                                    .is_ok()
-                            {
-                                switch_out_previous =
-                                    Some((prev.clone(), SwitchOutOutcome::StillRunnable));
+                            if prev.set_sched_state(SchedState::Runnable) {
+                                SwitchOutOutcome::StillRunnable
                             } else {
-                                switch_out_previous =
-                                    Some((prev.clone(), SwitchOutOutcome::Blocking));
+                                SwitchOutOutcome::Terminated
                             }
+                        } else if prev.set_sched_state(SchedState::Blocked) {
+                            SwitchOutOutcome::Blocking
                         } else {
-                            switch_out_previous = match prev.sched_state() {
-                                SchedState::Running | SchedState::Runnable => {
-                                    Some((prev.clone(), SwitchOutOutcome::StillRunnable))
-                                }
-                                SchedState::Parking | SchedState::Blocked => {
-                                    Some((prev.clone(), SwitchOutOutcome::Blocking))
-                                }
-                                SchedState::Terminated => {
-                                    Some((prev.clone(), SwitchOutOutcome::Terminated))
-                                }
-                            };
+                            SwitchOutOutcome::Terminated
                         }
                     }
-                    SchedState::Blocked => {
-                        switch_out_previous = Some((prev.clone(), SwitchOutOutcome::Blocking));
-                    }
-                    SchedState::Terminated => {
-                        switch_out_previous = Some((prev.clone(), SwitchOutOutcome::Terminated));
-                    }
-                }
+                    SchedState::Blocked => SwitchOutOutcome::Blocking,
+                    SchedState::Terminated => SwitchOutOutcome::Terminated,
+                };
+                self.handle_switch_out(prev, cpu_id, now_cycles, outcome);
             }
         }
 
-        if let Some((prev, outcome)) = switch_out_previous {
-            self.handle_switch_out(&prev, cpu_id, now_cycles, outcome);
-        }
-
-        loop {
-            let cand = match self.domains.pick_next(cpu_id, now_cycles) {
-                Some(task) => task,
-                None => break,
-            };
-
-            match cand.sched_state() {
-                SchedState::Terminated => {
-                    self.handle_switch_out(&cand, cpu_id, now_cycles, SwitchOutOutcome::Terminated);
-                    continue;
-                }
-                SchedState::Parking => continue,
-                SchedState::Blocked => continue,
-                SchedState::Runnable | SchedState::Running => {
-                    if self.commit_pending_migration(&cand, cpu_id, now_cycles) {
-                        let target_cpu = self.domains.enqueue(
-                            cand.domain_id(),
-                            cand.clone(),
-                            EnqueueReason::Migrated,
-                            cand.target_cpu(),
-                        );
-                        self.kick_remote_core(target_cpu);
-                        continue;
-                    }
-
-                    cand.set_sched_state(SchedState::Running);
-
-                    {
-                        let mut guard = cand.inner.write();
-                        guard.restore_fpu_state();
-                        guard.mark_scheduled_in(cpu_id, now_cycles);
-                    }
-
-                    sched_state.current = Some(cand.clone());
-                    core.current_is_idle.store(false, Ordering::Release);
-                    return Some(cand);
-                }
+        unsafe { switch_address_space_root(selected_root.unwrap()) };
+        self.restore_thread_local_storage(&next);
+        unsafe { platform::restore_task_context(&selected_context.unwrap(), state) };
+        local.return_fpu = selected_fpu;
+        access.state.current = Some((*next).clone());
+        core.current_is_idle
+            .store(Arc::ptr_eq(&next, &core.idle_task), Ordering::Release);
+        core.current_task_id
+            .store(next.task_id(), Ordering::Release);
+        local.current = Some(next);
+        if let Some(prev) = previous.as_ref() {
+            if prev.sched_state() == SchedState::Terminated {
+                self.unregister_task(prev);
             }
         }
-
-        core.idle_task.set_sched_state(SchedState::Running);
-
-        {
-            let mut guard = core.idle_task.inner.write();
-            guard.restore_fpu_state();
-            guard.mark_scheduled_in(cpu_id, now_cycles);
-        }
-
-        sched_state.current = Some(core.idle_task.clone());
-        core.current_is_idle.store(true, Ordering::Release);
-        Some(core.idle_task.clone())
+        drop(previous);
+        previous_handle.filter(|task| !Arc::ptr_eq(task, &core.idle_task))
     }
 
     fn handle_switch_out(
         &self,
-        task: &TaskHandle,
+        task: &mut TaskUpdate,
         cpu_id: usize,
         now_cycles: u64,
         outcome: SwitchOutOutcome,
     ) {
         if outcome == SwitchOutOutcome::StillRunnable && task.has_pending_sched_binding() {
             if self.commit_pending_migration(task, cpu_id, now_cycles) {
-                let target_cpu = self.domains.enqueue(
-                    task.domain_id(),
-                    task.clone(),
-                    EnqueueReason::Migrated,
-                    task.target_cpu(),
-                );
-                self.kick_remote_core(target_cpu);
+                let hint = task.target_cpu();
+                self.domains
+                    .enqueue(task.domain_id(), task, EnqueueReason::Migrated, hint);
                 return;
             }
         }
-
         self.domains
             .on_switch_out(task.domain_id(), task, cpu_id, now_cycles, outcome);
-
-        if outcome == SwitchOutOutcome::Terminated {
+        if outcome == SwitchOutOutcome::Terminated
+            && self
+                .core(cpu_id)
+                .is_none_or(|core| core.current_task_id.load(Ordering::Acquire) != task.task_id())
+        {
             self.unregister_task(task);
         }
     }
 
-    fn commit_pending_migration(&self, task: &TaskHandle, cpu_id: usize, now_cycles: u64) -> bool {
+    fn commit_pending_migration(
+        &self,
+        task: &mut TaskUpdate,
+        cpu_id: usize,
+        now_cycles: u64,
+    ) -> bool {
         let Some(new_binding) = task.take_pending_sched_binding() else {
             return false;
         };
@@ -670,13 +696,20 @@ impl Scheduler {
             return;
         }
 
-        let pid = task_handle.inner.read().parent_pid;
+        let Some(inner) = task_handle.inner.try_read() else {
+            return;
+        };
+        let pid = inner.parent_pid;
+        drop(inner);
 
-        if let Some(program) = PROGRAM_MANAGER.get(pid) {
-            unsafe { switch_address_space_root(program.read().address_space_root) };
-        } else {
-            let id = task_handle.task_id();
-            let _ = self.delete_task(id);
+        match PROGRAM_MANAGER.try_get(pid) {
+            Ok(Some(program)) => {
+                if let Some(program) = program.try_read() {
+                    unsafe { switch_address_space_root(program.address_space_root) };
+                }
+            }
+            Ok(None) => task_handle.terminate(),
+            Err(()) => {}
         }
     }
 
@@ -702,9 +735,7 @@ impl Scheduler {
         let mut count = self.num_cores.load(Ordering::Acquire);
 
         loop {
-            if count == self.cores.len()
-                || self.cores[count].load(Ordering::Acquire).is_null()
-            {
+            if count == self.cores.len() || self.cores[count].load(Ordering::Acquire).is_null() {
                 return count;
             }
 
@@ -734,63 +765,8 @@ impl Scheduler {
             .is_some_and(|core| core.current_is_idle.load(Ordering::Acquire))
     }
 
-    pub(crate) fn with_core_sched_lock<R>(
-        &self,
-        cpu_id: usize,
-        f: impl FnOnce() -> R,
-    ) -> Option<R> {
-        let core = self.core(cpu_id)?;
-        let _state = core.sched_lock.write();
-        Some(f())
-    }
-
-    pub(crate) fn unregister_task_from_domain(&self, task: &TaskHandle) {
+    pub(crate) fn unregister_task_from_domain(&self, task: &TaskUpdate) {
         self.unregister_task(task);
-    }
-
-    #[inline(always)]
-    /// # Safety
-    /// `state` must be the live IPI frame for `cpu_id` and remain valid for the
-    /// duration of this scheduling operation.
-    pub unsafe fn on_ipi(&self, state: *mut State, cpu_id: usize) {
-        if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
-            return;
-        }
-
-        let Some(core) = self.core(cpu_id) else {
-            return;
-        };
-
-        let can_schedule = {
-            let sched_state = core.sched_lock.read();
-            match sched_state.current.as_ref() {
-                Some(t) => Arc::ptr_eq(t, &core.idle_task),
-                None => true,
-            }
-        };
-
-        if !can_schedule {
-            platform::end_interrupt(platform::scheduler_ipi_vector());
-            return;
-        }
-
-        let now_cycles = platform::cycle_counter();
-
-        let next = match self.schedule_next(cpu_id, core, now_cycles, true) {
-            Some(t) => t,
-            None => {
-                platform::end_interrupt(platform::scheduler_ipi_vector());
-                return;
-            }
-        };
-
-        self.restore_page_table(&next);
-        self.restore_thread_local_storage(&next);
-
-        platform::end_interrupt(platform::scheduler_ipi_vector());
-
-        let ctx_guard = next.inner.read();
-        unsafe { platform::restore_task_context(&ctx_guard.context, state) };
     }
 }
 
@@ -806,10 +782,19 @@ pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
-    let _fpu_guard = KernelFpuGuard::new();
-    let cpu_id = platform::current_cpu_id();
-
-    unsafe { SCHEDULER.on_ipi(state, cpu_id) };
+    if let Some(mut local) = SCHEDULER.try_local_scheduler() {
+        let core = SCHEDULER
+            .core(local.access.as_ref().unwrap().cpu_id())
+            .unwrap();
+        if local
+            .current
+            .as_ref()
+            .is_none_or(|task| Arc::ptr_eq(task, &core.idle_task))
+        {
+            unsafe { local.on_timer_tick(state) };
+        }
+    }
+    platform::end_interrupt(platform::scheduler_ipi_vector());
 }
 
 #[unsafe(no_mangle)]
@@ -823,10 +808,9 @@ pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
-    let _fpu_guard = KernelFpuGuard::new();
-    let cpu_id = platform::current_cpu_id();
-
-    unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };
+    if let Some(mut local) = SCHEDULER.try_local_scheduler() {
+        unsafe { local.on_timer_tick(state) };
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -837,12 +821,8 @@ pub extern "C" fn ipi_eoi_only() {
 pub extern "C" fn kernel_task_end() -> ! {
     mimalloc_thread_done();
 
-    platform::with_interrupts_disabled(|| {
-        let task = SCHEDULER
-            .get_current_task(platform::current_cpu_id())
-            .unwrap();
-        task.terminate();
-    });
+    let task = SCHEDULER.get_local_current_task().unwrap();
+    task.terminate();
 
     loop {
         yield_now();

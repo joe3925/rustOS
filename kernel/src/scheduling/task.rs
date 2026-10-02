@@ -12,6 +12,7 @@ use crate::vec::Vec;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::ops::Deref;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::{mem, mem::ManuallyDrop, ptr};
@@ -25,6 +26,9 @@ pub const IDLE_UUID_UPPER: u64 = 0x1c82f35548bcbe24;
 pub const IDLE_MAGIC_LOWER: u64 = 0x890189d70ecaca7f;
 /// Sentinel value indicating no task in wait queue
 pub const WAIT_QUEUE_NONE: u64 = 0;
+const SCHED_STATE_MASK: u8 = 7;
+const SCHED_UPDATING: u8 = 8;
+const SCHED_PERMIT: u8 = 16;
 #[derive(Debug)]
 /// TaskRef is the primary handle to a task, containing:
 /// - Atomic scheduling state accessible without locks (for scheduler hot path)
@@ -43,12 +47,6 @@ pub struct TaskRef {
     /// Preferred CPU for this task's run queue
     /// Used by unpark() to decide where to enqueue
     target_cpu: AtomicUsize,
-
-    /// Park/unpark permit token (0 or 1)
-    /// - unpark() sets this to 1
-    /// - park_current() consumes it (swap to 0)
-    /// This prevents lost wakeups via the commit-point handshake
-    permit: AtomicU8,
 
     /// Intrusive wait queue link - holds task ID of next waiter (or WAIT_QUEUE_NONE)
     /// Used for mutex, condvar, channel wait queues
@@ -93,6 +91,135 @@ pub struct TaskRef {
 
 /// Handle type used throughout the scheduler
 pub type TaskHandle = Arc<TaskRef>;
+
+pub struct TaskUpdate {
+    task: TaskHandle,
+    notify_cpu: Option<usize>,
+}
+
+impl Deref for TaskUpdate {
+    type Target = TaskHandle;
+
+    fn deref(&self) -> &TaskHandle {
+        &self.task
+    }
+}
+
+impl TaskUpdate {
+    pub(crate) fn set_sched_state(&mut self, state: SchedState) -> bool {
+        self.task
+            .sched_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                if SchedState::from_u8(word & SCHED_STATE_MASK) == SchedState::Terminated {
+                    None
+                } else {
+                    Some((word & !SCHED_STATE_MASK) | state as u8)
+                }
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn consume_permit(&mut self) -> bool {
+        self.task
+            .sched_state
+            .fetch_and(!SCHED_PERMIT, Ordering::AcqRel)
+            & SCHED_PERMIT
+            != 0
+    }
+
+    pub(crate) fn set_target_cpu(&mut self, cpu: usize) {
+        self.task.target_cpu.store(cpu, Ordering::Relaxed);
+    }
+
+    pub(crate) fn notify_after_update(&mut self, cpu: usize) {
+        self.notify_cpu = Some(cpu);
+    }
+
+    pub(crate) fn with_class_state<T, R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let binding = self.task.sched_binding.read();
+        let ptr = binding.class_state();
+        f(unsafe { ptr.cast::<T>().as_ref() })
+    }
+
+    pub(crate) fn set_pending_sched_binding(
+        &mut self,
+        sched_binding: TaskSchedBinding,
+    ) -> Result<(), TaskSchedBinding> {
+        let mut pending = self.task.pending_sched_binding.lock();
+        if pending.is_some() {
+            return Err(sched_binding);
+        }
+
+        *pending = Some(sched_binding);
+        self.task
+            .pending_sched_binding_present
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn take_pending_sched_binding(&mut self) -> Option<TaskSchedBinding> {
+        if !self.has_pending_sched_binding() {
+            return None;
+        }
+
+        let mut pending = self.task.pending_sched_binding.lock();
+        let binding = pending.take();
+        self.task
+            .pending_sched_binding_present
+            .store(false, Ordering::Release);
+        binding
+    }
+
+    pub(crate) fn replace_sched_binding(
+        &mut self,
+        sched_binding: TaskSchedBinding,
+    ) -> TaskSchedBinding {
+        let new_domain_id = sched_binding.domain_id();
+        let mut active = self.task.sched_binding.write();
+        let old = mem::replace(&mut *active, sched_binding);
+        self.task
+            .active_domain_id
+            .store(new_domain_id.0 as u32, Ordering::Release);
+        old
+    }
+}
+
+impl Drop for TaskUpdate {
+    fn drop(&mut self) {
+        let mut word = self.task.sched_state.load(Ordering::Acquire);
+        loop {
+            if word & SCHED_STATE_MASK == SchedState::Blocked as u8 && word & SCHED_PERMIT != 0 {
+                let runnable =
+                    (word & !(SCHED_STATE_MASK | SCHED_PERMIT)) | SchedState::Runnable as u8;
+                match self.task.sched_state.compare_exchange(
+                    word,
+                    runnable,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        crate::scheduling::scheduler::SCHEDULER.enqueue_woken_task(self);
+                        word = self.task.sched_state.load(Ordering::Acquire);
+                    }
+                    Err(actual) => word = actual,
+                }
+                continue;
+            }
+            match self.task.sched_state.compare_exchange(
+                word,
+                word & !SCHED_UPDATING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => word = actual,
+            }
+        }
+        if let Some(cpu) = self.notify_cpu.take() {
+            crate::scheduling::scheduler::SCHEDULER.kick_remote_core(cpu);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum KernelStackFaultResolution {
@@ -143,27 +270,29 @@ impl TaskRef {
     /// Get the current scheduling state
     #[inline(always)]
     pub fn sched_state(&self) -> SchedState {
-        SchedState::from_u8(self.sched_state.load(Ordering::Acquire))
+        SchedState::from_u8(self.sched_state.load(Ordering::Acquire) & SCHED_STATE_MASK)
     }
 
-    /// Set the scheduling state
-    #[inline(always)]
-    pub fn set_sched_state(&self, state: SchedState) {
-        self.sched_state.store(state as u8, Ordering::Release);
-    }
-
-    /// Compare-and-swap scheduling state
-    /// Returns Ok(()) if successful, Err(actual) if the current state didn't match expected
-    #[inline(always)]
-    pub fn cas_sched_state(&self, expected: SchedState, new: SchedState) -> Result<(), SchedState> {
-        match self.sched_state.compare_exchange(
-            expected as u8,
-            new as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(actual) => Err(SchedState::from_u8(actual)),
+    pub(crate) fn try_update(self: &Arc<Self>) -> Option<TaskUpdate> {
+        let mut word = self.sched_state.load(Ordering::Acquire);
+        loop {
+            if word & SCHED_UPDATING != 0 {
+                return None;
+            }
+            match self.sched_state.compare_exchange(
+                word,
+                word | SCHED_UPDATING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(TaskUpdate {
+                        task: self.clone(),
+                        notify_cpu: None,
+                    });
+                }
+                Err(actual) => word = actual,
+            }
         }
     }
 
@@ -171,12 +300,6 @@ impl TaskRef {
     #[inline(always)]
     pub fn target_cpu(&self) -> usize {
         self.target_cpu.load(Ordering::Relaxed)
-    }
-
-    /// Set the target CPU for this task
-    #[inline(always)]
-    pub fn set_target_cpu(&self, cpu: usize) {
-        self.target_cpu.store(cpu, Ordering::Relaxed);
     }
 
     /// Check if task is terminated (convenience method)
@@ -188,27 +311,24 @@ impl TaskRef {
     /// Mark the task as terminated
     #[inline(always)]
     pub fn terminate(&self) {
-        self.set_sched_state(SchedState::Terminated);
+        let _ = self
+            .sched_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                Some((word & !SCHED_STATE_MASK) | SchedState::Terminated as u8)
+            });
     }
 
     /// Deliver a wake permit (called by unpark)
     /// Returns the previous permit value
     #[inline(always)]
     pub fn grant_permit(&self) -> u8 {
-        self.permit.swap(1, Ordering::Release)
-    }
-
-    /// Consume the wake permit (called by park_current)
-    /// Returns true if a permit was available (no need to block)
-    #[inline(always)]
-    pub fn consume_permit(&self) -> bool {
-        self.permit.swap(0, Ordering::Acquire) == 1
+        (self.sched_state.fetch_or(SCHED_PERMIT, Ordering::AcqRel) & SCHED_PERMIT != 0) as u8
     }
 
     /// Check if permit is available without consuming
     #[inline(always)]
     pub fn has_permit(&self) -> bool {
-        self.permit.load(Ordering::Acquire) == 1
+        self.sched_state.load(Ordering::Acquire) & SCHED_PERMIT != 0
     }
 
     /// Get the task ID
@@ -229,59 +349,13 @@ impl TaskRef {
     }
 
     #[inline(always)]
-    pub(crate) fn with_class_state<T, R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        let binding = self.sched_binding.read();
-        let ptr = binding.class_state();
-        f(unsafe { ptr.cast::<T>().as_ref() })
-    }
-
-    #[inline(always)]
     pub fn is_kernel_mode(&self) -> bool {
         self.is_kernel_mode.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_pending_sched_binding(
-        &self,
-        sched_binding: TaskSchedBinding,
-    ) -> Result<(), TaskSchedBinding> {
-        let mut pending = self.pending_sched_binding.lock();
-        if pending.is_some() {
-            return Err(sched_binding);
-        }
-
-        *pending = Some(sched_binding);
-        self.pending_sched_binding_present
-            .store(true, Ordering::Release);
-        Ok(())
     }
 
     #[inline(always)]
     pub(crate) fn has_pending_sched_binding(&self) -> bool {
         self.pending_sched_binding_present.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn take_pending_sched_binding(&self) -> Option<TaskSchedBinding> {
-        if !self.has_pending_sched_binding() {
-            return None;
-        }
-
-        let mut pending = self.pending_sched_binding.lock();
-        let binding = pending.take();
-        self.pending_sched_binding_present
-            .store(false, Ordering::Release);
-        binding
-    }
-
-    pub(crate) fn replace_sched_binding(
-        &self,
-        sched_binding: TaskSchedBinding,
-    ) -> TaskSchedBinding {
-        let new_domain_id = sched_binding.domain_id();
-        let mut active = self.sched_binding.write();
-        let old = mem::replace(&mut *active, sched_binding);
-        self.active_domain_id
-            .store(new_domain_id.0 as u32, Ordering::Release);
-        old
     }
 
     /// Attempt to grow the kernel stack by one page.
@@ -416,7 +490,6 @@ impl Task {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
-            permit: AtomicU8::new(0),
             wait_next: kernel_sync::WaitState::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
@@ -490,7 +563,6 @@ impl Task {
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
-            permit: AtomicU8::new(0),
             wait_next: kernel_sync::WaitState::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),

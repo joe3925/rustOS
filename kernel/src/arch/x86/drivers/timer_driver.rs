@@ -6,7 +6,7 @@ use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 use super::super::cpu::{current_cpu_id, current_is_in_interrupt};
 use super::super::interrupts::apic::local::send_eoi as send_eoi_timer;
 use super::super::timer::APIC_TICKS_PER_NS;
-use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::structs::stopwatch::Stopwatch;
@@ -44,15 +44,14 @@ pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
-    let Some(_fpu_guard) = KernelFpuGuard::try_new() else {
+    let Some(mut scheduling) = SCHEDULER.try_local_scheduler() else {
         return;
     };
     TIMER.fetch_add(1, Ordering::Relaxed);
-    let cpu_id = current_cpu_id();
     bench_submit_interrupt_sample_current_core(unsafe { &*state });
 
     let sw = Stopwatch::start();
-    unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };
+    unsafe { scheduling.on_timer_tick(state) };
     let dt = sw.elapsed_nanos() as usize;
     unsafe { TIMER_TIME_SCHED.get() }.fetch_add(dt, Ordering::Relaxed);
 }

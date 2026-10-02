@@ -15,8 +15,7 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn current_task() -> Option<Self::Task> {
-        let cpu_id = platform::current_cpu_id();
-        SCHEDULER.get_current_task(cpu_id)
+        SCHEDULER.get_local_current_task()
     }
 
     #[inline]
