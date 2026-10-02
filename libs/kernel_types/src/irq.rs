@@ -1,9 +1,7 @@
 use crate::dma::DmaDeviceHandle;
-use alloc::collections::VecDeque;
 use core::cell::UnsafeCell;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut};
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::Waker;
 
@@ -722,124 +720,6 @@ impl WaiterSlot {
                 _ => return,
             }
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct WaiterPtr {
-    ptr: NonNull<Waiter>,
-}
-
-impl WaiterPtr {
-    pub fn new(waiter: &Waiter) -> Self {
-        Self {
-            ptr: NonNull::from(waiter),
-        }
-    }
-
-    pub unsafe fn from_raw(ptr: *mut Waiter) -> Self {
-        Self {
-            ptr: unsafe { NonNull::new_unchecked(ptr) },
-        }
-    }
-
-    pub fn as_ptr(self) -> *mut Waiter {
-        self.ptr.as_ptr()
-    }
-
-    pub unsafe fn as_ref<'a>(self) -> &'a Waiter {
-        unsafe { self.ptr.as_ref() }
-    }
-
-    pub fn ptr_eq(self, other: WaiterPtr) -> bool {
-        self.ptr == other.ptr
-    }
-}
-
-unsafe impl Send for WaiterPtr {}
-unsafe impl Sync for WaiterPtr {}
-
-#[repr(C)]
-pub struct Waiter {
-    pub waker: IrqSafeMutex<Option<Waker>>,
-    pub result: IrqSafeMutex<Option<IrqWaitResult>>,
-    pub enqueued: AtomicBool,
-}
-
-unsafe impl Send for Waiter {}
-unsafe impl Sync for Waiter {}
-
-impl Waiter {
-    pub const fn new() -> Self {
-        Self {
-            waker: IrqSafeMutex::new(None),
-            result: IrqSafeMutex::new(None),
-            enqueued: AtomicBool::new(false),
-        }
-    }
-
-    pub fn set_waker(&self, w: &Waker) {
-        let mut g = self.waker.lock();
-        let update = match g.as_ref() {
-            Some(existing) => !existing.will_wake(w),
-            None => true,
-        };
-
-        if update {
-            *g = Some(w.clone());
-        }
-    }
-
-    pub fn take_result(&self) -> Option<IrqWaitResult> {
-        self.result.lock().take()
-    }
-
-    pub fn store_result(&self, r: IrqWaitResult) {
-        *self.result.lock() = Some(r);
-    }
-
-    pub fn wake_by_ref(&self) {
-        let g = self.waker.lock();
-
-        if let Some(w) = g.as_ref() {
-            w.wake_by_ref();
-        }
-    }
-
-    pub fn clear(&self) {
-        self.enqueued.store(false, Ordering::Release);
-        *self.waker.lock() = None;
-        *self.result.lock() = None;
-    }
-}
-
-pub struct WaitState {
-    pub waiters: VecDeque<WaiterPtr>,
-    pub pending_signals: usize,
-    pub last_meta: IrqMeta,
-}
-
-impl WaitState {
-    pub const fn new() -> Self {
-        Self {
-            waiters: VecDeque::new(),
-            pending_signals: 0,
-            last_meta: IrqMeta::new(),
-        }
-    }
-
-    pub fn pop_waiter(&mut self) -> Option<WaiterPtr> {
-        self.waiters.pop_front()
-    }
-
-    pub fn push_waiter(&mut self, waiter: WaiterPtr) {
-        self.waiters.push_back(waiter);
-    }
-
-    pub fn remove_waiter(&mut self, target: WaiterPtr) -> bool {
-        let before = self.waiters.len();
-        self.waiters.retain(|w| !w.ptr_eq(target));
-        before != self.waiters.len()
     }
 }
 

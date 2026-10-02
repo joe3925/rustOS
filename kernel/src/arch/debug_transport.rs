@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use kernel_types::irq::IrqSafeMutex;
+use spin::Mutex;
 
 const META_PREFIX: &[u8] = b"\x1eRUSTOS_META ";
 const HELLO_COMMAND: &[u8] = b"RUSTOS_META_HELLO version=1";
@@ -9,6 +9,7 @@ const RX_LINE_CAPACITY: usize = 128;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static LAST_READY_MODULE: AtomicU32 = AtomicU32::new(0);
+pub(crate) static RX_CONTEXT_READY: AtomicBool = AtomicBool::new(false);
 
 struct RxState {
     bytes: [u8; RX_LINE_CAPACITY],
@@ -43,7 +44,7 @@ impl RxState {
     }
 }
 
-static RX_STATE: IrqSafeMutex<RxState> = IrqSafeMutex::new(RxState::new());
+static RX_STATE: Mutex<RxState> = Mutex::new(RxState::new());
 
 enum RxEvent {
     None,
@@ -90,7 +91,10 @@ pub fn begin_initialize() -> bool {
 }
 
 pub fn poll_rx_once(mut read_byte: impl FnMut() -> Option<u8>) {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !INITIALIZED.load(Ordering::Acquire) || !RX_CONTEXT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    if crate::platform::current_is_in_interrupt() {
         return;
     }
     let mut hello_received = false;
@@ -134,6 +138,12 @@ pub fn metadata_sink(
 }
 
 pub fn sync_debug_module_load(module_id: u32, mut poll: impl FnMut()) {
+    if !RX_CONTEXT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    if crate::platform::current_is_in_interrupt() {
+        return;
+    }
     while LAST_READY_MODULE.load(Ordering::Acquire) < module_id {
         poll();
         core::hint::spin_loop();

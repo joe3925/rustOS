@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_abi::{MemoryRegion, MemoryRegionKind};
 use kernel_types::arch::PhysAddr;
 use kernel_types::irq::IrqSafeRwLock;
+use kernel_types::state_map::AtomicStateMap;
 
 use crate::platform::PageTableFrameAllocator;
 use crate::util::boot_info;
@@ -12,7 +13,7 @@ use crate::util::boot_info;
 use super::frame_bitmap::{
     BitmapResizeError, FrameBitmap, RuntimeFrameBitmap, bit_is_set,
     bitmap_layout_for_physical_coverage, build_memory_bitmap, clear_range, clear_unused_tail_bits,
-    count_set_bits_up_to, first_set_bit_in_range, heap_bitmap, low_reserved_frames,
+    count_set_bits_up_to, first_set_bit_in_range, low_reserved_frames,
     mark_unused_tail_bits_allocated, physical_coverage_for_ram,
     preserve_reclaimed_free_bits_limited, preserve_set_bits_limited, range_fits_bitmap, set_range,
     set_range_count_new, usable_region_bytes_below,
@@ -38,9 +39,14 @@ static NEXT_CONTIG_WORD_BASE: AtomicUsize = AtomicUsize::new(0);
 static FRAME_SIZE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LOW_RESERVED_FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+struct RuntimeAllocatorState {
+    memory: RuntimeFrameBitmap,
+    reclaimed: AtomicStateMap<1>,
+}
+
 struct RuntimeBitmapSlot {
     state: AtomicUsize,
-    bitmap: UnsafeCell<MaybeUninit<RuntimeFrameBitmap>>,
+    bitmap: UnsafeCell<MaybeUninit<RuntimeAllocatorState>>,
 }
 
 unsafe impl Sync for RuntimeBitmapSlot {}
@@ -53,7 +59,7 @@ impl RuntimeBitmapSlot {
         }
     }
 
-    fn get(&self) -> Option<&RuntimeFrameBitmap> {
+    fn get(&self) -> Option<&RuntimeAllocatorState> {
         if self.state.load(Ordering::Acquire) != RUNTIME_BITMAP_READY {
             return None;
         }
@@ -65,7 +71,7 @@ impl RuntimeBitmapSlot {
         self.state.load(Ordering::Acquire) == RUNTIME_BITMAP_READY
     }
 
-    fn install(&self, bitmap: RuntimeFrameBitmap) -> Result<(), RuntimeFrameBitmap> {
+    fn install(&self, bitmap: RuntimeAllocatorState) -> Result<(), RuntimeAllocatorState> {
         match self.state.compare_exchange(
             RUNTIME_BITMAP_EMPTY,
             RUNTIME_BITMAP_INITIALIZING,
@@ -96,15 +102,15 @@ impl KernelFrameAllocator {
 
     /// Allocates one base physical frame.
     pub fn allocate_base_frame() -> Option<PhysAddr> {
-        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
-            return allocate_base_frame_runtime(runtime);
+        if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+            return allocate_base_frame_runtime(&state.memory);
         }
 
         allocate_base_frame_boot()
     }
 
     pub fn allocate_zeroed_base_frame() -> Option<PhysAddr> {
-        let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() else {
+        let Some(state) = RUNTIME_MEMORY_BITMAP.get() else {
             let phys = allocate_base_frame_boot()?;
             if super::zero::zero_physical_frame(phys).is_err() {
                 free_mapping_frame_boot(
@@ -117,6 +123,7 @@ impl KernelFrameAllocator {
             }
             return Some(phys);
         };
+        let runtime = &state.memory;
 
         if let Some(frame) = runtime.alloc_zeroed_frame() {
             return finish_runtime_frame_allocation(runtime, frame);
@@ -143,9 +150,10 @@ impl KernelFrameAllocator {
     }
 
     pub fn zero_one_free_frame() -> bool {
-        let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() else {
+        let Some(state) = RUNTIME_MEMORY_BITMAP.get() else {
             return false;
         };
+        let runtime = &state.memory;
         let Some(frame) = runtime.alloc_dirty_frame() else {
             return false;
         };
@@ -168,7 +176,7 @@ impl KernelFrameAllocator {
     pub fn has_dirty_free_frames() -> bool {
         RUNTIME_MEMORY_BITMAP
             .get()
-            .is_some_and(RuntimeFrameBitmap::has_dirty_frames)
+            .is_some_and(|state| state.memory.has_dirty_frames())
     }
 
     /// Allocates a frame range suitable for a mapping of `size`.
@@ -186,8 +194,12 @@ impl KernelFrameAllocator {
             return None;
         }
 
-        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
-            return allocate_contiguous_frames_aligned_runtime(runtime, frame_count, align_frames);
+        if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+            return allocate_contiguous_frames_aligned_runtime(
+                &state.memory,
+                frame_count,
+                align_frames,
+            );
         }
 
         allocate_contiguous_frames_aligned_boot(frame_count, align_frames)
@@ -199,8 +211,8 @@ impl KernelFrameAllocator {
     /// The frame range must be owned by the caller, no longer mapped or
     /// referenced, and freed exactly once.
     pub unsafe fn free_mapping_frame(base: PhysAddr, size: MappingSize) {
-        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
-            free_mapping_frame_runtime(runtime, base, size);
+        if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+            free_mapping_frame_runtime(&state.memory, base, size);
             return;
         }
 
@@ -213,8 +225,8 @@ impl KernelFrameAllocator {
     /// The frame range must be reserved, owned by the caller, unused, and
     /// released exactly once.
     pub unsafe fn release_reserved_mapping_frame(base: PhysAddr, size: MappingSize) {
-        if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
-            release_reserved_mapping_frame_runtime(runtime, base, size);
+        if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+            release_reserved_mapping_frame_runtime(state, base, size);
             return;
         }
 
@@ -339,8 +351,8 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
     let physical_coverage_bytes = physical_coverage_for_ram(memory_regions, total_ram_bytes)?;
     let (new_frames, new_words) = bitmap_layout_for_physical_coverage(physical_coverage_bytes)?;
 
-    if let Some(runtime) = RUNTIME_MEMORY_BITMAP.get() {
-        if runtime.frame_capacity() == new_frames && runtime.word_len() == new_words {
+    if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+        if state.memory.frame_capacity() == new_frames && state.memory.word_len() == new_words {
             refresh_boot_usable_stats(memory_regions, physical_coverage_bytes);
             return Ok(());
         }
@@ -349,12 +361,13 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
     }
 
     let mut new_bitmap = build_memory_bitmap(memory_regions, new_frames, new_words)?;
-    let mut new_reclaimed = heap_bitmap(new_words, 0)?;
+    let new_reclaimed =
+        AtomicStateMap::<1>::try_new(new_frames).map_err(|_| BitmapResizeError::AllocationFailed)?;
     let runtime_builder = RuntimeFrameBitmap::prepare(new_frames)?;
 
-    let old_reclaimed_heap = {
+    {
         let bm = MEMORY_BITMAP.write();
-        let mut reclaimed = RECLAIMED_MEMORY_BITMAP.write();
+        let reclaimed = RECLAIMED_MEMORY_BITMAP.read();
 
         if RUNTIME_MEMORY_BITMAP.is_ready() {
             return Err(BitmapResizeError::RuntimeAllocatorAlreadyInitialized);
@@ -375,17 +388,24 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
         );
         mark_unused_tail_bits_allocated(new_bitmap.as_mut_slice(), new_frames);
 
-        preserve_set_bits_limited(
-            new_reclaimed.as_mut_slice(),
-            reclaimed.as_slice(),
-            core::cmp::min(reclaimed.frame_capacity(), new_frames),
-        );
-        clear_unused_tail_bits(new_reclaimed.as_mut_slice(), new_frames);
+        let common_reclaimed_frames = core::cmp::min(reclaimed.frame_capacity(), new_frames);
+        for word_index in 0..common_reclaimed_frames.div_ceil(WORD_BITS) {
+            let remaining = common_reclaimed_frames - word_index * WORD_BITS;
+            let mask = if remaining >= WORD_BITS {
+                u64::MAX
+            } else {
+                (1u64 << remaining) - 1
+            };
+            new_reclaimed.fetch_or_word(
+                word_index,
+                reclaimed.as_slice()[word_index] & mask,
+                Ordering::Relaxed,
+            );
+        }
 
-        let reclaimed_frames = count_set_bits_up_to(new_reclaimed.as_slice(), new_frames);
+        let reclaimed_frames =
+            count_set_bits_up_to(reclaimed.as_slice(), common_reclaimed_frames);
         let runtime_bitmap = runtime_builder.build(new_bitmap.as_slice())?;
-
-        let old_reclaimed_heap = reclaimed.replace_with_heap_storage(new_reclaimed, new_frames);
 
         NEXT_WORD_BASE.store(0, Ordering::Relaxed);
         NEXT_CONTIG_WORD_BASE.store(0, Ordering::Relaxed);
@@ -396,13 +416,12 @@ pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeErr
         refresh_boot_usable_stats(memory_regions, physical_coverage_bytes);
 
         RUNTIME_MEMORY_BITMAP
-            .install(runtime_bitmap)
+            .install(RuntimeAllocatorState {
+                memory: runtime_bitmap,
+                reclaimed: new_reclaimed,
+            })
             .map_err(|_| BitmapResizeError::RuntimeAllocatorAlreadyInitialized)?;
-
-        old_reclaimed_heap
-    };
-
-    drop(old_reclaimed_heap);
+    }
 
     Ok(())
 }
@@ -477,10 +496,11 @@ fn free_mapping_frame_runtime(runtime: &RuntimeFrameBitmap, base: PhysAddr, size
 }
 
 fn release_reserved_mapping_frame_runtime(
-    runtime: &RuntimeFrameBitmap,
+    state: &RuntimeAllocatorState,
     base: PhysAddr,
     size: MappingSize,
 ) {
+    let runtime = &state.memory;
     let Some(len) = base_frame_count_for_mapping(size) else {
         return;
     };
@@ -501,10 +521,24 @@ fn release_reserved_mapping_frame_runtime(
     }
 
     if !frame_range_is_boot_info_usable(base_idx, len) {
-        let mut reclaimed = RECLAIMED_MEMORY_BITMAP.write();
-        let reclaimed_frames = reclaimed.frame_capacity();
-        let newly_reclaimed =
-            set_range_count_new(reclaimed.as_mut_slice(), reclaimed_frames, base_idx, len);
+        let mut cursor = base_idx;
+        let mut newly_reclaimed = 0usize;
+
+        while cursor < end {
+            let word_index = cursor / WORD_BITS;
+            let first_bit = cursor % WORD_BITS;
+            let count = (end - cursor).min(WORD_BITS - first_bit);
+            let mask = if count == WORD_BITS {
+                u64::MAX
+            } else {
+                ((1u64 << count) - 1) << first_bit
+            };
+            let old = state
+                .reclaimed
+                .fetch_or_word(word_index, mask, Ordering::Relaxed);
+            newly_reclaimed += (mask & !old).count_ones() as usize;
+            cursor += count;
+        }
 
         if newly_reclaimed != 0 {
             RECLAIMED_MEMORY_BYTES.fetch_add(
@@ -522,6 +556,10 @@ fn allocate_base_frame_boot() -> Option<PhysAddr> {
     let frame_size = cached_frame_size();
     let low_frames = cached_low_reserved_frames();
     let mut bm = MEMORY_BITMAP.write();
+    if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+        drop(bm);
+        return allocate_base_frame_runtime(&state.memory);
+    }
     let words = bm.word_len();
     let total_frames = bm.frame_capacity();
 
@@ -564,6 +602,14 @@ fn allocate_contiguous_frames_aligned_boot(
     let frame_size = cached_frame_size();
     let low_frames = cached_low_reserved_frames();
     let mut bm = MEMORY_BITMAP.write();
+    if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+        drop(bm);
+        return allocate_contiguous_frames_aligned_runtime(
+            &state.memory,
+            frame_count,
+            align_frames,
+        );
+    }
     let total_words = bm.word_len();
     let total_frames = bm.frame_capacity();
 
@@ -648,6 +694,11 @@ fn free_mapping_frame_boot(base: PhysAddr, size: MappingSize) {
     }
 
     let mut bm = MEMORY_BITMAP.write();
+    if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+        drop(bm);
+        free_mapping_frame_runtime(&state.memory, base, size);
+        return;
+    }
     if !range_fits_bitmap(&bm, base_idx, len) {
         return;
     }
@@ -672,6 +723,11 @@ fn release_reserved_mapping_frame_boot(base: PhysAddr, size: MappingSize) {
     }
 
     let mut bm = MEMORY_BITMAP.write();
+    if let Some(state) = RUNTIME_MEMORY_BITMAP.get() {
+        drop(bm);
+        release_reserved_mapping_frame_runtime(state, base, size);
+        return;
+    }
     if !range_fits_bitmap(&bm, base_idx, len) {
         return;
     }

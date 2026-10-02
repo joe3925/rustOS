@@ -120,6 +120,7 @@ pub unsafe fn init() {
     }
 
     init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire));
+    crate::arch::debug_transport::RX_CONTEXT_READY.store(true, Ordering::Release);
 
     init_periodic_timer();
     SCHEDULER.init_core(current_cpu_id());

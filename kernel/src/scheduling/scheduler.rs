@@ -17,10 +17,11 @@ use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
 use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
@@ -99,7 +100,7 @@ struct SchedulerState {
 
 pub struct Scheduler {
     all_tasks: TaskTable,
-    cores: IrqSafeRwLock<Vec<Arc<CoreScheduler>>>,
+    cores: [AtomicPtr<CoreScheduler>; platform::MAX_CPUS],
     domains: DomainMaster<RoundRobinDomainAlgorithm>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
@@ -113,7 +114,7 @@ impl Scheduler {
     fn new() -> Self {
         Self {
             all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
-            cores: IrqSafeRwLock::new(Vec::new()),
+            cores: [const { AtomicPtr::new(ptr::null_mut()) }; platform::MAX_CPUS],
             domains: DomainMaster::new(
                 alloc::vec![
                     DomainEntry::new(
@@ -134,9 +135,10 @@ impl Scheduler {
     }
 
     #[inline(always)]
-    fn core(&self, cpu_id: usize) -> Option<Arc<CoreScheduler>> {
-        let cores = self.cores.read();
-        cores.get(cpu_id).cloned()
+    fn core(&self, cpu_id: usize) -> Option<&CoreScheduler> {
+        let slot = self.cores.get(cpu_id)?;
+        let ptr = slot.load(Ordering::Acquire);
+        unsafe { ptr.as_ref() }
     }
 
     #[inline(always)]
@@ -144,7 +146,7 @@ impl Scheduler {
         &self,
         cpu_id: usize,
         platform_cpu_id: kernel_types::irq::PlatformCpuId,
-    ) -> Arc<CoreScheduler> {
+    ) -> Box<CoreScheduler> {
         let idle = Task::new_kernel_mode(
             platform::idle_task_entry(),
             0,
@@ -158,7 +160,7 @@ impl Scheduler {
         let _idle_id = self.register_task_no_reap(idle.clone());
         idle.set_target_cpu(cpu_id);
 
-        Arc::new(CoreScheduler {
+        Box::new(CoreScheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
             idle_task: idle.clone(),
             current_is_idle: AtomicBool::new(false),
@@ -167,18 +169,6 @@ impl Scheduler {
     }
 
     pub fn init_core(&self, cpu_id: usize) {
-        let mut cores = self.cores.write();
-
-        if cpu_id < cores.len() {
-            return;
-        }
-
-        assert!(
-            cpu_id == cores.len(),
-            "cpu ids must be contiguous (got {}, expected next {})",
-            cpu_id,
-            cores.len()
-        );
         assert!(
             cpu_id < platform::MAX_CPUS,
             "cpu id {} exceeds scheduler domain cpu capacity {}",
@@ -186,9 +176,22 @@ impl Scheduler {
             platform::MAX_CPUS
         );
 
+        if self.core(cpu_id).is_some() {
+            return;
+        }
+
+        let expected = self.num_cores();
+        assert!(
+            cpu_id == expected,
+            "cpu ids must be contiguous (got {}, expected next {})",
+            cpu_id,
+            expected
+        );
+
         let platform_cpu_id = platform::current_platform_cpu_id();
-        cores.push(self.build_core(cpu_id, platform_cpu_id));
-        self.num_cores.store(cores.len(), Ordering::Release);
+        let core = self.build_core(cpu_id, platform_cpu_id);
+        self.cores[cpu_id].store(Box::into_raw(core), Ordering::Release);
+        self.num_cores();
     }
 
     fn register_task(&self, task: TaskHandle) -> u64 {
@@ -246,7 +249,7 @@ impl Scheduler {
     }
 
     pub fn add_task(&self, task: TaskHandle) -> u64 {
-        let n = self.num_cores.load(Ordering::Acquire);
+        let n = self.num_cores();
         if n == 0 {
             return 0;
         }
@@ -287,9 +290,7 @@ impl Scheduler {
 
     #[inline(always)]
     pub fn try_get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
-        let cores = self.cores.try_read()?;
-        let core = cores.get(cpu_id)?.clone();
-        drop(cores);
+        let core = self.core(cpu_id)?;
         let state = core.sched_lock.try_read()?;
         state.current.clone()
     }
@@ -330,7 +331,7 @@ impl Scheduler {
     pub fn unpark(&self, task: &TaskHandle) {
         task.grant_permit();
 
-        let n = self.num_cores.load(Ordering::Acquire);
+        let n = self.num_cores();
         if n == 0 {
             return;
         }
@@ -452,7 +453,7 @@ impl Scheduler {
             }
         }
 
-        let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
+        let next = match self.schedule_next(cpu_id, core, now_cycles, true) {
             Some(task) => task,
             None => return prev_task,
         };
@@ -471,7 +472,7 @@ impl Scheduler {
     fn schedule_next(
         &self,
         cpu_id: usize,
-        core: &Arc<CoreScheduler>,
+        core: &CoreScheduler,
         now_cycles: u64,
         prev_fpu_already_saved: bool,
     ) -> Option<TaskHandle> {
@@ -698,11 +699,29 @@ impl Scheduler {
     }
 
     pub fn num_cores(&self) -> usize {
-        self.num_cores.load(Ordering::Relaxed)
+        let mut count = self.num_cores.load(Ordering::Acquire);
+
+        loop {
+            if count == self.cores.len()
+                || self.cores[count].load(Ordering::Acquire).is_null()
+            {
+                return count;
+            }
+
+            match self.num_cores.compare_exchange(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => count += 1,
+                Err(actual) => count = actual,
+            }
+        }
     }
 
     pub(crate) fn new_task_placement_start(&self) -> usize {
-        let n = self.num_cores.load(Ordering::Acquire);
+        let n = self.num_cores();
         if n == 0 {
             0
         } else {
@@ -757,7 +776,7 @@ impl Scheduler {
 
         let now_cycles = platform::cycle_counter();
 
-        let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
+        let next = match self.schedule_next(cpu_id, core, now_cycles, true) {
             Some(t) => t,
             None => {
                 platform::end_interrupt(platform::scheduler_ipi_vector());
