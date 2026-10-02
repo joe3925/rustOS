@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       accept_run_id:
-        description: Completed benchmark run ID to accept as the trusted baseline (leave blank to run benchmarks)
+        description: Completed benchmark run ID to accept as the baseline for the selected branch (leave blank to run benchmarks)
         required: false
         type: string
         default: ""
@@ -16,10 +16,6 @@ permissions:
 
 env:
   BENCH_ENV_VERSION: "2"
-
-concurrency:
-  group: kernel-bench-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 jobs:
   benchmark:
@@ -113,8 +109,8 @@ jobs:
           BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          baseline_cache="$RUNNER_TEMP/rustos-baselines"
-          mkdir -p "$baseline_cache"
+          baseline_cache="$RUNNER_TEMP/rustos-baselines-$GITHUB_RUN_ID"
+          mkdir -p "$baseline_cache" target/bench
 
           list_runs() {
             local branch="$1"
@@ -122,43 +118,83 @@ jobs:
             local encoded_branch
             encoded_branch="$(jq -rn --arg value "$branch" '$value | @uri')"
             local query="repos/${GITHUB_REPOSITORY}/actions/workflows/kernel-benchmarks.yml/runs?branch=${encoded_branch}&status=${status}&per_page=50"
-            gh api "$query"
+            gh api --paginate "$query"
           }
 
           echo "trusted_available=false" >> "$GITHUB_OUTPUT"
           trusted_candidates="$baseline_cache/trusted-candidates.txt"
-          list_runs "$DEFAULT_BRANCH" completed |
-            jq -r '.workflow_runs[].id' > "$trusted_candidates"
-          while read -r run_id; do
-            run_dir="$baseline_cache/trusted-${run_id}"
-            mkdir -p "$run_dir"
-            if ! gh run download "$run_id" \
-              --name kernel-benchmark-anchor \
-              --dir "$run_dir"; then
-              continue
-            fi
+          for baseline_branch in "$BENCH_BRANCH" "$DEFAULT_BRANCH"; do
+            best_acceptance=0
+            best_dir=""
+            list_runs "$baseline_branch" completed |
+              jq -r '.workflow_runs[].id' > "$trusted_candidates"
+            while read -r run_id; do
+              [[ "$run_id" == "$GITHUB_RUN_ID" ]] && continue
+              run_dir="$baseline_cache/trusted-${run_id}"
+              mkdir -p "$run_dir"
+              if ! gh run download "$run_id" \
+                --name kernel-benchmark-anchor \
+                --dir "$run_dir"; then
+                continue
+              fi
 
-            manifest="$run_dir/manifest.json"
-            result="$run_dir/results.json"
-            boot_image="$run_dir/boot.img"
-            if [[ -f "$manifest" && -f "$result" && -f "$boot_image" ]] &&
-              [[ "$(jq -r '.environment_version // empty' "$manifest")" == "$BENCH_ENV_VERSION" ]]; then
+              manifest="$run_dir/manifest.json"
+              result="$run_dir/results.json"
+              boot_image="$run_dir/boot.img"
+              if [[ -f "$manifest" && -f "$result" && -f "$boot_image" ]] &&
+                [[ "$(jq -r '.environment_version // empty' "$manifest")" == "$BENCH_ENV_VERSION" ]] &&
+                [[ "$(jq -r --arg default_branch "$DEFAULT_BRANCH" '.branch // $default_branch' "$manifest")" == "$baseline_branch" ]] &&
+                jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+                acceptance="$(jq -r '.accepted_by_run' "$manifest")"
+                if [[ "$acceptance" =~ ^[0-9]+$ ]] && (( acceptance > best_acceptance )); then
+                  best_acceptance="$acceptance"
+                  best_dir="$run_dir"
+                fi
+              fi
+            done < "$trusted_candidates"
+            if [[ -n "$best_dir" ]]; then
               mkdir -p target/bench/anchor
-              cp "$manifest" target/bench/anchor/manifest.json
-              cp "$result" target/bench/anchor/results.json
-              cp "$boot_image" target/bench/anchor/boot.img
+              cp "$best_dir/"{manifest.json,results.json,boot.img} target/bench/anchor/
               echo "trusted_available=true" >> "$GITHUB_OUTPUT"
-              echo "trusted_run_id=$(jq -r '.run_id' "$manifest")" >> "$GITHUB_OUTPUT"
-              echo "trusted_commit=$(jq -r '.commit' "$manifest")" >> "$GITHUB_OUTPUT"
+              echo "trusted_run_id=$(jq -r '.run_id' "$best_dir/manifest.json")" >> "$GITHUB_OUTPUT"
+              echo "trusted_commit=$(jq -r '.commit' "$best_dir/manifest.json")" >> "$GITHUB_OUTPUT"
               break
             fi
-          done < "$trusted_candidates"
+            [[ "$BENCH_BRANCH" == "$DEFAULT_BRANCH" ]] && break
+          done
+
+          if [[ ! -f target/bench/anchor/manifest.json && "$BENCH_BRANCH" != "$DEFAULT_BRANCH" ]]; then
+            list_runs "$DEFAULT_BRANCH" success |
+              jq -r '.workflow_runs[] | [.id, .head_sha] | @tsv' > "$trusted_candidates"
+            while IFS=$'\t' read -r run_id commit; do
+              run_dir="$baseline_cache/main-${run_id}"
+              mkdir -p "$run_dir"
+              if ! gh run download "$run_id" --name kernel-benchmarks --dir "$run_dir"; then
+                continue
+              fi
+              result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
+              boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
+              environment_version="$(find "$run_dir" -path '*/head/environment-version' -print -quit)"
+              if [[ -n "$result" && -n "$boot_image" && -n "$environment_version" ]] &&
+                [[ "$(<"$environment_version")" == "$BENCH_ENV_VERSION" ]] &&
+                jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+                mkdir -p target/bench/trusted
+                cp "$boot_image" target/bench/trusted/boot.img
+                echo "trusted_available=true" >> "$GITHUB_OUTPUT"
+                echo "trusted_run_id=$run_id" >> "$GITHUB_OUTPUT"
+                echo "trusted_commit=$commit" >> "$GITHUB_OUTPUT"
+                break
+              fi
+            done < "$trusted_candidates"
+          fi
 
           echo "previous_available=false" >> "$GITHUB_OUTPUT"
           previous_candidates="$baseline_cache/previous-candidates.txt"
           list_runs "$BENCH_BRANCH" completed |
-            jq -r '.workflow_runs[].id' > "$previous_candidates"
-          while read -r run_id; do
+            jq -r '.workflow_runs[] | [.id, .head_sha] | @tsv' > "$previous_candidates"
+          while IFS=$'\t' read -r run_id commit; do
+            [[ "$run_id" == "$GITHUB_RUN_ID" || "$commit" == "$GITHUB_SHA" ]] && continue
+            git merge-base --is-ancestor "$commit" "$GITHUB_SHA" || continue
             run_dir="$baseline_cache/previous-${run_id}"
             mkdir -p "$run_dir"
             if ! gh run download "$run_id" \
@@ -172,7 +208,7 @@ jobs:
             environment_version="$(find "$run_dir" -path '*/head/environment-version' -print -quit)"
             if [[ -n "$result" && -n "$boot_image" && -n "$environment_version" ]] &&
               [[ "$(<"$environment_version")" == "$BENCH_ENV_VERSION" ]] &&
-              jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+              jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
               cp "$boot_image" target/bench/previous-boot.img
               echo "previous_available=true" >> "$GITHUB_OUTPUT"
               echo "previous_run_id=$run_id" >> "$GITHUB_OUTPUT"
@@ -180,11 +216,33 @@ jobs:
             fi
           done < "$previous_candidates"
 
+      - name: Prepare default branch baseline when no artifact is available
+        id: main-baseline
+        if: steps.baselines.outputs.trusted_available != 'true' && github.ref_name != github.event.repository.default_branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
+          RUSTOS_DISK_FORMAT: raw
+        run: |
+          baseline_worktree="$RUNNER_TEMP/rustos-main-$GITHUB_RUN_ID"
+          baseline_image="$GITHUB_WORKSPACE/target/bench/trusted/boot.img"
+          git worktree add --detach "$baseline_worktree" "origin/$DEFAULT_BRANCH"
+          commit="$(git -C "$baseline_worktree" rev-parse HEAD)"
+          cd "$baseline_worktree"
+          cargo run --release -p xtask -- bench \
+            --tag ci \
+            --prepare-only \
+            --export-boot-image "$baseline_image"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          git -C "$GITHUB_WORKSPACE" worktree remove "$baseline_worktree"
+
       - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
         env:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
-          TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available }}
+          TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available == 'true' || steps.main-baseline.outputs.available == 'true' }}
           PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
         run: |
           cargo run --release -p xtask -- bench \
@@ -205,7 +263,11 @@ jobs:
           }
 
           if [[ "$TRUSTED_AVAILABLE" == "true" ]]; then
-            run_variant trusted target/bench/anchor/boot.img
+            if [[ -f target/bench/anchor/boot.img ]]; then
+              run_variant trusted target/bench/anchor/boot.img
+            else
+              run_variant trusted target/bench/trusted/boot.img
+            fi
           fi
           run_variant head target/bench/head/boot.img
           if [[ "$PREVIOUS_AVAILABLE" == "true" ]]; then
@@ -215,9 +277,9 @@ jobs:
       - name: Compare benchmark results
         shell: bash
         env:
-          TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available }}
-          TRUSTED_RUN_ID: ${{ steps.baselines.outputs.trusted_run_id }}
-          TRUSTED_COMMIT: ${{ steps.baselines.outputs.trusted_commit }}
+          TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available == 'true' || steps.main-baseline.outputs.available == 'true' }}
+          TRUSTED_RUN_ID: ${{ steps.baselines.outputs.trusted_run_id || 'current default branch build' }}
+          TRUSTED_COMMIT: ${{ steps.baselines.outputs.trusted_commit || steps.main-baseline.outputs.commit }}
           PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
           PREVIOUS_RUN_ID: ${{ steps.baselines.outputs.previous_run_id }}
         run: |
@@ -236,7 +298,7 @@ jobs:
               --base target/bench/trusted/results.json \
               --head target/bench/head/results.json \
               --output target/bench/comparison-trusted.md \
-              --title "Against trusted baseline (\`$TRUSTED_COMMIT\`, accepted by run \`$TRUSTED_RUN_ID\`)"
+              --title "Against trusted baseline (\`$TRUSTED_COMMIT\`, baseline run \`$TRUSTED_RUN_ID\`)"
             trusted_status=$?
             cat target/bench/comparison-trusted.md >> "$GITHUB_STEP_SUMMARY"
             if (( trusted_status != 0 )); then
@@ -246,7 +308,7 @@ jobs:
             {
               echo "## Against trusted baseline"
               echo
-              echo "No trusted baseline has been accepted yet. Dispatch this workflow with a completed run ID in \`accept_run_id\` to create one."
+              echo "No compatible baseline is available for this branch or the default branch. Dispatch this workflow on this branch with a completed run ID in \`accept_run_id\` to create one."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -306,7 +368,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ACCEPT_RUN_ID: ${{ inputs.accept_run_id }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BENCH_BRANCH: ${{ github.ref_name }}
         run: |
           run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ACCEPT_RUN_ID}")"
           source_branch="$(jq -r '.head_branch' <<< "$run_json")"
@@ -318,8 +380,8 @@ jobs:
             echo "::error::Run $ACCEPT_RUN_ID is not a Kernel benchmarks workflow run."
             exit 1
           fi
-          if [[ "$source_branch" != "$DEFAULT_BRANCH" ]]; then
-            echo "::error::Only a benchmark from the default branch ($DEFAULT_BRANCH) can become the trusted baseline."
+          if [[ "$source_branch" != "$BENCH_BRANCH" ]]; then
+            echo "::error::Run $ACCEPT_RUN_ID must be from the selected branch ($BENCH_BRANCH)."
             exit 1
           fi
           if [[ "$source_status" != "completed" ]]; then
@@ -344,13 +406,14 @@ jobs:
             echo "::error::Run $ACCEPT_RUN_ID uses a different benchmark environment version."
             exit 1
           fi
-          jq -e 'all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null
+          jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null
 
           cp "$result" target/bench/anchor/results.json
           cp "$boot_image" target/bench/anchor/boot.img
           jq -n \
             --arg run_id "$ACCEPT_RUN_ID" \
             --arg commit "$source_commit" \
+            --arg branch "$source_branch" \
             --arg environment_version "$BENCH_ENV_VERSION" \
             --arg accepted_by_run "$GITHUB_RUN_ID" \
             --arg accepted_at "$(date --utc --iso-8601=seconds)" \
@@ -358,6 +421,7 @@ jobs:
               schema: 1,
               run_id: $run_id,
               commit: $commit,
+              branch: $branch,
               environment_version: $environment_version,
               accepted_by_run: $accepted_by_run,
               accepted_at: $accepted_at

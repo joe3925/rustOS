@@ -16,11 +16,10 @@ use std::{
 };
 
 use crate::{
-    assert_exists, build_platform, config, find_firmware, find_qemu, qemu_args, system_disk,
-    QemuOptions, SystemDisk,
+    QemuOptions, SystemDisk, assert_exists, build_platform, config, find_firmware, find_qemu,
+    qemu_args, system_disk,
 };
 
-const PROTOCOL_PREFIX: &str = "RUSTOS_BENCH\t";
 const MAX_ACTION_ANNOTATIONS: usize = 3;
 static ACTION_ANNOTATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -30,6 +29,7 @@ pub enum BenchCommand {
 }
 
 pub struct BenchOptions {
+    correctness: bool,
     platform: String,
     launch: String,
     host: Option<String>,
@@ -45,16 +45,19 @@ pub struct BenchOptions {
     offline: bool,
 }
 
-pub fn parse<I>(args: I) -> Result<BenchCommand, String>
+pub fn parse<I>(args: I, correctness: bool) -> Result<BenchCommand, String>
 where
     I: IntoIterator<Item = String>,
 {
     let mut args = args.into_iter().peekable();
     if args.peek().map(String::as_str) == Some("compare") {
+        if correctness {
+            return Err("correctness does not support baseline comparison".to_string());
+        }
         args.next();
         CompareOptions::parse(args).map(BenchCommand::Compare)
     } else {
-        BenchOptions::parse(args).map(BenchCommand::Run)
+        BenchOptions::parse(args, correctness).map(BenchCommand::Run)
     }
 }
 
@@ -69,14 +72,14 @@ pub fn execute(root: &Path, command: BenchCommand) -> Result<(), String> {
     };
     if annotations {
         if let Err(err) = &result {
-            annotate_error("Benchmark command failed", err);
+            annotate_error("Kernel command failed", err);
         }
     }
     result
 }
 
 impl BenchOptions {
-    fn parse<I>(args: I) -> Result<Self, String>
+    fn parse<I>(args: I, correctness: bool) -> Result<Self, String>
     where
         I: IntoIterator<Item = String>,
     {
@@ -86,7 +89,11 @@ impl BenchOptions {
         let mut cpus = vec![1, 2, 4];
         let mut suites = Vec::new();
         let mut tags = Vec::new();
-        let mut output = PathBuf::from("target/bench/results.json");
+        let mut output = PathBuf::from(if correctness {
+            "target/correctness/results.json"
+        } else {
+            "target/bench/results.json"
+        });
         let mut boot_image = None;
         let mut export_boot_image = None;
         let mut prepare_only = false;
@@ -154,6 +161,7 @@ impl BenchOptions {
         }
 
         Ok(Self {
+            correctness,
             platform,
             launch,
             host,
@@ -203,6 +211,16 @@ struct ProtocolEvent {
 }
 
 fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
+    let mode = if options.correctness {
+        "correctness"
+    } else {
+        "benchmark"
+    };
+    let protocol_prefix = if options.correctness {
+        "RUSTOS_CORRECTNESS\t"
+    } else {
+        "RUSTOS_BENCH\t"
+    };
     let platform = config::load_platform(root, &options.platform)?;
     let launch = config::load_launch(root, &options.launch)?;
     let host = config::load_host(
@@ -214,15 +232,38 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         resolve(root, path)
     } else {
         // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("RUSTOS_BENCH_SUITES", options.suites.join(",")) };
+        unsafe {
+            std::env::set_var(
+                if options.correctness {
+                    "RUSTOS_CORRECTNESS_SUITES"
+                } else {
+                    "RUSTOS_BENCH_SUITES"
+                },
+                options.suites.join(","),
+            )
+        };
         // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("RUSTOS_BENCH_TAGS", options.tags.join(",")) };
+        unsafe {
+            std::env::set_var(
+                if options.correctness {
+                    "RUSTOS_CORRECTNESS_TAGS"
+                } else {
+                    "RUSTOS_BENCH_TAGS"
+                },
+                options.tags.join(","),
+            )
+        };
         build_platform(
             root,
             &platform,
             true,
             options.offline,
-            &["kernel-bench".to_string()],
+            &[if options.correctness {
+                "kernel-correctness"
+            } else {
+                "kernel-bench"
+            }
+            .to_string()],
         )?;
         crate::load_artifact_manifest(root, &platform, true)?.boot_image
     };
@@ -276,7 +317,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
             if repetition > 1 && !suite_boots.iter().any(|(_, boots)| *boots >= repetition) {
                 break;
             }
-            println!("==> benchmarking with {cpus} vCPU(s), repetition {repetition}");
+            println!("==> {mode} with {cpus} vCPU(s), repetition {repetition}");
             let serial_log =
                 bench_dir.join(format!("{cpus}cpu-repetition-{repetition}.serial.log"));
             let topology = run_topology(
@@ -291,6 +332,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                 options.boot_timeout,
                 options.timeout,
                 serial_log,
+                protocol_prefix,
             );
             let topology = match topology {
                 Ok(topology) => topology,
@@ -299,7 +341,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                     return Err(error);
                 }
             };
-            if repetition == 1 {
+            if repetition == 1 && !options.correctness {
                 suite_boots = match suite_boot_plan(&topology) {
                     Ok(plan) => plan,
                     Err(error) => {
@@ -320,7 +362,12 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
     }
 
     let report = BenchReport {
-        schema: "rustos.bench-run.v1".to_string(),
+        schema: if options.correctness {
+            "rustos.correctness-run.v1"
+        } else {
+            "rustos.bench-run.v1"
+        }
+        .to_string(),
         protocol_version: 1,
         runs,
     };
@@ -334,11 +381,11 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         .iter()
         .all(|run| run.complete && run.status == "passed")
     {
-        println!("benchmark results: {}", output.display());
+        println!("{mode} results: {}", output.display());
         Ok(())
     } else {
         Err(format!(
-            "one or more benchmark topologies failed; partial results: {}",
+            "one or more {mode} CPU configurations failed; partial results: {}",
             output.display()
         ))
     }
@@ -357,6 +404,7 @@ fn run_topology(
     boot_timeout: Duration,
     timeout: Duration,
     serial_log: PathBuf,
+    protocol_prefix: &str,
 ) -> Result<TopologyRun, String> {
     let qemu_options = QemuOptions {
         release: true,
@@ -411,6 +459,7 @@ fn run_topology(
             println!("{line}");
             benchmark_started |= record_serial_line(
                 &line,
+                protocol_prefix,
                 &mut serial,
                 &mut events,
                 &mut complete,
@@ -455,6 +504,7 @@ fn run_topology(
         let line = line.map_err(|err| format!("failed reading QEMU serial output: {err}"))?;
         let _ = record_serial_line(
             &line,
+            protocol_prefix,
             &mut serial,
             &mut events,
             &mut complete,
@@ -472,26 +522,26 @@ fn run_topology(
         status = "panicked".to_string();
     } else if status == "timeout" {
         annotate_error(
-            &format!("Benchmark timed out ({cpus} vCPUs)"),
+            &format!("Kernel run timed out ({cpus} vCPUs)"),
             &format!("QEMU did not finish within {} seconds", timeout.as_secs()),
         );
     } else if status == "boot_timeout" {
         annotate_error(
             &format!("Kernel boot timed out ({cpus} vCPUs)"),
             &format!(
-                "The kernel did not emit benchmark run_start within {} seconds",
+                "The kernel did not emit run_start within {} seconds",
                 boot_timeout.as_secs()
             ),
         );
     } else if complete && status != "passed" {
         annotate_error(
-            &format!("Benchmark failed ({cpus} vCPUs)"),
-            &format!("The benchmark runner reported terminal status `{status}`"),
+            &format!("Kernel run failed ({cpus} vCPUs)"),
+            &format!("The kernel runner reported status `{status}`"),
         );
     } else if !complete {
         annotate_error(
-            &format!("Incomplete benchmark ({cpus} vCPUs)"),
-            "QEMU exited without emitting a benchmark run_end event",
+            &format!("Incomplete kernel run ({cpus} vCPUs)"),
+            "QEMU exited without emitting a run_end event",
         );
     }
 
@@ -536,6 +586,7 @@ fn suite_boot_plan(run: &TopologyRun) -> Result<Vec<(String, usize)>, String> {
 #[allow(clippy::too_many_arguments)]
 fn record_serial_line(
     line: &str,
+    protocol_prefix: &str,
     serial: &mut String,
     events: &mut Vec<ProtocolEvent>,
     complete: &mut bool,
@@ -554,7 +605,7 @@ fn record_serial_line(
     }
 
     let mut run_started = false;
-    if let Some(event) = parse_event(line)? {
+    if let Some(event) = parse_event(line, protocol_prefix)? {
         run_started = event.kind == "run_start";
         if event.kind == "run_end" {
             *complete = true;
@@ -653,8 +704,8 @@ fn reserve_action_annotation() -> bool {
     true
 }
 
-fn parse_event(line: &str) -> Result<Option<ProtocolEvent>, String> {
-    let Some(rest) = line.strip_prefix(PROTOCOL_PREFIX) else {
+fn parse_event(line: &str, protocol_prefix: &str) -> Result<Option<ProtocolEvent>, String> {
+    let Some(rest) = line.strip_prefix(protocol_prefix) else {
         return Ok(None);
     };
     let mut fields = rest.splitn(3, '\t');
@@ -982,6 +1033,11 @@ fn collect_metrics(report: &BenchReport) -> Result<BTreeMap<MetricKey, MetricSam
         let mut boot_values = BTreeMap::<MetricKey, Vec<f64>>::new();
         for event in &run.events {
             if event.kind != "measurement" {
+                continue;
+            }
+            if event.payload.get("suite").and_then(Value::as_str) == Some("executor.runtime")
+                && event.payload.get("case").and_then(Value::as_str) == Some("correctness")
+            {
                 continue;
             }
             let text = |name: &str| {

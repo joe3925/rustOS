@@ -363,13 +363,13 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
         "boot time: {:.3}s, Used memory: {:.2} MiB, Used heap: {:.2} MiB",
         secs, used_mib, heap_mib
     );
-    #[cfg(feature = "kernel-bench")]
+    #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
     spawn_detached(async {
         crate::benchmarking::register_builtin_suites();
         let passed = crate::benchmarking::run_configured_suites().await;
         crate::benchmarking::exit_benchmark_vm(passed);
     });
-    #[cfg(not(feature = "kernel-bench"))]
+    #[cfg(not(any(feature = "kernel-bench", feature = "kernel-correctness")))]
     spawn_detached(async {
         loop {
             bench_c_drive_io_async(true).await;
