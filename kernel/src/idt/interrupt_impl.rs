@@ -1,14 +1,15 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::future::Future;
+use core::ops::Deref;
 use core::pin::Pin;
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::irq::{
     AtomicIrqMeta, DropHook, HardwareInterruptId, IrqBorrowedHandle, IrqFrame, IrqHandle,
-    IrqHandleInner, IrqIsrFn, IrqMeta, IrqSafeRwLock, IrqWaitResult, MsiBinding, MsiBindingRequest,
+    IrqHandleInner, IrqIsrFn, IrqMeta, IrqWaitResult, MsiBinding, MsiBindingRequest,
     WAITER_CLAIMED, WAITER_FREE, WAITER_MAX_TICKET, WAITER_PREPARING, WAITER_SIGNALED,
     WAITER_WAITING, WaiterSlot,
 };
@@ -18,9 +19,8 @@ use crate::platform::{self, ActivePlatform, InterruptPlatform};
 
 pub type InterruptFrame = <ActivePlatform as InterruptPlatform>::InterruptFrame;
 
-const MAX_HANDLERS_PER_VECTOR: usize = 4;
-const MAX_TOTAL_REGISTRATIONS: usize = 64;
-const RESERVED_ID: usize = usize::MAX;
+const SLOT_CLOSED: usize = 1 << (usize::BITS - 1);
+const SLOT_READERS: usize = SLOT_CLOSED - 1;
 const NO_VECTOR: usize = usize::MAX;
 const NO_SOURCE: usize = usize::MAX;
 const MAX_INTERRUPT_IDS: usize = 1024;
@@ -28,18 +28,10 @@ static BINDING_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_handle_create(drop_hook: DropHook) -> IrqHandle {
-    let ptr = create_irq_handle_inner(drop_hook);
-
-    match irq_manager().install_handle(NO_VECTOR, NO_SOURCE, ptr) {
-        Some(handle) => handle,
-        None => {
-            unsafe {
-                drop(Box::from_raw(ptr.as_ptr()));
-            }
-
-            null_handle()
-        }
-    }
+    let inner = create_irq_handle_inner(drop_hook);
+    irq_manager()
+        .install_handle(NO_VECTOR, NO_SOURCE, inner, dummy_isr, 0, false)
+        .unwrap_or_else(null_handle)
 }
 
 #[unsafe(no_mangle)]
@@ -52,7 +44,6 @@ pub extern "C" fn irq_handle_drop(_h: IrqHandle) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_handle_unregister(h: &IrqHandle) {
-    let _lifecycle = BINDING_LIFECYCLE.lock();
     irq_manager().unregister_handle(*h);
 }
 
@@ -379,8 +370,9 @@ fn poll_slot(handle: &IrqHandleInner, slot_index: usize, cx: &Context<'_>) -> Po
     Poll::Pending
 }
 
-pub(crate) fn create_irq_handle_inner(drop_hook: DropHook) -> NonNull<IrqHandleInner> {
-    let inner = Box::new(IrqHandleInner {
+pub(crate) fn create_irq_handle_inner(drop_hook: DropHook) -> IrqHandleInner {
+    assert!(!platform::current_is_in_interrupt());
+    IrqHandleInner {
         drop_hook: Mutex::new(Some(drop_hook)),
         closed: AtomicBool::new(false),
         user_ctx: AtomicUsize::new(0),
@@ -390,9 +382,7 @@ pub(crate) fn create_irq_handle_inner(drop_hook: DropHook) -> NonNull<IrqHandleI
         waiter_ticket: AtomicUsize::new(0),
         last_meta: AtomicIrqMeta::new(),
         waiters: core::array::from_fn(|_| WaiterSlot::new()),
-    });
-
-    unsafe { NonNull::new_unchecked(Box::into_raw(inner)) }
+    }
 }
 
 pub(crate) fn irq_wait_future(handle: &IrqHandle) -> IrqWaitFuture {
@@ -469,59 +459,69 @@ impl Drop for IrqWaitFuture {
 struct IrqReg {
     id: usize,
     generation: usize,
+    source: usize,
     isr: IrqIsrFn,
     ctx: usize,
-    handle: NonNull<IrqHandleInner>,
+    inner: IrqHandleInner,
 }
 
-unsafe impl Send for IrqReg {}
-unsafe impl Sync for IrqReg {}
-
-extern "C" fn dummy_isr(
-    _: u32,
-    _: u32,
-    _: &mut InterruptFrame,
-    _: IrqBorrowedHandle,
-    _: usize,
-) -> bool {
+extern "C" fn dummy_isr(_: u32, _: u32, _: &mut IrqFrame, _: IrqBorrowedHandle, _: usize) -> bool {
     false
 }
 
 struct VectorSlot {
-    regs: IrqSafeRwLock<Vec<IrqReg>>,
+    head: AtomicPtr<IdMapEntry>,
+    tail: AtomicPtr<IdMapEntry>,
+    users: AtomicUsize,
 }
 
 impl VectorSlot {
     fn new() -> Self {
         Self {
-            regs: IrqSafeRwLock::new(Vec::new()),
+            head: AtomicPtr::new(core::ptr::null_mut()),
+            tail: AtomicPtr::new(core::ptr::null_mut()),
+            users: AtomicUsize::new(0),
         }
-    }
-
-    fn count(&self) -> usize {
-        self.regs.read().len()
     }
 }
 
 struct IdMapEntry {
+    access: AtomicUsize,
     id: AtomicUsize,
-    generation: AtomicUsize,
-    vector: AtomicUsize,
-    source: AtomicUsize,
-    ptr: AtomicUsize,
-    lifetime: IrqSafeRwLock<()>,
+    vector: usize,
+    next: Option<&'static IdMapEntry>,
+    vector_next: AtomicPtr<IdMapEntry>,
+    registration: UnsafeCell<Option<IrqReg>>,
 }
 
+unsafe impl Sync for IdMapEntry {}
+
 impl IdMapEntry {
-    fn new() -> Self {
-        Self {
-            id: AtomicUsize::new(0),
-            generation: AtomicUsize::new(0),
-            vector: AtomicUsize::new(NO_VECTOR),
-            source: AtomicUsize::new(NO_SOURCE),
-            ptr: AtomicUsize::new(0),
-            lifetime: IrqSafeRwLock::new(()),
+    fn try_read(&self) -> Option<IrqReadGuard<'_>> {
+        let previous = self.access.fetch_add(1, Ordering::Acquire);
+        let guard = IrqReadGuard { entry: self };
+        if previous & SLOT_CLOSED != 0 {
+            return None;
         }
+        Some(guard)
+    }
+}
+
+struct IrqReadGuard<'a> {
+    entry: &'a IdMapEntry,
+}
+
+impl Deref for IrqReadGuard<'_> {
+    type Target = IrqReg;
+
+    fn deref(&self) -> &IrqReg {
+        unsafe { (&*self.entry.registration.get()).as_ref().unwrap() }
+    }
+}
+
+impl Drop for IrqReadGuard<'_> {
+    fn drop(&mut self) {
+        self.entry.access.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -611,253 +611,178 @@ impl VectorAllocator {
 
 pub struct IrqManager {
     vectors: [VectorSlot; MAX_INTERRUPT_IDS],
-    id_map: [IdMapEntry; MAX_TOTAL_REGISTRATIONS],
+    id_map: AtomicPtr<IdMapEntry>,
+    entries: Mutex<Vec<&'static IdMapEntry>>,
     next_id: AtomicUsize,
-    next_generation: AtomicUsize,
 }
 
 impl IrqManager {
     fn new() -> Self {
         Self {
             vectors: core::array::from_fn(|_| VectorSlot::new()),
-            id_map: core::array::from_fn(|_| IdMapEntry::new()),
+            id_map: AtomicPtr::new(core::ptr::null_mut()),
+            entries: Mutex::new(Vec::new()),
             next_id: AtomicUsize::new(1),
-            next_generation: AtomicUsize::new(1),
         }
-    }
-
-    fn alloc_id(&self) -> usize {
-        let mut id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
-        if id == 0 || id == RESERVED_ID {
-            id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        }
-
-        id
-    }
-
-    fn alloc_generation(&self) -> usize {
-        let mut generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-
-        if generation == 0 {
-            generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        }
-
-        generation
     }
 
     fn install_handle(
         &self,
         vector: usize,
         source: usize,
-        ptr: NonNull<IrqHandleInner>,
+        inner: IrqHandleInner,
+        isr: IrqIsrFn,
+        ctx: usize,
+        exclusive: bool,
     ) -> Option<IrqHandle> {
-        let id = self.alloc_id();
-        let generation = self.alloc_generation();
-
-        for entry in &self.id_map {
-            if entry
-                .id
-                .compare_exchange(0, RESERVED_ID, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
+        assert!(!platform::current_is_in_interrupt());
+        let mut entries = self.entries.lock();
+        let slot = if vector == NO_VECTOR {
+            None
+        } else {
+            let slot = self.vectors.get(vector)?;
+            if exclusive && slot.users.load(Ordering::Relaxed) != 0 {
+                return None;
             }
-
-            let _lifetime = entry.lifetime.write();
-
-            entry.ptr.store(ptr.as_ptr() as usize, Ordering::Release);
-            entry.vector.store(vector, Ordering::Release);
-            entry.source.store(source, Ordering::Release);
-            entry.generation.store(generation, Ordering::Release);
-            entry.id.store(id, Ordering::Release);
-
-            return Some(IrqHandle { id, generation });
+            Some(slot)
+        };
+        let id = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()?;
+        let handle = IrqHandle { id, generation: id };
+        let entry = if let Some(entry) = entries
+            .iter()
+            .copied()
+            .find(|entry| entry.vector == vector && entry.id.load(Ordering::Acquire) == 0)
+        {
+            entry
+        } else {
+            let entry: &'static IdMapEntry = Box::leak(Box::new(IdMapEntry {
+                access: AtomicUsize::new(SLOT_CLOSED),
+                id: AtomicUsize::new(0),
+                vector,
+                next: unsafe { self.id_map.load(Ordering::Acquire).as_ref() },
+                vector_next: AtomicPtr::new(core::ptr::null_mut()),
+                registration: UnsafeCell::new(None),
+            }));
+            entries.push(entry);
+            let address = core::ptr::from_ref(entry).cast_mut();
+            self.id_map.store(address, Ordering::Release);
+            if let Some(slot) = slot {
+                let tail = slot.tail.load(Ordering::Relaxed);
+                if let Some(tail) = unsafe { tail.as_ref() } {
+                    tail.vector_next.store(address, Ordering::Release);
+                } else {
+                    slot.head.store(address, Ordering::Release);
+                }
+                slot.tail.store(address, Ordering::Release);
+            }
+            entry
+        };
+        unsafe {
+            *entry.registration.get() = Some(IrqReg {
+                id,
+                generation: id,
+                source,
+                isr,
+                ctx,
+                inner,
+            });
         }
-
-        None
+        entry.id.store(id, Ordering::Release);
+        entry.access.fetch_and(SLOT_READERS, Ordering::Release);
+        if let Some(slot) = slot {
+            slot.users.fetch_add(1, Ordering::Release);
+        }
+        Some(handle)
     }
 
     fn with_handle<R>(&self, handle: IrqHandle, f: impl FnOnce(&IrqHandleInner) -> R) -> Option<R> {
         if handle.is_null() {
             return None;
         }
-
-        for entry in &self.id_map {
-            if entry.id.load(Ordering::Acquire) != handle.id {
-                continue;
+        let mut entry = unsafe { self.id_map.load(Ordering::Acquire).as_ref() };
+        while let Some(current) = entry {
+            if current.id.load(Ordering::Acquire) == handle.id {
+                let registration = current.try_read()?;
+                if registration.id != handle.id || registration.generation != handle.generation {
+                    return None;
+                }
+                return Some(f(&registration.inner));
             }
-
-            let _lifetime = entry.lifetime.read();
-
-            if entry.id.load(Ordering::Acquire) != handle.id {
-                return None;
-            }
-
-            if entry.generation.load(Ordering::Acquire) != handle.generation {
-                return None;
-            }
-
-            let ptr = entry.ptr.load(Ordering::Acquire);
-
-            if ptr == 0 {
-                return None;
-            }
-
-            let inner = unsafe { &*(ptr as *const IrqHandleInner) };
-            return Some(f(inner));
+            entry = current.next;
         }
-
         None
     }
 
-    fn register(
-        &self,
-        interrupt_id: u32,
-        isr: IrqIsrFn,
-        ctx: usize,
-        handle: NonNull<IrqHandleInner>,
-        exclusive: bool,
-        source: usize,
-    ) -> Option<IrqHandle> {
-        let slot = self.vectors.get(interrupt_id as usize)?;
-        let mut regs = slot.regs.write();
-
-        if regs.len() >= MAX_HANDLERS_PER_VECTOR || (exclusive && !regs.is_empty()) {
-            return None;
-        }
-
-        let public_handle = self.install_handle(interrupt_id as usize, source, handle)?;
-
-        regs.push(IrqReg {
-            id: public_handle.id,
-            generation: public_handle.generation,
-            isr,
-            ctx,
-            handle,
-        });
-
-        Some(public_handle)
-    }
-
     fn unregister_handle(&self, handle: IrqHandle) {
+        assert!(!platform::current_is_in_interrupt());
         if handle.is_null() {
             return;
         }
-
-        for entry in &self.id_map {
-            if entry.id.load(Ordering::Acquire) != handle.id {
-                continue;
-            }
-
-            let vector = entry.vector.load(Ordering::Acquire);
-
-            if vector != NO_VECTOR {
-                if vector >= self.vectors.len() {
-                    return;
-                }
-
-                let slot = &self.vectors[vector];
-                let mut regs = slot.regs.write();
-                let _lifetime = entry.lifetime.write();
-
-                if entry.id.load(Ordering::Acquire) != handle.id {
-                    return;
-                }
-
-                if entry.generation.load(Ordering::Acquire) != handle.generation {
-                    return;
-                }
-
-                let ptr = entry.ptr.load(Ordering::Acquire);
-
-                if ptr == 0 {
-                    return;
-                }
-
-                let Some(pos) = regs
-                    .iter()
-                    .position(|r| r.id == handle.id && r.generation == handle.generation)
-                else {
-                    return;
-                };
-
-                let source = entry.source.load(Ordering::Acquire);
-                if regs.len() == 1 && source != NO_SOURCE {
-                    platform::unbind_wired_interrupt(HardwareInterruptId(source as u32));
-                }
-                let reg = regs.swap_remove(pos);
-                let inner = unsafe { reg.handle.as_ref() };
-
-                inner.close();
-
-                if let Some(hook) = inner.drop_hook.lock().take() {
-                    hook.invoke();
-                }
-
-                entry.ptr.store(0, Ordering::Release);
-                entry.vector.store(NO_VECTOR, Ordering::Release);
-                entry.source.store(NO_SOURCE, Ordering::Release);
-                entry.generation.store(0, Ordering::Release);
-                entry.id.store(0, Ordering::Release);
-
-                drop(_lifetime);
-                drop(regs);
-
-                unsafe {
-                    drop(Box::from_raw(reg.handle.as_ptr()));
-                }
-
-                let owns_vector = source == NO_SOURCE
-                    || platform::wired_interrupt_id(HardwareInterruptId(source as u32)).is_none();
-                if vector <= u8::MAX as usize
-                    && owns_vector
-                    && VectorAllocator::is_dynamic(vector as u8)
-                {
-                    VectorAllocator::release_after_unregister(vector as u8);
-                }
-
-                return;
-            }
-
-            let _lifetime = entry.lifetime.write();
-
-            if entry.id.load(Ordering::Acquire) != handle.id {
-                return;
-            }
-
-            if entry.generation.load(Ordering::Acquire) != handle.generation {
-                return;
-            }
-
-            let ptr = entry.ptr.load(Ordering::Acquire);
-
-            if ptr == 0 {
-                return;
-            }
-
-            let inner = unsafe { &*(ptr as *const IrqHandleInner) };
-
-            inner.close();
-
-            if let Some(hook) = inner.drop_hook.lock().take() {
-                hook.invoke();
-            }
-
-            entry.ptr.store(0, Ordering::Release);
-            entry.vector.store(NO_VECTOR, Ordering::Release);
-            entry.source.store(NO_SOURCE, Ordering::Release);
-            entry.generation.store(0, Ordering::Release);
-            entry.id.store(0, Ordering::Release);
-
-            drop(_lifetime);
-
-            unsafe {
-                drop(Box::from_raw(ptr as *mut IrqHandleInner));
-            }
-
+        let lifecycle = BINDING_LIFECYCLE.lock();
+        let entries = self.entries.lock();
+        let Some(entry) = entries
+            .iter()
+            .copied()
+            .find(|entry| entry.id.load(Ordering::Acquire) == handle.id)
+        else {
             return;
+        };
+        {
+            let Some(registration) = entry.try_read() else {
+                drop(entries);
+                drop(lifecycle);
+                while entry.id.load(Ordering::Acquire) == handle.id {
+                    if platform::interrupts_enabled() {
+                        crate::scheduling::runtime::runtime::yield_now();
+                    } else {
+                        core::hint::spin_loop();
+                    }
+                }
+                return;
+            };
+            if registration.id != handle.id || registration.generation != handle.generation {
+                return;
+            }
         }
+        entry.access.fetch_or(SLOT_CLOSED, Ordering::AcqRel);
+        drop(entries);
+        drop(lifecycle);
+        while entry.access.load(Ordering::Acquire) & SLOT_READERS != 0 {
+            if platform::interrupts_enabled() {
+                crate::scheduling::runtime::runtime::yield_now();
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+        let lifecycle = BINDING_LIFECYCLE.lock();
+        let registration = unsafe { (&mut *entry.registration.get()).take().unwrap() };
+        if entry.vector != NO_VECTOR {
+            let slot = &self.vectors[entry.vector];
+            if slot.users.fetch_sub(1, Ordering::AcqRel) == 1 && registration.source != NO_SOURCE {
+                platform::unbind_wired_interrupt(HardwareInterruptId(registration.source as u32));
+            }
+        }
+        registration.inner.close();
+        let hook = registration.inner.drop_hook.lock().take();
+        if let Some(hook) = hook {
+            hook.invoke();
+        }
+        let owns_vector = registration.source == NO_SOURCE
+            || platform::wired_interrupt_id(HardwareInterruptId(registration.source as u32))
+                .is_none();
+        if entry.vector <= u8::MAX as usize
+            && owns_vector
+            && VectorAllocator::is_dynamic(entry.vector as u8)
+        {
+            VectorAllocator::release_after_unregister(entry.vector as u8);
+        }
+        drop(registration);
+        let _entries = self.entries.lock();
+        entry.id.store(0, Ordering::Release);
+        drop(lifecycle);
     }
 
     fn dispatch(&self, interrupt_id: u32, frame: &mut InterruptFrame) {
@@ -865,15 +790,29 @@ impl IrqManager {
         let Some(slot) = self.vectors.get(interrupt_id as usize) else {
             return;
         };
-        let regs = slot.regs.read();
-
-        for r in regs.iter() {
-            let frame = unsafe { &mut *(frame as *mut InterruptFrame as *mut IrqFrame) };
-            let claimed = (r.isr)(interrupt_id, cpu, frame, r.handle.as_ptr(), r.ctx);
-
-            if claimed {
+        let tail = slot.tail.load(Ordering::Acquire);
+        if tail.is_null() {
+            return;
+        }
+        let mut entry = slot.head.load(Ordering::Acquire);
+        while let Some(current) = unsafe { entry.as_ref() } {
+            if let Some(registration) = current.try_read() {
+                let frame = unsafe { &mut *(frame as *mut InterruptFrame as *mut IrqFrame) };
+                let claimed = (registration.isr)(
+                    interrupt_id,
+                    cpu,
+                    frame,
+                    &registration.inner,
+                    registration.ctx,
+                );
+                if claimed {
+                    break;
+                }
+            }
+            if entry == tail {
                 break;
             }
+            entry = current.vector_next.load(Ordering::Acquire);
         }
     }
 }
@@ -913,14 +852,11 @@ fn register_vector(
         return null_handle();
     }
 
-    let handle_ptr = create_irq_handle_inner(drop_hook);
+    let inner = create_irq_handle_inner(drop_hook);
 
-    let Some(handle) = irq_manager().register(vector as u32, isr, ctx, handle_ptr, dynamic, source)
+    let Some(handle) =
+        irq_manager().install_handle(vector as usize, source, inner, isr, ctx, dynamic)
     else {
-        unsafe {
-            drop(Box::from_raw(handle_ptr.as_ptr()));
-        }
-
         if dynamic {
             VectorAllocator::release_after_unregister(vector);
         }
@@ -932,41 +868,45 @@ fn register_vector(
 }
 
 pub fn bind_wired_interrupt(source: HardwareInterruptId, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
+    assert!(!platform::current_is_in_interrupt());
     let lifecycle = BINDING_LIFECYCLE.lock();
-    let (interrupt_id, handle, activate) = if let Some(interrupt_id) =
-        platform::wired_interrupt_id(source)
-    {
-        if interrupt_id as usize >= MAX_INTERRUPT_IDS {
-            return null_handle();
-        }
-        let activate = irq_manager().vectors[interrupt_id as usize]
-            .regs
-            .read()
-            .is_empty();
-        let handle_ptr = create_irq_handle_inner(DropHook::new(dummy_drop, 0));
-        let Some(handle) =
-            irq_manager().register(interrupt_id, isr, ctx, handle_ptr, false, source.0 as usize)
-        else {
-            unsafe { drop(Box::from_raw(handle_ptr.as_ptr())) };
-            return null_handle();
-        };
-        (interrupt_id, handle, activate)
-    } else {
-        let Some(vector) = VectorAllocator::alloc() else {
-            return null_handle();
-        };
-        (
-            vector as u32,
-            register_vector(
-                vector,
+    let (interrupt_id, handle, activate) =
+        if let Some(interrupt_id) = platform::wired_interrupt_id(source) {
+            if interrupt_id as usize >= MAX_INTERRUPT_IDS {
+                return null_handle();
+            }
+            let activate = irq_manager().vectors[interrupt_id as usize]
+                .users
+                .load(Ordering::Acquire)
+                == 0;
+            let inner = create_irq_handle_inner(DropHook::new(dummy_drop, 0));
+            let Some(handle) = irq_manager().install_handle(
+                interrupt_id as usize,
+                source.0 as usize,
+                inner,
                 isr,
                 ctx,
-                source.0 as usize,
-                DropHook::new(dummy_drop, 0),
-            ),
-            true,
-        )
-    };
+                false,
+            ) else {
+                return null_handle();
+            };
+            (interrupt_id, handle, activate)
+        } else {
+            let Some(vector) = VectorAllocator::alloc() else {
+                return null_handle();
+            };
+            (
+                vector as u32,
+                register_vector(
+                    vector,
+                    isr,
+                    ctx,
+                    source.0 as usize,
+                    DropHook::new(dummy_drop, 0),
+                ),
+                true,
+            )
+        };
     if handle.is_null() {
         return handle;
     }
@@ -983,6 +923,8 @@ pub fn bind_msi_interrupt(
     isr: IrqIsrFn,
     ctx: usize,
 ) -> Option<MsiBinding> {
+    assert!(!platform::current_is_in_interrupt());
+    let lifecycle = BINDING_LIFECYCLE.lock();
     let vector = VectorAllocator::alloc()?;
     let handle = register_vector(
         vector,
@@ -995,6 +937,7 @@ pub fn bind_msi_interrupt(
         return None;
     }
     let Some(message) = platform::bind_msi(request, vector) else {
+        drop(lifecycle);
         irq_manager().unregister_handle(handle);
         return None;
     };
