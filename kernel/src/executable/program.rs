@@ -7,7 +7,8 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
-use kernel_sync::{AsyncMpmcQueue, AsyncRecvError, WaitRegistration};
+use kernel_sync::queues::{AsyncMpmcQueue, AsyncRecvError};
+use kernel_sync::queues::async_mpmc::WaitRegistration;
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::status::LoadError::NoSuchSymbol;
 use kernel_types::{
@@ -76,8 +77,6 @@ impl MessageQueue {
     }
 
     pub fn push_message(&self, msg: Message) {
-        // Preserve the existing closed-queue behavior: messages sent after
-        // shutdown are discarded rather than reported to the sender.
         let _ = self.queue.push(msg);
     }
 

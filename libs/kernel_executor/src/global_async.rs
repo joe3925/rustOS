@@ -2,7 +2,7 @@ use crate::platform::{ExecutorBatchGuard, Job, SlabCache, platform, with_executo
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::boxed::Box;
-use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
+use kernel_sync::queues::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Once;
 
 pub use crate::domain::{

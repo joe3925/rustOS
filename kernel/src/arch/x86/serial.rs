@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use kernel_types::irq::IrqSafeMutex;
+use kernel_sync::locks::irq::IrqSafeMutex;
 use x86_64::instructions::port::Port;
 
 use crate::platform::ConsolePlatform;

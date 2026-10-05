@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use crate::bounded_wait_queue::BoundedWaitQueueError;
+use crate::queues::bounded_wait_queue::BoundedWaitQueueError;
 
 use crate::platform::contract::Platform;
 use crate::test::support::{recv_timeout, P};
-use crate::BoundedWaitQueue;
+use crate::queues::BoundedWaitQueue;
 
 #[test]
 fn enqueue_clear_and_already_queued() {

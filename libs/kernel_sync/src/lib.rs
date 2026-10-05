@@ -2,29 +2,15 @@
 
 extern crate alloc;
 
-pub mod async_mpmc;
-pub mod bounded_mpmc;
-pub mod bounded_wait_queue;
-pub mod completion_port;
-pub mod mpmc;
+pub mod channels;
+pub mod completion;
+pub mod locks;
 pub mod platform;
+pub mod queues;
 mod sync;
-pub mod thread_pool;
-pub mod wait_queue;
-mod wait_state;
+pub mod workers;
 
-pub use async_mpmc::{AsyncMpmcQueue, AsyncRecvError, WaitRegistration};
-pub use bounded_mpmc::{bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender};
-pub use bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueError};
-pub use completion_port::{CompletionPort, PortPermit, PortReserveError, PortResizeError};
-pub use mpmc::mpmc_channel;
 pub use platform::contract::{Platform, ThreadEntry};
-pub use thread_pool::{
-    BoundedJobs, BoundedJobsConfig, BoundedThreadPool, Job, JobFn, JobQueue, QueueSendError,
-    SubmitError, ThreadPool, ThreadPoolImpl, UnboundedJobs,
-};
-pub use wait_queue::WaitQueue;
-pub use wait_state::WaitState;
 
 #[cfg(all(test, feature = "std", not(any(loom, feature = "loom"))))]
 mod test;

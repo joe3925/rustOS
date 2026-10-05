@@ -1,7 +1,6 @@
 use alloc::string::ToString;
 use spin::Once;
 
-use kernel_sync::Platform;
 use kernel_types::arch::PhysAddr;
 use kernel_types::status::PageMapError;
 
@@ -10,12 +9,11 @@ use crate::memory::paging::stack::StackSize;
 use crate::scheduling::fifo_scheduler::{FifoPriority, fifo_task_sched_binding};
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::scheduling::task::Task;
-use crate::sync_platform::{KernelPlatform, WaitQueue};
+use crate::scheduling::task::{Task, TaskHandle};
 
 use super::layout::base_page_size;
 
-static ZERO_PAGE_WAIT_QUEUE: Once<WaitQueue> = Once::new();
+static ZERO_PAGE_WORKER: Once<TaskHandle> = Once::new();
 
 pub fn zero_physical_frame(physical_address: PhysAddr) -> Result<(), PageMapError> {
     let page_size = base_page_size();
@@ -39,42 +37,30 @@ pub fn zero_physical_frame(physical_address: PhysAddr) -> Result<(), PageMapErro
 }
 
 pub fn start_zero_page_worker() {
-    ZERO_PAGE_WAIT_QUEUE.call_once(WaitQueue::new);
-    SCHEDULER.add_task(Task::new_kernel_mode_with_sched_binding(
+    let task = Task::new_kernel_mode_with_sched_binding(
         zero_page_worker,
         0,
         StackSize::Tiny,
         "zero-page".to_string(),
         0,
         fifo_task_sched_binding(FifoPriority::Low),
-    ));
+    );
+    ZERO_PAGE_WORKER.call_once(|| task.clone());
+    SCHEDULER.add_task(task);
 }
 
 pub fn wake_zero_page_worker() {
-    let Some(queue) = ZERO_PAGE_WAIT_QUEUE.get() else {
-        return;
-    };
-    let Some(task) = queue.dequeue_one() else {
-        return;
-    };
-    <KernelPlatform as Platform>::unpark(&task);
+    if let Some(task) = ZERO_PAGE_WORKER.get() {
+        SCHEDULER.unpark(task);
+    }
 }
 
 extern "C" fn zero_page_worker(_: usize) {
-    let queue = ZERO_PAGE_WAIT_QUEUE.get().unwrap();
     loop {
         if KernelFrameAllocator::zero_one_free_frame() {
             yield_now();
             continue;
         }
-        if !queue.enqueue_current() {
-            yield_now();
-            continue;
-        }
-        if KernelFrameAllocator::has_dirty_free_frames() {
-            queue.clear_current_if_queued();
-            continue;
-        }
-        <KernelPlatform as Platform>::park_current();
+        SCHEDULER.park_current();
     }
 }

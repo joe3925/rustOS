@@ -1,3 +1,7 @@
+pub mod port;
+
+pub use port::{CompletionPort, PortPermit, PortReserveError, PortResizeError};
+
 use core::num::NonZeroUsize;
 
 #[repr(transparent)]

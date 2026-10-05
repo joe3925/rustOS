@@ -9,6 +9,7 @@ edition = "2024"
 crate-type = ["rlib"]
 
 [dependencies]
+kernel_sync = { path = "../kernel_sync", default-features = false }
 spin = "0.10"
 portable-atomic = "1"
 kernel_types = { path = "../kernel_types" }

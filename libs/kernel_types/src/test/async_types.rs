@@ -4,7 +4,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use crate::async_types::{AsyncMutex, AsyncRwLock};
+use kernel_sync::locks::{AsyncMutex, AsyncRwLock};
 
 fn noop_waker() -> Waker {
     unsafe fn clone(_: *const ()) -> RawWaker {
@@ -49,7 +49,7 @@ fn async_mutex_try_lock_enforces_exclusive_access() {
 fn async_mutex_future_pending_then_ready_after_unlock() {
     let lock = AsyncMutex::new(10usize);
     let guard = lock.try_lock().unwrap();
-    let mut wait = lock.lock();
+    let mut wait = core::pin::pin!(lock.lock());
 
     assert!(matches!(poll_once(&mut wait), Poll::Pending));
     drop(guard);
@@ -108,7 +108,7 @@ fn async_rwlock_allows_many_readers_or_one_writer() {
 fn async_rwlock_write_future_waits_for_readers() {
     let lock = AsyncRwLock::new(1usize);
     let reader = lock.try_read().unwrap();
-    let mut write = lock.write();
+    let mut write = core::pin::pin!(lock.write());
 
     assert!(matches!(poll_once(&mut write), Poll::Pending));
     drop(reader);

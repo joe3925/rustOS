@@ -12,7 +12,7 @@ use fatfs::{
 };
 use kernel_api::device::DeviceObject;
 use kernel_api::error::{FileErrorKind, KernelError, ResultErrorContext, error};
-use kernel_api::kernel_types::async_types::AsyncMutex;
+use kernel_sync::locks::AsyncMutex;
 use kernel_api::kernel_types::dma::{IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, io};

@@ -155,7 +155,7 @@ pub fn init_percpu_gs(cpu_id: usize) -> &'static PerCpu {
     p.tls_array_pointer.store(0, Ordering::Relaxed);
     unsafe { set_gs_bases(ptr) };
     kernel_types::irq::set_irq_context_query(irq_context_query);
-    kernel_types::irq::set_irq_interrupt_control(
+    kernel_sync::locks::irq::set_irq_interrupt_control(
         irq_interrupts_enabled,
         irq_interrupts_disable,
         irq_interrupts_enable,

@@ -1,6 +1,7 @@
 use kernel_types::arch::PhysAddr;
+use kernel_sync::locks::irq::IrqSafeMutex;
 use kernel_types::irq::{
-    IrqSafeMutex, MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
+    MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
     MsiBindingRequest, MsiMessage,
 };
 use kernel_types::memory::PhysicalMappingCache;

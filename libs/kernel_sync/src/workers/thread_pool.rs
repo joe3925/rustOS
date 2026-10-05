@@ -4,8 +4,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 
-use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender};
-use crate::mpmc::{mpmc_channel, Receiver, RecvError, Sender, TryRecvError};
+use crate::channels::mpmc::{
+    bounded_mpmc_channel, mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender,
+    Receiver, RecvError, Sender, TryRecvError,
+};
 use crate::platform::contract::Platform;
 
 pub type JobFn = extern "C" fn(usize);

@@ -24,7 +24,7 @@ pub(crate) fn init_boot_interrupts() {
     gic.init_distributor();
     INTERRUPT_CONTROLLER.call_once(|| InterruptController::GicV3(gic));
     kernel_types::irq::set_irq_context_query(irq_context_query);
-    kernel_types::irq::set_irq_interrupt_control(
+    kernel_sync::locks::irq::set_irq_interrupt_control(
         irq_interrupts_enabled,
         irq_interrupts_disable,
         irq_interrupts_enable,

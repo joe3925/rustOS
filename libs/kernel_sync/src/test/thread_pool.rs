@@ -1,7 +1,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::test::support::{wait_until, P};
-use crate::{BoundedThreadPool, Job, SubmitError, ThreadPool};
+use crate::workers::BoundedThreadPool;
+use crate::workers::Job;
+use crate::workers::SubmitError;
+use crate::workers::ThreadPool;
 
 extern "C" fn increment(context: usize) {
     let counter = unsafe { &*(context as *const AtomicUsize) };

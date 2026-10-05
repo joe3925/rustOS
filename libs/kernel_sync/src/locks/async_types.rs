@@ -1,5 +1,5 @@
+use crate::queues::waiter_queue::{WaitRegistration, WaiterQueue};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::hint::spin_loop;
@@ -7,53 +7,15 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use core::task::{Context, Poll, Waker};
-use spin::Mutex;
+use core::task::{Context, Poll};
 
 use core::mem;
 use core::sync::atomic::AtomicUsize;
 
-struct Waiter {
-    id: usize,
-    waker: Waker,
-}
-
-fn push_or_update_waiter(list: &mut Vec<Waiter>, id: usize, waker: &Waker) {
-    for waiter in list.iter_mut() {
-        if waiter.id == id {
-            waiter.waker = waker.clone();
-            return;
-        }
-    }
-
-    list.push(Waiter {
-        id,
-        waker: waker.clone(),
-    });
-}
-
-fn remove_waiter(list: &mut Vec<Waiter>, id: usize) -> bool {
-    let mut i = 0usize;
-    while i < list.len() {
-        if list[i].id == id {
-            list.swap_remove(i);
-            return true;
-        }
-        i += 1;
-    }
-
-    false
-}
-
-fn pop_waiter(list: &mut Vec<Waiter>) -> Option<Waker> {
-    list.pop().map(|waiter| waiter.waker)
-}
-
 #[repr(C)]
 pub struct AsyncMutex<T> {
     locked: AtomicBool,
-    waiters: Mutex<Vec<Waiter>>,
-    next_waiter_id: AtomicUsize,
+    waiters: WaiterQueue,
     data: UnsafeCell<T>,
 }
 
@@ -69,8 +31,7 @@ pub struct AsyncMutexGuard<'a, T> {
 #[repr(C)]
 pub struct AsyncMutexLockFuture<'a, T> {
     m: &'a AsyncMutex<T>,
-    waiter_id: usize,
-    registered: bool,
+    waiter: WaitRegistration<'a>,
 }
 
 #[repr(C)]
@@ -82,8 +43,7 @@ impl<T> AsyncMutex<T> {
     pub const fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
-            waiters: Mutex::new(Vec::new()),
-            next_waiter_id: AtomicUsize::new(0),
+            waiters: WaiterQueue::new(),
             data: UnsafeCell::new(value),
         }
     }
@@ -91,20 +51,6 @@ impl<T> AsyncMutex<T> {
     #[inline]
     pub fn as_ptr(&self) -> *mut T {
         self.data.get()
-    }
-
-    #[inline]
-    fn next_waiter_id(&self) -> usize {
-        loop {
-            let id = self
-                .next_waiter_id
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1);
-
-            if id != 0 {
-                return id;
-            }
-        }
     }
 
     #[inline]
@@ -127,8 +73,7 @@ impl<T> AsyncMutex<T> {
     pub fn lock(&self) -> AsyncMutexLockFuture<'_, T> {
         AsyncMutexLockFuture {
             m: self,
-            waiter_id: 0,
-            registered: false,
+            waiter: self.waiters.registration(),
         }
     }
 
@@ -143,36 +88,10 @@ impl<T> AsyncMutex<T> {
         }
     }
 
-    #[inline]
-    fn unlock(&self) {
-        self.unlock_and_wake_one();
-    }
-
     fn unlock_and_wake_one(&self) {
         let was_locked = self.locked.swap(false, Ordering::Release);
         debug_assert!(was_locked);
-
-        self.wake_one_waiter();
-    }
-
-    fn wake_one_waiter(&self) -> bool {
-        let waiter = {
-            let mut waiters = self.waiters.lock();
-            pop_waiter(&mut waiters)
-        };
-
-        if let Some(waker) = waiter {
-            waker.wake();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn wake_one_if_unlocked(&self) {
-        if !self.locked.load(Ordering::Acquire) {
-            self.wake_one_waiter();
-        }
+        self.waiters.notify_one();
     }
 
     pub async fn lock_owned(self: Arc<Self>) -> AsyncMutexOwnedGuard<T> {
@@ -182,62 +101,30 @@ impl<T> AsyncMutex<T> {
     }
 }
 
-impl<'a, T> AsyncMutexLockFuture<'a, T> {
-    fn register_waiter(&mut self, cx: &Context<'_>) {
-        if self.waiter_id == 0 {
-            self.waiter_id = self.m.next_waiter_id();
-        }
-
-        let mut waiters = self.m.waiters.lock();
-        push_or_update_waiter(&mut waiters, self.waiter_id, cx.waker());
-        self.registered = true;
-    }
-
-    fn unregister_waiter(&mut self) -> bool {
-        if !self.registered {
-            return false;
-        }
-
-        let removed = {
-            let mut waiters = self.m.waiters.lock();
-            remove_waiter(&mut waiters, self.waiter_id)
-        };
-
-        self.registered = false;
-        removed
-    }
-}
-
 impl<'a, T> Future for AsyncMutexLockFuture<'a, T> {
     type Output = AsyncMutexGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        if let Some(g) = this.m.try_lock() {
-            this.unregister_waiter();
-            return Poll::Ready(g);
+        let this = unsafe { self.get_unchecked_mut() };
+        let mut waiter = unsafe { Pin::new_unchecked(&mut this.waiter) };
+        if let Some(guard) = this.m.try_lock() {
+            waiter.as_mut().remove();
+            return Poll::Ready(guard);
         }
-
-        this.register_waiter(cx);
-
-        if let Some(g) = this.m.try_lock() {
-            this.unregister_waiter();
-            return Poll::Ready(g);
+        waiter.as_mut().register(cx.waker());
+        if let Some(guard) = this.m.try_lock() {
+            waiter.as_mut().remove();
+            return Poll::Ready(guard);
         }
-
         Poll::Pending
     }
 }
 
-impl<'a, T> Drop for AsyncMutexLockFuture<'a, T> {
+impl<T> Drop for AsyncMutexLockFuture<'_, T> {
     fn drop(&mut self) {
-        if self.registered {
-            let removed = self.unregister_waiter();
-
-            if !removed {
-                self.m.wake_one_if_unlocked();
-            }
+        let notified = unsafe { Pin::new_unchecked(&mut self.waiter) }.remove();
+        if notified && !self.m.locked.load(Ordering::Acquire) {
+            self.m.waiters.notify_one();
         }
     }
 }
@@ -258,7 +145,7 @@ impl<'a, T> DerefMut for AsyncMutexGuard<'a, T> {
 
 impl<'a, T> Drop for AsyncMutexGuard<'a, T> {
     fn drop(&mut self) {
-        self.m.unlock();
+        self.m.unlock_and_wake_one();
     }
 }
 
@@ -289,9 +176,8 @@ unsafe impl<T: Send + Sync> Sync for AsyncMutexOwnedGuard<T> {}
 pub struct AsyncRwLock<T> {
     state: AtomicIsize,
     waiting_writers: AtomicUsize,
-    r_waiters: Mutex<Vec<Waiter>>,
-    w_waiters: Mutex<Vec<Waiter>>,
-    next_waiter_id: AtomicUsize,
+    r_waiters: WaiterQueue,
+    w_waiters: WaiterQueue,
     data: UnsafeCell<T>,
 }
 
@@ -313,15 +199,14 @@ pub struct AsyncRwLockWriteGuard<'a, T> {
 #[repr(C)]
 pub struct AsyncRwLockReadFuture<'a, T> {
     l: &'a AsyncRwLock<T>,
-    waiter_id: usize,
-    registered: bool,
+    waiter: WaitRegistration<'a>,
 }
 
 #[repr(C)]
 pub struct AsyncRwLockWriteFuture<'a, T> {
     l: &'a AsyncRwLock<T>,
-    waiter_id: usize,
-    registered: bool,
+    waiter: WaitRegistration<'a>,
+    counted: bool,
 }
 
 #[repr(C)]
@@ -339,24 +224,9 @@ impl<T> AsyncRwLock<T> {
         Self {
             state: AtomicIsize::new(0),
             waiting_writers: AtomicUsize::new(0),
-            r_waiters: Mutex::new(Vec::new()),
-            w_waiters: Mutex::new(Vec::new()),
-            next_waiter_id: AtomicUsize::new(0),
+            r_waiters: WaiterQueue::new(),
+            w_waiters: WaiterQueue::new(),
             data: UnsafeCell::new(value),
-        }
-    }
-
-    #[inline]
-    fn next_waiter_id(&self) -> usize {
-        loop {
-            let id = self
-                .next_waiter_id
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1);
-
-            if id != 0 {
-                return id;
-            }
         }
     }
 
@@ -410,8 +280,7 @@ impl<T> AsyncRwLock<T> {
     pub fn read(&self) -> AsyncRwLockReadFuture<'_, T> {
         AsyncRwLockReadFuture {
             l: self,
-            waiter_id: 0,
-            registered: false,
+            waiter: self.r_waiters.registration(),
         }
     }
 
@@ -419,19 +288,9 @@ impl<T> AsyncRwLock<T> {
     pub fn write(&self) -> AsyncRwLockWriteFuture<'_, T> {
         AsyncRwLockWriteFuture {
             l: self,
-            waiter_id: 0,
-            registered: false,
+            waiter: self.w_waiters.registration(),
+            counted: false,
         }
-    }
-
-    #[inline]
-    fn read_unlock(&self) {
-        self.read_unlock_and_wake_one();
-    }
-
-    #[inline]
-    fn write_unlock(&self) {
-        self.write_unlock_and_wake_one();
     }
 
     fn read_unlock_and_wake_one(&self) {
@@ -454,45 +313,11 @@ impl<T> AsyncRwLock<T> {
         if self.state.load(Ordering::Acquire) != 0 {
             return;
         }
-
-        if self.wake_one_writer() {
-            return;
-        }
-
-        if self.waiting_writers.load(Ordering::Acquire) == 0 {
-            self.wake_all_readers();
-        }
-    }
-
-    fn wake_one_writer(&self) -> bool {
-        let waiter = {
-            let mut waiters = self.w_waiters.lock();
-            pop_waiter(&mut waiters)
-        };
-
-        if let Some(waker) = waiter {
-            waker.wake();
-            true
+        if self.waiting_writers.load(Ordering::Acquire) != 0 {
+            self.w_waiters.notify_one();
         } else {
-            false
+            self.r_waiters.notify_all();
         }
-    }
-
-    fn wake_all_readers(&self) -> bool {
-        let waiters = {
-            let mut waiters = self.r_waiters.lock();
-            mem::take(&mut *waiters)
-        };
-
-        if waiters.is_empty() {
-            return false;
-        }
-
-        for waiter in waiters {
-            waiter.waker.wake();
-        }
-
-        true
     }
 
     pub async fn read_owned(self: Arc<Self>) -> AsyncRwLockOwnedReadGuard<T> {
@@ -508,95 +333,33 @@ impl<T> AsyncRwLock<T> {
     }
 }
 
-impl<'a, T> AsyncRwLockReadFuture<'a, T> {
-    fn register_waiter(&mut self, cx: &Context<'_>) {
-        if self.waiter_id == 0 {
-            self.waiter_id = self.l.next_waiter_id();
-        }
-
-        let mut waiters = self.l.r_waiters.lock();
-        push_or_update_waiter(&mut waiters, self.waiter_id, cx.waker());
-        self.registered = true;
-    }
-
-    fn unregister_waiter(&mut self) -> bool {
-        if !self.registered {
-            return false;
-        }
-
-        let removed = {
-            let mut waiters = self.l.r_waiters.lock();
-            remove_waiter(&mut waiters, self.waiter_id)
-        };
-
-        self.registered = false;
-        removed
-    }
-}
-
 impl<'a, T> Future for AsyncRwLockReadFuture<'a, T> {
     type Output = AsyncRwLockReadGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        if let Some(g) = this.l.try_read() {
-            this.unregister_waiter();
-            return Poll::Ready(g);
+        let this = unsafe { self.get_unchecked_mut() };
+        let mut waiter = unsafe { Pin::new_unchecked(&mut this.waiter) };
+        if let Some(guard) = this.l.try_read() {
+            waiter.as_mut().remove();
+            return Poll::Ready(guard);
         }
-
-        this.register_waiter(cx);
-
-        if let Some(g) = this.l.try_read() {
-            this.unregister_waiter();
-            return Poll::Ready(g);
+        waiter.as_mut().register(cx.waker());
+        if let Some(guard) = this.l.try_read() {
+            waiter.as_mut().remove();
+            return Poll::Ready(guard);
         }
-
         Poll::Pending
     }
 }
 
-impl<'a, T> Drop for AsyncRwLockReadFuture<'a, T> {
-    fn drop(&mut self) {
-        self.unregister_waiter();
-    }
-}
-
-impl<'a, T> AsyncRwLockWriteFuture<'a, T> {
-    fn register_waiter(&mut self, cx: &Context<'_>) {
-        if self.waiter_id == 0 {
-            self.waiter_id = self.l.next_waiter_id();
+impl<T> AsyncRwLockWriteFuture<'_, T> {
+    fn unregister_waiter(&mut self) {
+        unsafe { Pin::new_unchecked(&mut self.waiter) }.remove();
+        if self.counted {
+            self.counted = false;
+            let previous = self.l.waiting_writers.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0);
         }
-
-        let was_registered = self.registered;
-
-        {
-            let mut waiters = self.l.w_waiters.lock();
-            push_or_update_waiter(&mut waiters, self.waiter_id, cx.waker());
-        }
-
-        if !was_registered {
-            self.registered = true;
-            self.l.waiting_writers.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
-    fn unregister_waiter(&mut self) -> bool {
-        if !self.registered {
-            return false;
-        }
-
-        let removed = {
-            let mut waiters = self.l.w_waiters.lock();
-            remove_waiter(&mut waiters, self.waiter_id)
-        };
-
-        self.registered = false;
-
-        let prev = self.l.waiting_writers.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(prev > 0);
-
-        removed
     }
 }
 
@@ -604,27 +367,27 @@ impl<'a, T> Future for AsyncRwLockWriteFuture<'a, T> {
     type Output = AsyncRwLockWriteGuard<'a, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        if let Some(g) = this.l.try_write() {
+        let this = unsafe { self.get_unchecked_mut() };
+        if let Some(guard) = this.l.try_write() {
             this.unregister_waiter();
-            return Poll::Ready(g);
+            return Poll::Ready(guard);
         }
-
-        this.register_waiter(cx);
-
-        if let Some(g) = this.l.try_write() {
+        if !this.counted {
+            this.l.waiting_writers.fetch_add(1, Ordering::AcqRel);
+            this.counted = true;
+        }
+        unsafe { Pin::new_unchecked(&mut this.waiter) }.register(cx.waker());
+        if let Some(guard) = this.l.try_write() {
             this.unregister_waiter();
-            return Poll::Ready(g);
+            return Poll::Ready(guard);
         }
-
         Poll::Pending
     }
 }
 
-impl<'a, T> Drop for AsyncRwLockWriteFuture<'a, T> {
+impl<T> Drop for AsyncRwLockWriteFuture<'_, T> {
     fn drop(&mut self) {
-        if self.registered {
+        if self.counted {
             self.unregister_waiter();
             self.l.wake_after_state_became_free();
         }
@@ -641,7 +404,7 @@ impl<'a, T> Deref for AsyncRwLockReadGuard<'a, T> {
 
 impl<'a, T> Drop for AsyncRwLockReadGuard<'a, T> {
     fn drop(&mut self) {
-        self.l.read_unlock();
+        self.l.read_unlock_and_wake_one();
     }
 }
 
@@ -661,7 +424,7 @@ impl<'a, T> DerefMut for AsyncRwLockWriteGuard<'a, T> {
 
 impl<'a, T> Drop for AsyncRwLockWriteGuard<'a, T> {
     fn drop(&mut self) {
-        self.l.write_unlock();
+        self.l.write_unlock_and_wake_one();
     }
 }
 

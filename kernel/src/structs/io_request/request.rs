@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use kernel_types::completion::TaskToken;
+use kernel_sync::completion::TaskToken;
 
 use kernel_types::dma::{FromDevice, ToDevice};
 use kernel_types::error::{DriverErrorKind, ErrorKind, FileErrorKind, KernelError};
@@ -390,7 +390,7 @@ impl KernelIoOp {
                 MqReceiveFuture {
                     queue,
                     buffer: Some(buffer),
-                    registration: kernel_sync::WaitRegistration::new(),
+                    registration: kernel_sync::queues::async_mpmc::WaitRegistration::new(),
                 }
                 .await
             }

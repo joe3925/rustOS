@@ -15,6 +15,7 @@ test = false
 configuration = "src/fat32.toml"
 
 [dependencies]
+kernel_sync = { path = "../../libs/kernel_sync", default-features = false }
 kernel_api = { workspace = true }
 spin = { version = "0.10", default-features = false, features = ["mutex"] }
 fatfs = { path = "../../third_party/rust-fatfs", default-features = false, features = [

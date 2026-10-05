@@ -1,18 +1,18 @@
 use alloc::string::String;
 
-use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
+use crate::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use loom::sync::Arc;
 use loom::thread;
 
-use crate::async_mpmc::AsyncMpmcQueue;
-use crate::bounded_mpmc::{bounded_mpmc_channel, BoundedSendError};
-use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue};
-use crate::completion_port::CompletionPort;
-use crate::mpmc::{mpmc_channel, SendError as MpmcSendError, TryRecvError};
+use crate::queues::async_mpmc::AsyncMpmcQueue;
+use crate::channels::mpmc::{bounded_mpmc_channel, BoundedSendError};
+use crate::queues::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue};
+use crate::completion::port::CompletionPort;
+use crate::channels::mpmc::{mpmc_channel, SendError as MpmcSendError, TryRecvError};
 use crate::platform::contract::{Platform, ThreadEntry};
 use crate::sync::model;
-use crate::wait_queue::WaitQueue;
+use crate::queues::wait_queue::WaitQueue;
 
 #[test]
 fn async_mpmc_enqueue_racing_shutdown_is_drained_or_rejected() {

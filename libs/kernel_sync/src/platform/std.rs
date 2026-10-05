@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::platform::contract::{Platform, ThreadEntry};
-use crate::WaitState;
+use crate::queues::WaitState;
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 

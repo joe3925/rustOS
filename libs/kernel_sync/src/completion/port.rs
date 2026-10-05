@@ -3,11 +3,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::RwLock;
-use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
-use kernel_types::completion::{CompletionPermit, TaskCompletion};
+use crate::queues::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
+use crate::completion::{CompletionPermit, TaskCompletion};
 
-use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
-use crate::mpmc::{RecvError, TryRecvError};
+use crate::queues::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
+use crate::channels::mpmc::{RecvError, TryRecvError};
 use crate::platform::contract::Platform;
 
 struct PortChunk<T> {

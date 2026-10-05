@@ -15,4 +15,5 @@ test = false
 configuration = "src/ide.toml"
 
 [dependencies]
+kernel_sync = { path = "../../libs/kernel_sync", default-features = false }
 kernel_api = { workspace = true }

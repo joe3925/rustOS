@@ -1,7 +1,7 @@
-use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
+use crate::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
 
 use crate::test::support::P;
-use crate::CompletionPort;
+use crate::completion::CompletionPort;
 
 #[test]
 fn grows_publishes_and_reclaims_capacity() {

@@ -2,7 +2,7 @@ use alloc::sync::{Arc, Weak};
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::Ordering;
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use kernel_types::async_ffi::AbiFuture;
 use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::error::{DriverErrorKind, ErrorBacktrace, ErrorKind, KernelError};
@@ -15,6 +15,7 @@ use kernel_types::pnp::{
 use kernel_types::request::{
     DeviceControl, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Read, Write,
 };
+use kernel_sync::queues::waiter_queue::RawWaiterNode;
 
 #[cfg(feature = "kernel_link")]
 unsafe extern "Rust" {
@@ -520,18 +521,6 @@ routing_api!(io, IoRequest);
 routing_api!(pnp, PnpRequest);
 
 #[inline]
-fn wake_one(list: &kernel_types::io::TreiberStack<Waker>) {
-    if let Some(waker) = list.pop() {
-        waker.wake();
-    }
-}
-
-#[inline]
-fn remove_waiter(list: &kernel_types::io::TreiberStack<Waker>, waker: &Waker) {
-    let _ = list.remove_one_by(|candidate| candidate.will_wake(waker));
-}
-
-#[inline]
 fn try_acquire_slot<T>(handler: &IoHandler<T>) -> bool {
     loop {
         let current = handler.running_request.load(Ordering::Acquire);
@@ -550,23 +539,40 @@ fn try_acquire_slot<T>(handler: &IoHandler<T>) -> bool {
 
 struct SlotAcquireFuture<'a, T> {
     handler: &'a IoHandler<T>,
+    waiter: RawWaiterNode,
 }
 
 impl<T> Future for SlotAcquireFuture<'_, T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let handler = self.handler;
+        let this = unsafe { self.get_unchecked_mut() };
+        let handler = this.handler;
+        let mut waiter = unsafe { Pin::new_unchecked(&mut this.waiter) };
         if try_acquire_slot(handler) {
+            unsafe { handler.waiters.remove(waiter.as_mut()) };
             return Poll::Ready(());
         }
-        remove_waiter(&handler.waiters, cx.waker());
-        handler.waiters.push(cx.waker().clone());
+        unsafe { handler.waiters.register(waiter.as_mut(), cx.waker()) };
         if try_acquire_slot(handler) {
-            remove_waiter(&handler.waiters, cx.waker());
+            unsafe { handler.waiters.remove(waiter.as_mut()) };
             return Poll::Ready(());
         }
         Poll::Pending
+    }
+}
+
+impl<T> Drop for SlotAcquireFuture<'_, T> {
+    fn drop(&mut self) {
+        let notified = unsafe {
+            self.handler
+                .waiters
+                .remove(Pin::new_unchecked(&mut self.waiter))
+        };
+        if notified && self.handler.running_request.load(Ordering::Acquire) < self.handler.depth as u64
+        {
+            self.handler.waiters.notify_one();
+        }
     }
 }
 
@@ -577,11 +583,15 @@ struct SlotGuard<'a, T> {
 impl<T> Drop for SlotGuard<'_, T> {
     fn drop(&mut self) {
         self.handler.running_request.fetch_sub(1, Ordering::Release);
-        wake_one(&self.handler.waiters);
+        self.handler.waiters.notify_one();
     }
 }
 
 async fn acquire_slot<T>(handler: &IoHandler<T>) -> SlotGuard<'_, T> {
-    SlotAcquireFuture { handler }.await;
+    SlotAcquireFuture {
+        handler,
+        waiter: RawWaiterNode::new(),
+    }
+    .await;
     SlotGuard { handler }
 }

@@ -3,8 +3,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel_executor::global_async::ExecutorDomainId;
 use kernel_executor::runtime::runtime::try_spawn_to_port_in_executor_domain;
-use kernel_sync::{PortReserveError, mpmc::TryRecvError};
-use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome};
+use kernel_sync::completion::PortReserveError;
+use kernel_sync::channels::mpmc::TryRecvError;
+use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskOutcome};
 
 use crate::sync_platform::{CompletionPort as KernelCompletionPort, CompletionPortPermit};
 use crate::structs::executor_domain::UserExecutorDomain;

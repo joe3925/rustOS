@@ -1,4 +1,4 @@
-use crate::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
+use kernel_sync::queues::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 
 #[test]
 fn try_push_pop_reports_full_empty_and_preserves_fifo_order() {

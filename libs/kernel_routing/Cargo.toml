@@ -16,6 +16,7 @@ kernel_link = []
 ffi = ["dep:kernel_sys"]
 
 [dependencies]
+kernel_sync = { path = "../kernel_sync", default-features = false }
 kernel_sys = { path = "../kernel_sys", optional = true }
 kernel_types = { path = "../kernel_types" }
 [profile.dev]

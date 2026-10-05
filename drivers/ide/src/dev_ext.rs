@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::irq::IrqHandle;
-use kernel_api::kernel_types::async_types::AsyncMutex;
+use kernel_sync::locks::AsyncMutex;
 use kernel_api::kernel_types::port::Port;
 use kernel_api::spin::Once;
 #[repr(C)]

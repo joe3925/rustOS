@@ -9,7 +9,6 @@ use kernel_api::{
     },
     kernel_types::{
         async_ffi::{AbiFuture, FutureExt},
-        async_types::AsyncMutex,
         pnp::{ProbeContext, ProbeOutcome},
         protocol::volmgr::VolumeProtocol,
     },
@@ -21,6 +20,7 @@ use kernel_api::{
 };
 use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 use spin::Mutex;
+use kernel_sync::locks::AsyncMutex;
 
 use crate::{
     block_dev::{BlockDev, flush},

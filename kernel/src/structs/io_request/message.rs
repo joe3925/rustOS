@@ -7,7 +7,8 @@ use core::task::{Context, Poll, Waker};
 use crate::executable::program::{Message, ProgramHandle, QueueHandle};
 use crate::object_manager::behavior::CONFIGURE_BIT;
 use crate::object_manager::manager::{InterfaceMask, Object, ObjectPayload};
-use kernel_sync::{AsyncRecvError, WaitRegistration};
+use kernel_sync::queues::AsyncRecvError;
+use kernel_sync::queues::async_mpmc::WaitRegistration;
 use kernel_types::object_manager::ObjectTag;
 use spin::Mutex;
 

@@ -8,7 +8,7 @@ use crate::scheduling::task::{TaskHandle, TaskUpdate};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use kernel_types::bounded_mpmc::BoundedMpmcQueue;
+use kernel_sync::queues::bounded_mpmc::BoundedMpmcQueue;
 use spin::Mutex;
 
 pub const RUNQ_CAP: usize = 4096;

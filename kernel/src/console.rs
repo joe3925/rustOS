@@ -17,7 +17,7 @@ use embedded_graphics::text::Text;
 use embedded_graphics::text::TextStyle;
 use embedded_graphics::text::TextStyleBuilder;
 use kernel_abi::PixelFormat;
-use kernel_types::irq::IrqSafeMutex;
+use kernel_sync::locks::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
 const FRAMEBUFFER_CONSOLE: bool = true;
 const FONT_HEIGHT: usize = 18;
