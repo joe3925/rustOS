@@ -274,7 +274,7 @@ impl GicV3 {
         unsafe { ((self.distributor + offset as usize) as *const u32).read_volatile() }
     }
     unsafe fn write32(&self, offset: u32, value: u32) {
-        unsafe { ((self.distributor + offset as usize) as *mut u32).write_volatile(value) }
+        unsafe { mmio_write32(self.distributor + offset as usize, value) }
     }
     unsafe fn write64(&self, offset: u32, value: u64) {
         unsafe {
