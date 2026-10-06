@@ -257,7 +257,7 @@ enum StreamTableFormat {
     TwoLevel,
 }
 
-pub(super) struct SmmuV3 {
+pub(crate) struct SmmuV3 {
     register_mapping: KernelMapping,
     registers: usize,
     sid_bits: u8,

@@ -8,5 +8,11 @@ pub(crate) mod x86;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod aarch64;
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) use x86::memory::iommu::backend::X86DeviceMmu as ArchDeviceMmuBackend;
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) use aarch64::ArchDeviceMmuBackend;
+
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("kernel does not have an implementation for this target architecture");

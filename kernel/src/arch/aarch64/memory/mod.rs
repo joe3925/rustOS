@@ -3,3 +3,4 @@ pub(crate) mod device_mmu;
 mod layout;
 mod paging;
 mod smmu;
+pub(crate) use smmu::SmmuV3 as ArchDeviceMmuBackend;

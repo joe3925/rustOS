@@ -63,7 +63,7 @@ If there is a * it must be completed before user space is started
 
 ## IoBuffers (IOB)
 1. [x] Address the iobuffer back pointer causing performance loss. 
-2. [ ] Add iobuffer overlap checking without hurting performance.
+2. [x] Add iobuffer overlap checking without hurting performance.
 
 ## Actions (ACT)
 1. [x] The benchmarks in the github actions are depend on the compute of the github container. This means we can detect regressions if github is under load assuming they don't guarntee some amount of compute for there containers. Determine if github provides compute guarntees and if they don't maybe find a diffrent service. 

@@ -4,6 +4,7 @@ pub(crate) mod exception_handlers;
 mod interrupts;
 mod machine;
 mod memory;
+pub(crate) use memory::ArchDeviceMmuBackend;
 mod pci;
 pub mod platform;
 mod scheduling;

@@ -3,6 +3,8 @@ use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
 use kernel_types::dma::DmaPciDeviceIdentity;
 use spin::Mutex;
 
+use crate::arch::ArchDeviceMmuBackend;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceMmuError {
     NoBackingFrame,
@@ -305,21 +307,17 @@ pub trait DeviceMmuBackend: Send + Sync {
 
 #[derive(Clone)]
 pub struct DeviceMmuSystem {
-    backend: Arc<dyn DeviceMmuBackend>,
+    // The architecture fixes the backend type, so calls use static dispatch.
+    backend: Arc<ArchDeviceMmuBackend>,
 }
 
 impl DeviceMmuSystem {
-    pub fn new(backend: Arc<dyn DeviceMmuBackend>) -> Self {
+    pub fn new(backend: Arc<ArchDeviceMmuBackend>) -> Self {
         Self { backend }
     }
 
-    pub fn from_backend<B>(backend: B) -> Self
-    where
-        B: DeviceMmuBackend + 'static,
-    {
-        Self {
-            backend: Arc::new(backend),
-        }
+    pub fn from_backend(backend: ArchDeviceMmuBackend) -> Self {
+        Self::new(Arc::new(backend))
     }
 
     #[inline]
