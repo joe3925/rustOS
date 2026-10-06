@@ -33,7 +33,7 @@ use crate::profiling::backtrace::{self, Backtrace};
 use crate::registry::init as init_registry;
 use crate::scheduling::runtime::runtime::init_executor_platform;
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::{SCHEDULER, Scheduler, scheduler};
 use crate::scheduling::state::State;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
@@ -104,6 +104,10 @@ pub unsafe fn init() {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
         init_early_serial_mapping().expect("failed to map the early serial device");
+        crate::console::PRINT_QUEUE.call_once(|| {
+            crossbeam_queue::ArrayQueue::new(crate::console::PRINT_QUEUE_SLOTS)
+        });
+        crate::machine::MACHINE_INFO.call_once(crate::machine::MachineInfo::discover);
         initialize_bootstrap_provider();
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
@@ -111,6 +115,8 @@ pub unsafe fn init() {
         init_dma_manager();
         calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
+        let cpu_count = crate::machine::machine_info().cpu_topology().processors.len();
+        SCHEDULER.call_once(|| Scheduler::new(cpu_count));
         start_secondary_cpus()
             .unwrap_or_else(|error| panic!("secondary CPU startup failed: {:?}", error));
     }
@@ -123,9 +129,9 @@ pub unsafe fn init() {
     crate::arch::debug_transport::RX_CONTEXT_READY.store(true, Ordering::Release);
 
     init_periodic_timer();
-    SCHEDULER.init_core(current_cpu_id());
+    scheduler().init_core(current_cpu_id());
     PANIC_RUNTIME_READY.store(true, Ordering::Release);
-    SCHEDULER.add_task(Task::new_kernel_mode(
+    scheduler().add_task(Task::new_kernel_mode(
         kernel_main,
         0,
         StackSize::Tiny,
@@ -142,6 +148,7 @@ pub unsafe fn init() {
 }
 pub extern "C" fn kernel_main(ctx: usize) {
     enable_mimalloc();
+    crate::scheduling::scheduler::start_reaper();
     resize_bitmap_for_ram(boot_usable_bytes()).expect(&alloc::format!(
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
@@ -159,7 +166,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         kernel_address_space_root(),
         KERNEL_RANGE_MANAGER.clone(),
     );
-    program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
+    program.main_thread = Some(scheduler().get_current_task(current_cpu_id()).unwrap());
 
     program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
         title: "kernel.exe".into(),
@@ -277,7 +284,7 @@ pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
     let panic_scheduler_cpu = current_cpu_id();
 
     disable_interrupts();
-    let panic_task = SCHEDULER.try_get_current_task(panic_scheduler_cpu);
+    let panic_task = scheduler().try_get_current_task(panic_scheduler_cpu);
     unsafe {
         switch_address_space_root(kernel_address_space_root());
     }
@@ -638,7 +645,7 @@ extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
 }
 
 pub fn test_kernel_tls_runtime() {
-    let current = SCHEDULER
+    let current = scheduler()
         .get_current_task(current_cpu_id())
         .expect("kernel TLS self-test requires a scheduled task");
     assert!(
@@ -663,7 +670,7 @@ pub fn test_kernel_tls_runtime() {
         );
     }
 
-    SCHEDULER.add_task(Task::new_kernel_mode(
+    scheduler().add_task(Task::new_kernel_mode(
         kernel_tls_self_test_worker,
         0,
         StackSize::Huge,

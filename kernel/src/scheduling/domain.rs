@@ -1,4 +1,5 @@
 use crate::scheduling::scheduler::RunQueueAccess;
+use crate::scheduling::reclaim::{self, ReclaimNode};
 use crate::{
     platform::MAX_CPUS,
     scheduling::task::{TaskHandle, TaskUpdate},
@@ -94,6 +95,7 @@ impl CpuSet {
     }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 pub trait DomainOps: Send + Sync {
     fn name(&self) -> &'static str;
     fn contains_cpu(&self, cpu_id: usize) -> bool;
@@ -265,6 +267,7 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
     }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 pub trait DomainAlgorithm: Send + Sync {
     fn pick_next(
         &self,
@@ -401,7 +404,13 @@ where
 pub struct TaskSchedBinding {
     domain: DomainId,
     class_state: NonNull<()>,
-    drop_class_state: unsafe fn(NonNull<()>),
+    allocation: NonNull<ReclaimNode>,
+}
+
+#[repr(C)]
+struct ClassState<T> {
+    reclaim: ReclaimNode,
+    value: T,
 }
 
 unsafe impl Send for TaskSchedBinding {}
@@ -409,19 +418,26 @@ unsafe impl Sync for TaskSchedBinding {}
 
 impl TaskSchedBinding {
     pub fn new<T: Send + Sync + 'static>(domain: DomainId, class_state: T) -> Self {
-        unsafe fn drop_state<T>(ptr: NonNull<()>) {
+        #[cfg_attr(irq_check, irq::forbidden)]
+        unsafe fn drop_state<T>(ptr: *mut ReclaimNode) {
             unsafe {
-                drop(Box::from_raw(ptr.cast::<T>().as_ptr()));
+                drop(Box::from_raw(ptr.cast::<ClassState<T>>()));
             }
         }
 
-        let raw = Box::into_raw(Box::new(class_state));
-        let class_state = NonNull::new(raw.cast::<()>()).expect("class state allocation failed");
+        let allocation = Box::into_raw(Box::new(ClassState {
+            reclaim: ReclaimNode::new(drop_state::<T>),
+            value: class_state,
+        }));
+        let class_state = unsafe {
+            NonNull::new_unchecked(core::ptr::addr_of_mut!((*allocation).value)).cast()
+        };
+        let allocation = unsafe { NonNull::new_unchecked(allocation.cast()) };
 
         Self {
             domain,
             class_state,
-            drop_class_state: drop_state::<T>,
+            allocation,
         }
     }
 
@@ -437,9 +453,10 @@ impl TaskSchedBinding {
 }
 
 impl Drop for TaskSchedBinding {
+    #[cfg_attr(irq_check, irq::context)]
     fn drop(&mut self) {
         unsafe {
-            (self.drop_class_state)(self.class_state);
+            reclaim::enqueue(self.allocation);
         }
     }
 }

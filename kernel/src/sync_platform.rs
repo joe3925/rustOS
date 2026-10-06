@@ -1,10 +1,9 @@
 use alloc::string::String;
-use alloc::sync::Arc;
 use kernel_sync::{Platform, ThreadEntry};
 
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::{Task, TaskHandle};
 use crate::scheduling::tls;
 
@@ -15,7 +14,7 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn current_task() -> Option<Self::Task> {
-        SCHEDULER.get_local_current_task()
+        scheduler().get_local_current_task()
     }
 
     #[inline]
@@ -25,7 +24,7 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn same_task(a: &Self::Task, b: &Self::Task) -> bool {
-        Arc::ptr_eq(a, b)
+        TaskHandle::ptr_eq(a, b)
     }
 
     #[inline]
@@ -45,17 +44,17 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn unpark(task: &Self::Task) {
-        SCHEDULER.unpark(task);
+        scheduler().unpark(task);
     }
 
     #[inline]
     fn park_current() {
-        SCHEDULER.park_current();
+        scheduler().park_current();
     }
 
     fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
         let task = Task::new_kernel_mode(entry, context, StackSize::Tiny, name, 0);
-        SCHEDULER.add_task(task);
+        scheduler().add_task(task);
     }
 
     #[inline]

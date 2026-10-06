@@ -8,7 +8,7 @@ use crate::memory::paging::frame_alloc::KernelFrameAllocator;
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::fifo_scheduler::{FifoPriority, fifo_task_sched_binding};
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::{Task, TaskHandle};
 
 use super::layout::base_page_size;
@@ -46,12 +46,12 @@ pub fn start_zero_page_worker() {
         fifo_task_sched_binding(FifoPriority::Low),
     );
     ZERO_PAGE_WORKER.call_once(|| task.clone());
-    SCHEDULER.add_task(task);
+    scheduler().add_task(task);
 }
 
 pub fn wake_zero_page_worker() {
     if let Some(task) = ZERO_PAGE_WORKER.get() {
-        SCHEDULER.unpark(task);
+        scheduler().unpark(task);
     }
 }
 
@@ -61,6 +61,6 @@ extern "C" fn zero_page_worker(_: usize) {
             yield_now();
             continue;
         }
-        SCHEDULER.park_current();
+        scheduler().park_current();
     }
 }

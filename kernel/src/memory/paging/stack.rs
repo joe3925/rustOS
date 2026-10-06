@@ -1,6 +1,7 @@
 use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::memory::RangeReservation;
 use kernel_types::status::PageMapError;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::layout::{align_up, base_page_size, supported_mapping_sizes};
 use super::map::{map_kernel_range, unmap_kernel_reserved_range_unchecked};
@@ -9,6 +10,7 @@ use super::virt_tracker::reserve_auto_kernel_range_aligned;
 #[derive(Debug)]
 pub struct KernelStack {
     reservation: RangeReservation,
+    pub(crate) mapped_start: AtomicU64,
 }
 
 impl KernelStack {
@@ -19,10 +21,11 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
+        let start = self.mapped_start.load(Ordering::Acquire);
         unsafe {
             unmap_kernel_reserved_range_unchecked(
-                self.reservation.start(),
-                self.reservation.size(),
+                VirtAddr::new(start),
+                self.reservation.end().as_u64() - start,
             );
         }
     }
@@ -94,7 +97,6 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<KernelStack, PageMapErro
         required_alignment_for_bytes(max_stack),
     )
     .map_err(|_| PageMapError::NoMemory())?;
-    let region_base = reservation.start();
     let stack_top = reservation.end();
     let map_start = VirtAddr::new(stack_top.as_u64() - map_bytes);
 
@@ -102,5 +104,8 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<KernelStack, PageMapErro
         return Err(err);
     }
 
-    Ok(KernelStack { reservation })
+    Ok(KernelStack {
+        reservation,
+        mapped_start: AtomicU64::new(map_start.as_u64()),
+    })
 }

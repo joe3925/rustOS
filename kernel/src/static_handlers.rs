@@ -33,7 +33,7 @@ use crate::{
     },
     memory::{dma, paging::stack::StackSize},
     registry::reg,
-    scheduling::{self, scheduler::SCHEDULER, task::Task},
+    scheduling::{self, scheduler::scheduler, task::Task},
     structs::stopwatch::Stopwatch,
     util::boot_info,
 };
@@ -75,25 +75,25 @@ use spin::{Mutex, Once};
 #[unsafe(no_mangle)]
 pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, name: String) -> u64 {
     let task = Task::new_kernel_mode(entry, ctx, StackSize::Tiny, name, 0);
-    SCHEDULER.add_task(task)
+    scheduler().add_task(task)
 }
 
 pub unsafe extern "C" fn park_self_and_yield() {
-    SCHEDULER.park_current();
+    scheduler().park_current();
 }
 pub extern "C" fn get_current_platform_cpu_id() -> usize {
     crate::platform::current_platform_cpu_id() as usize
 }
 
 pub extern "C" fn wake_task(id: u64) {
-    if let Some(task) = SCHEDULER.get_task_by_id(id) {
-        SCHEDULER.unpark(&task);
+    if let Some(task) = scheduler().get_task_by_id(id) {
+        scheduler().unpark(&task);
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
-    SCHEDULER.delete_task(id)
+    scheduler().delete_task(id)
 }
 
 #[unsafe(no_mangle)]

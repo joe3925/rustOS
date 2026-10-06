@@ -5,6 +5,7 @@
 #![allow(unused_variables)]
 #![feature(custom_test_frameworks)]
 #![feature(allocator_api)]
+#![feature(core_intrinsics)]
 #![test_runner(crate::test_runner)]
 #![allow(static_mut_refs)]
 #![allow(improper_ctypes_definitions)]

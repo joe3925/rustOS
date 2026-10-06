@@ -78,6 +78,7 @@ impl<T> AsyncMutex<T> {
     }
 
     #[inline]
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn lock_blocking(&self) -> AsyncMutexGuard<'_, T> {
         loop {
             if let Some(g) = self.try_lock() {

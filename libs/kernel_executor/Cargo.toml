@@ -19,7 +19,7 @@ loom = { version = "0.7", optional = true }
 loom = ["dep:loom"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(irq_check)'] }
 
 [dev-dependencies]
 kernel_types = { path = "../kernel_types", features = ["hosted-tests"] }

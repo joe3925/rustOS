@@ -73,6 +73,7 @@ features = ["spin_no_std"]
 
 [lints.rust]
 unused_must_use = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(irq_check)'] }
 
 [build-dependencies]
 cc = "1.2"

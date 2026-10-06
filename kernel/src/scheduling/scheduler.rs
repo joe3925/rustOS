@@ -9,6 +9,7 @@ use crate::scheduling::domain::{
     SwitchOutOutcome, TaskSchedBinding, USER_DOMAIN_ID,
 };
 use crate::scheduling::fifo_scheduler::{FifoPriority, build_fifo_domain, fifo_task_sched_binding};
+use crate::scheduling::reclaim;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{FpuState, SchedState, State};
 use crate::scheduling::task::Task;
@@ -18,11 +19,9 @@ use crate::scheduling::task::{TaskTable, TaskUpdate};
 use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use lazy_static::lazy_static;
-use spin::{Mutex, MutexGuard};
+use spin::{Mutex, MutexGuard, Once};
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
 
 pub(crate) fn kernel_task_sched_binding() -> TaskSchedBinding {
@@ -50,7 +49,7 @@ impl KernelFpuGuard {
     #[inline(always)]
     pub fn try_new() -> Option<Self> {
         let cpu_id = platform::current_cpu_id();
-        let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
+        let saved_task = if let Some(task) = scheduler().get_current_task(cpu_id) {
             {
                 let mut guard = task.inner.try_write()?;
                 guard.save_fpu_state();
@@ -76,7 +75,7 @@ impl Drop for KernelFpuGuard {
         self.saved_task.take();
 
         let cpu_id = platform::current_cpu_id();
-        if let Some(current) = SCHEDULER.get_current_task(cpu_id) {
+        if let Some(current) = scheduler().get_current_task(cpu_id) {
             let mut guard = current
                 .inner
                 .try_write()
@@ -117,7 +116,7 @@ pub struct LocalScheduler<'a> {
 
 impl LocalScheduler<'_> {
     pub(crate) unsafe fn on_timer_tick(&mut self, state: *mut State) -> Option<TaskHandle> {
-        unsafe { SCHEDULER.schedule_next(self, state) }
+        unsafe { scheduler().schedule_next(self, state) }
     }
 }
 
@@ -125,7 +124,7 @@ impl Drop for LocalScheduler<'_> {
     fn drop(&mut self) {
         drop(self.current.take());
         drop(self.access.take());
-        SCHEDULER.maybe_balance();
+        scheduler().maybe_balance();
         if let Some(fpu) = self.return_fpu.as_ref() {
             platform::restore_fpu_state(fpu);
         }
@@ -140,12 +139,46 @@ pub struct Scheduler {
     num_cores: AtomicUsize,
 }
 
-lazy_static! {
-    pub static ref SCHEDULER: Scheduler = Scheduler::new();
+pub static SCHEDULER: Once<Scheduler> = Once::new();
+static REAPER: Once<TaskHandle> = Once::new();
+
+pub(crate) fn start_reaper() {
+    REAPER.call_once(|| {
+        let task = Task::new_kernel_mode(
+            reaper_entry,
+            0,
+            StackSize::Tiny,
+            "reaper".into(),
+            0,
+        );
+        scheduler().add_task(task.clone());
+        task
+    });
+}
+
+extern "C" fn reaper_entry(_: usize) {
+    loop {
+        scheduler().reap_retired_tasks();
+        if reclaim::has_pending() || scheduler().all_tasks.has_retired() {
+            yield_now();
+        } else {
+            scheduler().park_current();
+        }
+    }
+}
+
+pub(super) fn wake_reaper() {
+    if let Some(task) = REAPER.get() {
+        scheduler().unpark(task);
+    }
+}
+
+pub fn scheduler() -> &'static Scheduler {
+    SCHEDULER.get().expect("scheduler is not initialized")
 }
 
 impl Scheduler {
-    fn new() -> Self {
+    pub(crate) fn new(cpu_count: usize) -> Self {
         Self {
             all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
             cores: [const { AtomicPtr::new(ptr::null_mut()) }; platform::MAX_CPUS],
@@ -153,15 +186,15 @@ impl Scheduler {
                 alloc::vec![
                     DomainEntry::new(
                         KERNEL_DOMAIN_ID,
-                        build_fifo_domain("kernel", CpuSet::all(), platform::processor_count()),
+                        build_fifo_domain("kernel", CpuSet::all(), cpu_count),
                     ),
                     DomainEntry::new(
                         USER_DOMAIN_ID,
-                        build_fifo_domain("user", CpuSet::all(), platform::processor_count()),
+                        build_fifo_domain("user", CpuSet::all(), cpu_count),
                     ),
                 ]
                 .into_boxed_slice(),
-                platform::processor_count(),
+                cpu_count,
             ),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
@@ -273,13 +306,14 @@ impl Scheduler {
         }
 
         self.all_tasks.reap_retired();
+        reclaim::drain();
     }
 
     #[inline(always)]
     fn unregister_task(&self, task: &TaskHandle) {
         let id = task.task_id();
-        if id != 0 {
-            self.all_tasks.retire(id, task);
+        if id != 0 && self.all_tasks.retire(id, task) {
+            wake_reaper();
         }
     }
 
@@ -450,7 +484,7 @@ impl Scheduler {
         let cpu_id = platform::current_cpu_id();
         if self
             .core(cpu_id)
-            .is_some_and(|core| Arc::ptr_eq(&current, &core.idle_task))
+            .is_some_and(|core| TaskHandle::ptr_eq(&current, &core.idle_task))
         {
             return;
         }
@@ -480,7 +514,7 @@ impl Scheduler {
             let mut inner = previous.inner.try_write()?;
             unsafe { inner.update_from_context(state) };
             if previous.sched_state() == SchedState::Running
-                && !Arc::ptr_eq(previous, &core.idle_task)
+                && !TaskHandle::ptr_eq(previous, &core.idle_task)
                 && !self.domains.should_preempt(previous.domain_id(), previous)
             {
                 return previous_handle;
@@ -522,10 +556,10 @@ impl Scheduler {
                 let root = if candidate.is_kernel_mode() {
                     Some(kernel_address_space_root())
                 } else {
-                    match PROGRAM_MANAGER.try_get(inner.parent_pid) {
-                        Ok(Some(program)) => {
-                            program.try_read().map(|program| program.address_space_root)
-                        }
+                    match PROGRAM_MANAGER.try_with(inner.parent_pid, |program| {
+                        program.map(|program| program.address_space_root)
+                    }) {
+                        Ok(Some(root)) => Some(root),
                         Ok(None) => {
                             candidate.terminate();
                             None
@@ -566,7 +600,7 @@ impl Scheduler {
                 if resume && previous.set_sched_state(SchedState::Running) {
                     return previous_handle;
                 }
-                if Arc::ptr_eq(previous, &core.idle_task) {
+                if TaskHandle::ptr_eq(previous, &core.idle_task) {
                     return previous_handle;
                 }
             }
@@ -591,7 +625,7 @@ impl Scheduler {
 
         let mut previous = local.current.take();
         if let Some(prev) = previous.as_mut() {
-            if !Arc::ptr_eq(prev, &core.idle_task) {
+            if !TaskHandle::ptr_eq(prev, &core.idle_task) {
                 if let Some(inner) = prev.inner.try_read() {
                     inner.account_switched_out(now_cycles);
                 }
@@ -629,7 +663,7 @@ impl Scheduler {
         local.return_fpu = selected_fpu;
         access.state.current = Some((*next).clone());
         core.current_is_idle
-            .store(Arc::ptr_eq(&next, &core.idle_task), Ordering::Release);
+            .store(TaskHandle::ptr_eq(&next, &core.idle_task), Ordering::Release);
         core.current_task_id
             .store(next.task_id(), Ordering::Release);
         local.current = Some(next);
@@ -639,7 +673,7 @@ impl Scheduler {
             }
         }
         drop(previous);
-        previous_handle.filter(|task| !Arc::ptr_eq(task, &core.idle_task))
+        previous_handle.filter(|task| !TaskHandle::ptr_eq(task, &core.idle_task))
     }
 
     fn handle_switch_out(
@@ -702,12 +736,10 @@ impl Scheduler {
         let pid = inner.parent_pid;
         drop(inner);
 
-        match PROGRAM_MANAGER.try_get(pid) {
-            Ok(Some(program)) => {
-                if let Some(program) = program.try_read() {
-                    unsafe { switch_address_space_root(program.address_space_root) };
-                }
-            }
+        match PROGRAM_MANAGER.try_with(pid, |program| {
+            program.map(|program| unsafe { switch_address_space_root(program.address_space_root) })
+        }) {
+            Ok(Some(())) => {}
             Ok(None) => task_handle.terminate(),
             Err(()) => {}
         }
@@ -771,6 +803,7 @@ impl Scheduler {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
@@ -782,14 +815,14 @@ pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
-    if let Some(mut local) = SCHEDULER.try_local_scheduler() {
-        let core = SCHEDULER
+    if let Some(mut local) = scheduler().try_local_scheduler() {
+        let core = scheduler()
             .core(local.access.as_ref().unwrap().cpu_id())
             .unwrap();
         if local
             .current
             .as_ref()
-            .is_none_or(|task| Arc::ptr_eq(task, &core.idle_task))
+            .is_none_or(|task| TaskHandle::ptr_eq(task, &core.idle_task))
         {
             unsafe { local.on_timer_tick(state) };
         }
@@ -798,6 +831,7 @@ pub unsafe extern "C" fn ipi_handler_c(state: *mut State) {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
@@ -808,7 +842,7 @@ pub unsafe extern "C" fn yield_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
-    if let Some(mut local) = SCHEDULER.try_local_scheduler() {
+    if let Some(mut local) = scheduler().try_local_scheduler() {
         unsafe { local.on_timer_tick(state) };
     }
 }
@@ -821,8 +855,9 @@ pub extern "C" fn ipi_eoi_only() {
 pub extern "C" fn kernel_task_end() -> ! {
     mimalloc_thread_done();
 
-    let task = SCHEDULER.get_local_current_task().unwrap();
+    let task = scheduler().get_local_current_task().unwrap();
     task.terminate();
+    drop(task);
 
     loop {
         yield_now();

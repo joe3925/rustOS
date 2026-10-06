@@ -23,4 +23,4 @@ std = []
 loom = ["std", "dep:loom"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(irq_check)'] }

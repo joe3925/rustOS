@@ -2,7 +2,7 @@ use crate::scheduling::domain::{
     CpuSet, Domain, DomainOps, EnqueueReason, KERNEL_DOMAIN_ID, SchedulerClass, SwitchOutOutcome,
     TaskSchedBinding,
 };
-use crate::scheduling::scheduler::{RunQueueAccess, SCHEDULER};
+use crate::scheduling::scheduler::{RunQueueAccess, scheduler};
 use crate::scheduling::state::SchedState;
 use crate::scheduling::task::{TaskHandle, TaskUpdate};
 use alloc::boxed::Box;
@@ -164,7 +164,7 @@ impl SchedulerClass for FifoClass {
         reason: EnqueueReason,
         hint_cpu: usize,
     ) -> Option<usize> {
-        let n = SCHEDULER.num_cores();
+        let n = scheduler().num_cores();
 
         if matches!(
             reason,
@@ -234,7 +234,7 @@ impl SchedulerClass for FifoClass {
     fn effective_load(&self, cpu_id: usize, cpu: &Self::CpuState) -> usize {
         let queue_load = cpu.load.load(Ordering::Acquire);
 
-        if SCHEDULER.cpu_is_idle(cpu_id) {
+        if scheduler().cpu_is_idle(cpu_id) {
             queue_load
         } else {
             queue_load.saturating_add(1)
@@ -248,13 +248,13 @@ impl SchedulerClass for FifoClass {
         _dst_cpu_id: usize,
         _dst_cpu: &Self::CpuState,
     ) -> Option<TaskUpdate> {
-        let access = SCHEDULER.try_core_scheduler(src_cpu_id)?;
+        let access = scheduler().try_core_scheduler(src_cpu_id)?;
         drain_inbound_to_runqueue(&access, src_cpu);
         for _ in 0..src_cpu.run_queue.len() {
             let task = pop_queued_task(&access, src_cpu, true)?;
             match task.sched_state() {
                 SchedState::Runnable => return Some(task),
-                SchedState::Terminated => SCHEDULER.unregister_task_from_domain(&task),
+                SchedState::Terminated => scheduler().unregister_task_from_domain(&task),
                 SchedState::Running | SchedState::Parking | SchedState::Blocked => {
                     panic!("non-runnable task in run queue");
                 }
@@ -282,7 +282,7 @@ impl SchedulerClass for FifoClass {
 
         self.last_balance_tick.store(now_tick, Ordering::Relaxed);
 
-        let n = SCHEDULER.num_cores();
+        let n = scheduler().num_cores();
         if n < 2 {
             return;
         }

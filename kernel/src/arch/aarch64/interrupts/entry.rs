@@ -303,6 +303,7 @@ extern "C" fn aarch64_sync_handler(frame: &mut InterruptFrame, origin: u64) {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 extern "C" fn aarch64_irq_handler(frame: &mut InterruptFrame, _origin: u64) {
     let Some(token) = controller().acknowledge() else {
         return;

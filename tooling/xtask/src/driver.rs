@@ -165,8 +165,9 @@ fn build_cargo_driver(
         .join("target")
         .join("cargo")
         .join(&plan.id)
-        .join("drivers");
+        .join("irq-check-drivers");
     let mut command = super::cargo(root);
+    super::configure_irq_check(&mut command, root, plan, "drivers")?;
     command
         .arg("build")
         .args(["--manifest-path"])

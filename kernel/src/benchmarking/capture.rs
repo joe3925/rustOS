@@ -7,7 +7,7 @@ use crate::memory::{
     paging::frame_alloc::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::backtrace::{Backtrace, BacktraceStatus, MAX_BACKTRACE_DEPTH};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_archive_for_path};
@@ -15,6 +15,7 @@ use crate::structs::stopwatch::Stopwatch;
 use crate::util::{TOTAL_TIME, boot_info};
 use crate::{platform, print, println, vec};
 use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -138,27 +139,34 @@ fn bench_unwind_status(status: BacktraceStatus) -> u32 {
 }
 
 fn bench_frame_kind(ip: u64) -> u32 {
-    for program in PROGRAM_MANAGER.all() {
+    let Some(programs) = PROGRAM_MANAGER.programs.try_read() else {
+        return kernel_types::benchmark::BENCH_FRAME_KIND_UNKNOWN;
+    };
+    for program in programs.values() {
         let Some(program) = program.try_read() else {
             continue;
         };
-        let Some(module) = program.module_containing(kernel_types::arch::VirtAddr::new(ip)) else {
+        let Some(modules) = program.modules.try_read() else {
             continue;
         };
-        if module
-            .try_read()
-            .and_then(|module| module.pe_info.as_ref().map(|pe| pe.is_64))
-            .unwrap_or(false)
-        {
-            return kernel_types::benchmark::BENCH_FRAME_KIND_PE_X64;
+        for module in modules.iter() {
+            let Some(module) = module.try_read() else {
+                continue;
+            };
+            let start = module.image_base.as_u64();
+            let Some(end) = start.checked_add(module.image_size) else {
+                continue;
+            };
+            if ip >= start && ip < end && module.pe_info.as_ref().is_some_and(|pe| pe.is_64) {
+                return kernel_types::benchmark::BENCH_FRAME_KIND_PE_X64;
+            }
         }
     }
     kernel_types::benchmark::BENCH_FRAME_KIND_UNKNOWN
 }
 
-//const BENCH_ENABLED: bool = cfg!(debug_assertions);
-pub const BENCH_ENABLED: bool = cfg!(feature = "kernel-bench");
-
+//pub const BENCH_ENABLED: bool = cfg!(feature = "kernel-bench");
+pub const BENCH_ENABLED: bool = true;
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
 
@@ -287,7 +295,8 @@ enum BenchPushOutcome {
 
 struct BenchRing {
     next_seq: u64,
-    buffer: Vec<BenchEvent>,
+    buffer: Box<[BenchEvent]>,
+    len: usize,
     write_idx: usize,
     wrapped: bool,
 }
@@ -296,7 +305,8 @@ impl BenchRing {
     fn new(initial_capacity: usize) -> Self {
         BenchRing {
             next_seq: 1,
-            buffer: Vec::with_capacity(initial_capacity),
+            buffer: vec![BenchEvent::default(); initial_capacity].into_boxed_slice(),
+            len: 0,
             write_idx: 0,
             wrapped: false,
         }
@@ -307,16 +317,15 @@ impl BenchRing {
         self.write_idx = 0;
         self.wrapped = false;
 
-        if self.buffer.capacity() != capacity {
-            self.buffer = Vec::with_capacity(capacity);
-        } else {
-            self.buffer.clear();
+        if self.buffer.len() != capacity {
+            self.buffer = vec![BenchEvent::default(); capacity].into_boxed_slice();
         }
+        self.len = 0;
     }
 
     fn near_full(&self) -> bool {
-        let capacity = self.buffer.capacity();
-        capacity != 0 && self.buffer.len().saturating_mul(8) >= capacity.saturating_mul(7)
+        let capacity = self.buffer.len();
+        capacity != 0 && self.len.saturating_mul(8) >= capacity.saturating_mul(7)
     }
 
     fn push_event(
@@ -324,15 +333,16 @@ impl BenchRing {
         mut event: BenchEvent,
         policy: BenchOverflowPolicy,
     ) -> BenchPushOutcome {
-        let capacity = self.buffer.capacity();
+        let capacity = self.buffer.len();
         if capacity == 0 {
             return BenchPushOutcome::DroppedFull;
         }
 
-        if self.buffer.len() < capacity {
+        if self.len < capacity {
             event.seq = self.next_seq;
             self.next_seq = self.next_seq.wrapping_add(1);
-            self.buffer.push(event);
+            self.buffer[self.len] = event;
+            self.len += 1;
             return if self.near_full() {
                 BenchPushOutcome::StoredNearFull
             } else {
@@ -396,7 +406,7 @@ impl BenchRing {
     }
 
     fn drain_events(&mut self) -> Vec<BenchEvent> {
-        let len = self.buffer.len();
+        let len = self.len;
         if len == 0 {
             return Vec::new();
         }
@@ -405,10 +415,10 @@ impl BenchRing {
         if self.wrapped && self.write_idx < len {
             out.extend_from_slice(&self.buffer[self.write_idx..]);
             out.extend_from_slice(&self.buffer[..self.write_idx]);
-            self.buffer.clear();
         } else {
-            out.append(&mut self.buffer);
+            out.extend_from_slice(&self.buffer[..len]);
         }
+        self.len = 0;
         self.write_idx = 0;
         self.wrapped = false;
         out
@@ -597,7 +607,7 @@ static ACTIVE_PAUSE_POLICY: AtomicU32 =
 static ACTIVE_PAUSE_START_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLING_STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PERTURBED_BY_WORKER: AtomicBool = AtomicBool::new(false);
-static ACTIVE_OVERFLOW_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+static OVERFLOW_WORKER: Once<crate::scheduling::task::TaskHandle> = Once::new();
 static ACTIVE_OVERFLOW_WINDOW: Once<Mutex<Option<BenchWindow>>> = Once::new();
 
 fn bench_policy_from_raw(raw: u32) -> BenchOverflowPolicy {
@@ -644,6 +654,17 @@ fn active_overflow_window() -> &'static Mutex<Option<BenchWindow>> {
 }
 
 fn set_active_overflow_window(window: BenchWindow) {
+    OVERFLOW_WORKER.call_once(|| {
+        let task = crate::scheduling::task::Task::new_kernel_mode(
+            bench_overflow_worker,
+            0,
+            crate::memory::paging::stack::StackSize::Tiny,
+            "benchmark overflow".into(),
+            0,
+        );
+        scheduler().add_task(task.clone());
+        task
+    });
     *active_overflow_window().lock() = Some(window);
 }
 
@@ -774,7 +795,9 @@ fn callchain_from_external_stack(rip: u64, stack: &[u64]) -> BenchCallchain {
 fn bench_request_drain_worker() {
     ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
     let _ = ACTIVE_DRAIN_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
-    bench_spawn_overflow_worker_if_needed();
+    if let Some(task) = OVERFLOW_WORKER.get() {
+        scheduler().unpark(task);
+    }
 }
 
 #[inline]
@@ -787,31 +810,31 @@ fn bench_request_pause_flush(policy: BenchOverflowPolicy) {
         let _ =
             ACTIVE_PAUSE_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
     }
-    bench_spawn_overflow_worker_if_needed();
+    if let Some(task) = OVERFLOW_WORKER.get() {
+        scheduler().unpark(task);
+    }
 }
 
-fn bench_spawn_overflow_worker_if_needed() {
-    if ACTIVE_OVERFLOW_WORKER_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
+extern "C" fn bench_overflow_worker(_: usize) {
+    loop {
+        if !ACTIVE_DRAIN_PENDING.load(Ordering::Acquire)
+            && !ACTIVE_PAUSE_PENDING.load(Ordering::Acquire)
+        {
+            scheduler().park_current();
+            continue;
+        }
+        let window = {
+            let active = active_overflow_window().lock();
+            active.clone()
+        };
 
-    let window = {
-        let active = active_overflow_window().lock();
-        active.clone()
-    };
+        let Some(window) = window else {
+            ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
+            ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
+            ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
+            continue;
+        };
 
-    let Some(window) = window else {
-        ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
-        ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
-        ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
-        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
-        return;
-    };
-
-    spawn_blocking(move || {
         loop {
             let mut did_work = false;
 
@@ -834,15 +857,7 @@ fn bench_spawn_overflow_worker_if_needed() {
                 break;
             }
         }
-
-        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
-
-        if ACTIVE_DRAIN_PENDING.load(Ordering::Acquire)
-            || ACTIVE_PAUSE_PENDING.load(Ordering::Acquire)
-        {
-            bench_spawn_overflow_worker_if_needed();
-        }
-    });
+    }
 }
 
 #[inline]
@@ -1039,7 +1054,7 @@ pub fn bench_submit_interrupt_sample_current_core(state: &State) {
     }
 
     let core_id = platform::current_cpu_id();
-    let task = SCHEDULER.get_current_task(core_id);
+    let task = scheduler().get_current_task(core_id);
     if task.is_none() {
         if let Some(state) = bench_state_get() {
             if let Some(drops) = state.drops_for_core(core_id) {

@@ -32,6 +32,7 @@ pub(crate) const MAX_GSI: u8 = 64;
 
 const IRQ_SAVED_GPR_BYTES: usize = 15 * 8;
 
+#[cfg_attr(irq_check, irq::context)]
 extern "C" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
     let interrupt_guard = InterruptGuard::new();
     let _fpu_guard = interrupt_guard.is_outermost().then(KernelFpuGuard::new);

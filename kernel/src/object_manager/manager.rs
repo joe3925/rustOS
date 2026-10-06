@@ -281,7 +281,7 @@ impl Object {
                 }
             }
             ObjectPayload::Thread(task) => {
-                match crate::scheduling::scheduler::SCHEDULER.delete_task(task.task_id()) {
+                match crate::scheduling::scheduler::scheduler().delete_task(task.task_id()) {
                     Ok(()) => IoRequestOutput::success(0, 0),
                     Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
                 }

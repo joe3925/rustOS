@@ -7,7 +7,7 @@ use aarch64_cpu::asm::barrier::{SY, isb};
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 use crate::idt::interrupt_impl::InterruptGuard;
 use crate::platform::{self, TimerPlatform};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::state::State;
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::KERNEL_INITIALIZED;
@@ -65,7 +65,7 @@ pub(super) unsafe fn handle_interrupt(state: *mut State) {
     }
 
     let _interrupt_guard = InterruptGuard::new();
-    let Some(mut scheduling) = SCHEDULER.try_local_scheduler() else {
+    let Some(mut scheduling) = scheduler().try_local_scheduler() else {
         return;
     };
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);

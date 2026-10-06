@@ -1,5 +1,6 @@
 pub(crate) mod domain;
 pub(crate) mod fifo_scheduler;
+mod reclaim;
 #[allow(dead_code)]
 pub mod runtime;
 pub(crate) mod scheduler;

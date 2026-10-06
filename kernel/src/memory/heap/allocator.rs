@@ -5,7 +5,7 @@ use crate::memory::paging::stack::StackSize;
 use crate::platform;
 use crate::println;
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use alloc::boxed::Box;
@@ -68,6 +68,7 @@ impl KernelAllocator {
 }
 
 unsafe impl GlobalAlloc for KernelAllocator {
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
             if platform::current_is_in_interrupt() {
@@ -79,6 +80,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
     }}
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
             if platform::current_is_in_interrupt() {
@@ -94,6 +96,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
     }}
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { unsafe {
         if ptr.is_null() {
             return;
@@ -109,6 +112,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
     }}
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 { unsafe {
         if ptr.is_null() {
             return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
@@ -234,7 +238,7 @@ pub fn test_full_heap_parallel() {
             core::mem::forget(ctx_arg);
 
             tasks.push(task.clone());
-            SCHEDULER.add_task(task);
+            scheduler().add_task(task);
         }
 
         reset_parallel_heap_test_stats();
@@ -298,8 +302,8 @@ pub fn test_full_heap_parallel() {
             verify_ms,
         );
 
-        while tasks.iter().any(|task| Arc::strong_count(task) > 1) {
-            SCHEDULER.reap_retired_tasks();
+        while tasks.iter().any(|task| task.strong_count() > 1) {
+            scheduler().reap_retired_tasks();
             yield_now();
         }
 

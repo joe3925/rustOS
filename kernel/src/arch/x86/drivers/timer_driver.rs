@@ -6,7 +6,7 @@ use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 use super::super::cpu::{current_cpu_id, current_is_in_interrupt};
 use super::super::interrupts::apic::local::send_eoi as send_eoi_timer;
 use super::super::timer::APIC_TICKS_PER_NS;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::state::State;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::structs::stopwatch::Stopwatch;
@@ -34,6 +34,7 @@ pub struct TimerDebug {
     pub did_sched: bool,
 }
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
@@ -44,7 +45,7 @@ pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
-    let Some(mut scheduling) = SCHEDULER.try_local_scheduler() else {
+    let Some(mut scheduling) = scheduler().try_local_scheduler() else {
         return;
     };
     TIMER.fetch_add(1, Ordering::Relaxed);

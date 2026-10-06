@@ -133,6 +133,7 @@ pub trait ExecutorPlatform: Send + Sync {
     fn try_steal_blocking_one(&self) -> bool;
     fn yield_now(&self);
     fn print(&self, string: &str);
+    #[cfg_attr(irq_check, irq::context)]
     fn in_interrupt_context(&self) -> bool;
 }
 pub static PLATFORM: Once<&'static dyn ExecutorPlatform> = Once::new();

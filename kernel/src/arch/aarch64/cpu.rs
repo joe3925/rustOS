@@ -13,7 +13,7 @@ use kernel_types::irq::PlatformCpuId;
 use crate::machine::{PsciConduit, machine_info};
 use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::platform::{AddressSpacePlatform, CpuPlatform, CpuStartupError};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::structs::per_cpu::{PerCpu, alloc_or_get_percpu};
 use crate::util::{CORE_LOCK, KERNEL_INITIALIZED};
 
@@ -538,7 +538,7 @@ extern "C" fn aarch64_secondary_entry(cpu_id: u64) -> ! {
         core::hint::spin_loop();
     }
     crate::platform::init_periodic_timer();
-    SCHEDULER.init_core(cpu_id);
+    scheduler().init_core(cpu_id);
     AP_SCHEDULER_TURN.fetch_add(1, Ordering::Release);
     crate::platform::enable_interrupts();
     loop {

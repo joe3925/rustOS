@@ -5,7 +5,7 @@ use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::layout::{base_page_size, kernel_space_base};
 use crate::memory::paging::stack::StackSize;
 use crate::platform::{self, resolve_mapping_in_root};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
 use crate::structs::io_request::message::MessageDelivery;
@@ -229,7 +229,7 @@ fn invalid_handle(handle: UserHandle) -> u64 {
 }
 
 fn current_process() -> Result<(u64, ProgramHandle), u64> {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -810,7 +810,7 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
     }
 }
 pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -856,7 +856,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
         );
     }
     let tid = th.task_id();
-    match SCHEDULER.delete_task(tid) {
+    match scheduler().delete_task(tid) {
         Ok(_) => {
             let _ = OBJECT_MANAGER.unlink_object(&obj);
             obj.mark_dead();
@@ -868,7 +868,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
 
 pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     let stack_size = StackSize::Medium.as_bytes();
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -907,7 +907,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         stack.into(),
         caller_pid,
     );
-    SCHEDULER.add_task(task.clone());
+    scheduler().add_task(task.clone());
 
     let obj = ensure_thread_object(caller_pid, &task);
     caller.read().create_user_handle_for_object(obj)
@@ -1286,7 +1286,7 @@ pub(crate) fn sys_io_cancel(completion_queue_handle: UserHandle, request_id: Req
 }
 
 pub(crate) fn sys_get_thread() -> UserHandle {
-    let task = SCHEDULER
+    let task = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap();
     let caller_pid = task.inner.read().parent_pid;
@@ -1303,7 +1303,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
     }
     let msg = unsafe { &mut *message_ptr };
 
-    let sender_pid = SCHEDULER
+    let sender_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1348,7 +1348,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
     }
     let rule_u = unsafe { &*rule_ptr };
 
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1463,7 +1463,7 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     }
     let rule_u = unsafe { &*rule_ptr };
 
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1492,7 +1492,7 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
 }
 
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1507,7 +1507,7 @@ pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
 }
 
 pub(crate) fn sys_create_mq() -> UserHandle {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1529,7 +1529,7 @@ pub(crate) fn sys_create_mq() -> UserHandle {
 }
 
 pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner

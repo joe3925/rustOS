@@ -367,6 +367,7 @@ pub extern "C" fn virtio_device_add(
     Ok(DriverStep::Complete)
 }
 
+#[cfg_attr(irq_check, irq::context)]
 extern "C" fn virtio_isr(
     _interrupt_id: u32,
     _cpu: u32,
@@ -389,6 +390,7 @@ extern "C" fn virtio_isr(
     }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 extern "C" fn virtio_msix_isr(
     _interrupt_id: u32,
     _cpu: u32,

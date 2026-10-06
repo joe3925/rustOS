@@ -19,13 +19,14 @@ use embedded_graphics::text::TextStyleBuilder;
 use kernel_abi::PixelFormat;
 use kernel_sync::locks::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
+use spin::Once;
 const FRAMEBUFFER_CONSOLE: bool = true;
 const FONT_HEIGHT: usize = 18;
 const FONT_WIDTH: usize = 9;
 const TAB_SPACES: usize = 4;
 const PRINT_FLUSH_TRIES: usize = 256;
 
-const PRINT_QUEUE_SLOTS: usize = 256;
+pub(crate) const PRINT_QUEUE_SLOTS: usize = 256;
 const PRINT_SLOT_SIZE: usize = 1024;
 const PRINT_SLOT_PAYLOAD: usize = PRINT_SLOT_SIZE - 1;
 
@@ -35,7 +36,7 @@ pub(crate) struct Cursor {
 }
 
 #[derive(Clone, Copy)]
-struct PrintSlot {
+pub(crate) struct PrintSlot {
     bytes: [u8; PRINT_SLOT_SIZE],
     len: usize,
 }
@@ -378,7 +379,10 @@ impl Console {
     }
 
     fn flush_queued_prints(&mut self) {
-        while let Some(slot) = PRINT_QUEUE.pop() {
+        let Some(queue) = PRINT_QUEUE.get() else {
+            return;
+        };
+        while let Some(slot) = queue.pop() {
             self.push_bytes(slot.as_bytes());
             self.flush_pending();
         }
@@ -529,8 +533,8 @@ impl fmt::Write for Console {
 
 lazy_static! {
     pub static ref CONSOLE: IrqSafeMutex<Option<Console>> = IrqSafeMutex::new(Console::new());
-    static ref PRINT_QUEUE: ArrayQueue<PrintSlot> = ArrayQueue::new(PRINT_QUEUE_SLOTS);
 }
+pub(crate) static PRINT_QUEUE: Once<ArrayQueue<PrintSlot>> = Once::new();
 
 static PRINT_QUEUE_FULL_PANIC: AtomicBool = AtomicBool::new(false);
 
@@ -556,7 +560,10 @@ fn queue_slot(slot: PrintSlot) {
         return;
     }
 
-    match PRINT_QUEUE.push(slot) {
+    let Some(queue) = PRINT_QUEUE.get() else {
+        return;
+    };
+    match queue.push(slot) {
         Ok(()) => {}
         Err(slot) => {
             print_queue_full_panic(slot);

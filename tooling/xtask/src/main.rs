@@ -87,6 +87,7 @@ fn try_main() -> Result<(), String> {
                         ));
                     }
                     let mut command = cargo(&root);
+                    configure_irq_check(&mut command, &root, &plan, "kernel")?;
                     command
                         .args(&options.args)
                         .args(["--manifest-path"])
@@ -97,7 +98,7 @@ fn try_main() -> Result<(), String> {
                         .args(build_std_args())
                         .env(
                             "CARGO_TARGET_DIR",
-                            root.join("target/cargo").join(&plan.id).join("kernel"),
+                            root.join("target/cargo").join(&plan.id).join("irq-check-kernel"),
                         );
                     if plan.kernel.no_default_features {
                         command.arg("--no-default-features");
@@ -119,6 +120,7 @@ fn try_main() -> Result<(), String> {
                         found = true;
                         let (package_id, _) = driver::cargo_package_identity(manifest)?;
                         let mut command = cargo(&root);
+                        configure_irq_check(&mut command, &root, &plan, "drivers")?;
                         command
                             .args(&options.args)
                             .args(["--manifest-path"])
@@ -129,7 +131,7 @@ fn try_main() -> Result<(), String> {
                             .args(build_std_args())
                             .env(
                                 "CARGO_TARGET_DIR",
-                                root.join("target/cargo").join(&plan.id).join("drivers"),
+                                root.join("target/cargo").join(&plan.id).join("irq-check-drivers"),
                             )
                             .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
                         run(
@@ -560,6 +562,7 @@ fn build_kernel(
         ));
     }
     let mut kernel = cargo(root);
+    configure_irq_check(&mut kernel, root, plan, "kernel")?;
     kernel
         .arg("build")
         .args(["--manifest-path"])
@@ -575,7 +578,7 @@ fn build_kernel(
         ])
         .env(
             "CARGO_TARGET_DIR",
-            root.join("target/cargo").join(&plan.id).join("kernel"),
+            root.join("target/cargo").join(&plan.id).join("irq-check-kernel"),
         );
 
     if plan.kernel.no_default_features {
@@ -896,6 +899,44 @@ fn cargo(dir: &Path) -> Command {
     }
 
     command
+}
+
+fn configure_irq_check(
+    command: &mut Command,
+    root: &Path,
+    plan: &BuildPlan,
+    component: &str,
+) -> Result<(), String> {
+    let executable = env::var_os("IRQ_CHECK").unwrap_or_else(|| "irq-check".into());
+    let instructions = "Install the interrupt checker:\n  git clone https://github.com/joe3925/irq-check.git\n  cd irq-check\n  rustup toolchain install nightly-2026-04-07 --component rustc-dev --component rust-src --component llvm-tools-preview\n  cargo +nightly-2026-04-07 install --locked --path .\nAdd the Cargo bin directory to PATH, or set IRQ_CHECK to the full path of irq-check.";
+    let output = Command::new(&executable)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("Cannot start {}: {error}.\n{instructions}", Path::new(&executable).display()))?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success()
+        || !version.starts_with("irq-check 0.1.2 nightly-2026-04-07 ")
+        || !version.contains("bcded331651b60a0383b3ff51db4f24c4495ac53")
+    {
+        return Err(format!("The interrupt checker version is incompatible: {version}\n{instructions}"));
+    }
+    let readiness = Command::new(&executable)
+        .arg("--self-check")
+        .output()
+        .map_err(|error| format!("Cannot check irq-check: {error}.\n{instructions}"))?;
+    if !readiness.status.success() {
+        return Err(format!("The interrupt checker cannot load its compiler driver: {}\n{instructions}", String::from_utf8_lossy(&readiness.stderr)));
+    }
+    if let Some(wrapper) = env::var_os("RUSTC_WRAPPER") {
+        if !wrapper.is_empty() && wrapper != executable {
+            return Err("RUSTC_WRAPPER is already set. Clear it so irq-check can check every dependency.".into());
+        }
+    }
+    command
+        .env("RUSTC_WRAPPER", &executable)
+        .env("IRQ_CHECK_REQUIRED_CRATE", if component == "kernel" { plan.kernel.package.as_str() } else { "" })
+        .env("IRQ_CHECK_REPORT_DIR", root.join("target/irq-check").join(&plan.id).join(component));
+    Ok(())
 }
 
 fn path_with_rust_linkers() -> Option<OsString> {

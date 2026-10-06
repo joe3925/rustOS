@@ -27,7 +27,7 @@ use crate::{
 use crate::{
     memory::paging::address_space::AddressSpaceRoot,
     memory::user_pins::UserMemoryPins,
-    scheduling::scheduler::SCHEDULER,
+    scheduling::scheduler::scheduler,
 };
 use kernel_types::arch::{PageFlags, VirtAddr};
 
@@ -592,11 +592,11 @@ impl Program {
 
             let mut running = managed.len() + 1;
 
-            if SCHEDULER.get_task_by_id(main_tid).is_none() {
+            if scheduler().get_task_by_id(main_tid).is_none() {
                 running -= 1;
             }
             for tid in &*managed {
-                if SCHEDULER
+                if scheduler()
                     .get_task_by_id(tid.inner.read().executer_id.unwrap())
                     .is_none()
                 {
@@ -769,7 +769,7 @@ impl Program {
 
 pub struct ProgramManager {
     next_pid: AtomicU64,
-    programs: RwLock<BTreeMap<u64, ProgramHandle>>,
+    pub(crate) programs: RwLock<BTreeMap<u64, ProgramHandle>>,
 }
 
 impl ProgramManager {
@@ -853,20 +853,28 @@ impl ProgramManager {
         self.programs.read().get(&pid).map(Arc::clone)
     }
 
-    pub(crate) fn try_get(&self, pid: u64) -> Result<Option<ProgramHandle>, ()> {
+    pub(crate) fn try_with<R>(
+        &self,
+        pid: u64,
+        f: impl FnOnce(Option<&Program>) -> R,
+    ) -> Result<R, ()> {
         let programs = self.programs.try_read().ok_or(())?;
-        Ok(programs.get(&pid).map(Arc::clone))
+        let Some(program) = programs.get(&pid) else {
+            return Ok(f(None));
+        };
+        let program = program.try_read().ok_or(())?;
+        Ok(f(Some(&program)))
     }
 
     pub fn start_pid(&self, pid: u64) -> Option<TaskHandle> {
         let handle = self.get(pid)?;
         let task_arc = {
             let prog = handle.write();
-            Arc::clone(prog.main_thread.as_ref()?)
+            prog.main_thread.as_ref()?.clone()
         };
         let tid = task_arc.task_id();
-        SCHEDULER.add_task(task_arc);
-        SCHEDULER.get_task_by_id(tid)
+        scheduler().add_task(task_arc);
+        scheduler().get_task_by_id(tid)
     }
 
     pub fn kill_program(&self, pid: u64) -> Result<(), LoadError> {
