@@ -8,7 +8,7 @@ use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
 use crate::runtime::runtime::submit_global_to_executor_domain;
-use crate::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
 
 use super::super::runtime::JoinStorage;
@@ -70,7 +70,7 @@ fn write_drop_fn(c: &UnsafeCell<Option<TaskDropFn>>, v: Option<TaskDropFn>) {
 
 #[repr(C, align(64))]
 pub struct TaskSlot {
-    pub(super) gen_ref: AtomicU32,
+    pub(super) gen_ref: AtomicU64,
     pub(super) state: AtomicU8,
     pub(super) control: AtomicU8,
     pub(super) waker_state: AtomicU8,
@@ -92,7 +92,7 @@ unsafe impl Sync for TaskSlot {}
 impl TaskSlot {
     pub(super) fn new() -> Self {
         Self {
-            gen_ref: AtomicU32::new(0),
+            gen_ref: AtomicU64::new(0),
             state: AtomicU8::new(STATE_IDLE),
             control: AtomicU8::new(0),
             waker_state: AtomicU8::new(WAKER_NONE),

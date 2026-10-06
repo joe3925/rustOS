@@ -2,7 +2,7 @@ use core::mem::MaybeUninit;
 
 use spin::Once;
 
-use crate::growable_slab::{GrowableSlab, MAX_LOCAL_SLOTS, SlabHandle};
+use crate::growable_slab::{GrowableSlab, MAX_LOCAL_SLOTS, SLAB_GENERATION_MASK, SlabHandle};
 use crate::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::{SlabConfig, SlabConfigBuilder, SlabStats};
@@ -12,21 +12,21 @@ use super::slot::TaskSlot;
 
 const GEN_SHIFT: u32 = 16;
 const REF_MASK: u32 = 0xFFFF;
-const GEN_MASK: u32 = 0xFFFF;
+const GEN_MASK: u32 = SLAB_GENERATION_MASK;
 
 #[inline]
-fn pack_gen_ref(generation: u32, ref_count: u32) -> u32 {
-    ((generation & GEN_MASK) << GEN_SHIFT) | (ref_count & REF_MASK)
+fn pack_gen_ref(generation: u32, ref_count: u32) -> u64 {
+    (((generation & GEN_MASK) as u64) << GEN_SHIFT) | (ref_count & REF_MASK) as u64
 }
 
 #[inline]
-fn unpack_gen(packed: u32) -> u32 {
-    (packed >> GEN_SHIFT) & GEN_MASK
+fn unpack_gen(packed: u64) -> u32 {
+    ((packed >> GEN_SHIFT) as u32) & GEN_MASK
 }
 
 #[inline]
-fn unpack_ref(packed: u32) -> u32 {
-    packed & REF_MASK
+fn unpack_ref(packed: u64) -> u32 {
+    packed as u32 & REF_MASK
 }
 
 fn new_task_slot() -> TaskSlot {

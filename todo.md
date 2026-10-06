@@ -41,7 +41,7 @@ If there is a * it must be completed before user space is started
 3. [x] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
 4. [x] stop using the x86_64 crate for paging 
 5. [x] when we move away from the x86_64 crate program.rs should be refactored to not care if the table is offline or online just passes a table to map leaf 
-6. [ ] low prio but the vtable cost in the devicemmu -> arch-specific backend can probably be removed considering mmus arent swapped at runtime 
+6. [x] low prio but the vtable cost in the devicemmu -> arch-specific backend can probably be removed considering mmus arent swapped at runtime 
 7. [ ] allow for stacks to also grow for user mode task from the page fault 
 ## Kernel General (KEG)
 1. [x] Clearer stack unwind api, I like what the std lib does with Backtrace 

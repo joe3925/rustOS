@@ -4,7 +4,7 @@ use super::task_slab::get_task_table;
 
 const PTR_SHARD_BITS: usize = 3;
 const PTR_LOCAL_BITS: usize = 32;
-const PTR_GEN_BITS: usize = 16;
+const PTR_GEN_BITS: usize = crate::growable_slab::SLAB_GENERATION_BITS as usize;
 
 const PTR_SHARD_SHIFT: usize = 0;
 const PTR_LOCAL_SHIFT: usize = PTR_SHARD_SHIFT + PTR_SHARD_BITS;
@@ -15,7 +15,6 @@ const PTR_LOCAL_MASK: usize = (1usize << PTR_LOCAL_BITS) - 1;
 const PTR_GEN_MASK: usize = (1usize << PTR_GEN_BITS) - 1;
 
 const _: () = assert!(usize::BITS as usize >= PTR_GEN_SHIFT + PTR_GEN_BITS);
-
 #[inline]
 pub fn encode_slab_task_ptr(shard_idx: u8, local_idx: u32, generation: u32) -> usize {
     let shard_bits = ((shard_idx as usize) & PTR_SHARD_MASK) << PTR_SHARD_SHIFT;
@@ -96,7 +95,7 @@ mod tests {
         let encoded = encode_slab_task_ptr(7, 0xFEDC_BA98, 0x7654_3210);
         assert_eq!(
             decode_slab_task_ptr(encoded),
-            Some((7, 0xFEDC_BA98, 0x3210))
+            Some((7, 0xFEDC_BA98, 0x1654_3210))
         );
     }
 }

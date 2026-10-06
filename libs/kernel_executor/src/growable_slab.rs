@@ -7,6 +7,8 @@ use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Orderin
 use crate::sync::spin_loop;
 
 pub const DEFAULT_SLAB_SHARDS: usize = 8;
+pub(crate) const SLAB_GENERATION_BITS: u32 = 29;
+pub(crate) const SLAB_GENERATION_MASK: u32 = (1 << SLAB_GENERATION_BITS) - 1;
 // Keep the eagerly allocated per-shard chunk table bounded while allowing the
 // executor to hold well over one million resident tasks with its default shards.
 pub(crate) const MAX_LOCAL_SLOTS: usize = 1 << 20;
@@ -181,11 +183,11 @@ impl<T> SlabShard<T> {
                 let generation = slot
                     .generation
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                        Some(old.wrapping_add(1) & 0xFFFF)
+                        Some(old.wrapping_add(1) & SLAB_GENERATION_MASK)
                     })
                     .unwrap()
                     .wrapping_add(1)
-                    & 0xFFFF;
+                    & SLAB_GENERATION_MASK;
                 slot.occupied.store(true, Ordering::Release);
                 self.alloc_hint.store(index + 1, Ordering::Relaxed);
                 self.allocated_count.fetch_add(1, Ordering::Relaxed);
@@ -400,11 +402,11 @@ impl<T> GrowableSlab<T> {
             let generation = slot
                 .generation
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                    Some(old.wrapping_add(1) & 0xffff)
+                    Some(old.wrapping_add(1) & SLAB_GENERATION_MASK)
                 })
                 .unwrap()
                 .wrapping_add(1)
-                & 0xffff;
+                & SLAB_GENERATION_MASK;
             slot.occupied.store(true, Ordering::Release);
             shard.allocated_count.fetch_add(1, Ordering::Relaxed);
             Some(SlabHandle {
@@ -498,12 +500,14 @@ impl<T> GrowableSlab<T> {
         Some(slot.value.get())
     }
 
-    pub unsafe fn release(&self, handle: SlabHandle) -> bool { unsafe {
-        let Some(shard) = self.shards.get(handle.shard as usize) else {
-            return false;
-        };
-        shard.release(handle)
-    }}
+    pub unsafe fn release(&self, handle: SlabHandle) -> bool {
+        unsafe {
+            let Some(shard) = self.shards.get(handle.shard as usize) else {
+                return false;
+            };
+            shard.release(handle)
+        }
+    }
 
     pub fn allocated_count(&self) -> usize {
         self.shards

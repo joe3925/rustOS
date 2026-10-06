@@ -1,9 +1,17 @@
 use alloc::alloc::{Layout, alloc, dealloc};
 use core::ptr::NonNull;
 
-use crate::growable_slab::{DEFAULT_SLAB_SHARDS, GrowableSlab, SlabHandle};
+use crate::growable_slab::{
+    DEFAULT_SLAB_SHARDS, GrowableSlab, MAX_LOCAL_SLOTS, SLAB_GENERATION_BITS,
+    SLAB_GENERATION_MASK, SlabHandle,
+};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::async_ffi::AbiFutureAllocation;
+
+// Slab tokens use 29 generation bits and 20 local-index bits (the slab's
+// maximum is 2^20 slots), followed by the existing shard/class/backing fields.
+const ABI_LOCAL_SHIFT: u32 = SLAB_GENERATION_BITS;
+const ABI_LOCAL_MASK: u64 = (MAX_LOCAL_SLOTS - 1) as u64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FutureArenaConfig {
@@ -296,8 +304,8 @@ impl FutureArena {
                 (1u64 << 63)
                     | ((class as u64) << 60)
                     | ((handle.shard as u64) << 52)
-                    | ((handle.local_index as u64) << 20)
-                    | (handle.generation as u64 & 0xffff)
+                    | (((handle.local_index as u64) & ABI_LOCAL_MASK) << ABI_LOCAL_SHIFT)
+                    | (handle.generation & SLAB_GENERATION_MASK) as u64
             }
             FutureBacking::Large => large_token(
                 allocation.ptr,
@@ -348,8 +356,8 @@ impl FutureArena {
                 }
                 let handle = SlabHandle {
                     shard: ((allocation.token >> 52) & 0xff) as u8,
-                    local_index: ((allocation.token >> 20) & 0xffff_ffff) as u32,
-                    generation: (allocation.token & 0xffff) as u32,
+                    local_index: ((allocation.token >> ABI_LOCAL_SHIFT) & ABI_LOCAL_MASK) as u32,
+                    generation: (allocation.token & SLAB_GENERATION_MASK as u64) as u32,
                 };
                 let expected = match class {
                     FutureSizeClass::Bytes64 => block_ptr(&self.c64, handle),
@@ -439,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn abi_token_preserves_u32_slab_local_index() {
+    fn abi_token_preserves_max_slab_index_and_29_bit_generation() {
         let allocation = FutureAllocation {
             ptr: NonNull::dangling(),
             owner_domain: ExecutorDomainId::from_parts(100, 1),
@@ -447,8 +455,8 @@ mod tests {
                 class: FutureSizeClass::Bytes256,
                 handle: SlabHandle {
                     shard: 7,
-                    local_index: 0xFEDC_BA98,
-                    generation: 0x3210,
+                    local_index: (MAX_LOCAL_SLOTS - 1) as u32,
+                    generation: SLAB_GENERATION_MASK,
                 },
             },
             capacity: 256,
@@ -458,8 +466,8 @@ mod tests {
 
         assert_eq!((abi.token >> 60) & 0x7, FutureSizeClass::Bytes256 as u64);
         assert_eq!((abi.token >> 52) & 0xff, 7);
-        assert_eq!((abi.token >> 20) & 0xffff_ffff, 0xFEDC_BA98);
-        assert_eq!(abi.token & 0xffff, 0x3210);
+        assert_eq!((abi.token >> ABI_LOCAL_SHIFT) & ABI_LOCAL_MASK, ABI_LOCAL_MASK);
+        assert_eq!(abi.token & SLAB_GENERATION_MASK as u64, SLAB_GENERATION_MASK as u64);
     }
 
     #[test]
