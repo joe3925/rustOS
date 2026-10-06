@@ -5,16 +5,16 @@ If there is a * it must be completed before user space is started
 # Kernel
 ## Bootloader (BLO)
 1. [ ] move away from bootloader with our own x86_64 bootloader
-2. [ ] * Finish aarch64 bootloader. 
+2. [x] * Finish aarch64 bootloader. 
 
 ## AArch64 (AA64)
-1. [ ] * Finish aarch64-vmsa crate.
+1. [x] * Finish aarch64-vmsa crate.
 2. [x] * Make debug.json platform independent, find a way for xtask to be able to pass info to it.
 3. [x] * Expand xtask for aarch64 boot. 
-4. [ ] * Impl the platform traits for kernel_types, kernel_api, kernel_stub, and the kernel
-5. [ ] * Test everything.
-6. [ ] * Add spin-table startup for secondary CPUs.
-7. [ ] * Add ACPI parking protocol startup for secondary CPUs.
+4. [x] * Impl the platform traits for kernel_types, kernel_api, kernel_stub, and the kernel
+5. [x] * Test everything.
+6. [x] * Add spin-table startup for secondary CPUs.
+7. [x] * Add ACPI parking protocol startup for secondary CPUs.
 
 ## Drivers (DRI) - Complete last
 1. [ ] Add a nvme driver.
@@ -29,7 +29,7 @@ If there is a * it must be completed before user space is started
 3. [ ] * properly handle invalid user ptrs.
 
 ## Proc Management (PRM)
-1. [ ] * Audit how the proc manager handles user space mappings I wrote that a while ago and haven't changed it much while the kernel has evolved a lot.
+1. [x] * Audit how the proc manager handles user space mappings I wrote that a while ago and haven't changed it much while the kernel has evolved a lot.
 2. [ ] * Make sure that the way queues work is still in line with the direction I am taking the OS.  
 
 ## FrameBuffer/Window Management (FBM)
@@ -38,7 +38,7 @@ If there is a * it must be completed before user space is started
 ## Paging (PAG)
 1. [x] * Pinned pages for iobuffers and stuff
 2. [x] subsytem for providing zeroed frames; i like how windows does this. 
-3. [ ] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
+3. [x] Get rid of the global page table lock, fragment the lock on the page tables or create a lockless design (if possible). 
 4. [x] stop using the x86_64 crate for paging 
 5. [x] when we move away from the x86_64 crate program.rs should be refactored to not care if the table is offline or online just passes a table to map leaf 
 6. [ ] low prio but the vtable cost in the devicemmu -> arch-specific backend can probably be removed considering mmus arent swapped at runtime 
@@ -71,7 +71,6 @@ If there is a * it must be completed before user space is started
 
 ## Known Bugs and Correctness Issues (BUG)
 1. on x86-64 we don't save the fpu stuff in the interrupt assembly it is therefore possible for fpu corruption before we reach the fpu guard. 
-2. The page table locking and sync is down right incorrect im lucky the kernel even boots. 
 
 # User Space 
 ## User Space DLL (USD)
