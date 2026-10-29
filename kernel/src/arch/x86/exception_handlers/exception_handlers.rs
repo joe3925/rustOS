@@ -142,19 +142,6 @@ pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode
 
     let is_protection = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
     let is_user = error_code.contains(PageFaultErrorCode::USER_MODE);
-    if error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH) {
-        let rsp = stack_frame.rsp;
-        unsafe {
-            println!("  [rsp-0x20] = {:#x}", *((rsp - 0x20) as *const u64));
-            println!("  [rsp-0x18] = {:#x}", *((rsp - 0x18) as *const u64));
-            println!("  [rsp-0x10] = {:#x}", *((rsp - 0x10) as *const u64));
-            println!("  [rsp-0x08] = {:#x}", *((rsp - 0x08) as *const u64));
-            println!("  [rsp+0x00] = {:#x}", *((rsp + 0x00) as *const u64));
-            println!("  [rsp+0x08] = {:#x}", *((rsp + 0x08) as *const u64));
-            println!("  [rsp+0x10] = {:#x}", *((rsp + 0x10) as *const u64));
-            println!("  [rsp+0x18] = {:#x}", *((rsp + 0x18) as *const u64));
-        }
-    }
     if !is_protection {
         if !is_user {
             match resolve_current_kernel_stack_fault(fault) {
