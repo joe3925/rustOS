@@ -105,6 +105,14 @@ impl Platform for ModelPlatform {
         thread::yield_now();
     }
 
+    fn interrupts_enabled() -> bool {
+        false
+    }
+
+    fn disable_interrupts() {}
+
+    fn enable_interrupts() {}
+
     fn spawn_thread(_name: String, _entry: ThreadEntry, _context: usize) {
         panic!("thread-pool spawning is not used by primitive loom models")
     }

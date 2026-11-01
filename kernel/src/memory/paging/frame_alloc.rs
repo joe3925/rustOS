@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_abi::{MemoryRegion, MemoryRegionKind};
 use kernel_types::arch::PhysAddr;
-use kernel_sync::locks::irq::IrqSafeRwLock;
+use crate::sync_platform::IrqSafeRwLock;
 use kernel_types::state_map::AtomicStateMap;
 
 use crate::platform::PageTableFrameAllocator;

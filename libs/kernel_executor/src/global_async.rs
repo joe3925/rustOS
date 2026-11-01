@@ -1,6 +1,7 @@
 use crate::platform::{ExecutorBatchGuard, Job, SlabCache, platform, with_executor_local};
+use crate::runtime::runtime::{drain_retired_block_on_states, has_retired_block_on_states};
 use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use alloc::boxed::Box;
 use kernel_sync::queues::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use spin::Once;
@@ -118,7 +119,7 @@ impl GlobalAsyncExecutor {
         EXEC.call_once(|| GlobalAsyncExecutor {
             runtime: Once::new(),
             active_pumps: CacheAligned(AtomicUsize::new(0)),
-            max_pumps: CacheAligned(AtomicUsize::new(1)),
+            max_pumps: CacheAligned(AtomicUsize::new(0)),
             total_submissions: CacheAligned(AtomicUsize::new(0)),
             total_pump_runs: CacheAligned(AtomicUsize::new(0)),
             run_tick: CacheAligned(AtomicUsize::new(0)),
@@ -134,13 +135,18 @@ impl GlobalAsyncExecutor {
 
         self.runtime.call_once(|| ExecutorRuntime::new(shards));
 
-        self.max_pumps.0.store(shards, Ordering::Release);
-
         platform().init_blocking(shards);
         platform().init_runtime(shards, shards);
 
+        self.max_pumps.0.store(shards, Ordering::Release);
+        fence(Ordering::SeqCst);
+
         if self.runnable_executor_domain_count() != 0 {
-            self.try_schedule();
+            self.try_schedule::<false>();
+        } else if crate::runtime::slab::task_slab::get_task_table().has_retired()
+            || has_retired_block_on_states()
+        {
+            self.try_schedule::<true>();
         }
     }
 
@@ -174,7 +180,7 @@ impl GlobalAsyncExecutor {
                 });
             if local {
                 if !domain.is_at_active_limit() {
-                    self.try_schedule();
+                    self.try_schedule::<false>();
                 }
             } else {
                 assert!(
@@ -198,8 +204,8 @@ impl GlobalAsyncExecutor {
                 return Some(f(domain));
             }
         }
-        let domain = self.get_executor_domain(domain_id)?;
-        Some(f(&domain))
+        let domain = self.runtime().domains.borrow_executor_domain(domain_id)?;
+        Some(f(domain))
     }
 
     pub(crate) fn publish_claimed_task(&self, task_id: usize) {
@@ -291,18 +297,25 @@ impl GlobalAsyncExecutor {
 
         while domain.try_reserve_schedule_token() {
             runtime.run_queue.push(domain_id);
-            self.try_schedule();
+            self.try_schedule::<false>();
         }
     }
 
-    fn try_schedule(&self) {
-        let max = self.max_pumps.0.load(Ordering::Acquire);
+    pub(crate) fn try_schedule<const IDLE_ONLY: bool>(&self) {
+        if IDLE_ONLY {
+            fence(Ordering::SeqCst);
+        }
+        let mut max = self.max_pumps.0.load(Ordering::Acquire);
+        if max == 0 {
+            fence(Ordering::SeqCst);
+            max = self.max_pumps.0.load(Ordering::Acquire);
+        }
 
         let reserved = self
             .active_pumps
             .0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < max).then_some(active + 1)
+                (active < max && (!IDLE_ONLY || active == 0)).then_some(active + 1)
             })
             .is_ok();
 
@@ -326,6 +339,7 @@ impl GlobalAsyncExecutor {
 
     fn pump(&self) {
         self.flush_local_task();
+        let task_table = crate::runtime::slab::task_slab::get_task_table();
         let worker = self
             .runtime()
             .workers
@@ -391,6 +405,8 @@ impl GlobalAsyncExecutor {
 
             let budget = self.pick_domain_budget(&domain);
             let ran = self.run_domain_batch(&domain, budget);
+            task_table.drain_retired();
+            drain_retired_block_on_states();
 
             domain.release_active();
             domain.maybe_finish_draining();
@@ -398,11 +414,16 @@ impl GlobalAsyncExecutor {
             self.after_domain_batch(runtime, domain_id, &domain, ran);
         }
 
+        task_table.drain_retired();
+        drain_retired_block_on_states();
         drop(worker_guard);
         self.exit_pump();
+        fence(Ordering::SeqCst);
 
         if self.runnable_executor_domain_count() != 0 {
-            self.try_schedule();
+            self.try_schedule::<false>();
+        } else if task_table.has_retired() || has_retired_block_on_states() {
+            self.try_schedule::<true>();
         }
     }
 

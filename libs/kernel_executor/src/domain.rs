@@ -896,7 +896,7 @@ impl ExecutorDomainTable {
         Ok(DestroyExecutorDomainResult::Draining)
     }
 
-    pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
+    pub(crate) fn borrow_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<&ExecutorDomain> {
         if !domain_id.is_valid() {
             return None;
         }
@@ -918,8 +918,6 @@ impl ExecutorDomainTable {
             return None;
         }
 
-        let domain = unsafe { DomainSlot::clone_domain_from_ptr(ptr) };
-
         let state_after = slot.state.load(Ordering::Acquire);
         let generation_after = slot.generation.load(Ordering::Acquire) as u32;
         let ptr_after = slot.load_domain_ptr();
@@ -928,11 +926,15 @@ impl ExecutorDomainTable {
             || generation_after != domain_id.generation()
             || (state_after != DOMAIN_SLOT_ACTIVE && state_after != DOMAIN_SLOT_BUILTIN)
         {
-            drop(domain);
             return None;
         }
 
-        Some(domain)
+        Some(unsafe { &*ptr })
+    }
+
+    pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
+        let domain = self.borrow_executor_domain(domain_id)?;
+        Some(unsafe { DomainSlot::clone_domain_from_ptr(ptr::from_ref(domain).cast_mut()) })
     }
 
     pub fn domain_count(&self) -> usize {

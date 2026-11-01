@@ -17,7 +17,7 @@ use embedded_graphics::text::Text;
 use embedded_graphics::text::TextStyle;
 use embedded_graphics::text::TextStyleBuilder;
 use kernel_abi::PixelFormat;
-use kernel_sync::locks::irq::IrqSafeMutex;
+use crate::sync_platform::IrqSafeMutex;
 use lazy_static::lazy_static;
 use spin::Once;
 const FRAMEBUFFER_CONSOLE: bool = true;
@@ -540,9 +540,12 @@ static PRINT_QUEUE_FULL_PANIC: AtomicBool = AtomicBool::new(false);
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => {
-        $crate::console::_print(core::format_args!($($arg)*))
-    };
+    ($($arg:tt)*) => {{
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe {
+            $crate::console::_print(core::format_args!($($arg)*))
+        }
+    }};
 }
 
 #[macro_export]

@@ -30,10 +30,12 @@ pub fn create_slab_task_waker(shard_idx: usize, local_idx: usize, generation: u3
     }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn slab_clone_waker(ptr: *const ()) -> RawWaker {
     RawWaker::new(ptr, &SLAB_WAKER_VTABLE)
 }
 
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn slab_wake(ptr: *const ()) {
     let encoded = waker_ptr_to_encoded(ptr);
     if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(encoded) {
@@ -41,6 +43,7 @@ unsafe fn slab_wake(ptr: *const ()) {
     }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn slab_wake_by_ref(ptr: *const ()) {
     let encoded = waker_ptr_to_encoded(ptr);
     if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(encoded) {
@@ -48,6 +51,7 @@ unsafe fn slab_wake_by_ref(ptr: *const ()) {
     }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn slab_drop_waker(_ptr: *const ()) {
     // No-op — slot lifetime is managed by structural anchor refs, not waker clones.
 }
@@ -55,6 +59,6 @@ unsafe fn slab_drop_waker(_ptr: *const ()) {
 #[allow(dead_code)]
 unsafe extern "C" fn drop_slab_ctx(ctx: usize) {
     if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(ctx) {
-        get_task_table().decrement_ref(shard_idx, local_idx, generation);
+        get_task_table().decrement_ref::<false>(shard_idx, local_idx, generation);
     }
 }

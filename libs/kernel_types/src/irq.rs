@@ -516,13 +516,20 @@ impl WaiterSlot {
             (*self.result.get()).write(result);
         }
 
-        let waker = unsafe { (*self.waker.get()).clone() };
+        let waker = {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { (*self.waker.get()).clone() }
+        };
 
         self.word
             .store(waiter_word(WAITER_SIGNALED, ticket), Ordering::Release);
 
         if self.abandoned.swap(false, Ordering::AcqRel) {
             unsafe { self.cleanup_signaled(ticket) };
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe {
+                drop(waker);
+            }
             return None;
         }
 
@@ -546,6 +553,9 @@ impl WaiterSlot {
 
         unsafe {
             let _ = (*self.result.get()).assume_init_read();
+        }
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe {
             let _ = (*self.waker.get()).take();
         }
 
@@ -603,6 +613,7 @@ impl WaiterSlot {
 
     #[inline]
     unsafe fn clear_waker_exclusive(&self) {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe {
             let _ = (*self.waker.get()).take();
         }

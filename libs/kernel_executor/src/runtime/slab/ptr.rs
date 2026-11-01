@@ -48,10 +48,10 @@ fn poll_slab_task(ctx: usize) {
 
     let completed = slot.poll_once(&waker, shard_idx, local_idx, generation);
 
-    slab.decrement_ref(shard_idx, local_idx, generation);
+    slab.decrement_ref::<true>(shard_idx, local_idx, generation);
 
     if completed {
-        slab.decrement_ref(shard_idx, local_idx, generation);
+        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
     }
 }
 
@@ -64,7 +64,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
     }
 
     let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
-        slab.decrement_ref(shard_idx, local_idx, generation);
+        slab.decrement_ref::<false>(shard_idx, local_idx, generation);
         return;
     };
 
@@ -77,7 +77,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
             submit_global_to_executor_domain(domain_id, encoded);
         }
         WakeAction::Represented | WakeAction::Completed => {
-            slab.decrement_ref(shard_idx, local_idx, generation);
+            slab.decrement_ref::<false>(shard_idx, local_idx, generation);
         }
     }
 }

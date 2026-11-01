@@ -60,36 +60,42 @@ impl PortAccess for Platform {
     #[inline]
     unsafe fn read_u8(port: u16) -> u8 {
         let mut port = x86_64::instructions::port::Port::<u8>::new(port);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe { port.read() }
     }
 
     #[inline]
     unsafe fn read_u16(port: u16) -> u16 {
         let mut port = x86_64::instructions::port::Port::<u16>::new(port);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe { port.read() }
     }
 
     #[inline]
     unsafe fn read_u32(port: u16) -> u32 {
         let mut port = x86_64::instructions::port::Port::<u32>::new(port);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe { port.read() }
     }
 
     #[inline]
     unsafe fn write_u8(port: u16, value: u8) {
         let mut port = x86_64::instructions::port::Port::<u8>::new(port);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe { port.write(value) }
     }
 
     #[inline]
     unsafe fn write_u16(port: u16, value: u16) {
         let mut port = x86_64::instructions::port::Port::<u16>::new(port);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe { port.write(value) }
     }
 
     #[inline]
     unsafe fn write_u32(port: u16, value: u32) {
         let mut port = x86_64::instructions::port::Port::<u32>::new(port);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe { port.write(value) }
     }
 }

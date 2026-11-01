@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -6,14 +6,14 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
+use kernel_types::runtime::BlockOnThreadState;
 
 pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
 use crate::future_arena::FutureAllocation;
 use crate::global_async::{ExecutorDomain, ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{Job, platform};
-use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
 use super::slab::task_slab::{SlotHandle, TaskTable, get_task_table};
@@ -45,26 +45,102 @@ pub extern "C" fn try_steal_blocking_one() -> bool {
 
 struct BlockOnWakeState {
     ready: AtomicBool,
+    thread_state: Option<Arc<BlockOnThreadState>>,
+    refs: AtomicUsize,
+    retired_next: AtomicUsize,
 }
 
+static RETIRED_BLOCK_ON_STATES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+unsafe fn release_block_on_wake_state<const NOTIFY: bool>(ptr: *mut BlockOnWakeState) {
+    let state = unsafe { &*ptr };
+    if state.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    let retired = ptr.expose_provenance();
+    let mut head = RETIRED_BLOCK_ON_STATES.load(Ordering::Relaxed);
+    loop {
+        state.retired_next.store(head, Ordering::Relaxed);
+        match RETIRED_BLOCK_ON_STATES.compare_exchange(
+            head,
+            retired,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                if NOTIFY && head == 0 {
+                    GlobalAsyncExecutor::global().try_schedule::<true>();
+                }
+                return;
+            }
+            Err(actual) => head = actual,
+        }
+    }
+}
+
+pub(crate) fn has_retired_block_on_states() -> bool {
+    RETIRED_BLOCK_ON_STATES.load(Ordering::Acquire) != 0
+}
+
+#[cfg_attr(irq_check, irq::forbidden)]
+pub(crate) fn drain_retired_block_on_states() {
+    if !has_retired_block_on_states() {
+        return;
+    }
+    let mut retired = RETIRED_BLOCK_ON_STATES.swap(0, Ordering::Acquire);
+    while retired != 0 {
+        let state = unsafe {
+            Box::from_raw(core::ptr::with_exposed_provenance_mut::<BlockOnWakeState>(retired))
+        };
+        retired = state.retired_next.load(Ordering::Relaxed);
+        drop(state);
+    }
+}
+
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn block_on_waker_clone(ptr: *const ()) -> RawWaker {
-    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
-    let cloned = Arc::clone(&arc);
-    RawWaker::new(Arc::into_raw(cloned) as *const (), &BLOCK_ON_WAKER_VTABLE)
+    let state = unsafe { &*ptr.cast::<BlockOnWakeState>() };
+    let mut refs = state.refs.load(Ordering::Relaxed);
+    loop {
+        assert!(refs < isize::MAX as usize, "block_on waker reference count overflow");
+        match state.refs.compare_exchange(
+            refs,
+            refs + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return RawWaker::new(ptr, &BLOCK_ON_WAKER_VTABLE),
+            Err(actual) => refs = actual,
+        }
+    }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn block_on_waker_wake(ptr: *const ()) {
-    let arc = unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) };
-    arc.ready.store(true, Ordering::Release);
+    let ptr = ptr.cast::<BlockOnWakeState>().cast_mut();
+    let state = unsafe { &*ptr };
+    if let Some(thread_state) = &state.thread_state {
+        thread_state.mark_ready();
+    } else {
+        state.ready.store(true, Ordering::Release);
+    }
+    unsafe { release_block_on_wake_state::<true>(ptr) };
 }
 
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn block_on_waker_wake_by_ref(ptr: *const ()) {
-    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
-    arc.ready.store(true, Ordering::Release);
+    let state = unsafe { &*ptr.cast::<BlockOnWakeState>() };
+    if let Some(thread_state) = &state.thread_state {
+        thread_state.mark_ready();
+    } else {
+        state.ready.store(true, Ordering::Release);
+    }
 }
 
+#[cfg_attr(irq_check, irq::context)]
 unsafe fn block_on_waker_drop(ptr: *const ()) {
-    drop(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
+    unsafe { release_block_on_wake_state::<true>(ptr.cast::<BlockOnWakeState>().cast_mut()) };
 }
 
 static BLOCK_ON_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -74,34 +150,47 @@ static BLOCK_ON_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     block_on_waker_drop,
 );
 
+#[cfg_attr(irq_check, irq::forbidden)]
+pub fn block_on_waker(thread_state: Option<Arc<BlockOnThreadState>>) -> Waker {
+    let ptr = Box::into_raw(Box::new(BlockOnWakeState {
+        ready: AtomicBool::new(false),
+        thread_state,
+        refs: AtomicUsize::new(1),
+        retired_next: AtomicUsize::new(0),
+    }));
+    let raw = RawWaker::new(ptr.cast(), &BLOCK_ON_WAKER_VTABLE);
+    unsafe { Waker::from_raw(raw) }
+}
+
 pub fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
 {
     let _suspend = crate::platform::ExecutorSuspendGuard::enter();
-    let state = Arc::new(BlockOnWakeState {
-        ready: AtomicBool::new(false),
-    });
+    let waker = block_on_waker(None);
+    let ptr = waker.data().cast::<BlockOnWakeState>().cast_mut();
+    let state = unsafe { &*ptr };
+    let output = {
+        let mut cx = Context::from_waker(&waker);
+        let mut future = future;
 
-    let raw = RawWaker::new(
-        Arc::into_raw(state.clone()) as *const (),
-        &BLOCK_ON_WAKER_VTABLE,
-    );
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-    let mut future = future;
+        loop {
+            let poll = unsafe { Pin::new_unchecked(&mut future) }.poll(&mut cx);
+            drain_retired_block_on_states();
+            match poll {
+                Poll::Ready(v) => break v,
+                Poll::Pending => {}
+            }
 
-    loop {
-        let poll = unsafe { Pin::new_unchecked(&mut future) }.poll(&mut cx);
-        match poll {
-            Poll::Ready(v) => return v,
-            Poll::Pending => {}
+            if !state.ready.swap(false, Ordering::AcqRel) && !try_steal_blocking_one() {
+                yield_now();
+            }
         }
-
-        if !state.ready.swap(false, Ordering::AcqRel) && !try_steal_blocking_one() {
-            yield_now();
-        }
-    }
+    };
+    let _waker = ManuallyDrop::new(waker);
+    unsafe { release_block_on_wake_state::<false>(ptr) };
+    drain_retired_block_on_states();
+    output
 }
 
 pub struct JoinStorage<T> {
@@ -243,7 +332,7 @@ impl<T: Send + 'static> Future for JoinHandle<'_, T> {
         if slot.is_completed() {
             let result = unsafe { (&*this.storage).take() };
 
-            slab.decrement_ref(
+            slab.decrement_ref::<true>(
                 this.shard_idx as usize,
                 this.local_idx as usize,
                 this.generation,
@@ -257,7 +346,7 @@ impl<T: Send + 'static> Future for JoinHandle<'_, T> {
             if slot.is_completed() {
                 let result = unsafe { (&*this.storage).take() };
 
-                slab.decrement_ref(
+                slab.decrement_ref::<true>(
                     this.shard_idx as usize,
                     this.local_idx as usize,
                     this.generation,
@@ -307,7 +396,7 @@ impl<T: Send + 'static> Drop for JoinHandle<'_, T> {
                     }
                 }
             }
-            slab.decrement_ref(
+            slab.decrement_ref::<true>(
                 self.shard_idx as usize,
                 self.local_idx as usize,
                 self.generation,
@@ -611,6 +700,6 @@ pub fn abort_task(token: TaskToken) -> bool {
     if result {
         super::slab::ptr::enqueue_slab_task(shard, local, generation);
     }
-    slab.decrement_ref(shard, local, generation);
+    slab.decrement_ref::<false>(shard, local, generation);
     result
 }

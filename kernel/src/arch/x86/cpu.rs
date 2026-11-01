@@ -39,12 +39,17 @@ pub fn wait_cycle_idle(cycles: u128) {
 }
 
 pub fn get_cpu_info() -> CpuId<CpuIdReaderNative> {
-    CpuId::new()
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+    unsafe { CpuId::new() }
 }
 
 pub(crate) fn platform_cpu_id() -> u8 {
     let info = get_cpu_info();
-    info.get_feature_info()
+    let features = {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { info.get_feature_info() }
+    };
+    features
         .expect("cpu id not available?")
         .initial_local_apic_id()
 }
@@ -70,6 +75,7 @@ fn rdmsr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
 
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!(
             "rdmsr",
@@ -111,6 +117,7 @@ pub fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
 #[inline(always)]
 pub fn current_is_in_interrupt() -> bool {
     let value: u8;
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!(
             "mov {value}, byte ptr gs:[{offset}]",
@@ -126,22 +133,6 @@ extern "C" fn irq_context_query() -> bool {
     current_is_in_interrupt()
 }
 
-extern "C" fn irq_interrupts_enabled() -> bool {
-    x86_64::instructions::interrupts::are_enabled()
-}
-
-extern "C" fn irq_interrupts_disable() {
-    x86_64::instructions::interrupts::disable();
-}
-
-extern "C" fn irq_interrupts_enable() {
-    x86_64::instructions::interrupts::enable();
-}
-
-extern "C" fn irq_interrupts_enable_and_hlt() {
-    x86_64::instructions::interrupts::enable_and_hlt();
-}
-
 #[inline(always)]
 pub fn current_cpu_id() -> usize {
     *current_percpu().cpu_id.get().unwrap()
@@ -155,12 +146,6 @@ pub fn init_percpu_gs(cpu_id: usize) -> &'static PerCpu {
     p.tls_array_pointer.store(0, Ordering::Relaxed);
     unsafe { set_gs_bases(ptr) };
     kernel_types::irq::set_irq_context_query(irq_context_query);
-    kernel_sync::locks::irq::set_irq_interrupt_control(
-        irq_interrupts_enabled,
-        irq_interrupts_disable,
-        irq_interrupts_enable,
-        irq_interrupts_enable_and_hlt,
-    );
     p
 }
 
@@ -250,9 +235,10 @@ impl CpuPlatform for X86Platform {
     }
 
     fn halt() -> ! {
-        unsafe {
-            loop {
-                super::debug::poll_rx_once();
+        loop {
+            super::debug::poll_rx_once();
+            #[cfg_attr(irq_check, irq::trusted(unsafe))]
+            unsafe {
                 core::arch::asm!("hlt;", options(nomem, nostack, preserves_flags));
             }
         }

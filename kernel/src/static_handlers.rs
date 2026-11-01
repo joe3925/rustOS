@@ -4,7 +4,7 @@ use core::{
     time::Duration,
 };
 use kernel_executor::runtime::runtime::{
-    block_on as kernel_block_on, spawn_blocking as kernel_spawn_blocking,
+    block_on as kernel_block_on, block_on_waker, spawn_blocking as kernel_spawn_blocking,
     spawn_detached as kernel_spawn_detached, spawn_join_owned as kernel_spawn,
 };
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
@@ -67,7 +67,7 @@ use kernel_types::{
     },
     pci::PciConfigAddress,
     pnp::{DeviceIds, DeviceRelationType},
-    runtime::BlockOnThreadState,
+    runtime::BlockOnContext,
     status::{Data, PageMapError},
 };
 use spin::{Mutex, Once};
@@ -81,10 +81,12 @@ pub extern "C" fn create_kernel_task(entry: extern "C" fn(usize), ctx: usize, na
 pub unsafe extern "C" fn park_self_and_yield() {
     scheduler().park_current();
 }
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn get_current_platform_cpu_id() -> usize {
     crate::platform::current_platform_cpu_id() as usize
 }
 
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn wake_task(id: u64) {
     if let Some(task) = scheduler().get_task_by_id(id) {
         scheduler().unpark(&task);
@@ -149,6 +151,7 @@ pub extern "C" fn kernel_pci_write_config_u32(address: PciConfigAddress, value: 
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub unsafe extern "C" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
     unsafe {
         irq_borrowed_signal(handle, meta);
@@ -156,6 +159,7 @@ pub unsafe extern "C" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, m
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub unsafe extern "C" fn kernel_irq_borrowed_ensure_signal(
     handle: IrqBorrowedHandle,
     meta: IrqMeta,
@@ -166,6 +170,7 @@ pub unsafe extern "C" fn kernel_irq_borrowed_ensure_signal(
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub unsafe extern "C" fn kernel_irq_borrowed_signal_n(
     handle: IrqBorrowedHandle,
     meta: IrqMeta,
@@ -177,6 +182,7 @@ pub unsafe extern "C" fn kernel_irq_borrowed_signal_n(
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub unsafe extern "C" fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta) {
     unsafe {
         irq_borrowed_signal_all(handle, meta);
@@ -254,18 +260,22 @@ pub extern "C" fn wait_duration(time: Duration) {
     crate::platform::wait_duration(time);
 }
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn stopwatch_new() -> Stopwatch {
     Stopwatch::start()
 }
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn elapsed(s: &Stopwatch) -> Duration {
     s.elapsed()
 }
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn kernel_cycle_counter() -> u64 {
     crate::platform::cycle_counter()
 }
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn kernel_cycle_counter_frequency_hz() -> u64 {
     crate::platform::cycle_counter_frequency_hz()
 }
@@ -616,8 +626,11 @@ pub extern "C" fn kernel_block_on_abi(fut: AbiFuture<()>) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState> {
-    scheduling::tls::current_block_on_thread_state()
+#[cfg_attr(irq_check, irq::forbidden)]
+pub extern "C" fn kernel_block_on_context() -> BlockOnContext {
+    let state = scheduling::tls::current_block_on_thread_state();
+    let waker = block_on_waker(Some(state.clone()));
+    BlockOnContext { state, waker }
 }
 
 #[unsafe(no_mangle)]
@@ -793,6 +806,7 @@ pub extern "C" fn bench_kernel_span_end(
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn get_current_cpu_id() -> usize {
     crate::platform::current_cpu_id()
 }

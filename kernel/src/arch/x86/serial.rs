@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use kernel_sync::locks::irq::IrqSafeMutex;
+use crate::sync_platform::IrqSafeMutex;
 use x86_64::instructions::port::Port;
 
 use crate::platform::ConsolePlatform;
@@ -20,6 +20,7 @@ pub(crate) fn init_once() {
         return;
     }
 
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
     unsafe {
         Port::<u8>::new(COM1 + 1).write(0x00);
         Port::<u8>::new(COM1 + 3).write(0x80);
@@ -33,12 +34,14 @@ pub(crate) fn init_once() {
 
 #[inline]
 fn can_transmit() -> bool {
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
     unsafe { Port::<u8>::new(COM1 + 5).read() & 0x20 != 0 }
 }
 
 fn write_byte(byte: u8) {
     for _ in 0..100_000 {
         if can_transmit() {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
             unsafe {
                 Port::<u8>::new(COM1).write(byte);
             }
@@ -65,8 +68,16 @@ impl ConsolePlatform for X86Platform {
 pub(crate) fn try_read_byte() -> Option<u8> {
     init_once();
 
-    if unsafe { Port::<u8>::new(COM1 + 5).read() & 0x01 != 0 } {
-        Some(unsafe { Port::<u8>::new(COM1).read() })
+    let ready = {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { Port::<u8>::new(COM1 + 5).read() & 0x01 != 0 }
+    };
+    if ready {
+        let byte = {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { Port::<u8>::new(COM1).read() }
+        };
+        Some(byte)
     } else {
         None
     }

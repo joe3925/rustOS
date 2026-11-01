@@ -1,4 +1,12 @@
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::Waker;
+
+#[repr(C)]
+pub struct BlockOnContext {
+    pub state: Arc<BlockOnThreadState>,
+    pub waker: Waker,
+}
 
 #[repr(C)]
 pub struct BlockOnThreadState {

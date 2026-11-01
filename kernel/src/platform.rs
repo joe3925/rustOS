@@ -306,7 +306,10 @@ pub fn start_secondary_cpus() -> Result<(), CpuStartupError> {
 }
 
 pub fn halt() -> ! {
-    <ActivePlatform as CpuPlatform>::halt()
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+    unsafe {
+        <ActivePlatform as CpuPlatform>::halt()
+    }
 }
 
 pub fn broadcast_panic_stop() {

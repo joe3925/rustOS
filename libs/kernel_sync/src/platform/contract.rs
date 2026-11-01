@@ -20,6 +20,10 @@ pub trait Platform: Sized + 'static {
     fn unpark(task: &Self::Task);
     fn park_current();
 
+    fn interrupts_enabled() -> bool;
+    fn disable_interrupts();
+    fn enable_interrupts();
+
     fn spawn_thread(name: String, entry: ThreadEntry, context: usize);
 
     #[inline]

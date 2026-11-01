@@ -28,7 +28,7 @@ use kernel_types::irq::{
 };
 use kernel_types::object_manager::OmError;
 use kernel_types::pci::PciConfigAddress;
-use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
+use kernel_types::runtime::{BlockOnContext, Stopwatch};
 
 use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
@@ -266,7 +266,7 @@ unsafe extern "C" {
     pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()>;
     pub fn kernel_spawn_detached_abi(fut: AbiFuture<()>);
     pub fn kernel_block_on_abi(fut: AbiFuture<()>);
-    pub fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState>;
+    pub fn kernel_block_on_context() -> BlockOnContext;
     pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize);
 
     // Routing FFI (sync - for kernel_routing crate)

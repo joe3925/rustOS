@@ -81,7 +81,7 @@ mod threaded {
         }
         drop(wakers);
 
-        slab.decrement_ref(shard_idx, local_idx, generation);
+        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
     }
 
     // This test covers stale generation protection for joinable slab slots. Once a
@@ -97,8 +97,8 @@ mod threaded {
         let (shard_idx, local_idx, generation) = handle.indices();
 
         assert!(slab.increment_ref(shard_idx, local_idx, generation));
-        slab.decrement_ref(shard_idx, local_idx, generation);
-        slab.decrement_ref(shard_idx, local_idx, generation);
+        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
+        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
 
         assert!(
             !slab.increment_ref(shard_idx, local_idx, generation),

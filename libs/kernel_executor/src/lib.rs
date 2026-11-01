@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(target_has_atomic = "128", feature(integer_atomics))]
 #![cfg_attr(not(any(test, loom, feature = "loom")), feature(thread_local))]
 
 extern crate alloc;

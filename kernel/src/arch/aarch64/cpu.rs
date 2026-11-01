@@ -162,7 +162,11 @@ unsafe fn set_per_cpu(ptr: *const PerCpu) {
 
 #[inline(always)]
 fn per_cpu_ptr() -> *const PerCpu {
-    TPIDR_EL1.get() as *const PerCpu
+    let pointer = {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { TPIDR_EL1.get() }
+    };
+    pointer as *const PerCpu
 }
 
 fn mark_online(cpu_id: usize) {
@@ -308,15 +312,17 @@ impl CpuPlatform for Aarch64Platform {
 
     fn halt() -> ! {
         super::debug::init_debug_metadata_transport();
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
                 "msr daifset, #0xf",
                 options(nomem, nostack, preserves_flags)
             );
-            loop {
-                super::debug::poll_rx_once();
-                wfi();
-            }
+        }
+        loop {
+            super::debug::poll_rx_once();
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { wfi() };
         }
     }
 }

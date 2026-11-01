@@ -165,9 +165,8 @@ fn build_cargo_driver(
         .join("target")
         .join("cargo")
         .join(&plan.id)
-        .join("irq-check-drivers");
+        .join("drivers");
     let mut command = super::cargo(root);
-    super::configure_irq_check(&mut command, root, plan, "drivers")?;
     command
         .arg("build")
         .args(["--manifest-path"])
@@ -436,7 +435,7 @@ pub fn cargo_artifact(
     })
 }
 
-fn checkout_git(
+pub(super) fn checkout_git(
     root: &Path,
     repository: &str,
     revision: &str,

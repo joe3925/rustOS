@@ -264,99 +264,103 @@ fn current_cpu_owns_panic() -> bool {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
-    if !PANIC_RUNTIME_READY.load(Ordering::Acquire) {
-        let mut writer = EarlyPanicWriter;
-        let _ = writeln!(writer, "=== EARLY KERNEL PANIC [{}] ===", mod_name);
-        let _ = writeln!(writer, "{}", info);
-        halt_loop()
-    }
-
-    if !current_cpu_owns_panic() {
-        halt_loop()
-    }
-
-    if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
-        halt_loop()
-    }
-
-    let panic_in_interrupt = current_is_in_interrupt();
-    let panic_scheduler_cpu = current_cpu_id();
-
-    disable_interrupts();
-    let panic_task = scheduler().try_get_current_task(panic_scheduler_cpu);
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
     unsafe {
-        switch_address_space_root(kernel_address_space_root());
+        if !PANIC_RUNTIME_READY.load(Ordering::Acquire) {
+            let mut writer = EarlyPanicWriter;
+            let _ = writeln!(writer, "=== EARLY KERNEL PANIC [{}] ===", mod_name);
+            let _ = writeln!(writer, "{}", info);
+            halt_loop()
+        }
+
+        if !current_cpu_owns_panic() {
+            halt_loop()
+        }
+
+        if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
+            halt_loop()
+        }
+
+        let panic_in_interrupt = current_is_in_interrupt();
+        let panic_scheduler_cpu = current_cpu_id();
+
+        disable_interrupts();
+        let panic_task = scheduler().try_get_current_task(panic_scheduler_cpu);
+        unsafe {
+            switch_address_space_root(kernel_address_space_root());
+        }
+        let backtrace = if let Some(state) = PANIC_STATE.get() {
+            Backtrace::from_state(state, panic_task.as_deref())
+        } else {
+            Backtrace::capture_with_task(panic_task.as_deref())
+        };
+        println!("Panic-site backtrace status: {:?}", backtrace.status());
+        println!("Panic-site backtrace:");
+        for trace in backtrace.iter() {
+            println!("{:#X}", trace.instruction_pointer().as_u64());
+        }
+        crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
+
+        println!("=== KERNEL PANIC [{}] ===", mod_name);
+        println!("is in interrupt: {:#?}", panic_in_interrupt);
+        println!("{}", info);
+        println!("Panic-site backtrace:");
+        for trace in backtrace.iter() {
+            println!("{:#X}", trace.instruction_pointer().as_u64())
+        }
+        // let dump = dump_scheduler();
+        // println!("--- Running tasks at panic ---");
+        // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+        //     if let Some(task) = slot {
+        //         let name = unsafe { task_name_panic(task) };
+        //         println!(
+        //             "  CPU {}: \"{}\" (id={})",
+        //             cpu_id,
+        //             name,
+        //             task.id.load(Ordering::Relaxed)
+        //         );
+        //     } else {
+        //         println!("  CPU {}: <idle>", cpu_id);
+        //     }
+        // }
+        // println!("--- Tasks in run queue and ipi queue ---");
+        // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
+        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+        //     println!(
+        //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
+        //         cpu_id, some_count, queue.captured, queue.total_before_drain
+        //     );
+        // }
+
+        // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
+        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+        //     println!(
+        //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
+        //         cpu_id, some_count, queue.captured, queue.total_before_drain
+        //     );
+        // }
+        // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+        //     match task {
+        //         Some(task) => {
+        //             let stack_size = task.stack_size.load(Ordering::Acquire);
+        //             let guard_page = task.guard_page.load(Ordering::Acquire);
+
+        //             println!(
+        //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
+        //                 cpu_id, stack_size, guard_page
+        //             );
+        //         }
+        //         None => {
+        //             println!("  CPU {}: current_task=None", cpu_id);
+        //         }
+        //     }
+        // }
+        broadcast_panic_stop();
+
+        halt_loop()
     }
-    let backtrace = if let Some(state) = PANIC_STATE.get() {
-        Backtrace::from_state(state, panic_task.as_deref())
-    } else {
-        Backtrace::capture_with_task(panic_task.as_deref())
-    };
-    println!("Panic-site backtrace status: {:?}", backtrace.status());
-    println!("Panic-site backtrace:");
-    for trace in backtrace.iter() {
-        println!("{:#X}", trace.instruction_pointer().as_u64());
-    }
-    crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
-
-    println!("=== KERNEL PANIC [{}] ===", mod_name);
-    println!("is in interrupt: {:#?}", panic_in_interrupt);
-    println!("{}", info);
-    println!("Panic-site backtrace:");
-    for trace in backtrace.iter() {
-        println!("{:#X}", trace.instruction_pointer().as_u64())
-    }
-    // let dump = dump_scheduler();
-    // println!("--- Running tasks at panic ---");
-    // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-    //     if let Some(task) = slot {
-    //         let name = unsafe { task_name_panic(task) };
-    //         println!(
-    //             "  CPU {}: \"{}\" (id={})",
-    //             cpu_id,
-    //             name,
-    //             task.id.load(Ordering::Relaxed)
-    //         );
-    //     } else {
-    //         println!("  CPU {}: <idle>", cpu_id);
-    //     }
-    // }
-    // println!("--- Tasks in run queue and ipi queue ---");
-    // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
-    //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-    //     println!(
-    //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
-    //         cpu_id, some_count, queue.captured, queue.total_before_drain
-    //     );
-    // }
-
-    // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
-    //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-    //     println!(
-    //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
-    //         cpu_id, some_count, queue.captured, queue.total_before_drain
-    //     );
-    // }
-    // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-    //     match task {
-    //         Some(task) => {
-    //             let stack_size = task.stack_size.load(Ordering::Acquire);
-    //             let guard_page = task.guard_page.load(Ordering::Acquire);
-
-    //             println!(
-    //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
-    //                 cpu_id, stack_size, guard_page
-    //             );
-    //         }
-    //         None => {
-    //             println!("  CPU {}: current_task=None", cpu_id);
-    //         }
-    //     }
-    // }
-    broadcast_panic_stop();
-
-    halt_loop()
 }
 
 struct EarlyPanicWriter;

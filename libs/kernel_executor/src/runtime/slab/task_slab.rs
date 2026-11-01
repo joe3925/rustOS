@@ -2,12 +2,13 @@ use core::mem::MaybeUninit;
 
 use spin::Once;
 
+use crate::global_async::GlobalAsyncExecutor;
 use crate::growable_slab::{GrowableSlab, MAX_LOCAL_SLOTS, SlabHandle};
-use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::config::{SlabConfig, SlabConfigBuilder, SlabStats};
 use super::constants::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
-use super::ptr::encode_slab_task_ptr;
+use super::ptr::{decode_slab_task_ptr, encode_slab_task_ptr};
 use super::slot::TaskSlot;
 
 const GEN_SHIFT: u32 = 16;
@@ -38,6 +39,7 @@ static mut TASK_TABLE_STORAGE: MaybeUninit<TaskTable> = MaybeUninit::uninit();
 
 pub struct TaskTable {
     slab: GrowableSlab<TaskSlot>,
+    retired_head: AtomicUsize,
     total_allocations: AtomicU64,
 }
 
@@ -54,6 +56,7 @@ impl TaskTable {
                 max_chunks,
                 new_task_slot,
             ),
+            retired_head: AtomicUsize::new(0),
             total_allocations: AtomicU64::new(0),
         }
     }
@@ -132,7 +135,12 @@ impl TaskTable {
         }
     }
 
-    pub(crate) fn decrement_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
+    pub(crate) fn decrement_ref<const RECLAIM: bool>(
+        &self,
+        shard_idx: usize,
+        local_idx: usize,
+        expected_gen: u32,
+    ) {
         let Some(handle) = self.make_handle(shard_idx, local_idx, expected_gen) else {
             return;
         };
@@ -157,15 +165,31 @@ impl TaskTable {
             ) {
                 Ok(_) => {
                     if refs == 1 {
-                        slot.release_last_ref();
-                        unsafe {
-                            if TASK_TABLE_PTR
-                                .get()
-                                .is_some_and(|table| core::ptr::eq(*table, self))
-                            {
-                                let _ = self.slab.release_cached(handle, 0, 8);
-                            } else {
-                                let _ = self.slab.release(handle);
+                        if RECLAIM {
+                            self.release_slot(handle, slot);
+                        } else {
+                            let retired = encode_slab_task_ptr(
+                                handle.shard,
+                                handle.local_index,
+                                handle.generation,
+                            ) + 1;
+                            let mut head = self.retired_head.load(Ordering::Relaxed);
+                            loop {
+                                slot.retired_next.store(head, Ordering::Relaxed);
+                                match self.retired_head.compare_exchange(
+                                    head,
+                                    retired,
+                                    Ordering::Release,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => {
+                                        if head == 0 {
+                                            GlobalAsyncExecutor::global().try_schedule::<true>();
+                                        }
+                                        break;
+                                    }
+                                    Err(actual) => head = actual,
+                                }
                             }
                         }
                     }
@@ -174,6 +198,42 @@ impl TaskTable {
                 Err(next) if unpack_gen(next) != expected_gen => return,
                 Err(_) => core::hint::spin_loop(),
             }
+        }
+    }
+
+    fn release_slot(&self, handle: SlabHandle, slot: &TaskSlot) {
+        slot.release_last_ref();
+        unsafe {
+            if TASK_TABLE_PTR
+                .get()
+                .is_some_and(|table| core::ptr::eq(*table, self))
+            {
+                let _ = self.slab.release_cached(handle, 0, 8);
+            } else {
+                let _ = self.slab.release(handle);
+            }
+        }
+    }
+
+    pub(crate) fn has_retired(&self) -> bool {
+        self.retired_head.load(Ordering::Acquire) != 0
+    }
+
+    #[cfg_attr(irq_check, irq::forbidden)]
+    pub(crate) fn drain_retired(&self) {
+        if !self.has_retired() {
+            return;
+        }
+        let mut retired = self.retired_head.swap(0, Ordering::Acquire);
+        while retired != 0 {
+            let (shard, local, generation) = decode_slab_task_ptr(retired - 1)
+                .expect("invalid retired task");
+            let handle = self
+                .make_handle(shard, local, generation)
+                .expect("invalid retired task handle");
+            let slot = self.slab.get(handle).expect("retired task slot disappeared");
+            retired = slot.retired_next.load(Ordering::Relaxed);
+            self.release_slot(handle, slot);
         }
     }
 
@@ -210,6 +270,7 @@ impl SlotHandle {
     }
 }
 
+#[cfg_attr(irq_check, irq::forbidden)]
 pub fn init_task_table(config: SlabConfig) {
     TASK_TABLE_PTR.call_once(|| unsafe {
         let ptr = core::ptr::addr_of_mut!(TASK_TABLE_STORAGE).cast::<TaskTable>();
@@ -226,11 +287,10 @@ where
 }
 
 pub fn get_task_table() -> &'static TaskTable {
-    TASK_TABLE_PTR.call_once(|| unsafe {
-        let ptr = core::ptr::addr_of_mut!(TASK_TABLE_STORAGE).cast::<TaskTable>();
-        ptr.write(TaskTable::new(SlabConfig::default()));
-        &*ptr
-    })
+    TASK_TABLE_PTR
+        .get()
+        .copied()
+        .expect("task table not initialized")
 }
 
 pub fn slab_stats() -> SlabStats {

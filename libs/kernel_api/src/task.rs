@@ -16,5 +16,6 @@ pub unsafe fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> { unsafe 
 
 #[inline]
 pub fn wake_task(id: u64) {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe { kernel_sys::wake_task(id) };
 }

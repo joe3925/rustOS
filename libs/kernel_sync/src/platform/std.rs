@@ -72,6 +72,17 @@ impl Platform for StdPlatform {
         ::std::thread::park();
     }
 
+    #[inline]
+    fn interrupts_enabled() -> bool {
+        false
+    }
+
+    #[inline]
+    fn disable_interrupts() {}
+
+    #[inline]
+    fn enable_interrupts() {}
+
     fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
         ::std::thread::Builder::new()
             .name(name)

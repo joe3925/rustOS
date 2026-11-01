@@ -16,7 +16,7 @@ kernel-self-tests = []
 boot-timings = []
 
 [dependencies]
-spin = "0.10.0"
+spin = { version = "0.10.0" }
 bitflags = "2.6.0"
 async-lock = { version = "3.4.0", default-features = false }
 rand_xoshiro = { version = "0.7.0", default-features = false }
@@ -58,7 +58,7 @@ device_tree = { path = "../third_party/device_tree" }
 
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = "=0.15.2"
+x86_64 = "=0.15.5"
 x86_64-paging = { git = "https://github.com/joe3925/x86_64-paging.git", rev = "812d744461e432978288953f5086f10ee60ac7f3" }
 raw-cpuid = "11.5.0"
 

@@ -77,6 +77,7 @@ pub struct TaskSlot {
     pub(super) cached_waker_state: AtomicU8,
     pub(super) _pad: u8,
     pub(crate) ready_next: AtomicUsize,
+    pub(super) retired_next: AtomicUsize,
     pub(super) domain_id: UnsafeCell<Option<ExecutorDomainId>>,
     pub(super) future: UnsafeCell<Option<FutureAllocation>>,
     pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
@@ -99,6 +100,7 @@ impl TaskSlot {
             cached_waker_state: AtomicU8::new(CW_NONE),
             _pad: 0,
             ready_next: AtomicUsize::new(0),
+            retired_next: AtomicUsize::new(0),
             domain_id: UnsafeCell::new(None),
             future: UnsafeCell::new(None),
             poll_fn: UnsafeCell::new(None),
@@ -117,6 +119,7 @@ impl TaskSlot {
         self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
         self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
         self.ready_next.store(0, Ordering::Relaxed);
+        self.retired_next.store(0, Ordering::Relaxed);
         write_poll_fn(&self.poll_fn, None);
         write_drop_fn(&self.drop_fn, None);
         unsafe { *self.cancel_fn.get() = None };
@@ -128,6 +131,7 @@ impl TaskSlot {
     }
 
     #[inline]
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub(super) fn release_last_ref(&self) {
         if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
             unsafe {
@@ -142,6 +146,7 @@ impl TaskSlot {
 
         let cws = self.cached_waker_state.load(Ordering::Acquire);
         if cws == CW_SET {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
             unsafe {
                 core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
             }
@@ -150,6 +155,7 @@ impl TaskSlot {
 
         let ws = self.waker_state.load(Ordering::Acquire);
         if ws == WAKER_SET {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
             unsafe {
                 core::ptr::drop_in_place((*self.join_waker.get()).as_mut_ptr());
             }

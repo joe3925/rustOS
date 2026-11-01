@@ -4,7 +4,8 @@ mod config;
 mod driver;
 
 use artifacts::{
-    ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel, StubArtifact,
+    ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel,
+    StubArtifact,
 };
 use config::{BootPackageSource, BuildPlan, HostPlan, LaunchPlan};
 use serde::Serialize;
@@ -48,6 +49,73 @@ fn try_main() -> Result<(), String> {
             )
             .map(|_| ())
         }
+        CliCommand::IrqCheck(options) => {
+            let platform = options.platform.as_deref()
+                .ok_or_else(|| "irq-check requires --platform NAME|FILE".to_string())?;
+            let plan = config::load_platform(&root, platform)?;
+            let output = root.join("target/irq-check").join(&plan.id).join(profile(options.release));
+            fs::create_dir_all(&output)
+                .map_err(|error| format!("failed to create {}: {error}", output.display()))?;
+            fs::write(output.join("results.json"), b"{\"schema\":\"rustos.irq-check.v1\",\"complete\":false,\"results\":[]}")
+                .map_err(|error| format!("failed to initialize IRQ results: {error}"))?;
+            let mut kernel = kernel_command(
+                &root, &plan, options.release, options.offline, &options.kernel_features, "check",
+            )?;
+            configure_irq_check(&mut kernel, &root, &plan, "kernel")?;
+            let mut checks = vec![("kernel".to_string(), plan.kernel.target.clone(), kernel)];
+            let sdk = create_kernel_sdk(&root, &plan, options.release)?;
+            for source in &plan.drivers.boot_packages {
+                let manifest = match source {
+                    BootPackageSource::LocalCargo { manifest } => manifest.clone(),
+                    BootPackageSource::GitCargo { repository, revision, manifest } => {
+                        let checkout = driver::checkout_git(&root, repository, revision, options.offline)?;
+                        let checkout = dunce::canonicalize(&checkout)
+                            .map_err(|error| format!("failed to resolve driver checkout: {error}"))?;
+                        let manifest = dunce::canonicalize(checkout.join(manifest))
+                            .map_err(|error| format!("failed to resolve driver manifest: {error}"))?;
+                        if !manifest.starts_with(&checkout) || !manifest.is_file() {
+                            return Err(format!("git driver manifest escapes its checkout: {}", manifest.display()));
+                        }
+                        manifest
+                    }
+                    BootPackageSource::LocalFiles { .. } => continue,
+                };
+                let (package_id, package_name) = driver::cargo_package_identity(&manifest)?;
+                let mut command = cargo(&root);
+                command.arg("check")
+                    .arg("--manifest-path").arg(&manifest)
+                    .args(["-p", &package_id, "--target"]).arg(&plan.drivers.target)
+                    .arg("--lib").args(build_std_args())
+                    .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
+                if options.release { command.arg("--release"); }
+                if options.offline { command.arg("--offline"); }
+                configure_irq_check(&mut command, &root, &plan, "drivers")?;
+                checks.push((package_name, plan.drivers.target.clone(), command));
+            }
+            let mut results = Vec::new();
+            let mut failed = 0;
+            let total = checks.len();
+            for (component, target, command) in checks {
+                let started = Instant::now();
+                let result = run(command, &format!("checking IRQ paths for {component}"));
+                if result.is_err() { failed += 1; }
+                results.push(serde_json::json!({
+                    "component": component, "target": target,
+                    "passed": result.is_ok(), "error": result.err(),
+                    "seconds": started.elapsed().as_secs_f64(),
+                }));
+                let report = serde_json::json!({
+                    "schema": "rustos.irq-check.v1", "platform": plan.id,
+                    "profile": profile(options.release), "complete": results.len() == total,
+                    "passed": results.len() == total && failed == 0, "results": results,
+                });
+                let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+                fs::write(output.join("results.json"), bytes)
+                    .map_err(|error| format!("failed to write IRQ results: {error}"))?;
+            }
+            println!("IRQ results: {}", output.join("results.json").display());
+            if failed == 0 { Ok(()) } else { Err(format!("IRQ checks failed for {failed} component(s)")) }
+        }
         CliCommand::Qemu {
             options,
             file_serial,
@@ -87,7 +155,6 @@ fn try_main() -> Result<(), String> {
                         ));
                     }
                     let mut command = cargo(&root);
-                    configure_irq_check(&mut command, &root, &plan, "kernel")?;
                     command
                         .args(&options.args)
                         .args(["--manifest-path"])
@@ -98,7 +165,9 @@ fn try_main() -> Result<(), String> {
                         .args(build_std_args())
                         .env(
                             "CARGO_TARGET_DIR",
-                            root.join("target/cargo").join(&plan.id).join("irq-check-kernel"),
+                            root.join("target/cargo")
+                                .join(&plan.id)
+                                .join("kernel"),
                         );
                     if plan.kernel.no_default_features {
                         command.arg("--no-default-features");
@@ -120,7 +189,6 @@ fn try_main() -> Result<(), String> {
                         found = true;
                         let (package_id, _) = driver::cargo_package_identity(manifest)?;
                         let mut command = cargo(&root);
-                        configure_irq_check(&mut command, &root, &plan, "drivers")?;
                         command
                             .args(&options.args)
                             .args(["--manifest-path"])
@@ -131,7 +199,9 @@ fn try_main() -> Result<(), String> {
                             .args(build_std_args())
                             .env(
                                 "CARGO_TARGET_DIR",
-                                root.join("target/cargo").join(&plan.id).join("irq-check-drivers"),
+                                root.join("target/cargo")
+                                    .join(&plan.id)
+                                    .join("drivers"),
                             )
                             .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
                         run(
@@ -190,6 +260,7 @@ struct Cli {
 
 enum CliCommand {
     Build(BuildOptions),
+    IrqCheck(BuildOptions),
     Qemu {
         options: QemuOptions,
         file_serial: Option<PathBuf>,
@@ -232,8 +303,8 @@ impl Cli {
         let mut args = args.into_iter().peekable();
 
         match args.peek().map(String::as_str) {
-            Some("build") => {
-                args.next();
+            Some("build" | "irq-check") => {
+                let command = args.next().unwrap();
                 let mut release = false;
                 let mut offline = false;
                 let mut platform = None;
@@ -256,19 +327,15 @@ impl Cli {
                         }
                         "-h" | "--help" => return Err(usage()),
                         other => {
-                            return Err(format!("unknown build argument `{other}`\n\n{}", usage()));
+                            return Err(format!("unknown {command} argument `{other}`\n\n{}", usage()));
                         }
                     }
                 }
 
-                Ok(Self {
-                    command: CliCommand::Build(BuildOptions {
-                        release,
-                        offline,
-                        platform,
-                        kernel_features,
-                    }),
-                })
+                let options = BuildOptions { release, offline, platform, kernel_features };
+                Ok(Self { command: if command == "irq-check" {
+                    CliCommand::IrqCheck(options)
+                } else { CliCommand::Build(options) } })
             }
             Some("qemu") => {
                 args.next();
@@ -393,6 +460,7 @@ fn usage() -> String {
     [
         "usage:",
         "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
+        "  cargo run -p xtask -- irq-check --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta]",
         "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
@@ -494,7 +562,7 @@ fn build_platform(
         .map_err(|err| format!("failed to create {}: {err}", output.display()))?;
 
     println!("==> building kernel");
-    let kernel_artifact = build_kernel(root, plan, release, kernel_features)?;
+    let kernel_artifact = build_kernel(root, plan, release, offline, kernel_features)?;
 
     println!("==> generating kernel SDK");
     let sdk = create_kernel_sdk(root, plan, release)?;
@@ -548,12 +616,14 @@ fn artifact_root(root: &Path, plan: &BuildPlan, release: bool) -> PathBuf {
         .join(profile(release))
 }
 
-fn build_kernel(
+fn kernel_command(
     root: &Path,
     plan: &BuildPlan,
     release: bool,
+    offline: bool,
     extra_features: &[String],
-) -> Result<KernelArtifact, String> {
+    action: &str,
+) -> Result<Command, String> {
     let (package_id, package_name) = driver::cargo_package_identity(&plan.kernel.manifest)?;
     if package_name != plan.kernel.package {
         return Err(format!(
@@ -562,23 +632,19 @@ fn build_kernel(
         ));
     }
     let mut kernel = cargo(root);
-    configure_irq_check(&mut kernel, root, plan, "kernel")?;
     kernel
-        .arg("build")
+        .arg(action)
         .args(["--manifest-path"])
         .arg(&plan.kernel.manifest)
         .args(["-p", &package_id, "--target"])
         .arg(&plan.kernel.target)
+        .args(["--bin", &plan.kernel.binary])
         .args(build_std_args())
-        .args([
-            "--message-format",
-            "json-render-diagnostics",
-            "--color",
-            "always",
-        ])
         .env(
             "CARGO_TARGET_DIR",
-            root.join("target/cargo").join(&plan.id).join("irq-check-kernel"),
+            root.join("target/cargo")
+                .join(&plan.id)
+                .join("kernel"),
         );
 
     if plan.kernel.no_default_features {
@@ -596,6 +662,22 @@ fn build_kernel(
     if release {
         kernel.arg("--release");
     }
+    if offline {
+        kernel.arg("--offline");
+    }
+    Ok(kernel)
+}
+
+fn build_kernel(
+    root: &Path,
+    plan: &BuildPlan,
+    release: bool,
+    offline: bool,
+    extra_features: &[String],
+) -> Result<KernelArtifact, String> {
+    let mut kernel = kernel_command(root, plan, release, offline, extra_features, "build")?;
+    kernel.args(["--message-format", "json-render-diagnostics", "--color", "always"]);
+    let (package_id, _) = driver::cargo_package_identity(&plan.kernel.manifest)?;
     let kernel_pe = driver::cargo_artifact(
         kernel,
         &package_id,
@@ -908,34 +990,87 @@ fn configure_irq_check(
     component: &str,
 ) -> Result<(), String> {
     let executable = env::var_os("IRQ_CHECK").unwrap_or_else(|| "irq-check".into());
-    let instructions = "Install the interrupt checker:\n  git clone https://github.com/joe3925/irq-check.git\n  cd irq-check\n  rustup toolchain install nightly-2026-04-07 --component rustc-dev --component rust-src --component llvm-tools-preview\n  cargo +nightly-2026-04-07 install --locked --path .\nAdd the Cargo bin directory to PATH, or set IRQ_CHECK to the full path of irq-check.";
+    let instructions = "Install the interrupt checker with the same installed nightly as this build:\n  git clone https://github.com/joe3925/irq-check.git\n  cd irq-check\n  rustup component add --toolchain nightly rustc-dev rust-src llvm-tools-preview\n  cargo +nightly install --locked --force --path . --bins\nAdd the Cargo bin directory to PATH, or set IRQ_CHECK to the full path of irq-check.";
     let output = Command::new(&executable)
         .arg("--version")
         .output()
-        .map_err(|error| format!("Cannot start {}: {error}.\n{instructions}", Path::new(&executable).display()))?;
+        .map_err(|error| {
+            format!(
+                "Cannot start {}: {error}.\n{instructions}",
+                Path::new(&executable).display()
+            )
+        })?;
     let version = String::from_utf8_lossy(&output.stdout);
     if !output.status.success()
-        || !version.starts_with("irq-check 0.1.2 nightly-2026-04-07 ")
-        || !version.contains("bcded331651b60a0383b3ff51db4f24c4495ac53")
+        || !version.starts_with("irq-check 0.1.3 ")
     {
-        return Err(format!("The interrupt checker version is incompatible: {version}\n{instructions}"));
+        return Err(format!(
+            "The interrupt checker version is incompatible: {version}\n{instructions}"
+        ));
+    }
+    let interface = Command::new(&executable)
+        .arg("--interface")
+        .output()
+        .map_err(|error| {
+            format!("Cannot check the irq-check interface: {error}.\n{instructions}")
+        })?;
+    if !interface.status.success()
+        || String::from_utf8_lossy(&interface.stdout).trim() != "strict-blocks-4"
+    {
+        return Err(format!(
+            "The interrupt checker does not support strict block checks. Rebuild it from the current source.\n{instructions}"
+        ));
     }
     let readiness = Command::new(&executable)
         .arg("--self-check")
         .output()
         .map_err(|error| format!("Cannot check irq-check: {error}.\n{instructions}"))?;
-    if !readiness.status.success() {
-        return Err(format!("The interrupt checker cannot load its compiler driver: {}\n{instructions}", String::from_utf8_lossy(&readiness.stderr)));
+    if !readiness.status.success()
+        || !String::from_utf8_lossy(&readiness.stdout).contains("strict-blocks-4")
+    {
+        return Err(format!(
+            "The interrupt checker cannot load its compiler driver: {}\n{instructions}",
+            String::from_utf8_lossy(&readiness.stderr)
+        ));
     }
     if let Some(wrapper) = env::var_os("RUSTC_WRAPPER") {
         if !wrapper.is_empty() && wrapper != executable {
-            return Err("RUSTC_WRAPPER is already set. Clear it so irq-check can check every dependency.".into());
+            return Err(
+                "RUSTC_WRAPPER is already set. Clear it so irq-check can check every dependency."
+                    .into(),
+            );
         }
     }
-    command
-        .env("RUSTC_WRAPPER", &executable)
-        .env("IRQ_CHECK_REQUIRED_CRATE", if component == "kernel" { plan.kernel.package.as_str() } else { "" })
-        .env("IRQ_CHECK_REPORT_DIR", root.join("target/irq-check").join(&plan.id).join(component));
+    let mut checked = Command::new(&executable);
+    checked
+        .arg("--cargo")
+        .args(command.get_args())
+        .current_dir(command.get_current_dir().unwrap_or(root))
+        .env("IRQ_CHECK_CARGO", command.get_program());
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            checked.env(name, value);
+        } else {
+            checked.env_remove(name);
+        }
+    }
+    checked.env(
+        "IRQ_CHECK_REQUIRED_CRATE",
+        if component == "kernel" {
+            plan.kernel.package.as_str()
+        } else {
+            ""
+        },
+    );
+    checked.env("CARGO_TARGET_DIR", root.join("target/cargo").join(&plan.id).join(format!("irq-check-{component}")));
+    for (name, value) in [
+        ("IRQ_CHECK_QUERY_STEPS", "1000000"),
+        ("IRQ_CHECK_SCALAR_STEPS", "1000000"),
+        ("IRQ_CHECK_ALTERNATIVES", "160"),
+    ] {
+        if env::var_os(name).is_none() { checked.env(name, value); }
+    }
+    *command = checked;
     Ok(())
 }
 

@@ -37,23 +37,34 @@ impl AddressSpacePlatform for Aarch64Platform {
     }
 
     fn current_root() -> AddressSpaceRoot {
-        root_from_ttbr(TTBR0_EL1.get())
+        let ttbr = {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { TTBR0_EL1.get() }
+        };
+        root_from_ttbr(ttbr)
     }
 
     unsafe fn switch_root(root: AddressSpaceRoot) {
         assert_eq!(root.as_u64() & (root_table_size() - 1), 0);
         let mask = ((1u64 << 48) - 1) & !(root_table_size() - 1);
-        let ttbr0_controls = TTBR0_EL1.get() & !mask;
-        let ttbr1_controls = TTBR1_EL1.get() & !mask;
-        dsb(ISHST);
-        TTBR0_EL1.set(root.as_u64() | ttbr0_controls);
-        TTBR1_EL1.set(root.as_u64() | ttbr1_controls);
-        isb(SY);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe {
+            let ttbr0_controls = TTBR0_EL1.get() & !mask;
+            let ttbr1_controls = TTBR1_EL1.get() & !mask;
+            dsb(ISHST);
+            TTBR0_EL1.set(root.as_u64() | ttbr0_controls);
+            TTBR1_EL1.set(root.as_u64() | ttbr1_controls);
+            isb(SY);
+        }
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             core::arch::asm!("tlbi vmalle1is", options(nostack, preserves_flags));
         }
-        dsb(ISH);
-        isb(SY);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe {
+            dsb(ISH);
+            isb(SY);
+        }
     }
 
     fn create_user_root<A: PageTableFrameAllocator>(

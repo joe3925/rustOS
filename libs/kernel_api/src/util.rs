@@ -18,13 +18,16 @@ pub fn wait_duration(time: Duration) {
 }
 #[inline]
 pub fn get_current_cpu_id() -> usize {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe { kernel_sys::get_current_cpu_id() }
 }
 #[inline]
 pub fn get_current_platform_cpu_id() -> usize {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe { kernel_sys::get_current_platform_cpu_id() }
 }
 #[inline]
 pub fn panic_common(mod_name: &'static str, info: &core::panic::PanicInfo) -> ! {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe { kernel_sys::panic_common(mod_name, info) }
 }

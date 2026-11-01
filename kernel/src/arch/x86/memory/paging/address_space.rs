@@ -23,10 +23,15 @@ impl AddressSpacePlatform for X86Platform {
     }
 
     fn current_root() -> AddressSpaceRoot {
-        unsafe { AddressSpaceRoot::from_raw(Cr3::read().0.start_address().as_u64()) }
+        let current = {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { Cr3::read() }
+        };
+        unsafe { AddressSpaceRoot::from_raw(current.0.start_address().as_u64()) }
     }
 
     unsafe fn switch_root(root: AddressSpaceRoot) {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe {
             Cr3::write(
                 PhysFrame::containing_address(PhysAddr::new(root.as_u64())),

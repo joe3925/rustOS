@@ -32,6 +32,7 @@ fn counter_frequency_hz() -> u64 {
         return cached;
     }
     let frequency: u64;
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!("mrs {frequency}, cntfrq_el0", frequency = out(reg) frequency, options(nomem, nostack, preserves_flags));
     }
@@ -51,11 +52,13 @@ fn duration_ticks(time: Duration) -> u64 {
 
 fn program_period() {
     let ticks = duration_ticks(Duration::from_nanos(TIMER_PERIOD_NS)).max(1);
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!("msr cntv_tval_el0, {ticks}", ticks = in(reg) ticks, options(nomem, nostack, preserves_flags));
         asm!("msr cntv_ctl_el0, {control}", control = in(reg) CNTV_CTL_ENABLE, options(nomem, nostack, preserves_flags));
     }
-    isb(SY);
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+    unsafe { isb(SY) };
 }
 
 pub(super) unsafe fn handle_interrupt(state: *mut State) {
@@ -102,6 +105,7 @@ impl TimerPlatform for Aarch64Platform {
 
     fn cycle_counter() -> u64 {
         let value: u64;
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!("mrs {value}, cntvct_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
         }

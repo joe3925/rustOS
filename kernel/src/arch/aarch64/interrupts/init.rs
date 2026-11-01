@@ -24,12 +24,6 @@ pub(crate) fn init_boot_interrupts() {
     gic.init_distributor();
     INTERRUPT_CONTROLLER.call_once(|| InterruptController::GicV3(gic));
     kernel_types::irq::set_irq_context_query(irq_context_query);
-    kernel_sync::locks::irq::set_irq_interrupt_control(
-        irq_interrupts_enabled,
-        irq_interrupts_disable,
-        irq_interrupts_enable,
-        irq_interrupts_enable_and_halt,
-    );
 }
 
 pub(crate) fn init_current_cpu_interrupts() {
@@ -38,20 +32,4 @@ pub(crate) fn init_current_cpu_interrupts() {
 
 extern "C" fn irq_context_query() -> bool {
     Aarch64Platform::current_is_in_interrupt()
-}
-
-extern "C" fn irq_interrupts_enabled() -> bool {
-    Aarch64Platform::interrupts_enabled()
-}
-
-extern "C" fn irq_interrupts_disable() {
-    Aarch64Platform::disable_interrupts();
-}
-
-extern "C" fn irq_interrupts_enable() {
-    Aarch64Platform::enable_interrupts();
-}
-
-extern "C" fn irq_interrupts_enable_and_halt() {
-    Aarch64Platform::enable_interrupts_and_halt();
 }

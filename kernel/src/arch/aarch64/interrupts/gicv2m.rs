@@ -1,5 +1,5 @@
 use kernel_types::arch::PhysAddr;
-use kernel_sync::locks::irq::IrqSafeMutex;
+use crate::sync_platform::IrqSafeMutex;
 use kernel_types::irq::{
     MSI_KIND_MSI, MSI_KIND_MSIX, MSI_TARGET_ANY, MSI_TARGET_PLATFORM_CPU,
     MsiBindingRequest, MsiMessage,

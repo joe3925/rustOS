@@ -3,7 +3,6 @@ extern crate alloc;
 use crate::kernel_types::runtime::Stopwatch;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -15,11 +14,11 @@ use kernel_types::arch::{Platform, PlatformInfo};
 use spin::Mutex;
 
 use kernel_sys::{
-    kernel_block_on_thread_state, kernel_spawn_blocking_raw, kernel_spawn_detached_abi,
+    kernel_block_on_context, kernel_spawn_blocking_raw, kernel_spawn_detached_abi,
     kernel_spawn_joinable_abi, try_steal_blocking_one as sys_try_steal_blocking_one,
 };
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
-use kernel_types::runtime::BlockOnThreadState;
+use kernel_types::runtime::{BlockOnContext, BlockOnThreadState};
 
 /// Spawn an async task on the kernel executor (shared singleton in the kernel) and
 /// return a join handle that can be awaited for completion.
@@ -54,23 +53,9 @@ impl Drop for BlockOnActiveGuard<'_> {
     }
 }
 
-struct BlockOnWaker {
-    state: Arc<BlockOnThreadState>,
-}
-
-impl Wake for BlockOnWaker {
-    fn wake(self: Arc<Self>) {
-        self.state.mark_ready();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.state.mark_ready();
-    }
-}
-
 pub fn block_on<F: Future + Send>(future: F) -> F::Output {
     let mut future = core::pin::pin!(future);
-    let state = unsafe { kernel_block_on_thread_state() };
+    let BlockOnContext { state, waker } = unsafe { kernel_block_on_context() };
 
     if !state.try_enter() {
         panic!("reentrant kernel_api::runtime::block_on is not supported");
@@ -79,9 +64,6 @@ pub fn block_on<F: Future + Send>(future: F) -> F::Output {
     let _active = BlockOnActiveGuard::new(&state);
     state.clear_ready();
 
-    let waker = Waker::from(Arc::new(BlockOnWaker {
-        state: state.clone(),
-    }));
     let mut context = Context::from_waker(&waker);
 
     loop {
@@ -206,6 +188,7 @@ pub fn cycle_counter() -> u64 {
 
 #[inline(always)]
 pub fn cycle_counter_frequency_hz() -> u64 {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe { kernel_cycle_counter_frequency_hz() }
 }
 
@@ -216,13 +199,17 @@ pub struct KernelStopwatch {
 impl KernelStopwatch {
     #[inline(always)]
     pub fn start() -> Self {
-        Self {
-            inner: unsafe { stopwatch_new() },
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
+        unsafe {
+            Self {
+                inner: stopwatch_new(),
+            }
         }
     }
 
     #[inline(always)]
     pub fn elapsed(&self) -> Duration {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe { elapsed(&self.inner) }
     }
 

@@ -52,6 +52,21 @@ impl Platform for KernelPlatform {
         scheduler().park_current();
     }
 
+    #[inline]
+    fn interrupts_enabled() -> bool {
+        platform::interrupts_enabled()
+    }
+
+    #[inline]
+    fn disable_interrupts() {
+        platform::disable_interrupts();
+    }
+
+    #[inline]
+    fn enable_interrupts() {
+        platform::enable_interrupts();
+    }
+
     fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
         let task = Task::new_kernel_mode(entry, context, StackSize::Tiny, name, 0);
         scheduler().add_task(task);
@@ -73,6 +88,8 @@ pub type CompletionPort<T> = kernel_sync::completion::CompletionPort<KernelPlatf
 pub type CompletionPortPermit<T> = kernel_sync::completion::PortPermit<KernelPlatform, T>;
 pub type ThreadPool = kernel_sync::workers::thread_pool::ThreadPool<KernelPlatform>;
 pub type BoundedThreadPool = kernel_sync::workers::thread_pool::BoundedThreadPool<KernelPlatform>;
+pub type IrqSafeMutex<T> = kernel_sync::locks::IrqSafeMutex<KernelPlatform, T>;
+pub type IrqSafeRwLock<T> = kernel_sync::locks::IrqSafeRwLock<KernelPlatform, T>;
 
 #[inline]
 pub fn mpmc_channel<T>() -> (MpmcSender<T>, MpmcReceiver<T>) {

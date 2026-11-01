@@ -99,6 +99,7 @@ impl TaskPlatform for X86Platform {
     }
 
     unsafe fn activate_kernel_tls(thread_pointer: u64) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
                 "mov qword ptr gs:[{off}], {tls}",

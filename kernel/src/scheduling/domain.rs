@@ -95,7 +95,6 @@ impl CpuSet {
     }
 }
 
-#[cfg_attr(irq_check, irq::context)]
 pub trait DomainOps: Send + Sync {
     fn name(&self) -> &'static str;
     fn contains_cpu(&self, cpu_id: usize) -> bool;
@@ -267,7 +266,6 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
     }
 }
 
-#[cfg_attr(irq_check, irq::context)]
 pub trait DomainAlgorithm: Send + Sync {
     fn pick_next(
         &self,
@@ -453,7 +451,6 @@ impl TaskSchedBinding {
 }
 
 impl Drop for TaskSchedBinding {
-    #[cfg_attr(irq_check, irq::context)]
     fn drop(&mut self) {
         unsafe {
             reclaim::enqueue(self.allocation);

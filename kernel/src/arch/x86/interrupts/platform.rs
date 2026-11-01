@@ -31,7 +31,8 @@ impl InterruptPlatform for X86Platform {
     }
 
     fn interrupts_enabled() -> bool {
-        x86_64::instructions::interrupts::are_enabled()
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { x86_64::instructions::interrupts::are_enabled() }
     }
 
     fn current_is_in_interrupt() -> bool {
@@ -39,19 +40,30 @@ impl InterruptPlatform for X86Platform {
     }
 
     fn disable_interrupts() {
-        x86_64::instructions::interrupts::disable();
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { x86_64::instructions::interrupts::disable() };
     }
 
     fn enable_interrupts() {
-        x86_64::instructions::interrupts::enable();
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { x86_64::instructions::interrupts::enable() };
     }
 
     fn with_interrupts_disabled<T>(f: impl FnOnce() -> T) -> T {
-        x86_64::instructions::interrupts::without_interrupts(f)
+        let enabled = Self::interrupts_enabled();
+        if enabled {
+            Self::disable_interrupts();
+        }
+        let result = f();
+        if enabled {
+            Self::enable_interrupts();
+        }
+        result
     }
 
     fn enable_interrupts_and_halt() {
-        x86_64::instructions::interrupts::enable_and_hlt();
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { x86_64::instructions::interrupts::enable_and_hlt() };
     }
 
     fn end_interrupt(vector: u8) {

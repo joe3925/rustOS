@@ -1,7 +1,7 @@
 #[cfg(any(loom, feature = "loom"))]
 pub mod atomic {
     pub use loom::sync::atomic::{
-        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering, fence,
     };
 
     pub struct AtomicU128(loom::sync::Mutex<u128>);
@@ -35,10 +35,13 @@ pub mod atomic {
 
 #[cfg(not(any(loom, feature = "loom")))]
 pub mod atomic {
+    #[cfg(target_has_atomic = "128")]
+    pub use core::sync::atomic::AtomicU128;
+    #[cfg(not(target_has_atomic = "128"))]
     pub use portable_atomic::AtomicU128;
 
     pub use core::sync::atomic::{
-        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering, fence,
     };
 }
 

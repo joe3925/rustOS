@@ -177,12 +177,18 @@ impl PagingPlatform for X86Platform {
     }
 
     fn local_flush_tlb_all(include_global: bool) {
-        let cr4 = Cr4::read();
+        let cr4 = {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { Cr4::read() }
+        };
         if include_global && cr4.contains(Cr4Flags::PAGE_GLOBAL) {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
             unsafe { Cr4::write(cr4 - Cr4Flags::PAGE_GLOBAL) };
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
             unsafe { Cr4::write(cr4) };
         } else {
-            x86_64::instructions::tlb::flush_all();
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { x86_64::instructions::tlb::flush_all() };
         }
     }
 
@@ -204,7 +210,8 @@ impl PagingPlatform for X86Platform {
                 Self::local_flush_tlb_all(false);
                 return;
             };
-            x86_64::instructions::tlb::flush(virt);
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { x86_64::instructions::tlb::flush(virt) };
             let Some(next) = addr.checked_add(stride) else {
                 Self::local_flush_tlb_all(false);
                 return;

@@ -137,17 +137,29 @@ pub struct MimallocAllocStats {
 }
 
 unsafe extern "C" {
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_process_init();
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_thread_done();
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_collect(force: bool);
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_malloc(size: usize) -> *mut c_void;
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_zalloc(size: usize) -> *mut c_void;
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_realloc(ptr: *mut c_void, new_size: usize) -> *mut c_void;
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_malloc_aligned(size: usize, alignment: usize) -> *mut c_void;
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_zalloc_aligned(size: usize, alignment: usize) -> *mut c_void;
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_realloc_aligned(ptr: *mut c_void, new_size: usize, alignment: usize) -> *mut c_void;
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_free(ptr: *mut c_void);
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn rustos_mi_configure_options();
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn rustos_mi_manage_arena(start: *mut c_void, size: usize) -> bool;
 }
 
@@ -561,10 +573,12 @@ impl RangeAllocator {
 }
 
 unsafe extern "C" {
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_register_output(
         cb: extern "C" fn(msg: *const core::ffi::c_char, arg: *mut c_void),
         arg: *mut c_void,
     );
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_register_error(cb: extern "C" fn(err: i32, arg: *mut c_void), arg: *mut c_void);
 }
 

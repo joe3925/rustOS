@@ -48,6 +48,7 @@ pub extern "C" fn irq_handle_unregister(h: &IrqHandle) {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn irq_handle_is_closed(h: &IrqHandle) -> bool {
     if h.is_null() {
         return true;
@@ -59,6 +60,7 @@ pub extern "C" fn irq_handle_is_closed(h: &IrqHandle) -> bool {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn irq_handle_set_user_ctx(h: &IrqHandle, v: usize) {
     let _ = irq_manager().with_handle(*h, |inner| {
         inner.set_user_ctx(v);
@@ -66,6 +68,7 @@ pub extern "C" fn irq_handle_set_user_ctx(h: &IrqHandle, v: usize) {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn irq_handle_get_user_ctx(h: &IrqHandle) -> usize {
     irq_manager()
         .with_handle(*h, |inner| inner.user_ctx())
@@ -153,7 +156,11 @@ impl IrqHandleOps for IrqHandleInner {
             if let Some(waker) =
                 unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
             {
-                waker.wake_by_ref();
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
+                }
             }
 
             self.signal_phase.fetch_add(1, Ordering::AcqRel);
@@ -194,7 +201,11 @@ impl IrqHandleOps for IrqHandleInner {
             if let Some(waker) =
                 unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
             {
-                waker.wake_by_ref();
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
+                }
             }
 
             signaled += 1;
@@ -229,7 +240,11 @@ impl IrqHandleOps for IrqHandleInner {
             if let Some(waker) =
                 unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
             {
-                waker.wake_by_ref();
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
+                }
             }
 
             signaled += 1;
@@ -798,13 +813,18 @@ impl IrqManager {
         while let Some(current) = unsafe { entry.as_ref() } {
             if let Some(registration) = current.try_read() {
                 let frame = unsafe { &mut *(frame as *mut InterruptFrame as *mut IrqFrame) };
-                let claimed = (registration.isr)(
-                    interrupt_id,
-                    cpu,
-                    frame,
-                    &registration.inner,
-                    registration.ctx,
-                );
+                let claimed;
+                #[allow(unused_unsafe)]
+                #[cfg_attr(irq_check, irq::trusted(unsafe))]
+                unsafe {
+                    claimed = (registration.isr)(
+                        interrupt_id,
+                        cpu,
+                        frame,
+                        &registration.inner,
+                        registration.ctx,
+                    );
+                }
                 if claimed {
                     break;
                 }

@@ -40,6 +40,7 @@ impl FpuState {
 
     #[inline(always)]
     pub fn save(&mut self) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
                 "fxsave [{}]",
@@ -51,6 +52,7 @@ impl FpuState {
 
     #[inline(always)]
     pub fn restore(&self) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
                 "fxrstor [{}]",
