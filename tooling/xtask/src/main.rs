@@ -1002,7 +1002,7 @@ fn configure_irq_check(
         })?;
     let version = String::from_utf8_lossy(&output.stdout);
     if !output.status.success()
-        || !version.starts_with("irq-check 0.1.3 ")
+        || !version.starts_with("irq-check 0.1.4 ")
     {
         return Err(format!(
             "The interrupt checker version is incompatible: {version}\n{instructions}"
