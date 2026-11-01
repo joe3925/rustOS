@@ -990,7 +990,7 @@ fn configure_irq_check(
     component: &str,
 ) -> Result<(), String> {
     let executable = env::var_os("IRQ_CHECK").unwrap_or_else(|| "irq-check".into());
-    let instructions = "Install the interrupt checker with the same installed nightly as this build:\n  git clone https://github.com/joe3925/irq-check.git\n  cd irq-check\n  rustup component add --toolchain nightly rustc-dev rust-src llvm-tools-preview\n  cargo +nightly install --locked --force --path . --bins\nAdd the Cargo bin directory to PATH, or set IRQ_CHECK to the full path of irq-check.";
+    let instructions = "Install the interrupt checker from the rustOS repository root with the compiler selected by rust-toolchain.toml:\n  rustup component add rustc-dev llvm-tools-preview\n  cargo install --locked --force --git https://github.com/joe3925/irq-check.git --tag v0.1.4 --bins irq-check\nAdd the Cargo bin directory to PATH, or set IRQ_CHECK to the full path of irq-check.";
     let output = Command::new(&executable)
         .arg("--version")
         .output()

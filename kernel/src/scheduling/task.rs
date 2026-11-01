@@ -154,7 +154,8 @@ impl Clone for TaskHandle {
             })
             .is_err()
         {
-            core::intrinsics::abort();
+            // TODO: FIXME
+            panic!("handle overflow");
         }
         Self { ptr: self.ptr }
     }

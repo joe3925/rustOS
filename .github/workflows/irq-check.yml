@@ -8,9 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  RUSTUP_TOOLCHAIN: nightly-2026-09-17
-
 jobs:
   discover-platforms:
     runs-on: ubuntu-latest
@@ -47,15 +44,15 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustc-dev --component rust-src --component llvm-tools-preview
+      - name: Install IRQ compiler components
+        run: rustup component add rustc-dev llvm-tools-preview
 
       - name: Install platform Rust targets
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
           targets="$(python3 -c 'import sys, tomllib; p=tomllib.load(open(sys.argv[1], "rb")); t=p["stub"]["target"]; print(t); print(t.removesuffix("-unknown-none") + "-unknown-uefi") if p["bootloader"]["firmware"] == "uefi" else None' "platforms/$PLATFORM")"
-          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" $targets
+          rustup target add $targets
 
       - name: Install IRQ Check
         run: |
