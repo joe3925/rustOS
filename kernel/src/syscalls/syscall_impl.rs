@@ -927,7 +927,6 @@ pub(crate) fn sys_executor_domain_create(
         Err(err) => return err,
     };
     let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::ProcessIo,
         max_active: if config.max_active_tasks == 0 {
             usize::MAX
         } else {

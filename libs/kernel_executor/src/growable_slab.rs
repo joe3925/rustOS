@@ -75,7 +75,6 @@ struct SlabShard<T> {
     chunks: Box<[AtomicPtr<SlabChunk<T>>]>,
     published_chunks: AtomicUsize,
     alloc_hint: AtomicUsize,
-    allocated_count: AtomicUsize,
     init: fn() -> T,
 }
 
@@ -94,7 +93,6 @@ impl<T> SlabShard<T> {
             chunks: chunks.into_boxed_slice(),
             published_chunks: AtomicUsize::new(0),
             alloc_hint: AtomicUsize::new(0),
-            allocated_count: AtomicUsize::new(0),
             init,
         };
         let _ = shard.grow_chunk();
@@ -188,7 +186,6 @@ impl<T> SlabShard<T> {
                     & 0xFFFF;
                 slot.occupied.store(true, Ordering::Release);
                 self.alloc_hint.store(index + 1, Ordering::Relaxed);
-                self.allocated_count.fetch_add(1, Ordering::Relaxed);
                 return Some(SlabHandle {
                     shard,
                     local_index: index as u32,
@@ -298,7 +295,6 @@ impl<T> SlabShard<T> {
             let chunk = &*self.chunks[chunk_index].load(Ordering::Acquire);
             chunk.free_bitmap[local / 64].fetch_or(1u64 << (local % 64), Ordering::Release);
             self.alloc_hint.store(index, Ordering::Relaxed);
-            self.allocated_count.fetch_sub(1, Ordering::Relaxed);
             true
         }
     }
@@ -406,7 +402,6 @@ impl<T> GrowableSlab<T> {
                 .wrapping_add(1)
                 & 0xffff;
             slot.occupied.store(true, Ordering::Release);
-            shard.allocated_count.fetch_add(1, Ordering::Relaxed);
             Some(SlabHandle {
                 generation,
                 ..handle
@@ -446,7 +441,6 @@ impl<T> GrowableSlab<T> {
             {
                 return false;
             }
-            shard.allocated_count.fetch_sub(1, Ordering::Relaxed);
             cache.owner = owner;
             cache.flush = Some(Self::return_cached_batch);
             let handles = &mut cache.handles[..limit];
@@ -504,13 +498,6 @@ impl<T> GrowableSlab<T> {
         };
         shard.release(handle)
     }}
-
-    pub fn allocated_count(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| shard.allocated_count.load(Ordering::Relaxed))
-            .sum()
-    }
 
     pub fn capacity(&self) -> usize {
         self.shards

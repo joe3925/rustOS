@@ -9,7 +9,7 @@ use spin::Once;
 pub use crate::domain::{
     DRIVER_EXECUTOR_DOMAIN, DestroyExecutorDomainError, DestroyExecutorDomainResult,
     ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
-    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable, GlobalExecutorStats,
+    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable,
     KERNEL_BACKGROUND_EXECUTOR_DOMAIN, KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 
@@ -107,9 +107,6 @@ pub struct GlobalAsyncExecutor {
     runtime: Once<ExecutorRuntime>,
     active_pumps: CacheAligned,
     max_pumps: CacheAligned,
-    total_submissions: CacheAligned,
-    total_pump_runs: CacheAligned,
-    run_tick: CacheAligned,
 }
 
 impl GlobalAsyncExecutor {
@@ -120,9 +117,6 @@ impl GlobalAsyncExecutor {
             runtime: Once::new(),
             active_pumps: CacheAligned(AtomicUsize::new(0)),
             max_pumps: CacheAligned(AtomicUsize::new(0)),
-            total_submissions: CacheAligned(AtomicUsize::new(0)),
-            total_pump_runs: CacheAligned(AtomicUsize::new(0)),
-            run_tick: CacheAligned(AtomicUsize::new(0)),
         })
     }
 
@@ -163,8 +157,6 @@ impl GlobalAsyncExecutor {
         task_id: usize,
     ) {
         self.with_executor_domain(domain_id, |domain| {
-            domain.submitted.0.fetch_add(1, Ordering::Relaxed);
-            self.total_submissions.0.fetch_add(1, Ordering::Relaxed);
             let local = !crate::platform::in_interrupt_context()
                 && with_executor_local(|tls| {
                     if tls.active_domain.get() != domain as *const ExecutorDomain {
@@ -255,27 +247,6 @@ impl GlobalAsyncExecutor {
         self.runtime().domains.get_executor_domain(domain_id)
     }
 
-    pub fn executor_domain_stats(
-        &self,
-        domain_id: ExecutorDomainId,
-    ) -> Option<ExecutorDomainStats> {
-        self.get_executor_domain(domain_id)
-            .map(|domain| domain.stats())
-    }
-
-    pub fn stats(&self) -> GlobalExecutorStats {
-        let runtime = self.runtime();
-
-        GlobalExecutorStats {
-            active_pumps: self.active_pumps.0.load(Ordering::Acquire),
-            max_pumps: self.max_pumps.0.load(Ordering::Acquire),
-            runnable_executor_domain_count: runtime.run_queue.len(),
-            domain_count: runtime.domains.domain_count(),
-            total_submissions: self.total_submissions.0.load(Ordering::Relaxed),
-            total_pump_runs: self.total_pump_runs.0.load(Ordering::Relaxed),
-        }
-    }
-
     pub fn runnable_executor_domain_count(&self) -> usize {
         let Some(runtime) = self.runtime.get() else {
             return 0;
@@ -363,7 +334,6 @@ impl GlobalAsyncExecutor {
             worker: worker.map(|(_, worker)| worker),
             previous,
         };
-        self.total_pump_runs.0.fetch_add(1, Ordering::Relaxed);
 
         loop {
             let runtime = self.runtime();
@@ -398,10 +368,6 @@ impl GlobalAsyncExecutor {
             }
 
             domain.release_schedule_token();
-            domain.record_scheduler_selection();
-
-            let tick = self.run_tick.0.fetch_add(1, Ordering::Relaxed) + 1;
-            domain.record_run_started(tick);
 
             let budget = self.pick_domain_budget(&domain);
             let ran = self.run_domain_batch(&domain, budget);
@@ -480,7 +446,6 @@ impl GlobalAsyncExecutor {
             };
 
             crate::runtime::slab::ptr::slab_task_poll_trampoline(task_id);
-            domain.record_completed();
             ran += 1;
         }
 

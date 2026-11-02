@@ -4,9 +4,9 @@ use spin::Once;
 
 use crate::global_async::GlobalAsyncExecutor;
 use crate::growable_slab::{GrowableSlab, MAX_LOCAL_SLOTS, SlabHandle};
-use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicUsize, Ordering};
 
-use super::config::{SlabConfig, SlabConfigBuilder, SlabStats};
+use super::config::{SlabConfig, SlabConfigBuilder};
 use super::constants::{MAX_SLOTS_PER_SHARD, MIN_SLOTS_PER_SHARD, NUM_SHARDS};
 use super::ptr::{decode_slab_task_ptr, encode_slab_task_ptr};
 use super::slot::TaskSlot;
@@ -40,7 +40,6 @@ static mut TASK_TABLE_STORAGE: MaybeUninit<TaskTable> = MaybeUninit::uninit();
 pub struct TaskTable {
     slab: GrowableSlab<TaskSlot>,
     retired_head: AtomicUsize,
-    total_allocations: AtomicU64,
 }
 
 impl TaskTable {
@@ -57,7 +56,6 @@ impl TaskTable {
                 new_task_slot,
             ),
             retired_head: AtomicUsize::new(0),
-            total_allocations: AtomicU64::new(0),
         }
     }
 
@@ -74,7 +72,6 @@ impl TaskTable {
         slot.prepare_for_allocation();
         slot.gen_ref
             .store(pack_gen_ref(handle.generation, 1), Ordering::Release);
-        self.total_allocations.fetch_add(1, Ordering::Relaxed);
         Some(SlotHandle { handle })
     }
 
@@ -238,12 +235,8 @@ impl TaskTable {
         }
     }
 
-    pub fn stats(&self) -> SlabStats {
-        SlabStats {
-            total_capacity: self.slab.capacity(),
-            currently_allocated: self.slab.allocated_count(),
-            total_allocations: self.total_allocations.load(Ordering::Relaxed),
-        }
+    pub fn capacity(&self) -> usize {
+        self.slab.capacity()
     }
 }
 
@@ -292,8 +285,4 @@ pub fn get_task_table() -> &'static TaskTable {
         .get()
         .copied()
         .expect("task table not initialized")
-}
-
-pub fn slab_stats() -> SlabStats {
-    get_task_table().stats()
 }

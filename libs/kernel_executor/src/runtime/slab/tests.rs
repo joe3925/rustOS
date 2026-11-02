@@ -2,7 +2,7 @@
 mod threaded {
     use crate::runtime::slab::config::SlabConfigBuilder;
     use crate::runtime::slab::ptr::enqueue_slab_task;
-    use crate::runtime::slab::task_slab::{get_task_table, slab_stats};
+    use crate::runtime::slab::task_slab::get_task_table;
     use alloc::{sync::Arc, vec::Vec};
     use core::future::Future;
     use core::pin::Pin;
@@ -111,16 +111,12 @@ mod threaded {
         );
     }
 
-    // This test exists to make sure the global slab initializes under the threaded
-    // runtime and reports sane capacity/allocation counters after startup.
     #[test]
-    fn global_slab_stats_are_readable_after_default_initialization() {
+    fn global_slab_has_capacity_after_default_initialization() {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let stats = slab_stats();
-        assert!(stats.total_capacity >= 64);
-        assert!(stats.currently_allocated <= stats.total_capacity);
+        assert!(get_task_table().capacity() >= 64);
     }
 
     // This test exists to verify the detached slab exhaustion path. It holds every
@@ -130,8 +126,7 @@ mod threaded {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let stats = slab_stats();
-        let tasks = stats.total_capacity + 64;
+        let tasks = get_task_table().capacity() + 64;
         let gate = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicUsize::new(0));
         let wakers = Arc::new(Mutex::new(Vec::with_capacity(tasks)));

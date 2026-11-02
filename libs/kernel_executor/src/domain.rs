@@ -132,7 +132,6 @@ impl ExecutorDomainState {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorDomainConfig {
-    pub class: ExecutorDomainClass,
     pub max_active: usize,
     pub quantum: usize,
     pub weight: usize,
@@ -143,7 +142,6 @@ pub struct ExecutorDomainConfig {
 impl ExecutorDomainConfig {
     pub fn for_class(class: ExecutorDomainClass, cpu_count: usize) -> Self {
         Self {
-            class,
             max_active: class.default_max_active(cpu_count),
             quantum: class.default_quantum(),
             weight: class.default_weight(),
@@ -186,9 +184,6 @@ pub enum DestroyExecutorDomainResult {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorDomainStats {
-    pub domain_id: ExecutorDomainId,
-    pub generation: u32,
-    pub class: ExecutorDomainClass,
     pub state: ExecutorDomainState,
     pub queued_count: usize,
     pub active_count: usize,
@@ -196,32 +191,11 @@ pub struct ExecutorDomainStats {
     pub live_future_count: usize,
     pub live_future_bytes: usize,
     pub max_active: usize,
-    pub quantum: usize,
-    pub weight: usize,
     pub ready_shards: usize,
-    pub deficit: usize,
-    pub scheduled: bool,
-    pub submitted: usize,
-    pub completed: usize,
-    pub total_runs: usize,
-    pub scheduler_selections: usize,
-    pub last_run_tick: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GlobalExecutorStats {
-    pub active_pumps: usize,
-    pub max_pumps: usize,
-    pub runnable_executor_domain_count: usize,
-    pub domain_count: usize,
-    pub total_submissions: usize,
-    pub total_pump_runs: usize,
 }
 
 pub struct ExecutorDomain {
     id: ExecutorDomainId,
-    generation: u32,
-    class: ExecutorDomainClass,
     ready_heads: Box<[ReadyHead]>,
     ready_cursor: CacheAligned,
     future_arena: FutureArena,
@@ -237,12 +211,6 @@ pub struct ExecutorDomain {
     quantum: CacheAligned,
     weight: CacheAligned,
     deficit: CacheAligned,
-
-    pub(crate) submitted: CacheAligned,
-    completed: CacheAligned,
-    total_runs: CacheAligned,
-    scheduler_selections: CacheAligned,
-    last_run_tick: CacheAligned,
 }
 
 impl ExecutorDomain {
@@ -251,8 +219,6 @@ impl ExecutorDomain {
 
         Self {
             id,
-            generation: id.generation(),
-            class: config.class,
             ready_heads: (0..config.ready_shards)
                 .map(|_| ReadyHead(AtomicU128::new(0)))
                 .collect::<alloc::vec::Vec<_>>()
@@ -271,18 +237,7 @@ impl ExecutorDomain {
             quantum: CacheAligned(AtomicUsize::new(config.quantum)),
             weight: CacheAligned(AtomicUsize::new(config.weight)),
             deficit: CacheAligned(AtomicUsize::new(0)),
-
-            submitted: CacheAligned(AtomicUsize::new(0)),
-            completed: CacheAligned(AtomicUsize::new(0)),
-            total_runs: CacheAligned(AtomicUsize::new(0)),
-            scheduler_selections: CacheAligned(AtomicUsize::new(0)),
-            last_run_tick: CacheAligned(AtomicUsize::new(0)),
         }
-    }
-
-    #[inline]
-    pub fn is_scheduled(&self) -> bool {
-        self.scheduled_count.0.load(Ordering::Acquire) != 0
     }
 
     #[inline]
@@ -296,10 +251,6 @@ impl ExecutorDomain {
 
     pub fn id(&self) -> ExecutorDomainId {
         self.id
-    }
-
-    pub fn class(&self) -> ExecutorDomainClass {
-        self.class
     }
 
     pub fn state(&self) -> ExecutorDomainState {
@@ -353,10 +304,6 @@ impl ExecutorDomain {
         self.ready_heads
             .iter()
             .any(|head| head.0.load(Ordering::Acquire) & TASK_ID_MASK != 0)
-    }
-
-    pub fn ready_shard_count(&self) -> usize {
-        self.ready_heads.len()
     }
 
     #[inline]
@@ -521,19 +468,6 @@ impl ExecutorDomain {
             });
     }
 
-    pub(crate) fn record_scheduler_selection(&self) {
-        self.scheduler_selections.0.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_run_started(&self, tick: usize) {
-        self.total_runs.0.fetch_add(1, Ordering::Relaxed);
-        self.last_run_tick.0.store(tick, Ordering::Release);
-    }
-
-    pub(crate) fn record_completed(&self) {
-        self.completed.0.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn move_to_draining(&self) {
         let _ = self.state.compare_exchange(
             ExecutorDomainState::Active as u8,
@@ -562,9 +496,6 @@ impl ExecutorDomain {
 
     pub fn stats(&self) -> ExecutorDomainStats {
         ExecutorDomainStats {
-            domain_id: self.id,
-            generation: self.generation,
-            class: self.class,
             state: self.state(),
             queued_count: self.queued_count(),
             active_count: self.active_count(),
@@ -572,16 +503,7 @@ impl ExecutorDomain {
             live_future_count: self.future_arena.live_futures(),
             live_future_bytes: self.future_arena.live_bytes(),
             max_active: self.max_active(),
-            quantum: self.quantum(),
-            weight: self.weight(),
-            ready_shards: self.ready_shard_count(),
-            deficit: self.deficit.0.load(Ordering::Acquire),
-            scheduled: self.is_scheduled(),
-            submitted: self.submitted.0.load(Ordering::Acquire),
-            completed: self.completed.0.load(Ordering::Acquire),
-            total_runs: self.total_runs.0.load(Ordering::Acquire),
-            scheduler_selections: self.scheduler_selections.0.load(Ordering::Acquire),
-            last_run_tick: self.last_run_tick.0.load(Ordering::Acquire),
+            ready_shards: self.ready_heads.len(),
         }
     }
 }
@@ -935,25 +857,5 @@ impl ExecutorDomainTable {
     pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
         let domain = self.borrow_executor_domain(domain_id)?;
         Some(unsafe { DomainSlot::clone_domain_from_ptr(ptr::from_ref(domain).cast_mut()) })
-    }
-
-    pub fn domain_count(&self) -> usize {
-        let limit = self.next_slot.load(Ordering::Acquire);
-        let mut count = 0usize;
-        let mut idx = 0usize;
-
-        while idx < limit {
-            if let Some(slot) = self.get_existing_slot(idx) {
-                let state = slot.state.load(Ordering::Acquire);
-
-                if state == DOMAIN_SLOT_ACTIVE || state == DOMAIN_SLOT_BUILTIN {
-                    count += 1;
-                }
-            }
-
-            idx += 1;
-        }
-
-        count
     }
 }

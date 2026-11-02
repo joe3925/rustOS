@@ -8,7 +8,7 @@ use std::sync::{Condvar, Mutex};
 use std::task::Wake;
 use std::time::Duration;
 
-use crate::global_async::{ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor};
+use crate::global_async::{ExecutorDomainConfig, GlobalAsyncExecutor};
 use crate::runtime::abi_spawn::kernel_spawn_abi_internal;
 use crate::runtime::runtime::{
     block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
@@ -997,15 +997,12 @@ impl Future for RootAbiProbe {
 }
 
 #[test]
-fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
+fn abi_future_polls_inline_with_exact_parent_context() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
     let domain_id =
         GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
-    let before = GlobalAsyncExecutor::global()
-        .executor_domain_stats(domain_id)
-        .unwrap();
     let parent_context = Arc::new(AtomicUsize::new(0));
     let child_context = Arc::new(AtomicUsize::new(0));
     let child_drops = Arc::new(AtomicUsize::new(0));
@@ -1022,20 +1019,19 @@ fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
 
     super::support::wait_until(Duration::from_secs(5), || {
         GlobalAsyncExecutor::global()
-            .executor_domain_stats(domain_id)
-            .is_some_and(|stats| stats.live_task_count == 0)
+            .get_executor_domain(domain_id)
+            .is_some_and(|domain| domain.live_task_count() == 0)
     });
-    let after = GlobalAsyncExecutor::global()
-        .executor_domain_stats(domain_id)
+    let domain = GlobalAsyncExecutor::global()
+        .get_executor_domain(domain_id)
         .unwrap();
     assert_eq!(
         parent_context.load(Ordering::Acquire),
         child_context.load(Ordering::Acquire)
     );
     assert_eq!(child_drops.load(Ordering::Acquire), 1);
-    assert_eq!(after.submitted - before.submitted, 1);
-    assert_eq!(after.live_future_count, 0);
-    assert_eq!(after.live_task_count, 0);
+    assert_eq!(domain.future_arena().live_futures(), 0);
+    assert_eq!(domain.live_task_count(), 0);
 }
 
 #[test]
@@ -1043,18 +1039,16 @@ fn spawn_in_executor_domain_completes_joinhandle() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::KernelHigh,
-        ..ExecutorDomainConfig::default()
-    });
+    let domain_id =
+        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
 
     let value = block_on(async { spawn_in_executor_domain(domain_id, async { 1234usize }).await });
     assert_eq!(value, 1234);
 
     super::support::wait_until(Duration::from_secs(10), || {
         GlobalAsyncExecutor::global()
-            .executor_domain_stats(domain_id)
-            .is_some_and(|stats| stats.completed >= 1)
+            .get_executor_domain(domain_id)
+            .is_some_and(|domain| domain.live_task_count() == 0)
     });
 }
 
@@ -1063,10 +1057,8 @@ fn spawn_detached_in_executor_domain_executes_work() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::KernelBackground,
-        ..ExecutorDomainConfig::default()
-    });
+    let domain_id =
+        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_for_task = counter.clone();
 
@@ -1080,7 +1072,7 @@ fn spawn_detached_in_executor_domain_executes_work() {
 
     super::support::wait_until(Duration::from_secs(10), || {
         GlobalAsyncExecutor::global()
-            .executor_domain_stats(domain_id)
-            .is_some_and(|stats| stats.completed >= 1)
+            .get_executor_domain(domain_id)
+            .is_some_and(|domain| domain.live_task_count() == 0)
     });
 }
