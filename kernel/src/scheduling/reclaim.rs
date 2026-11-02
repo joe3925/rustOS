@@ -22,7 +22,6 @@ impl ReclaimNode {
     }
 }
 
-#[cfg_attr(irq_check, irq::context)]
 pub(super) unsafe fn enqueue(node: NonNull<ReclaimNode>) {
     let mut head = PENDING.load(Ordering::Relaxed);
     loop {

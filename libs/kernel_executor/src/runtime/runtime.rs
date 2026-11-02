@@ -88,6 +88,7 @@ pub(crate) fn drain_retired_block_on_states() {
     if !has_retired_block_on_states() {
         return;
     }
+    core::hint::cold_path();
     let mut retired = RETIRED_BLOCK_ON_STATES.swap(0, Ordering::Acquire);
     while retired != 0 {
         let state = unsafe {

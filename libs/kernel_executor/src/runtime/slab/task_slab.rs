@@ -224,6 +224,7 @@ impl TaskTable {
         if !self.has_retired() {
             return;
         }
+        core::hint::cold_path();
         let mut retired = self.retired_head.swap(0, Ordering::Acquire);
         while retired != 0 {
             let (shard, local, generation) = decode_slab_task_ptr(retired - 1)

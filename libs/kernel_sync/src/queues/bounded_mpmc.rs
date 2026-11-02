@@ -246,37 +246,36 @@ impl<T> MpmcQueue<T> {
     }
 
     pub fn try_push_wait_free(&self, value: T) -> Result<(), BoundedMpmcPushError<T>> {
+        if !self.growable {
+            return unsafe { &*self.first }.ring.try_push_wait_free(value);
+        }
         let tail = self.tail.load(Ordering::Acquire);
         let segment = unsafe { &*tail };
-        if self.growable {
-            let next = segment.next.load(Ordering::Acquire);
-            if !next.is_null() {
-                segment.writers.fetch_or(SEGMENT_CLOSED, Ordering::AcqRel);
-                let _ = self
-                    .tail
-                    .compare_exchange(tail, next, Ordering::AcqRel, Ordering::Acquire);
-                return Err(BoundedMpmcPushError::Contended(value));
-            }
-            let writers = segment.writers.load(Ordering::Acquire);
-            if writers & SEGMENT_CLOSED != 0 || writers == SEGMENT_CLOSED - 1 {
-                return Err(BoundedMpmcPushError::Contended(value));
-            }
-            if segment
-                .writers
-                .compare_exchange(writers, writers + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(BoundedMpmcPushError::Contended(value));
-            }
+        let next = segment.next.load(Ordering::Acquire);
+        if !next.is_null() {
+            segment.writers.fetch_or(SEGMENT_CLOSED, Ordering::AcqRel);
+            let _ = self
+                .tail
+                .compare_exchange(tail, next, Ordering::AcqRel, Ordering::Acquire);
+            return Err(BoundedMpmcPushError::Contended(value));
+        }
+        let writers = segment.writers.load(Ordering::Acquire);
+        if writers & SEGMENT_CLOSED != 0 || writers == SEGMENT_CLOSED - 1 {
+            return Err(BoundedMpmcPushError::Contended(value));
+        }
+        if segment
+            .writers
+            .compare_exchange(writers, writers + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(BoundedMpmcPushError::Contended(value));
         }
         self.len.fetch_add(1, Ordering::AcqRel);
         let result = segment.ring.try_push_wait_free(value);
         if result.is_err() {
             self.len.fetch_sub(1, Ordering::AcqRel);
         }
-        if self.growable {
-            segment.writers.fetch_sub(1, Ordering::Release);
-        }
+        segment.writers.fetch_sub(1, Ordering::Release);
         result
     }
 
@@ -337,6 +336,9 @@ impl<T> MpmcQueue<T> {
     }
 
     pub fn try_pop_wait_free(&self) -> Result<T, BoundedMpmcPopError> {
+        if !self.growable {
+            return unsafe { &*self.first }.ring.try_pop_wait_free();
+        }
         let head = self.head.load(Ordering::Acquire);
         let segment = unsafe { &*head };
         match segment.ring.try_pop_wait_free() {
@@ -379,7 +381,11 @@ impl<T> MpmcQueue<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire)
+        if self.growable {
+            self.len.load(Ordering::Acquire)
+        } else {
+            unsafe { &*self.first }.ring.len()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
