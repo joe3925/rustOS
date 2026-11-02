@@ -619,16 +619,10 @@ impl Scheduler {
             self.handle_switch_out(&mut next, cpu_id, now_cycles, SwitchOutOutcome::Terminated);
             return previous_handle;
         }
-        if let Some(inner) = next.inner.try_read() {
-            inner.mark_scheduled_in(cpu_id, now_cycles);
-        }
 
         let mut previous = local.current.take();
         if let Some(prev) = previous.as_mut() {
             if !TaskHandle::ptr_eq(prev, &core.idle_task) {
-                if let Some(inner) = prev.inner.try_read() {
-                    inner.account_switched_out(now_cycles);
-                }
                 let outcome = match prev.sched_state() {
                     SchedState::Running | SchedState::Runnable => {
                         if prev.set_sched_state(SchedState::Runnable) {

@@ -581,6 +581,20 @@ where
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
         kind: IoKind,
     ) -> Result<usize, Error<IO::Error>> {
+        let fs = self.fs;
+        let mut disk = fs.disk.borrow_mut();
+        self.read_iobuffer_with(&mut *disk, buffer, kind).await
+    }
+
+    pub async fn read_iobuffer_with<'buffer, R>(
+        &mut self,
+        disk: &mut R,
+        buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
+        kind: IoKind,
+    ) -> Result<usize, Error<IO::Error>>
+    where
+        R: ReadWriteSeek<Error = IO::Error> + ReadIoBuffer,
+    {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -595,7 +609,7 @@ where
             let current_cluster_opt = if offset_in_cluster == 0 {
                 match self.current_cluster {
                     None => self.first_cluster,
-                    Some(n) => match self.fs.cluster_iter(n).next().await {
+                    Some(n) => match self.fs.cluster_iter_with(&mut *disk, n).next().await {
                         Some(Err(err)) => return Err(err),
                         Some(Ok(n)) => Some(n),
                         None => None,
@@ -619,7 +633,7 @@ where
             let mut read_size = max_read_size.min((cluster_size - offset_in_cluster) as usize);
             let mut last_cluster = current_cluster;
             while read_size < max_read_size {
-                let next_cluster = match self.fs.cluster_iter(last_cluster).next().await {
+                let next_cluster = match self.fs.cluster_iter_with(&mut *disk, last_cluster).next().await {
                     Some(Err(err)) => return Err(err),
                     Some(Ok(n)) => n,
                     None => break,
@@ -641,7 +655,6 @@ where
 
             let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
             let read_bytes = {
-                let mut disk = self.fs.disk.borrow_mut();
                 disk.seek(SeekFrom::Start(offset_in_fs))?;
                 disk.read_iobuffer(piece, kind).await?
             };
@@ -771,6 +784,16 @@ where
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> File<'_, IO, TP, OCC> {
     pub async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Error<IO::Error>> {
+        let fs = self.fs;
+        let mut disk = fs.disk.borrow_mut();
+        self.seek_with(&mut *disk, pos).await
+    }
+
+    pub async fn seek_with<R: ReadWriteSeek<Error = IO::Error>>(
+        &mut self,
+        disk: &mut R,
+        pos: SeekFrom,
+    ) -> Result<u64, Error<IO::Error>> {
         trace!("File::seek");
         let size_opt = self.size();
         let new_offset_opt: Option<u32> = match pos {
@@ -810,7 +833,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> File<'_, IO, TP, 
             debug_assert!(new_offset_in_clusters > 0);
             let clusters_to_skip = new_offset_in_clusters - 1;
             let mut cluster = first_cluster;
-            let mut iter = self.fs.cluster_iter(first_cluster);
+            let mut iter = self.fs.cluster_iter_with(disk, first_cluster);
             for i in 0..clusters_to_skip {
                 cluster = if let Some(r) = iter.next().await {
                     r?

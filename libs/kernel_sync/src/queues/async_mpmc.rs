@@ -8,10 +8,14 @@ use futures_core::task::__internal::AtomicWaker;
 #[cfg(any(loom, feature = "loom"))]
 use loom::{future::AtomicWaker, sync::Arc};
 
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicUsize, Ordering};
 
 const CLOSED: usize = 1usize << (usize::BITS - 1);
 const PRODUCER_MASK: usize = !CLOSED;
+const IDLE: usize = 0;
+const WAITING: usize = 1;
+const NOTIFIED: usize = 2;
+const FINISHED: usize = 3;
 
 #[inline]
 fn wait_for_producer() {
@@ -29,7 +33,7 @@ pub enum AsyncRecvError {
 
 struct Waiter {
     waker: AtomicWaker,
-    armed: AtomicBool,
+    state: AtomicUsize,
 }
 
 impl Waiter {
@@ -44,46 +48,49 @@ impl Waiter {
     }
 }
 
-/// A reusable registration owned by one receive future.
-///
-/// Keeping the registration separate from the queue prevents repeated polls
-/// from allocating duplicate waiter entries. A queued registration may outlive
-/// a cancelled future until the next notification, but its `Arc` keeps that
-/// storage valid and its disarmed state prevents a stale wake.
+struct ReceiverWaiters {
+    queue: SegQueue<Arc<Waiter>>,
+}
+
+impl ReceiverWaiters {
+    fn notify(&self, all: bool) {
+        while let Some(waiter) = self.queue.pop() {
+            if waiter
+                .state
+                .compare_exchange(WAITING, NOTIFIED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                waiter.waker.wake();
+                if !all {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub struct WaitRegistration {
     inner: Arc<Waiter>,
+    waiters: Arc<ReceiverWaiters>,
 }
 
 impl WaitRegistration {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Waiter {
-                waker: AtomicWaker::new(),
-                armed: AtomicBool::new(false),
-            }),
-        }
-    }
-
-    pub fn disarm(&self) {
-        self.inner.armed.store(false, Ordering::Release);
-    }
-}
-
-impl Default for WaitRegistration {
-    fn default() -> Self {
-        Self::new()
+    fn finish(&mut self) {
+        self.inner.state.store(FINISHED, Ordering::Release);
     }
 }
 
 impl Drop for WaitRegistration {
     fn drop(&mut self) {
-        self.disarm();
+        if self.inner.state.swap(FINISHED, Ordering::AcqRel) == NOTIFIED {
+            self.waiters.notify(false);
+        }
     }
 }
 
 pub struct AsyncMpmcQueue<T> {
     queue: SegQueue<T>,
-    waiters: SegQueue<Arc<Waiter>>,
+    waiters: Arc<ReceiverWaiters>,
     state: AtomicUsize,
 }
 
@@ -91,8 +98,20 @@ impl<T> AsyncMpmcQueue<T> {
     pub fn new() -> Self {
         Self {
             queue: SegQueue::new(),
-            waiters: SegQueue::new(),
+            waiters: Arc::new(ReceiverWaiters {
+                queue: SegQueue::new(),
+            }),
             state: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn registration(&self) -> WaitRegistration {
+        WaitRegistration {
+            inner: Arc::new(Waiter {
+                waker: AtomicWaker::new(),
+                state: AtomicUsize::new(IDLE),
+            }),
+            waiters: self.waiters.clone(),
         }
     }
 
@@ -125,7 +144,7 @@ impl<T> AsyncMpmcQueue<T> {
 
         self.queue.push(value);
         self.state.fetch_sub(1, Ordering::Release);
-        self.wake_waiters();
+        self.waiters.notify(false);
         Ok(())
     }
 
@@ -142,43 +161,42 @@ impl<T> AsyncMpmcQueue<T> {
 
     pub fn poll_pop(
         &self,
-        registration: &WaitRegistration,
+        registration: &mut WaitRegistration,
         cx: &mut Context<'_>,
     ) -> Poll<Result<T, AsyncRecvError>> {
+        assert!(Arc::ptr_eq(&self.waiters, &registration.waiters));
+        assert_ne!(registration.inner.state.load(Ordering::Acquire), FINISHED);
         if let Ok(value) = self.try_pop() {
-            registration.disarm();
+            registration.finish();
             return Poll::Ready(Ok(value));
         }
         if self.is_closed() {
-            registration.disarm();
+            registration.finish();
             return Poll::Ready(Err(AsyncRecvError::Closed));
         }
 
         registration.inner.register(cx.waker());
-        if !registration.inner.armed.swap(true, Ordering::AcqRel) {
-            self.waiters.push(registration.inner.clone());
+        match registration.inner.state.load(Ordering::Acquire) {
+            IDLE | NOTIFIED => {
+                registration.inner.state.store(WAITING, Ordering::Release);
+                self.waiters.queue.push(registration.inner.clone());
+            }
+            WAITING => {}
+            _ => unreachable!(),
         }
 
         // Registration must precede this second observation. An enqueue racing
         // before registration is found here; one racing after it wakes us.
         match self.try_pop() {
             Ok(value) => {
-                registration.disarm();
+                registration.finish();
                 Poll::Ready(Ok(value))
             }
             Err(AsyncRecvError::Closed) => {
-                registration.disarm();
+                registration.finish();
                 Poll::Ready(Err(AsyncRecvError::Closed))
             }
             Err(AsyncRecvError::Empty) => Poll::Pending,
-        }
-    }
-
-    fn wake_waiters(&self) {
-        while let Some(waiter) = self.waiters.pop() {
-            if waiter.armed.swap(false, Ordering::AcqRel) {
-                waiter.waker.wake();
-            }
         }
     }
 
@@ -188,7 +206,7 @@ impl<T> AsyncMpmcQueue<T> {
             wait_for_producer();
         }
         while self.queue.pop().is_some() {}
-        self.wake_waiters();
+        self.waiters.notify(true);
     }
 
     pub fn is_closed(&self) -> bool {
@@ -213,13 +231,13 @@ impl<T> Default for AsyncMpmcQueue<T> {
 impl<T> Drop for AsyncMpmcQueue<T> {
     fn drop(&mut self) {
         while self.queue.pop().is_some() {}
-        while self.waiters.pop().is_some() {}
+        while self.waiters.queue.pop().is_some() {}
     }
 }
 
 #[cfg(all(test, feature = "std", not(any(loom, feature = "loom"))))]
 mod tests {
-    use super::{AsyncMpmcQueue, AsyncRecvError, WaitRegistration};
+    use super::{AsyncMpmcQueue, AsyncRecvError};
     use alloc::sync::Arc;
     use alloc::task::Wake;
     use core::task::{Context, Waker};
@@ -251,37 +269,41 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_wakes_every_armed_receiver() {
+    fn enqueue_wakes_one_armed_receiver() {
         let queue = AsyncMpmcQueue::<usize>::new();
-        let first = WaitRegistration::new();
-        let second = WaitRegistration::new();
+        let mut first = queue.registration();
+        let mut second = queue.registration();
         let first_count = Arc::new(Counter(AtomicUsize::new(0)));
         let second_count = Arc::new(Counter(AtomicUsize::new(0)));
         let first_waker = Waker::from(first_count.clone());
         let second_waker = Waker::from(second_count.clone());
 
-        assert!(queue
-            .poll_pop(&first, &mut Context::from_waker(&first_waker))
-            .is_pending());
-        assert!(queue
-            .poll_pop(&second, &mut Context::from_waker(&second_waker))
-            .is_pending());
+        assert!(
+            queue
+                .poll_pop(&mut first, &mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            queue
+                .poll_pop(&mut second, &mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
         queue.push(7).unwrap();
 
         assert_eq!(first_count.0.load(Ordering::Relaxed), 1);
-        assert_eq!(second_count.0.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.0.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn repeated_poll_does_not_duplicate_registration() {
         let queue = AsyncMpmcQueue::<usize>::new();
-        let registration = WaitRegistration::new();
+        let mut registration = queue.registration();
         let count = Arc::new(Counter(AtomicUsize::new(0)));
         let waker = Waker::from(count.clone());
         let mut cx = Context::from_waker(&waker);
 
-        assert!(queue.poll_pop(&registration, &mut cx).is_pending());
-        assert!(queue.poll_pop(&registration, &mut cx).is_pending());
+        assert!(queue.poll_pop(&mut registration, &mut cx).is_pending());
+        assert!(queue.poll_pop(&mut registration, &mut cx).is_pending());
         queue.push(1).unwrap();
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
     }

@@ -501,11 +501,6 @@ pub struct Task {
     pub executer_id: Option<u64>,
 
     // Accounting (can be accessed via inner lock or made atomic if needed)
-    sched_in_cycles: AtomicU64,
-    last_quantum_cycles: AtomicU64,
-    total_run_cycles: AtomicU64,
-    quantum_count: AtomicU64,
-    last_cpu: AtomicUsize,
 }
 
 impl Task {
@@ -550,11 +545,6 @@ impl Task {
             kernel_tls: None,
             parent_pid,
             executer_id: None,
-            sched_in_cycles: AtomicU64::new(0),
-            last_quantum_cycles: AtomicU64::new(0),
-            total_run_cycles: AtomicU64::new(0),
-            quantum_count: AtomicU64::new(0),
-            last_cpu: AtomicUsize::new(usize::MAX),
         };
 
         let active_domain_id = sched_binding.domain_id();
@@ -625,11 +615,6 @@ impl Task {
             kernel_tls,
             parent_pid,
             executer_id: None,
-            sched_in_cycles: AtomicU64::new(0),
-            last_quantum_cycles: AtomicU64::new(0),
-            total_run_cycles: AtomicU64::new(0),
-            quantum_count: AtomicU64::new(0),
-            last_cpu: AtomicUsize::new(usize::MAX),
         };
 
         let active_domain_id = sched_binding.domain_id();
@@ -661,29 +646,6 @@ impl Task {
     /// current scheduling operation.
     pub unsafe fn update_from_context(&mut self, context: *mut State) {
         self.context = unsafe { *context };
-    }
-
-    #[inline(always)]
-    pub fn mark_scheduled_in(&self, cpu_id: usize, now_cycles: u64) {
-        self.last_cpu.store(cpu_id, Ordering::Relaxed);
-        self.sched_in_cycles.store(now_cycles, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn account_switched_out(&self, now_cycles: u64) {
-        let start = self.sched_in_cycles.swap(0, Ordering::Relaxed);
-        if start == 0 || now_cycles <= start {
-            return;
-        }
-        let delta = now_cycles - start;
-        self.last_quantum_cycles.store(delta, Ordering::Relaxed);
-        self.total_run_cycles.fetch_add(delta, Ordering::Relaxed);
-        self.quantum_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn last_cpu(&self) -> usize {
-        self.last_cpu.load(Ordering::Relaxed)
     }
 
     #[inline(always)]

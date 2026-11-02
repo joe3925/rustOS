@@ -57,7 +57,7 @@ fn obj_as_queue(obj: &ObjectRef) -> Option<QueueHandle> {
 }
 
 pub struct MessageQueue {
-    queue: AsyncMpmcQueue<Message>,
+    pub(crate) queue: AsyncMpmcQueue<Message>,
 }
 
 impl core::fmt::Debug for MessageQueue {
@@ -86,7 +86,7 @@ impl MessageQueue {
 
     pub fn poll_message(
         &self,
-        registration: &WaitRegistration,
+        registration: &mut WaitRegistration,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Message, AsyncRecvError>> {
         self.queue.poll_pop(registration, cx)

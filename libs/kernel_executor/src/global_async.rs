@@ -139,6 +139,7 @@ impl GlobalAsyncExecutor {
             self.try_schedule::<false>();
         } else if crate::runtime::slab::task_slab::get_task_table().has_retired()
             || has_retired_block_on_states()
+            || self.runtime().domains.has_retired()
         {
             self.try_schedule::<true>();
         }
@@ -197,7 +198,7 @@ impl GlobalAsyncExecutor {
             }
         }
         let domain = self.runtime().domains.borrow_executor_domain(domain_id)?;
-        Some(f(domain))
+        Some(f(&domain))
     }
 
     pub(crate) fn publish_claimed_task(&self, task_id: usize) {
@@ -222,8 +223,7 @@ impl GlobalAsyncExecutor {
             return;
         }
         let task = with_executor_local(|tls| {
-            unsafe { tls.worker.get().as_ref() }
-                .map_or(0, WorkerShared::take_task)
+            unsafe { tls.worker.get().as_ref() }.map_or(0, WorkerShared::take_task)
         });
         self.publish_claimed_task(task);
     }
@@ -351,7 +351,7 @@ impl GlobalAsyncExecutor {
                 }
             };
 
-            let Some(domain) = runtime.domains.get_executor_domain(domain_id) else {
+            let Some(domain) = runtime.domains.borrow_executor_domain(domain_id) else {
                 continue;
             };
 
@@ -378,17 +378,23 @@ impl GlobalAsyncExecutor {
             domain.maybe_finish_draining();
 
             self.after_domain_batch(runtime, domain_id, &domain, ran);
+            drop(domain);
+            runtime.domains.drain_retired();
         }
 
         task_table.drain_retired();
         drain_retired_block_on_states();
         drop(worker_guard);
+        self.runtime().domains.drain_retired();
         self.exit_pump();
         fence(Ordering::SeqCst);
 
         if self.runnable_executor_domain_count() != 0 {
             self.try_schedule::<false>();
-        } else if task_table.has_retired() || has_retired_block_on_states() {
+        } else if task_table.has_retired()
+            || has_retired_block_on_states()
+            || self.runtime().domains.has_retired()
+        {
             self.try_schedule::<true>();
         }
     }
@@ -419,8 +425,7 @@ impl GlobalAsyncExecutor {
         while ran < budget {
             let local_task = if local_runs < 3 {
                 with_executor_local(|tls| {
-                    unsafe { tls.worker.get().as_ref() }
-                        .map_or(0, WorkerShared::take_task)
+                    unsafe { tls.worker.get().as_ref() }.map_or(0, WorkerShared::take_task)
                 })
             } else {
                 0
@@ -434,8 +439,7 @@ impl GlobalAsyncExecutor {
                     Some(task_id) => task_id,
                     None => {
                         let task = with_executor_local(|tls| {
-                            unsafe { tls.worker.get().as_ref() }
-                                .map_or(0, WorkerShared::take_task)
+                            unsafe { tls.worker.get().as_ref() }.map_or(0, WorkerShared::take_task)
                         });
                         if task == 0 {
                             break;

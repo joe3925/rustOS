@@ -1,7 +1,7 @@
 use crate::future_arena::{FutureArena, FutureArenaConfig};
 use crate::global_async::CacheAligned;
 use crate::sync::Arc;
-use crate::sync::atomic::{AtomicU8, AtomicU128, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicU128, AtomicUsize, Ordering};
 use alloc::boxed::Box;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
@@ -16,6 +16,13 @@ const DOMAIN_SLOT_EMPTY: usize = 0;
 const DOMAIN_SLOT_RESERVED: usize = 1;
 const DOMAIN_SLOT_ACTIVE: usize = 2;
 const DOMAIN_SLOT_BUILTIN: usize = 3;
+const DOMAIN_SLOT_RETIRED: usize = 4;
+const DOMAIN_SLOT_REAPING: usize = 5;
+const DOMAIN_READER_CLOSED: usize = 1usize << (usize::BITS - 1);
+const DOMAIN_READER_CHECKING: usize = 1usize << (usize::BITS - 2);
+const DOMAIN_READER_TOUCHED: usize = 1usize << (usize::BITS - 3);
+const DOMAIN_READER_COUNT: usize =
+    !(DOMAIN_READER_CLOSED | DOMAIN_READER_CHECKING | DOMAIN_READER_TOUCHED);
 
 const DOMAIN_CHUNK_BITS: usize = 6;
 const DOMAIN_CHUNK_SIZE: usize = 1 << DOMAIN_CHUNK_BITS;
@@ -199,6 +206,7 @@ pub struct ExecutorDomain {
     ready_heads: Box<[ReadyHead]>,
     ready_cursor: CacheAligned,
     future_arena: FutureArena,
+    reclamation: Arc<DomainReclamation>,
     live_task_count: CacheAligned,
 
     state: AtomicU8,
@@ -214,7 +222,11 @@ pub struct ExecutorDomain {
 }
 
 impl ExecutorDomain {
-    fn new(id: ExecutorDomainId, config: ExecutorDomainConfig) -> Self {
+    fn new(
+        id: ExecutorDomainId,
+        config: ExecutorDomainConfig,
+        reclamation: Arc<DomainReclamation>,
+    ) -> Self {
         let config = config.normalized();
 
         Self {
@@ -225,6 +237,7 @@ impl ExecutorDomain {
                 .into_boxed_slice(),
             ready_cursor: CacheAligned(AtomicUsize::new(0)),
             future_arena: FutureArena::new(id, config.future_arena),
+            reclamation,
             live_task_count: CacheAligned(AtomicUsize::new(0)),
 
             state: AtomicU8::new(ExecutorDomainState::Active as u8),
@@ -283,7 +296,7 @@ impl ExecutorDomain {
         self.active_count.0.load(Ordering::Acquire)
     }
 
-    pub fn future_arena(&self) -> &FutureArena {
+    pub(crate) fn future_arena(&self) -> &FutureArena {
         &self.future_arena
     }
 
@@ -315,7 +328,8 @@ impl ExecutorDomain {
         if self.state() == ExecutorDomainState::Dead || task_id == 0 {
             return false;
         }
-        let Some((shard, local, generation)) = crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
+        let Some((shard, local, generation)) =
+            crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
         else {
             return false;
         };
@@ -374,7 +388,8 @@ impl ExecutorDomain {
             if task_id == 0 {
                 return None;
             }
-            let (shard, local, generation) = crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)?;
+            let (shard, local, generation) =
+                crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)?;
             let slot = slab.get_slot(shard, local, generation)?;
             let next_id = slot.ready_next.load(Ordering::Acquire);
             let tag = ((head >> READY_TAG_SHIFT) as u64).wrapping_add(1);
@@ -490,7 +505,7 @@ impl ExecutorDomain {
             && self.live_task_count() == 0
             && self.future_arena.live_futures() == 0
         {
-            self.move_to_dead();
+            self.reclamation.request(self.id.slot() as usize);
         }
     }
 
@@ -508,8 +523,57 @@ impl ExecutorDomain {
     }
 }
 
+struct DomainReclamation {
+    pending: AtomicBool,
+    candidates: [AtomicUsize; MAX_DOMAIN_SLOTS.div_ceil(usize::BITS as usize)],
+}
+
+impl DomainReclamation {
+    fn request(&self, index: usize) {
+        self.candidates[index / usize::BITS as usize]
+            .fetch_or(1usize << (index % usize::BITS as usize), Ordering::Release);
+        self.pending.store(true, Ordering::Release);
+        crate::global_async::GlobalAsyncExecutor::global().try_schedule::<true>();
+    }
+}
+
+pub(crate) struct DomainBorrow<'a> {
+    domain: *const ExecutorDomain,
+    slot: &'a DomainSlot,
+    reclamation: &'a DomainReclamation,
+    pinned: bool,
+    notify: bool,
+}
+
+impl core::ops::Deref for DomainBorrow<'_> {
+    type Target = ExecutorDomain;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.domain }
+    }
+}
+
+impl Drop for DomainBorrow<'_> {
+    fn drop(&mut self) {
+        if self.pinned {
+            let index = self.id.slot() as usize;
+            let draining = self.notify && self.state() != ExecutorDomainState::Active;
+            if self.slot.readers.fetch_sub(1, Ordering::SeqCst) & DOMAIN_READER_COUNT == 1
+                && (draining
+                    || matches!(
+                        self.slot.state.load(Ordering::SeqCst),
+                        DOMAIN_SLOT_RETIRED | DOMAIN_SLOT_REAPING
+                    ))
+            {
+                self.reclamation.request(index);
+            }
+        }
+    }
+}
+
 struct DomainSlot {
     state: AtomicUsize,
+    readers: AtomicUsize,
     generation: AtomicUsize,
     domain: AtomicPtr<ExecutorDomain>,
 }
@@ -518,6 +582,7 @@ impl DomainSlot {
     fn new() -> Self {
         Self {
             state: AtomicUsize::new(DOMAIN_SLOT_EMPTY),
+            readers: AtomicUsize::new(0),
             generation: AtomicUsize::new(BUILTIN_GENERATION as usize),
             domain: AtomicPtr::new(ptr::null_mut()),
         }
@@ -534,10 +599,12 @@ impl DomainSlot {
     }
 
     #[inline]
-    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> { unsafe {
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    }}
+    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> {
+        unsafe {
+            Arc::increment_strong_count(ptr);
+            Arc::from_raw(ptr)
+        }
+    }
 }
 
 struct DomainChunk {
@@ -553,6 +620,7 @@ impl DomainChunk {
 }
 
 pub struct ExecutorDomainTable {
+    reclamation: Arc<DomainReclamation>,
     next_slot: AtomicUsize,
     chunks: [AtomicPtr<DomainChunk>; MAX_DOMAIN_CHUNKS],
 }
@@ -560,6 +628,10 @@ pub struct ExecutorDomainTable {
 impl ExecutorDomainTable {
     pub(crate) fn new(cpu_count: usize) -> Self {
         let table = Self {
+            reclamation: Arc::new(DomainReclamation {
+                pending: AtomicBool::new(false),
+                candidates: core::array::from_fn(|_| AtomicUsize::new(0)),
+            }),
             next_slot: AtomicUsize::new(0),
             chunks: core::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
         };
@@ -670,7 +742,7 @@ impl ExecutorDomainTable {
         slot.generation
             .store(BUILTIN_GENERATION as usize, Ordering::Release);
 
-        let domain = Arc::new(ExecutorDomain::new(id, config));
+        let domain = Arc::new(ExecutorDomain::new(id, config, self.reclamation.clone()));
         let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
 
         slot.domain.store(raw, Ordering::Release);
@@ -749,7 +821,7 @@ impl ExecutorDomainTable {
         let generation = slot.generation.load(Ordering::Acquire).max(1) as u32;
         let id = ExecutorDomainId::from_parts(idx as u32, generation);
 
-        let domain = Arc::new(ExecutorDomain::new(id, config));
+        let domain = Arc::new(ExecutorDomain::new(id, config, self.reclamation.clone()));
         let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
 
         slot.domain.store(raw, Ordering::Release);
@@ -765,97 +837,183 @@ impl ExecutorDomainTable {
         let slot = self
             .get_existing_slot(domain_id.slot() as usize)
             .ok_or(DestroyExecutorDomainError::InvalidDomain)?;
-
-        let slot_state = slot.state.load(Ordering::Acquire);
-
-        if slot_state == DOMAIN_SLOT_BUILTIN {
+        if slot.state.load(Ordering::SeqCst) == DOMAIN_SLOT_BUILTIN {
             return Err(DestroyExecutorDomainError::BuiltinDomain);
         }
-
-        if slot_state != DOMAIN_SLOT_ACTIVE {
-            return Err(DestroyExecutorDomainError::InvalidDomain);
-        }
-
         if slot.generation() != domain_id.generation() {
             return Err(DestroyExecutorDomainError::StaleDomain);
         }
-
-        let Some(domain) = self.get_executor_domain(domain_id) else {
-            return Err(DestroyExecutorDomainError::InvalidDomain);
-        };
-
-        if domain.queued_count() == 0
-            && domain.active_count() == 0
-            && domain.live_task_count() == 0
-            && domain.future_arena().live_futures() == 0
-        {
-            domain.move_to_dead();
-
-            if slot
-                .state
-                .compare_exchange(
-                    DOMAIN_SLOT_ACTIVE,
-                    DOMAIN_SLOT_RESERVED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                return Err(DestroyExecutorDomainError::InvalidDomain);
-            }
-
-            slot.domain.store(ptr::null_mut(), Ordering::Release);
-
-            let next_generation = domain_id.generation().wrapping_add(1).max(1);
-            slot.generation
-                .store(next_generation as usize, Ordering::Release);
-            slot.state.store(DOMAIN_SLOT_EMPTY, Ordering::Release);
-
-            return Ok(DestroyExecutorDomainResult::Destroyed);
-        }
-
+        let domain = self
+            .borrow_executor_domain(domain_id)
+            .ok_or(DestroyExecutorDomainError::InvalidDomain)?;
         domain.move_to_draining();
-        Ok(DestroyExecutorDomainResult::Draining)
+        self.reclamation.request(domain_id.slot() as usize);
+        drop(domain);
+        if !crate::platform::in_interrupt_context() {
+            self.drain_retired();
+        }
+        if slot.generation() != domain_id.generation()
+            || matches!(
+                slot.state.load(Ordering::SeqCst),
+                DOMAIN_SLOT_RETIRED | DOMAIN_SLOT_REAPING | DOMAIN_SLOT_EMPTY
+            )
+        {
+            Ok(DestroyExecutorDomainResult::Destroyed)
+        } else {
+            Ok(DestroyExecutorDomainResult::Draining)
+        }
     }
 
-    pub(crate) fn borrow_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<&ExecutorDomain> {
+    pub(crate) fn borrow_executor_domain(
+        &self,
+        domain_id: ExecutorDomainId,
+    ) -> Option<DomainBorrow<'_>> {
         if !domain_id.is_valid() {
             return None;
         }
-
         let slot = self.get_existing_slot(domain_id.slot() as usize)?;
-
-        let state = slot.state.load(Ordering::Acquire);
+        let state = slot.state.load(Ordering::SeqCst);
         if state != DOMAIN_SLOT_ACTIVE && state != DOMAIN_SLOT_BUILTIN {
             return None;
         }
-
-        let generation = slot.generation.load(Ordering::Acquire) as u32;
-        if generation != domain_id.generation() {
-            return None;
+        let pinned = state != DOMAIN_SLOT_BUILTIN;
+        if pinned {
+            let previous = slot.readers.fetch_add(1, Ordering::SeqCst);
+            assert!(previous & DOMAIN_READER_COUNT < DOMAIN_READER_COUNT);
+            if previous & DOMAIN_READER_CLOSED != 0 {
+                if slot.readers.fetch_sub(1, Ordering::SeqCst) & DOMAIN_READER_COUNT == 1 {
+                    self.reclamation.request(domain_id.slot() as usize);
+                }
+                return None;
+            }
+            if previous & DOMAIN_READER_CHECKING != 0 {
+                let mut readers = slot.readers.load(Ordering::SeqCst);
+                while readers & DOMAIN_READER_CHECKING != 0 && readers & DOMAIN_READER_TOUCHED == 0
+                {
+                    match slot.readers.compare_exchange_weak(
+                        readers,
+                        readers | DOMAIN_READER_TOUCHED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => readers = actual,
+                    }
+                }
+            }
         }
-
-        let ptr = slot.load_domain_ptr();
-        if ptr.is_null() {
-            return None;
-        }
-
-        let state_after = slot.state.load(Ordering::Acquire);
-        let generation_after = slot.generation.load(Ordering::Acquire) as u32;
-        let ptr_after = slot.load_domain_ptr();
-
-        if ptr_after != ptr
-            || generation_after != domain_id.generation()
-            || (state_after != DOMAIN_SLOT_ACTIVE && state_after != DOMAIN_SLOT_BUILTIN)
+        if slot.state.load(Ordering::SeqCst) != state || slot.generation() != domain_id.generation()
         {
+            if pinned && slot.readers.fetch_sub(1, Ordering::SeqCst) & DOMAIN_READER_COUNT == 1 {
+                self.reclamation.request(domain_id.slot() as usize);
+            }
             return None;
         }
-
-        Some(unsafe { &*ptr })
+        let raw = slot.load_domain_ptr();
+        assert!(!raw.is_null());
+        Some(DomainBorrow {
+            domain: raw,
+            slot,
+            reclamation: &self.reclamation,
+            pinned,
+            notify: true,
+        })
     }
 
     pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
         let domain = self.borrow_executor_domain(domain_id)?;
-        Some(unsafe { DomainSlot::clone_domain_from_ptr(ptr::from_ref(domain).cast_mut()) })
+        Some(unsafe { DomainSlot::clone_domain_from_ptr(ptr::from_ref(&*domain).cast_mut()) })
+    }
+
+    pub(crate) fn has_retired(&self) -> bool {
+        self.reclamation.pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn drain_retired(&self) {
+        if !self.reclamation.pending.load(Ordering::Acquire)
+            || !self.reclamation.pending.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        for (word_index, word) in self.reclamation.candidates.iter().enumerate() {
+            let mut candidates = word.swap(0, Ordering::AcqRel);
+            while candidates != 0 {
+                let bit = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                let index = word_index * usize::BITS as usize + bit;
+                let Some(slot) = self.get_existing_slot(index) else {
+                    continue;
+                };
+                if slot.state.load(Ordering::SeqCst) == DOMAIN_SLOT_ACTIVE {
+                    let id = ExecutorDomainId::from_parts(index as u32, slot.generation());
+                    if let Some(mut domain) = self.borrow_executor_domain(id) {
+                        domain.notify = false;
+                        if domain.state() == ExecutorDomainState::Draining
+                            && slot
+                                .readers
+                                .compare_exchange(
+                                    1,
+                                    DOMAIN_READER_CHECKING | 1,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                        {
+                            let empty = domain.queued_count() == 0
+                                && domain.active_count() == 0
+                                && domain.live_task_count() == 0
+                                && domain.future_arena.live_futures() == 0;
+                            if empty
+                                && slot
+                                    .readers
+                                    .compare_exchange(
+                                        DOMAIN_READER_CHECKING | 1,
+                                        DOMAIN_READER_CLOSED | 1,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                            {
+                                domain.move_to_dead();
+                                slot.state.store(DOMAIN_SLOT_RETIRED, Ordering::SeqCst);
+                            } else {
+                                let previous = slot
+                                    .readers
+                                    .fetch_and(DOMAIN_READER_COUNT, Ordering::SeqCst);
+                                if empty && previous & DOMAIN_READER_TOUCHED != 0 {
+                                    self.reclamation.request(index);
+                                }
+                            }
+                        }
+                    }
+                }
+                if slot
+                    .state
+                    .compare_exchange(
+                        DOMAIN_SLOT_RETIRED,
+                        DOMAIN_SLOT_REAPING,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                if slot.readers.load(Ordering::SeqCst) & DOMAIN_READER_COUNT != 0 {
+                    slot.state.store(DOMAIN_SLOT_RETIRED, Ordering::SeqCst);
+                    if slot.readers.load(Ordering::SeqCst) & DOMAIN_READER_COUNT == 0 {
+                        self.reclamation.request(index);
+                    }
+                    continue;
+                }
+                let raw = slot.domain.swap(ptr::null_mut(), Ordering::AcqRel);
+                let generation = slot.generation().wrapping_add(1).max(1);
+                slot.generation
+                    .store(generation as usize, Ordering::Release);
+                unsafe { drop(Arc::from_raw(raw)) };
+                slot.readers.store(0, Ordering::SeqCst);
+                slot.state.store(DOMAIN_SLOT_EMPTY, Ordering::SeqCst);
+            }
+        }
     }
 }

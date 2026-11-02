@@ -108,20 +108,9 @@ fn drain_inbound_to_runqueue(access: &RunQueueAccess<'_>, cpu: &FifoCpuState) {
 fn pop_queued_task(
     access: &RunQueueAccess<'_>,
     cpu: &FifoCpuState,
-    youngest: bool,
 ) -> Option<TaskUpdate> {
     assert_eq!(access.cpu_id(), cpu.cpu_id);
     let queued = cpu.run_queue.len();
-    if youngest {
-        for _ in 1..queued {
-            let Ok(task) = cpu.run_queue.try_pop_wait_free() else {
-                return None;
-            };
-            if cpu.run_queue.try_push(task).is_err() {
-                panic!("run queue rotation overflow");
-            }
-        }
-    }
     for allow_low in [false, true] {
         for _ in 0..queued {
             let Ok(task) = cpu.run_queue.try_pop_wait_free() else {
@@ -215,7 +204,7 @@ impl SchedulerClass for FifoClass {
         _now_cycles: u64,
     ) -> Option<TaskUpdate> {
         drain_inbound_to_runqueue(access, cpu);
-        pop_queued_task(access, cpu, false)
+        pop_queued_task(access, cpu)
     }
 
     fn on_switch_out(
@@ -251,7 +240,7 @@ impl SchedulerClass for FifoClass {
         let access = scheduler().try_core_scheduler(src_cpu_id)?;
         drain_inbound_to_runqueue(&access, src_cpu);
         for _ in 0..src_cpu.run_queue.len() {
-            let task = pop_queued_task(&access, src_cpu, true)?;
+            let task = pop_queued_task(&access, src_cpu)?;
             match task.sched_state() {
                 SchedState::Runnable => return Some(task),
                 SchedState::Terminated => scheduler().unregister_task_from_domain(&task),

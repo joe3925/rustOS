@@ -20,7 +20,7 @@ use kernel_api::{
 };
 use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 use spin::Mutex;
-use kernel_sync::locks::AsyncMutex;
+use kernel_sync::locks::AsyncRwLock;
 
 use crate::{
     block_dev::{BlockDev, flush},
@@ -214,9 +214,11 @@ async fn fat32_start(
     };
 
     let mounted = MountedFat32 {
-        fs: Arc::new(AsyncMutex::new(filesystem)),
+        fs: Arc::new(AsyncRwLock::new(filesystem)),
         handles: Mutex::new(FileHandleTable::with_capacity(FILE_HANDLE_CAPACITY)),
         volume_target,
+        sector_size,
+        total_sectors: sectors,
         should_flush,
         pending_flush_owner: Arc::new(AtomicU64::new(0)),
         pending_flush_block: Arc::new(AtomicBool::new(false)),

@@ -388,9 +388,9 @@ impl KernelIoOp {
             Self::ChangeDirectory { owner, path, .. } => run_change_directory(owner, path).await,
             Self::MqReceive { queue, buffer, .. } => {
                 MqReceiveFuture {
+                    registration: queue.queue.registration(),
                     queue,
                     buffer: Some(buffer),
-                    registration: kernel_sync::queues::async_mpmc::WaitRegistration::new(),
                 }
                 .await
             }

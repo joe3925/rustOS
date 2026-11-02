@@ -480,6 +480,14 @@ impl<IO: Read + Write + Seek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<
         ClusterIterator::new(disk_slice, self.fat_type, cluster)
     }
 
+    pub(crate) fn cluster_iter_with<'b, R: ReadWriteSeek<Error = IO::Error>>(
+        &'b self,
+        disk: &'b mut R,
+        cluster: u32,
+    ) -> ClusterIterator<impl ReadWriteSeek<Error = Error<IO::Error>> + 'b, IO::Error> {
+        ClusterIterator::new(fat_slice::<R, &mut R>(disk, &self.bpb), self.fat_type, cluster)
+    }
+
     pub(crate) async fn truncate_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
         let mut iter = self.cluster_iter(cluster);
         let num_free = iter.truncate().await?;

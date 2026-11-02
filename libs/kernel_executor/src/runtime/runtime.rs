@@ -92,7 +92,9 @@ pub(crate) fn drain_retired_block_on_states() {
     let mut retired = RETIRED_BLOCK_ON_STATES.swap(0, Ordering::Acquire);
     while retired != 0 {
         let state = unsafe {
-            Box::from_raw(core::ptr::with_exposed_provenance_mut::<BlockOnWakeState>(retired))
+            Box::from_raw(core::ptr::with_exposed_provenance_mut::<BlockOnWakeState>(
+                retired,
+            ))
         };
         retired = state.retired_next.load(Ordering::Relaxed);
         drop(state);
@@ -104,13 +106,14 @@ unsafe fn block_on_waker_clone(ptr: *const ()) -> RawWaker {
     let state = unsafe { &*ptr.cast::<BlockOnWakeState>() };
     let mut refs = state.refs.load(Ordering::Relaxed);
     loop {
-        assert!(refs < isize::MAX as usize, "block_on waker reference count overflow");
-        match state.refs.compare_exchange(
-            refs,
-            refs + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        assert!(
+            refs < isize::MAX as usize,
+            "block_on waker reference count overflow"
+        );
+        match state
+            .refs
+            .compare_exchange(refs, refs + 1, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => return RawWaker::new(ptr, &BLOCK_ON_WAKER_VTABLE),
             Err(actual) => refs = actual,
         }
@@ -207,17 +210,21 @@ impl<T> JoinStorage<T> {
         }
     }
 
-    pub(crate) unsafe fn write(&self, output: T) { unsafe {
-        (*self.output.get()).write(output);
-    }}
+    pub(crate) unsafe fn write(&self, output: T) {
+        unsafe {
+            (*self.output.get()).write(output);
+        }
+    }
 
-    unsafe fn take(&self) -> T { unsafe {
-        (*self.output.get()).assume_init_read()
-    }}
+    unsafe fn take(&self) -> T {
+        unsafe { (*self.output.get()).assume_init_read() }
+    }
 
-    unsafe fn drop_output(&self) { unsafe {
-        (*self.output.get()).assume_init_drop();
-    }}
+    unsafe fn drop_output(&self) {
+        unsafe {
+            (*self.output.get()).assume_init_drop();
+        }
+    }
 }
 
 unsafe impl<T: Send> Send for JoinStorage<T> {}
@@ -272,20 +279,20 @@ where
         .with_executor_domain(domain_id, |domain| {
             let (allocation, slab, slot_handle) = reserve_future(domain, future);
 
-    let (shard_idx, local_idx, generation) = slot_handle.indices();
+            let (shard_idx, local_idx, generation) = slot_handle.indices();
 
-    let slot = slab
-        .get_slot(shard_idx, local_idx, generation)
-        .expect("reserved task slot disappeared before initialization");
-    let storage_ptr = unsafe { storage.get_unchecked_mut() as *mut JoinStorage<T> };
-    unsafe { slot.init_joinable::<F, T>(domain_id, allocation, storage_ptr) };
-    domain.retain_task();
+            let slot = slab
+                .get_slot(shard_idx, local_idx, generation)
+                .expect("reserved task slot disappeared before initialization");
+            let storage_ptr = unsafe { storage.get_unchecked_mut() as *mut JoinStorage<T> };
+            unsafe { slot.init_joinable::<F, T>(domain_id, allocation, storage_ptr) };
+            domain.retain_task();
 
-    slab.increment_ref(shard_idx, local_idx, generation);
-    slab.increment_ref(shard_idx, local_idx, generation);
+            slab.increment_ref(shard_idx, local_idx, generation);
+            slab.increment_ref(shard_idx, local_idx, generation);
 
-    let encoded = slot_handle.encoded_ptr();
-    submit_global_to_executor_domain(domain_id, encoded);
+            let encoded = slot_handle.encoded_ptr();
+            submit_global_to_executor_domain(domain_id, encoded);
 
             JoinHandle {
                 shard_idx: shard_idx as u8,
@@ -471,13 +478,13 @@ where
             let (allocation, slab, slot_handle) = reserve_future(domain, future);
             let (shard_idx, local_idx, generation) = slot_handle.indices();
 
-    let slot = slab
-        .get_slot(shard_idx, local_idx, generation)
-        .expect("reserved task slot disappeared before initialization");
-    unsafe { slot.init_detached::<F>(domain_id, allocation) };
-    domain.retain_task();
+            let slot = slab
+                .get_slot(shard_idx, local_idx, generation)
+                .expect("reserved task slot disappeared before initialization");
+            unsafe { slot.init_detached::<F>(domain_id, allocation) };
+            domain.retain_task();
 
-    slab.increment_ref(shard_idx, local_idx, generation);
+            slab.increment_ref(shard_idx, local_idx, generation);
 
             let encoded = slot_handle.encoded_ptr();
             submit_global_to_executor_domain(domain_id, encoded);
@@ -688,7 +695,8 @@ where
 }
 
 pub fn abort_task(token: TaskToken) -> bool {
-    let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token.raw()) else {
+    let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token.raw())
+    else {
         return false;
     };
     let slab = get_task_table();

@@ -131,7 +131,7 @@ impl Future for MqReceiveFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let message = match this.queue.poll_message(&this.registration, cx) {
+        let message = match this.queue.poll_message(&mut this.registration, cx) {
             Poll::Ready(Ok(message)) => message,
             Poll::Ready(Err(AsyncRecvError::Closed)) => {
                 return Poll::Ready(IoRequestOutput::error(IO_STATUS_CANCELLED));
