@@ -2,7 +2,7 @@ use crate::artifacts::{DriverPackageArtifact, DriverProvenance, KernelSdkArtifac
 use crate::config::{BootPackageSource, BuildPlan};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
@@ -12,6 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::thread;
 
 #[derive(Debug, Deserialize)]
@@ -46,69 +47,116 @@ pub fn resolve_all(
     release: bool,
     offline: bool,
 ) -> Result<Vec<DriverPackageArtifact>, String> {
-    let mut packages = Vec::with_capacity(plan.drivers.boot_packages.len());
-    let mut names = HashSet::new();
-    for source in &plan.drivers.boot_packages {
-        let package = match source {
-            BootPackageSource::LocalCargo { manifest } => build_cargo_driver(
-                root,
-                plan,
-                manifest,
-                sdk,
-                release,
-                DriverProvenance::LocalCargo {
-                    manifest: manifest.clone(),
-                },
-            )?,
-            BootPackageSource::LocalFiles {
-                configuration,
-                binary,
-            } => resolve_files(configuration, binary, DriverProvenance::LocalFiles)?,
-            BootPackageSource::GitCargo {
-                repository,
-                revision,
-                manifest,
-            } => {
-                let checkout = checkout_git(root, repository, revision, offline)?;
-                let checkout = dunce::canonicalize(&checkout).map_err(|err| {
-                    format!(
-                        "failed to canonicalize git checkout {}: {err}",
-                        checkout.display()
-                    )
-                })?;
-                let local_manifest = checkout.join(manifest);
-                let local_manifest = dunce::canonicalize(&local_manifest).map_err(|err| {
-                    format!(
-                        "failed to resolve git driver manifest {}: {err}",
-                        local_manifest.display()
-                    )
-                })?;
-                if !local_manifest.starts_with(&checkout) || !local_manifest.is_file() {
-                    return Err(format!(
-                        "git driver manifest escapes its checkout: {}",
-                        manifest.display()
-                    ));
+    let cpu_count = thread::available_parallelism().map_or(1, usize::from);
+    let worker_count = cpu_count.min(plan.drivers.boot_packages.len());
+    let jobs = cpu_count / worker_count.max(1);
+    let sources = Mutex::new(plan.drivers.boot_packages.iter().enumerate());
+    let checkouts = Mutex::new(());
+    let results = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let sources = &sources;
+            let checkouts = &checkouts;
+            workers.push(scope.spawn(move || -> Result<Vec<_>, String> {
+                let mut packages = Vec::new();
+                loop {
+                    let source = sources
+                        .lock()
+                        .map_err(|_| "driver build queue lock failed".to_string())?
+                        .next();
+                    let Some((index, source)) = source else {
+                        break;
+                    };
+                    let package = match source {
+                        BootPackageSource::LocalCargo { manifest } => build_cargo_driver(
+                            root,
+                            plan,
+                            manifest,
+                            sdk,
+                            release,
+                            jobs,
+                            DriverProvenance::LocalCargo {
+                                manifest: manifest.clone(),
+                            },
+                        )?,
+                        BootPackageSource::LocalFiles {
+                            configuration,
+                            binary,
+                        } => resolve_files(configuration, binary, DriverProvenance::LocalFiles)?,
+                        BootPackageSource::GitCargo {
+                            repository,
+                            revision,
+                            manifest,
+                        } => {
+                            let checkout = {
+                                let _checkout = checkouts
+                                    .lock()
+                                    .map_err(|_| "driver checkout lock failed".to_string())?;
+                                checkout_git(root, repository, revision, offline)?
+                            };
+                            let checkout = dunce::canonicalize(&checkout).map_err(|err| {
+                                format!(
+                                    "failed to canonicalize git checkout {}: {err}",
+                                    checkout.display()
+                                )
+                            })?;
+                            let local_manifest = checkout.join(manifest);
+                            let local_manifest =
+                                dunce::canonicalize(&local_manifest).map_err(|err| {
+                                    format!(
+                                        "failed to resolve git driver manifest {}: {err}",
+                                        local_manifest.display()
+                                    )
+                                })?;
+                            if !local_manifest.starts_with(&checkout) || !local_manifest.is_file() {
+                                return Err(format!(
+                                    "git driver manifest escapes its checkout: {}",
+                                    manifest.display()
+                                ));
+                            }
+                            build_cargo_driver(
+                                root,
+                                plan,
+                                &local_manifest,
+                                sdk,
+                                release,
+                                jobs,
+                                DriverProvenance::GitCargo {
+                                    repository: repository.clone(),
+                                    revision: revision.clone(),
+                                    manifest: manifest.clone(),
+                                },
+                            )?
+                        }
+                    };
+                    packages.push((index, package));
                 }
-                build_cargo_driver(
-                    root,
-                    plan,
-                    &local_manifest,
-                    sdk,
-                    release,
-                    DriverProvenance::GitCargo {
-                        repository: repository.clone(),
-                        revision: revision.clone(),
-                        manifest: manifest.clone(),
-                    },
-                )?
-            }
-        };
-        if !names.insert(package.name.clone()) {
+                Ok(packages)
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| Err("driver build worker panicked".to_string()))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut packages = results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    packages.sort_by_key(|(index, _)| *index);
+    let mut names = HashSet::new();
+    for (_, package) in &packages {
+        if !names.insert(&package.name) {
             return Err(format!("duplicate boot package `{}`", package.name));
         }
-        packages.push(package);
     }
-    Ok(packages)
+    Ok(packages.into_iter().map(|(_, package)| package).collect())
 }
 
 fn build_cargo_driver(
@@ -117,6 +165,7 @@ fn build_cargo_driver(
     manifest: &Path,
     sdk: &KernelSdkArtifact,
     release: bool,
+    jobs: usize,
     provenance: DriverProvenance,
 ) -> Result<DriverPackageArtifact, String> {
     let package = package_metadata(manifest)?;
@@ -161,11 +210,6 @@ fn build_cargo_driver(
         ));
     }
 
-    let target_dir = root
-        .join("target")
-        .join("cargo")
-        .join(&plan.id)
-        .join("drivers");
     let mut command = super::cargo(root);
     command
         .arg("build")
@@ -173,6 +217,8 @@ fn build_cargo_driver(
         .arg(manifest)
         .args(["-p", &package.id, "--target"])
         .arg(&plan.drivers.target)
+        .arg("--jobs")
+        .arg(jobs.to_string())
         .args(super::build_std_args())
         .args([
             "--message-format",
@@ -180,13 +226,31 @@ fn build_cargo_driver(
             "--color",
             "always",
         ])
-        .env("CARGO_TARGET_DIR", target_dir)
+        .env(
+            "CARGO_TARGET_DIR",
+            cargo_target_dir(root, &plan.id, manifest),
+        )
         .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
     if release {
         command.arg("--release");
     }
-    let binary = cargo_artifact(command, &package.id, &target.name, "dll", "building driver")?;
+    let binary = cargo_artifact(
+        command,
+        &package.id,
+        &target.name,
+        "dll",
+        &format!("building driver `{}`", package.name),
+    )?;
     resolve_files(&configuration, &binary, provenance)
+}
+
+pub fn cargo_target_dir(root: &Path, platform: &str, manifest: &Path) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    manifest.hash(&mut hasher);
+    root.join("target/cargo")
+        .join(platform)
+        .join("drivers")
+        .join(format!("{:016x}", hasher.finish()))
 }
 
 fn package_metadata(manifest: &Path) -> Result<CargoPackage, String> {

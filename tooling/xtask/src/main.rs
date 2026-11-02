@@ -199,9 +199,7 @@ fn try_main() -> Result<(), String> {
                             .args(build_std_args())
                             .env(
                                 "CARGO_TARGET_DIR",
-                                root.join("target/cargo")
-                                    .join(&plan.id)
-                                    .join("drivers"),
+                                driver::cargo_target_dir(&root, &plan.id, manifest),
                             )
                             .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
                         run(

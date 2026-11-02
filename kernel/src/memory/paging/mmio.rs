@@ -3,7 +3,7 @@ use spin::Mutex;
 use kernel_types::arch::{PageFlags, PhysAddr};
 use kernel_types::memory::KernelMapping;
 use kernel_types::memory::PhysicalMappingCache;
-use kernel_types::status::{PageMapError, PageMapFailure};
+use kernel_types::status::PageMapError;
 
 use super::layout::{base_page_size, largest_mapping_size_for};
 use super::map::map_physical_into_reservation;
@@ -43,21 +43,8 @@ pub fn map_physical_pages_aligned(
     }
 
     let flags = PageFlags::PRESENT | PageFlags::WRITABLE;
-    loop {
-        let reservation = reserve_auto_kernel_range_aligned(size, va_alignment)
-            .map_err(|_| PageMapError::NoMemory())?;
-        match map_physical_into_reservation(reservation, 0, phys, size, flags, Some(cache)) {
-            Ok(mapping) => return Ok(mapping),
-            Err((
-                _,
-                PageMapError::Page4KiB(PageMapFailure::PageAlreadyMapped)
-                | PageMapError::Page2MiB(PageMapFailure::PageAlreadyMapped)
-                | PageMapError::Page1GiB(PageMapFailure::PageAlreadyMapped)
-                | PageMapError::Page4KiB(PageMapFailure::ParentEntryHugePage)
-                | PageMapError::Page2MiB(PageMapFailure::ParentEntryHugePage)
-                | PageMapError::Page1GiB(PageMapFailure::ParentEntryHugePage),
-            )) => {}
-            Err((_, err)) => return Err(err),
-        }
-    }
+    let reservation = reserve_auto_kernel_range_aligned(size, va_alignment)
+        .map_err(|_| PageMapError::NoMemory())?;
+    map_physical_into_reservation(reservation, 0, phys, size, flags, Some(cache))
+        .map_err(|(_, err)| err)
 }
