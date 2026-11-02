@@ -2,6 +2,7 @@
 name = "rustos_boot_image"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 bootloader = { version = "=0.11.17", default-features = false, features = ["uefi"] }

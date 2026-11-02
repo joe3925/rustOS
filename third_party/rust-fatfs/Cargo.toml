@@ -10,7 +10,7 @@ repository = "https://github.com/rafalh/rust-fatfs"
 readme = "README.md"
 keywords = ["fat", "filesystem", "no_std"]
 categories = ["filesystem"]
-license = "MIT"
+license = "MIT AND Apache-2.0"
 description = """
 FAT filesystem library.
 """
