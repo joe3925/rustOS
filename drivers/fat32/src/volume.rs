@@ -8,10 +8,10 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{
     CachedFileState, Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase,
-    LossyOemCpConverter, NullTimeProvider, RenamedFileState, SeekFrom, Write,
+    LossyOemCpConverter, NullTimeProvider, RenamedFileState, Seek, SeekFrom, Write,
 };
 use kernel_api::device::DeviceObject;
-use kernel_api::error::{FileErrorKind, KernelError, ResultErrorContext, error};
+use kernel_api::error::{DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext, error};
 use kernel_sync::locks::AsyncRwLock;
 use kernel_api::kernel_types::dma::{IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
@@ -33,6 +33,7 @@ use spin::{Mutex, Once};
 
 use crate::block_dev::{flush_owner, flush_owner_blocking};
 use crate::control::ext_mut;
+use crate::reader_pool::{ReaderLease, ReaderPool, ReaderPoolState, ReaderSlot};
 
 type FatDev = BlockDev;
 type TP = NullTimeProvider;
@@ -56,6 +57,7 @@ pub struct VolCtrlDevExt {
 
 pub struct MountedFat32 {
     pub fs: Arc<AsyncRwLock<Fs>>,
+    pub(crate) readers: ReaderPool,
     pub(crate) handles: Mutex<FileHandleTable>,
     pub(crate) volume_target: IoTarget,
     pub(crate) sector_size: u16,
@@ -623,7 +625,30 @@ impl FileSystem for Fat32Fs {
         req: &'b mut FsRequest<'data, FsRead>,
     ) -> Result<DriverStep, kernel_api::error::KernelError> {
         let vdx = ext_mut::<VolCtrlDevExt>(dev);
-        let fs = vdx.fs.read().await;
+        let mut reservation = ReaderLease {
+            pool: &vdx.readers,
+            slot: None,
+            pending: false,
+        };
+        let fs = match vdx.fs.try_read() {
+            Some(fs) => fs,
+            None => {
+                vdx.readers
+                    .state
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                        let mut state = ReaderPoolState::unpack(old);
+                        state.pending = state.pending.checked_add(1)?;
+                        Some(state.pack())
+                    })
+                    .map_err(|_| {
+                        error(DriverErrorKind::InsufficientResources)
+                            .with_context("FAT32 reader reservation count exceeded its limit")
+                    })?;
+                reservation.pending = true;
+                vdx.fs.read().await
+            }
+        };
+        let mut reader = reservation;
         let payload = &mut req.payload;
         let params = &mut payload.params;
         let fs_file_id = params.fs_file_id;
@@ -644,17 +669,33 @@ impl FileSystem for Fat32Fs {
                 }
                 ctx.cached.clone().ok_or_else(|| missing_cached_file_state(fs_file_id))?
             };
-            let mut reader = BlockDev::new(
-                vdx.volume_target.clone(),
-                vdx.sector_size,
-                vdx.total_sectors,
-                vdx.should_flush.clone(),
-                vdx.current_owner.clone(),
-            )?;
+            reader.slot = vdx.readers.take(reader.pending);
+            reader.pending = false;
+            if let Some(slot) = reader.slot.as_mut() {
+                let next = core::mem::take(&mut slot.next);
+                if next != 0 {
+                    vdx.readers.put(unsafe {
+                        Box::from_raw(core::ptr::with_exposed_provenance_mut(next))
+                    });
+                }
+            } else {
+                reader.slot = Some(Box::new(ReaderSlot {
+                    reader: BlockDev::new(
+                        vdx.volume_target.clone(),
+                        vdx.sector_size,
+                        vdx.total_sectors,
+                        vdx.should_flush.clone(),
+                        vdx.current_owner.clone(),
+                    )?,
+                    next: 0,
+                }));
+            }
+            let block = &mut reader.slot.as_mut().expect("FAT32 reader is present").reader;
+            block.seek(SeekFrom::Start(0)).map_err(|err| err.0)?;
             let mut file = state.into_file(&*fs);
             let result = async {
-                file.seek_with(&mut reader, SeekFrom::Start(offset)).await?;
-                file.read_iobuffer_with(&mut reader, buffer, fatfs::IoKind::Data).await
+                file.seek_with(&mut *block, SeekFrom::Start(offset)).await?;
+                file.read_iobuffer_with(&mut *block, buffer, fatfs::IoKind::Data).await
             }.await;
             let mut handles = vdx.handles.lock();
             let ctx = handles.ctx_mut(fs_file_id)?;

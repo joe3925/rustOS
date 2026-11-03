@@ -18,6 +18,7 @@ fn panic(info: &PanicInfo) -> ! {
 
 mod control;
 mod volume;
+mod reader_pool;
 
 mod block_dev;
 pub use control::DriverEntry;

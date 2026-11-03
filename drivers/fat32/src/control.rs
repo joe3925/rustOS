@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 
 use fatfs::{Error, FileSystem, FsOptions, IoKind, Read};
@@ -21,9 +21,11 @@ use kernel_api::{
 use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
 use spin::Mutex;
 use kernel_sync::locks::AsyncRwLock;
+use portable_atomic::AtomicU128;
 
 use crate::{
     block_dev::{BlockDev, flush},
+    reader_pool::{ReaderPool, ReaderSlot},
     volume::{
         FILE_HANDLE_CAPACITY, Fat32Fs, FileHandleTable, METADATA_OWNER_ID, MountedFat32,
         VolCtrlDevExt,
@@ -213,8 +215,26 @@ async fn fat32_start(
         }
     };
 
+    if !AtomicU128::is_lock_free() {
+        return Err(error(DriverErrorKind::NotImplemented))
+            .with_context(|| "FAT32 reader pool requires native 128-bit atomics");
+    }
+    let readers = ReaderPool {
+        state: AtomicU128::new(0),
+    };
+    readers.put(Box::new(ReaderSlot {
+        reader: BlockDev::new(
+            volume_target.clone(),
+            sector_size,
+            sectors,
+            should_flush.clone(),
+            current_owner.clone(),
+        )?,
+        next: 0,
+    }));
     let mounted = MountedFat32 {
         fs: Arc::new(AsyncRwLock::new(filesystem)),
+        readers,
         handles: Mutex::new(FileHandleTable::with_capacity(FILE_HANDLE_CAPACITY)),
         volume_target,
         sector_size,

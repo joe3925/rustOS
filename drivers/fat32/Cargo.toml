@@ -19,6 +19,7 @@ configuration = "src/fat32.toml"
 kernel_sync = { path = "../../libs/kernel_sync", default-features = false }
 kernel_api = { workspace = true }
 spin = { version = "0.10", default-features = false, features = ["mutex"] }
+portable-atomic = "1"
 fatfs = { path = "../../third_party/rust-fatfs", default-features = false, features = [
     "alloc",
     "lfn",
