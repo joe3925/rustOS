@@ -730,6 +730,15 @@ where
             return Ok(page);
         }
 
+        if self.dirty_pages.load(Ordering::Acquire) != 0 {
+            self.flush_internal_filtered(&FlushFilter::All, false).await?;
+            let free_page = self.free_pages.lock().pop();
+            if let Some(page) = free_page.or_else(|| self.try_reclaim_cache_page(preferred_idx)) {
+                page.reset_for_lba(lba);
+                return Ok(page);
+            }
+        }
+
         if self.cfg.direct_io_on_no_free_pages {
             cold_path();
             return Err(CacheError::NoFreePages);
@@ -2199,7 +2208,10 @@ where
             return Ok(());
         }
 
-        if (offset as usize) % BLOCK_SIZE == 0 && len % BLOCK_SIZE == 0 {
+        if (len > BLOCK_SIZE || !self.cfg.read_allocate)
+            && (offset as usize) % BLOCK_SIZE == 0
+            && len % BLOCK_SIZE == 0
+        {
             let block_range = VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
             let mut has_cached_page = false;
             let mut lba = block_range.start;
@@ -2288,7 +2300,10 @@ where
             return Ok(());
         }
 
-        if (offset as usize) % BLOCK_SIZE == 0 && len % BLOCK_SIZE == 0 {
+        if (len > BLOCK_SIZE || !self.cfg.write_allocate)
+            && (offset as usize) % BLOCK_SIZE == 0
+            && len % BLOCK_SIZE == 0
+        {
             let block_range = VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
             let mut has_cached_page = false;
             let mut lba = block_range.start;
