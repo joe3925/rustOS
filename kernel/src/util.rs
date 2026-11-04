@@ -112,7 +112,6 @@ pub unsafe fn init() {
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
         init_boot_processor();
-        init_dma_manager();
         calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
         let cpu_count = crate::machine::machine_info().cpu_topology().processors.len();
@@ -126,6 +125,7 @@ pub unsafe fn init() {
     }
 
     init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire));
+    init_dma_manager();
     crate::arch::debug_transport::RX_CONTEXT_READY.store(true, Ordering::Release);
 
     init_periodic_timer();

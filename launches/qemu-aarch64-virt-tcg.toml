@@ -6,6 +6,7 @@ compatible_platforms = ["aarch64-uefi"]
 supported_hosts = ["windows", "macos", "linux"]
 
 firmware_files = [
+    "AAVMF_CODE.fd",
     "edk2-aarch64-code.fd",
     "edk2-arm-code.fd",
     "QEMU_EFI.fd",
@@ -16,6 +17,7 @@ args = [
     "-m", "{memory}",
     "-cpu", "max",
     "-machine", "virt,gic-version=3,its=on,iommu=smmuv3",
+    "-global", "arm-smmuv3.stage=2",
     "-accel", "tcg",
     "-smp", "{cpus}",
     "-drive", "if=pflash,format=raw,readonly=on,file={firmware}",

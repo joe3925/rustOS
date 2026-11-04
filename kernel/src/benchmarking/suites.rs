@@ -16,7 +16,7 @@ use crate::structs::stopwatch::Stopwatch;
 
 use super::{
     bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_tolerance,
-    capture::bench_c_drive_io_async, task_batch::run_task_batch,
+    capture::bench_c_drive_io_workload, task_batch::run_task_batch,
 };
 
 /// Independent boots dominate confidence. More boots narrow uncertainty but increase CI time.
@@ -301,39 +301,51 @@ fn queue_value(value: u64) -> u64 {
 }
 extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {
     async move {
-        if !bench_case_start(handle, "read-write".to_string()) {
-            return BenchSuiteStatus::Failed;
+        let repetition = super::boot_state::current_repetition().await;
+        let seed = 0x2026_1104u64.wrapping_add(repetition as u64);
+        let mut modes = ["write-through", "cached", "buffered"];
+        let mut order_seed = seed;
+        for index in (1..modes.len()).rev() {
+            order_seed ^= order_seed << 13;
+            order_seed ^= order_seed >> 7;
+            order_seed ^= order_seed << 17;
+            modes.swap(index, order_seed as usize % (index + 1));
         }
+        for mode in modes {
+            if !bench_case_start(handle, mode.to_string()) {
+                return BenchSuiteStatus::Failed;
+            }
 
-        let Some(results) = bench_c_drive_io_async(true).await else {
-            bench_case_fail(handle, "C drive workload failed".to_string());
+            let Some(results) = bench_c_drive_io_workload(mode == "write-through", mode == "cached", seed).await else {
+                bench_case_fail(handle, "C drive workload failed".to_string());
+                bench_case_end(handle);
+                return BenchSuiteStatus::Failed;
+            };
+            for result in results.sizes {
+                let size = alloc::format!("{}k", result.size_bytes / 1024);
+                for value in result.write_ns_per_op {
+                    bench_measure_with_tolerance(
+                        handle,
+                        alloc::format!("write_ns_per_op.{size}"),
+                        value as f64,
+                        BenchMetricUnit::Nanoseconds,
+                        BenchMetricDirection::LowerIsBetter,
+                        Some(DISK_TOLERANCE_PERCENT),
+                    );
+                }
+                for value in result.read_ns_per_op {
+                    bench_measure_with_tolerance(
+                        handle,
+                        alloc::format!("read_ns_per_op.{size}"),
+                        value as f64,
+                        BenchMetricUnit::Nanoseconds,
+                        BenchMetricDirection::LowerIsBetter,
+                        Some(DISK_TOLERANCE_PERCENT),
+                    );
+                }
+            }
             bench_case_end(handle);
-            return BenchSuiteStatus::Failed;
-        };
-        for result in results.sizes {
-            let size = alloc::format!("{}k", result.size_bytes / 1024);
-            for value in result.write_ns_per_op {
-                bench_measure_with_tolerance(
-                    handle,
-                    alloc::format!("write_ns_per_op.{size}"),
-                    value as f64,
-                    BenchMetricUnit::Nanoseconds,
-                    BenchMetricDirection::LowerIsBetter,
-                    Some(DISK_TOLERANCE_PERCENT),
-                );
-            }
-            for value in result.read_ns_per_op {
-                bench_measure_with_tolerance(
-                    handle,
-                    alloc::format!("read_ns_per_op.{size}"),
-                    value as f64,
-                    BenchMetricUnit::Nanoseconds,
-                    BenchMetricDirection::LowerIsBetter,
-                    Some(DISK_TOLERANCE_PERCENT),
-                );
-            }
         }
-        bench_case_end(handle);
         BenchSuiteStatus::Passed
     }
     .into_abi()

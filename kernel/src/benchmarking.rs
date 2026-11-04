@@ -38,6 +38,11 @@ pub fn exit_benchmark_vm(success: bool) -> ! {
         port.write(if success { 0x10 } else { 0x11 });
     }
 
+    #[cfg(target_arch = "aarch64")]
+    if let Some(conduit) = crate::machine::machine_info().cpu_topology().psci_conduit {
+        crate::arch::aarch64::psci_call(conduit, 0x8400_0008, 0, 0, 0);
+    }
+
     loop {
         crate::platform::halt();
     }
