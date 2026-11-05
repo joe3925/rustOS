@@ -1,5 +1,5 @@
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 pub(crate) struct CachePage {
     pub(super) slot: usize,
@@ -9,6 +9,7 @@ pub(crate) struct CachePage {
     pub(super) owner: AtomicU64,
     pub(super) generation: AtomicU64,
     pub(super) wb_generation: AtomicU64,
+    pub(super) dirty_lock: Mutex<()>,
     pub(super) data_lock: RwLock<()>,
 }
 
@@ -22,6 +23,7 @@ impl CachePage {
             owner: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             wb_generation: AtomicU64::new(0),
+            dirty_lock: Mutex::new(()),
             data_lock: RwLock::new(()),
         }
     }

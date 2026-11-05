@@ -13,7 +13,7 @@ use core::hint::{cold_path, likely, unlikely};
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use kernel_api::kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, ToDevice,
@@ -168,6 +168,8 @@ where
 {
     backend: Arc<B>,
     shards: Vec<Mutex<Shard<F::Index>>>,
+    slot_lbas: Vec<AtomicU64>,
+    dirty_slots: Vec<AtomicU64>,
     free_pages: Mutex<Vec<Arc<CachePage>>>,
     direct_page: Mutex<Option<Arc<CachePage>>>,
     flush_scratch: Mutex<FlushScratch>,
@@ -309,6 +311,19 @@ where
 
         let direct_page = Arc::new(CachePage::new(cfg.capacity_blocks));
 
+        let mut slot_lbas = Vec::new();
+        slot_lbas
+            .try_reserve_exact(cfg.capacity_blocks)
+            .map_err(|_| CacheError::InsufficientResources)?;
+        slot_lbas.resize_with(cfg.capacity_blocks, || AtomicU64::new(0));
+
+        let dirty_words = cfg.capacity_blocks.div_ceil(64);
+        let mut dirty_slots = Vec::new();
+        dirty_slots
+            .try_reserve_exact(dirty_words)
+            .map_err(|_| CacheError::InsufficientResources)?;
+        dirty_slots.resize_with(dirty_words, || AtomicU64::new(0));
+
         let flush_scratch = match FlushScratch::new(cfg.capacity_blocks, FLUSH_WRITE_CHAIN) {
             Ok(scratch) => scratch,
             Err(_) => {
@@ -324,6 +339,8 @@ where
         Ok(Self {
             backend,
             shards,
+            slot_lbas,
+            dirty_slots,
             free_pages: Mutex::new(free_pages),
             direct_page: Mutex::new(Some(direct_page)),
             flush_scratch: Mutex::new(flush_scratch),
@@ -498,12 +515,15 @@ where
             return;
         }
 
+        let _guard = page.dirty_lock.lock();
         page.owner.store(owner, Ordering::Release);
         page.valid_mask.fetch_or(bits, Ordering::AcqRel);
         page.generation.fetch_add(1, Ordering::AcqRel);
 
         if page.dirty_mask.fetch_or(bits, Ordering::AcqRel) == 0 {
             self.dirty_pages.fetch_add(1, Ordering::AcqRel);
+            self.dirty_slots[page.slot / 64]
+                .fetch_or(1u64 << (page.slot % 64), Ordering::AcqRel);
         }
     }
 
@@ -529,6 +549,8 @@ where
                 Ok(_) => {
                     if old != 0 && new == 0 {
                         self.dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                        self.dirty_slots[page.slot / 64]
+                            .fetch_and(!(1u64 << (page.slot % 64)), Ordering::AcqRel);
                     }
                     return;
                 }
@@ -778,6 +800,7 @@ where
 
         self.trim_shard_locked(&mut shard);
 
+        self.slot_lbas[page.slot].store(lba, Ordering::Release);
         let _ = shard.index.insert(lba, Arc::clone(&page));
         page
     }
@@ -1181,6 +1204,7 @@ where
         let mut completed_writebacks = 0usize;
 
         for prepared in extents {
+            let _guard = prepared.page.dirty_lock.lock();
             if likely(success) {
                 let cur_gen = prepared.page.generation.load(Ordering::Acquire);
                 if cur_gen == prepared.wb_generation {
@@ -1193,6 +1217,8 @@ where
                 == 0
             {
                 self.dirty_pages.fetch_add(1, Ordering::AcqRel);
+                self.dirty_slots[prepared.page.slot / 64]
+                    .fetch_or(1u64 << (prepared.page.slot % 64), Ordering::AcqRel);
             }
 
             prepared
@@ -1452,6 +1478,27 @@ where
         result
     }
 
+    fn for_each_dirty_page(&self, mut visit: impl FnMut(u64, &Arc<CachePage>)) {
+        if self.dirty_pages.load(Ordering::Acquire) == 0 {
+            return;
+        }
+
+        for (word_index, word) in self.dirty_slots.iter().enumerate() {
+            let mut slots = word.load(Ordering::Acquire);
+            while slots != 0 {
+                let slot = word_index * 64 + slots.trailing_zeros() as usize;
+                slots &= slots - 1;
+                let lba = self.slot_lbas[slot].load(Ordering::Acquire);
+                let shard = self.shards[self.shard_index(lba)].lock();
+                if let Some(page) = shard.index.peek(&lba) {
+                    if page.slot == slot && page.dirty_mask.load(Ordering::Acquire) != 0 {
+                        visit(lba, page);
+                    }
+                }
+            }
+        }
+    }
+
     fn page_for_flush_key(&self, lba: u64, filter: &FlushFilter) -> Option<Arc<CachePage>> {
         let shard_idx = self.shard_index(lba);
         let shard = self.shards[shard_idx].lock();
@@ -1673,16 +1720,11 @@ where
 
         keys.clear();
 
-        let mut shard_idx = 0usize;
-        while shard_idx < self.shards.len() {
-            let shard = self.shards[shard_idx].lock();
-            shard.index.for_each(|lba, page| {
-                if page.dirty_mask.load(Ordering::Acquire) != 0 && filter.matches(lba, page) {
-                    keys.push(lba);
-                }
-            });
-            shard_idx += 1;
-        }
+        self.for_each_dirty_page(|lba, page| {
+            if filter.matches(lba, page) {
+                keys.push(lba);
+            }
+        });
 
         keys.sort_unstable();
         let matched = keys.len();
@@ -1707,28 +1749,16 @@ where
     fn filtered_writeback_state(&self, filter: &FlushFilter) -> FilteredWritebackState {
         let mut has_dirty = false;
         let mut has_active_writeback = false;
-        let mut shard_idx = 0usize;
-
-        while shard_idx < self.shards.len() {
-            let shard = self.shards[shard_idx].lock();
-
-            shard.index.for_each(|lba, page| {
-                if page.dirty_mask.load(Ordering::Acquire) != 0 && filter.matches(lba, page) {
-                    has_dirty = true;
-                    if page.writeback_mask.load(Ordering::Acquire) != 0 {
-                        has_active_writeback = true;
-                    }
-                }
-            });
-
-            if has_active_writeback {
-                return FilteredWritebackState::ActiveWriteback;
+        self.for_each_dirty_page(|lba, page| {
+            if filter.matches(lba, page) {
+                has_dirty = true;
+                has_active_writeback |= page.writeback_mask.load(Ordering::Acquire) != 0;
             }
+        });
 
-            shard_idx += 1;
-        }
-
-        if has_dirty {
+        if has_active_writeback {
+            FilteredWritebackState::ActiveWriteback
+        } else if has_dirty {
             FilteredWritebackState::NeedsFlush
         } else {
             FilteredWritebackState::Clean

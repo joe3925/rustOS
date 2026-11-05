@@ -2837,8 +2837,8 @@ pub async fn bench_c_drive_io_workload(
     cache_resident: bool,
     mut order_seed: u64,
 ) -> Option<CDriveBenchResult> {
-    let total_bytes = if cache_resident {
-        16 * 1024 * 1024
+    let total_bytes = if cache_resident || write_through {
+        10 * 1024 * 1024
     } else {
         DISK_BENCH_TOTAL_BYTES
     };
@@ -2849,7 +2849,13 @@ pub async fn bench_c_drive_io_workload(
     } else {
         "buffered"
     };
-    let file_name = if cache_resident { "io_cache.bin" } else { DISK_BENCH_FILE };
+    let file_name = if cache_resident {
+        "io_cache.bin"
+    } else if write_through {
+        "io_through.bin"
+    } else {
+        DISK_BENCH_FILE
+    };
     let mut dir_path = Path::from_string(DISK_BENCH_DIR);
     if let Err(e) = File::make_dir(&dir_path).await {
         println!(
@@ -3013,6 +3019,7 @@ pub async fn bench_c_drive_io_workload(
         let mut write_bytes = 0u64;
         let mut write_ops = 0u64;
         let mut write_ns = 0u128;
+        let mut flush_ns = 0u128;
 
         let mut read_bytes = 0u64;
         let mut read_ops = 0u64;
@@ -3072,7 +3079,7 @@ pub async fn bench_c_drive_io_workload(
             }
         }
 
-        for _ in 0..passes {
+        for pass in 0..passes {
             let write_timer = Stopwatch::start();
             let mut offset = 0u64;
             let mut ops = 0u64;
@@ -3080,7 +3087,7 @@ pub async fn bench_c_drive_io_workload(
             while offset < bench_len {
                 let remaining = (bench_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
-                let tag = (ops ^ offset).to_le_bytes();
+                let tag = (ops ^ offset ^ ((pass as u64 + 1) << 32)).to_le_bytes();
                 let tag_len = core::cmp::min(tag.len(), len);
 
                 let mut edit = match io_backing.create_bidirectional(0, len) {
@@ -3125,6 +3132,7 @@ pub async fn bench_c_drive_io_workload(
             write_ops += ops;
             write_samples.push((pass_write_ns / ops.max(1) as u128) as u64);
 
+            let flush_timer = Stopwatch::start();
             if let Err(e) = file.flush().await {
                 println!(
                     "[disk-bench] post-write flush failed size={}: {:?}",
@@ -3133,6 +3141,7 @@ pub async fn bench_c_drive_io_workload(
                 let _ = file.close().await;
                 return None;
             }
+            flush_ns += flush_timer.elapsed_nanos() as u128;
 
             let read_timer = Stopwatch::start();
             let mut offset = 0u64;
@@ -3170,7 +3179,7 @@ pub async fn bench_c_drive_io_workload(
                     .try_as_slice()
                     .expect("benchmark backing is contiguous");
                 let tag = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                valid &= tag == (ops ^ offset);
+                valid &= tag == (ops ^ offset ^ ((pass as u64 + 1) << 32));
                 checksum ^= tag;
                 drop(inspect);
                 offset += len as u64;
@@ -3235,8 +3244,8 @@ pub async fn bench_c_drive_io_workload(
             read_ns_per_op: read_samples,
         });
         println!(
-            "[disk-bench-sample] mode={} size={} file_bytes={} passes={} write_bytes={} write_ns={} read_bytes={} read_ns={}",
-            mode, size, total_bytes, passes, write_bytes, write_ns, read_bytes, read_ns,
+            "[disk-bench-sample] mode={} size={} file_bytes={} passes={} write_bytes={} write_ns={} read_bytes={} read_ns={} flush_ns={}",
+            mode, size, total_bytes, passes, write_bytes, write_ns, read_bytes, read_ns, flush_ns,
         );
     }
 
