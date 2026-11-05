@@ -686,7 +686,7 @@ fn reserve_action_annotation() -> bool {
     ACTION_ANNOTATIONS.fetch_max(persisted, Ordering::Relaxed);
 
     let Ok(previous) =
-        ACTION_ANNOTATIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        ACTION_ANNOTATIONS.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < MAX_ACTION_ANNOTATIONS).then_some(count + 1)
         })
     else {

@@ -104,18 +104,27 @@ pub unsafe fn init() {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
         init_early_serial_mapping().expect("failed to map the early serial device");
-        crate::console::PRINT_QUEUE.call_once(|| {
-            crossbeam_queue::ArrayQueue::new(crate::console::PRINT_QUEUE_SLOTS)
-        });
+        crate::console::PRINT_QUEUE
+            .call_once(|| crossbeam_queue::ArrayQueue::new(crate::console::PRINT_QUEUE_SLOTS));
         crate::machine::MACHINE_INFO.call_once(crate::machine::MachineInfo::discover);
         initialize_bootstrap_provider();
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
         init_boot_processor();
+
+        // DMA discovery binds interrupts and queries the current CPU's interrupt state.
+        init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire));
+        init_dma_manager();
         calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
-        let cpu_count = crate::machine::machine_info().cpu_topology().processors.len();
+        let cpu_count = crate::machine::machine_info()
+            .cpu_topology()
+            .processors
+            .len();
         SCHEDULER.call_once(|| Scheduler::new(cpu_count));
+        // The BSP owns CPU 0. Register it before APs can register their cores,
+        // since scheduler core registration requires contiguous CPU IDs.
+        scheduler().init_core(current_cpu_id());
         start_secondary_cpus()
             .unwrap_or_else(|error| panic!("secondary CPU startup failed: {:?}", error));
     }
@@ -123,13 +132,9 @@ pub unsafe fn init() {
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {
         spin_loop();
     }
-
-    init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire));
-    init_dma_manager();
     crate::arch::debug_transport::RX_CONTEXT_READY.store(true, Ordering::Release);
 
     init_periodic_timer();
-    scheduler().init_core(current_cpu_id());
     PANIC_RUNTIME_READY.store(true, Ordering::Release);
     scheduler().add_task(Task::new_kernel_mode(
         kernel_main,
