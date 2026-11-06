@@ -2721,6 +2721,7 @@ const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 1024 * 1024 * 1024;
+const DISK_BENCH_WRITE_THROUGH_MIN_BYTES_PER_SIZE: usize = 50 * 1024 * 1024;
 const DISK_BENCH_IOBUFFER_CREATE_OPS: u64 = 1_000_000;
 
 const DISK_BENCH_SIZES: &[usize] = &[
@@ -2937,7 +2938,12 @@ async fn bench_c_drive_io_inner(
         }
     };
 
-    let passes = core::cmp::max(1, ceil_div(DISK_BENCH_MIN_BYTES_PER_SIZE, total_bytes));
+    let min_bytes_per_size = if write_through {
+        DISK_BENCH_WRITE_THROUGH_MIN_BYTES_PER_SIZE
+    } else {
+        DISK_BENCH_MIN_BYTES_PER_SIZE
+    };
+    let passes = core::cmp::max(1, ceil_div(min_bytes_per_size, total_bytes));
 
     if initialize {
         let mut offset = 0;
