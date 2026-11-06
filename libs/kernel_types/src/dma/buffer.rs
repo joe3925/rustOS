@@ -348,13 +348,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
             return Err(IoBufferError::InvalidRange);
         }
 
-        if let IoBufferSource::Virt(virt) = &self.source {
-            let source = virt
-                .virt_base
-                .checked_add(self.offset)
-                .and_then(|address| address.checked_add(offset))
-                .ok_or(IoBufferError::LengthOverflow)?;
-            unsafe { ptr::copy_nonoverlapping(source as *const u8, dst.as_mut_ptr(), dst.len()) };
+        if let Some(source) = self.try_as_slice() {
+            dst.copy_from_slice(&source[offset..end]);
             return Ok(());
         }
 
@@ -428,13 +423,8 @@ impl<'backing, 'data, Access: WritableIoBufferAccess> IoBuffer<'backing, 'data, 
             return Err(IoBufferError::InvalidRange);
         }
 
-        if let IoBufferSource::Virt(virt) = &self.source {
-            let destination = virt
-                .virt_base
-                .checked_add(self.offset)
-                .and_then(|address| address.checked_add(offset))
-                .ok_or(IoBufferError::LengthOverflow)?;
-            unsafe { ptr::copy_nonoverlapping(src.as_ptr(), destination as *mut u8, src.len()) };
+        if let Some(destination) = self.try_as_mut_slice() {
+            destination[offset..end].copy_from_slice(src);
             return Ok(());
         }
 

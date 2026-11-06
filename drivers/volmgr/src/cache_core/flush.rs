@@ -9,6 +9,7 @@ use super::page::CachePage;
 
 pub(super) const MAX_WRITE_CHAIN: usize = 64;
 
+#[derive(Clone, Copy)]
 pub(super) enum FlushFilter {
     All,
     Owner(u64),

@@ -10,7 +10,6 @@ use crate::{
 use alloc::sync::Arc;
 use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
-use kernel_api::kernel_types::dma::IoBuffer;
 use kernel_api::kernel_types::dma::IoBufferAccess;
 use kernel_api::error::{
     DriverErrorKind, KernelError, ResultErrorContext, error, error_with_message,
@@ -165,19 +164,12 @@ fn largest_sector_aligned_prefix(bytes_before: usize, seg_len: usize) -> Option<
     }
 }
 
-fn next_indirect_chunk_len<D>(
-    buffer: &IoBuffer<'_, '_, D>,
-    byte_offset: usize,
-    remaining_len: usize,
-) -> Result<usize, DriverErrorKind>
-where
-    D: IoBufferAccess,
-{
+fn next_indirect_chunk_len(
+    segments: impl IntoIterator<Item = IoBufferDmaSegment>,
+) -> Result<usize, DriverErrorKind> {
     let mut desc_count = 0usize;
     let mut bytes = 0usize;
     let mut best = 0usize;
-
-    let segments = DmaSegmentByteWindow::new(buffer.dma_segments(), byte_offset, remaining_len);
 
     for seg in segments {
         if seg.byte_len == 0 {
@@ -240,19 +232,24 @@ impl PendingBlockCursor {
         self.op_index >= ops.len()
     }
 
-    fn advance<D>(&mut self, ops: &PendingOpBatch<'_, '_, D>, chunk_len: usize)
+    fn advance<D>(&mut self, ops: &PendingOpBatch<'_, '_, D>, mut chunk_len: usize)
     where
         D: IoBufferAccess + 'static,
     {
-        self.byte_offset += chunk_len;
-        self.sector += (chunk_len as u64) >> 9;
+        while chunk_len != 0 {
+            let len = ops.get(self.op_index).len;
+            let take = chunk_len.min(len - self.byte_offset);
+            self.byte_offset += take;
+            self.sector += (take as u64) >> 9;
+            chunk_len -= take;
 
-        if self.byte_offset == ops.get(self.op_index).len {
-            self.op_index += 1;
-            self.byte_offset = 0;
+            if self.byte_offset == len {
+                self.op_index += 1;
+                self.byte_offset = 0;
 
-            if self.op_index < ops.len() {
-                self.sector = ops.get(self.op_index).sector;
+                if self.op_index < ops.len() {
+                    self.sector = ops.get(self.op_index).sector;
+                }
             }
         }
     }
@@ -374,14 +371,41 @@ where
                     }
                 };
 
-                let op = ops.get(cursor.op_index);
-                let remaining = op.len - cursor.byte_offset;
+                let start = cursor.op_index;
+                let byte_offset = cursor.byte_offset;
+                let mut end = start + 1;
+                let mut remaining = ops.get(start).len - byte_offset;
+                while end < ops.len() {
+                    let previous = ops.get(end - 1);
+                    let next = ops.get(end);
+                    if previous.sector.checked_add((previous.len as u64) >> 9)
+                        != Some(next.sector)
+                    {
+                        break;
+                    }
+                    let Some(total) = remaining.checked_add(next.len) else {
+                        break;
+                    };
+                    remaining = total;
+                    end += 1;
+                }
+                let segments = || {
+                    (start..end).flat_map(|index| {
+                        let op = ops.get(index);
+                        let offset = if index == start { byte_offset } else { 0 };
+                        DmaSegmentByteWindow::new(
+                            op.mapped_buffer.dma_segments(),
+                            offset,
+                            op.len - offset,
+                        )
+                    })
+                };
 
-                let chunk_len = match next_indirect_chunk_len(
-                    &op.mapped_buffer,
-                    cursor.byte_offset,
+                let chunk_len = match next_indirect_chunk_len(DmaSegmentByteWindow::new(
+                    segments(),
+                    0,
                     remaining,
-                ) {
+                )) {
                     Ok(chunk_len) => chunk_len,
                     Err(status) => {
                         cold_path();
@@ -405,11 +429,7 @@ where
                     }
                 };
 
-                let segments = DmaSegmentByteWindow::new(
-                    op.mapped_buffer.dma_segments(),
-                    cursor.byte_offset,
-                    chunk_len,
-                );
+                let segments = DmaSegmentByteWindow::new(segments(), 0, chunk_len);
 
                 match qs
                     .arena

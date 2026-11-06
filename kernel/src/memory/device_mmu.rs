@@ -194,32 +194,39 @@ impl DeviceMmuDomain {
     pub fn alloc_iova(&self, size: u64) -> Option<u64> {
         let granularity = self.device_page_size();
         let size = size.checked_add(granularity - 1)? & !(granularity - 1);
+        let preferred_alignment = self
+            .capabilities
+            .supported_superpage_sizes
+            .iter()
+            .copied()
+            .filter(|page_size| *page_size <= size)
+            .max()
+            .unwrap_or(granularity);
         let mut allocations = self.iova_allocations.lock();
         let free_slot = allocations.iter().position(|slot| slot.is_none())?;
-        let mut candidate = self.iova_start;
-        loop {
-            let mut next = None;
-            for range in allocations.iter().flatten() {
-                if range.base >= candidate
-                    && next.is_none_or(|current: CachedIovaRange| range.base < current.base)
-                {
-                    next = Some(*range);
+        for alignment in [preferred_alignment, granularity] {
+            let mut candidate = self.iova_start;
+            loop {
+                candidate = candidate.checked_add(alignment - 1)? & !(alignment - 1);
+                let end = candidate.checked_add(size)?;
+                if end > self.iova_end {
+                    break;
+                }
+                let overlap = allocations.iter().flatten().find(|range| {
+                    range.base < end && candidate < range.base + range.size
+                });
+                if let Some(range) = overlap {
+                    candidate = range.base.checked_add(range.size)?;
+                } else {
+                    allocations[free_slot] = Some(CachedIovaRange {
+                        base: candidate,
+                        size,
+                    });
+                    return Some(candidate);
                 }
             }
-            match next {
-                Some(range) if candidate.checked_add(size)? <= range.base => break,
-                Some(range) => candidate = range.base.checked_add(range.size)?,
-                None => break,
-            }
         }
-        if candidate.checked_add(size)? > self.iova_end {
-            return None;
-        }
-        allocations[free_slot] = Some(CachedIovaRange {
-            base: candidate,
-            size,
-        });
-        Some(candidate)
+        None
     }
 
     #[inline]

@@ -9,7 +9,7 @@ use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
 use super::domain::{IommuDomain, IommuError};
-use super::page_table::{self, PTE_ADDR_MASK, PTE_P, PTE_RW};
+use super::page_table::{self, PTE_ADDR_MASK};
 use super::backend::{IntelDeviceScope, IntelPciPath, IntelPlatformIommuInfo, X86PlatformDeviceRoute};
 use crate::memory::paging::mmio::map_physical_pages;
 use crate::println;
@@ -298,18 +298,22 @@ impl IntelVtdBackend {
     }
 
     #[inline]
-    pub fn unmap_pages(&self, domain: &IommuDomain, iova: u64, page_count: u32) {
-        let mut cur = iova;
-        for _ in 0..page_count {
-            let _ = page_table::unmap_4k(
-                domain.root_phys,
-                cur,
-                PTE_P | PTE_RW,
-                domain.page_table_levels,
-            );
-            cur += 0x1000;
-        }
+    pub fn unmap_pages(
+        &self,
+        domain: &IommuDomain,
+        iova: u64,
+        page_count: u32,
+    ) -> Result<(), IommuError> {
+        let result = page_table::unmap_range(
+            domain.root_phys,
+            iova,
+            page_count as u64 * 4096,
+            page_table::X86IommuPageTableFormat::Intel {
+                levels: domain.page_table_levels,
+            },
+        );
         self.invalidate(domain, 0, 0);
+        result
     }
 
     pub fn invalidate(&self, domain: &IommuDomain, _iova: u64, _len: u64) {

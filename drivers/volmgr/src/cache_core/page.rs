@@ -1,8 +1,9 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::{Mutex, RwLock};
 
 pub(crate) struct CachePage {
     pub(super) slot: usize,
+    pub(super) prefetched: AtomicBool,
     pub(super) valid_mask: AtomicU64,
     pub(super) dirty_mask: AtomicU64,
     pub(super) writeback_mask: AtomicU64,
@@ -17,6 +18,7 @@ impl CachePage {
     pub(super) fn new(slot: usize) -> Self {
         Self {
             slot,
+            prefetched: AtomicBool::new(false),
             valid_mask: AtomicU64::new(0),
             dirty_mask: AtomicU64::new(0),
             writeback_mask: AtomicU64::new(0),
@@ -29,6 +31,7 @@ impl CachePage {
     }
 
     pub(super) fn reset_for_lba(&self, _lba: u64) {
+        self.prefetched.store(false, Ordering::Relaxed);
         self.valid_mask.store(0, Ordering::Release);
         self.dirty_mask.store(0, Ordering::Release);
         self.writeback_mask.store(0, Ordering::Release);

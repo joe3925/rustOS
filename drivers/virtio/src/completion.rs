@@ -1,7 +1,7 @@
 use core::future::Future;
 use core::hint::{cold_path, unlikely};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use spin::Mutex;
@@ -68,6 +68,7 @@ impl CompletionCellState {
 struct CompletionCell {
     state: Mutex<CompletionCellState>,
     next_free: AtomicU16,
+    ready: AtomicBool,
 }
 
 impl CompletionCell {
@@ -75,6 +76,7 @@ impl CompletionCell {
         Self {
             state: Mutex::new(CompletionCellState::new()),
             next_free: AtomicU16::new(INVALID_INDEX),
+            ready: AtomicBool::new(false),
         }
     }
 
@@ -89,6 +91,7 @@ impl CompletionCell {
         state.phase = PHASE_ALLOCATED;
         state.status = 0xFF;
         state.waker = None;
+        self.ready.store(false, Ordering::Release);
         state.generation
     }
 }
@@ -221,6 +224,7 @@ impl CompletionTable {
                 PHASE_WAITING => {
                     state.status = status;
                     state.phase = PHASE_COMPLETE;
+                    cell.ready.store(true, Ordering::Release);
                     wake = state.waker.take();
                 }
                 PHASE_ABANDONED => {
@@ -255,6 +259,7 @@ impl CompletionTable {
             match state.phase {
                 PHASE_WAITING => {
                     state.phase = PHASE_CANCELED;
+                    cell.ready.store(true, Ordering::Release);
                     wake = state.waker.take();
                 }
                 PHASE_ABANDONED => {
@@ -380,6 +385,12 @@ pub struct CompletionToken<'a> {
     cell_idx: u16,
     generation: u32,
     active: bool,
+}
+
+impl CompletionToken<'_> {
+    pub fn is_ready(&self) -> bool {
+        !self.active || self.table.cells[self.cell_idx as usize].ready.load(Ordering::Acquire)
+    }
 }
 
 impl Future for CompletionToken<'_> {

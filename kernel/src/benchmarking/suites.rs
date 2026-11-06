@@ -54,6 +54,13 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
         )
         .with_independent_boots(INDEPENDENT_BOOTS),
         BenchSuiteDescriptor::new(
+            "io.multi-file",
+            "Concurrent file I/O on the kernel executor",
+            vec!["io".to_string(), "concurrent".to_string()],
+            super::multi_file::multi_file_suite,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
             "io.iobuffer",
             "I/O buffer lease and scratch performance",
             vec!["ci".to_string(), "io".to_string()],

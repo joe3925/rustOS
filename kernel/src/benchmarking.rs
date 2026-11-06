@@ -11,6 +11,8 @@ compile_error!("kernel-bench and kernel-correctness require separate builds");
 mod capture;
 #[cfg(feature = "kernel-correctness")]
 mod correctness;
+#[cfg(feature = "kernel-bench")]
+mod multi_file;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod runner;
 #[cfg(feature = "kernel-bench")]

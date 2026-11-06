@@ -365,8 +365,6 @@ impl DeviceMmuBackend for X86DeviceMmu {
             Self::Intel { backend, .. } => backend.unmap_pages(&raw, iova, page_count),
             Self::Amd { backend, .. } => backend.unmap_pages(&raw, iova, page_count),
         }
-
-        Ok(())
     }
 
     fn invalidate_range(

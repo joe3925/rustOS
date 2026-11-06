@@ -47,7 +47,7 @@ pub const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
 pub const VIRTIO_F_INDIRECT_DESC: u64 = 1u64 << 28;
 
 const DEVCFG_CAPACITY: usize = 0x00; // u64 — capacity in 512-byte sectors
-const DEVCFG_NUM_QUEUES: usize = 0x08; // u16 — number of request queues (if VIRTIO_BLK_F_MQ)
+const DEVCFG_NUM_QUEUES: usize = 0x22; // u16 — number of request queues (if VIRTIO_BLK_F_MQ)
 
 /// Result of device initialization containing capacity and multiqueue info.
 pub struct DeviceInitResult {

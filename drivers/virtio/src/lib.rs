@@ -26,12 +26,10 @@ use kernel_api::kernel_types::protocol::pci::PciProtocol;
 
 use alloc::{sync::Arc, vec, vec::Vec};
 use blk::{BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP};
-use core::future::poll_fn;
 use core::hint::{cold_path, likely, unlikely};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
-use core::task::Poll;
 use core::time::Duration;
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use io::VirtioPdoIo;
@@ -77,7 +75,7 @@ use virtqueue::Virtqueue;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const COMPLETION_POLL_MIN_NS: u64 = 500_000;
-const COMPLETION_POLL_MAX_NS: u64 = 800_000;
+const COMPLETION_POLL_MAX_NS: u64 = 2_000_000;
 const COMPLETION_FIT_MIN_SAMPLES: u64 = 32;
 const COMPLETION_FIT_FALLBACK_BASE_NS: u64 = 5_000;
 const COMPLETION_FIT_FALLBACK_NS_PER_KIB: u64 = 1_250;
@@ -214,88 +212,55 @@ pub(crate) fn virtio_completion_should_poll(byte_len: usize) -> Option<usize> {
         Some(ns.max(COMPLETION_POLL_MIN_NS) as usize)
     }
 }
-pub(crate) async fn wait_completion_hybrid<F>(
+pub(crate) async fn wait_completion_hybrid(
     qs: &QueueState,
-    completion: F,
+    completion: completion::CompletionToken<'_>,
     byte_len: usize,
-) -> F::Output
-where
-    F: Future,
-{
+) -> Result<u8, completion::CompletionError> {
     let profile_timer = KernelStopwatch::start();
-    let mut completion = core::pin::pin!(completion);
-
-    let poll_ns = virtio_completion_should_poll(byte_len);
-    if poll_ns.is_none() && qs.irq_handle.get().is_some() {
-        let result = completion.await;
-
-        let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-
-        record_completion_fit_sample(byte_len, elapsed_ns);
-        return result;
+    if byte_len >= 4 * 1024 * 1024 && !completion.is_ready() {
+        let mut yielded = false;
+        core::future::poll_fn(|cx| {
+            if yielded {
+                core::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        }).await;
     }
 
-    let poll_timer = KernelStopwatch::start();
-
-    loop {
-        drain_queue_completions(qs);
-
-        if let Some(result) = poll_fn(|cx| match completion.as_mut().poll(cx) {
-            Poll::Ready(result) => Poll::Ready(Some(result)),
-            Poll::Pending => Poll::Ready(None),
-        })
-        .await
-        {
-            let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-
-            record_completion_fit_sample(byte_len, elapsed_ns);
-            return result;
-        }
-
-        let poll_elapsed_ns = poll_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-
-        if let Some(poll_ns) = poll_ns {
-            if poll_elapsed_ns >= poll_ns as u64 && qs.irq_handle.get().is_some() {
-                break;
-            }
-        }
-
-        core::hint::spin_loop();
-    }
-
-    if qs.irq_handle.get().is_none() {
-        loop {
-            drain_queue_completions(qs);
-
-            if let Some(result) = poll_fn(|cx| match completion.as_mut().poll(cx) {
-                Poll::Ready(result) => Poll::Ready(Some(result)),
-                Poll::Pending => Poll::Ready(None),
-            })
-            .await
-            {
-                let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                record_completion_fit_sample(byte_len, elapsed_ns);
-                return result;
-            }
-
-            let mut yielded = false;
-            poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+    if !completion.is_ready() {
+        let poll_ns = virtio_completion_should_poll(byte_len);
+        if poll_ns.is_some() || qs.irq_handle.get().is_none() {
+            let poll_timer = KernelStopwatch::start();
+            let poll_cycles = poll_ns.map(|ns| {
+                (ns as u128 * poll_timer.cycle_counter_frequency_hz() as u128)
+                    .div_ceil(1_000_000_000) as u64
+            });
+            qs.queue.read().set_interrupts(false);
+            loop {
+                drain_queue_completions(qs);
+                if completion.is_ready() {
+                    break;
                 }
-            })
-            .await;
+                if let Some(poll_cycles) = poll_cycles {
+                    if kernel_api::runtime::cycle_counter().wrapping_sub(poll_timer.start_cycles()) >= poll_cycles
+                        && qs.irq_handle.get().is_some()
+                    {
+                        break;
+                    }
+                }
+                core::hint::spin_loop();
+            }
+            qs.queue.read().set_interrupts(true);
+            drain_queue_completions(qs);
         }
     }
 
     let result = completion.await;
-
     let elapsed_ns = profile_timer.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-
     record_completion_fit_sample(byte_len, elapsed_ns);
     result
 }

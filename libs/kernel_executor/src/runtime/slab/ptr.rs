@@ -14,18 +14,19 @@ const PTR_SHARD_MASK: usize = (1usize << PTR_SHARD_BITS) - 1;
 const PTR_LOCAL_MASK: usize = (1usize << PTR_LOCAL_BITS) - 1;
 const PTR_GEN_MASK: usize = (1usize << PTR_GEN_BITS) - 1;
 
-const _: () = assert!(usize::BITS as usize >= PTR_GEN_SHIFT + PTR_GEN_BITS);
+const _: () = assert!(usize::BITS as usize > PTR_GEN_SHIFT + PTR_GEN_BITS);
 
 #[inline]
 pub fn encode_slab_task_ptr(shard_idx: u8, local_idx: u32, generation: u32) -> usize {
     let shard_bits = ((shard_idx as usize) & PTR_SHARD_MASK) << PTR_SHARD_SHIFT;
     let local_bits = ((local_idx as usize) & PTR_LOCAL_MASK) << PTR_LOCAL_SHIFT;
     let gen_bits = ((generation as usize) & PTR_GEN_MASK) << PTR_GEN_SHIFT;
-    gen_bits | local_bits | shard_bits
+    (gen_bits | local_bits | shard_bits) + 1
 }
 
 #[inline]
 pub fn decode_slab_task_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
+    let ptrv = ptrv.checked_sub(1)?;
     let shard_idx = (ptrv >> PTR_SHARD_SHIFT) & PTR_SHARD_MASK;
     let local_idx = (ptrv >> PTR_LOCAL_SHIFT) & PTR_LOCAL_MASK;
     let generation = ((ptrv >> PTR_GEN_SHIFT) & PTR_GEN_MASK) as u32;
