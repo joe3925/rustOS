@@ -14,8 +14,8 @@ use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_arch
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{TOTAL_TIME, boot_info};
 use crate::{platform, print, println, vec};
-use alloc::collections::BTreeMap;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -38,9 +38,7 @@ use kernel_types::benchmark::{
     BENCH_SAMPLE_PROTO_SCHEMA_VERSION, BenchDroppedSampleCounterProto, BenchOverflowPolicy,
     BenchSampleChunkProto, BenchSampleProto, BenchWindowConfig,
 };
-use kernel_types::dma::{
-    IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-};
+use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::error::KernelError;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
@@ -2829,13 +2827,23 @@ pub struct CDriveBenchResult {
 }
 
 pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchResult> {
-    bench_c_drive_io_workload(write_through, false, 0x2026_1104).await
+    bench_c_drive_io_inner(write_through, false, None).await
 }
 
 pub async fn bench_c_drive_io_workload(
     write_through: bool,
     cache_resident: bool,
-    mut order_seed: u64,
+    order_seed: u64,
+) -> Option<CDriveBenchResult> {
+    bench_c_drive_io_inner(write_through, cache_resident, Some(order_seed)).await
+}
+
+// Normal boots show sizes in ascending order. Automated suites shuffle them
+// and emit machine-readable sample records for benchmark analysis.
+async fn bench_c_drive_io_inner(
+    write_through: bool,
+    cache_resident: bool,
+    order_seed: Option<u64>,
 ) -> Option<CDriveBenchResult> {
     let total_bytes = if cache_resident || write_through {
         10 * 1024 * 1024
@@ -2929,10 +2937,7 @@ pub async fn bench_c_drive_io_workload(
         }
     };
 
-    let passes = core::cmp::max(
-        1,
-        ceil_div(DISK_BENCH_MIN_BYTES_PER_SIZE, total_bytes),
-    );
+    let passes = core::cmp::max(1, ceil_div(DISK_BENCH_MIN_BYTES_PER_SIZE, total_bytes));
 
     if initialize {
         let mut offset = 0;
@@ -3009,11 +3014,13 @@ pub async fn bench_c_drive_io_workload(
     let mut results = Vec::with_capacity(DISK_BENCH_SIZES.len());
 
     let mut block_sizes = DISK_BENCH_SIZES.to_vec();
-    for index in (1..block_sizes.len()).rev() {
-        order_seed ^= order_seed << 13;
-        order_seed ^= order_seed >> 7;
-        order_seed ^= order_seed << 17;
-        block_sizes.swap(index, order_seed as usize % (index + 1));
+    if let Some(mut seed) = order_seed {
+        for index in (1..block_sizes.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            block_sizes.swap(index, seed as usize % (index + 1));
+        }
     }
     for &size in &block_sizes {
         let mut write_bytes = 0u64;
@@ -3243,10 +3250,20 @@ pub async fn bench_c_drive_io_workload(
             write_ns_per_op: write_samples,
             read_ns_per_op: read_samples,
         });
-        println!(
-            "[disk-bench-sample] mode={} size={} file_bytes={} passes={} write_bytes={} write_ns={} read_bytes={} read_ns={} flush_ns={}",
-            mode, size, total_bytes, passes, write_bytes, write_ns, read_bytes, read_ns, flush_ns,
-        );
+        if order_seed.is_some() {
+            println!(
+                "[disk-bench-sample] mode={} size={} file_bytes={} passes={} write_bytes={} write_ns={} read_bytes={} read_ns={} flush_ns={}",
+                mode,
+                size,
+                total_bytes,
+                passes,
+                write_bytes,
+                write_ns,
+                read_bytes,
+                read_ns,
+                flush_ns,
+            );
+        }
     }
 
     if let Some((intercept, slope)) = lin_regress_overhead(&sizes, &write_ns_per_op) {
