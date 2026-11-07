@@ -21,7 +21,7 @@ mod suites;
 mod task_batch;
 
 pub use capture::{
-    BENCH_ENABLED, BenchSpanGuard, BenchWindow, bench_c_drive_io_async, bench_log_span_end,
+    BENCH_ENABLED, BenchSpanGuard, BenchWindow, bench_c_drive_io_inner, bench_log_span_end,
     bench_span_guard, bench_submit_interrupt_sample_current_core, bench_submit_rip_sample,
     bench_submit_rip_sample_current_core, used_memory,
 };

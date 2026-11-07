@@ -16,7 +16,7 @@ use crate::structs::stopwatch::Stopwatch;
 
 use super::{
     bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_tolerance,
-    capture::bench_c_drive_io_workload, task_batch::run_task_batch,
+    capture::bench_c_drive_io_inner, task_batch::run_task_batch,
 };
 
 /// Independent boots dominate confidence. More boots narrow uncertainty but increase CI time.
@@ -310,15 +310,27 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
     async move {
         let repetition = super::boot_state::current_repetition().await;
         let seed = 0x2026_1104u64.wrapping_add(repetition as u64);
-        let mut modes = ["buffered", "cached", "write-through"];
+        let total_bytes = 1024 * 1024 * 1024;
+        let mut modes = [
+            ("buffered", 1024 * 1024 * 1024),
+            ("cached", 10 * 1024 * 1024),
+            ("write-through", 10 * 1024 * 1024),
+        ];
         let mode_count = modes.len();
         modes.rotate_left(repetition.saturating_sub(1) as usize % mode_count);
-        for mode in modes {
+        for (mode, bytes_per_pass) in modes {
             if !bench_case_start(handle, mode.to_string()) {
                 return BenchSuiteStatus::Failed;
             }
 
-            let Some(results) = bench_c_drive_io_workload(mode == "write-through", mode == "cached", seed).await else {
+            let Some(results) = bench_c_drive_io_inner(
+                mode == "write-through",
+                mode == "cached",
+                Some(seed),
+                bytes_per_pass,
+                total_bytes,
+            )
+            .await else {
                 bench_case_fail(handle, "C drive workload failed".to_string());
                 bench_case_end(handle);
                 return BenchSuiteStatus::Failed;

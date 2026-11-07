@@ -2719,9 +2719,6 @@ pub fn used_memory() -> usize {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
-const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 1024 * 1024 * 1024;
-const DISK_BENCH_WRITE_THROUGH_MIN_BYTES_PER_SIZE: usize = 50 * 1024 * 1024;
 const DISK_BENCH_IOBUFFER_CREATE_OPS: u64 = 1_000_000;
 
 const DISK_BENCH_SIZES: &[usize] = &[
@@ -2778,14 +2775,6 @@ fn lin_regress_overhead(bytes: &[u64], ns_per_op: &[u128]) -> Option<(f64, f64)>
 }
 
 #[inline(always)]
-fn ceil_div(a: usize, b: usize) -> usize {
-    if a == 0 {
-        return 0;
-    }
-
-    1 + ((a - 1) / b)
-}
-#[inline(always)]
 fn disk_bench_now_ns() -> u128 {
     TOTAL_TIME.get().unwrap().elapsed().as_nanos()
 }
@@ -2811,9 +2800,9 @@ fn fill_disk_bench_pattern(buf: &mut [u8]) {
     }
 }
 
-pub fn bench_c_drive_io(write_through: bool) {
+pub fn bench_c_drive_io(write_through: bool, bytes_per_pass: usize, total_bytes: usize) {
     spawn_detached(async move {
-        let _ = bench_c_drive_io_async(write_through).await;
+        let _ = bench_c_drive_io_inner(write_through, false, None, bytes_per_pass, total_bytes).await;
     });
 }
 
@@ -2827,30 +2816,22 @@ pub struct CDriveBenchResult {
     pub sizes: Vec<CDriveSizeResult>,
 }
 
-pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchResult> {
-    bench_c_drive_io_inner(write_through, false, None).await
-}
-
-pub async fn bench_c_drive_io_workload(
-    write_through: bool,
-    cache_resident: bool,
-    order_seed: u64,
-) -> Option<CDriveBenchResult> {
-    bench_c_drive_io_inner(write_through, cache_resident, Some(order_seed)).await
-}
-
-// Normal boots show sizes in ascending order. Automated suites shuffle them
-// and emit machine-readable sample records for benchmark analysis.
-async fn bench_c_drive_io_inner(
+/// Runs each block size for `total_bytes` measured writes and reads, excluding
+/// initialization and warmup. The file holds `bytes_per_pass` bytes; the final
+/// pass is shortened when the total is not a multiple of that size.
+/// With no order seed, sizes run in ascending order. A seed enables shuffled
+/// order and machine-readable sample records for automated suites.
+pub async fn bench_c_drive_io_inner(
     write_through: bool,
     cache_resident: bool,
     order_seed: Option<u64>,
+    bytes_per_pass: usize,
+    total_bytes: usize,
 ) -> Option<CDriveBenchResult> {
-    let total_bytes = if cache_resident || write_through {
-        10 * 1024 * 1024
-    } else {
-        DISK_BENCH_TOTAL_BYTES
-    };
+    if bytes_per_pass == 0 || total_bytes == 0 {
+        println!("[disk-bench] bytes per pass and total bytes must be nonzero");
+        return None;
+    }
     let mode = if write_through {
         "write-through"
     } else if cache_resident {
@@ -2900,7 +2881,7 @@ async fn bench_c_drive_io_inner(
         }
     };
 
-    let bench_len = total_bytes as u64;
+    let bench_len = bytes_per_pass as u64;
     let initialize = file.size != bench_len;
     if initialize {
         if let Err(e) = file.set_len(bench_len).await {
@@ -2938,12 +2919,7 @@ async fn bench_c_drive_io_inner(
         }
     };
 
-    let min_bytes_per_size = if write_through {
-        DISK_BENCH_WRITE_THROUGH_MIN_BYTES_PER_SIZE
-    } else {
-        DISK_BENCH_MIN_BYTES_PER_SIZE
-    };
-    let passes = core::cmp::max(1, ceil_div(min_bytes_per_size, total_bytes));
+    let passes = total_bytes.div_ceil(bytes_per_pass);
 
     if initialize {
         let mut offset = 0;
@@ -2973,12 +2949,13 @@ async fn bench_c_drive_io_inner(
     }
 
     println!(
-        "\n[disk-bench] path={}/{} mode={} total_per_pass={} MiB passes={}",
+        "\n[disk-bench] path={}/{} mode={} total_per_pass={} MiB passes={} total_bytes={}",
         DISK_BENCH_DIR,
         file_name,
         mode,
-        total_bytes / 1024 / 1024,
-        passes
+        bytes_per_pass / 1024 / 1024,
+        passes,
+        total_bytes
     );
 
     let create_timer = Stopwatch::start();
@@ -3093,12 +3070,13 @@ async fn bench_c_drive_io_inner(
         }
 
         for pass in 0..passes {
+            let pass_len = (total_bytes - pass * bytes_per_pass).min(bytes_per_pass) as u64;
             let write_timer = Stopwatch::start();
             let mut offset = 0u64;
             let mut ops = 0u64;
 
-            while offset < bench_len {
-                let remaining = (bench_len - offset) as usize;
+            while offset < pass_len {
+                let remaining = (pass_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
                 let tag = (ops ^ offset ^ ((pass as u64 + 1) << 32)).to_le_bytes();
                 let tag_len = core::cmp::min(tag.len(), len);
@@ -3162,8 +3140,8 @@ async fn bench_c_drive_io_inner(
             let mut checksum = 0u64;
             let mut valid = true;
 
-            while offset < bench_len {
-                let remaining = (bench_len - offset) as usize;
+            while offset < pass_len {
+                let remaining = (pass_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
 
                 let io_buffer = match io_backing.create_from_device(0, len) {
@@ -3191,9 +3169,10 @@ async fn bench_c_drive_io_inner(
                 let bytes = inspect
                     .try_as_slice()
                     .expect("benchmark backing is contiguous");
-                let tag = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                valid &= tag == (ops ^ offset ^ ((pass as u64 + 1) << 32));
-                checksum ^= tag;
+                let expected = (ops ^ offset ^ ((pass as u64 + 1) << 32)).to_le_bytes();
+                let tag_len = expected.len().min(len);
+                valid &= bytes[..tag_len] == expected[..tag_len];
+                checksum ^= bytes[0] as u64;
                 drop(inspect);
                 offset += len as u64;
                 ops += 1;
@@ -3261,7 +3240,7 @@ async fn bench_c_drive_io_inner(
                 "[disk-bench-sample] mode={} size={} file_bytes={} passes={} write_bytes={} write_ns={} read_bytes={} read_ns={} flush_ns={}",
                 mode,
                 size,
-                total_bytes,
+                bytes_per_pass,
                 passes,
                 write_bytes,
                 write_ns,
