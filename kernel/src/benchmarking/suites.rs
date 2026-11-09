@@ -310,22 +310,23 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
     async move {
         let repetition = super::boot_state::current_repetition().await;
         let seed = 0x2026_1104u64.wrapping_add(repetition as u64);
-        let total_bytes = 1024 * 1024 * 1024;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
         let mut modes = [
-            ("buffered", 1024 * 1024 * 1024),
-            ("cached", 10 * 1024 * 1024),
-            ("write-through", 10 * 1024 * 1024),
+            ("buffered", gib, gib),
+            ("cached", 10 * mib, gib),
+            ("read-write", 10 * mib, 50 * mib),
         ];
         let mode_count = modes.len();
         modes.rotate_left(repetition.saturating_sub(1) as usize % mode_count);
-        for (mode, bytes_per_pass) in modes {
-            if !bench_case_start(handle, mode.to_string()) {
+        for (case_name, bytes_per_pass, total_bytes) in modes {
+            if !bench_case_start(handle, case_name.to_string()) {
                 return BenchSuiteStatus::Failed;
             }
 
             let Some(results) = bench_c_drive_io_inner(
-                mode == "write-through",
-                mode == "cached",
+                case_name == "read-write",
+                case_name == "cached",
                 Some(seed),
                 bytes_per_pass,
                 total_bytes,

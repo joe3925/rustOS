@@ -63,7 +63,7 @@ jobs:
 
       - name: Create C drive seed image
         shell: bash
-        run: bash .github/scripts/create-ci-disk.sh
+        run: bash .github/scripts/create-ci-disk.sh --benchmark
 
       - name: Download trusted baseline and previous run
         id: baselines

@@ -3,6 +3,12 @@ set -euo pipefail
 image="$RUNNER_TEMP/rustos-ci-seed.img"
 mount_dir="$RUNNER_TEMP/rustos-ci-mount"
 loop_device=""
+image_size=2G
+cluster_options=()
+if [[ ${1:-} == --benchmark ]]; then
+  image_size=5G
+  cluster_options=(-S 512 -s 128)
+fi
 
 cleanup() {
   if mountpoint -q "$mount_dir"; then
@@ -15,7 +21,7 @@ cleanup() {
 trap cleanup EXIT
 
 truncate -s 0 "$image"
-truncate -s 2G "$image"
+truncate -s "$image_size" "$image"
 sgdisk --new=1:2048:0 --typecode=1:0700 --change-name=1:rustOS "$image"
 
 loop_device="$(sudo losetup --find --show --partscan "$image")"
@@ -26,7 +32,7 @@ for _ in {1..10}; do
 done
 [[ -b "$partition" ]]
 
-sudo mkfs.vfat -F 32 -n RUSTOS "$partition"
+sudo mkfs.vfat -F 32 "${cluster_options[@]}" -n RUSTOS "$partition"
 mkdir -p "$mount_dir"
 sudo mount "$partition" "$mount_dir"
 sudo mkdir -p \
