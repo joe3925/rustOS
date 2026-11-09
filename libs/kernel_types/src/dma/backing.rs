@@ -265,7 +265,7 @@ pub struct IoBufferBacking<'data> {
     dma_alloc_cursor: AtomicUsize,
     persistent_dma_count: AtomicUsize,
 
-    overlap: spin::Mutex<RadixMap>,
+    overlap: RadixMap,
     overlap_granularity: usize,
 }
 
@@ -354,7 +354,7 @@ impl<'data> IoBufferBacking<'data> {
             dma_records: dma_records.into_boxed_slice(),
             dma_alloc_cursor: AtomicUsize::new(0),
             persistent_dma_count: AtomicUsize::new(0),
-            overlap: spin::Mutex::new(overlap),
+            overlap,
             overlap_granularity: config.overlap_granularity,
         })
     }
@@ -371,7 +371,7 @@ impl<'data> IoBufferBacking<'data> {
             let mut frames = ptr::read(&this.frames);
             let leases = ptr::read(&this.leases);
             let dma_records = ptr::read(&this.dma_records);
-            let overlap = ptr::read(&this.overlap).into_inner();
+            let overlap = ptr::read(&this.overlap);
 
             extents.clear();
             frames.clear();
@@ -438,7 +438,7 @@ impl<'data> IoBufferBacking<'data> {
         self.memory = memory;
         self.byte_len = byte_len;
         if let Some(overlap) = overlap {
-            *self.overlap.get_mut() = overlap;
+            self.overlap = overlap;
         }
         self.clear_dma_records();
 
@@ -552,7 +552,7 @@ impl<'data> IoBufferBacking<'data> {
             reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
         let slot = &self.leases[index];
 
-        if let Err(error) = self.overlap.lock().try_claim_chunks(range.first, range.count) {
+        if let Err(error) = self.overlap.try_claim_chunks(range.first, range.count) {
             slot.cancel_reservation();
             return Err(self.map_radix_error(error, range));
         }
@@ -561,7 +561,7 @@ impl<'data> IoBufferBacking<'data> {
             Ok(Some(record)) => record,
             Ok(None) => NO_DMA_RECORD,
             Err(error) => {
-                unsafe { self.overlap.lock().release_chunks(range.first, range.count) };
+                unsafe { self.overlap.release_chunks(range.first, range.count) };
                 slot.cancel_reservation();
                 return Err(error);
             }
@@ -720,7 +720,7 @@ impl<'data> IoBufferBacking<'data> {
             reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
         let slot = &self.leases[index];
         if let Err(error) = unsafe {
-            self.overlap.lock().split_claim(
+            self.overlap.split_claim(
                 slot_snapshot.range.first,
                 slot_snapshot.range.count,
                 left_count,
@@ -757,7 +757,7 @@ impl<'data> IoBufferBacking<'data> {
             self.release_dma_record(dma_record);
         }
         unsafe {
-            self.overlap.lock()
+            self.overlap
                 .release_chunks(handle.range.first, handle.range.count)
         };
         slot.finish_release();

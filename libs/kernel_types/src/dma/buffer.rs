@@ -28,8 +28,8 @@ struct VirtIoBuffer {
 }
 
 struct VirtDetails {
-    phys: VirtPhys,
     dma: Option<VirtDma>,
+    phys: VirtPhys,
 }
 
 struct VirtPhys {
@@ -42,6 +42,14 @@ struct VirtDma {
     mapped_len: usize,
     layout: IoBufferDmaMappingLayout,
     drop_ctx: Option<DmaDropContext>,
+}
+
+impl Drop for VirtDma {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.drop_ctx.take() {
+            ctx.run();
+        }
+    }
 }
 
 impl VirtIoBuffer {
@@ -545,12 +553,10 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
     pub fn remove_dma_mapping(self) -> Result<Self, (Self, IoBufferError)> {
         let mut self_ = self;
         if let IoBufferSource::Virt(virt) = &mut self_.source {
-            let Some(mut dma) = virt.details.as_mut().and_then(|details| details.dma.take()) else {
+            let Some(dma) = virt.details.as_mut().and_then(|details| details.dma.take()) else {
                 return Err((self_, IoBufferError::DmaMappingNotFound));
             };
-            if let Some(ctx) = dma.drop_ctx.take() {
-                ctx.run();
-            }
+            drop(dma);
             return Ok(self_);
         }
         let this = ManuallyDrop::new(self_);
@@ -625,16 +631,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
 
 impl<'backing, 'data, Access: IoBufferAccess> Drop for IoBuffer<'backing, 'data, Access> {
     fn drop(&mut self) {
-        match &mut self.source {
-            IoBufferSource::Backing { backing, lease } => backing.release_lease(*lease),
-            IoBufferSource::Virt(virt) => {
-                if let Some(mut dma) = virt.details.as_mut().and_then(|details| details.dma.take())
-                {
-                    if let Some(ctx) = dma.drop_ctx.take() {
-                        ctx.run();
-                    }
-                }
-            }
+        if let IoBufferSource::Backing { backing, lease } = &self.source {
+            backing.release_lease(*lease);
         }
     }
 }
