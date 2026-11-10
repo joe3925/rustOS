@@ -226,6 +226,23 @@ jobs:
               --output "target/bench/${variant}/results.json"
           }
 
+          dirty_bytes="$(sysctl -n vm.dirty_bytes)"
+          background_bytes="$(sysctl -n vm.dirty_background_bytes)"
+          if (( dirty_bytes > 0 )); then
+            restore_dirty="vm.dirty_bytes=$dirty_bytes"
+          else
+            restore_dirty="vm.dirty_ratio=$(sysctl -n vm.dirty_ratio)"
+          fi
+          if (( background_bytes > 0 )); then
+            restore_background="vm.dirty_background_bytes=$background_bytes"
+          else
+            restore_background="vm.dirty_background_ratio=$(sysctl -n vm.dirty_background_ratio)"
+          fi
+          trap 'sudo sysctl -w "$restore_dirty" "$restore_background"' EXIT
+          sudo sysctl -w \
+            vm.dirty_bytes=2147483648 \
+            vm.dirty_background_bytes=1073741824
+
           if [[ "$TRUSTED_AVAILABLE" == "true" ]]; then
             if [[ -f target/bench/anchor/boot.img ]]; then
               run_variant trusted target/bench/anchor/boot.img

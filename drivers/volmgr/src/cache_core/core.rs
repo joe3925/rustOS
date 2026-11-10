@@ -37,6 +37,7 @@ const READ_AHEAD_REQUESTS: usize = 2;
 struct ReadAhead {
     start: u64,
     next: u64,
+    last_lba: u64,
     pending: [Option<Range<u64>>; READ_AHEAD_REQUESTS],
 }
 
@@ -405,6 +406,7 @@ where
             read_ahead: Mutex::new(ReadAhead {
                 start: 0,
                 next: 0,
+                last_lba: 0,
                 pending: [const { None }; READ_AHEAD_REQUESTS],
             }),
             read_ahead_active: AtomicUsize::new(0),
@@ -1007,13 +1009,14 @@ where
             [const { None }; READ_AHEAD_REQUESTS];
         {
             let mut state = self.read_ahead.lock();
-            if lba < state.start || lba >= state.next {
+            if lba < state.last_lba || lba >= state.next {
                 if state.pending.iter().any(Option::is_some) {
                     return;
                 }
                 state.start = lba;
                 state.next = lba;
             }
+            state.last_lba = lba;
             for (slot, launch) in launches.iter_mut().enumerate() {
                 if state.pending[slot].is_none() && state.next < horizon {
                     let end = state.next.saturating_add(blocks as u64);
