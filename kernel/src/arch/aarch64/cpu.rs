@@ -230,6 +230,7 @@ impl CpuPlatform for Aarch64Platform {
         assert_eq!(processor.cpu_id, cpu_id);
         let percpu = alloc_or_get_percpu(cpu_id, processor.platform_cpu_id);
         percpu.tls_array_pointer.store(0, Ordering::Relaxed);
+        percpu.mimalloc_heap.store(0, Ordering::Relaxed);
         unsafe { set_per_cpu(percpu as *const PerCpu) };
         super::interrupts::init::init_current_cpu_interrupts();
         let exception_stack_top = Box::leak(Box::new(

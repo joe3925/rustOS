@@ -846,6 +846,7 @@ pub extern "C" fn ipi_eoi_only() {
     platform::end_interrupt(platform::scheduler_ipi_vector());
 }
 
+#[unsafe(no_mangle)]
 pub extern "C" fn kernel_task_end() -> ! {
     mimalloc_thread_done();
 

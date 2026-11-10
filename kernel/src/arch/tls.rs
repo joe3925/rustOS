@@ -3,7 +3,26 @@ use core::{fmt, ptr};
 
 use spin::Once;
 
-const PE_TLS_ARRAY_BYTES: usize = core::mem::size_of::<u64>();
+#[repr(C)]
+struct KernelThreadSlots {
+    pe_tls_block: *mut u8,
+    mimalloc_heap: *const u8,
+}
+
+unsafe extern "C" {
+    static _mi_heap_empty: u8;
+}
+
+const _: () = assert!(core::mem::offset_of!(KernelThreadSlots, mimalloc_heap) == 8);
+
+#[inline]
+pub(super) unsafe fn mimalloc_heap_for_thread(thread_pointer: u64) -> u64 {
+    if thread_pointer == 0 {
+        return 0;
+    }
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
+    unsafe { (*(thread_pointer as *const KernelThreadSlots)).mimalloc_heap as u64 }
+}
 
 static KERNEL_TLS_LAYOUT: Once<Option<KernelTlsLayout>> = Once::new();
 
@@ -51,7 +70,10 @@ impl KernelTls {
                     layout.raw_data_size,
                 );
             }
-            ptr::write_unaligned((allocation as *mut u8).cast::<u64>(), tls_block as u64);
+            (allocation as *mut KernelThreadSlots).write(KernelThreadSlots {
+                pe_tls_block: tls_block,
+                mimalloc_heap: &raw const _mi_heap_empty,
+            });
         }
         Some(Self {
             allocation,
@@ -119,7 +141,7 @@ fn detect_kernel_tls_layout(directory: TlsDirectory) -> Option<KernelTlsLayout> 
         _ => 1,
     }
     .max(core::mem::align_of::<u64>());
-    let tls_block_offset = PE_TLS_ARRAY_BYTES
+    let tls_block_offset = core::mem::size_of::<KernelThreadSlots>()
         .checked_add(align - 1)
         .expect("kernel TLS layout overflow")
         / align

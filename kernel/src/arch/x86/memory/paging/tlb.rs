@@ -1,14 +1,14 @@
 use core::arch::naked_asm;
 
 use super::super::super::interrupts::apic::local::send_eoi;
-use super::super::super::idt::table::TLB_FLUSH_VECTOR;
 use crate::idt::interrupt_impl::InterruptGuard;
 
 #[cfg_attr(irq_check, irq::context)]
+#[unsafe(no_mangle)]
 extern "C" fn tlb_flush_ipi() {
     let _guard = InterruptGuard::new();
     crate::memory::paging::tlb::handle_remote_tlb_shootdown();
-    send_eoi(TLB_FLUSH_VECTOR);
+    send_eoi();
 }
 
 #[unsafe(naked)]

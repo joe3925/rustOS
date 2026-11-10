@@ -2040,7 +2040,7 @@ where
                         }
                     };
                     if !has_chain {
-                        continue;
+                        break;
                     }
                     batch += 1;
                     let flushed = cache.flush_prepared_pages_chained_with_runs(

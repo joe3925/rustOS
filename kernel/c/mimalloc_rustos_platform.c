@@ -12,15 +12,12 @@ extern void* rustos_mi_os_alloc(size_t size, size_t alignment);
 extern void rustos_mi_os_free(void* addr, size_t size);
 extern bool rustos_mi_os_commit(void* addr, size_t size);
 extern bool rustos_mi_os_decommit(void* addr, size_t size);
+extern bool rustos_mi_is_precommitted(void* addr, size_t size);
 extern size_t rustos_mi_physical_memory_kib(void);
 extern uint64_t rustos_mi_clock_now(void);
 extern bool rustos_mi_random_buf(void* buf, size_t len);
 extern void rustos_mi_out_stderr(const char* msg);
 extern void rustos_mi_thread_yield(void);
-
-void rustos_mi_configure_options(void) {
-  mi_option_set(mi_option_eager_commit_delay, 1);
-}
 
 bool rustos_mi_manage_arena(void* start, size_t size) {
   return mi_manage_os_memory(start, size, false, false, false, -1);
@@ -64,7 +61,7 @@ int _mi_prim_alloc(
   }
 
   if (is_zero != NULL) {
-    *is_zero = true;
+    *is_zero = false;
   }
 
   if (addr == NULL) {
@@ -85,7 +82,7 @@ int _mi_prim_free(void* addr, size_t size) {
 }
 
 int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
-  if (!rustos_mi_os_commit(addr, size)) {
+  if (!rustos_mi_is_precommitted(addr, size) && !rustos_mi_os_commit(addr, size)) {
     return RUSTOS_ENOMEM;
   }
 
@@ -97,12 +94,13 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
 }
 
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
-  if (!rustos_mi_os_decommit(addr, size)) {
+  const bool precommitted = rustos_mi_is_precommitted(addr, size);
+  if (!precommitted && !rustos_mi_os_decommit(addr, size)) {
     return RUSTOS_ENOMEM;
   }
 
   if (needs_recommit != NULL) {
-    *needs_recommit = true;
+    *needs_recommit = !precommitted;
   }
 
   return 0;

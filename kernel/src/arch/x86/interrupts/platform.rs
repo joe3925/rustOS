@@ -66,8 +66,8 @@ impl InterruptPlatform for X86Platform {
         unsafe { x86_64::instructions::interrupts::enable_and_hlt() };
     }
 
-    fn end_interrupt(vector: u8) {
-        send_eoi(vector);
+    fn end_interrupt(_vector: u8) {
+        send_eoi();
     }
 
     fn send_ipi(target_platform_cpu_id: PlatformCpuId, vector: u8) -> bool {

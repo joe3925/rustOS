@@ -25,9 +25,10 @@ pub fn for_kernel_thread() -> Option<KernelTls> {
 }
 
 pub(crate) unsafe fn activate(tls_array_pointer: u64) {
-    Aarch64Platform::current_percpu()
-        .tls_array_pointer
-        .store(tls_array_pointer, Ordering::Release);
+    let percpu = Aarch64Platform::current_percpu();
+    let heap = unsafe { crate::arch::tls::mimalloc_heap_for_thread(tls_array_pointer) };
+    percpu.tls_array_pointer.store(tls_array_pointer, Ordering::Release);
+    percpu.mimalloc_heap.store(heap, Ordering::Release);
 }
 
 pub fn ensure_current_thread_runtime_initialized() {

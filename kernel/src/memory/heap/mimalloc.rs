@@ -1,8 +1,9 @@
 use crate::memory::heap::heap::{
-    mimalloc_arena_size, mimalloc_arena_start, mimalloc_heap_end, mimalloc_heap_start,
-    mimalloc_os_heap_size,
+    heap_capacity_bytes, mimalloc_arena_start, mimalloc_heap_start, mimalloc_os_heap_size,
 };
-use crate::memory::paging::layout::{align_up_to_base_page, base_page_size};
+use crate::memory::paging::layout::{
+    align_up_to_base_page, base_page_size, heap_range_end, heap_range_start,
+};
 use crate::memory::paging::map::{commit_heap_range, decommit_heap_range};
 use crate::platform;
 use crate::structs::linked_list::{LinkedList, ListNode};
@@ -17,11 +18,14 @@ use kernel_abi::MemoryRegionKind;
 use kernel_types::arch::{PageFlags, VirtAddr};
 
 const MIMALLOC_STATS_ENABLED: bool = false;
-const MIMALLOC_OS_ALLOC_ZEROES: bool = false;
 const MIMALLOC_COMMIT_GRANULARITY: usize = 2 * 1024 * 1024;
 const MIMALLOC_COMMIT_BITMAP_BITS: usize = usize::BITS as usize;
 
 pub static MIMALLOC_ARENA_COMMITTED: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_ARENA_END: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "kernel-bench")]
+pub static MIMALLOC_INITIAL_COMMITTED: AtomicUsize = AtomicUsize::new(0);
+
 static MIMALLOC_COMMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MIMALLOC_COMMIT_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MIMALLOC_COMMIT_REQUESTED: AtomicUsize = AtomicUsize::new(0);
@@ -156,9 +160,9 @@ unsafe extern "C" {
     #[cfg_attr(irq_check, irq::forbidden)]
     fn mi_realloc_aligned(ptr: *mut c_void, new_size: usize, alignment: usize) -> *mut c_void;
     #[cfg_attr(irq_check, irq::forbidden)]
-    fn mi_free(ptr: *mut c_void);
+    fn mi_free_size(ptr: *mut c_void, size: usize);
     #[cfg_attr(irq_check, irq::forbidden)]
-    fn rustos_mi_configure_options();
+    fn rustos_mi_configure_options() -> usize;
     #[cfg_attr(irq_check, irq::forbidden)]
     fn rustos_mi_manage_arena(start: *mut c_void, size: usize) -> bool;
 }
@@ -168,7 +172,14 @@ static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocato
 pub unsafe fn enable_mimalloc_impl() {
     unsafe {
         let arena_start = mimalloc_arena_start();
-        let arena_size = mimalloc_arena_size();
+        let heap_start = heap_range_start().as_u64() as usize;
+        let window = heap_range_end().as_u64() as usize - heap_start;
+        let segment_size = rustos_mi_configure_options();
+        let reserved = (heap_capacity_bytes() as usize)
+            .saturating_mul(segment_size.div_ceil(MIMALLOC_COMMIT_GRANULARITY))
+            .min(window);
+        let arena_end = heap_start + reserved;
+        let arena_size = arena_end.saturating_sub(arena_start);
         if arena_size < MIMALLOC_COMMIT_GRANULARITY {
             panic!(
                 "mimalloc arena too small: start={:#x}, size={}",
@@ -180,14 +191,16 @@ pub unsafe fn enable_mimalloc_impl() {
             .lock()
             .configure(mimalloc_heap_start(), mimalloc_os_heap_size());
         MIMALLOC_COMMIT_TRACKER.lock().init(arena_start, arena_size);
+        MIMALLOC_ARENA_END.store(arena_end, Ordering::Release);
         MIMALLOC_ARENA_COMMITTED.store(0, Ordering::Release);
 
         mi_process_init();
-        rustos_mi_configure_options();
         init_mimalloc_diagnostics();
         if !rustos_mi_manage_arena(arena_start as *mut c_void, arena_size) {
             panic!("failed to register rustOS mimalloc arena");
         }
+        #[cfg(feature = "kernel-bench")]
+        MIMALLOC_INITIAL_COMMITTED.store(committed_heap_bytes(), Ordering::Release);
     }
 }
 
@@ -249,10 +262,10 @@ pub fn mimalloc_alloc_stats() -> MimallocAllocStats {
     }
 }
 
-#[inline(always)]
-pub fn ptr_is_mimalloc(ptr: *mut u8) -> bool {
-    let addr = ptr as usize;
-    addr >= mimalloc_heap_start() && addr < mimalloc_heap_end()
+#[cfg(feature = "kernel-bench")]
+pub fn committed_heap_bytes() -> usize {
+    super::heap::mimalloc_upfront_heap_size() as usize
+        + MIMALLOC_ARENA_COMMITTED.load(Ordering::Relaxed)
 }
 
 pub fn get_mimalloc_free_memory() -> usize {
@@ -262,7 +275,7 @@ pub fn get_mimalloc_free_memory() -> usize {
 pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
     unsafe {
         let start = mimalloc_stats_start();
-        let size = layout.size().max(1);
+        let size = layout.size();
         let ptr = if layout.align() <= core::mem::align_of::<usize>() {
             mi_malloc(size)
         } else {
@@ -276,7 +289,7 @@ pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
 pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
     unsafe {
         let start = mimalloc_stats_start();
-        let size = layout.size().max(1);
+        let size = layout.size();
         let ptr = if layout.align() <= core::mem::align_of::<usize>() {
             mi_zalloc(size)
         } else {
@@ -290,7 +303,7 @@ pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
 pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
     unsafe {
         let start = mimalloc_stats_start();
-        mi_free(ptr.cast::<c_void>());
+        mi_free_size(ptr.cast::<c_void>(), layout.size());
         mimalloc_record_dealloc(layout.size(), start);
     }
 }
@@ -450,9 +463,6 @@ impl RangeAllocator {
             }
 
             self.free_bytes = self.free_bytes.saturating_sub(size);
-            if MIMALLOC_OS_ALLOC_ZEROES {
-                core::ptr::write_bytes(alloc_start as *mut u8, 0, size);
-            }
             alloc_start as *mut u8
         }
     }
@@ -620,6 +630,13 @@ pub fn init_mimalloc_diagnostics() {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rustos_mi_is_precommitted(addr: *mut c_void, size: usize) -> bool {
+    let start = addr.addr();
+    let end = mimalloc_arena_start();
+    (mimalloc_heap_start()..end).contains(&start) && size <= end - start
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
     unsafe {
         let start_cycles = mimalloc_stats_start();
@@ -641,15 +658,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
         };
 
         let arena_start = mimalloc_arena_start();
-        let Some(arena_end) = arena_start.checked_add(mimalloc_arena_size()) else {
-            crate::println!(
-                "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Arena bounds overflow",
-                addr,
-                size
-            );
-            mimalloc_record_commit_cycles(start_cycles);
-            return false;
-        };
+        let arena_end = MIMALLOC_ARENA_END.load(Ordering::Acquire);
 
         if addr_usize < arena_start || end_usize > arena_end {
             crate::println!(
@@ -744,14 +753,7 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
     };
 
     let arena_start = mimalloc_arena_start();
-    let Some(arena_end) = arena_start.checked_add(mimalloc_arena_size()) else {
-        crate::println!(
-            "MIMALLOC DECOMMIT FAILED: address={:p}, size={}, reason=Arena bounds overflow",
-            addr,
-            size
-        );
-        return false;
-    };
+    let arena_end = MIMALLOC_ARENA_END.load(Ordering::Acquire);
 
     if addr_usize < arena_start || end_usize > arena_end {
         crate::println!(

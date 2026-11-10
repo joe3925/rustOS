@@ -374,6 +374,24 @@ mi_decl_nodiscard size_t mi_usable_size(const void* p) mi_attr_noexcept {
 
 void mi_free_size(void* p, size_t size) mi_attr_noexcept {
   MI_UNUSED_RELEASE(size);
+  #if defined(MI_SMALL_PAGE_QUEUE) && !MI_DEBUG && !MI_SECURE && !MI_GUARDED
+  if (p == NULL) return;
+  mi_page_t* page;
+  if mi_likely(size <= MI_SMALL_SIZE_MAX) {
+    page = _mi_heap_get_free_small_page(mi_prim_get_default_heap(), size + MI_PADDING_SIZE);
+  }
+  else {
+    if (size > MI_SMALL_OBJ_SIZE_MAX - MI_PADDING_SIZE) goto generic_free;
+    page = MI_SMALL_PAGE_QUEUE(mi_prim_get_default_heap(), size + MI_PADDING_SIZE)->first;
+    if (page == NULL) goto generic_free;
+  }
+  const bool same_slice = ((uintptr_t)p ^ (uintptr_t)page->page_start) < MI_SEGMENT_SLICE_SIZE;
+  if mi_likely(same_slice && page->flags.full_aligned == 0) {
+    mi_free_block_local(page, (mi_block_t*)p, false, true, false);
+    return;
+  }
+generic_free:
+  #endif
   #if MI_DEBUG
   const mi_page_t* const page = mi_validate_ptr_page(p,"mi_free_size");  
   const size_t available = _mi_usable_size(p,page);

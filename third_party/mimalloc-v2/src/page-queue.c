@@ -59,6 +59,12 @@ static inline bool mi_page_queue_is_special(const mi_page_queue_t* pq) {
 // i.e. byte size == `wsize*sizeof(void*)`.
 static inline size_t mi_bin(size_t size) {
   size_t wsize = _mi_wsize_from_size(size);
+#if defined(MI_SMALL_BIN)
+  if mi_likely(size <= MI_SMALL_OBJ_SIZE_MAX) {
+    const size_t bin = MI_SMALL_BIN(wsize);
+    if mi_likely(bin != 0) return bin;
+  }
+#endif
 #if defined(MI_ALIGN4W)
   if mi_likely(wsize <= 4) {
     return (wsize <= 1 ? 1 : (wsize+1)&~1); // round to double word sizes

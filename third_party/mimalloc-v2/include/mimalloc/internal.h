@@ -571,6 +571,9 @@ static inline mi_page_t* _mi_segment_page_of(const mi_segment_t* segment, const 
   size_t idx = (size_t)diff >> MI_SEGMENT_SLICE_SHIFT;
   mi_assert_internal(idx <= segment->slice_entries);
   mi_slice_t* slice0 = (mi_slice_t*)&segment->slices[idx];
+  #if defined(MI_RUSTOS_HIGH_HALF)
+  if mi_likely(slice0->slice_offset == 0) return mi_slice_to_page(slice0);
+  #endif
   mi_slice_t* slice = mi_slice_first(slice0);  // adjust to the block that holds the page data
   mi_assert_internal(slice->slice_offset == 0);
   mi_assert_internal(slice >= segment->slices && slice < segment->slices + segment->slice_entries);

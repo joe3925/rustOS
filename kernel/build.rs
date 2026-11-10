@@ -11,7 +11,7 @@ struct MimallocTarget {
 
 fn mimalloc_target(arch: &str) -> Result<MimallocTarget, Box<dyn Error>> {
     let flags: &'static [&'static str] = match arch {
-        "x86_64" => &["-mno-red-zone", "-mcmodel=large"],
+        "x86_64" => &["-mno-red-zone"],
         "aarch64" => &[],
         _ => return Err(format!("unsupported mimalloc target architecture: {arch}").into()),
     };
@@ -55,6 +55,7 @@ fn compile_mimalloc(
         .file(manifest_dir.join("c").join("mimalloc_rustos_platform.c"))
         .file(manifest_dir.join("c").join("rustos_libc.c"))
         .flag(&clang_target_flag)
+        .flag("-flto=full")
         .flag("-U_WIN32")
         .flag("-U_WIN64")
         .flag("-U_MSC_VER")

@@ -28,7 +28,7 @@ const QUEUE_TRIALS: usize = 15;
 /// recommended; lowering it detects smaller slowdowns but demands a quieter host.
 const QUEUE_DURATION_TOLERANCE_PERCENT: f64 = 3.0;
 /// Throughput is derived from duration and tends to amplify jitter. 5–10% is recommended.
-const QUEUE_THROUGHPUT_TOLERANCE_PERCENT: f64 = 8.0;
+pub(super) const THROUGHPUT_TOLERANCE_PERCENT: f64 = 8.0;
 /// Largest disk slowdown treated as practically unchanged. Lower values catch smaller changes but
 /// warn more often; 5–10% is recommended for end-to-end virtual-disk benchmarks.
 const DISK_TOLERANCE_PERCENT: f64 = 8.0;
@@ -38,7 +38,23 @@ const IOBUFFER_LEASE_OPS: usize = 20_000;
 const IOBUFFER_SPLIT_OPS: usize = 1_000;
 
 pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
+    let heap_boots = if option_env!("RUSTOS_BENCH_TAGS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|tag| tag == "ci")
+    {
+        INDEPENDENT_BOOTS
+    } else {
+        3
+    };
     vec![
+        BenchSuiteDescriptor::new(
+            "heap.mimalloc",
+            "Parallel mimalloc allocation and free",
+            vec!["ci".to_string(), "heap".to_string()],
+            super::heap::suite,
+        )
+        .with_independent_boots(heap_boots),
         BenchSuiteDescriptor::new(
             "executor.runtime",
             "Executor queue-pressure performance",
@@ -291,7 +307,7 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
             task_count as f64 * 1_000_000_000.0 / elapsed as f64,
             BenchMetricUnit::OperationsPerSecond,
             BenchMetricDirection::HigherIsBetter,
-            Some(QUEUE_THROUGHPUT_TOLERANCE_PERCENT),
+            Some(THROUGHPUT_TOLERANCE_PERCENT),
         );
     }
 

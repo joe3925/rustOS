@@ -88,11 +88,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
             }
             mimalloc::mimalloc_alloc_zeroed(layout)
         } else {
-            let ptr = self.bootstrap.alloc(layout);
-            if !ptr.is_null() {
-                core::ptr::write_bytes(ptr, 0, layout.size());
-            }
-            ptr
+            self.bootstrap.alloc_zeroed(layout)
         }
     }}
 
@@ -102,7 +98,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
             return;
         }
 
-        if mimalloc::ptr_is_mimalloc(ptr) {
+        if ptr.addr() >= super::heap::mimalloc_heap_start() {
             if platform::current_is_in_interrupt() {
                 panic!("Cannot accses allocator from interrupt");
             }
@@ -118,7 +114,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
             return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
         }
 
-        if mimalloc::ptr_is_mimalloc(ptr) {
+        if ptr.addr() >= super::heap::mimalloc_heap_start() {
             if platform::current_is_in_interrupt() {
                 panic!("Cannot accses allocator from interrupt");
             }

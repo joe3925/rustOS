@@ -71,25 +71,6 @@ fn wrmsr(msr: u32, val: u64) {
 }
 
 #[inline(always)]
-fn rdmsr(msr: u32) -> u64 {
-    let lo: u32;
-    let hi: u32;
-
-    #[cfg_attr(irq_check, irq::trusted(unsafe))]
-    unsafe {
-        asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") lo,
-            out("edx") hi,
-            options(nostack, preserves_flags)
-        );
-    }
-
-    ((hi as u64) << 32) | lo as u64
-}
-
-#[inline(always)]
 /// # Safety
 /// `percpu` must be a stable, initialized per-CPU allocation that remains live
 /// while either GS base can reference it.
@@ -102,11 +83,17 @@ pub(crate) unsafe fn set_gs_bases(percpu: *const PerCpu) {
 
 #[inline(always)]
 pub fn current_percpu() -> &'static PerCpu {
-    let ptr = rdmsr(IA32_GS_BASE) as *const PerCpu;
-
-    debug_assert!(!ptr.is_null());
-
-    unsafe { &*ptr }
+    let ptr: *const PerCpu;
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
+    unsafe {
+        asm!(
+            "mov {ptr}, qword ptr gs:[{offset}]",
+            ptr = out(reg) ptr,
+            offset = const crate::structs::per_cpu::PERCPU_SELF_POINTER_OFF,
+            options(nostack, preserves_flags, readonly)
+        );
+        &*ptr
+    }
 }
 
 #[inline(always)]
@@ -144,6 +131,7 @@ pub fn init_percpu_gs(cpu_id: usize) -> &'static PerCpu {
     let p: &'static PerCpu = alloc_or_get_percpu(cpu_id, platform_cpu_id);
     let ptr = p as *const PerCpu;
     p.tls_array_pointer.store(0, Ordering::Relaxed);
+    p.mimalloc_heap.store(0, Ordering::Relaxed);
     unsafe { set_gs_bases(ptr) };
     kernel_types::irq::set_irq_context_query(irq_context_query);
     p

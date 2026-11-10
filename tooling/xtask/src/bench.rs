@@ -329,6 +329,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                 &boot_image,
                 &disk,
                 cpus,
+                repetition,
                 options.boot_timeout,
                 options.timeout,
                 serial_log,
@@ -401,6 +402,7 @@ fn run_topology(
     boot_image: &Path,
     disk: &SystemDisk,
     cpus: usize,
+    repetition: usize,
     boot_timeout: Duration,
     timeout: Duration,
     serial_log: PathBuf,
@@ -422,7 +424,11 @@ fn run_topology(
     unsafe { std::env::set_var("RUSTOS_QEMU_SMP", cpus.to_string()) };
     // FIXME: Audit that the environment access only happens in single-threaded code.
     unsafe { std::env::set_var("RUSTOS_QEMU_SERIAL", "stdio") };
-    let args = qemu_args(root, launch, firmware, boot_image, disk, &qemu_options)?;
+    let mut args = qemu_args(root, launch, firmware, boot_image, disk, &qemu_options)?;
+    if platform.kernel.import_library_machine == "X64" && protocol_prefix == "RUSTOS_BENCH\t" {
+        args.push("-fw_cfg".into());
+        args.push(format!("name=opt/rustos/bench-repetition,string={repetition}").into());
+    }
 
     let mut child = Command::new(qemu)
         .args(args)

@@ -201,8 +201,8 @@ pub(crate) enum IpiKind {
     Startup { vector_phys_addr: PhysAddr },
 }
 
-#[inline(always)]
-pub(crate) fn send_eoi(_vector: u8) {
+#[unsafe(export_name = "x86_apic_send_eoi")]
+pub(crate) extern "C" fn send_eoi() {
     let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
     if base != 0 {
         unsafe {

@@ -12,6 +12,8 @@ mod capture;
 #[cfg(feature = "kernel-correctness")]
 mod correctness;
 #[cfg(feature = "kernel-bench")]
+mod heap;
+#[cfg(feature = "kernel-bench")]
 mod multi_file;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod runner;
