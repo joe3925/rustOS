@@ -296,6 +296,7 @@ impl RawWaiterQueue {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub unsafe fn register(&self, node: Pin<&mut RawWaiterNode>, waker: &Waker) {
         assert!(
             AtomicU128::is_lock_free(),
@@ -389,6 +390,7 @@ impl RawWaiterQueue {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub unsafe fn remove(&self, node: Pin<&mut RawWaiterNode>) -> bool {
         let node = unsafe { node.get_unchecked_mut() };
         let phase = node.meta.load(SeqCst) & PHASE_MASK;
@@ -489,6 +491,7 @@ impl RawWaiterQueue {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn notify_one(&self) {
         self.pending_one
             .fetch_update(SeqCst, SeqCst, |value| value.checked_add(1))
@@ -496,6 +499,7 @@ impl RawWaiterQueue {
         self.drive_notifications();
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn notify_all(&self) {
         self.broadcast_until
             .fetch_max(self.last_ticket.load(SeqCst), SeqCst);

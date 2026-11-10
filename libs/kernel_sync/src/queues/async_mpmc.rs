@@ -53,6 +53,7 @@ struct ReceiverWaiters {
 }
 
 impl ReceiverWaiters {
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn notify(&self, all: bool) {
         while let Some(waiter) = self.queue.pop() {
             if waiter
@@ -137,6 +138,7 @@ impl<T> AsyncMpmcQueue<T> {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn push(&self, value: T) -> Result<(), T> {
         if !self.reserve_producer() {
             return Err(value);
@@ -148,6 +150,7 @@ impl<T> AsyncMpmcQueue<T> {
         Ok(())
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_pop(&self) -> Result<T, AsyncRecvError> {
         if let Some(value) = self.queue.pop() {
             return Ok(value);
@@ -159,6 +162,7 @@ impl<T> AsyncMpmcQueue<T> {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn poll_pop(
         &self,
         registration: &mut WaitRegistration,
@@ -200,6 +204,7 @@ impl<T> AsyncMpmcQueue<T> {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn shutdown(&self) {
         self.state.fetch_or(CLOSED, Ordering::AcqRel);
         while self.state.load(Ordering::Acquire) & PRODUCER_MASK != 0 {
@@ -229,6 +234,7 @@ impl<T> Default for AsyncMpmcQueue<T> {
 }
 
 impl<T> Drop for AsyncMpmcQueue<T> {
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn drop(&mut self) {
         while self.queue.pop().is_some() {}
         while self.waiters.queue.pop().is_some() {}

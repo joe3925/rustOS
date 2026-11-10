@@ -18,6 +18,7 @@ pub trait Platform: Sized + 'static {
     fn is_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
 
     fn unpark(task: &Self::Task);
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn park_current();
 
     fn interrupts_enabled() -> bool;

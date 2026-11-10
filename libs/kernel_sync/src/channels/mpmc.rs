@@ -7,7 +7,9 @@ use core::ptr;
 use core::sync::atomic::AtomicPtr;
 
 use crate::platform::contract::Platform;
-use crate::queues::bounded_mpmc::{BoundedMpmcPushError, MpmcQueue};
+use crate::queues::bounded_mpmc::{
+    BoundedMpmcPopError, BoundedMpmcPushError, MpmcQueue, wait_for_segment_writer,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendError<T>(pub T);
@@ -34,6 +36,13 @@ pub enum TryRecvError {
     Disconnected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitFreeRecvError {
+    Empty,
+    Contended,
+    Disconnected,
+}
+
 const WAITER_EMPTY: usize = 0;
 const WAITER_PREPARING: usize = 1;
 const WAITER_WAITING: usize = 2;
@@ -56,6 +65,7 @@ struct ReceiverRegistration<'a, P: Platform> {
 }
 
 impl<P: Platform> Drop for ReceiverRegistration<'_, P> {
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn drop(&mut self) {
         loop {
             let state = self.slot.state.load(Ordering::Acquire);
@@ -292,6 +302,7 @@ impl<P: Platform, T, const GROWABLE: bool> Drop for Sender<P, T, GROWABLE> {
 }
 
 impl<P: Platform, T, const GROWABLE: bool> Receiver<P, T, GROWABLE> {
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn recv(&self) -> Result<T, RecvError> {
         loop {
             match self.try_recv() {
@@ -389,12 +400,28 @@ impl<P: Platform, T, const GROWABLE: bool> Receiver<P, T, GROWABLE> {
     }
 
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if let Some(value) = self.inner.queue.try_pop() {
-            Ok(value)
-        } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-            self.inner.queue.try_pop().ok_or(TryRecvError::Disconnected)
-        } else {
-            Err(TryRecvError::Empty)
+        loop {
+            match self.try_recv_wait_free() {
+                Ok(value) => return Ok(value),
+                Err(WaitFreeRecvError::Empty) => return Err(TryRecvError::Empty),
+                Err(WaitFreeRecvError::Disconnected) => return Err(TryRecvError::Disconnected),
+                Err(WaitFreeRecvError::Contended) if GROWABLE => wait_for_segment_writer(),
+                Err(WaitFreeRecvError::Contended) => core::hint::spin_loop(),
+            }
+        }
+    }
+
+    pub fn try_recv_wait_free(&self) -> Result<T, WaitFreeRecvError> {
+        match self.inner.queue.try_pop_wait_free() {
+            Ok(value) => Ok(value),
+            Err(BoundedMpmcPopError::Contended) => Err(WaitFreeRecvError::Contended),
+            Err(BoundedMpmcPopError::Empty) if self.is_disconnected() => {
+                self.inner.queue.try_pop_wait_free().map_err(|err| match err {
+                    BoundedMpmcPopError::Empty => WaitFreeRecvError::Disconnected,
+                    BoundedMpmcPopError::Contended => WaitFreeRecvError::Contended,
+                })
+            }
+            Err(BoundedMpmcPopError::Empty) => Err(WaitFreeRecvError::Empty),
         }
     }
 

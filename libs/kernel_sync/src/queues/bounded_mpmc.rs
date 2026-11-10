@@ -209,6 +209,12 @@ impl<T> Drop for MpmcRing<T> {
 
 const SEGMENT_CLOSED: usize = 1 << (usize::BITS - 1);
 
+#[inline]
+#[cfg_attr(irq_check, irq::forbidden)]
+pub(crate) fn wait_for_segment_writer() {
+    core::hint::spin_loop();
+}
+
 struct QueueSegment<T> {
     ring: MpmcRing<T>,
     next: AtomicPtr<QueueSegment<T>>,
@@ -294,6 +300,7 @@ impl<T> MpmcQueue<T> {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn grow(&self) -> usize {
         let tail = self.tail.load(Ordering::Acquire);
         let segment = unsafe { &*tail };
@@ -371,6 +378,7 @@ impl<T> MpmcQueue<T> {
             match self.try_pop_wait_free() {
                 Ok(value) => return Some(value),
                 Err(BoundedMpmcPopError::Empty) => return None,
+                Err(BoundedMpmcPopError::Contended) if self.growable => wait_for_segment_writer(),
                 Err(BoundedMpmcPopError::Contended) => core::hint::spin_loop(),
             }
         }

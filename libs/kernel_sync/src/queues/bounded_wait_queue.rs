@@ -125,6 +125,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
     }
 
     #[inline]
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn capacity(&self) -> usize {
         self.slots.read().len()
     }
@@ -136,6 +137,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
             .div_ceil(self.slots_per_chunk)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_grow(&self) -> Result<usize, BoundedWaitQueueError> {
         let mut slots = self.slots.write();
         slots
@@ -147,6 +149,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
         Ok(slots.len())
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn empty_chunk_count(&self) -> usize {
         let slots = self.slots.read();
         slots[self.initial_capacity..]
@@ -159,6 +162,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
             .count()
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_shrink(&self) -> bool {
         let mut slots = self.slots.write();
         let growth_slots = slots.len().saturating_sub(self.initial_capacity);
@@ -196,6 +200,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
         self.enqueue(&current)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn enqueue(
         &self,
         task: &P::Task,
@@ -268,6 +273,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
         self.enqueue(task)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn dequeue_one_for_wake(&self) -> WakeResult<P> {
         let slots = self.slots.read();
         let cap = slots.len();
@@ -338,6 +344,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
         result
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn wake_all(&self) -> usize {
         let slots = self.slots.read();
         let cap = slots.len();
@@ -399,6 +406,7 @@ impl<P: Platform> BoundedWaitQueue<P> {
         P::is_waiting(&current, self.id)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn clear_current_if_queued(&self) -> bool {
         let current = match P::current_task() {
             Some(task) => task,

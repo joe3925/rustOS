@@ -91,6 +91,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         })
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_reserve(self: &Arc<Self>) -> Result<PortPermit<P, T>, PortReserveError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PortReserveError::Closed);
@@ -112,6 +113,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         Err(PortReserveError::Full)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_grow(&self, additional_capacity: usize) -> Result<usize, PortResizeError> {
         if additional_capacity == 0 {
             return Ok(self.capacity());
@@ -139,6 +141,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
 
     /// Shrinks to `target_capacity` only when whole idle chunks reach that
     /// target exactly. Failure leaves the port unchanged.
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_shrink_to(&self, target_capacity: usize) -> Result<usize, PortResizeError> {
         let mut chunks = self.chunks.write();
         let current = self.capacity.load(Ordering::Acquire);
@@ -184,6 +187,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         Ok(target_capacity)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_recv(&self) -> Result<TaskCompletion<T>, TryRecvError> {
         let chunks = self.chunks.read();
         let count = chunks.len();
@@ -203,6 +207,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn recv(&self) -> Result<TaskCompletion<T>, RecvError> {
         loop {
             if let Ok(value) = self.try_recv() {
@@ -244,6 +249,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         self.outstanding.load(Ordering::Acquire)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.waiters.wake_all();
@@ -251,6 +257,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
 }
 
 impl<P: Platform, T: Send + 'static> CompletionPermit<T> for PortPermit<P, T> {
+    #[cfg_attr(irq_check, irq::forbidden)]
     fn complete(mut self, completion: TaskCompletion<T>) {
         loop {
             match self.chunk.queue.try_push_wait_free(completion) {
