@@ -1,4 +1,3 @@
-use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::scheduling::state::State;
 use core::hint::black_box;
 use core::sync::atomic::Ordering;
@@ -151,7 +150,6 @@ pub(crate) fn general_protection_fault(stack_frame: &mut State, error_code: u64)
 #[kernel_macros::exception_handler]
 #[unsafe(no_mangle)]
 pub(crate) fn page_fault(stack_frame: &mut State, error_code: PageFaultErrorCode) {
-    let _fpu_guard = KernelFpuGuard::new();
     let fault = Cr2::read_raw();
 
     let is_protection = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);

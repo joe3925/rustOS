@@ -11,12 +11,9 @@ use crate::scheduling::state::State;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::KERNEL_INITIALIZED;
-use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub static TIMER: AtomicUsize = AtomicUsize::new(0);
-
-const STATE_BYTES: usize = 15 * 8;
 
 #[repr(align(64))]
 pub struct Al64<T>(pub T);
@@ -69,35 +66,8 @@ pub fn set_num_cores(n: usize) {
     }
 }
 
-#[unsafe(naked)]
-pub extern "C" fn timer_interrupt_entry() {
-    naked_asm!(
-        "cli",
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-
-        "mov  rcx, rsp",
-        "mov  rbx, rsp",
-        "cld",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {handler}",
-        "mov  rsp, rbx",
-
-        "mov  rbx, rsp",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "call {eoi}",
-        "mov  rsp, rbx",
-
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
-        "iretq",
-        handler = sym timer_interrupt_handler_c,
-        eoi     = sym send_eoi_timer,
-    );
-}
+crate::x86_interrupt_entry!(
+    pub timer_interrupt_entry,
+    timer_interrupt_handler_c,
+    eoi = send_eoi_timer
+);

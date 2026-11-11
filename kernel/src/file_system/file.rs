@@ -369,7 +369,7 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
     #[cfg(not(any(feature = "kernel-bench", feature = "kernel-correctness")))]
     spawn_detached(async {
         loop {
-            let bytes_per_pass = 1024 * 1024 * 1024;
+            let bytes_per_pass = 50 * 1024 * 1024;
             let total_bytes = bytes_per_pass;
             bench_c_drive_io_inner(true, false, None, bytes_per_pass, total_bytes).await;
             bench_c_drive_io_inner(false, false, None, bytes_per_pass, total_bytes).await;

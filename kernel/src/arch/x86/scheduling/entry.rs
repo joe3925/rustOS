@@ -1,41 +1,15 @@
 use core::arch::naked_asm;
 
 use crate::scheduling::scheduler::{ipi_eoi_only, ipi_handler_c, kernel_task_end, yield_handler_c};
-use crate::scheduling::task::{IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
 
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub extern "C" fn ipi_entry() {
-    naked_asm!(
-        "/* {upper} {lower} {eoi_only} */",
-        "cli",
-        "push rax",
-        "mov  rax, {upper}",
-        "cmp  r10, rax",
-        "jne  9f",
-        "mov  rax, {lower}",
-        "cmp  r11, rax",
-        "jne  9f",
-        "pop  rax",
-        crate::x86_interrupt_call_template!("", "{handler}"),
-        "9:",
-        "pop  rax",
-        crate::x86_interrupt_call_template!("", "{eoi_only}"),
-        upper = const IDLE_UUID_UPPER,
-        lower = const IDLE_MAGIC_LOWER,
-        handler = sym ipi_handler_c,
-        eoi_only = sym ipi_eoi_only,
-    );
-}
+crate::x86_interrupt_entry!(
+    #[unsafe(no_mangle)]
+    pub ipi_entry,
+    ipi_handler_c,
+    idle_only = ipi_eoi_only
+);
 
-#[unsafe(naked)]
-pub extern "C" fn yield_interrupt_entry() {
-    naked_asm!(
-        "cli",
-        crate::x86_interrupt_call_template!("", "{handler}"),
-        handler = sym yield_handler_c,
-    );
-}
+crate::x86_interrupt_entry!(pub yield_interrupt_entry, yield_handler_c);
 
 #[unsafe(naked)]
 pub extern "C" fn task_return_trampoline() -> ! {

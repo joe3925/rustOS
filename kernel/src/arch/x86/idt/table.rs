@@ -1,5 +1,3 @@
-use core::arch::naked_asm;
-
 use spin::Once;
 use x86_64::VirtAddr;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
@@ -12,7 +10,6 @@ use super::super::gdt::{
 };
 use super::super::memory::paging::tlb::tlb_flush_entry;
 use super::super::scheduling::platform_impl::{ipi_entry, yield_interrupt_entry};
-use crate::scheduling::scheduler::KernelFpuGuard;
 
 use crate::idt::interrupt_impl::{InterruptGuard, irq_dispatch};
 
@@ -30,13 +27,10 @@ pub(crate) const MAX_GSI: u8 = 64;
 // IRQ VECTOR STUBS
 // =============================================================================
 
-const IRQ_SAVED_GPR_BYTES: usize = 15 * 8;
-
 #[cfg_attr(irq_check, irq::context)]
 #[unsafe(no_mangle)]
 extern "C" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
-    let interrupt_guard = InterruptGuard::new();
-    let _fpu_guard = interrupt_guard.is_outermost().then(KernelFpuGuard::new);
+    let _interrupt_guard = InterruptGuard::new();
     let frame = unsafe { &mut *frame };
     irq_dispatch(vector as u32, frame);
     crate::platform::end_interrupt(vector);
@@ -44,32 +38,7 @@ extern "C" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFram
 
 macro_rules! gen_irq_stub {
     ($name:ident, $vec:expr) => {
-        #[unsafe(naked)]
-        extern "C" fn $name() {
-            naked_asm!(
-                "cli",
-                "push r15","push r14","push r13","push r12",
-                "push r11","push r10","push r9","push r8",
-                "push rdi","push rsi","push rbp","push rbx",
-                "push rdx","push rcx","push rax",
-                "mov  ecx, {vector}",
-                "lea  rdx, [rsp + {saved_gpr_bytes}]",
-                "mov  rbx, rsp",
-                "cld",
-                "and  rsp, -16",
-                "sub  rsp, 32",
-                "call {handler}",
-                "mov  rsp, rbx",
-                "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-                "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-                "pop  r9","pop  r10","pop  r11","pop  r12",
-                "pop  r13","pop  r14","pop  r15",
-                "iretq",
-                vector = const $vec,
-                saved_gpr_bytes = const IRQ_SAVED_GPR_BYTES,
-                handler = sym irq_interrupt_handler_c,
-            );
-        }
+        crate::x86_interrupt_entry!($name, irq_interrupt_handler_c, vector = $vec);
     };
 }
 

@@ -41,50 +41,6 @@ pub enum TaskMigrationError {
     PendingMigration(u64),
 }
 
-pub struct KernelFpuGuard {
-    saved_task: Option<TaskHandle>,
-}
-
-impl KernelFpuGuard {
-    #[inline(always)]
-    pub fn try_new() -> Option<Self> {
-        let cpu_id = platform::current_cpu_id();
-        let saved_task = if let Some(task) = scheduler().get_current_task(cpu_id) {
-            {
-                let mut guard = task.inner.try_write()?;
-                guard.save_fpu_state();
-            }
-
-            Some(task)
-        } else {
-            None
-        };
-
-        Some(Self { saved_task })
-    }
-
-    #[inline(always)]
-    pub fn new() -> Self {
-        Self::try_new()
-            .expect("Failed to acquire task lock for saving FPU state in interrupt handler")
-    }
-}
-
-impl Drop for KernelFpuGuard {
-    fn drop(&mut self) {
-        self.saved_task.take();
-
-        let cpu_id = platform::current_cpu_id();
-        if let Some(current) = scheduler().get_current_task(cpu_id) {
-            let mut guard = current
-                .inner
-                .try_write()
-                .expect("Failed to acquire task lock for restoring FPU state in interrupt handler");
-            guard.restore_fpu_state();
-        }
-    }
-}
-
 pub struct CoreScheduler {
     scheduling: Mutex<SchedulerState>,
     current_task_id: AtomicU64,

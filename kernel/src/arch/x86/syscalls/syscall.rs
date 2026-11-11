@@ -2,7 +2,6 @@ use super::super::cpu::platform_cpu_id;
 use super::super::gdt::PER_CPU_GDT;
 
 use crate::executable::program::{Message, UserHandle};
-use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
@@ -62,13 +61,10 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         "push r14",
         "push r15",
 
-        "mov  rbx, rsp",
-        "and  rsp, -16",
-        "sub  rsp, 32",
+        crate::x86_entry_fpu_save!(0, 0),
         "mov  rcx, rbx",
-        "cld",
         "call {handler}",
-        "mov  rsp, rbx",
+        crate::x86_entry_fpu_restore!(),
 
         "pop  r15",
         "pop  r14",
@@ -88,6 +84,11 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
 
         "sysretq",
 
+        entry_frame_size = const super::super::interrupts::entry::ENTRY_FRAME_SIZE,
+        fpu_state_offset = const super::super::interrupts::entry::FPU_STATE_OFFSET,
+        previous_fpu_frame_offset = const super::super::interrupts::entry::PREVIOUS_FPU_FRAME_OFFSET,
+        percpu_self_offset = const crate::structs::per_cpu::PERCPU_SELF_POINTER_OFF,
+        active_fpu_offset = const crate::structs::per_cpu::PERCPU_ACTIVE_EXCEPTION_FPU_OFF,
         handler = sym syscall_handler,
     );
 }
@@ -237,7 +238,6 @@ const SYSCALL_TABLE: &[Handler] = &[
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
-    let _fpu_guard = KernelFpuGuard::new();
     let num = frame.rax as usize;
     // stack args start immediately after the pushed register block
     let rest_ptr = unsafe { (frame as *const SyscallFrame).add(1) } as *const u64;

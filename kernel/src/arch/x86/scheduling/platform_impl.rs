@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 use kernel_types::arch::VirtAddr;
 use kernel_types::runtime::BlockOnThreadState;
 use spin::Mutex;
@@ -83,10 +84,40 @@ impl TaskPlatform for X86Platform {
     }
 
     fn save_fpu_state(state: &mut Self::FpuState) {
+        let active_exception_fpu = Self::current_percpu()
+            .active_exception_fpu
+            .load(Ordering::Relaxed);
+
+        if active_exception_fpu != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    active_exception_fpu as *const FpuState,
+                    state as *mut FpuState,
+                    1,
+                );
+            }
+            return;
+        }
+
         state.save();
     }
 
     fn restore_fpu_state(state: &Self::FpuState) {
+        let active_exception_fpu = Self::current_percpu()
+            .active_exception_fpu
+            .load(Ordering::Relaxed);
+
+        if active_exception_fpu != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    state as *const FpuState,
+                    active_exception_fpu as *mut FpuState,
+                    1,
+                );
+            }
+            return;
+        }
+
         state.restore();
     }
 
