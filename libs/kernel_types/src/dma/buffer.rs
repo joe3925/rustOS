@@ -13,6 +13,10 @@ pub struct IoBuffer<'backing, 'data, Access: IoBufferAccess> {
     _access: PhantomData<fn() -> Access>,
 }
 
+// Keep the backing pointer before the lease in the Backing payload. With three
+// variants, repr(Rust) reordered these fields and generated overlapping stack
+// copies on the create/drop hot path (nightly-2026-11-01).
+#[repr(C)]
 enum IoBufferSource<'backing, 'data> {
     Backing {
         backing: &'backing IoBufferBacking<'data>,
