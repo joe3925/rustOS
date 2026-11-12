@@ -15,7 +15,6 @@ use kernel_api::{
         io::IoTarget,
     },
     pnp::io,
-    println,
     request::{Read as ReadRequest, Write as WriteRequest},
 };
 
@@ -272,12 +271,11 @@ impl BlockDev {
         let cap_bytes = self.capacity_bytes();
         if unlikely(self.pos >= cap_bytes) {
             cold_path();
-            println!(
-                "attempt to sec to pos {}, with capacity {}",
-                cap_bytes,
-                self.capacity_bytes()
-            );
-            return Ok(0);
+            return Err(error(DriverErrorKind::InvalidParameter).with_context(alloc::format!(
+                "writing FAT32 volume at offset {} for {} bytes with capacity {cap_bytes}",
+                self.pos,
+                src.len()
+            )));
         }
 
         let len = min(src.len(), cap_bytes.saturating_sub(self.pos) as usize);
@@ -361,7 +359,13 @@ impl WriteIoBuffer for BlockDev {
             }
             let cap_bytes = self.capacity_bytes();
             if self.pos >= cap_bytes {
-                return Ok(0);
+                return Err(FatIoError(
+                    error(DriverErrorKind::InvalidParameter).with_context(alloc::format!(
+                        "writing FAT32 I/O buffer at offset {} for {} bytes with capacity {cap_bytes}",
+                        self.pos,
+                        buffer.len()
+                    )),
+                ));
             }
             let len = min(buffer.len(), (cap_bytes - self.pos) as usize);
             let buffer = clip_iobuffer(buffer, len, "splitting a FAT32 write I/O buffer")?;
@@ -372,6 +376,49 @@ impl WriteIoBuffer for BlockDev {
             self.pos += written as u64;
             let _ = kind;
             Ok(written)
+        }
+        .into_abi()
+    }
+
+    fn write_iobuffer_chain<'a, 'buffer>(
+        &'a mut self,
+        requests: &'a mut WriteRequest<'buffer>,
+        _kind: IoKind,
+    ) -> AbiFuture<Result<(), Self::Error>> {
+        async move {
+            let capacity = self.capacity_bytes();
+            let owner = self.current_owner.load(Ordering::Acquire);
+            let mut end = self.pos;
+            for request in requests.iter_mut() {
+                end = request
+                    .offset
+                    .checked_add(request.len as u64)
+                    .ok_or_else(|| {
+                        FatIoError(
+                            error(DriverErrorKind::InvalidParameter)
+                                .with_context("calculating the end of a FAT32 write chain entry"),
+                        )
+                    })?;
+                if end > capacity
+                    || request.no_buffer
+                    || request
+                        .buffer
+                        .as_ref()
+                        .is_none_or(|buffer| buffer.len() < request.len)
+                {
+                    return Err(FatIoError(
+                        error(DriverErrorKind::InvalidParameter)
+                            .with_context("validating a FAT32 write chain entry"),
+                    ));
+                }
+                request.owner = owner;
+            }
+            io::send_down_stack(self.volume.clone(), requests)
+                .await
+                .with_context(|| "writing a FAT32 I/O buffer chain")
+                .map_err(FatIoError)?;
+            self.pos = end;
+            Ok(())
         }
         .into_abi()
     }

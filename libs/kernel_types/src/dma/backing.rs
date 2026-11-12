@@ -842,7 +842,7 @@ impl<'data> IoBufferBacking<'data> {
         Err(IoBufferError::DmaRecordCapacityExceeded { capacity })
     }
 
-    fn retain_dma_record(&self, index: usize) -> Result<(), IoBufferError> {
+    pub(super) fn retain_dma_record(&self, index: usize) -> Result<(), IoBufferError> {
         let record = self
             .dma_records
             .get(index)
@@ -862,7 +862,7 @@ impl<'data> IoBufferBacking<'data> {
         }
     }
 
-    fn dma_record_snapshot(
+    pub(super) fn dma_record_snapshot(
         &self,
         index: usize,
     ) -> Result<(usize, usize, IoBufferDmaMappingLayout), IoBufferError> {

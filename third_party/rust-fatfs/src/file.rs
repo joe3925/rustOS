@@ -9,8 +9,10 @@ use crate::time::{Date, DateTime, TimeProvider};
 
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::dma::{FromDevice, IoBuffer, ToDevice};
+use kernel_types::request::Write as WriteRequest;
 
 pub const MAX_FILE_SIZE: u32 = u32::MAX;
+const WRITE_CHAIN_LIMIT: usize = 32;
 
 /// A FAT filesystem file object used for reading and writing data.
 ///
@@ -686,6 +688,54 @@ where
         Ok(total_read)
     }
 
+    async fn prepare_write_run(
+        &mut self,
+        offset: u32,
+        previous_cluster: Option<u32>,
+        remaining_len: usize,
+    ) -> Result<(u32, usize), Error<IO::Error>> {
+        let cluster_size = self.fs.cluster_size();
+        let offset_in_cluster = offset % cluster_size;
+        let current_cluster = if offset_in_cluster == 0 {
+            let next_cluster = match previous_cluster {
+                None => self.first_cluster,
+                Some(n) => match self.fs.cluster_iter(n).next().await {
+                    Some(Err(err)) => return Err(err),
+                    Some(Ok(n)) => Some(n),
+                    None => None,
+                },
+            };
+            if let Some(n) = next_cluster {
+                n
+            } else {
+                let new_cluster = self.fs.alloc_cluster(previous_cluster, self.is_dir()).await?;
+                if self.first_cluster.is_none() {
+                    self.set_first_cluster(new_cluster);
+                }
+                new_cluster
+            }
+        } else {
+            previous_cluster.expect("Offset inside cluster but no cluster allocated")
+        };
+
+        let mut last_cluster = current_cluster;
+        let mut write_size = remaining_len.min((cluster_size - offset_in_cluster) as usize);
+        while write_size < remaining_len {
+            let next_cluster = match self.fs.cluster_iter(last_cluster).next().await {
+                Some(Err(err)) => return Err(err),
+                Some(Ok(n)) => n,
+                None => self.fs.alloc_cluster(Some(last_cluster), self.is_dir()).await?,
+            };
+            if next_cluster != last_cluster + 1 {
+                break;
+            }
+            last_cluster = next_cluster;
+            write_size += (remaining_len - write_size).min(cluster_size as usize);
+        }
+
+        Ok((current_cluster, write_size))
+    }
+
     /// Writes opaque file payload from an owned I/O buffer.
     pub async fn write_iobuffer<'buffer>(
         &mut self,
@@ -707,44 +757,9 @@ where
 
         while total_written < total_len {
             let offset_in_cluster = self.offset % cluster_size;
-            let current_cluster = if offset_in_cluster == 0 {
-                let next_cluster = match self.current_cluster {
-                    None => self.first_cluster,
-                    Some(n) => match self.fs.cluster_iter(n).next().await {
-                        Some(Err(err)) => return Err(err),
-                        Some(Ok(n)) => Some(n),
-                        None => None,
-                    },
-                };
-                if let Some(n) = next_cluster {
-                    n
-                } else {
-                    let new_cluster = self.fs.alloc_cluster(self.current_cluster, self.is_dir()).await?;
-                    if self.first_cluster.is_none() {
-                        self.set_first_cluster(new_cluster);
-                    }
-                    new_cluster
-                }
-            } else {
-                self.current_cluster
-                    .expect("Offset inside cluster but no cluster allocated")
-            };
-
-            let remaining_len = total_len - total_written;
-            let mut last_cluster = current_cluster;
-            let mut write_size = remaining_len.min((cluster_size - offset_in_cluster) as usize);
-            while write_size < remaining_len {
-                let next_cluster = match self.fs.cluster_iter(last_cluster).next().await {
-                    Some(Err(err)) => return Err(err),
-                    Some(Ok(n)) => n,
-                    None => self.fs.alloc_cluster(Some(last_cluster), self.is_dir()).await?,
-                };
-                if next_cluster != last_cluster + 1 {
-                    break;
-                }
-                last_cluster = next_cluster;
-                write_size += (remaining_len - write_size).min(cluster_size as usize);
-            }
+            let (current_cluster, write_size) = self
+                .prepare_write_run(self.offset, self.current_cluster, total_len - total_written)
+                .await?;
 
             let current = remaining_buffer.take().ok_or(Error::InvalidInput)?;
             let (piece, tail) = if write_size == current.len() {
@@ -778,6 +793,105 @@ where
             remaining_buffer = tail;
         }
 
+        Ok(total_written)
+    }
+
+    pub async fn write_iobuffer_chain<'buffer>(
+        &mut self,
+        buffer_len: usize,
+        total_len: usize,
+        mut create_buffer: impl FnMut(usize) -> Result<IoBuffer<'buffer, 'buffer, ToDevice>, Error<IO::Error>>,
+        kind: IoKind,
+    ) -> Result<usize, Error<IO::Error>> {
+        if total_len == 0 {
+            return Ok(0);
+        }
+        if buffer_len == 0 {
+            return Err(Error::InvalidInput);
+        }
+        if total_len as u64 > u64::from(MAX_FILE_SIZE - self.offset) {
+            return Err(Error::FileTooLarge);
+        }
+        self.fs.set_dirty_flag(true).await?;
+        let cluster_size = self.fs.cluster_size();
+        let mut total_written = 0usize;
+        let mut requests: alloc::vec::Vec<Option<(WriteRequest<'_>, u32, u32, usize)>> =
+            alloc::vec::Vec::with_capacity(WRITE_CHAIN_LIMIT);
+        requests.resize_with(WRITE_CHAIN_LIMIT, || None);
+
+        while total_written < total_len {
+            let mut count = 0usize;
+            let mut planned_bytes = 0usize;
+            let mut planned_offset = self.offset;
+            let mut planned_cluster = self.current_cluster;
+
+            while count < requests.len() && total_written + planned_bytes < total_len {
+                let offset_in_cluster = planned_offset % cluster_size;
+                let mut remaining = (total_len - total_written - planned_bytes).min(buffer_len);
+                if offset_in_cluster != 0 {
+                    remaining = remaining.min((cluster_size - offset_in_cluster) as usize);
+                }
+                let (current_cluster, write_size) = self
+                    .prepare_write_run(planned_offset, planned_cluster, remaining)
+                    .await?;
+                let buffer = create_buffer(write_size)?;
+                if buffer.len() != write_size {
+                    return Err(Error::InvalidInput);
+                }
+                let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+                requests[count] = Some((
+                    WriteRequest::new(offset_in_fs, write_size, false, 0, Some(buffer)),
+                    current_cluster,
+                    offset_in_cluster,
+                    write_size,
+                ));
+                let advance = ((u64::from(offset_in_cluster) + write_size as u64 - 1) / u64::from(cluster_size)) as u32;
+                planned_cluster = Some(current_cluster + advance);
+                planned_offset += write_size as u32;
+                planned_bytes += write_size;
+                count += 1;
+            }
+
+            let head = {
+                let mut entries = requests[..count].iter_mut();
+                let head = &mut entries.next().unwrap().as_mut().unwrap().0;
+                let mut tail = head as *mut WriteRequest<'_>;
+                for entry in entries {
+                    let next = &mut entry.as_mut().unwrap().0 as *mut WriteRequest<'_>;
+                    unsafe {
+                        (*tail).append_next(next);
+                    }
+                    tail = next;
+                }
+                head
+            };
+            {
+                let mut disk = self.fs.disk.borrow_mut();
+                disk.write_iobuffer_chain(head, kind).await?;
+            }
+
+            for entry in requests[..count].iter() {
+                let (request, current_cluster, offset_in_cluster, expected) = entry.as_ref().unwrap();
+                let written = request.len;
+                if written > *expected {
+                    return Err(Error::InvalidInput);
+                }
+                if written == 0 {
+                    return Ok(total_written);
+                }
+                let advance = ((u64::from(*offset_in_cluster) + written as u64 - 1) / u64::from(cluster_size)) as u32;
+                self.offset += written as u32;
+                self.current_cluster = Some(*current_cluster + advance);
+                self.update_dir_entry_after_write();
+                total_written += written;
+                if written != *expected {
+                    return Ok(total_written);
+                }
+            }
+            for entry in &mut requests[..count] {
+                *entry = None;
+            }
+        }
         Ok(total_written)
     }
 }

@@ -2606,174 +2606,216 @@ where
     async fn read_request<'req, 'data>(&self, req: &mut Read<'data>) -> Result<(), Self::Error> {
         self.check_open()?;
 
-        let (offset, len_req, no_buffer, req_data_len) = {
-            let r = &*req;
-            (
-                r.offset,
-                r.len,
-                r.no_buffer,
-                r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
-            )
-        };
+        for entry in req.iter_mut() {
+            let mut single = Read::new(
+                entry.offset,
+                entry.len,
+                entry.no_buffer,
+                entry.buffer.take(),
+            );
+            let result = async {
+                let req = &mut single;
+                let (offset, len_req, no_buffer, req_data_len) = {
+                    let r = &*req;
+                    (
+                        r.offset,
+                        r.len,
+                        r.no_buffer,
+                        r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+                    )
+                };
 
-        let len = if no_buffer {
-            len_req
-        } else {
-            core::cmp::min(len_req, req_data_len)
-        };
+                let len = if no_buffer {
+                    len_req
+                } else {
+                    core::cmp::min(len_req, req_data_len)
+                };
 
-        let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, len)?;
+                req.len = len;
+                let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, len)?;
 
-        if unlikely(len == 0) {
-            cold_path();
-            return Ok(());
-        }
-
-        if no_buffer {
-            {
-                let w = &mut *req;
-                w.len = len;
-            }
-
-            self.backend
-                .read_request(req)
-                .await
-                .map_err(CacheError::Backend)?;
-            return Ok(());
-        }
-
-        if !self.cfg.read_allocate
-            && (offset as usize) % BLOCK_SIZE == 0
-            && len % BLOCK_SIZE == 0
-        {
-            let block_range = VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
-            let mut has_cached_page = false;
-            let mut lba = block_range.start;
-
-            while lba < block_range.end {
-                if self.try_get_page(lba).is_some() {
-                    has_cached_page = true;
-                    break;
+                if unlikely(len == 0) {
+                    cold_path();
+                    return Ok(());
                 }
 
-                lba += 1;
+                if no_buffer {
+                    {
+                        let w = &mut *req;
+                        w.len = len;
+                    }
+
+                    self.backend
+                        .read_request(req)
+                        .await
+                        .map_err(CacheError::Backend)?;
+                    return Ok(());
+                }
+
+                if !self.cfg.read_allocate
+                    && (offset as usize) % BLOCK_SIZE == 0
+                    && len % BLOCK_SIZE == 0
+                {
+                    let block_range =
+                        VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
+                    let mut has_cached_page = false;
+                    let mut lba = block_range.start;
+
+                    while lba < block_range.end {
+                        if self.try_get_page(lba).is_some() {
+                            has_cached_page = true;
+                            break;
+                        }
+
+                        lba += 1;
+                    }
+
+                    if !has_cached_page && self.free_pages.lock().is_empty() {
+                        req.len = len;
+
+                        self.backend
+                            .read_request(req)
+                            .await
+                            .map_err(CacheError::Backend)?;
+
+                        return Ok(());
+                    }
+                }
+
+                let contiguous_dst = req
+                    .buffer
+                    .as_mut()
+                    .and_then(|buffer| buffer.try_as_mut_slice())
+                    .map(|slice| slice.as_mut_ptr() as usize);
+                if let Some(dst) = contiguous_dst {
+                    let dst = unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                    return self.read_at(offset, dst).await;
+                }
+
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(len)
+                    .map_err(|_| CacheError::InsufficientResources)?;
+                bytes.resize(len, 0);
+                self.read_at(offset, &mut bytes).await?;
+
+                let buffer = req.buffer.as_mut().ok_or(CacheError::InvalidConfig)?;
+                buffer
+                    .copy_from_slice(0, &bytes)
+                    .map_err(CacheError::InvalidIoBuffer)
             }
-
-            if !has_cached_page && self.free_pages.lock().is_empty() {
-                req.len = len;
-
-                self.backend
-                    .read_request(req)
-                    .await
-                    .map_err(CacheError::Backend)?;
-
-                return Ok(());
-            }
+            .await;
+            entry.len = single.len;
+            entry.buffer = single.buffer.take();
+            result?;
         }
-
-        let contiguous_dst = req
-            .buffer
-            .as_mut()
-            .and_then(|buffer| buffer.try_as_mut_slice())
-            .map(|slice| slice.as_mut_ptr() as usize);
-        if let Some(dst) = contiguous_dst {
-            let dst = unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, len) };
-            return self.read_at(offset, dst).await;
-        }
-
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| CacheError::InsufficientResources)?;
-        bytes.resize(len, 0);
-        self.read_at(offset, &mut bytes).await?;
-
-        let buffer = req.buffer.as_mut().ok_or(CacheError::InvalidConfig)?;
-        buffer
-            .copy_from_slice(0, &bytes)
-            .map_err(CacheError::InvalidIoBuffer)
+        Ok(())
     }
 
     async fn write_request<'req, 'data>(&self, req: &mut Write<'data>) -> Result<(), Self::Error> {
         self.check_open()?;
 
-        let (offset, len_req, no_buffer, owner, req_data_len) = {
-            let r = &*req;
-            (
-                r.offset,
-                r.len,
-                r.no_buffer,
-                r.owner,
-                r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
-            )
-        };
+        for entry in req.iter_mut() {
+            let mut single = Write::new(
+                entry.offset,
+                entry.len,
+                entry.no_buffer,
+                entry.owner,
+                entry.buffer.take(),
+            );
+            let result = async {
+                let req = &mut single;
+                let (offset, len_req, no_buffer, owner, req_data_len) = {
+                    let r = &*req;
+                    (
+                        r.offset,
+                        r.len,
+                        r.no_buffer,
+                        r.owner,
+                        r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+                    )
+                };
 
-        let len = if no_buffer {
-            len_req
-        } else {
-            core::cmp::min(len_req, req_data_len)
-        };
+                let len = if no_buffer {
+                    len_req
+                } else {
+                    core::cmp::min(len_req, req_data_len)
+                };
 
-        let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, len)?;
+                req.len = len;
+                let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, len)?;
 
-        if unlikely(len == 0) {
-            cold_path();
-            return Ok(());
-        }
-
-        self.active_writes.fetch_add(1, Ordering::AcqRel);
-        self.write_epoch.fetch_add(1, Ordering::AcqRel);
-        let _write_guard = CacheWriteGuard { active: &self.active_writes };
-        let range = VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
-        self.wait_for_read_ahead(range).await;
-
-        if no_buffer {
-            {
-                let w = &mut *req;
-                w.len = len;
-            }
-
-            self.backend
-                .write_request(req)
-                .await
-                .map_err(CacheError::Backend)?;
-            return Ok(());
-        }
-
-        if !self.cfg.write_allocate
-            && (offset as usize) % BLOCK_SIZE == 0
-            && len % BLOCK_SIZE == 0
-        {
-            let block_range = VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
-            let mut has_cached_page = false;
-            let mut lba = block_range.start;
-
-            while lba < block_range.end {
-                if self.try_get_page(lba).is_some() {
-                    has_cached_page = true;
-                    break;
+                if unlikely(len == 0) {
+                    cold_path();
+                    return Ok(());
                 }
 
-                lba += 1;
-            }
+                self.active_writes.fetch_add(1, Ordering::AcqRel);
+                self.write_epoch.fetch_add(1, Ordering::AcqRel);
+                let _write_guard = CacheWriteGuard {
+                    active: &self.active_writes,
+                };
+                let range = VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
+                self.wait_for_read_ahead(range).await;
 
-            if !has_cached_page && self.free_pages.lock().is_empty() {
-                req.len = len;
+                if no_buffer {
+                    {
+                        let w = &mut *req;
+                        w.len = len;
+                    }
 
-                self.backend
-                    .write_request(req)
-                    .await
-                    .map_err(CacheError::Backend)?;
+                    self.backend
+                        .write_request(req)
+                        .await
+                        .map_err(CacheError::Backend)?;
+                    return Ok(());
+                }
 
+                if !self.cfg.write_allocate
+                    && (offset as usize) % BLOCK_SIZE == 0
+                    && len % BLOCK_SIZE == 0
+                {
+                    let block_range =
+                        VolumeCache::<B, BLOCK_SIZE, F>::block_range_from_bytes(offset, len)?;
+                    let mut has_cached_page = false;
+                    let mut lba = block_range.start;
+
+                    while lba < block_range.end {
+                        if self.try_get_page(lba).is_some() {
+                            has_cached_page = true;
+                            break;
+                        }
+
+                        lba += 1;
+                    }
+
+                    if !has_cached_page && self.free_pages.lock().is_empty() {
+                        req.len = len;
+
+                        self.backend
+                            .write_request(req)
+                            .await
+                            .map_err(CacheError::Backend)?;
+
+                        VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(
+                            self, None,
+                        );
+                        return Ok(());
+                    }
+                }
+
+                let buffer = req.buffer.take().ok_or(CacheError::InvalidConfig)?;
+
+                VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, buffer, len, owner)
+                    .await?;
                 VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self, None);
-                return Ok(());
+                Ok(())
             }
+            .await;
+            entry.len = single.len;
+            entry.buffer = single.buffer.take();
+            result?;
         }
-
-        let buffer = req.buffer.take().ok_or(CacheError::InvalidConfig)?;
-
-        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, buffer, len, owner).await?;
-        VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self, None);
         Ok(())
     }
     async fn flush(&self) -> Result<(), Self::Error> {

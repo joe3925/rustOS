@@ -1,4 +1,4 @@
-use crate::block_dev::BlockDev;
+use crate::block_dev::{BlockDev, FatIoError};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -12,8 +12,9 @@ use fatfs::{
 };
 use kernel_api::device::DeviceObject;
 use kernel_api::error::{DriverErrorKind, FileErrorKind, KernelError, ResultErrorContext, error};
-use kernel_sync::locks::AsyncRwLock;
-use kernel_api::kernel_types::dma::{IoBuffer, ToDevice};
+use kernel_api::kernel_types::dma::{
+    IoBuffer, IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc, ToDevice,
+};
 use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, io};
 use kernel_api::request::{
@@ -29,6 +30,7 @@ use kernel_api::{
     },
     println, request_handler,
 };
+use kernel_sync::locks::AsyncRwLock;
 use spin::{Mutex, Once};
 
 use crate::block_dev::{flush_owner, flush_owner_blocking};
@@ -47,8 +49,7 @@ type FsError = FatError<<FatDev as IoBase>::Error>;
 pub(crate) const METADATA_OWNER_ID: u64 = 1;
 pub(crate) const FIRST_FILE_OWNER_ID: u64 = METADATA_OWNER_ID + 1;
 pub(crate) const FILE_HANDLE_CAPACITY: usize = 1024;
-const SET_LEN_ZERO_CHUNK: usize = 64 * 1024;
-static ZERO_CHUNK: [u8; SET_LEN_ZERO_CHUNK] = [0u8; SET_LEN_ZERO_CHUNK];
+const ZERO_CHAIN_CHUNK_BYTES: usize = 64 * 1024;
 
 #[repr(C)]
 pub struct VolCtrlDevExt {
@@ -292,13 +293,7 @@ async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsErro
         file.seek(SeekFrom::Start(new_size)).await?;
         file.truncate().await?;
     } else {
-        let mut remaining = new_size - old_size;
-        while remaining != 0 {
-            let take = remaining.min(ZERO_CHUNK.len() as u64) as usize;
-            file.write_all(&ZERO_CHUNK[..take], fatfs::IoKind::Data)
-                .await?;
-            remaining -= take as u64;
-        }
+        write_file_zeros(file, new_size - old_size).await?;
     }
     file.flush().await?;
     Ok(())
@@ -340,11 +335,51 @@ async fn write_cached_file<'buffer>(
 }
 
 async fn write_file_zeros(file: &mut FatFile<'_>, mut len: u64) -> Result<(), FsError> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    let buffer_len = len.min(ZERO_CHAIN_CHUNK_BYTES as u64) as usize;
+    let mut zeros = Vec::new();
+    zeros.try_reserve_exact(buffer_len).map_err(|cause| {
+        FsError::Io(FatIoError(
+            error(DriverErrorKind::InsufficientResources)
+                .with_context(alloc::format!("allocating FAT32 zero buffer: {cause:?}")),
+        ))
+    })?;
+    zeros.resize(buffer_len, 0u8);
+
+    let map_buffer_error = |cause| {
+        FsError::Io(FatIoError(
+            error(DriverErrorKind::InsufficientResources)
+                .with_context(alloc::format!("preparing FAT32 zero buffer: {cause:?}")),
+        ))
+    };
+    let zero_backing = IoBufferBacking::new(
+        IoBufferBackingDesc::Slice(&zeros),
+        IoBufferBackingConfig {
+            lease_capacity: 1,
+            ..IoBufferBackingConfig::default()
+        },
+    )
+    .map_err(map_buffer_error)?;
+    let factory = zero_backing
+        .create_to_device_factory(0, buffer_len)
+        .map_err(map_buffer_error)?;
+
     while len != 0 {
-        let take = len.min(ZERO_CHUNK.len() as u64) as usize;
-        file.write_all(&ZERO_CHUNK[..take], fatfs::IoKind::Data)
+        let written = file
+            .write_iobuffer_chain(
+                buffer_len,
+                len as usize,
+                |len| factory.create(0, len).map_err(map_buffer_error),
+                fatfs::IoKind::Data,
+            )
             .await?;
-        len -= take as u64;
+        if written == 0 {
+            return Err(FsError::WriteZero);
+        }
+        len -= written as u64;
     }
     Ok(())
 }

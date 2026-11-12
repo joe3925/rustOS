@@ -720,30 +720,16 @@ async fn vol_pdo_read_impl<'req, 'data, 'b>(
         }
     };
 
-    let (offset, len_req, no_buffer, req_data_len) = {
-        let r = &*req;
-        (
-            r.offset,
-            r.len,
-            r.no_buffer,
-            r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
-        )
-    };
-
-    let Some(len) = volume_request_len(
-        vol_len,
-        offset,
-        len_req,
-        no_buffer,
-        req_data_len,
-        "read",
-    )? else {
-        return Ok(DriverStep::Complete);
-    };
-
-    {
-        let w = &mut *req;
-        w.len = len;
+    for read in req.iter_mut() {
+        read.len = volume_request_len(
+            vol_len,
+            read.offset,
+            read.len,
+            read.no_buffer,
+            read.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+            "read",
+        )?
+        .unwrap_or(0);
     }
 
     let cache = match dx.cache.get() {
@@ -779,30 +765,16 @@ async fn vol_pdo_write_impl<'req, 'data, 'b>(
         }
     };
 
-    let (offset, len_req, no_buffer, req_data_len) = {
-        let r = &*req;
-        (
-            r.offset,
-            r.len,
-            r.no_buffer,
-            r.buffer.as_ref().map_or(0, |buffer| buffer.len()),
-        )
-    };
-
-    let Some(len) = volume_request_len(
-        vol_len,
-        offset,
-        len_req,
-        no_buffer,
-        req_data_len,
-        "write",
-    )? else {
-        return Ok(DriverStep::Complete);
-    };
-
-    {
-        let w = &mut *req;
-        w.len = len;
+    for write in req.iter_mut() {
+        write.len = volume_request_len(
+            vol_len,
+            write.offset,
+            write.len,
+            write.no_buffer,
+            write.buffer.as_ref().map_or(0, |buffer| buffer.len()),
+            "write",
+        )?
+        .unwrap_or(0);
     }
 
     let cache = match dx.cache.get() {

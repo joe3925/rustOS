@@ -14,6 +14,7 @@ pub trait IoBase: Send {
 /// It is based on the `std::io::Read` trait.
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::dma::{FromDevice, IoBuffer, ToDevice};
+use kernel_types::request::Write as WriteRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoKind {
@@ -95,6 +96,12 @@ pub trait WriteIoBuffer: IoBase {
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         kind: IoKind,
     ) -> AbiFuture<Result<usize, Self::Error>>;
+
+    fn write_iobuffer_chain<'a, 'buffer>(
+        &'a mut self,
+        requests: &'a mut WriteRequest<'buffer>,
+        kind: IoKind,
+    ) -> AbiFuture<Result<(), Self::Error>>;
 }
 
 /// Enumeration of possible methods to seek within an I/O object.

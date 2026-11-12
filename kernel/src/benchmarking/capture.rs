@@ -2846,7 +2846,20 @@ pub async fn bench_c_drive_io_inner(
     } else {
         DISK_BENCH_FILE
     };
+    let passes = total_bytes.div_ceil(bytes_per_pass);
+    println!(
+        "\n[disk-bench] path={}/{} mode={} total_per_pass={} MiB passes={} total_bytes={}",
+        DISK_BENCH_DIR,
+        file_name,
+        mode,
+        bytes_per_pass / 1024 / 1024,
+        passes,
+        total_bytes
+    );
+    let setup_timer = Stopwatch::start();
     let mut dir_path = Path::from_string(DISK_BENCH_DIR);
+    println!("[disk-bench] setup: creating/opening directory");
+    let dir_timer = Stopwatch::start();
     if let Err(e) = File::make_dir(&dir_path).await {
         println!(
             "[disk-bench] failed to create bench dir {}: {:?}",
@@ -2854,9 +2867,16 @@ pub async fn bench_c_drive_io_inner(
         );
         return None;
     }
+    let dir_ns = dir_timer.elapsed_nanos();
+    println!(
+        "[disk-bench] setup: directory ready in {:.3} ms",
+        dir_ns as f64 / 1_000_000.0
+    );
 
     dir_path.push(file_name);
 
+    println!("[disk-bench] setup: opening/creating file");
+    let open_timer = Stopwatch::start();
     let mut file = match File::open(
         &dir_path,
         if write_through {
@@ -2880,10 +2900,21 @@ pub async fn bench_c_drive_io_inner(
             return None;
         }
     };
+    let open_ns = open_timer.elapsed_nanos();
+    println!(
+        "[disk-bench] setup: file open/create took {:.3} ms, size={} bytes",
+        open_ns as f64 / 1_000_000.0,
+        file.size
+    );
 
     let bench_len = bytes_per_pass as u64;
     let initialize = file.size != bench_len;
     if initialize {
+        println!(
+            "[disk-bench] setup: resizing file from {} to {} bytes",
+            file.size, bench_len
+        );
+        let resize_timer = Stopwatch::start();
         if let Err(e) = file.set_len(bench_len).await {
             println!(
                 "[disk-bench] failed to size benchmark file to {} bytes: {:?}",
@@ -2892,7 +2923,13 @@ pub async fn bench_c_drive_io_inner(
             let _ = file.close().await;
             return None;
         }
+        let resize_ns = resize_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: set_len took {:.3} ms; flushing file sizing",
+            resize_ns as f64 / 1_000_000.0
+        );
 
+        let flush_timer = Stopwatch::start();
         if let Err(e) = file.flush().await {
             println!(
                 "[disk-bench] failed to flush benchmark file sizing: {:?}",
@@ -2901,8 +2938,17 @@ pub async fn bench_c_drive_io_inner(
             let _ = file.close().await;
             return None;
         }
+        let flush_ns = flush_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: sizing flush took {:.3} ms",
+            flush_ns as f64 / 1_000_000.0
+        );
+    } else {
+        println!("[disk-bench] setup: file size unchanged; skipping sizing and data initialization");
     }
 
+    println!("[disk-bench] setup: preparing I/O backing and data pattern");
+    let backing_timer = Stopwatch::start();
     let max_size = DISK_BENCH_SIZES.iter().copied().max().unwrap_or(4096);
     let mut buf = vec![0u8; max_size];
 
@@ -2918,10 +2964,15 @@ pub async fn bench_c_drive_io_inner(
             return None;
         }
     };
-
-    let passes = total_bytes.div_ceil(bytes_per_pass);
+    let backing_ns = backing_timer.elapsed_nanos();
+    println!(
+        "[disk-bench] setup: I/O backing and data pattern took {:.3} ms",
+        backing_ns as f64 / 1_000_000.0
+    );
 
     if initialize {
+        println!("[disk-bench] setup: writing {} bytes of initial data", bench_len);
+        let initialize_timer = Stopwatch::start();
         let mut offset = 0;
         while offset < bench_len {
             let len = core::cmp::min(max_size, (bench_len - offset) as usize);
@@ -2941,21 +2992,30 @@ pub async fn bench_c_drive_io_inner(
             }
             offset += len as u64;
         }
+        let initialize_ns = initialize_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: initial data writes took {:.3} ms ({:.2} MiB/s); flushing data",
+            initialize_ns as f64 / 1_000_000.0,
+            mib_per_sec(bench_len, initialize_ns as u128)
+        );
+        let flush_timer = Stopwatch::start();
         if let Err(e) = file.flush().await {
             println!("[disk-bench] initialization flush failed: {:?}", e);
             let _ = file.close().await;
             return None;
         }
+        let flush_ns = flush_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: initial data flush took {:.3} ms",
+            flush_ns as f64 / 1_000_000.0
+        );
     }
 
+    let setup_ns = setup_timer.elapsed_nanos();
     println!(
-        "\n[disk-bench] path={}/{} mode={} total_per_pass={} MiB passes={} total_bytes={}",
-        DISK_BENCH_DIR,
-        file_name,
-        mode,
-        bytes_per_pass / 1024 / 1024,
-        passes,
-        total_bytes
+        "[disk-bench] setup complete in {:.3} ms; starting {} I/O buffer creations",
+        setup_ns as f64 / 1_000_000.0,
+        DISK_BENCH_IOBUFFER_CREATE_OPS
     );
 
     let create_timer = Stopwatch::start();
@@ -2982,8 +3042,11 @@ pub async fn bench_c_drive_io_inner(
     };
     let create_avg_ns = create_ns as f64 / DISK_BENCH_IOBUFFER_CREATE_OPS as f64;
     println!(
-        "[disk-bench] iobuffer creation: {:.2} buffers/s, {:.2} ns/buffer ({} buffers)",
-        create_ops_per_sec, create_avg_ns, DISK_BENCH_IOBUFFER_CREATE_OPS
+        "[disk-bench] iobuffer creation: {:.2} buffers/s, {:.2} ns/buffer ({} buffers, {:.3} ms total)",
+        create_ops_per_sec,
+        create_avg_ns,
+        DISK_BENCH_IOBUFFER_CREATE_OPS,
+        create_ns as f64 / 1_000_000.0
     );
 
     println!(
