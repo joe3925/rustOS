@@ -16,6 +16,12 @@ extern "C" fn record_unmap(_dev: &Arc<DeviceObject>, cookie: usize) {
     UNMAP_COOKIE_SUM.fetch_add(cookie, Ordering::AcqRel);
 }
 
+extern "C" fn count_unmap(_dev: &Arc<DeviceObject>, cookie: usize) {
+    // Tests keep the counter alive until every buffer with this mapping is dropped.
+    let count = unsafe { &*(cookie as *const AtomicUsize) };
+    count.fetch_add(1, Ordering::AcqRel);
+}
+
 fn device() -> Arc<DeviceObject> {
     DeviceObject::new(DeviceInit::new())
 }
@@ -169,6 +175,114 @@ fn virtual_iobuffer_copies_without_physical_description() {
     buffer.copy_from_slice(1, &[9, 8]).unwrap();
     assert_eq!(bytes, [1, 9, 8, 4, 5, 6]);
     assert_eq!(buffer.regions().count(), 0);
+}
+
+#[test]
+fn factory_mapping_unmaps_after_last_split_without_releasing_anchor_lease() {
+    let unmaps = AtomicUsize::new(0);
+    let frames = [frame(0x4000)];
+    let backing = backing_from_frames(0, TEST_GRANULE, &frames).unwrap();
+    let factory = backing
+        .create_phys_to_device(0, TEST_GRANULE)
+        .unwrap()
+        .into_to_device_factory()
+        .unwrap();
+    let mapped = factory
+        .create(0, TEST_GRANULE)
+        .unwrap()
+        .apply_dma_mapping(
+            IoBufferDmaMappingLayout::Contiguous {
+                dma_addr: 0x8000,
+                byte_len: TEST_GRANULE,
+            },
+            device(),
+            count_unmap,
+            &unmaps as *const AtomicUsize as usize,
+        )
+        .unwrap();
+
+    let (left, right) = mapped.split_at(TEST_GRANULE / 2).unwrap();
+    drop(left);
+    assert_eq!(unmaps.load(Ordering::Acquire), 0);
+    drop(right);
+    assert_eq!(unmaps.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        backing.create_phys_to_device(0, TEST_GRANULE),
+        Err(IoBufferError::LeaseConflict { .. })
+    ));
+
+    drop(factory);
+    drop(backing.create_phys_to_device(0, TEST_GRANULE).unwrap());
+    assert_eq!(unmaps.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn factory_mapping_replacement_and_removal_preserve_other_owners() {
+    let unmaps = [const { AtomicUsize::new(0) }; 3];
+    let frames = [frame(0x4000)];
+    let backing = backing_from_frames(0, TEST_GRANULE, &frames).unwrap();
+    let factory = backing
+        .create_phys_to_device(0, TEST_GRANULE)
+        .unwrap()
+        .apply_dma_mapping(
+            IoBufferDmaMappingLayout::Contiguous {
+                dma_addr: 0x8000,
+                byte_len: TEST_GRANULE,
+            },
+            device(),
+            count_unmap,
+            &unmaps[0] as *const AtomicUsize as usize,
+        )
+        .unwrap()
+        .into_to_device_factory()
+        .unwrap();
+    let child = factory.create(0, TEST_GRANULE).unwrap();
+    assert_eq!(child.dma_segments().next().unwrap().dma_addr, 0x8000);
+    let mapped = child
+        .apply_dma_mapping(
+            IoBufferDmaMappingLayout::Contiguous {
+                dma_addr: 0xa000,
+                byte_len: TEST_GRANULE,
+            },
+            device(),
+            count_unmap,
+            &unmaps[1] as *const AtomicUsize as usize,
+        )
+        .unwrap();
+    let (left, right) = mapped.split_at(TEST_GRANULE / 2).unwrap();
+    let left = left
+        .apply_dma_mapping(
+            IoBufferDmaMappingLayout::Contiguous {
+                dma_addr: 0xc000,
+                byte_len: TEST_GRANULE / 2,
+            },
+            device(),
+            count_unmap,
+            &unmaps[2] as *const AtomicUsize as usize,
+        )
+        .unwrap();
+    assert_eq!(unmaps[1].load(Ordering::Acquire), 0);
+    assert_eq!(left.dma_segments().next().unwrap().dma_addr, 0xc000);
+    assert_eq!(right.dma_segments().next().unwrap().dma_addr, 0xa800);
+
+    let left = left.remove_dma_mapping().unwrap();
+    assert!(!left.is_dma_mapped());
+    assert_eq!(unmaps[2].load(Ordering::Acquire), 1);
+    drop(left);
+    drop(right);
+    assert_eq!(unmaps[1].load(Ordering::Acquire), 1);
+    assert_eq!(unmaps[0].load(Ordering::Acquire), 0);
+    let inherited = factory.create(0, TEST_GRANULE).unwrap();
+    assert_eq!(inherited.dma_segments().next().unwrap().dma_addr, 0x8000);
+    let inherited = inherited.remove_dma_mapping().unwrap();
+    assert!(!inherited.is_dma_mapped());
+    drop(inherited);
+    assert_eq!(unmaps[0].load(Ordering::Acquire), 0);
+
+    drop(factory);
+    for count in unmaps {
+        assert_eq!(count.load(Ordering::Acquire), 1);
+    }
 }
 
 #[test]
