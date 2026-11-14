@@ -13,6 +13,10 @@ pub struct IoBuffer<'backing, 'data, Access: IoBufferAccess> {
     _access: PhantomData<fn() -> Access>,
 }
 
+// Keep the backing pointer before the lease in the Backing payload. With three
+// variants, repr(Rust) reordered these fields and generated overlapping stack
+// copies on the create/drop hot path (nightly-2026-11-01).
+#[repr(C)]
 enum IoBufferSource<'backing, 'data> {
     Backing {
         backing: &'backing IoBufferBacking<'data>,
@@ -20,16 +24,22 @@ enum IoBufferSource<'backing, 'data> {
     },
     Factory {
         anchor: &'backing IoBuffer<'backing, 'data, ToDevice>,
-        mapping: FactoryDmaMapping,
+        mapping: FactoryDmaMapping<'backing, 'data>,
     },
     Virt(VirtIoBuffer),
 }
 
 #[derive(Clone, Copy)]
-enum FactoryDmaMapping {
+enum FactoryDmaMapping<'backing, 'data> {
     Inherited,
     Unmapped,
-    Owned(usize),
+    // Cache the backing resolved when mapping. This avoids walking the anchor
+    // in cleanup and keeps Drop small enough to inline on the virtual hot path.
+    // The extra reference fits within IoBufferSource's existing Backing payload.
+    Owned {
+        backing: &'backing IoBufferBacking<'data>,
+        record: usize,
+    },
 }
 
 pub struct IoBufferToDeviceFactory<'backing, 'data> {
@@ -264,8 +274,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                 Err(err) => Err((ManuallyDrop::into_inner(this), err)),
             },
             IoBufferSource::Factory { anchor, mapping } => {
-                if let FactoryDmaMapping::Owned(record) = mapping {
-                    if let Err(err) = anchor.backing().unwrap().retain_dma_record(*record) {
+                if let FactoryDmaMapping::Owned { backing, record } = mapping {
+                    if let Err(err) = backing.retain_dma_record(*record) {
                         return Err((ManuallyDrop::into_inner(this), err));
                     }
                 }
@@ -600,10 +610,14 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                 Ok(record) => record,
                 Err(err) => return Err((self_, err)),
             };
-            if let FactoryDmaMapping::Owned(previous) = *mapping {
-                backing.release_dma_record(previous);
+            if let FactoryDmaMapping::Owned {
+                backing: previous_backing,
+                record: previous,
+            } = *mapping
+            {
+                previous_backing.release_dma_record(previous);
             }
-            *mapping = FactoryDmaMapping::Owned(record);
+            *mapping = FactoryDmaMapping::Owned { backing, record };
             return Ok(self_);
         }
         if let IoBufferSource::Virt(virt) = &mut self_.source {
@@ -675,8 +689,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
                 FactoryDmaMapping::Unmapped => {
                     return Err((self_, IoBufferError::DmaMappingNotFound));
                 }
-                FactoryDmaMapping::Owned(record) => {
-                    anchor.backing().unwrap().release_dma_record(record);
+                FactoryDmaMapping::Owned { backing, record } => {
+                    backing.release_dma_record(record);
                 }
                 FactoryDmaMapping::Inherited => {}
             }
@@ -713,8 +727,8 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
             IoBufferSource::Factory { anchor, mapping } => match mapping {
                 FactoryDmaMapping::Inherited => anchor.dma_mapping_snapshot(),
                 FactoryDmaMapping::Unmapped => Ok(None),
-                FactoryDmaMapping::Owned(record) => {
-                    anchor.backing().unwrap().dma_record_snapshot(*record).map(Some)
+                FactoryDmaMapping::Owned { backing, record } => {
+                    backing.dma_record_snapshot(*record).map(Some)
                 }
             },
             IoBufferSource::Virt(virt) => Ok(virt.details.as_ref()
@@ -772,9 +786,10 @@ impl<'backing, 'data, Access: IoBufferAccess> Drop for IoBuffer<'backing, 'data,
         if let IoBufferSource::Backing { backing, lease } = &self.source {
             backing.release_lease(*lease);
         } else if let IoBufferSource::Factory {
-            anchor, mapping: FactoryDmaMapping::Owned(record),
+            mapping: FactoryDmaMapping::Owned { backing, record },
+            ..
         } = &self.source {
-            anchor.backing().unwrap().release_dma_record(*record);
+            backing.release_dma_record(*record);
         }
     }
 }
