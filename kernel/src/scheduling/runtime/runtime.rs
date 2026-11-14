@@ -4,7 +4,7 @@ use kernel_executor::platform::{self, ExecutorPlatform, Job};
 use spin::Once;
 
 use crate::platform::current_is_in_interrupt;
-use crate::static_handlers::{print, task_yield};
+use crate::static_handlers::print;
 use crate::sync_platform::{BoundedThreadPool, ThreadPool};
 
 struct KernelExecutorPlatform {
@@ -34,7 +34,7 @@ impl KernelExecutorPlatform {
 }
 
 pub fn yield_now() {
-    unsafe { task_yield() };
+    crate::platform::request_task_yield();
 }
 
 impl ExecutorPlatform for KernelExecutorPlatform {

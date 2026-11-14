@@ -4,7 +4,7 @@ use core::{
     time::Duration,
 };
 use kernel_executor::runtime::runtime::{
-    block_on as kernel_block_on, block_on_waker, spawn_blocking as kernel_spawn_blocking,
+    block_on_waker, spawn_blocking as kernel_spawn_blocking,
     spawn_detached as kernel_spawn_detached, spawn_join_owned as kernel_spawn,
 };
 use kernel_types::dma::DeviceMmuPlatformDeviceIdentity;
@@ -20,21 +20,18 @@ use crate::{
     console::CONSOLE,
     drivers::{
         ACPI::ACPIImpl,
-        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
+        pnp::{manager::PNP_MANAGER, request::DpcFn},
     },
     file_system::{
         file::{self, File},
         file_provider::VFS_PROVIDER,
     },
     idt::interrupt_impl::{
-        bind_msi_interrupt, bind_wired_interrupt, irq_borrowed_ensure_signal, irq_borrowed_signal,
-        irq_borrowed_signal_all, irq_borrowed_signal_n, irq_signal, irq_signal_all,
-        irq_signal_exactly, irq_signal_n,
+        bind_msi_interrupt, bind_wired_interrupt,
     },
     memory::{dma, paging::stack::StackSize},
     registry::reg,
     scheduling::{self, scheduler::scheduler, task::Task},
-    structs::stopwatch::Stopwatch,
     util::boot_info,
 };
 use acpi::AcpiTables;
@@ -46,13 +43,13 @@ use alloc::{
 };
 use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
 use kernel_types::{
-    ClassEventCallback, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
+    ClassEventCallback,
     async_ffi::{AbiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchMetricDirection, BenchMetricUnit, BenchObjectId, BenchRunHandle,
         BenchSpanId, BenchSuiteDescriptor, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
-    device::{DevNode, DeviceInit, DeviceObject, DriverObject},
+    device::{DevNode, DeviceInit, DeviceObject},
     dma::{
         DmaBufferView, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappedBuffer,
         DmaMappingStrategy, DmaPciDeviceIdentity,
@@ -62,7 +59,7 @@ use kernel_types::{
     fs::{OpenFlags, Path},
     io::IoTarget,
     irq::{
-        HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, MsiBinding,
+        HardwareInterruptId, IrqHandle, IrqIsrFn, MsiBinding,
         MsiBindingRequest,
     },
     pci::PciConfigAddress,
@@ -151,44 +148,6 @@ pub extern "C" fn kernel_pci_write_config_u32(address: PciConfigAddress, value: 
 }
 
 #[unsafe(no_mangle)]
-#[cfg_attr(irq_check, irq::context)]
-pub unsafe extern "C" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
-    unsafe {
-        irq_borrowed_signal(handle, meta);
-    }
-}
-
-#[unsafe(no_mangle)]
-#[cfg_attr(irq_check, irq::context)]
-pub unsafe extern "C" fn kernel_irq_borrowed_ensure_signal(
-    handle: IrqBorrowedHandle,
-    meta: IrqMeta,
-) {
-    unsafe {
-        irq_borrowed_ensure_signal(handle, meta);
-    }
-}
-
-#[unsafe(no_mangle)]
-#[cfg_attr(irq_check, irq::context)]
-pub unsafe extern "C" fn kernel_irq_borrowed_signal_n(
-    handle: IrqBorrowedHandle,
-    meta: IrqMeta,
-    n: u32,
-) {
-    unsafe {
-        irq_borrowed_signal_n(handle, meta, n);
-    }
-}
-
-#[unsafe(no_mangle)]
-#[cfg_attr(irq_check, irq::context)]
-pub unsafe extern "C" fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta) {
-    unsafe {
-        irq_borrowed_signal_all(handle, meta);
-    }
-}
-#[unsafe(no_mangle)]
 pub extern "C" fn kernel_dma_base_page_size() -> u64 {
     dma::get_info()
         .capabilities
@@ -248,32 +207,12 @@ pub extern "C" fn print(str: &str) {
         console.print(str.as_bytes());
     }
 }
-#[unsafe(no_mangle)]
-pub fn routing_print_impl(s: &str) {
-    crate::platform::serial_write_bytes(s.as_bytes());
-    if let Some(console) = CONSOLE.lock().as_mut() {
-        console.print(s.as_bytes());
-    }
-}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wait_duration(time: Duration) {
     crate::platform::wait_duration(time);
 }
-#[unsafe(no_mangle)]
-#[cfg_attr(irq_check, irq::context)]
-pub extern "C" fn stopwatch_new() -> Stopwatch {
-    Stopwatch::start()
-}
-#[unsafe(no_mangle)]
-#[cfg_attr(irq_check, irq::context)]
-pub extern "C" fn elapsed(s: &Stopwatch) -> Duration {
-    s.elapsed()
-}
-#[unsafe(no_mangle)]
-#[cfg_attr(irq_check, irq::context)]
-pub extern "C" fn kernel_cycle_counter() -> u64 {
-    crate::platform::cycle_counter()
-}
+
 #[unsafe(no_mangle)]
 #[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn kernel_cycle_counter_frequency_hz() -> u64 {
@@ -419,35 +358,6 @@ pub extern "C" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
     PNP_MANAGER.queue_dpc(func, arg)
 }
 
-pub extern "C" fn driver_get_name(driver: &Arc<DriverObject>) -> String {
-    driver.driver_name.clone()
-}
-
-pub extern "C" fn driver_get_flags(driver: &Arc<DriverObject>) -> u32 {
-    driver.flags
-}
-
-pub extern "C" fn driver_set_evt_device_add(
-    driver: &Arc<DriverObject>,
-    callback: EvtDriverDeviceAdd,
-) {
-    *driver.evt_device_add.write() = Some(callback);
-}
-
-pub extern "C" fn driver_set_evt_probe_device(
-    driver: &Arc<DriverObject>,
-    callback: EvtDriverProbeDevice,
-) {
-    *driver.evt_probe_device.write() = Some(callback);
-}
-
-pub extern "C" fn driver_set_evt_driver_unload(
-    driver: &Arc<DriverObject>,
-    callback: EvtDriverUnload,
-) {
-    *driver.evt_driver_unload.write() = Some(callback);
-}
-
 pub extern "C" fn get_rsdp() -> u64 {
     boot_info().rsdp_addr.into_option().unwrap_or(0)
 }
@@ -550,13 +460,6 @@ pub extern "C" fn pnp_add_class_listener(
 
 static BLOCKING_INIT: Once = Once::new();
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn task_yield() {
-    crate::platform::with_interrupts_disabled(|| {
-        crate::platform::request_task_yield();
-    });
-}
-
 pub unsafe extern "C" fn switch_to_vfs_async() -> AbiFuture<Result<(), KernelError>> {
     file::switch_to_vfs().into_abi()
 }
@@ -603,11 +506,6 @@ pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_spawn_abi(fut: AbiFuture<()>) {
-    kernel_executor::runtime::abi_spawn::kernel_spawn_abi_internal(fut);
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()> {
     let handle = kernel_spawn(fut);
     handle.into_abi()
@@ -615,14 +513,7 @@ pub extern "C" fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()>
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_detached_abi(fut: AbiFuture<()>) {
-    kernel_spawn_detached(async move {
-        fut.await;
-    });
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_block_on_abi(fut: AbiFuture<()>) {
-    kernel_block_on(fut);
+    kernel_spawn_detached(fut);
 }
 
 #[unsafe(no_mangle)]
@@ -849,11 +740,6 @@ pub unsafe extern "C" fn kernel_mapping_drop(base: VirtAddr, size: u64, owns_fra
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virt_to_phys(root: AddressSpaceRoot, addr: VirtAddr) -> Option<(u64, PhysAddr)> {
-    crate::memory::paging::map::virt_to_phys(root, addr)
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn resolve_virtual_range_frame(
     root: AddressSpaceRoot,
     addr: VirtAddr,
@@ -866,47 +752,7 @@ pub extern "C" fn kernel_address_space_root() -> AddressSpaceRoot {
     crate::memory::paging::address_space::kernel_address_space_root()
 }
 
-// ============================================================================
-// Routing functions - linker seams for kernel_routing crate (kernel_link feature)
-// and FFI exports for drivers
-// ============================================================================
-
-/// Resolve a symlink/path to a device target
-/// Linker seam for kernel_routing when compiled with kernel_link feature
-#[unsafe(no_mangle)]
-pub fn routing_resolve_path_to_device_impl(path: &str) -> Option<IoTarget> {
-    PNP_MANAGER.resolve_targetio_from_symlink(path.to_string())
-}
-
-/// Get the top device from a weak DevNode reference
-/// Linker seam for kernel_routing when compiled with kernel_link feature
-#[unsafe(no_mangle)]
-pub fn routing_get_stack_top_from_weak_impl(
-    dev_node_weak: &alloc::sync::Weak<DevNode>,
-) -> Option<Arc<DeviceObject>> {
-    let dn = dev_node_weak.upgrade()?;
-    let stack_top = dn
-        .stack
-        .read()
-        .as_ref()
-        .and_then(|s| s.get_top_device_object());
-    stack_top.or_else(|| dn.get_pdo())
-}
-
-#[unsafe(no_mangle)]
-pub fn routing_capture_error_backtrace_impl(output: &mut kernel_types::error::ErrorBacktrace) {
-    *output = crate::error::capture();
-}
-
-// FFI exports for drivers (extern "C" ABI)
 #[unsafe(no_mangle)]
 pub extern "C" fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget> {
-    routing_resolve_path_to_device_impl(path)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn routing_get_stack_top_from_weak(
-    dev_node_weak: &alloc::sync::Weak<DevNode>,
-) -> Option<Arc<DeviceObject>> {
-    routing_get_stack_top_from_weak_impl(dev_node_weak)
+    PNP_MANAGER.resolve_targetio_from_symlink(path.to_string())
 }

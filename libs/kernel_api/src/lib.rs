@@ -2,7 +2,8 @@
 #![allow(non_upper_case_globals)]
 pub extern crate alloc;
 
-pub use kernel_types::{async_ffi, request, status};
+pub use kernel_executor::async_ffi;
+pub use kernel_types::{request, status};
 
 pub use kernel_routing;
 pub use kernel_types;

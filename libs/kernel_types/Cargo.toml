@@ -11,6 +11,7 @@ crate-type = ["rlib"]
 
 
 [dependencies]
+kernel_executor = { path = "../kernel_executor", default-features = false }
 kernel_sync = { path = "../kernel_sync", default-features = false }
 kernel_macros = { path = "../kernel_macros" }
 

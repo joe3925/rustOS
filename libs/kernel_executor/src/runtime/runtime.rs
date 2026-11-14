@@ -6,7 +6,7 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
-use kernel_types::runtime::BlockOnThreadState;
+use crate::thread_state::BlockOnThreadState;
 
 pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 

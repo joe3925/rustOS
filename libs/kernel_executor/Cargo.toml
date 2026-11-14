@@ -10,20 +10,20 @@ license = "Apache-2.0"
 crate-type = ["rlib"]
 
 [dependencies]
-kernel_sync = { path = "../kernel_sync", default-features = false }
-spin = "0.10"
-portable-atomic = "1"
-kernel_types = { path = "../kernel_types" }
+kernel_sync = { path = "../kernel_sync", default-features = false, optional = true }
+spin = { version = "0.10", optional = true }
+portable-atomic = { version = "1", optional = true }
 loom = { version = "0.7", optional = true }
 
 [features]
-loom = ["dep:loom"]
+default = ["executor"]
+executor = ["dep:kernel_sync", "dep:spin", "dep:portable-atomic"]
+loom = ["executor", "dep:loom"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(irq_check)'] }
 
 [dev-dependencies]
-kernel_types = { path = "../kernel_types", features = ["hosted-tests"] }
 threadpool = "1.8"
 tokio = { version = "1.45", features = [
     "io-util",

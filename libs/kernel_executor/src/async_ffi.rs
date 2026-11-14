@@ -1,3 +1,6 @@
+use crate::future_allocation::FutureAllocation;
+use core::alloc::Layout;
+use core::ptr::NonNull;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
@@ -34,19 +37,12 @@ pub enum AbiPoll {
 pub type AbiFuturePollFn<T> =
     unsafe extern "C" fn(future: *mut (), context: *mut (), output: *mut MaybeUninit<T>) -> AbiPoll;
 pub type AbiFutureDropFn = unsafe extern "C" fn(*mut ());
-pub type AbiFutureFreeFn = unsafe extern "C" fn(AbiFutureAllocation);
-
-unsafe extern "C" {
-    fn kernel_abi_future_allocate(size: usize, align: usize) -> AbiFutureAllocation;
-    fn kernel_abi_future_free(allocation: AbiFutureAllocation);
-}
 
 #[repr(C)]
 pub struct AbiFuture<T> {
     allocation: AbiFutureAllocation,
     poll_fn: AbiFuturePollFn<T>,
     drop_fn: AbiFutureDropFn,
-    free_fn: AbiFutureFreeFn,
     live: bool,
     _output: PhantomData<fn() -> T>,
 }
@@ -65,7 +61,13 @@ impl<T> AbiFuture<T> {
         self.live = false;
         unsafe {
             (self.drop_fn)(self.allocation.ptr);
-            (self.free_fn)(self.allocation);
+            FutureAllocation {
+                ptr: NonNull::new_unchecked(self.allocation.ptr.cast()),
+                layout: Layout::from_size_align_unchecked(
+                    self.allocation.capacity as usize,
+                    self.allocation.align as usize,
+                ),
+            }.release();
         }
     }
 }
@@ -108,14 +110,16 @@ impl<F> FutureExt for F
 where
     F: Future + Send,
 {
+    #[inline]
     fn into_abi(self) -> AbiFuture<Self::Output> {
-        let allocation = unsafe {
-            kernel_abi_future_allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+        let storage = FutureAllocation::allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+            .expect("AbiFuture allocation failed");
+        let allocation = AbiFutureAllocation {
+            ptr: storage.ptr.as_ptr().cast(),
+            reserved: [0; 2],
+            capacity: storage.layout.size() as u32,
+            align: storage.layout.align() as u32,
         };
-        assert!(
-            !allocation.ptr.is_null(),
-            "AbiFuture allocation failed"
-        );
         unsafe {
             allocation.ptr.cast::<F>().write(self);
         }
@@ -123,7 +127,6 @@ where
             allocation,
             poll_fn: poll_future::<F>,
             drop_fn: drop_future::<F>,
-            free_fn: kernel_abi_future_free,
             live: true,
             _output: PhantomData,
         }

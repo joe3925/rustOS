@@ -11,7 +11,7 @@ extern crate self as kernel_types;
 
 pub use prost::Message;
 pub mod arch;
-pub mod async_ffi;
+pub use kernel_executor::async_ffi;
 pub mod bench_archive;
 pub mod benchmark;
 pub mod capacity;

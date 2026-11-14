@@ -9,13 +9,12 @@ use std::task::Wake;
 use std::time::Duration;
 
 use crate::global_async::{ExecutorDomainConfig, GlobalAsyncExecutor};
-use crate::runtime::abi_spawn::kernel_spawn_abi_internal;
 use crate::runtime::runtime::{
     block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
     spawn_join_owned_in_executor_domain as spawn_in_executor_domain, JoinAll,
 };
 use crate::runtime::slab::constants::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
-use kernel_types::async_ffi::{AbiFuture, FutureExt};
+use crate::async_ffi::{AbiFuture, FutureExt};
 
 fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
     unsafe fn clone(ptr: *const ()) -> RawWaker {
@@ -924,7 +923,7 @@ fn abi_spawn_internal_runs_owned_abi_future() {
             completed_for_future.fetch_add(1, Ordering::AcqRel);
         }
         .into_abi();
-        kernel_spawn_abi_internal(future);
+        crate::runtime::runtime::spawn_detached(future);
     }));
 
     super::support::wait_until(Duration::from_secs(10), || {

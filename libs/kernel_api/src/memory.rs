@@ -56,7 +56,7 @@ pub fn virt_to_phys(to_phys: VirtAddr) -> Option<(u64, PhysAddr)> {
 }
 
 pub fn virt_to_phys_in(root: AddressSpaceRoot, to_phys: VirtAddr) -> Option<(u64, PhysAddr)> {
-    unsafe { kernel_sys::virt_to_phys(root, to_phys) }
+    unsafe { kernel_sys::resolve_virtual_range_frame(root, to_phys) }
 }
 
 pub fn resolve_virtual_range_frame(

@@ -1,22 +1,32 @@
 #![no_std]
-#![cfg_attr(target_has_atomic = "128", feature(integer_atomics))]
-#![cfg_attr(not(any(test, loom, feature = "loom")), feature(thread_local))]
+#![cfg_attr(all(feature = "executor", target_has_atomic = "128"), feature(integer_atomics))]
+#![cfg_attr(all(feature = "executor", not(any(test, loom, feature = "loom"))), feature(thread_local))]
 
 extern crate alloc;
 #[cfg(any(test, loom, feature = "loom"))]
 extern crate std;
 
+pub mod async_ffi;
+pub mod thread_state;
+
+#[cfg(feature = "executor")]
 mod domain;
 pub mod future_allocation;
+#[cfg(feature = "executor")]
 pub mod global_async;
+#[cfg(feature = "executor")]
 pub mod growable_slab;
+#[cfg(feature = "executor")]
 pub mod platform;
+#[cfg(feature = "executor")]
 pub mod runtime;
+#[cfg(feature = "executor")]
 mod sync;
 
-#[cfg(all(test, not(any(loom, feature = "loom"))))]
+#[cfg(all(test, feature = "executor", not(any(loom, feature = "loom"))))]
 mod test;
 
+#[cfg(feature = "executor")]
 #[macro_export]
 macro_rules! println {
     () => {
@@ -31,6 +41,7 @@ macro_rules! println {
     }};
 }
 
+#[cfg(feature = "executor")]
 #[macro_export]
 macro_rules! spawn_join {
     ($future:expr_2021) => {

@@ -11,8 +11,6 @@ crate-type = ["rlib"]
 
 [features]
 default = ["ffi"]
-# When enabled, uses direct function calls via linker seams instead of FFI.
-# This should only be enabled when compiling as part of the kernel.
 kernel_link = []
 ffi = ["dep:kernel_sys"]
 

@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+pub use kernel_executor::thread_state::BlockOnThreadState;
 use core::task::Waker;
+use core::time::Duration;
 
 #[repr(C)]
 pub struct BlockOnContext {
@@ -9,53 +10,32 @@ pub struct BlockOnContext {
 }
 
 #[repr(C)]
-pub struct BlockOnThreadState {
-    ready: AtomicBool,
-    active: AtomicBool,
-}
-
-impl BlockOnThreadState {
-    pub const fn new() -> Self {
-        Self {
-            ready: AtomicBool::new(false),
-            active: AtomicBool::new(false),
-        }
-    }
-
-    #[inline(always)]
-    pub fn try_enter(&self) -> bool {
-        self.active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    #[inline(always)]
-    pub fn exit(&self) {
-        self.active.store(false, Ordering::Release);
-    }
-
-    #[inline(always)]
-    pub fn clear_ready(&self) {
-        self.ready.store(false, Ordering::Release);
-    }
-
-    #[inline(always)]
-    pub fn take_ready(&self) -> bool {
-        self.ready.swap(false, Ordering::AcqRel)
-    }
-
-    #[inline(always)]
-    pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::Release);
-    }
-}
-#[repr(C)]
 pub struct Stopwatch {
     start_cycles: u64,
     cycle_counter_frequency_hz: u64,
 }
 
 impl Stopwatch {
+    #[inline]
+    pub fn new(start_cycles: u64, cycle_counter_frequency_hz: u64) -> Self {
+        assert!(cycle_counter_frequency_hz != 0, "platform cycle counter not calibrated");
+        Self { start_cycles, cycle_counter_frequency_hz }
+    }
+
+    #[inline]
+    pub fn duration_from_cycles(cycles: u64, frequency_hz: u64) -> Duration {
+        assert!(frequency_hz != 0, "platform cycle counter not calibrated");
+        let secs = cycles / frequency_hz;
+        let rem_cycles = cycles % frequency_hz;
+        let nanos = ((rem_cycles as u128 * 1_000_000_000) / frequency_hz as u128) as u32;
+        Duration::new(secs, nanos)
+    }
+
+    #[inline]
+    pub fn elapsed_at(&self, cycles: u64) -> Duration {
+        Self::duration_from_cycles(cycles - self.start_cycles, self.cycle_counter_frequency_hz)
+    }
+
     #[inline(always)]
     pub fn start_cycles(&self) -> u64 {
         self.start_cycles

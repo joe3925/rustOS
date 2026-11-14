@@ -717,3 +717,172 @@ impl core::fmt::Debug for DropHook {
             .finish()
     }
 }
+
+impl IrqHandleInner {
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        self.pending_signals.store(0, Ordering::Release);
+
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) = unsafe { slot.complete_claimed(ticket, IrqWaitResult::closed()) } {
+                waker.wake_by_ref();
+            }
+        }
+    }
+
+    #[inline]
+    pub fn signal_one(&self, meta: IrqMeta) {
+        let _ = self.signal_n(meta, 1);
+    }
+
+    #[inline]
+    pub fn ensure_signal_exactly_one(&self, meta: IrqMeta) {
+        if self.is_closed() {
+            return;
+        }
+
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
+                }
+            }
+
+            self.signal_phase.fetch_add(1, Ordering::AcqRel);
+            self.signal_active.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+
+        let _ = self
+            .pending_signals
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                if pending == 0 { Some(1) } else { Some(pending) }
+            });
+
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
+        if n == 0 || self.is_closed() {
+            return 0;
+        }
+
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+
+        let mut signaled = 0;
+
+        for slot in &self.waiters {
+            if signaled == n {
+                break;
+            }
+
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
+                }
+            }
+
+            signaled += 1;
+        }
+
+        if signaled < n {
+            self.pending_signals
+                .fetch_add(n - signaled, Ordering::AcqRel);
+        }
+
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
+        signaled
+    }
+
+    #[inline]
+    pub fn signal_all(&self, meta: IrqMeta) -> usize {
+        if self.is_closed() {
+            return 0;
+        }
+
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+
+        let mut signaled = 0;
+
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
+                }
+            }
+
+            signaled += 1;
+        }
+
+        if signaled == 0 {
+            self.pending_signals.fetch_add(1, Ordering::AcqRel);
+        }
+
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
+        signaled
+    }
+
+    #[inline]
+    pub fn cancel_waiter(&self, slot: usize) {
+        if let Some(waiter) = self.waiters.get(slot) {
+            waiter.cancel();
+        }
+    }
+
+    pub fn set_user_ctx(&self, v: usize) {
+        self.user_ctx.store(v, Ordering::Release);
+    }
+
+    pub fn user_ctx(&self) -> usize {
+        self.user_ctx.load(Ordering::Acquire)
+    }
+}

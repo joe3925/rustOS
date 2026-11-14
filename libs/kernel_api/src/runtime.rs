@@ -9,7 +9,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
-use kernel_sys::{elapsed, kernel_cycle_counter, kernel_cycle_counter_frequency_hz, stopwatch_new};
+use kernel_sys::kernel_cycle_counter_frequency_hz;
 use kernel_types::arch::{Platform, PlatformInfo};
 use spin::Mutex;
 
@@ -201,16 +201,16 @@ impl KernelStopwatch {
     pub fn start() -> Self {
         #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
+            let frequency_hz = kernel_cycle_counter_frequency_hz();
             Self {
-                inner: stopwatch_new(),
+                inner: Stopwatch::new(cycle_counter(), frequency_hz),
             }
         }
     }
 
     #[inline(always)]
     pub fn elapsed(&self) -> Duration {
-        #[cfg_attr(irq_check, irq::trusted(unsafe))]
-        unsafe { elapsed(&self.inner) }
+        self.inner.elapsed_at(cycle_counter())
     }
 
     #[inline(always)]

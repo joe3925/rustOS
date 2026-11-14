@@ -264,9 +264,6 @@ fn copy_framebuffer(src: &Optional<FrameBuffer>) -> Optional<FrameBuffer> {
     }
 }
 
-pub extern "C" fn function(x: i64) -> i64 {
-    (x - 10) / 10
-}
 #[cfg(test)]
 pub fn test_runner(tests: &[&dyn Fn()]) {
     println!("Running {} tests", tests.len());
