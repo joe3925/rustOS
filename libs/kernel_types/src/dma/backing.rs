@@ -220,10 +220,6 @@ impl LeaseSlot {
     }
 
     fn finish_release(&self) {
-        self.first_chunk.store(0, Ordering::Relaxed);
-        self.chunk_count.store(0, Ordering::Relaxed);
-        self.access.store(0, Ordering::Relaxed);
-        self.dma_record.store(NO_DMA_RECORD, Ordering::Relaxed);
         let generation = self.generation.load(Ordering::Relaxed);
         self.generation
             .store(generation.wrapping_add(1), Ordering::Relaxed);
@@ -378,7 +374,9 @@ impl<'data> IoBufferBacking<'data> {
 
             let mut leases = leases;
             for slot in leases.iter_mut() {
-                *slot = LeaseSlot::free();
+                if *slot.state.get_mut() != LEASE_FREE {
+                    *slot = LeaseSlot::free();
+                }
             }
 
             let mut dma_records = dma_records.into_vec();
@@ -680,23 +678,22 @@ impl<'data> IoBufferBacking<'data> {
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
         let snapshot = validate_snapshot(parent, handle, self.overlap_granularity, self.byte_len)?;
-        let slot_snapshot = parent.snapshot().ok_or(IoBufferError::InvalidLease)?;
 
         if mid > snapshot.len {
             return Err(IoBufferError::InvalidRange);
         }
-        if mid % self.overlap_granularity != 0 {
+        if mid & (self.overlap_granularity - 1) != 0 {
             return Err(IoBufferError::InvalidRange);
         }
 
-        let left_count = mid / self.overlap_granularity;
+        let left_count = mid >> self.overlap_granularity.trailing_zeros();
         let right_range = LeaseChunkRange {
-            first: slot_snapshot
+            first: handle
                 .range
                 .first
                 .checked_add(left_count)
                 .ok_or(IoBufferError::LengthOverflow)?,
-            count: slot_snapshot.range.count - left_count,
+            count: handle.range.count - left_count,
         };
         let capacity = self.leases.len();
         if capacity == 0 {
@@ -721,13 +718,13 @@ impl<'data> IoBufferBacking<'data> {
         let slot = &self.leases[index];
         if let Err(error) = unsafe {
             self.overlap.split_claim(
-                slot_snapshot.range.first,
-                slot_snapshot.range.count,
+                handle.range.first,
+                handle.range.count,
                 left_count,
             )
         } {
             slot.cancel_reservation();
-            return Err(self.map_radix_error(error, slot_snapshot.range));
+            return Err(self.map_radix_error(error, handle.range));
         }
 
         if snapshot.dma_record != NO_DMA_RECORD {
@@ -947,20 +944,20 @@ impl<'data> IoBufferBacking<'data> {
         let end = start
             .checked_add(len)
             .ok_or(IoBufferError::LengthOverflow)?;
-        if start % self.overlap_granularity != 0
-            || (len % self.overlap_granularity != 0 && end != self.byte_len)
-        {
+        let mask = self.overlap_granularity - 1;
+        let shift = self.overlap_granularity.trailing_zeros();
+        if start & mask != 0 || (len & mask != 0 && end != self.byte_len) {
             return Err(IoBufferError::InvalidRange);
         }
         let count = if len == 0 {
             0
         } else {
-            len.checked_add(self.overlap_granularity - 1)
+            len.checked_add(mask)
                 .ok_or(IoBufferError::LengthOverflow)?
-                / self.overlap_granularity
+                >> shift
         };
         Ok(LeaseChunkRange {
-            first: start / self.overlap_granularity,
+            first: start >> shift,
             count,
         })
     }

@@ -148,6 +148,10 @@ where
     I: IntoIterator<Item = (usize, usize)>,
 {
     let mut byte_len = 0usize;
+    let regions = regions.into_iter();
+    extents
+        .try_reserve_exact(regions.size_hint().0)
+        .map_err(|_| IoBufferError::AllocationFailed)?;
 
     for (virt_addr, len) in regions {
         let first_frame = frames.len();
@@ -156,7 +160,8 @@ where
             describe_virtual_buffer_to_frames(virt_addr, len, frames)?;
 
         extents
-            .try_reserve_exact(1)
+            .try_reserve(1)
+            .or_else(|_| extents.try_reserve_exact(1))
             .map_err(|_| IoBufferError::AllocationFailed)?;
 
         extents.push(unsafe {
@@ -265,7 +270,8 @@ pub(super) fn describe_virtual_buffer_to_frames(
             .ok_or(IoBufferError::TranslationFailed { virt_addr: current })?;
 
         frames
-            .try_reserve_exact(1)
+            .try_reserve(1)
+            .or_else(|_| frames.try_reserve_exact(1))
             .map_err(|_| IoBufferError::AllocationFailed)?;
 
         frames.push(unsafe {

@@ -3,7 +3,7 @@ use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
 
-use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
 
 pub const DEFAULT_SLAB_SHARDS: usize = 8;
@@ -19,8 +19,7 @@ pub struct SlabHandle {
 }
 
 struct StableSlot<T> {
-    generation: AtomicU32,
-    occupied: AtomicBool,
+    state: AtomicU32,
     value: UnsafeCell<T>,
 }
 
@@ -30,8 +29,7 @@ unsafe impl<T: Send> Sync for StableSlot<T> {}
 impl<T> StableSlot<T> {
     fn new(value: T) -> Self {
         Self {
-            generation: AtomicU32::new(0),
-            occupied: AtomicBool::new(false),
+            state: AtomicU32::new(0),
             value: UnsafeCell::new(value),
         }
     }
@@ -176,15 +174,8 @@ impl<T> SlabShard<T> {
                 }
                 let index = chunk_index * self.slots_per_chunk + local_in_chunk;
                 let slot = &chunk.slots[local_in_chunk];
-                let generation = slot
-                    .generation
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                        Some(old.wrapping_add(1) & 0xFFFF)
-                    })
-                    .unwrap()
-                    .wrapping_add(1)
-                    & 0xFFFF;
-                slot.occupied.store(true, Ordering::Release);
+                let generation = ((slot.state.load(Ordering::Relaxed) >> 1) + 1) & 0xffff;
+                slot.state.store((generation << 1) | 1, Ordering::Release);
                 self.alloc_hint.store(index + 1, Ordering::Relaxed);
                 return Some(SlabHandle {
                     shard,
@@ -238,7 +229,7 @@ impl<T> SlabShard<T> {
                             handles[count] = Some(SlabHandle {
                                 shard,
                                 local_index: (chunk_index * self.slots_per_chunk + local) as u32,
-                                generation: chunk.slots[local].generation.load(Ordering::Relaxed),
+                                generation: chunk.slots[local].state.load(Ordering::Relaxed) >> 1,
                             });
                             count += 1;
                         }
@@ -268,10 +259,11 @@ impl<T> SlabShard<T> {
     }
 
     fn slot(&self, handle: SlabHandle) -> Option<&StableSlot<T>> {
+        if handle.generation > 0xffff {
+            return None;
+        }
         let slot = self.cached_slot(handle)?;
-        if !slot.occupied.load(Ordering::Acquire)
-            || slot.generation.load(Ordering::Acquire) != handle.generation
-        {
+        if slot.state.load(Ordering::Acquire) != (handle.generation << 1) | 1 {
             return None;
         }
         Some(slot)
@@ -283,8 +275,13 @@ impl<T> SlabShard<T> {
                 return false;
             };
             if slot
-                .occupied
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .state
+                .compare_exchange(
+                    (handle.generation << 1) | 1,
+                    handle.generation << 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_err()
             {
                 return false;
@@ -393,15 +390,8 @@ impl<T> GrowableSlab<T> {
             let slot = shard
                 .cached_slot(handle)
                 .expect("cached slab slot disappeared");
-            let generation = slot
-                .generation
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                    Some(old.wrapping_add(1) & 0xffff)
-                })
-                .unwrap()
-                .wrapping_add(1)
-                & 0xffff;
-            slot.occupied.store(true, Ordering::Release);
+            let generation = (handle.generation + 1) & 0xffff;
+            slot.state.store((generation << 1) | 1, Ordering::Release);
             Some(SlabHandle {
                 generation,
                 ..handle
@@ -435,8 +425,13 @@ impl<T> GrowableSlab<T> {
                 return false;
             };
             if slot
-                .occupied
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .state
+                .compare_exchange(
+                    (handle.generation << 1) | 1,
+                    handle.generation << 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_err()
             {
                 return false;

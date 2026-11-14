@@ -17,5 +17,6 @@ configuration = "src/volmgr.toml"
 
 [dependencies]
 kernel_api = { workspace = true }
+kernel_sync = { path = "../../libs/kernel_sync", default-features = false }
 spin = { version = "0.10", default-features = false}
 schnellru = { version = "0.2.4", default-features = false }

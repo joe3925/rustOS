@@ -4,7 +4,7 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use crate::future_arena::FutureAllocation;
+use crate::future_allocation::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
 use crate::runtime::runtime::submit_global_to_executor_domain;
@@ -137,7 +137,7 @@ impl TaskSlot {
             unsafe {
                 if let Some(allocation) = (&mut *self.future.get()).take() {
                     drop_fn(allocation.ptr.as_ptr());
-                    release_future_allocation(allocation);
+                    allocation.release();
                 }
             };
         }
@@ -521,7 +521,7 @@ where
                 let allocation = (&mut *slot.future.get())
                     .take()
                     .expect("task future allocation missing on completion");
-                release_future_allocation(allocation);
+                allocation.release();
                 loop {
                     let ptr = slot.result_ptr.load(Ordering::Acquire);
                     if ptr == RESULT_ABANDONED {
@@ -562,7 +562,7 @@ where
                 let allocation = (&mut *slot.future.get())
                     .take()
                     .expect("task future allocation missing on completion");
-                release_future_allocation(allocation);
+                allocation.release();
                 true
             }
             Poll::Pending => false,
@@ -570,23 +570,11 @@ where
     }
 }
 
-unsafe fn release_future_allocation(allocation: FutureAllocation) {
-    unsafe {
-        let domain_id = allocation.owner_domain;
-        GlobalAsyncExecutor::global()
-            .with_executor_domain(domain_id, |domain| {
-                assert!(domain.future_arena().release(allocation));
-                domain.maybe_finish_draining();
-            })
-            .expect("future owner domain disappeared while allocation was live");
-    }
-}
-
 unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) {
     unsafe {
         if let Some(allocation) = (&mut *slot.future.get()).take() {
             core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
-            release_future_allocation(allocation);
+            allocation.release();
         }
         write_poll_fn(&slot.poll_fn, None);
         write_drop_fn(&slot.drop_fn, None);

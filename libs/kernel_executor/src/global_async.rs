@@ -411,7 +411,7 @@ impl GlobalAsyncExecutor {
             let previous_caches = caches
                 .iter()
                 .any(|cache| !cache.owner.is_null())
-                .then(|| core::mem::replace(&mut *caches, [const { SlabCache::new() }; 8]));
+                .then(|| core::mem::replace(&mut *caches, [const { SlabCache::new() }; 1]));
             (tls.active_domain.replace(domain), previous_caches)
         });
         let _batch = ExecutorBatchGuard {

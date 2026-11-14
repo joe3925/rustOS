@@ -53,9 +53,10 @@ impl KernelAllocator {
 
     pub fn mimalloc_thread_done(&self) {
         if self.mimalloc_enabled() {
-            if platform::current_is_in_interrupt() {
-                panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "mimalloc_thread_done called from interrupt, this shouldn't happen"
+            );
             unsafe {
                 mimalloc::mimalloc_thread_done_impl();
             }
@@ -71,9 +72,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
     #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_alloc(layout)
         } else {
             self.bootstrap.alloc(layout)
@@ -83,9 +85,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
     #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_alloc_zeroed(layout)
         } else {
             self.bootstrap.alloc_zeroed(layout)
@@ -99,9 +102,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         if ptr.addr() >= super::heap::mimalloc_heap_start() {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_dealloc(ptr, layout)
         } else {
             self.bootstrap.dealloc(ptr, layout)
@@ -115,9 +119,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         if ptr.addr() >= super::heap::mimalloc_heap_start() {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_realloc(ptr, layout, new_size)
         } else {
             let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());

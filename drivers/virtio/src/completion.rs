@@ -23,27 +23,30 @@ pub enum CompletionError {
 }
 
 struct CompletionHeadSlot {
-    cell: Mutex<Option<u16>>,
+    cell: AtomicU16,
 }
 
 impl CompletionHeadSlot {
     pub const fn new() -> Self {
         Self {
-            cell: Mutex::new(None),
+            cell: AtomicU16::new(INVALID_INDEX),
         }
     }
 
     fn put(&self, cell_idx: u16) {
-        let mut guard = self.cell.lock();
-        if unlikely(guard.is_some()) {
+        if unlikely(
+            self.cell
+                .compare_exchange(INVALID_INDEX, cell_idx, Ordering::Release, Ordering::Relaxed)
+                .is_err(),
+        ) {
             cold_path();
             panic!("virtio: completion head slot already occupied");
         }
-        *guard = Some(cell_idx);
     }
 
     fn take(&self) -> Option<u16> {
-        self.cell.lock().take()
+        let cell_idx = self.cell.swap(INVALID_INDEX, Ordering::AcqRel);
+        (cell_idx != INVALID_INDEX).then_some(cell_idx)
     }
 }
 

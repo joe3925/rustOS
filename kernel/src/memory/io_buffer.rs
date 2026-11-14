@@ -204,22 +204,22 @@ impl MappedIoBufferBacking {
     }
 
     pub fn create_to_device(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         offset: usize,
         len: usize,
     ) -> Result<OwnedIoBuffer<ToDevice>, IoBufferError> {
-        OwnedIoBuffer::new(self.clone(), offset, len, false)
+        OwnedIoBuffer::new(self, offset, len, false)
     }
 
     pub fn create_from_device(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         offset: usize,
         len: usize,
     ) -> Result<OwnedIoBuffer<FromDevice>, IoBufferError> {
         if self.access != UserBufferAccess::ReadWrite {
             return Err(IoBufferError::InvalidBackingKind);
         }
-        OwnedIoBuffer::new(self.clone(), offset, len, true)
+        OwnedIoBuffer::new(self, offset, len, true)
     }
 
     pub fn len(&self) -> usize {

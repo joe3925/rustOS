@@ -1,4 +1,3 @@
-use crate::future_arena::{FutureArena, FutureArenaConfig};
 use crate::global_async::CacheAligned;
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicU128, AtomicUsize, Ordering};
@@ -142,7 +141,6 @@ pub struct ExecutorDomainConfig {
     pub max_active: usize,
     pub quantum: usize,
     pub weight: usize,
-    pub future_arena: FutureArenaConfig,
     pub ready_shards: usize,
 }
 
@@ -152,7 +150,6 @@ impl ExecutorDomainConfig {
             max_active: class.default_max_active(cpu_count),
             quantum: class.default_quantum(),
             weight: class.default_weight(),
-            future_arena: FutureArenaConfig::default(),
             ready_shards: cpu_count.clamp(1, MAX_READY_SHARDS),
         }
     }
@@ -195,8 +192,6 @@ pub struct ExecutorDomainStats {
     pub queued_count: usize,
     pub active_count: usize,
     pub live_task_count: usize,
-    pub live_future_count: usize,
-    pub live_future_bytes: usize,
     pub max_active: usize,
     pub ready_shards: usize,
 }
@@ -205,7 +200,6 @@ pub struct ExecutorDomain {
     id: ExecutorDomainId,
     ready_heads: Box<[ReadyHead]>,
     ready_cursor: CacheAligned,
-    future_arena: FutureArena,
     reclamation: Arc<DomainReclamation>,
     live_task_count: CacheAligned,
 
@@ -236,7 +230,6 @@ impl ExecutorDomain {
                 .collect::<alloc::vec::Vec<_>>()
                 .into_boxed_slice(),
             ready_cursor: CacheAligned(AtomicUsize::new(0)),
-            future_arena: FutureArena::new(id, config.future_arena),
             reclamation,
             live_task_count: CacheAligned(AtomicUsize::new(0)),
 
@@ -294,10 +287,6 @@ impl ExecutorDomain {
 
     pub fn active_count(&self) -> usize {
         self.active_count.0.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn future_arena(&self) -> &FutureArena {
-        &self.future_arena
     }
 
     pub fn live_task_count(&self) -> usize {
@@ -503,7 +492,6 @@ impl ExecutorDomain {
             && self.queued_count() == 0
             && self.active_count() == 0
             && self.live_task_count() == 0
-            && self.future_arena.live_futures() == 0
         {
             self.reclamation.request(self.id.slot() as usize);
         }
@@ -515,8 +503,6 @@ impl ExecutorDomain {
             queued_count: self.queued_count(),
             active_count: self.active_count(),
             live_task_count: self.live_task_count(),
-            live_future_count: self.future_arena.live_futures(),
-            live_future_bytes: self.future_arena.live_bytes(),
             max_active: self.max_active(),
             ready_shards: self.ready_heads.len(),
         }
@@ -961,8 +947,7 @@ impl ExecutorDomainTable {
                         {
                             let empty = domain.queued_count() == 0
                                 && domain.active_count() == 0
-                                && domain.live_task_count() == 0
-                                && domain.future_arena.live_futures() == 0;
+                                && domain.live_task_count() == 0;
                             if empty
                                 && slot
                                     .readers

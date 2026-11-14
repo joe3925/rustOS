@@ -40,7 +40,7 @@ pub(crate) struct ExecutorThreadLocal {
     pub active_domain: Cell<*const ExecutorDomain>,
     pub ready_cursor: Cell<usize>,
     pub allocation_cursor: Cell<usize>,
-    pub caches: RefCell<[SlabCache; 8]>,
+    pub caches: RefCell<[SlabCache; 1]>,
 }
 
 impl ExecutorThreadLocal {
@@ -51,7 +51,7 @@ impl ExecutorThreadLocal {
             active_domain: Cell::new(core::ptr::null()),
             ready_cursor: Cell::new(0),
             allocation_cursor: Cell::new(0),
-            caches: RefCell::new([const { SlabCache::new() }; 8]),
+            caches: RefCell::new([const { SlabCache::new() }; 1]),
         }
     }
 }
@@ -78,7 +78,7 @@ pub(crate) fn with_executor_local<R>(f: impl FnOnce(&ExecutorThreadLocal) -> R) 
 
 pub(crate) struct ExecutorBatchGuard {
     pub previous_domain: *const ExecutorDomain,
-    pub previous_caches: Option<[SlabCache; 8]>,
+    pub previous_caches: Option<[SlabCache; 1]>,
 }
 
 impl Drop for ExecutorBatchGuard {

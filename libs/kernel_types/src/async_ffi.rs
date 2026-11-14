@@ -8,8 +8,7 @@ use core::task::{Context, Poll};
 #[derive(Clone, Copy, Debug)]
 pub struct AbiFutureAllocation {
     pub ptr: *mut (),
-    pub owner_domain: u64,
-    pub token: u64,
+    pub reserved: [u64; 2],
     pub capacity: u32,
     pub align: u32,
 }
@@ -18,8 +17,7 @@ impl AbiFutureAllocation {
     pub const fn null() -> Self {
         Self {
             ptr: core::ptr::null_mut(),
-            owner_domain: 0,
-            token: 0,
+            reserved: [0; 2],
             capacity: 0,
             align: 0,
         }
@@ -69,7 +67,6 @@ impl<T> AbiFuture<T> {
             (self.drop_fn)(self.allocation.ptr);
             (self.free_fn)(self.allocation);
         }
-        self.allocation = AbiFutureAllocation::null();
     }
 }
 
@@ -117,7 +114,7 @@ where
         };
         assert!(
             !allocation.ptr.is_null(),
-            "AbiFuture created outside an executor poll context or arena allocation failed"
+            "AbiFuture allocation failed"
         );
         unsafe {
             allocation.ptr.cast::<F>().write(self);

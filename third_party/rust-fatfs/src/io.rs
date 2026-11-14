@@ -12,7 +12,6 @@ pub trait IoBase: Send {
 /// The `Read` trait allows for reading bytes from a source.
 ///
 /// It is based on the `std::io::Read` trait.
-use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::dma::{FromDevice, IoBuffer, ToDevice};
 use kernel_types::request::Write as WriteRequest;
 
@@ -25,10 +24,10 @@ pub enum IoKind {
 
 pub trait Read: IoBase {
     /// Pull some bytes from this source into the specified buffer, returning how many bytes were read.
-    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>>;
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> impl core::future::Future<Output = Result<usize, Self::Error>> + Send;
 
     /// Read the exact number of bytes required to fill `buf`.
-    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> AbiFuture<Result<(), Self::Error>> {
+    fn read_exact<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
             let mut buf = buf;
             while !buf.is_empty() {
@@ -48,17 +47,16 @@ pub trait Read: IoBase {
                 Err(Self::Error::new_unexpected_eof_error())
             }
         }
-        .into_abi()
     }
 }
 
 /// The `Write` trait allows for writing bytes into the sink.
 pub trait Write: IoBase {
     /// Write a buffer into this writer, returning how many bytes were written.
-    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>>;
+    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> impl core::future::Future<Output = Result<usize, Self::Error>> + Send;
 
     /// Attempts to write an entire buffer into this writer.
-    fn write_all<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> AbiFuture<Result<(), Self::Error>> {
+    fn write_all<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
             let mut buf = buf;
             while !buf.is_empty() {
@@ -73,11 +71,10 @@ pub trait Write: IoBase {
             }
             Ok(())
         }
-        .into_abi()
     }
 
     /// Flush this output stream, ensuring that all intermediately buffered contents reach their destination.
-    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>>;
+    fn flush(&mut self) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// Bulk data I/O that preserves an owned scatter/gather buffer through the
@@ -87,7 +84,7 @@ pub trait ReadIoBuffer: IoBase {
         &'a mut self,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
         kind: IoKind,
-    ) -> AbiFuture<Result<usize, Self::Error>>;
+    ) -> impl core::future::Future<Output = Result<usize, Self::Error>> + Send;
 }
 
 pub trait WriteIoBuffer: IoBase {
@@ -95,13 +92,13 @@ pub trait WriteIoBuffer: IoBase {
         &'a mut self,
         buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
         kind: IoKind,
-    ) -> AbiFuture<Result<usize, Self::Error>>;
+    ) -> impl core::future::Future<Output = Result<usize, Self::Error>> + Send;
 
     fn write_iobuffer_chain<'a, 'buffer>(
         &'a mut self,
         requests: &'a mut WriteRequest<'buffer>,
         kind: IoKind,
-    ) -> AbiFuture<Result<(), Self::Error>>;
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// Enumeration of possible methods to seek within an I/O object.
@@ -135,61 +132,52 @@ pub trait Seek: IoBase {
 
 pub(crate) trait ReadLeExt {
     type Error;
-    fn read_u8(&mut self, kind: IoKind) -> AbiFuture<Result<u8, Self::Error>>;
-    fn read_u16_le(&mut self, kind: IoKind) -> AbiFuture<Result<u16, Self::Error>>;
-    fn read_u32_le(&mut self, kind: IoKind) -> AbiFuture<Result<u32, Self::Error>>;
+    fn read_u8(&mut self, kind: IoKind) -> impl core::future::Future<Output = Result<u8, Self::Error>> + Send;
+    fn read_u16_le(&mut self, kind: IoKind) -> impl core::future::Future<Output = Result<u16, Self::Error>> + Send;
+    fn read_u32_le(&mut self, kind: IoKind) -> impl core::future::Future<Output = Result<u32, Self::Error>> + Send;
 }
 
 impl<T: Read> ReadLeExt for T {
     type Error = <Self as IoBase>::Error;
 
-    fn read_u8(&mut self, kind: IoKind) -> AbiFuture<Result<u8, Self::Error>> {
-        async move {
-            let mut buf = [0_u8; 1];
-            self.read_exact(&mut buf, kind).await?;
-            Ok(buf[0])
-        }
-        .into_abi()
+    async fn read_u8(&mut self, kind: IoKind) -> Result<u8, Self::Error> {
+        let mut buf = [0_u8; 1];
+        self.read_exact(&mut buf, kind).await?;
+        Ok(buf[0])
     }
 
-    fn read_u16_le(&mut self, kind: IoKind) -> AbiFuture<Result<u16, Self::Error>> {
-        async move {
-            let mut buf = [0_u8; 2];
-            self.read_exact(&mut buf, kind).await?;
-            Ok(u16::from_le_bytes(buf))
-        }
-        .into_abi()
+    async fn read_u16_le(&mut self, kind: IoKind) -> Result<u16, Self::Error> {
+        let mut buf = [0_u8; 2];
+        self.read_exact(&mut buf, kind).await?;
+        Ok(u16::from_le_bytes(buf))
     }
 
-    fn read_u32_le(&mut self, kind: IoKind) -> AbiFuture<Result<u32, Self::Error>> {
-        async move {
-            let mut buf = [0_u8; 4];
-            self.read_exact(&mut buf, kind).await?;
-            Ok(u32::from_le_bytes(buf))
-        }
-        .into_abi()
+    async fn read_u32_le(&mut self, kind: IoKind) -> Result<u32, Self::Error> {
+        let mut buf = [0_u8; 4];
+        self.read_exact(&mut buf, kind).await?;
+        Ok(u32::from_le_bytes(buf))
     }
 }
 
 pub(crate) trait WriteLeExt {
     type Error;
-    fn write_u8(&mut self, n: u8, kind: IoKind) -> AbiFuture<Result<(), Self::Error>>;
-    fn write_u16_le(&mut self, n: u16, kind: IoKind) -> AbiFuture<Result<(), Self::Error>>;
-    fn write_u32_le(&mut self, n: u32, kind: IoKind) -> AbiFuture<Result<(), Self::Error>>;
+    fn write_u8(&mut self, n: u8, kind: IoKind) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
+    fn write_u16_le(&mut self, n: u16, kind: IoKind) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
+    fn write_u32_le(&mut self, n: u32, kind: IoKind) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 impl<T: Write> WriteLeExt for T {
     type Error = <Self as IoBase>::Error;
 
-    fn write_u8(&mut self, n: u8, kind: IoKind) -> AbiFuture<Result<(), Self::Error>> {
-        async move { self.write_all(&[n], kind).await }.into_abi()
+    async fn write_u8(&mut self, n: u8, kind: IoKind) -> Result<(), Self::Error> {
+        self.write_all(&[n], kind).await
     }
 
-    fn write_u16_le(&mut self, n: u16, kind: IoKind) -> AbiFuture<Result<(), Self::Error>> {
-        async move { self.write_all(&n.to_le_bytes(), kind).await }.into_abi()
+    async fn write_u16_le(&mut self, n: u16, kind: IoKind) -> Result<(), Self::Error> {
+        self.write_all(&n.to_le_bytes(), kind).await
     }
 
-    fn write_u32_le(&mut self, n: u32, kind: IoKind) -> AbiFuture<Result<(), Self::Error>> {
-        async move { self.write_all(&n.to_le_bytes(), kind).await }.into_abi()
+    async fn write_u32_le(&mut self, n: u32, kind: IoKind) -> Result<(), Self::Error> {
+        self.write_all(&n.to_le_bytes(), kind).await
     }
 }

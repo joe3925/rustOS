@@ -145,92 +145,89 @@ impl CacheBackend {
 impl VolumeCacheBackend for CacheBackend {
     type Error = KernelError;
 
-    fn read_phys_framed<'a, 'buffer>(
+    async fn read_phys_framed<'a, 'buffer>(
         &'a self,
         lba: u64,
         blocks: usize,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> AbiFuture<Result<usize, Self::Error>> {
-        async move {
-            if unlikely(blocks == 0) {
-                cold_path();
-                return Ok(0);
-            }
+    ) -> Result<usize, Self::Error> {
+        if unlikely(blocks == 0) {
+            cold_path();
+            return Ok(0);
+        }
 
-            let Some(offset) = lba.checked_mul(BLOCK_SIZE as u64) else {
+        let Some(offset) = lba.checked_mul(BLOCK_SIZE as u64) else {
+            cold_path();
+            return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                alloc::format!(
+                    "calculating volmgr cache read offset for LBA {lba}, block count {blocks}"
+                )
+            });
+        };
+
+        let mut total_len = 0usize;
+        let mut block_idx = 0usize;
+        while block_idx < blocks {
+            let Some(block_lba) = lba.checked_add(block_idx as u64) else {
                 cold_path();
                 return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
                     alloc::format!(
-                        "calculating volmgr cache read offset for LBA {lba}, block count {blocks}"
+                        "calculating volmgr cache block LBA from base {lba} and index {block_idx}"
                     )
                 });
             };
-
-            let mut total_len = 0usize;
-            let mut block_idx = 0usize;
-            while block_idx < blocks {
-                let Some(block_lba) = lba.checked_add(block_idx as u64) else {
+            let block_len = match self.block_len(block_lba) {
+                Some(block_len) => block_len,
+                None => {
                     cold_path();
+                    println!(
+                        "volmgr: CacheBackend::read_phys_framed invalid lba {} for volume length {}",
+                        block_lba, self.volume_bytes
+                    );
                     return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
                         alloc::format!(
-                            "calculating volmgr cache block LBA from base {lba} and index {block_idx}"
+                            "reading cache block LBA {block_lba} beyond volume length {}",
+                            self.volume_bytes
                         )
                     });
-                };
-                let block_len = match self.block_len(block_lba) {
-                    Some(block_len) => block_len,
-                    None => {
-                        cold_path();
-                        println!(
-                            "volmgr: CacheBackend::read_phys_framed invalid lba {} for volume length {}",
-                            block_lba, self.volume_bytes
-                        );
-                        return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
-                            alloc::format!(
-                                "reading cache block LBA {block_lba} beyond volume length {}",
-                                self.volume_bytes
-                            )
-                        });
-                    }
-                };
-                let Some(next_total_len) = total_len.checked_add(block_len) else {
-                    cold_path();
-                    return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
-                        alloc::format!(
-                            "accumulating cache read length at block index {block_idx}"
-                        )
-                    });
-                };
-                total_len = next_total_len;
-                block_idx += 1;
-            }
-
-            if unlikely(buffer.len() < total_len) {
+                }
+            };
+            let Some(next_total_len) = total_len.checked_add(block_len) else {
                 cold_path();
                 return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
                     alloc::format!(
-                        "cache read buffer has {} bytes but {total_len} are required for LBA {lba}, block count {blocks}",
-                        buffer.len()
+                        "accumulating cache read length at block index {block_idx}"
                     )
                 });
-            }
-
-            let mut req =  Read::new(
-                offset,
-                 total_len,
-                 false,Some(buffer),);
-            io::send_down_stack(self.target.clone(), &mut req)
-                .await
-                .map(|_| ())
-                .with_context(|| {
-                    alloc::format!(
-                        "reading lower volume at cache LBA {lba}, block count {blocks}, byte length {total_len}"
-                    )
-                })?;
-
-            Ok(total_len)
+            };
+            total_len = next_total_len;
+            block_idx += 1;
         }
-        .into_abi()
+
+        if unlikely(buffer.len() < total_len) {
+            cold_path();
+            return Err(error(DriverErrorKind::InvalidParameter)).with_context(|| {
+                alloc::format!(
+                    "cache read buffer has {} bytes but {total_len} are required for LBA {lba}, block count {blocks}",
+                    buffer.len()
+                )
+            });
+        }
+
+        let mut req =  Read::new(
+            offset,
+             total_len,
+             false,Some(buffer),);
+        io::send_down_stack(self.target.clone(), &mut req)
+            .await
+            .map(|_| ())
+            .with_context(|| {
+                alloc::format!(
+                    "reading lower volume at cache LBA {lba}, block count {blocks}, byte length {total_len}"
+                )
+            })?;
+
+        Ok(total_len)
     }
     fn read_request<'a, 'req, 'data>(
         &'a self,
@@ -422,22 +419,19 @@ impl VolumeCacheBackend for CacheBackend {
         .into_abi()
     }
 
-    fn flush_device(&self) -> AbiFuture<Result<(), Self::Error>> {
-        async move {
-            let mut req = Flush { should_block: true };
-            match io::send_down_stack(self.target.clone(), &mut req).await {
-                Ok(_) => {}
-                Err(err)
-                    if err.kind()
-                        == ErrorKind::Driver(DriverErrorKind::NotImplemented) => {}
-                Err(err) => {
-                    return Err(err)
-                        .with_context(|| "flushing the lower device for the volume cache")
-                }
+    async fn flush_device<'a>(&'a self) -> Result<(), Self::Error> {
+        let mut req = Flush { should_block: true };
+        match io::send_down_stack(self.target.clone(), &mut req).await {
+            Ok(_) => {}
+            Err(err)
+                if err.kind()
+                    == ErrorKind::Driver(DriverErrorKind::NotImplemented) => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| "flushing the lower device for the volume cache")
             }
-            Ok(())
         }
-        .into_abi()
+        Ok(())
     }
     fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> AbiFuture<Result<(), Self::Error>> {
         async move {

@@ -363,7 +363,7 @@ fn join_all_polls_ready_queue_after_child_wakes_parent() {
 // thread pool: inline futures, oversized futures, oversized results, and
 // over-aligned futures all have to complete through the same public spawn API.
 #[test]
-fn spawn_joinhandle_completes_small_and_large_arena_storage_paths() {
+fn spawn_joinhandle_completes_small_and_large_heap_storage_paths() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
@@ -441,8 +441,6 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     ));
 }
 
-// This test mirrors the slab wake contract on the large arena-backed path. It prevents
-// the large-future path from depending on eager repolling by block_on/JoinAll.
 #[test]
 fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     let _guard = super::support::global_runtime_lock();
@@ -480,7 +478,7 @@ fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
 
     assert!(
         join_wake.wait_for_wakes(1, Duration::from_secs(10)),
-        "large arena-backed JoinHandle was not woken after its child completed"
+        "large-future JoinHandle was not woken after its child completed"
     );
     assert_eq!(completed.load(Ordering::Acquire), 1);
     assert!(matches!(
@@ -544,9 +542,6 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
     ));
 }
 
-// This test protects waker replacement on large arena-backed JoinHandles. The fallback
-// JoinableTask path uses a different waker store than slab slots, so it needs the
-// same stale-waiter check independently.
 #[test]
 fn joinhandle_completion_uses_latest_registered_waiter() {
     let _guard = super::support::global_runtime_lock();
@@ -585,12 +580,12 @@ fn joinhandle_completion_uses_latest_registered_waiter() {
 
     assert!(
         latest_waiter.wait_for_wakes(1, Duration::from_secs(10)),
-        "latest large arena-backed JoinHandle waiter was not woken"
+        "latest large-future JoinHandle waiter was not woken"
     );
     assert_eq!(
         stale_waiter.wake_count(),
         0,
-        "stale large arena-backed JoinHandle waiter was woken after replacement"
+        "stale large-future JoinHandle waiter was woken after replacement"
     );
     assert!(matches!(
         poll_once(&mut handle, &latest_waiter.waker()),
@@ -688,9 +683,6 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
     });
 }
 
-// This test covers the large arena-backed completed-but-unawaited cleanup path. Large
-// futures store their result in JoinableTask; dropping the unconsumed handle must
-// still drop that result exactly once.
 #[test]
 fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
     let _guard = super::support::global_runtime_lock();
@@ -729,7 +721,7 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
     take_child_waker(&child_waker).wake();
     assert!(
         join_wake.wait_for_wakes(1, Duration::from_secs(10)),
-        "large arena-backed JoinHandle did not wake after storing an unconsumed result"
+        "large-future JoinHandle did not wake after storing an unconsumed result"
     );
     assert_eq!(completed.load(Ordering::Acquire), 1);
 
@@ -740,9 +732,6 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
     });
 }
 
-// This test covers the large arena-backed pending-then-dropped cleanup path. Dropping
-// the JoinHandle must not cancel a large future, and its eventual result must be
-// dropped when the task finishes with no waiter left.
 #[test]
 fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
     let _guard = super::support::global_runtime_lock();
@@ -847,11 +836,8 @@ fn many_joinable_tasks_reschedule_across_core_count_shards() {
     assert_eq!(results.into_iter().sum::<usize>(), expected);
 }
 
-// This test exists to cover detached work on both slab-inline and large arena-backed
-// storage. Detached tasks have no JoinHandle, so completion is observed through
-// shared state instead.
 #[test]
-fn spawn_detached_runs_size_class_and_large_direct_futures() {
+fn spawn_detached_runs_small_and_large_heap_futures() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
@@ -877,9 +863,6 @@ fn spawn_detached_runs_size_class_and_large_direct_futures() {
     });
 }
 
-// This test exists to prove that dropping a JoinHandle does not cancel already
-// queued work. It covers both the slab-backed small future and the large-future path
-// oversized future cleanup paths.
 #[test]
 fn dropping_joinhandles_does_not_cancel_queued_work() {
     let _guard = super::support::global_runtime_lock();
@@ -1030,7 +1013,6 @@ fn abi_future_polls_inline_with_exact_parent_context() {
         child_context.load(Ordering::Acquire)
     );
     assert_eq!(child_drops.load(Ordering::Acquire), 1);
-    assert_eq!(domain.future_arena().live_futures(), 0);
     assert_eq!(domain.live_task_count(), 0);
 }
 

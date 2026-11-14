@@ -90,6 +90,7 @@ where
 {
     cache: &'cache VolumeCache<B, BLOCK_SIZE, F>,
     filter: &'filter FlushFilter,
+    yielded: bool,
 }
 
 impl<'cache, 'filter, B, const BLOCK_SIZE: usize, F> Future
@@ -109,6 +110,11 @@ where
             match this.cache.filtered_writeback_state(this.filter) {
                 FilteredWritebackState::Clean => return Poll::Ready(WritebackWaitResult::Clean),
                 FilteredWritebackState::NeedsFlush => {
+                    if !this.yielded {
+                        this.yielded = true;
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
                     return Poll::Ready(WritebackWaitResult::NeedsFlush);
                 }
                 FilteredWritebackState::ActiveWriteback => {
@@ -919,28 +925,38 @@ where
             return Ok(());
         }
 
-        let offset = lba
+        let bits = Self::granule_mask_for_range(block_off, len)?;
+        let base = lba
             .checked_mul(BLOCK_SIZE as u64)
-            .and_then(|base| base.checked_add(block_off as u64))
             .ok_or(CacheError::OffsetOverflow)?;
 
-        let bits = Self::granule_mask_for_range(block_off, len)?;
-
         {
-            let _data_guard = page.data_lock.write();
+            let _data_guard = match page.data_lock.try_write() {
+                Some(guard) => guard,
+                None => page.data_lock.write().await,
+            };
 
-            if page.valid_mask.load(Ordering::Acquire) & bits == bits {
-                return Ok(());
+            let mut missing = bits & !page.valid_mask.load(Ordering::Acquire);
+            while let Some((granule_start, granule_count, run_bits)) = Self::first_mask_run(missing) {
+                let read_off = granule_start
+                    .checked_mul(CACHE_GRANULE)
+                    .ok_or(CacheError::OffsetOverflow)?;
+                let read_len = granule_count
+                    .checked_mul(CACHE_GRANULE)
+                    .ok_or(CacheError::OffsetOverflow)?;
+                let offset = base
+                    .checked_add(read_off as u64)
+                    .ok_or(CacheError::OffsetOverflow)?;
+                let io_buf = self.create_cache_from_device_buffer_at(page, read_off, read_len)?;
+                let mut req = Read::new(offset, read_len, false, Some(io_buf));
+                self.backend
+                    .read_request(&mut req)
+                    .await
+                    .map_err(CacheError::Backend)?;
+
+                page.valid_mask.fetch_or(run_bits, Ordering::AcqRel);
+                missing &= !run_bits;
             }
-
-            let io_buf = self.create_cache_from_device_buffer_at(page, block_off, len)?;
-            let mut req = Read::new(offset, len, false, Some(io_buf));
-            self.backend
-                .read_request(&mut req)
-                .await
-                .map_err(CacheError::Backend)?;
-
-            page.valid_mask.fetch_or(bits, Ordering::AcqRel);
         }
 
         Ok(())
@@ -1218,7 +1234,10 @@ where
         page: &Arc<CachePage>,
     ) -> Result<usize, CacheError<B::Error>> {
         let bytes_read = {
-            let _data_guard = page.data_lock.write();
+            let _data_guard = match page.data_lock.try_write() {
+                Some(guard) => guard,
+                None => page.data_lock.write().await,
+            };
             let io_buf = self.create_cache_from_device_buffer(page, BLOCK_SIZE)?;
             self.backend
                 .read_phys_framed(lba, 1, io_buf)
@@ -1233,7 +1252,10 @@ where
 
         if unlikely(bytes_read < BLOCK_SIZE) {
             cold_path();
-            let _data_guard = page.data_lock.write();
+            let _data_guard = match page.data_lock.try_write() {
+                Some(guard) => guard,
+                None => page.data_lock.write().await,
+            };
             unsafe {
                 core::slice::from_raw_parts_mut(self.page_ptr(page), BLOCK_SIZE)[bytes_read..]
                     .fill(0);
@@ -1298,7 +1320,10 @@ where
                 .await?;
 
             {
-                let _guard = page.data_lock.read();
+                let _guard = match page.data_lock.try_read() {
+                    Some(guard) => guard,
+                    None => page.data_lock.read().await,
+                };
                 unsafe {
                     out[dst_pos..dst_pos + take]
                         .copy_from_slice(&self.page_slice(&page)[block_off..block_off + take]);
@@ -1404,7 +1429,10 @@ where
             }
 
             {
-                let _guard = page.data_lock.write();
+                let _guard = match page.data_lock.try_write() {
+                    Some(guard) => guard,
+                    None => page.data_lock.write().await,
+                };
                 let destination =
                     unsafe {
                         &mut core::slice::from_raw_parts_mut(self.page_ptr(&page), BLOCK_SIZE)
@@ -2154,6 +2182,7 @@ where
         WritebackProgressWait {
             cache: self,
             filter,
+            yielded: false,
         }
     }
 
@@ -2448,7 +2477,10 @@ where
                     }
 
                     loop {
-                        let guard = page.data_lock.write();
+                        let guard = match page.data_lock.try_write() {
+                            Some(guard) => guard,
+                            None => page.data_lock.write().await,
+                        };
                         if page.writeback_mask.load(Ordering::Acquire) & bits != 0 {
                             drop(guard);
                             core::future::poll_fn(|cx| loop {
@@ -2568,7 +2600,10 @@ where
                 .await?;
 
             {
-                let _guard = page.data_lock.read();
+                let _guard = match page.data_lock.try_read() {
+                    Some(guard) => guard,
+                    None => page.data_lock.read().await,
+                };
                 unsafe {
                     out[dst_pos..dst_pos + take]
                         .copy_from_slice(&self.page_slice(&page)[block_off..block_off + take]);

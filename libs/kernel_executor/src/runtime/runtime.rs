@@ -10,8 +10,8 @@ use kernel_types::runtime::BlockOnThreadState;
 
 pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
-use crate::future_arena::FutureAllocation;
-use crate::global_async::{ExecutorDomain, ExecutorDomainId, GlobalAsyncExecutor};
+use crate::future_allocation::FutureAllocation;
+use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::{Job, platform};
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -242,20 +242,15 @@ where
     )
 }
 
-fn reserve_future<F>(
-    domain: &ExecutorDomain,
-    future: F,
-) -> (FutureAllocation, &'static TaskTable, SlotHandle) {
-    let allocation = domain
-        .future_arena()
-        .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-        .expect("future arena allocation failed");
+fn reserve_future<F>(future: F) -> (FutureAllocation, &'static TaskTable, SlotHandle) {
+    let allocation = FutureAllocation::allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+        .expect("future heap allocation failed");
     unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
     let slab = get_task_table();
     let slot_handle = match slab.allocate() {
         Some(handle) => handle,
         None => unsafe {
-            release_unpublished_future::<F>(domain, allocation);
+            release_unpublished_future::<F>(allocation);
             panic!("task table allocation failed");
         },
     };
@@ -277,7 +272,7 @@ where
     );
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
-            let (allocation, slab, slot_handle) = reserve_future(domain, future);
+            let (allocation, slab, slot_handle) = reserve_future(future);
 
             let (shard_idx, local_idx, generation) = slot_handle.indices();
 
@@ -475,7 +470,7 @@ where
     );
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
-            let (allocation, slab, slot_handle) = reserve_future(domain, future);
+            let (allocation, slab, slot_handle) = reserve_future(future);
             let (shard_idx, local_idx, generation) = slot_handle.indices();
 
             let slot = slab
@@ -492,13 +487,10 @@ where
         .expect("invalid executor domain")
 }
 
-unsafe fn release_unpublished_future<F>(
-    domain: &crate::global_async::ExecutorDomain,
-    allocation: FutureAllocation,
-) {
+unsafe fn release_unpublished_future<F>(allocation: FutureAllocation) {
     unsafe {
         core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
-        assert!(domain.future_arena().release(allocation));
+        allocation.release();
     }
 }
 
@@ -650,13 +642,11 @@ where
     }
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
-            let allocation = domain
-                .future_arena()
-                .allocate(
-                    core::mem::size_of::<PortFuture<F, P, T>>(),
-                    core::mem::align_of::<PortFuture<F, P, T>>(),
-                )
-                .ok_or(SpawnToPortError::FutureAllocationFailed)?;
+            let allocation = FutureAllocation::allocate(
+                core::mem::size_of::<PortFuture<F, P, T>>(),
+                core::mem::align_of::<PortFuture<F, P, T>>(),
+            )
+            .ok_or(SpawnToPortError::FutureAllocationFailed)?;
             unsafe {
                 allocation
                     .ptr
@@ -673,12 +663,12 @@ where
             }
             let slab = get_task_table();
             let Some(handle) = slab.allocate() else {
-                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(domain, allocation) };
+                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(allocation) };
                 return Err(SpawnToPortError::TaskAllocationFailed);
             };
             let (shard, local, generation) = handle.indices();
             let Some(token) = TaskToken::from_raw(handle.encoded_ptr()) else {
-                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(domain, allocation) };
+                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(allocation) };
                 return Err(SpawnToPortError::TaskAllocationFailed);
             };
             unsafe { (*allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>()).token = token.raw() };

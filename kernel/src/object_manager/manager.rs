@@ -452,8 +452,7 @@ impl ObjectBehavior for Arc<UserExecutorDomain> {
             queued_tasks: stats.queued_count as u64,
             active_tasks: stats.active_count as u64,
             live_tasks: stats.live_task_count as u64,
-            live_futures: stats.live_future_count as u64,
-            live_future_bytes: stats.live_future_bytes as u64,
+            reserved2: [0; 2],
             ready_shards: stats.ready_shards as u64,
         })
     }

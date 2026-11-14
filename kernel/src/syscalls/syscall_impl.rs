@@ -934,7 +934,6 @@ pub(crate) fn sys_executor_domain_create(
         },
         quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
         weight: ExecutorDomainClass::ProcessIo.default_weight(),
-        future_arena: Default::default(),
         ready_shards: if config.ready_shards == 0 {
             GlobalAsyncExecutor::global().worker_count()
         } else {

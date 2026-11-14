@@ -105,14 +105,14 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
         lba: u64,
         blocks: usize,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> AbiFuture<Result<usize, Self::Error>>;
+    ) -> impl core::future::Future<Output = Result<usize, Self::Error>> + Send;
 
     fn write_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Write<'data>,
     ) -> AbiFuture<Result<(), Self::Error>>;
 
-    fn flush_device(&self) -> AbiFuture<Result<(), Self::Error>>;
+    fn flush_device<'a>(&'a self) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send + 'a;
 
     fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> AbiFuture<Result<(), Self::Error>>;
 }

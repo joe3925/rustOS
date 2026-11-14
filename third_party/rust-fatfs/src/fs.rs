@@ -710,32 +710,28 @@ pub(crate) struct FsIoAdapter<'a, IO: ReadWriteSeek, TP, OCC> {
     fs: &'a FileSystem<IO, TP, OCC>,
 }
 
-use kernel_types::async_ffi::{AbiFuture, FutureExt};
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
     type Error = IO::Error;
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for FsIoAdapter<'_, IO, TP, OCC> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
-        async move { self.fs.disk.borrow_mut().read(buf, kind).await }.into_abi()
+    async fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> Result<usize, Self::Error> {
+        self.fs.disk.borrow_mut().read(buf, kind).await
     }
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for FsIoAdapter<'_, IO, TP, OCC> {
-    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
-        async move {
-            let size = self.fs.disk.borrow_mut().write(buf, kind).await?;
-            if size > 0 {
-                self.fs.set_dirty_flag(true).await?;
-            }
-            Ok(size)
+    async fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> Result<usize, Self::Error> {
+        let size = self.fs.disk.borrow_mut().write(buf, kind).await?;
+        if size > 0 {
+            self.fs.set_dirty_flag(true).await?;
         }
-        .into_abi()
+        Ok(size)
     }
 
-    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
-        async move { self.fs.disk.borrow_mut().flush().await }.into_abi()
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.fs.disk.borrow_mut().flush().await
     }
 }
 
@@ -834,43 +830,37 @@ impl<B: Send, S: IoBase> IoBase for DiskSlice<B, S> {
 }
 
 impl<B: BorrowMut<S> + Send, S: Read + Seek> Read for DiskSlice<B, S> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8], _kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
-        async move {
-            let offset = self.begin + self.offset;
-            let read_size = (buf.len() as u64).min(self.size - self.offset) as usize;
-            self.inner.borrow_mut().seek(SeekFrom::Start(offset))?;
-            let size = self.inner.borrow_mut().read(&mut buf[..read_size], self.kind).await?;
-            self.offset += size as u64;
-            Ok(size)
-        }
-        .into_abi()
+    async fn read<'a>(&'a mut self, buf: &'a mut [u8], _kind: IoKind) -> Result<usize, Self::Error> {
+        let offset = self.begin + self.offset;
+        let read_size = (buf.len() as u64).min(self.size - self.offset) as usize;
+        self.inner.borrow_mut().seek(SeekFrom::Start(offset))?;
+        let size = self.inner.borrow_mut().read(&mut buf[..read_size], self.kind).await?;
+        self.offset += size as u64;
+        Ok(size)
     }
 }
 
 impl<B: BorrowMut<S> + Send, S: Write + Seek> Write for DiskSlice<B, S> {
-    fn write<'a>(&'a mut self, buf: &'a [u8], _kind: IoKind) -> AbiFuture<Result<usize, Self::Error>> {
-        async move {
-            let offset = self.begin + self.offset;
-            let write_size = (buf.len() as u64).min(self.size - self.offset) as usize;
-            if write_size == 0 {
-                return Ok(0);
-            }
-            // Write data
-            {
-                let mut storage = self.inner.borrow_mut();
-                for i in 0..self.mirrors {
-                    storage.seek(SeekFrom::Start(offset + u64::from(i) * self.size))?;
-                    storage.write_all(&buf[..write_size], self.kind).await?;
-                }
-            }
-            self.offset += write_size as u64;
-            Ok(write_size)
+    async fn write<'a>(&'a mut self, buf: &'a [u8], _kind: IoKind) -> Result<usize, Self::Error> {
+        let offset = self.begin + self.offset;
+        let write_size = (buf.len() as u64).min(self.size - self.offset) as usize;
+        if write_size == 0 {
+            return Ok(0);
         }
-        .into_abi()
+        // Write data
+        {
+            let mut storage = self.inner.borrow_mut();
+            for i in 0..self.mirrors {
+                storage.seek(SeekFrom::Start(offset + u64::from(i) * self.size))?;
+                storage.write_all(&buf[..write_size], self.kind).await?;
+            }
+        }
+        self.offset += write_size as u64;
+        Ok(write_size)
     }
 
-    fn flush(&mut self) -> AbiFuture<Result<(), Self::Error>> {
-        async move { Ok(self.inner.borrow_mut().flush().await?) }.into_abi()
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(self.inner.borrow_mut().flush().await?)
     }
 }
 

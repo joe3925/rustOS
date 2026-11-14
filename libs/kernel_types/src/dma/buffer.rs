@@ -93,7 +93,7 @@ struct VirtDetails {
 }
 
 struct VirtPhys {
-    extents: Vec<IoBufferExtent>,
+    extents: [IoBufferExtent; 1],
     frames: Vec<PhysicalFrameExtent>,
 }
 
@@ -115,23 +115,18 @@ impl Drop for VirtDma {
 impl VirtIoBuffer {
     fn ensure_phys_described(&mut self) -> Result<&mut VirtDetails, IoBufferError> {
         if self.details.is_none() {
-            let mut extents = Vec::new();
             let mut frames = Vec::new();
-            let first_frame = frames.len();
             let (frame_count, frame_offset) =
                 describe_virtual_buffer_to_frames(self.virt_base, self.len, &mut frames)?;
-            extents
-                .try_reserve_exact(1)
-                .map_err(|_| IoBufferError::AllocationFailed)?;
-            extents.push(unsafe {
+            let extents = [unsafe {
                 IoBufferExtent::new(
                     Some(self.virt_base),
                     frame_offset,
                     self.len,
-                    first_frame,
+                    0,
                     frame_count,
                 )
-            });
+            }];
             self.details = Some(
                 Box::try_new(VirtDetails {
                     phys: VirtPhys { extents, frames },
@@ -148,21 +143,20 @@ impl VirtIoBuffer {
 }
 
 fn crop_virt_phys(phys: &VirtPhys, start: usize, len: usize) -> VirtPhys {
-    let mut extents = Vec::new();
+    let mut extents = [unsafe { IoBufferExtent::new(None, 0, 0, 0, 0) }];
     let mut frames = Vec::new();
 
-    for region in IoBufferRegionIter::new(&phys.extents, &phys.frames, start, len) {
-        let first_frame = frames.len();
+    if let Some(region) = IoBufferRegionIter::new(&phys.extents, &phys.frames, start, len).next() {
         frames.extend_from_slice(region.page_frames());
-        extents.push(unsafe {
+        extents[0] = unsafe {
             IoBufferExtent::new(
                 region.virtual_address(),
                 region.frame_offset(),
                 region.len(),
-                first_frame,
+                0,
                 region.page_frames().len(),
             )
-        });
+        };
     }
 
     VirtPhys { extents, frames }
@@ -177,7 +171,7 @@ fn split_virt_phys(
     if left_len == 0 && start == 0 {
         return (
             Some(VirtPhys {
-                extents: Vec::new(),
+                extents: [unsafe { IoBufferExtent::new(None, 0, 0, 0, 0) }],
                 frames: Vec::new(),
             }),
             Some(phys),
@@ -187,7 +181,7 @@ fn split_virt_phys(
         return (
             Some(phys),
             Some(VirtPhys {
-                extents: Vec::new(),
+                extents: [unsafe { IoBufferExtent::new(None, 0, 0, 0, 0) }],
                 frames: Vec::new(),
             }),
         );

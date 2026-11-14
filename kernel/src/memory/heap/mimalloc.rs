@@ -12,12 +12,13 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::ffi::c_void;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(debug_assertions)]
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 
 use kernel_types::arch::{PageFlags, VirtAddr};
 
-const MIMALLOC_STATS_ENABLED: bool = false;
 const MIMALLOC_COMMIT_GRANULARITY: usize = 2 * 1024 * 1024;
 const MIMALLOC_COMMIT_BITMAP_BITS: usize = usize::BITS as usize;
 
@@ -26,20 +27,35 @@ static MIMALLOC_ARENA_END: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "kernel-bench")]
 pub static MIMALLOC_INITIAL_COMMITTED: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(debug_assertions)]
 static MIMALLOC_COMMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_COMMIT_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_COMMIT_REQUESTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_COMMIT_MAPPED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_COMMIT_CYCLES: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_ALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_REALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_REALLOC_OLD_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_REALLOC_NEW_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_REALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_DEALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
 static MIMALLOC_DEALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 struct MimallocCommitTracker {
@@ -119,6 +135,7 @@ impl MimallocCommitTracker {
 static MIMALLOC_COMMIT_TRACKER: spin::Mutex<MimallocCommitTracker> =
     spin::Mutex::new(MimallocCommitTracker::new());
 
+#[derive(Default)]
 pub struct MimallocCommitStats {
     pub calls: usize,
     pub map_calls: usize,
@@ -127,6 +144,7 @@ pub struct MimallocCommitStats {
     pub cycles: u64,
 }
 
+#[derive(Default)]
 pub struct MimallocAllocStats {
     pub alloc_calls: usize,
     pub alloc_bytes: usize,
@@ -217,48 +235,68 @@ pub fn mimalloc_collect(force: bool) {
 }
 
 pub fn mimalloc_commit_stats_reset() {
-    MIMALLOC_COMMIT_CALLS.store(0, Ordering::Relaxed);
-    MIMALLOC_COMMIT_MAP_CALLS.store(0, Ordering::Relaxed);
-    MIMALLOC_COMMIT_REQUESTED.store(0, Ordering::Relaxed);
-    MIMALLOC_COMMIT_MAPPED.store(0, Ordering::Relaxed);
-    MIMALLOC_COMMIT_CYCLES.store(0, Ordering::Relaxed);
+    #[cfg(debug_assertions)]
+    {
+        MIMALLOC_COMMIT_CALLS.store(0, Ordering::Relaxed);
+        MIMALLOC_COMMIT_MAP_CALLS.store(0, Ordering::Relaxed);
+        MIMALLOC_COMMIT_REQUESTED.store(0, Ordering::Relaxed);
+        MIMALLOC_COMMIT_MAPPED.store(0, Ordering::Relaxed);
+        MIMALLOC_COMMIT_CYCLES.store(0, Ordering::Relaxed);
+    }
 }
 
 pub fn mimalloc_alloc_stats_reset() {
-    MIMALLOC_ALLOC_CALLS.store(0, Ordering::Relaxed);
-    MIMALLOC_ALLOC_BYTES.store(0, Ordering::Relaxed);
-    MIMALLOC_ALLOC_CYCLES.store(0, Ordering::Relaxed);
-    MIMALLOC_REALLOC_CALLS.store(0, Ordering::Relaxed);
-    MIMALLOC_REALLOC_OLD_BYTES.store(0, Ordering::Relaxed);
-    MIMALLOC_REALLOC_NEW_BYTES.store(0, Ordering::Relaxed);
-    MIMALLOC_REALLOC_CYCLES.store(0, Ordering::Relaxed);
-    MIMALLOC_DEALLOC_CALLS.store(0, Ordering::Relaxed);
-    MIMALLOC_DEALLOC_BYTES.store(0, Ordering::Relaxed);
-    MIMALLOC_DEALLOC_CYCLES.store(0, Ordering::Relaxed);
+    #[cfg(debug_assertions)]
+    {
+        MIMALLOC_ALLOC_CALLS.store(0, Ordering::Relaxed);
+        MIMALLOC_ALLOC_BYTES.store(0, Ordering::Relaxed);
+        MIMALLOC_ALLOC_CYCLES.store(0, Ordering::Relaxed);
+        MIMALLOC_REALLOC_CALLS.store(0, Ordering::Relaxed);
+        MIMALLOC_REALLOC_OLD_BYTES.store(0, Ordering::Relaxed);
+        MIMALLOC_REALLOC_NEW_BYTES.store(0, Ordering::Relaxed);
+        MIMALLOC_REALLOC_CYCLES.store(0, Ordering::Relaxed);
+        MIMALLOC_DEALLOC_CALLS.store(0, Ordering::Relaxed);
+        MIMALLOC_DEALLOC_BYTES.store(0, Ordering::Relaxed);
+        MIMALLOC_DEALLOC_CYCLES.store(0, Ordering::Relaxed);
+    }
 }
 
 pub fn mimalloc_commit_stats() -> MimallocCommitStats {
-    MimallocCommitStats {
-        calls: MIMALLOC_COMMIT_CALLS.load(Ordering::Relaxed),
-        map_calls: MIMALLOC_COMMIT_MAP_CALLS.load(Ordering::Relaxed),
-        requested: MIMALLOC_COMMIT_REQUESTED.load(Ordering::Relaxed),
-        mapped: MIMALLOC_COMMIT_MAPPED.load(Ordering::Relaxed),
-        cycles: MIMALLOC_COMMIT_CYCLES.load(Ordering::Relaxed),
+    #[cfg(debug_assertions)]
+    {
+        MimallocCommitStats {
+            calls: MIMALLOC_COMMIT_CALLS.load(Ordering::Relaxed),
+            map_calls: MIMALLOC_COMMIT_MAP_CALLS.load(Ordering::Relaxed),
+            requested: MIMALLOC_COMMIT_REQUESTED.load(Ordering::Relaxed),
+            mapped: MIMALLOC_COMMIT_MAPPED.load(Ordering::Relaxed),
+            cycles: MIMALLOC_COMMIT_CYCLES.load(Ordering::Relaxed),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        MimallocCommitStats::default()
     }
 }
 
 pub fn mimalloc_alloc_stats() -> MimallocAllocStats {
-    MimallocAllocStats {
-        alloc_calls: MIMALLOC_ALLOC_CALLS.load(Ordering::Relaxed),
-        alloc_bytes: MIMALLOC_ALLOC_BYTES.load(Ordering::Relaxed),
-        alloc_cycles: MIMALLOC_ALLOC_CYCLES.load(Ordering::Relaxed),
-        realloc_calls: MIMALLOC_REALLOC_CALLS.load(Ordering::Relaxed),
-        realloc_old_bytes: MIMALLOC_REALLOC_OLD_BYTES.load(Ordering::Relaxed),
-        realloc_new_bytes: MIMALLOC_REALLOC_NEW_BYTES.load(Ordering::Relaxed),
-        realloc_cycles: MIMALLOC_REALLOC_CYCLES.load(Ordering::Relaxed),
-        dealloc_calls: MIMALLOC_DEALLOC_CALLS.load(Ordering::Relaxed),
-        dealloc_bytes: MIMALLOC_DEALLOC_BYTES.load(Ordering::Relaxed),
-        dealloc_cycles: MIMALLOC_DEALLOC_CYCLES.load(Ordering::Relaxed),
+    #[cfg(debug_assertions)]
+    {
+        MimallocAllocStats {
+            alloc_calls: MIMALLOC_ALLOC_CALLS.load(Ordering::Relaxed),
+            alloc_bytes: MIMALLOC_ALLOC_BYTES.load(Ordering::Relaxed),
+            alloc_cycles: MIMALLOC_ALLOC_CYCLES.load(Ordering::Relaxed),
+            realloc_calls: MIMALLOC_REALLOC_CALLS.load(Ordering::Relaxed),
+            realloc_old_bytes: MIMALLOC_REALLOC_OLD_BYTES.load(Ordering::Relaxed),
+            realloc_new_bytes: MIMALLOC_REALLOC_NEW_BYTES.load(Ordering::Relaxed),
+            realloc_cycles: MIMALLOC_REALLOC_CYCLES.load(Ordering::Relaxed),
+            dealloc_calls: MIMALLOC_DEALLOC_CALLS.load(Ordering::Relaxed),
+            dealloc_bytes: MIMALLOC_DEALLOC_BYTES.load(Ordering::Relaxed),
+            dealloc_cycles: MIMALLOC_DEALLOC_CYCLES.load(Ordering::Relaxed),
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        MimallocAllocStats::default()
     }
 }
 
@@ -274,6 +312,7 @@ pub fn get_mimalloc_free_memory() -> usize {
 
 pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
     unsafe {
+        #[cfg(debug_assertions)]
         let start = mimalloc_stats_start();
         let size = layout.size();
         let ptr = if layout.align() <= core::mem::align_of::<usize>() {
@@ -281,6 +320,7 @@ pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
         } else {
             mi_malloc_aligned(size, layout.align())
         } as *mut u8;
+        #[cfg(debug_assertions)]
         mimalloc_record_alloc(layout.size(), start);
         ptr
     }
@@ -288,6 +328,7 @@ pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
 
 pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
     unsafe {
+        #[cfg(debug_assertions)]
         let start = mimalloc_stats_start();
         let size = layout.size();
         let ptr = if layout.align() <= core::mem::align_of::<usize>() {
@@ -295,6 +336,7 @@ pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
         } else {
             mi_zalloc_aligned(size, layout.align())
         } as *mut u8;
+        #[cfg(debug_assertions)]
         mimalloc_record_alloc(layout.size(), start);
         ptr
     }
@@ -302,14 +344,17 @@ pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
 
 pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
     unsafe {
+        #[cfg(debug_assertions)]
         let start = mimalloc_stats_start();
         mi_free_size(ptr.cast::<c_void>(), layout.size());
+        #[cfg(debug_assertions)]
         mimalloc_record_dealloc(layout.size(), start);
     }
 }
 
 pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
     unsafe {
+        #[cfg(debug_assertions)]
         let start = mimalloc_stats_start();
         let size = new_size.max(1);
         let new_ptr = if layout.align() <= core::mem::align_of::<usize>() {
@@ -317,26 +362,21 @@ pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) ->
         } else {
             mi_realloc_aligned(ptr.cast::<c_void>(), size, layout.align())
         } as *mut u8;
+        #[cfg(debug_assertions)]
         mimalloc_record_realloc(layout.size(), new_size, start);
         new_ptr
     }
 }
 
 #[inline(always)]
+#[cfg(debug_assertions)]
 fn mimalloc_stats_start() -> u64 {
-    if MIMALLOC_STATS_ENABLED {
-        platform::cycle_counter()
-    } else {
-        0
-    }
+    platform::cycle_counter()
 }
 
 #[inline(always)]
+#[cfg(debug_assertions)]
 fn mimalloc_record_alloc(size: usize, start: u64) {
-    if !MIMALLOC_STATS_ENABLED {
-        return;
-    }
-
     let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_ALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
@@ -344,11 +384,8 @@ fn mimalloc_record_alloc(size: usize, start: u64) {
 }
 
 #[inline(always)]
+#[cfg(debug_assertions)]
 fn mimalloc_record_dealloc(size: usize, start: u64) {
-    if !MIMALLOC_STATS_ENABLED {
-        return;
-    }
-
     let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_DEALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
@@ -356,11 +393,8 @@ fn mimalloc_record_dealloc(size: usize, start: u64) {
 }
 
 #[inline(always)]
+#[cfg(debug_assertions)]
 fn mimalloc_record_realloc(old_size: usize, new_size: usize, start: u64) {
-    if !MIMALLOC_STATS_ENABLED {
-        return;
-    }
-
     let elapsed = platform::cycle_counter().wrapping_sub(start);
     MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_REALLOC_OLD_BYTES.fetch_add(old_size, Ordering::Relaxed);
@@ -639,9 +673,11 @@ pub extern "C" fn rustos_mi_is_precommitted(addr: *mut c_void, size: usize) -> b
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
     unsafe {
+        #[cfg(debug_assertions)]
         let start_cycles = mimalloc_stats_start();
 
-        if MIMALLOC_STATS_ENABLED {
+        #[cfg(debug_assertions)]
+        {
             MIMALLOC_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
             MIMALLOC_COMMIT_REQUESTED.fetch_add(size, Ordering::Relaxed);
         }
@@ -653,6 +689,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
                 addr,
                 size
             );
+            #[cfg(debug_assertions)]
             mimalloc_record_commit_cycles(start_cycles);
             return false;
         };
@@ -666,6 +703,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
                 addr,
                 size
             );
+            #[cfg(debug_assertions)]
             mimalloc_record_commit_cycles(start_cycles);
             return false;
         }
@@ -684,6 +722,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
                 addr,
                 size
             );
+            #[cfg(debug_assertions)]
             mimalloc_record_commit_cycles(start_cycles);
             return false;
         };
@@ -719,18 +758,21 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
                     flags,
                     e
                 );
+                #[cfg(debug_assertions)]
                 mimalloc_record_commit_cycles(start_cycles);
                 return false;
             }
 
             tracker.mark_range(run_start, chunk);
             MIMALLOC_ARENA_COMMITTED.fetch_add(run_size, Ordering::Relaxed);
-            if MIMALLOC_STATS_ENABLED {
+            #[cfg(debug_assertions)]
+            {
                 MIMALLOC_COMMIT_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
                 MIMALLOC_COMMIT_MAPPED.fetch_add(run_size, Ordering::Relaxed);
             }
         }
 
+        #[cfg(debug_assertions)]
         mimalloc_record_commit_cycles(start_cycles);
         true
     }
@@ -809,13 +851,12 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
 }
 
 #[inline(always)]
+#[cfg(debug_assertions)]
 fn mimalloc_record_commit_cycles(start: u64) {
-    if MIMALLOC_STATS_ENABLED {
-        MIMALLOC_COMMIT_CYCLES.fetch_add(
-            platform::cycle_counter().wrapping_sub(start),
-            Ordering::Relaxed,
-        );
-    }
+    MIMALLOC_COMMIT_CYCLES.fetch_add(
+        platform::cycle_counter().wrapping_sub(start),
+        Ordering::Relaxed,
+    );
 }
 
 #[unsafe(no_mangle)]
