@@ -330,7 +330,7 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
         let gib = 1024 * mib;
         let mut modes = [
             ("buffered", gib, gib),
-            ("cached", 10 * mib, gib),
+            ("cached", 10 * mib, 100 * mib),
             ("read-write", 10 * mib, 50 * mib),
         ];
         let mode_count = modes.len();
