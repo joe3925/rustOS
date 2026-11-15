@@ -20,6 +20,19 @@ use crate::{
     qemu_args, system_disk,
 };
 
+// Console output is optional: a closed pipe or non-blocking terminal must not
+// abort a benchmark or discard the profiles being collected.
+pub(super) fn best_effort_output(writer: &mut impl Write, args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{args}");
+}
+
+macro_rules! print_status {
+    ($($args:tt)*) => {
+        $crate::bench::best_effort_output(&mut std::io::stdout().lock(), format_args!($($args)*))
+    };
+}
+pub(crate) use print_status;
+
 const MAX_ACTION_ANNOTATIONS: usize = 3;
 static ACTION_ANNOTATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -30,6 +43,9 @@ pub enum BenchCommand {
 
 pub struct BenchOptions {
     correctness: bool,
+    pgo: bool,
+    merge: bool,
+    pgo_output: Option<PathBuf>,
     release: bool,
     platform: String,
     launch: String,
@@ -40,7 +56,6 @@ pub struct BenchOptions {
     output: PathBuf,
     boot_image: Option<PathBuf>,
     export_boot_image: Option<PathBuf>,
-    prepare_only: bool,
     boot_timeout: Duration,
     timeout: Duration,
     offline: bool,
@@ -54,7 +69,7 @@ where
     let mut args = args.into_iter().peekable();
     if args.peek().map(String::as_str) == Some("compare") {
         if correctness {
-            return Err("correctness does not support baseline comparison".to_string());
+            return Err("this command does not support baseline comparison".to_string());
         }
         args.next();
         CompareOptions::parse(args).map(BenchCommand::Compare)
@@ -88,6 +103,9 @@ impl BenchOptions {
         let mut platform = "x86_64-uefi".to_string();
         let mut release = true;
         let mut all = false;
+        let mut pgo = false;
+        let mut merge = false;
+        let mut pgo_output = None;
         let mut launch = "qemu-x86_64-q35-ci".to_string();
         let mut host = None;
         let mut cpus = vec![1, 2, 4];
@@ -100,7 +118,6 @@ impl BenchOptions {
         });
         let mut boot_image = None;
         let mut export_boot_image = None;
-        let mut prepare_only = false;
         let mut boot_timeout = Duration::from_secs(2 * 60);
         let mut timeout = Duration::from_secs(15 * 60);
         let mut offline = false;
@@ -110,6 +127,9 @@ impl BenchOptions {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--all" => all = true,
+                "--pgo" if !correctness => pgo = true,
+                "--merge" if !correctness => merge = true,
+                "--pgo-output" if !correctness => pgo_output = Some(PathBuf::from(next_value(&mut args, "--pgo-output")?)),
                 "--profile" => {
                     release = match next_value(&mut args, "--profile")?.as_str() {
                         "release" => true,
@@ -137,8 +157,21 @@ impl BenchOptions {
                         return Err("--cpus requires positive comma-separated counts".to_string());
                     }
                 }
-                "--suite" => suites.push(next_value(&mut args, "--suite")?),
-                "--tag" => tags.push(next_value(&mut args, "--tag")?),
+                "--suite" | "--tag" => {
+                    let value = next_value(&mut args, &arg)?;
+                    let selection = if arg == "--suite" { &mut suites } else { &mut tags };
+                    for name in value.split(',').map(str::trim) {
+                        if name.is_empty() || name.len() > 128 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/')) {
+                            return Err(format!("Invalid {arg} value `{name}`; expected comma-separated names"));
+                        }
+                        if !selection.iter().any(|existing| existing == name) {
+                            selection.push(name.to_string());
+                        }
+                    }
+                    if selection.join(";").len() > 4095 {
+                        return Err(format!("{arg} selection is too long (maximum 4095 bytes)"));
+                    }
+                }
                 "--output" => output = PathBuf::from(next_value(&mut args, "--output")?),
                 "--boot-image" => {
                     boot_image = Some(PathBuf::from(next_value(&mut args, "--boot-image")?))
@@ -147,7 +180,6 @@ impl BenchOptions {
                     export_boot_image =
                         Some(PathBuf::from(next_value(&mut args, "--export-boot-image")?))
                 }
-                "--prepare-only" => prepare_only = true,
                 "--boot-timeout-secs" => {
                     let value = next_value(&mut args, "--boot-timeout-secs")?;
                     boot_timeout = Duration::from_secs(
@@ -178,15 +210,21 @@ impl BenchOptions {
             }
         }
 
+        if (merge || pgo_output.is_some()) && !pgo {
+            return Err("--merge and --pgo-output require --pgo".to_string());
+        }
         if all && (!suites.is_empty() || !tags.is_empty()) {
             return Err("Use --all without --suite or --tag".to_string());
         }
-        if !all && suites.is_empty() && tags.is_empty() {
+        if correctness && !all && suites.is_empty() && tags.is_empty() {
             tags.push("ci".to_string());
         }
 
         Ok(Self {
             correctness,
+            pgo,
+            merge,
+            pgo_output,
             release,
             platform,
             launch,
@@ -197,7 +235,6 @@ impl BenchOptions {
             output,
             boot_image,
             export_boot_image,
-            prepare_only,
             boot_timeout,
             timeout,
             offline,
@@ -237,6 +274,12 @@ struct ProtocolEvent {
     payload: Value,
 }
 
+fn existing_image(root: &Path, platform: &config::BuildPlan, release: bool) -> Result<PathBuf, String> {
+    crate::load_artifact_manifest(root, platform, release)
+        .map(|artifacts| artifacts.boot_image)
+        .map_err(|error| format!("{error}\nBuild a benchmark image explicitly with: cargo xtask build --platform {}{} --kernel-feature kernel-bench", platform.id, if release { " --release" } else { "" }))
+}
+
 fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
     let mode = if options.correctness {
         "correctness"
@@ -249,6 +292,17 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         "RUSTOS_BENCH\t"
     };
     let platform = config::load_platform(root, &options.platform)?;
+    if options.merge {
+        crate::pgo::check_merge_tool()?;
+    }
+    let pgo_output = if options.pgo {
+        let directory = match &options.pgo_output {
+            Some(path) => resolve(root, path),
+            None => crate::pgo::default_output(root, &platform, options.release)?,
+        };
+        if directory.exists() { return Err(format!("Use a new PGO output directory: {}", directory.display())); }
+        Some(directory)
+    } else { None };
     let launch = config::load_launch(root, &options.launch)?;
     let host = config::load_host(
         root,
@@ -257,67 +311,24 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
 
     let boot_image = if let Some(path) = &options.boot_image {
         resolve(root, path)
-    } else if !options.correctness
-        && std::env::var_os("RUSTOS_PGO_DISABLE").is_none()
-        && !crate::pgo::MODE_ENV.iter().any(|name| std::env::var_os(name).is_some())
-    {
-        let training_cpus = options.cpus.iter().max()
-            .ok_or_else(|| "Benchmark training requires a CPU count".to_string())?;
-        println!("==> creating benchmark image: one PGO training boot with {training_cpus} vCPU(s)");
-        let mut args = vec![
-            "--platform".to_string(), options.platform.clone(),
-            "--launch".to_string(), options.launch.clone(),
-            "--profile".to_string(), if options.release { "release" } else { "dev" }.to_string(),
-            "--cpus".to_string(), training_cpus.to_string(),
-        ];
-        if let Some(host) = &options.host {
-            args.extend(["--host".to_string(), host.clone()]);
-        }
-        if options.offline {
-            args.push("--offline".to_string());
-        }
-        crate::pgo::execute(root, args, Some(crate::pgo::BenchmarkImage {
-            suites: options.suites.clone(),
-            tags: options.tags.clone(),
-            boot_timeout_secs: options.boot_timeout.as_secs(),
-            timeout_secs: options.timeout.as_secs(),
-        }))?
-    } else {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
+    } else if options.correctness {
         unsafe {
-            std::env::set_var(
-                if options.correctness {
-                    "RUSTOS_CORRECTNESS_SUITES"
-                } else {
-                    "RUSTOS_BENCH_SUITES"
-                },
-                options.suites.join(","),
-            )
-        };
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe {
-            std::env::set_var(
-                if options.correctness {
-                    "RUSTOS_CORRECTNESS_TAGS"
-                } else {
-                    "RUSTOS_BENCH_TAGS"
-                },
-                options.tags.join(","),
-            )
-        };
-        build_platform(
-            root,
-            &platform,
-            options.release,
-            options.offline,
-            &[if options.correctness {
-                "kernel-correctness"
-            } else {
-                "kernel-bench"
-            }
-            .to_string()],
-        )?;
+            std::env::set_var("RUSTOS_CORRECTNESS_SUITES", options.suites.join(","));
+            std::env::set_var("RUSTOS_CORRECTNESS_TAGS", options.tags.join(","));
+        }
+        build_platform(root, &platform, options.release, options.offline, &["kernel-correctness".to_string()])?;
         crate::load_artifact_manifest(root, &platform, options.release)?.boot_image
+    } else {
+        if options.pgo {
+            crate::pgo::enable_generation();
+        }
+        unsafe {
+            std::env::set_var("RUSTOS_BENCH_SUITES", options.suites.join(","));
+            std::env::set_var("RUSTOS_BENCH_TAGS", options.tags.join(","));
+            std::env::set_var("RUSTOS_BENCH_AUTORUN", "1");
+        }
+        build_platform(root, &platform, options.release, options.offline, &["kernel-bench".to_string()])?;
+        existing_image(root, &platform, options.release)?
     };
     let qemu = find_qemu(&launch, &host)?;
     let firmware = find_firmware(&launch, &host, &qemu)?;
@@ -333,9 +344,6 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         }
         fs::copy(&boot_image, &export)
             .map_err(|err| format!("failed to export boot image to {}: {err}", export.display()))?;
-    }
-    if options.prepare_only {
-        return Ok(());
     }
 
     let output = if options.output.is_absolute() {
@@ -369,7 +377,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
             if repetition > 1 && !suite_boots.iter().any(|(_, boots)| *boots >= repetition) {
                 break;
             }
-            println!("==> {mode} with {cpus} vCPU(s), repetition {repetition}");
+            print_status!("==> {mode} with {cpus} vCPU(s), repetition {repetition}");
             let serial_log =
                 bench_dir.join(format!("{cpus}cpu-repetition-{repetition}.serial.log"));
             let topology = run_topology(
@@ -382,6 +390,9 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                 &disk,
                 cpus,
                 repetition,
+                &options.suites,
+                &options.tags,
+                options.pgo,
                 options.boot_timeout,
                 options.timeout,
                 serial_log,
@@ -437,7 +448,10 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         .iter()
         .all(|run| run.complete && run.status == "passed")
     {
-        println!("{mode} results: {}", output.display());
+        if let Some(directory) = &pgo_output {
+            crate::pgo::collect(&serde_json::to_value(&report).map_err(|error| error.to_string())?, directory, &platform, options.release, options.merge)?;
+        }
+        print_status!("{mode} results: {}", output.display());
         Ok(())
     } else {
         Err(format!(
@@ -458,6 +472,9 @@ fn run_topology(
     disk: &SystemDisk,
     cpus: usize,
     repetition: usize,
+    suite_names: &[String],
+    tags: &[String],
+    pgo: bool,
     boot_timeout: Duration,
     timeout: Duration,
     serial_log: PathBuf,
@@ -480,11 +497,24 @@ fn run_topology(
     // FIXME: Audit that the environment access only happens in single-threaded code.
     unsafe { std::env::set_var("RUSTOS_QEMU_SERIAL", "stdio") };
     let mut args = qemu_args(root, launch, firmware, boot_image, disk, &qemu_options)?;
-    if platform.kernel.import_library_machine == "X64" && protocol_prefix == "RUSTOS_BENCH\t" {
+    if protocol_prefix == "RUSTOS_BENCH\t" {
         args.push("-fw_cfg".into());
         args.push(format!("name=opt/rustos/bench-repetition,string={repetition}").into());
+        if pgo {
+            args.push("-fw_cfg".into());
+            args.push("name=opt/rustos/bench-pgo,string=1".into());
+        }
+        if !suite_names.is_empty() || !tags.is_empty() {
+            for (key, values) in [("bench-suites", suite_names), ("bench-tags", tags)] {
+                args.push("-fw_cfg".into());
+                args.push(format!("name=opt/rustos/{key},string={}", values.join(";")).into());
+            }
+        }
     }
 
+    // Write each serial line as it arrives rather than waiting for QEMU to exit.
+    let mut serial_output = fs::File::create(&serial_log)
+        .map_err(|err| format!("failed to create {}: {err}", serial_log.display()))?;
     let mut child = Command::new(qemu)
         .args(args)
         .current_dir(root)
@@ -499,7 +529,12 @@ fn run_topology(
     let (sender, receiver) = mpsc::channel();
     let reader_thread = thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
-            if sender.send(line).is_err() {
+            let line = line.and_then(|line| {
+                writeln!(serial_output, "{line}")?;
+                Ok(line)
+            });
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
                 break;
             }
         }
@@ -513,11 +548,20 @@ fn run_topology(
     let mut panic_lines = Vec::new();
     let mut panic_seen_at = None;
     let mut benchmark_started = false;
+    let mut selection_error = None;
 
     loop {
         while let Ok(line) = receiver.try_recv() {
             let line = line.map_err(|err| format!("failed reading QEMU serial output: {err}"))?;
-            println!("{line}");
+            // Profile payloads are transport data. Keep them in the serial log
+            // and event stream, but only mirror progress records to the terminal.
+            let profile_chunk = line
+                .strip_prefix(protocol_prefix)
+                .and_then(|record| record.split_once('\t'))
+                .is_some_and(|(_, record)| record.starts_with("pgo_chunk\t"));
+            if !profile_chunk {
+                print_status!("{line}");
+            }
             benchmark_started |= record_serial_line(
                 &line,
                 protocol_prefix,
@@ -528,6 +572,28 @@ fn run_topology(
                 &mut panic_lines,
                 &mut panic_seen_at,
             )?;
+        }
+
+        if protocol_prefix == "RUSTOS_BENCH\t" && (!suite_names.is_empty() || !tags.is_empty()) && benchmark_started {
+            if let Some(start) = events.iter().find(|event| event.kind == "run_start") {
+                if start.payload.get("requested_suites") != Some(&serde_json::json!(suite_names))
+                    || start.payload.get("requested_tags") != Some(&serde_json::json!(tags))
+                {
+                    selection_error = Some("The image does not acknowledge the requested benchmark filter; rebuild it with runtime selection support".to_string());
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
+
+        if pgo && benchmark_started {
+            if let Some(start) = events.iter().find(|event| event.kind == "run_start") {
+                if start.payload.get("pgo") != Some(&Value::Bool(true)) {
+                    selection_error = Some("bench --pgo requires an instrumented image with runtime PGO support; use build --pgo --kernel-feature kernel-bench first".to_string());
+                    let _ = child.kill();
+                    break;
+                }
+            }
         }
 
         if panic_seen_at.is_some_and(|seen| seen.elapsed() >= Duration::from_secs(1)) {
@@ -574,8 +640,8 @@ fn run_topology(
             &mut panic_seen_at,
         )?;
     }
-    fs::write(&serial_log, serial)
-        .map_err(|err| format!("failed to write {}: {err}", serial_log.display()))?;
+
+    if let Some(error) = selection_error { return Err(error); }
 
     let panic = (!panic_lines.is_empty()).then(|| panic_lines.join("\n"));
     if let Some(details) = &panic {
@@ -604,6 +670,10 @@ fn run_topology(
             &format!("Incomplete kernel run ({cpus} vCPUs)"),
             "QEMU exited without emitting a run_end event",
         );
+    }
+
+    if pgo && !events.iter().any(|event| event.kind == "pgo_end" && event.payload["component"] == "kernel") {
+        return Err("The benchmark did not finish collecting the kernel PGO profile".to_string());
     }
 
     Ok(TopologyRun {
@@ -1012,7 +1082,7 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     }
     fs::write(&output_path, markdown)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
-    println!("benchmark comparison: {}", output_path.display());
+    print_status!("benchmark comparison: {}", output_path.display());
     if options.annotations {
         for (key, regression, tolerance) in &regressions {
             annotate_error(
@@ -1256,5 +1326,84 @@ fn median(values: &[f64]) -> f64 {
         0 => 0.0,
         len if len % 2 == 1 => values[len / 2],
         len => (values[len / 2 - 1] + values[len / 2]) / 2.0,
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn console_write_errors_do_not_abort_benchmarks() {
+        struct FailingOutput(std::io::ErrorKind);
+        impl Write for FailingOutput {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for kind in [std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::WouldBlock] {
+            best_effort_output(&mut FailingOutput(kind), format_args!("benchmark sample {}", 4));
+        }
+        let mut output = Vec::new();
+        best_effort_output(&mut output, format_args!("benchmark sample {}", 4));
+        assert_eq!(output, b"benchmark sample 4\n");
+    }
+
+    #[test]
+    fn benchmark_names_are_optional_and_comma_separated() {
+        assert!(BenchOptions::parse(Vec::new(), false).unwrap().suites.is_empty());
+        let options = BenchOptions::parse([
+            "--suite", "heap.mimalloc, io.iobuffer,heap.mimalloc", "--tag", "io,heap", "--tag", "ci"
+        ].map(str::to_string), false).unwrap();
+        assert_eq!(options.suites, ["heap.mimalloc", "io.iobuffer"]);
+        assert_eq!(options.tags, ["io", "heap", "ci"]);
+        for value in ["", "heap.mimalloc,", "bad;name"] {
+            assert!(BenchOptions::parse(["--suite", value].map(str::to_string), false).is_err());
+        }
+    }
+
+    #[test]
+    fn benchmark_pgo_collection_is_opt_in() {
+        assert!(!BenchOptions::parse(Vec::new(), false).unwrap().pgo);
+        assert!(BenchOptions::parse(["--pgo".to_string()], false).unwrap().pgo);
+    }
+
+    #[test]
+    fn benchmark_accepts_build_and_collection_options() {
+        let options = BenchOptions::parse([
+            "--all", "--offline", "--pgo", "--merge"
+        ].map(str::to_string), false).unwrap();
+        assert!(options.offline && options.pgo && options.merge);
+        assert!(options.boot_image.is_none());
+    }
+
+    #[test]
+    fn existing_image_uses_platform_and_profile_without_building() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let root = std::env::temp_dir().join(format!("rustos-bench-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        for platform in ["aarch64-uefi", "x86_64-uefi"] {
+            let plan = config::load_platform(repository, platform).unwrap();
+            for release in [false, true] {
+                // A missing build must fail without creating any build output.
+                assert!(existing_image(&root, &plan, release).is_err());
+                let directory = root.join("target/rustos").join(platform).join(crate::profile(release));
+                assert!(!directory.exists());
+                fs::create_dir_all(&directory).unwrap();
+                for name in ["kernel.exe", "boot.img", "kernel.def", "kernel.lib", "stub"] {
+                    fs::write(directory.join(name), b"existing artifact").unwrap();
+                }
+                let manifest = serde_json::json!({
+                    "schema": 2, "platform": platform, "profile": crate::profile(release),
+                    "kernel": {"image": "kernel.exe", "debug": null},
+                    "sdk": {"definition_file": "kernel.def", "import_library": "kernel.lib"},
+                    "stub": "stub", "boot_image": "boot.img", "boot_packages": [], "debug_search_paths": []
+                });
+                fs::write(directory.join("artifacts.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+                assert_eq!(existing_image(&root, &plan, release).unwrap(), directory.join("boot.img"));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

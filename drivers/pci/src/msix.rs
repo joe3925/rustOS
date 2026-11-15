@@ -27,8 +27,20 @@ unsafe fn write_mmio_u32(address: u64, value: u32) {
             options(nostack, preserves_flags),
         );
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    unsafe { write_volatile(address as *mut u32, value) };
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "str {value:w}, [{address}]",
+            address = in(reg) address,
+            value = in(reg) value,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe {
+        write_volatile(address as *mut u32, value)
+    };
 }
 
 /// Read 16-bit value from config space.
@@ -243,7 +255,7 @@ pub extern "C" fn pci_setup_msix(
 
         Err(map_err) => {
             unsafe {
-                write_volatile((entry_va + 12) as *mut u32, VECTOR_CTRL_MASKED);
+                write_mmio_u32(entry_va + 12, VECTOR_CTRL_MASKED);
             }
 
             binding.handle.unregister();

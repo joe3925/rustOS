@@ -36,6 +36,12 @@ fn try_main() -> Result<(), String> {
 
     match cli.command {
         CliCommand::Build(options) => {
+            if options.pgo {
+                if options.kernel_features.iter().any(|feature| feature == "kernel-correctness") {
+                    return Err("build --pgo cannot be combined with kernel-correctness".to_string());
+                }
+                pgo::enable_generation();
+            }
             let platform = options
                 .platform
                 .as_deref()
@@ -47,8 +53,8 @@ fn try_main() -> Result<(), String> {
                 options.release,
                 options.offline,
                 &options.kernel_features,
-            )
-            .map(|_| ())
+            )?;
+            Ok(())
         }
         CliCommand::IrqCheck(options) => {
             let platform = options.platform.as_deref()
@@ -136,7 +142,7 @@ fn try_main() -> Result<(), String> {
             run_qemu(&root, &plan, &launch, &host, options, file_serial)
         }
         CliCommand::Bench(command) => bench::execute(&root, command),
-        CliCommand::Pgo(args) => pgo::execute(&root, args, None).map(|_| ()),
+        CliCommand::Pgo(args) => pgo::execute(&root, args).map(|_| ()),
         CliCommand::Cargo(options) => {
             let platform = options
                 .platform
@@ -278,6 +284,7 @@ struct CargoOptions {
 
 struct BuildOptions {
     release: bool,
+    pgo: bool,
     offline: bool,
     platform: Option<String>,
     kernel_features: Vec<String>,
@@ -314,10 +321,12 @@ impl Cli {
                 let mut offline = false;
                 let mut platform = None;
                 let mut kernel_features = Vec::new();
+                let mut pgo = false;
 
                 while let Some(arg) = args.next() {
                     match arg.as_str() {
                         "--release" => release = true,
+                        "--pgo" if command == "build" => pgo = true,
                         "--drivers" => {}
                         "--offline" => offline = true,
                         "--platform" => {
@@ -337,7 +346,7 @@ impl Cli {
                     }
                 }
 
-                let options = BuildOptions { release, offline, platform, kernel_features };
+                let options = BuildOptions { release, pgo, offline, platform, kernel_features };
                 Ok(Self { command: if command == "irq-check" {
                     CliCommand::IrqCheck(options)
                 } else { CliCommand::Build(options) } })
@@ -414,8 +423,8 @@ impl Cli {
                 })
             }
             Some("bench" | "correctness") => {
-                let correctness = args.next().as_deref() == Some("correctness");
-                bench::parse(args, correctness).map(|command| Self {
+                let command = args.next().unwrap();
+                bench::parse(args, command == "correctness").map(|command| Self {
                     command: CliCommand::Bench(command),
                 })
             }
@@ -464,21 +473,21 @@ impl Cli {
 fn usage() -> String {
     [
         "usage:",
-        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
+        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--pgo] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- irq-check --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta]",
-        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--profile dev|release] [--cpus 1,2,4] [--all | --suite NAME | --tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N] [--max-repetitions N]",
+        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--profile dev|release] [--cpus 1,2,4] [--suite NAME,NAME] [--tag TAG,TAG] [--pgo [--merge] [--pgo-output DIR]] [--boot-image FILE] [--export-boot-image FILE] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N] [--max-repetitions N] [--offline]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "  cargo run -p xtask -- correctness [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE]",
         "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
-        "  cargo xtask pgo --launch NAME|FILE [--profile dev|release] [--platform NAME|FILE] [--host NAME|FILE] [--cpus N,N] [--output DIR] [--offline]",
-        "  bench image creation trains PGO once at the largest selected CPU count, then rebuilds the kernel and loaded drivers",
-        "  bench --prepare-only includes PGO training; --boot-image uses the supplied image without training",
+        "  cargo xtask pgo --platform NAME|FILE --profiles DIR [--profile dev|release] [--kernel-feature NAME] [--offline]",
+        "  bench builds the selected platform/profile image before running; --boot-image skips building",
+        "  build --kernel-feature kernel-bench creates a benchmark image; RUSTOS_BENCH_TAGS and RUSTOS_BENCH_SUITES select its benchmarks",
         "",
+        "  build always ignores profiles; build --pgo instruments the kernel and drivers",
+        "  bench --pgo builds an instrumented image and writes raw profiles; add --merge to merge them",
+        "  pgo --profiles DIR builds using those merged profiles; it never runs benchmarks",
         "environment:",
-        "  RUSTOS_PGO_GENERATE collect a kernel profile during benchmark runs",
-        "  RUSTOS_PGO_USE      absolute path to the merged kernel profile",
-        "  RUSTOS_PGO_DISABLE skip automatic benchmark PGO training and ignore saved profiles",
         "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",
         "  RUSTOS_FIRMWARE   direct firmware path; bypasses candidate discovery",
         "  RUSTOS_FIRMWARE_CANDIDATES path-list prepended to host firmware discovery",
@@ -618,6 +627,8 @@ fn build_platform(
         &debug_search_paths,
     )?;
 
+    let metadata = output.join("pgo.json");
+    if metadata.exists() { fs::remove_file(metadata).map_err(|error| error.to_string())?; }
     Ok(boot)
 }
 fn artifact_root(root: &Path, plan: &BuildPlan, release: bool) -> PathBuf {

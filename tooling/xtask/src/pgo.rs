@@ -6,24 +6,24 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) const MODE_ENV: [&str; 6] = [
-    "RUSTOS_PGO_GENERATE",
-    "RUSTOS_PGO_USE",
-    "RUSTOS_PGO_DRIVERS",
-    "RUSTOS_PGO_DRIVER_GENERATE",
-    "RUSTOS_PGO_DRIVER_USE",
-    "RUSTOS_PGO_DRIVER_BASELINE",
-];
+static GENERATE: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_generation() {
+    GENERATE.store(true, Ordering::Relaxed);
+}
+
+static APPLY: std::sync::OnceLock<BTreeMap<String, PathBuf>> = std::sync::OnceLock::new();
 
 #[derive(Deserialize, Serialize)]
-struct InstalledProfiles {
+struct ProfileSet {
     schema: u32,
     platform: String,
     profile: String,
-    launch: String,
     compiler: String,
+    merged: bool,
     profiles: BTreeMap<String, PathBuf>,
 }
 
@@ -33,68 +33,23 @@ struct Capture {
     bytes: Vec<u8>,
 }
 
-pub struct BenchmarkImage {
-    pub suites: Vec<String>,
-    pub tags: Vec<String>,
-    pub boot_timeout_secs: u64,
-    pub timeout_secs: u64,
-}
-
 pub fn configure(
     command: &mut Command,
-    root: &Path,
-    plan: &BuildPlan,
-    release: bool,
+    _root: &Path,
+    _plan: &BuildPlan,
+    _release: bool,
     component: &str,
     target: &Path,
 ) -> Result<bool, String> {
     let kernel = component == "kernel";
-    let selected = env::var("RUSTOS_PGO_DRIVERS")
-        .unwrap_or_default()
-        .split(',')
-        .any(|name| name == "all" || name.eq_ignore_ascii_case(component));
-    let generate = if kernel {
-        env::var_os("RUSTOS_PGO_GENERATE").is_some()
-    } else {
-        selected && env::var_os("RUSTOS_PGO_DRIVER_GENERATE").is_some()
-    };
-    let capture_drivers = kernel && env::var_os("RUSTOS_PGO_DRIVER_GENERATE").is_some();
-    let baseline = !kernel && env::var_os("RUSTOS_PGO_DRIVER_BASELINE").is_some();
-    let mut profile = if kernel {
-        env::var_os("RUSTOS_PGO_USE").map(PathBuf::from)
-    } else if selected {
-        env::var_os("RUSTOS_PGO_DRIVER_USE").map(|directory| {
-            PathBuf::from(directory).join(format!("{}.profdata", component.to_ascii_lowercase()))
-        })
-    } else {
-        None
-    };
-    if generate && profile.is_some() {
-        return Err(format!("Set only one PGO mode for {component}"));
-    }
-    if env::var_os("RUSTOS_PGO_DISABLE").is_none()
-        && !MODE_ENV.iter().any(|name| env::var_os(name).is_some())
-    {
-        let path = crate::artifact_root(root, plan, release).join("pgo.json");
-        if path.is_file() {
-            let state: InstalledProfiles = serde_json::from_slice(
-                &fs::read(&path)
-                    .map_err(|error| format!("Cannot read {}: {error}", path.display()))?,
-            )
-            .map_err(|error| format!("Invalid PGO settings in {}: {error}", path.display()))?;
-            if state.schema != 1
-                || state.platform != plan.id
-                || state.profile != crate::profile(release)
-            {
-                return Err(format!(
-                    "PGO settings do not match this build: {}",
-                    path.display()
-                ));
-            }
-            profile = state.profiles.get(&component.to_ascii_lowercase()).cloned();
-        }
-    }
-    if !generate && profile.is_none() && !baseline && !capture_drivers {
+    let generate = GENERATE.load(Ordering::Relaxed);
+    // Only the explicit `pgo` command populates APPLY. Builds never read saved
+    // profile state or PGO environment variables.
+    let profile = APPLY
+        .get()
+        .and_then(|profiles| profiles.get(&component.to_ascii_lowercase()))
+        .cloned();
+    if !generate && profile.is_none() {
         return Ok(false);
     }
     let target_data: Value = serde_json::from_slice(
@@ -119,8 +74,14 @@ pub fn configure(
     if llvm_target.starts_with("x86_64") {
         cflags.push_str(" -mno-red-zone");
     }
-    command.env("CFLAGS", cflags).env("AR", "llvm-lib");
-    if generate || profile.is_some() || baseline {
+    let archiver = crate::find_tool_in_augmented_path("llvm-lib")
+        .or_else(|| crate::find_tool_in_augmented_path("llvm-ar"))
+        .ok_or_else(|| {
+            "PGO requires llvm-lib or llvm-ar; install rustup component add llvm-tools-preview"
+                .to_string()
+        })?;
+    command.env("CFLAGS", cflags).env("AR", archiver);
+    if generate || profile.is_some() {
         let mut flags = "-Clinker-plugin-lto\x1f-Clto=fat\x1f-Clink-arg=/opt:lldlto=3".to_string();
         if llvm_target.starts_with("aarch64") {
             flags.push_str("\x1f--cfg\x1fportable_atomic_no_outline_atomics");
@@ -128,9 +89,8 @@ pub fn configure(
         if generate {
             flags.push_str("\x1f-Cprofile-generate=rustos.profraw\x1f-Zno-profiler-runtime\x1f-Cllvm-args=-instrprof-atomic-counter-update-all");
         } else if let Some(path) = profile {
-            let path = dunce::canonicalize(&path).map_err(|error| {
-                format!("Cannot read PGO profile {}: {error}. Run xtask pgo again, or set RUSTOS_PGO_DISABLE=1", path.display())
-            })?;
+            let path = dunce::canonicalize(&path)
+                .map_err(|error| format!("Cannot read PGO profile {}: {error}", path.display()))?;
             if !path.is_file() {
                 return Err(format!("PGO profile is not a file: {}", path.display()));
             }
@@ -138,7 +98,7 @@ pub fn configure(
                 "\x1f-Cprofile-use={}\x1f-Cllvm-args=-pgo-warn-missing-function",
                 path.display()
             ));
-            println!("==> using PGO for {component}: {}", path.display());
+            crate::bench::print_status!("==> using PGO for {component}: {}", path.display());
         }
         command.env("CARGO_ENCODED_RUSTFLAGS", flags);
     }
@@ -148,30 +108,8 @@ pub fn configure(
     Ok(true)
 }
 
-fn stage_command(root: &Path, executable: &Path, staging: &Path, offline: bool) -> Command {
-    let mut command = Command::new(executable);
-    command.current_dir(root);
-    for name in MODE_ENV {
-        command.env_remove(name);
-    }
-    for name in [
-        "RUSTOS_BENCH_SUITES",
-        "RUSTOS_BENCH_TAGS",
-        "RUSTOS_BENCH_AUTORUN",
-    ] {
-        command.env_remove(name);
-    }
-    command
-        .env("RUSTOS_PGO_DISABLE", "1")
-        .env("RUSTOS_PGO_ARTIFACT_ROOT", staging);
-    if offline {
-        command.env("CARGO_NET_OFFLINE", "true");
-    }
-    command
-}
-
 fn run_step(mut command: Command, log: &Path, step: &str) -> Result<(), String> {
-    println!("==> {step}; log: {}", log.display());
+    crate::bench::print_status!("==> {step}; log: {}", log.display());
     let output = fs::File::create(log)
         .map_err(|error| format!("Cannot create {}: {error}", log.display()))?;
     let errors = output.try_clone().map_err(|error| error.to_string())?;
@@ -182,10 +120,7 @@ fn run_step(mut command: Command, log: &Path, step: &str) -> Result<(), String> 
         .status()
         .map_err(|error| format!("Cannot start {step}: {error}"))?;
     if !status.success() {
-        return Err(format!(
-            "{step} failed ({status}). Read {}. Published binaries were not replaced",
-            log.display()
-        ));
+        return Err(format!("{step} failed ({status}). Read {}", log.display()));
     }
     Ok(())
 }
@@ -212,206 +147,95 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn execute(
-    root: &Path,
-    args: Vec<String>,
-    benchmark: Option<BenchmarkImage>,
-) -> Result<PathBuf, String> {
-    let mut launch_selector = None;
-    let mut platform_selector = None;
-    let mut host_selector = None;
-    let mut cpu_selector = None;
-    let mut output = None;
-    let mut release = true;
-    let mut offline = false;
-    let mut args = args.into_iter();
-    while let Some(argument) = args.next() {
-        if matches!(argument.as_str(), "--help" | "-h") {
-            println!(
-                "cargo xtask pgo --launch NAME|FILE [--profile dev|release] [--platform NAME|FILE] [--host NAME|FILE] [--cpus N,N] [--output DIR] [--offline]\nRun all benchmarks once per CPU count, collect kernel and driver profiles, check the optimized benchmark build, then replace the published build. The default profile is release. The default CPU count comes from the launch. Drivers not loaded by the launch are left without PGO. Previous binaries are kept in a backup directory. Later xtask builds reuse the saved profiles. Set RUSTOS_PGO_DISABLE=1 to build without them."
-            );
-            return Ok(PathBuf::new());
-        }
-        if argument == "--offline" {
-            offline = true;
-            continue;
-        }
-        if !matches!(
-            argument.as_str(),
-            "--launch" | "--profile" | "--platform" | "--host" | "--cpus" | "--output"
-        ) {
-            return Err(format!("Unknown pgo argument `{argument}`"));
-        }
-        let value = args
-            .next()
-            .ok_or_else(|| format!("{argument} requires a value"))?;
-        match argument.as_str() {
-            "--launch" => launch_selector = Some(value),
-            "--platform" => platform_selector = Some(value),
-            "--host" => host_selector = Some(value),
-            "--cpus" => cpu_selector = Some(value),
-            "--output" => output = Some(PathBuf::from(value)),
-            "--profile" => {
-                release = match value.as_str() {
-                    "release" => true,
-                    "dev" | "debug" => false,
-                    _ => return Err(format!("Unsupported build profile `{value}`")),
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-    let launch_selector =
-        launch_selector.ok_or_else(|| "pgo requires --launch NAME|FILE".to_string())?;
-    let launch = config::load_launch(root, &launch_selector)?;
-    let platform_selector = match platform_selector {
-        Some(platform) => platform,
-        None if launch.compatible_platforms.len() == 1 => launch.compatible_platforms[0].clone(),
-        None => return Err("This launch requires an explicit --platform".to_string()),
-    };
-    let plan = config::load_platform(root, &platform_selector)?;
-    if !launch.compatible_platforms.contains(&plan.id) {
-        return Err(format!("Launch {} does not support {}", launch.id, plan.id));
-    }
-    let host = config::load_host(root, host_selector.as_deref().unwrap_or(env::consts::OS))?;
-    let qemu = crate::find_qemu(&launch, &host)?;
-    crate::find_firmware(&launch, &host, &qemu)?;
-    let disk = crate::system_disk(root)?;
-    crate::assert_exists(&disk.path, "system disk")?;
-    let cpus = cpu_selector.unwrap_or_else(|| launch.defaults.cpus.clone());
-    let mut cpu_counts = BTreeSet::new();
-    for cpu in cpus.split(',') {
-        let cpu = cpu
-            .parse::<usize>()
-            .map_err(|_| "CPU counts must be positive integers".to_string())?;
-        if cpu == 0 || !cpu_counts.insert(cpu) {
-            return Err("CPU counts must be positive and must not repeat".to_string());
-        }
-    }
-    let compiler_output = Command::new("rustc")
+fn compiler_version() -> Result<String, String> {
+    let output = Command::new("rustc")
         .arg("-vV")
         .output()
-        .map_err(|error| format!("Cannot read the Rust compiler version: {error}"))?;
-    if !compiler_output.status.success() {
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
         return Err("rustc -vV failed".to_string());
     }
-    let compiler = String::from_utf8(compiler_output.stdout).map_err(|error| error.to_string())?;
-    let compiler_host = compiler
+    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+}
+
+fn profile_tool(compiler: &str) -> Result<PathBuf, String> {
+    let host = compiler
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
-        .ok_or_else(|| "The compiler did not report its host".to_string())?;
-    let sysroot_output = Command::new("rustc")
+        .ok_or_else(|| "Compiler did not report its host".to_string())?;
+    let output = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()
-        .map_err(|error| format!("Cannot find the Rust sysroot: {error}"))?;
-    if !sysroot_output.status.success() {
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
         return Err("rustc --print sysroot failed".to_string());
     }
-    let sysroot = String::from_utf8(sysroot_output.stdout).map_err(|error| error.to_string())?;
-    let profdata = Path::new(sysroot.trim())
+    let sysroot = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    let path = Path::new(sysroot.trim())
         .join("lib/rustlib")
-        .join(compiler_host)
+        .join(host)
         .join("bin")
         .join(format!("llvm-profdata{}", env::consts::EXE_SUFFIX));
-    if !profdata.is_file() {
+    if !path.is_file() {
         return Err(
-            "Install the matching profile tool with: rustup component add llvm-tools-preview"
+            "Install the matching profile tool: rustup component add llvm-tools-preview"
                 .to_string(),
         );
     }
-    let stamp = SystemTime::now()
+    Ok(path)
+}
+
+pub fn check_merge_tool() -> Result<(), String> {
+    let tool = profile_tool(&compiler_version()?)?;
+    let output = Command::new(&tool)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("Cannot run {}: {error}", tool.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version failed: {}",
+            tool.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn stamp() -> Result<u128, String> {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| error.to_string())?
-        .as_nanos();
-    let output = output.unwrap_or_else(|| {
-        root.join("target/pgo")
-            .join(&plan.id)
-            .join(crate::profile(release))
-            .join(&launch.id)
-            .join(format!("run-{stamp}"))
-    });
-    let output = if output.is_absolute() {
-        output
-    } else {
-        root.join(output)
-    };
+        .map(|time| time.as_nanos())
+        .map_err(|error| error.to_string())
+}
+
+pub fn collect(
+    report: &Value,
+    output: &Path,
+    plan: &BuildPlan,
+    release: bool,
+    should_merge: bool,
+) -> Result<(), String> {
     if output.exists() {
         return Err(format!(
             "Use a new PGO output directory: {}",
             output.display()
         ));
     }
-    fs::create_dir_all(&output)
-        .map_err(|error| format!("Cannot create {}: {error}", output.display()))?;
+    fs::create_dir_all(output).map_err(|error| error.to_string())?;
     let output = dunce::canonicalize(output).map_err(|error| error.to_string())?;
-    let staging = output.join("staging");
-    let profiles_dir = output.join("profiles");
-    fs::create_dir(&profiles_dir).map_err(|error| error.to_string())?;
-    let executable = env::current_exe().map_err(|error| error.to_string())?;
-    let mut bench_args = vec![
-        "bench".to_string(),
-        "--all".to_string(),
-        "--platform".to_string(),
-        platform_selector.clone(),
-        "--launch".to_string(),
-        launch_selector.clone(),
-        "--profile".to_string(),
-        if release { "release" } else { "dev" }.to_string(),
-        "--cpus".to_string(),
-        cpus.clone(),
-        "--max-repetitions".to_string(),
-        "1".to_string(),
-        "--boot-timeout-secs".to_string(),
-        benchmark.as_ref().map_or(180, |options| options.boot_timeout_secs).to_string(),
-        "--timeout-secs".to_string(),
-        benchmark.as_ref().map_or(1200, |options| options.timeout_secs).to_string(),
-    ];
-    if let Some(host) = &host_selector {
-        bench_args.extend(["--host".to_string(), host.clone()]);
-    }
-    if offline {
-        bench_args.push("--offline".to_string());
-    }
-    let training_report = output.join("training/results.json");
-    let mut train = stage_command(root, &executable, &staging, offline);
-    train
-        .args(&bench_args)
-        .arg("--output")
-        .arg(&training_report)
-        .arg("--export-boot-image")
-        .arg(output.join("instrumented.img"))
-        .env("RUSTOS_PGO_GENERATE", "1")
-        .env("RUSTOS_PGO_DRIVER_GENERATE", "1")
-        .env("RUSTOS_PGO_DRIVERS", "all");
-    run_step(
-        train,
-        &output.join("training.log"),
-        "collecting PGO profiles",
-    )?;
-    let report: Value =
-        serde_json::from_slice(&fs::read(&training_report).map_err(|error| error.to_string())?)
-            .map_err(|error| format!("Invalid training report: {error}"))?;
+    let profiles_dir = &output;
     if report["schema"] != "rustos.bench-run.v1" || report["protocol_version"] != 1 {
         return Err("Unsupported training report format".to_string());
     }
     let runs = report["runs"]
         .as_array()
         .ok_or_else(|| "Training report has no runs".to_string())?;
-    if runs.len() != cpu_counts.len() {
-        return Err("Training did not complete each CPU configuration".to_string());
+    if runs.is_empty() {
+        return Err("The benchmark report has no runs".to_string());
     }
     let mut raw_profiles = BTreeMap::<String, Vec<PathBuf>>::new();
-    let mut completed_cpus = BTreeSet::new();
     for (run_index, run) in runs.iter().enumerate() {
-        let cpu = run["cpus"]
-            .as_u64()
-            .and_then(|cpu| usize::try_from(cpu).ok())
-            .ok_or_else(|| "Training run has an invalid CPU count".to_string())?;
-        if !cpu_counts.contains(&cpu)
-            || !completed_cpus.insert(cpu)
-            || run["complete"] != true
-            || run["status"] != "passed"
-        {
+        if run["complete"] != true || run["status"] != "passed" {
             return Err(format!("Training run {run_index} did not pass"));
         }
         let mut captures = BTreeMap::<String, Capture>::new();
@@ -507,120 +331,168 @@ pub fn execute(
             return Err(format!("Training run {run_index} has incomplete profiles"));
         }
     }
-    let mut profiles = BTreeMap::new();
-    for (component, raw) in &raw_profiles {
-        let path = profiles_dir.join(format!("{component}.profdata"));
-        let mut merge = Command::new(&profdata);
-        merge.arg("merge").arg("-o").arg(&path).args(raw);
-        run_step(
-            merge,
-            &output.join(format!("merge-{component}.log")),
-            &format!("merging {component}"),
-        )?;
-        let mut show = Command::new(&profdata);
-        show.arg("show").arg(&path);
-        run_step(
-            show,
-            &output.join(format!("profile-{component}.log")),
-            &format!("checking {component} profile"),
-        )?;
-        profiles.insert(component.clone(), path);
-    }
-    let stage = staging.join(&plan.id).join(crate::profile(release));
-    let artifacts: crate::artifacts::ArtifactManifest = serde_json::from_slice(
-        &fs::read(stage.join("artifacts.json")).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let skipped: Vec<_> = artifacts
-        .boot_packages
-        .iter()
-        .filter(|driver| !profiles.contains_key(&driver.name.to_ascii_lowercase()))
-        .map(|driver| driver.name.clone())
-        .collect();
-    if !skipped.is_empty() {
-        println!("==> no profile was captured for: {}", skipped.join(", "));
-    }
-    let drivers = profiles
-        .keys()
-        .filter(|name| name.as_str() != "kernel")
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(",");
-    let kernel_profile = profiles
-        .get("kernel")
-        .ok_or_else(|| "No kernel profile was captured".to_string())?;
-    let verification_report = output.join("verification/results.json");
-    if let Some(options) = &benchmark {
-        bench_args.retain(|argument| argument != "--all");
-        for suite in &options.suites {
-            bench_args.extend(["--suite".to_string(), suite.clone()]);
+    let compiler = compiler_version()?;
+    let profiles = if should_merge {
+        let profdata = profile_tool(&compiler)?;
+        let mut profiles = BTreeMap::new();
+        for (component, raw) in &raw_profiles {
+            let path = profiles_dir.join(format!("{component}.profdata"));
+            let mut merge = Command::new(&profdata);
+            merge.arg("merge").arg("-o").arg(&path).args(raw);
+            run_step(
+                merge,
+                &output.join(format!("merge-{component}.log")),
+                &format!("merging {component}"),
+            )?;
+            let mut show = Command::new(&profdata);
+            show.arg("show").arg(&path);
+            run_step(
+                show,
+                &output.join(format!("profile-{component}.log")),
+                &format!("checking {component} profile"),
+            )?;
+            profiles.insert(
+                component.clone(),
+                PathBuf::from(format!("{component}.profdata")),
+            );
         }
-        for tag in &options.tags {
-            bench_args.extend(["--tag".to_string(), tag.clone()]);
-        }
-        if options.suites.is_empty() && options.tags.is_empty() {
-            bench_args.push("--all".to_string());
-        }
-    }
-    let mut verify = stage_command(root, &executable, &staging, offline);
-    verify
-        .args(&bench_args)
-        .arg("--output")
-        .arg(&verification_report)
-        .arg("--export-boot-image")
-        .arg(output.join("optimized-benchmark.img"))
-        .env("RUSTOS_PGO_USE", kernel_profile)
-        .env("RUSTOS_PGO_DRIVER_USE", &profiles_dir)
-        .env("RUSTOS_PGO_DRIVERS", &drivers);
-    if benchmark.is_some() {
-        verify.arg("--prepare-only");
-    }
-    run_step(
-        verify,
-        &output.join(if benchmark.is_some() { "image-build.log" } else { "verification.log" }),
-        if benchmark.is_some() { "creating the PGO benchmark image" } else { "checking all benchmarks with PGO" },
-    )?;
-    if let Some(options) = benchmark {
-        let image = output.join("optimized-benchmark.img");
-        crate::assert_exists(&image, "PGO benchmark image")?;
-        let result = json!({
-            "schema": "rustos.pgo-benchmark-image.v1", "complete": true,
-            "platform": plan.id, "profile": crate::profile(release), "launch": launch.id,
-            "training_cpus": cpu_counts, "training_report": training_report,
-            "profiles": profiles, "unprofiled_drivers": skipped,
-            "suites": options.suites, "tags": options.tags, "image": image,
-        });
-        fs::write(output.join("image-build.json"), serde_json::to_vec_pretty(&result)
-            .map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-        println!("PGO benchmark image: {}", image.display());
-        println!("PGO image details: {}", output.join("image-build.json").display());
-        return Ok(image);
-    }
-    let mut build = stage_command(root, &executable, &staging, offline);
-    build
-        .args(["build", "--platform", &platform_selector])
-        .env("RUSTOS_PGO_USE", kernel_profile)
-        .env("RUSTOS_PGO_DRIVER_USE", &profiles_dir)
-        .env("RUSTOS_PGO_DRIVERS", &drivers);
-    if release {
-        build.arg("--release");
-    }
-    if offline {
-        build.arg("--offline");
-    }
-    run_step(
-        build,
-        &output.join("build.log"),
-        "building the normal PGO image",
-    )?;
-    let state = InstalledProfiles {
+        profiles
+    } else {
+        BTreeMap::new()
+    };
+    let state = ProfileSet {
         schema: 1,
         platform: plan.id.clone(),
         profile: crate::profile(release).to_string(),
-        launch: launch.id.clone(),
         compiler,
+        merged: should_merge,
         profiles,
     };
+    fs::write(
+        output.join("profiles.json"),
+        serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    crate::bench::print_status!(
+        "PGO {}profiles: {}",
+        if should_merge {
+            "raw and merged "
+        } else {
+            "raw "
+        },
+        output.display()
+    );
+    Ok(())
+}
+
+pub fn default_output(root: &Path, plan: &BuildPlan, release: bool) -> Result<PathBuf, String> {
+    Ok(root
+        .join("target/pgo")
+        .join(&plan.id)
+        .join(crate::profile(release))
+        .join(format!("run-{}", stamp()?)))
+}
+
+pub fn execute(root: &Path, args: Vec<String>) -> Result<PathBuf, String> {
+    let mut platform = None;
+    let mut profiles_dir = None;
+    let mut release = true;
+    let mut offline = false;
+    let mut features = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                crate::bench::print_status!(
+                    "cargo xtask pgo --platform NAME --profiles DIR [--profile dev|release] [--kernel-feature NAME] [--offline]\nBuild using profiles collected by bench --pgo --merge. This command does not run benchmarks or merge profiles. Ordinary builds always ignore profiles."
+                );
+                return Ok(PathBuf::new());
+            }
+            "--offline" => offline = true,
+            "--platform" | "--profiles" | "--profile" | "--kernel-feature" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires a value"))?;
+                match arg.as_str() {
+                    "--platform" => platform = Some(value),
+                    "--profiles" => profiles_dir = Some(PathBuf::from(value)),
+                    "--kernel-feature" => features.push(value),
+                    "--profile" => {
+                        release = match value.as_str() {
+                            "release" => true,
+                            "dev" | "debug" => false,
+                            _ => return Err(format!("Unsupported profile `{value}`")),
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => return Err(format!("Unknown pgo argument `{arg}`; use pgo --help")),
+        }
+    }
+    let platform = platform.ok_or_else(|| "pgo requires --platform NAME".to_string())?;
+    let plan = config::load_platform(root, &platform)?;
+    let directory = profiles_dir
+        .ok_or_else(|| "pgo requires --profiles DIR from bench --pgo --merge".to_string())?;
+    let directory = if directory.is_absolute() {
+        directory
+    } else {
+        root.join(directory)
+    };
+    let mut state: ProfileSet =
+        serde_json::from_slice(&fs::read(directory.join("profiles.json")).map_err(|error| {
+            format!("Cannot read profile set: {error}. Collect with bench --pgo --merge first")
+        })?)
+        .map_err(|error| error.to_string())?;
+    if state.schema != 1
+        || !state.merged
+        || state.platform != plan.id
+        || state.profile != crate::profile(release)
+    {
+        return Err(
+            "Profiles must be merged and match the selected platform and build profile".to_string(),
+        );
+    }
+    if state.compiler != compiler_version()? {
+        return Err("Profiles were collected with a different compiler".to_string());
+    }
+    if !state.profiles.contains_key("kernel") {
+        return Err("The profile set has no kernel profile".to_string());
+    }
+    for path in state.profiles.values_mut() {
+        let source = if path.is_absolute() {
+            path.clone()
+        } else {
+            directory.join(&*path)
+        };
+        crate::assert_exists(&source, "merged PGO profile")?;
+        *path = dunce::canonicalize(&source).map_err(|error| error.to_string())?;
+    }
+    if features
+        .iter()
+        .any(|feature| feature == "kernel-correctness")
+    {
+        return Err("PGO application does not support kernel-correctness builds".to_string());
+    }
+    APPLY
+        .set(state.profiles.clone())
+        .map_err(|_| "PGO profiles already configured".to_string())?;
+    let stamp = stamp()?;
+    let output = root.join("target/pgo-build").join(format!("run-{stamp}"));
+    let staging = output.join("staging");
+    let previous_root = env::var_os("RUSTOS_PGO_ARTIFACT_ROOT");
+    unsafe {
+        env::set_var("RUSTOS_PGO_ARTIFACT_ROOT", &staging);
+    }
+    let result = crate::build_platform(root, &plan, release, offline, &features);
+    unsafe {
+        match previous_root {
+            Some(value) => env::set_var("RUSTOS_PGO_ARTIFACT_ROOT", value),
+            None => env::remove_var("RUSTOS_PGO_ARTIFACT_ROOT"),
+        }
+    }
+    result?;
+    let stage = staging.join(&plan.id).join(crate::profile(release));
     fs::write(
         stage.join("pgo.json"),
         serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
@@ -656,25 +528,16 @@ pub fn execute(
             "Publication failed: {error}. The previous build was restored"
         ));
     }
-    let result = json!({
-        "schema": "rustos.pgo.v1", "complete": true,
-        "platform": plan.id, "profile": crate::profile(release), "launch": launch.id,
-        "cpus": cpu_counts, "profiles": state.profiles, "unprofiled_drivers": skipped,
-        "training_report": training_report, "benchmark_verification_report": verification_report,
-        "published": published, "backup": if had_previous { Some(&backup) } else { None },
-        "normal_image_runtime_checked": false,
-    });
     fs::write(
         output.join("results.json"),
-        serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "rustos.pgo-build.v1", "complete": true, "platform": plan.id,
+            "profile": crate::profile(release), "profiles": state.profiles, "published": published,
+            "backup": if had_previous { Some(&backup) } else { None },
+        }))
+        .map_err(|error| error.to_string())?,
     )
-    .map_err(|error| {
-        format!("PGO binaries were installed, but the result report could not be written: {error}")
-    })?;
-    println!("PGO binaries: {}", published.display());
-    println!("PGO results: {}", output.join("results.json").display());
-    if had_previous {
-        println!("Previous binaries: {}", backup.display());
-    }
+    .map_err(|error| error.to_string())?;
+    crate::bench::print_status!("PGO binaries: {}", published.display());
     Ok(published)
 }

@@ -1020,7 +1020,15 @@ where
             return;
         }
         let blocks = self.read_ahead_blocks;
-        let horizon = lba.saturating_add((blocks * READ_AHEAD_REQUESTS) as u64);
+        // Prefetch publishes complete cache pages. Leave any partial final page
+        // to read_block_into_page, whose backend read handles the short tail.
+        let end_lba = self.backend.volume_len() / BLOCK_SIZE as u64;
+        if lba >= end_lba {
+            return;
+        }
+        let horizon = lba
+            .saturating_add((blocks * READ_AHEAD_REQUESTS) as u64)
+            .min(end_lba);
         let mut launches: [Option<Range<u64>>; READ_AHEAD_REQUESTS] =
             [const { None }; READ_AHEAD_REQUESTS];
         {
@@ -1035,7 +1043,7 @@ where
             state.last_lba = lba;
             for (slot, launch) in launches.iter_mut().enumerate() {
                 if state.pending[slot].is_none() && state.next < horizon {
-                    let end = state.next.saturating_add(blocks as u64);
+                    let end = state.next.saturating_add(blocks as u64).min(horizon);
                     if end == state.next {
                         break;
                     }

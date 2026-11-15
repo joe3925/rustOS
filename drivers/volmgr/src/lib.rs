@@ -145,6 +145,10 @@ impl CacheBackend {
 impl VolumeCacheBackend for CacheBackend {
     type Error = KernelError;
 
+    fn volume_len(&self) -> u64 {
+        self.volume_bytes
+    }
+
     async fn read_phys_framed<'a, 'buffer>(
         &'a self,
         lba: u64,

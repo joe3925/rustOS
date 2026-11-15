@@ -5,6 +5,7 @@ import os
 import platform
 import statistics
 import subprocess
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -56,8 +57,18 @@ subprocess.run(["rustc", "--edition=2024", "-Copt-level=3", "-Cpanic=abort",
 kernel_path = args.kernel_report or out / "kernel.json"
 if args.kernel_report is None:
     offline = ["--offline"] if args.offline else []
-    subprocess.run(["cargo", "run", *offline, "-p", "xtask", "--", "bench", "--launch", "qemu-x86_64-q35-whpx",
-                    "--suite", "heap.mimalloc", "--cpus", args.cpus, "--output", kernel_path, *offline],
+    profiles = out / f"pgo-{time.time_ns()}"
+    bench_env = {**os.environ, "RUSTOS_BENCH_SUITES": "heap.mimalloc", "RUSTOS_BENCH_TAGS": ""}
+    subprocess.run(["cargo", "run", *offline, "-p", "xtask", "--", "bench",
+                    "--launch", "qemu-x86_64-q35-whpx", "--cpus", args.cpus, "--max-repetitions", "1",
+                    "--suite", "heap.mimalloc", "--pgo", "--merge", "--pgo-output", profiles, "--output", out / "training.json", *offline],
+                   cwd=root, check=True)
+    subprocess.run(["cargo", "run", *offline, "-p", "xtask", "--", "pgo",
+                    "--platform", "x86_64-uefi", "--profile", "release", "--kernel-feature", "kernel-bench",
+                    "--profiles", profiles, *offline], cwd=root, check=True, env=bench_env)
+    subprocess.run(["cargo", "run", *offline, "-p", "xtask", "--", "bench",
+                    "--launch", "qemu-x86_64-q35-whpx", "--cpus", args.cpus,
+                    "--boot-image", root / "target/rustos/x86_64-uefi/release/image/boot.img", "--output", kernel_path],
                    cwd=root, check=True)
 
 report = json.loads(kernel_path.read_text())

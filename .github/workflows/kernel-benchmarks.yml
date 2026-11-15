@@ -15,7 +15,7 @@ permissions:
   actions: read
 
 env:
-  BENCH_ENV_VERSION: "3"
+  BENCH_ENV_VERSION: "4"
 
 jobs:
   benchmark:
@@ -60,6 +60,10 @@ jobs:
           jq --version
           rustc --version
           cargo --version
+
+      - name: Install PGO tools
+        shell: bash
+        run: bash .github/scripts/prepare-pgo-tools.sh
 
       - name: Create C drive seed image
         shell: bash
@@ -193,34 +197,60 @@ jobs:
           baseline_image="$GITHUB_WORKSPACE/target/bench/trusted/boot.img"
           git worktree add --detach "$baseline_worktree" "origin/$DEFAULT_BRANCH"
           commit="$(git -C "$baseline_worktree" rev-parse HEAD)"
+          trap 'git -C "$GITHUB_WORKSPACE" worktree remove --force "$baseline_worktree"' EXIT
           cd "$baseline_worktree"
-          cargo run --release -p xtask -- bench \
-            --tag ci \
-            --prepare-only \
-            --export-boot-image "$baseline_image"
+          bash "$GITHUB_WORKSPACE/.github/scripts/prepare-pgo-tools.sh"
+          if grep -q -- '"--pgo-output"' tooling/xtask/src/bench.rs; then
+            cargo run --release -p xtask -- bench \
+              --platform x86_64-uefi --profile release \
+              --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 1 \
+              --pgo --merge --pgo-output target/bench/training/profiles \
+              --output target/bench/training/results.json
+            RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- pgo \
+              --platform x86_64-uefi --profile release --kernel-feature kernel-bench \
+              --profiles target/bench/training/profiles
+            mkdir -p "$(dirname "$baseline_image")"
+            cp target/rustos/x86_64-uefi/release/image/boot.img "$baseline_image"
+          else
+            # Older default-branch commits use the original image-preparation CLI.
+            cargo run --release -p xtask -- bench \
+              --tag ci --prepare-only --export-boot-image "$baseline_image"
+          fi
           echo "available=true" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          git -C "$GITHUB_WORKSPACE" worktree remove "$baseline_worktree"
+          cd "$GITHUB_WORKSPACE"
 
-      - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
+      - name: Build PGO benchmark image for proposed commit
+        env:
+          RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
+          RUSTOS_DISK_FORMAT: raw
+        run: |
+          cargo run --release -p xtask -- bench \
+            --platform x86_64-uefi --profile release \
+            --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 1 \
+            --pgo --merge --pgo-output target/bench/training/profiles \
+            --output target/bench/training/results.json
+          RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- pgo \
+            --platform x86_64-uefi --profile release --kernel-feature kernel-bench \
+            --profiles target/bench/training/profiles
+          mkdir -p target/bench/head
+          cp target/rustos/x86_64-uefi/release/image/boot.img target/bench/head/boot.img
+          printf '%s\n' "$BENCH_ENV_VERSION" > target/bench/head/environment-version
+
+      - name: Benchmark existing images at 1, 2, and 4 vCPUs
         env:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
           TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available == 'true' || steps.main-baseline.outputs.available == 'true' }}
           PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
         run: |
-          cargo run --release -p xtask -- bench \
-            --tag ci \
-            --prepare-only \
-            --export-boot-image target/bench/head/boot.img
-          printf '%s\n' "$BENCH_ENV_VERSION" > target/bench/head/environment-version
-
           run_variant() {
             local variant="$1"
             local boot_image="$2"
             mkdir -p "target/bench/${variant}"
             cargo run --release -p xtask -- bench \
-              --cpus 1,2,4 \
+              --platform x86_64-uefi --profile release \
+              --launch qemu-x86_64-q35-ci --cpus 1,2,4 \
               --boot-image "$boot_image" \
               --boot-timeout-secs 120 \
               --output "target/bench/${variant}/results.json"
@@ -326,6 +356,17 @@ jobs:
             target/bench/head/environment-version
             !target/bench/baselines/**
             !target/bench/anchor/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload PGO training diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-benchmark-pgo
+          path: |
+            target/bench/training/profiles
+            target/pgo-build/**/results.json
           if-no-files-found: warn
           retention-days: 14
 

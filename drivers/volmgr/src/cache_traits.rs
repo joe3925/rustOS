@@ -95,6 +95,9 @@ impl<E: Clone> Clone for CacheError<E> {
 pub trait VolumeCacheBackend: Send + Sync + 'static {
     type Error: Send + Sync + core::fmt::Debug + 'static;
 
+    /// Exclusive byte limit for requests to this volume.
+    fn volume_len(&self) -> u64;
+
     fn read_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Read<'data>,
