@@ -16,6 +16,21 @@ use kernel_api::memory::{PhysAddr, VirtAddr, map_mmio_region};
 use crate::dev_ext::PciPdoExt;
 use kernel_api::kernel_types::pci::BarKind;
 
+#[inline]
+unsafe fn write_mmio_u32(address: u64, value: u32) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "mov dword ptr [{address}], {value:e}",
+            address = in(reg) address,
+            value = in(reg) value,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe { write_volatile(address as *mut u32, value) };
+}
+
 /// Read 16-bit value from config space.
 #[inline]
 unsafe fn cfg_read16(base: VirtAddr, offset: u16) -> u16 {
@@ -212,15 +227,15 @@ pub extern "C" fn pci_setup_msix(
     const VECTOR_CTRL_UNMASKED: u32 = 0;
 
     unsafe {
-        write_volatile((entry_va + 12) as *mut u32, VECTOR_CTRL_MASKED);
+        write_mmio_u32(entry_va + 12, VECTOR_CTRL_MASKED);
 
-        write_volatile(entry_va as *mut u32, binding.message.address_lo());
+        write_mmio_u32(entry_va, binding.message.address_lo());
 
-        write_volatile((entry_va + 4) as *mut u32, binding.message.address_hi());
+        write_mmio_u32(entry_va + 4, binding.message.address_hi());
 
-        write_volatile((entry_va + 8) as *mut u32, binding.message.data);
+        write_mmio_u32(entry_va + 8, binding.message.data);
 
-        write_volatile((entry_va + 12) as *mut u32, VECTOR_CTRL_UNMASKED);
+        write_mmio_u32(entry_va + 12, VECTOR_CTRL_UNMASKED);
     }
 
     let config_mapping = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {

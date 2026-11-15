@@ -147,6 +147,7 @@ impl MsvcLibTool {
 fn main() {
     println!("cargo:rerun-if-env-changed=RUSTOS_BENCH_SUITES");
     println!("cargo:rerun-if-env-changed=RUSTOS_BENCH_TAGS");
+    println!("cargo:rerun-if-env-changed=RUSTOS_BENCH_AUTORUN");
     println!("cargo:rerun-if-env-changed=RUSTOS_CORRECTNESS_SUITES");
     println!("cargo:rerun-if-env-changed=RUSTOS_CORRECTNESS_TAGS");
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());

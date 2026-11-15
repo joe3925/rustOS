@@ -207,6 +207,20 @@ fn matches_selection(descriptor: &BenchSuiteDescriptor, names: &[String], tags: 
             .any(|tag| descriptor.tags.iter().any(|candidate| candidate == tag))
 }
 
+#[cfg(feature = "kernel-pgo")]
+fn emit_pgo_profile(component: &str, profile: &[u8]) {
+    emit("pgo_start", json!({ "component": component, "bytes": profile.len() }));
+    for (index, chunk) in profile.chunks(4096).enumerate() {
+        let mut data = String::with_capacity(chunk.len() * 2);
+        use core::fmt::Write;
+        for byte in chunk {
+            write!(&mut data, "{byte:02x}").unwrap();
+        }
+        emit("pgo_chunk", json!({ "component": component, "index": index, "data": data }));
+    }
+    emit("pgo_end", json!({ "component": component, "bytes": profile.len() }));
+}
+
 async fn run_selected_suites_for_repetition(
     names: &[String],
     tags: &[String],
@@ -272,6 +286,37 @@ async fn run_selected_suites_for_repetition(
     }
     #[cfg(not(feature = "kernel-bench"))]
     let _ = persist_repetition;
+
+    #[cfg(feature = "kernel-pgo")]
+    {
+        let mut profiles = Vec::new();
+        if minicov::coverage_enabled() {
+            let mut profile = Vec::new();
+            unsafe { minicov::capture_coverage(&mut profile).unwrap() };
+            profiles.push((String::from("kernel"), profile));
+        }
+        let program = crate::executable::program::PROGRAM_MANAGER.get(0).unwrap();
+        let modules = program.read().modules.read().clone();
+        for module in modules {
+            let (component, capture) = {
+                let module = module.read();
+                let Some((_, rva)) = module.exports.iter().find(|(name, _)| name == "RustosPgoCapture") else {
+                    continue;
+                };
+                let capture: unsafe extern "C" fn(&mut Vec<u8>) -> bool = unsafe {
+                    core::mem::transmute((module.image_base.as_u64() + *rva as u64) as *const ())
+                };
+                (module.title.to_ascii_lowercase(), capture)
+            };
+            let mut profile = Vec::new();
+            if unsafe { capture(&mut profile) } {
+                profiles.push((component, profile));
+            }
+        }
+        for (component, profile) in profiles {
+            emit_pgo_profile(component.trim_end_matches(".dll"), &profile);
+        }
+    }
 
     emit(
         "run_end",

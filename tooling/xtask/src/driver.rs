@@ -231,6 +231,7 @@ fn build_cargo_driver(
             cargo_target_dir(root, &plan.id, manifest),
         )
         .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
+    super::pgo::configure(&mut command, root, plan, release, &target.name, &plan.drivers.target)?;
     if release {
         command.arg("--release");
     }

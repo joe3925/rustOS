@@ -361,12 +361,14 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
         secs, used_mib, heap_mib
     );
     #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
-    spawn_detached(async {
-        crate::benchmarking::register_builtin_suites();
-        let passed = crate::benchmarking::run_configured_suites().await;
-        crate::benchmarking::exit_benchmark_vm(passed);
-    });
-    #[cfg(not(any(feature = "kernel-bench", feature = "kernel-correctness")))]
+    if option_env!("RUSTOS_BENCH_AUTORUN") != Some("0") {
+        spawn_detached(async {
+            crate::benchmarking::register_builtin_suites();
+            let passed = crate::benchmarking::run_configured_suites().await;
+            crate::benchmarking::exit_benchmark_vm(passed);
+        });
+        return Ok(());
+    }
     spawn_detached(async {
         loop {
             let bytes_per_pass = 50 * 1024 * 1024;

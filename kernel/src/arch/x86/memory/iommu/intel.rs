@@ -646,7 +646,16 @@ fn domain_id_count_from_nd(nd: u32) -> Option<u32> {
 
 #[inline]
 unsafe fn read_reg32(base: *mut u8, off: usize) -> u32 {
-    unsafe { core::ptr::read_volatile(base.add(off) as *const u32) }
+    let value: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {value:e}, dword ptr [{address}]",
+            address = in(reg) base.add(off),
+            value = out(reg) value,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    value
 }
 
 #[inline]

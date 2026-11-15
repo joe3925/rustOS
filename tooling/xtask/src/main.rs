@@ -2,6 +2,7 @@ mod artifacts;
 mod bench;
 mod config;
 mod driver;
+mod pgo;
 
 use artifacts::{
     ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel,
@@ -135,6 +136,7 @@ fn try_main() -> Result<(), String> {
             run_qemu(&root, &plan, &launch, &host, options, file_serial)
         }
         CliCommand::Bench(command) => bench::execute(&root, command),
+        CliCommand::Pgo(args) => pgo::execute(&root, args, None).map(|_| ()),
         CliCommand::Cargo(options) => {
             let platform = options
                 .platform
@@ -264,6 +266,7 @@ enum CliCommand {
         file_serial: Option<PathBuf>,
     },
     Bench(bench::BenchCommand),
+    Pgo(Vec<String>),
     Cargo(CargoOptions),
 }
 
@@ -301,6 +304,10 @@ impl Cli {
         let mut args = args.into_iter().peekable();
 
         match args.peek().map(String::as_str) {
+            Some("pgo") => {
+                args.next();
+                Ok(Self { command: CliCommand::Pgo(args.collect()) })
+            }
             Some("build" | "irq-check") => {
                 let command = args.next().unwrap();
                 let mut release = false;
@@ -460,12 +467,18 @@ fn usage() -> String {
         "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- irq-check --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta]",
-        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
+        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--profile dev|release] [--cpus 1,2,4] [--all | --suite NAME | --tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N] [--max-repetitions N]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "  cargo run -p xtask -- correctness [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE]",
         "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
+        "  cargo xtask pgo --launch NAME|FILE [--profile dev|release] [--platform NAME|FILE] [--host NAME|FILE] [--cpus N,N] [--output DIR] [--offline]",
+        "  bench image creation trains PGO once at the largest selected CPU count, then rebuilds the kernel and loaded drivers",
+        "  bench --prepare-only includes PGO training; --boot-image uses the supplied image without training",
         "",
         "environment:",
+        "  RUSTOS_PGO_GENERATE collect a kernel profile during benchmark runs",
+        "  RUSTOS_PGO_USE      absolute path to the merged kernel profile",
+        "  RUSTOS_PGO_DISABLE skip automatic benchmark PGO training and ignore saved profiles",
         "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",
         "  RUSTOS_FIRMWARE   direct firmware path; bypasses candidate discovery",
         "  RUSTOS_FIRMWARE_CANDIDATES path-list prepended to host firmware discovery",
@@ -608,8 +621,9 @@ fn build_platform(
     Ok(boot)
 }
 fn artifact_root(root: &Path, plan: &BuildPlan, release: bool) -> PathBuf {
-    root.join("target")
-        .join("rustos")
+    env::var_os("RUSTOS_PGO_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target/rustos"))
         .join(&plan.id)
         .join(profile(release))
 }
@@ -649,6 +663,12 @@ fn kernel_command(
         kernel.arg("--no-default-features");
     }
     let mut features = plan.kernel.features.clone();
+    if !extra_features.iter().any(|feature| feature == "kernel-correctness")
+        && pgo::configure(&mut kernel, root, plan, release, "kernel", &plan.kernel.target)?
+    {
+        features.push("kernel-pgo".to_string());
+        kernel.env("RUSTOS_BENCH_AUTORUN", if extra_features.iter().any(|feature| feature == "kernel-bench") { "1" } else { "0" });
+    }
     for feature in extra_features {
         if !features.contains(feature) {
             features.push(feature.clone());

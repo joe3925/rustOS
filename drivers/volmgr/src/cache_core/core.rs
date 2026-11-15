@@ -1171,6 +1171,21 @@ where
 
         let next = lba.saturating_add(1);
         if self.read_miss_next.swap(next, Ordering::Relaxed) == lba {
+            core::future::poll_fn(|cx| loop {
+                let epoch = self.writeback_notifier.epoch();
+                let pending = {
+                    let state = self.read_ahead.lock();
+                    (lba < state.last_lba || lba >= state.next)
+                        && state.pending.iter().any(Option::is_some)
+                };
+                if !pending {
+                    return Poll::Ready(());
+                }
+                if self.writeback_notifier.register_if_unchanged(epoch, cx.waker()) {
+                    return Poll::Pending;
+                }
+            })
+            .await;
             self.start_read_ahead(lba);
         }
         self.wait_for_read_ahead(lba..next).await;

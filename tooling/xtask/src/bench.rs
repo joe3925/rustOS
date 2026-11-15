@@ -30,6 +30,7 @@ pub enum BenchCommand {
 
 pub struct BenchOptions {
     correctness: bool,
+    release: bool,
     platform: String,
     launch: String,
     host: Option<String>,
@@ -43,6 +44,7 @@ pub struct BenchOptions {
     boot_timeout: Duration,
     timeout: Duration,
     offline: bool,
+    max_repetitions: Option<usize>,
 }
 
 pub fn parse<I>(args: I, correctness: bool) -> Result<BenchCommand, String>
@@ -84,6 +86,8 @@ impl BenchOptions {
         I: IntoIterator<Item = String>,
     {
         let mut platform = "x86_64-uefi".to_string();
+        let mut release = true;
+        let mut all = false;
         let mut launch = "qemu-x86_64-q35-ci".to_string();
         let mut host = None;
         let mut cpus = vec![1, 2, 4];
@@ -100,10 +104,19 @@ impl BenchOptions {
         let mut boot_timeout = Duration::from_secs(2 * 60);
         let mut timeout = Duration::from_secs(15 * 60);
         let mut offline = false;
+        let mut max_repetitions = None;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--all" => all = true,
+                "--profile" => {
+                    release = match next_value(&mut args, "--profile")?.as_str() {
+                        "release" => true,
+                        "dev" | "debug" => false,
+                        value => return Err(format!("Unsupported build profile `{value}`")),
+                    };
+                }
                 "--platform" => {
                     platform = next_value(&mut args, "--platform")?;
                 }
@@ -152,16 +165,29 @@ impl BenchOptions {
                     );
                 }
                 "--offline" => offline = true,
+                "--max-repetitions" => {
+                    let value = next_value(&mut args, "--max-repetitions")?;
+                    let count = value.parse::<usize>()
+                        .map_err(|_| "Invalid repetition count".to_string())?;
+                    if count == 0 {
+                        return Err("Repetition count must be positive".to_string());
+                    }
+                    max_repetitions = Some(count);
+                }
                 other => return Err(format!("unknown bench argument `{other}`")),
             }
         }
 
-        if suites.is_empty() && tags.is_empty() {
+        if all && (!suites.is_empty() || !tags.is_empty()) {
+            return Err("Use --all without --suite or --tag".to_string());
+        }
+        if !all && suites.is_empty() && tags.is_empty() {
             tags.push("ci".to_string());
         }
 
         Ok(Self {
             correctness,
+            release,
             platform,
             launch,
             host,
@@ -175,6 +201,7 @@ impl BenchOptions {
             boot_timeout,
             timeout,
             offline,
+            max_repetitions,
         })
     }
 }
@@ -230,6 +257,31 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
 
     let boot_image = if let Some(path) = &options.boot_image {
         resolve(root, path)
+    } else if !options.correctness
+        && std::env::var_os("RUSTOS_PGO_DISABLE").is_none()
+        && !crate::pgo::MODE_ENV.iter().any(|name| std::env::var_os(name).is_some())
+    {
+        let training_cpus = options.cpus.iter().max()
+            .ok_or_else(|| "Benchmark training requires a CPU count".to_string())?;
+        println!("==> creating benchmark image: one PGO training boot with {training_cpus} vCPU(s)");
+        let mut args = vec![
+            "--platform".to_string(), options.platform.clone(),
+            "--launch".to_string(), options.launch.clone(),
+            "--profile".to_string(), if options.release { "release" } else { "dev" }.to_string(),
+            "--cpus".to_string(), training_cpus.to_string(),
+        ];
+        if let Some(host) = &options.host {
+            args.extend(["--host".to_string(), host.clone()]);
+        }
+        if options.offline {
+            args.push("--offline".to_string());
+        }
+        crate::pgo::execute(root, args, Some(crate::pgo::BenchmarkImage {
+            suites: options.suites.clone(),
+            tags: options.tags.clone(),
+            boot_timeout_secs: options.boot_timeout.as_secs(),
+            timeout_secs: options.timeout.as_secs(),
+        }))?
     } else {
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe {
@@ -256,7 +308,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         build_platform(
             root,
             &platform,
-            true,
+            options.release,
             options.offline,
             &[if options.correctness {
                 "kernel-correctness"
@@ -265,7 +317,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
             }
             .to_string()],
         )?;
-        crate::load_artifact_manifest(root, &platform, true)?.boot_image
+        crate::load_artifact_manifest(root, &platform, options.release)?.boot_image
     };
     let qemu = find_qemu(&launch, &host)?;
     let firmware = find_firmware(&launch, &host, &qemu)?;
@@ -352,6 +404,9 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                 };
             }
             runs.push(topology);
+            if options.max_repetitions.is_some_and(|limit| repetition >= limit) {
+                break;
+            }
             repetition += 1;
         }
         if let Err(err) = fs::remove_file(&disk.path) {

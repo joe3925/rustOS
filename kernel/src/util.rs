@@ -107,8 +107,6 @@ pub unsafe fn init() {
         crate::console::PRINT_QUEUE
             .call_once(|| crossbeam_queue::ArrayQueue::new(crate::console::PRINT_QUEUE_SLOTS));
         crate::machine::MACHINE_INFO.call_once(crate::machine::MachineInfo::discover);
-        initialize_bootstrap_provider();
-        reclaim_kernel_stub();
         Screen::clear_framebuffer();
         init_boot_processor();
 
@@ -153,6 +151,8 @@ pub unsafe fn init() {
 }
 pub extern "C" fn kernel_main(ctx: usize) {
     enable_mimalloc();
+    initialize_bootstrap_provider();
+    reclaim_kernel_stub();
     crate::scheduling::scheduler::start_reaper();
     resize_bitmap_for_ram(boot_usable_bytes()).expect(&alloc::format!(
         "Failed to resize phys frame bitmap to capacity {}",
