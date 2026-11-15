@@ -24,8 +24,8 @@ impl Future for YieldOnce {
     }
 }
 
-fn yield_once() -> YieldOnce {
-    YieldOnce(false)
+pub(super) async fn yield_once() {
+    YieldOnce(false).await
 }
 
 #[repr(align(64))]

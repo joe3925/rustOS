@@ -109,6 +109,7 @@ impl BenchOptions {
         let mut launch = "qemu-x86_64-q35-ci".to_string();
         let mut host = None;
         let mut cpus = vec![1, 2, 4];
+        let mut cpus_explicit = false;
         let mut suites = Vec::new();
         let mut tags = Vec::new();
         let mut output = PathBuf::from(if correctness {
@@ -145,6 +146,7 @@ impl BenchOptions {
                 }
                 "--host" => host = Some(next_value(&mut args, "--host")?),
                 "--cpus" => {
+                    cpus_explicit = true;
                     let value = next_value(&mut args, "--cpus")?;
                     cpus = value
                         .split(',')
@@ -218,6 +220,12 @@ impl BenchOptions {
         }
         if correctness && !all && suites.is_empty() && tags.is_empty() {
             tags.push("ci".to_string());
+        }
+        if pgo {
+            if !cpus_explicit {
+                cpus = vec![4];
+            }
+            max_repetitions.get_or_insert(1);
         }
 
         Ok(Self {
@@ -454,8 +462,20 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         print_status!("{mode} results: {}", output.display());
         Ok(())
     } else {
+        let failures = report.runs.iter()
+            .filter(|run| !run.complete || run.status != "passed")
+            .map(|run| {
+                let reason = run.events.iter()
+                    .find(|event| event.kind == "case_failure")
+                    .map(|event| format!("{} / {}: {}",
+                        event.payload["suite"].as_str().unwrap_or("unknown suite"),
+                        event.payload["case"].as_str().unwrap_or("unknown case"),
+                        event.payload["reason"].as_str().unwrap_or("case failed")))
+                    .unwrap_or_else(|| run.status.clone());
+                format!("{} vCPU(s): {reason}; serial log: {}", run.cpus, run.serial_log.display())
+            }).collect::<Vec<_>>().join("\n");
         Err(format!(
-            "one or more {mode} CPU configurations failed; partial results: {}",
+            "one or more {mode} CPU configurations failed:\n{failures}\npartial results: {}",
             output.display()
         ))
     }
@@ -507,7 +527,10 @@ fn run_topology(
         if !suite_names.is_empty() || !tags.is_empty() {
             for (key, values) in [("bench-suites", suite_names), ("bench-tags", tags)] {
                 args.push("-fw_cfg".into());
-                args.push(format!("name=opt/rustos/{key},string={}", values.join(";")).into());
+                // QEMU rejects string= with no value. A separator encodes an
+                // empty selection while still overriding the image defaults.
+                let selection = if values.is_empty() { ";".to_string() } else { values.join(";") };
+                args.push(format!("name=opt/rustos/{key},string={selection}").into());
             }
         }
     }
@@ -1367,6 +1390,28 @@ mod image_tests {
     fn benchmark_pgo_collection_is_opt_in() {
         assert!(!BenchOptions::parse(Vec::new(), false).unwrap().pgo);
         assert!(BenchOptions::parse(["--pgo".to_string()], false).unwrap().pgo);
+    }
+
+    #[test]
+    fn pgo_defaults_to_one_training_boot_and_preserves_overrides() {
+        let normal = BenchOptions::parse(Vec::new(), false).unwrap();
+        assert_eq!(normal.cpus, [1, 2, 4]);
+        assert_eq!(normal.max_repetitions, None);
+        let pgo = BenchOptions::parse(["--pgo"].map(str::to_string), false).unwrap();
+        assert_eq!(pgo.cpus, [4]);
+        assert_eq!(pgo.max_repetitions, Some(1));
+        for args in [
+            vec!["--pgo", "--cpus", "1,4"],
+            vec!["--cpus", "1,4", "--pgo"],
+        ] {
+            let options = BenchOptions::parse(args.into_iter().map(str::to_string), false).unwrap();
+            assert_eq!(options.cpus, [1, 4]);
+            assert_eq!(options.max_repetitions, Some(1));
+        }
+        let options = BenchOptions::parse(
+            ["--max-repetitions", "2", "--pgo"].map(str::to_string), false
+        ).unwrap();
+        assert_eq!(options.max_repetitions, Some(2));
     }
 
     #[test]

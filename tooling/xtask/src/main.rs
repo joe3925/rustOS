@@ -486,6 +486,7 @@ fn usage() -> String {
         "",
         "  build always ignores profiles; build --pgo instruments the kernel and drivers",
         "  bench --pgo builds an instrumented image and writes raw profiles; add --merge to merge them",
+        "  PGO defaults to one boot with 4 CPUs; --cpus and --max-repetitions override this",
         "  pgo --profiles DIR builds using those merged profiles; it never runs benchmarks",
         "environment:",
         "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",

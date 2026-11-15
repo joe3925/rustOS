@@ -161,6 +161,10 @@ async fn run_worker(mut input: WorkerInput, shared: Arc<Shared>) -> WorkerResult
                 result.flush_ops += 1;
             }
             cursor = (cursor + size) % (FILE_BYTES * FILES_PER_WORKER);
+            // Cached I/O can stay Ready for the entire timed window. Return to
+            // the executor so every worker gets polled, even on a single CPU.
+            // Keep this outside the per-operation latency measurements.
+            super::task_batch::yield_once().await;
         }
         Ok(())
     }.await;
