@@ -15,7 +15,7 @@ permissions:
   actions: read
 
 env:
-  BENCH_ENV_VERSION: "4"
+  BENCH_ENV_VERSION: "3"
 
 jobs:
   benchmark:
