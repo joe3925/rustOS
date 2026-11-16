@@ -44,11 +44,17 @@ fn caller_storage_and_spawn_join_macro_return_results() {
     super::support::init_threaded_runtime();
 
     let mut storage = core::pin::pin!(crate::runtime::runtime::JoinStorage::<usize>::new());
-    let explicit = crate::runtime::runtime::spawn(storage.as_mut(), async { 41usize });
-    assert_eq!(block_on(explicit), TaskOutcome::Completed(41));
+    let explicit = crate::runtime::runtime::spawn::<crate::test_support::TestExecutorPlatform, _, _>(
+        storage.as_mut(),
+        async { 41usize },
+    );
+    assert_eq!(
+        block_on::<crate::test_support::TestExecutorPlatform, _>(explicit),
+        TaskOutcome::Completed(41)
+    );
 
     assert_eq!(
-        block_on(crate::spawn_join!(async { 42usize })),
+        block_on::<crate::test_support::TestExecutorPlatform, _>(crate::spawn_join!(crate::test_support::TestExecutorPlatform; async { 42usize })),
         TaskOutcome::Completed(42)
     );
 }
@@ -330,7 +336,10 @@ fn take_child_waker(slot: &Arc<Mutex<Option<Waker>>>) -> Waker {
 // should complete without requiring the platform or global executor to be initialized.
 #[test]
 fn block_on_returns_immediately_for_ready_future() {
-    assert_eq!(block_on(async { 123usize }), 123);
+    assert_eq!(
+        block_on::<crate::test_support::TestExecutorPlatform, _>(async { 123usize }),
+        123
+    );
 }
 
 // This test exists to cover JoinAll's local polling contract. It proves that a
@@ -373,14 +382,19 @@ fn spawn_joinhandle_completes_small_and_large_heap_storage_paths() {
     assert!(size_of::<LargeResult>() > JOINABLE_STORAGE_SIZE);
     assert!(align_of::<OverAlignedJoinFuture>() > INLINE_FUTURE_ALIGN);
 
-    let result = block_on(async {
-        let inline = spawn(async { 11usize });
-        let large_future = spawn(LargeJoinFuture {
+    let result = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
+        let inline = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async { 11usize });
+        let large_future = spawn::<crate::test_support::TestExecutorPlatform, _, _>(LargeJoinFuture {
             _padding: [0; JOINABLE_STORAGE_SIZE + 1],
             value: 22,
         });
-        let large_result = spawn(async { LargeResult([33usize; 128]) });
-        let over_aligned = spawn(OverAlignedJoinFuture { value: 44 });
+        let large_result = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async {
+            LargeResult([33usize; 128])
+        });
+        let over_aligned =
+            spawn::<crate::test_support::TestExecutorPlatform, _, _>(OverAlignedJoinFuture {
+                value: 44,
+            });
 
         (
             inline.await.expect("inline task cancelled"),
@@ -409,7 +423,7 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed.clone(),
@@ -460,7 +474,7 @@ fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
         ),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let join_wake = WakeSignal::new();
     assert!(matches!(
@@ -500,7 +514,7 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed,
@@ -556,7 +570,7 @@ fn joinhandle_completion_uses_latest_registered_waiter() {
         inner: ControlledFuture::new(ready.clone(), child_waker.clone(), completed, 100usize),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let stale_waiter = WakeSignal::new();
     let latest_waiter = WakeSignal::new();
@@ -607,7 +621,7 @@ fn dropping_completed_slab_joinhandle_drops_unconsumed_result_once() {
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed.clone(),
@@ -655,7 +669,7 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed.clone(),
@@ -705,7 +719,7 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
         ),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let join_wake = WakeSignal::new();
     assert!(matches!(
@@ -754,7 +768,7 @@ fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
         ),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let join_wake = WakeSignal::new();
     assert!(matches!(
@@ -786,9 +800,9 @@ fn slab_joinhandle_panics_when_polled_after_completion() {
     let guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let mut handle = spawn(async { 5usize });
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async { 5usize });
     assert_eq!(
-        block_on(async { (&mut handle).await }),
+        block_on::<crate::test_support::TestExecutorPlatform, _>(async { (&mut handle).await }),
         TaskOutcome::Completed(5)
     );
     drop(guard);
@@ -825,10 +839,10 @@ fn many_joinable_tasks_reschedule_across_core_count_shards() {
     let tasks = super::support::stress_task_count(256);
     let expected = tasks * (tasks - 1) / 2;
 
-    let results = block_on(async {
+    let results = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
         let handles = (0..tasks)
             .map(|i| {
-                spawn(YieldMany {
+                spawn::<crate::test_support::TestExecutorPlatform, _, _>(YieldMany {
                     remaining: i % 5,
                     value: i,
                 })
@@ -859,12 +873,12 @@ fn spawn_detached_runs_small_and_large_heap_futures() {
 
     for _ in 0..inline_tasks {
         let counter = counter.clone();
-        spawn_detached(async move {
+        spawn_detached::<crate::test_support::TestExecutorPlatform, _>(async move {
             counter.fetch_add(1, Ordering::AcqRel);
         });
     }
 
-    spawn_detached(LargeDetachedFuture {
+    spawn_detached::<crate::test_support::TestExecutorPlatform, _>(LargeDetachedFuture {
         _padding: [0; 4097],
         counter: counter.clone(),
     });
@@ -882,12 +896,12 @@ fn dropping_joinhandles_does_not_cancel_queued_work() {
     let completed = Arc::new(AtomicUsize::new(0));
 
     let small_completed = completed.clone();
-    let small = spawn(async move {
+    let small = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async move {
         small_completed.fetch_add(1, Ordering::AcqRel);
         1usize
     });
 
-    let large = spawn(LargeCountingJoinFuture {
+    let large = spawn::<crate::test_support::TestExecutorPlatform, _, _>(LargeCountingJoinFuture {
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
         counter: completed.clone(),
         value: 2,
@@ -909,8 +923,8 @@ fn externally_woken_future_is_rescheduled_by_executor_waker() {
     super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
-    let value = block_on(async {
-        spawn(ExternalWakeFuture {
+    let value = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
+        spawn::<crate::test_support::TestExecutorPlatform, _, _>(ExternalWakeFuture {
             started: false,
             ready,
         })
@@ -930,12 +944,18 @@ fn abi_spawn_internal_runs_owned_abi_future() {
 
     let completed = Arc::new(AtomicUsize::new(0));
     let completed_for_future = completed.clone();
-    block_on(spawn(async move {
+    block_on::<crate::test_support::TestExecutorPlatform, _>(spawn::<
+        crate::test_support::TestExecutorPlatform,
+        _,
+        _,
+    >(async move {
         let future = async move {
             completed_for_future.fetch_add(1, Ordering::AcqRel);
         }
         .into_abi();
-        crate::runtime::runtime::spawn_detached(future);
+        crate::runtime::runtime::spawn_detached::<crate::test_support::TestExecutorPlatform, _>(
+            future,
+        );
     }));
 
     super::support::wait_until(Duration::from_secs(10), || {
@@ -995,13 +1015,13 @@ fn abi_future_polls_inline_with_exact_parent_context() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id =
-        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
+    let domain_id = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .create_executor_domain(ExecutorDomainConfig::default());
     let parent_context = Arc::new(AtomicUsize::new(0));
     let child_context = Arc::new(AtomicUsize::new(0));
     let child_drops = Arc::new(AtomicUsize::new(0));
 
-    block_on(spawn_in_executor_domain(
+    block_on::<crate::test_support::TestExecutorPlatform, _>(spawn_in_executor_domain::<crate::test_support::TestExecutorPlatform, _, _>(
         domain_id,
         RootAbiProbe {
             parent_context: parent_context.clone(),
@@ -1011,11 +1031,11 @@ fn abi_future_polls_inline_with_exact_parent_context() {
         },
     ));
 
-    GlobalAsyncExecutor::global()
+    GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
         .destroy_executor_domain(domain_id)
         .unwrap();
     super::support::wait_until(Duration::from_secs(5), || {
-        GlobalAsyncExecutor::global().get_executor_domain(domain_id).is_none()
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain_id).is_none()
     });
     assert_eq!(
         parent_context.load(Ordering::Acquire),
@@ -1029,17 +1049,23 @@ fn spawn_in_executor_domain_completes_joinhandle() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id =
-        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
+    let domain_id = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .create_executor_domain(ExecutorDomainConfig::default());
 
-    let value = block_on(async { spawn_in_executor_domain(domain_id, async { 1234usize }).await });
+    let value = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
+        spawn_in_executor_domain::<crate::test_support::TestExecutorPlatform, _, _>(
+            domain_id,
+            async { 1234usize },
+        )
+        .await
+    });
     assert_eq!(value, TaskOutcome::Completed(1234));
 
-    GlobalAsyncExecutor::global()
+    GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
         .destroy_executor_domain(domain_id)
         .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::global().get_executor_domain(domain_id).is_none()
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain_id).is_none()
     });
 }
 
@@ -1048,23 +1074,26 @@ fn spawn_detached_in_executor_domain_executes_work() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id =
-        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
+    let domain_id = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .create_executor_domain(ExecutorDomainConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_for_task = counter.clone();
 
-    spawn_detached_in_executor_domain(domain_id, async move {
+    spawn_detached_in_executor_domain::<crate::test_support::TestExecutorPlatform, _>(
+        domain_id,
+        async move {
         counter_for_task.fetch_add(1, Ordering::AcqRel);
-    });
+    },
+    );
 
     super::support::wait_until(Duration::from_secs(10), || {
         counter.load(Ordering::Acquire) == 1
     });
 
-    GlobalAsyncExecutor::global()
+    GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
         .destroy_executor_domain(domain_id)
         .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::global().get_executor_domain(domain_id).is_none()
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain_id).is_none()
     });
 }

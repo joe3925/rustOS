@@ -1,9 +1,6 @@
-use core::mem::MaybeUninit;
-
-use spin::Once;
-
 use crate::global_async::GlobalAsyncExecutor;
 use crate::growable_slab::{GrowableSlab, MAX_LOCAL_SLOTS, SlabHandle};
+use crate::platform::ExecutorPlatform;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 
 use super::config::{SlabConfig, SlabConfigBuilder};
@@ -34,15 +31,12 @@ fn new_task_slot() -> TaskSlot {
     TaskSlot::new()
 }
 
-static TASK_TABLE_PTR: Once<&'static TaskTable> = Once::new();
-static mut TASK_TABLE_STORAGE: MaybeUninit<TaskTable> = MaybeUninit::uninit();
-
-pub struct TaskTable {
-    pub(crate) slab: GrowableSlab<TaskSlot>,
+pub struct TaskTable<E: ExecutorPlatform> {
+    pub(crate) slab: GrowableSlab<TaskSlot, E>,
     retired_head: AtomicUsize,
 }
 
-impl TaskTable {
+impl<E: ExecutorPlatform> TaskTable<E> {
     fn new(mut config: SlabConfig) -> Self {
         config.slots_per_shard = config
             .slots_per_shard
@@ -65,9 +59,9 @@ impl TaskTable {
 
     pub(crate) fn allocate_with_refs(&self, refs: u32) -> Option<SlotHandle> {
         assert!(refs != 0 && refs <= REF_MASK);
-        let handle = if TASK_TABLE_PTR
+        let handle = if GlobalAsyncExecutor::<E>::global().task_table
             .get()
-            .is_some_and(|table| core::ptr::eq(*table, self))
+            .is_some_and(|table| core::ptr::eq(table, self))
         {
             unsafe { self.slab.reserve_cached(0, 8)? }
         } else {
@@ -196,7 +190,7 @@ impl TaskTable {
                                 ) {
                                     Ok(_) => {
                                         if head == 0 {
-                                            GlobalAsyncExecutor::global().try_schedule::<true>();
+                                            GlobalAsyncExecutor::<E>::global().try_schedule::<true>();
                                         }
                                         break;
                                     }
@@ -216,9 +210,9 @@ impl TaskTable {
     fn release_slot(&self, handle: SlabHandle, slot: &TaskSlot) {
         slot.release_last_ref();
         unsafe {
-            if TASK_TABLE_PTR
+            if GlobalAsyncExecutor::<E>::global().task_table
                 .get()
-                .is_some_and(|table| core::ptr::eq(*table, self))
+                .is_some_and(|table| core::ptr::eq(table, self))
             {
                 let _ = self.slab.release_cached(handle, 0, 8);
             } else {
@@ -283,24 +277,21 @@ impl SlotHandle {
 }
 
 #[cfg_attr(irq_check, irq::forbidden)]
-pub fn init_task_table(config: SlabConfig) {
-    TASK_TABLE_PTR.call_once(|| unsafe {
-        let ptr = core::ptr::addr_of_mut!(TASK_TABLE_STORAGE).cast::<TaskTable>();
-        ptr.write(TaskTable::new(config));
-        &*ptr
-    });
+pub fn init_task_table<E: ExecutorPlatform>(config: SlabConfig) {
+    GlobalAsyncExecutor::<E>::global()
+        .task_table
+        .call_once(|| TaskTable::<E>::new(config));
 }
 
-pub fn init_task_table_with<F>(configure: F)
+pub fn init_task_table_with<E: ExecutorPlatform, F>(configure: F)
 where
     F: FnOnce(SlabConfigBuilder) -> SlabConfigBuilder,
 {
-    init_task_table(configure(SlabConfigBuilder::new()).build());
+    init_task_table::<E>(configure(SlabConfigBuilder::new()).build());
 }
 
-pub fn get_task_table() -> &'static TaskTable {
-    TASK_TABLE_PTR
+pub fn get_task_table<E: ExecutorPlatform>() -> &'static TaskTable<E> {
+    GlobalAsyncExecutor::<E>::global().task_table
         .get()
-        .copied()
         .expect("task table not initialized")
 }

@@ -380,6 +380,7 @@ impl RadixMap {
         Ok(())
     }
 
+    #[inline(always)]
     fn release_branch_run(&self, first: usize, end: usize) {
         const BRANCH_BITS: u32 = LEAF_BITS + RADIX_BITS;
         const BRANCH_SPAN: usize = 1usize << BRANCH_BITS;

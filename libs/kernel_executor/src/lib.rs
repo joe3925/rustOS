@@ -1,8 +1,4 @@
 #![no_std]
-#![cfg_attr(
-    all(feature = "executor", not(any(test, loom, feature = "loom"))),
-    feature(thread_local)
-)]
 
 extern crate alloc;
 #[cfg(any(test, loom, feature = "loom"))]
@@ -28,32 +24,32 @@ mod sync;
 #[cfg(all(test, feature = "executor", not(any(loom, feature = "loom"))))]
 mod test;
 
-#[cfg(all(test, feature = "executor", any(loom, feature = "loom")))]
+#[cfg(all(test, feature = "executor"))]
 #[path = "test/support.rs"]
 mod test_support;
 
 #[cfg(feature = "executor")]
 #[macro_export]
 macro_rules! println {
-    () => {
-        $crate::platform::print("\n")
+    ($platform:ty;) => {
+        <$platform as $crate::platform::ExecutorPlatform>::print("\n")
     };
-    ($($arg:tt)*) => {{
+    ($platform:ty; $($arg:tt)*) => {{
         use core::fmt::Write;
         let mut buf = alloc::string::String::new();
         core::write!(&mut buf, $($arg)*).unwrap();
         buf.push('\n');
-        $crate::platform::print(&buf);
+        <$platform as $crate::platform::ExecutorPlatform>::print(&buf);
     }};
 }
 
 #[cfg(feature = "executor")]
 #[macro_export]
 macro_rules! spawn_join {
-    ($future:expr_2021) => {
-        $crate::runtime::runtime::spawn_join_owned($future)
+    ($platform:ty; $future:expr_2021) => {
+        $crate::runtime::runtime::spawn_join_owned::<$platform, _, _>($future)
     };
-    (in $domain:expr_2021, $future:expr_2021) => {
-        $crate::runtime::runtime::spawn_join_owned_in_executor_domain($domain, $future)
+    ($platform:ty; in $domain:expr_2021, $future:expr_2021) => {
+        $crate::runtime::runtime::spawn_join_owned_in_executor_domain::<$platform, _, _>($domain, $future)
     };
 }

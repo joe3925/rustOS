@@ -3,6 +3,7 @@ use crate::error::{kernel_capture_error_backtrace, kernel_resolve_error_context_
 use crate::export;
 use crate::get_rva;
 use crate::idt::interrupt_impl::*;
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;
@@ -23,7 +24,7 @@ export! {
     vfs_notify_label_published,
     vfs_notify_label_unpublished,
     panic_common,
-    try_steal_blocking_one,
+    try_steal_blocking_one::<KernelExecutorPlatform>,
     get_rsdp,
     get_acpi_tables,
     get_device_tree_blob,

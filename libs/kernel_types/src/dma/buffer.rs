@@ -238,6 +238,7 @@ impl<'backing, 'data, Access: IoBufferAccess> IoBuffer<'backing, 'data, Access> 
         self.len() == 0
     }
 
+    #[inline(always)]
     pub fn split_at(self, mid: usize) -> Result<(Self, Self), (Self, IoBufferError)> {
         if mid > self.len {
             return Err((self, IoBufferError::InvalidRange));

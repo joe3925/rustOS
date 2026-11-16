@@ -278,11 +278,11 @@ const fn get_rva(addr: usize) -> usize {
 }
 #[macro_export]
 macro_rules! export {
-    ($($name:ident),* $(,)?) => {
+    ($($name:ident $(::<$($arg:ty),+>)?),* $(,)?) => {
         lazy_static::lazy_static! {
             pub static ref EXPORTS: Vec<(String, usize)> = vec![
                 $(
-                    (stringify!($name).to_string(), get_rva($name as *const () as usize)),
+                    (stringify!($name).to_string(), get_rva($name $(::<$($arg),+>)? as *const () as usize)),
                 )*
             ];
         }

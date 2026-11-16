@@ -53,7 +53,7 @@ mod threaded {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let slab = get_task_table();
+        let slab = get_task_table::<crate::test_support::TestExecutorPlatform>();
         let handle = slab.allocate().expect("expected a joinable slab slot");
         let (shard_idx, local_idx, generation) = handle.indices();
         assert!(slab.get_slot(shard_idx, local_idx, generation).is_some());
@@ -63,7 +63,7 @@ mod threaded {
             for _ in 0..32 {
                 let wakers = wakers.clone();
                 scope.spawn(move || {
-                    let waker = crate::runtime::waker::create_slab_task_waker(
+                    let waker = crate::runtime::waker::create_slab_task_waker::<crate::test_support::TestExecutorPlatform>(
                         shard_idx, local_idx, generation,
                     );
                     wakers.lock().expect("waker result lock").push(waker);
@@ -89,7 +89,7 @@ mod threaded {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let slab = get_task_table();
+        let slab = get_task_table::<crate::test_support::TestExecutorPlatform>();
         let handle = slab.allocate().expect("expected a joinable slab slot");
         let (shard_idx, local_idx, generation) = handle.indices();
 
@@ -101,7 +101,9 @@ mod threaded {
             !slab.increment_ref(shard_idx, local_idx, generation),
             "stale joinable generation reacquired a freed slot"
         );
-        enqueue_slab_task(shard_idx, local_idx, generation);
+        enqueue_slab_task::<crate::test_support::TestExecutorPlatform>(
+            shard_idx, local_idx, generation,
+        );
         assert!(
             !slab.increment_ref(shard_idx, local_idx, generation),
             "stale joinable wake resurrected a freed slot"
@@ -113,7 +115,7 @@ mod threaded {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        assert!(get_task_table().capacity() >= 64);
+        assert!(get_task_table::<crate::test_support::TestExecutorPlatform>().capacity() >= 64);
     }
 
     // This test exists to verify the detached slab exhaustion path. It holds every
@@ -123,13 +125,13 @@ mod threaded {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let tasks = get_task_table().capacity() + 64;
+        let tasks = get_task_table::<crate::test_support::TestExecutorPlatform>().capacity() + 64;
         let gate = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicUsize::new(0));
         let wakers = Arc::new(Mutex::new(Vec::with_capacity(tasks)));
 
         for _ in 0..tasks {
-            spawn_detached(GatedDetachedFuture {
+            spawn_detached::<crate::test_support::TestExecutorPlatform, _>(GatedDetachedFuture {
                 gate: gate.clone(),
                 wakers: wakers.clone(),
                 completed: completed.clone(),

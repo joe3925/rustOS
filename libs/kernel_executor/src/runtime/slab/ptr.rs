@@ -1,6 +1,7 @@
 use super::super::runtime::submit_global_to_executor_domain;
 use super::slot::{PollResult, WakeAction};
 use super::task_slab::get_task_table;
+use crate::platform::ExecutorPlatform;
 
 const PTR_SHARD_BITS: usize = 3;
 const PTR_LOCAL_BITS: usize = 32;
@@ -35,19 +36,19 @@ pub fn decode_slab_task_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
 }
 
 #[inline(always)]
-fn poll_slab_task(ctx: usize) {
+fn poll_slab_task<E: ExecutorPlatform>(ctx: usize) {
     let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(ctx) else {
         return;
     };
 
-    let slab = get_task_table();
+    let slab = get_task_table::<E>();
     let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
         return;
     };
 
-    let waker = super::super::waker::create_slab_task_waker(shard_idx, local_idx, generation);
+    let waker = super::super::waker::create_slab_task_waker::<E>(shard_idx, local_idx, generation);
 
-    let refs = match slot.poll_once(&waker, shard_idx, local_idx, generation) {
+    let refs = match slot.poll_once::<E>(&waker, shard_idx, local_idx, generation) {
         PollResult::Pending => 1,
         PollResult::Completed => 2,
         PollResult::Requeued => return,
@@ -56,8 +57,8 @@ fn poll_slab_task(ctx: usize) {
 }
 
 #[inline(always)]
-pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
-    let slab = get_task_table();
+pub fn enqueue_slab_task<E: ExecutorPlatform>(shard_idx: usize, local_idx: usize, generation: u32) {
+    let slab = get_task_table::<E>();
 
     if !slab.increment_ref(shard_idx, local_idx, generation) {
         return;
@@ -72,7 +73,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         WakeAction::Enqueue => {
             let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
             if let Some(domain_id) = slot.executor_domain_id() {
-                submit_global_to_executor_domain(domain_id, encoded);
+                submit_global_to_executor_domain::<E>(domain_id, encoded);
             } else {
                 slab.decrement_ref::<false>(shard_idx, local_idx, generation);
             }
@@ -84,8 +85,8 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
 }
 
 #[inline(never)]
-pub extern "C" fn slab_task_poll_trampoline(ctx: usize) {
-    poll_slab_task(ctx);
+pub extern "C" fn slab_task_poll_trampoline<E: ExecutorPlatform>(ctx: usize) {
+    poll_slab_task::<E>(ctx);
 }
 
 #[cfg(test)]

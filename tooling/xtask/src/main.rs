@@ -794,8 +794,12 @@ fn create_kernel_sdk(
     let target_dir = artifact_root(root, plan, release).join("sdk");
     let kernel_lib = target_dir.join("kernel.lib");
     let exports_path = root.join("kernel").join("src").join("exports.rs");
+    let sdk_generator_path = root.join("tooling/xtask/src/main.rs");
 
-    if kernel_lib.is_file() && !is_source_newer(&exports_path, &kernel_lib)? {
+    if kernel_lib.is_file()
+        && !is_source_newer(&exports_path, &kernel_lib)?
+        && !is_source_newer(&sdk_generator_path, &kernel_lib)?
+    {
         return Ok(KernelSdkArtifact {
             definition_file: target_dir.join("kernel.def"),
             import_library: kernel_lib,
@@ -868,7 +872,8 @@ fn generate_kernel_def(root: &Path, def_path: &Path) -> Result<(), String> {
         let trimmed = line.trim().trim_end_matches(',');
 
         if !trimmed.is_empty() {
-            lines.push(format!("    {trimmed}"));
+            let name = trimmed.split_once("::").map_or(trimmed, |(name, _)| name).trim();
+            lines.push(format!("    {name}"));
         }
     }
 

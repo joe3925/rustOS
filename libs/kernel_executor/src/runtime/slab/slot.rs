@@ -1,3 +1,4 @@
+use crate::platform::ExecutorPlatform;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::MaybeUninit;
@@ -207,7 +208,7 @@ impl TaskSlot {
         }
     }
 
-    pub fn poll_once(
+    pub fn poll_once<E: ExecutorPlatform>(
         &self,
         waker: &Waker,
         shard_idx: usize,
@@ -235,13 +236,13 @@ impl TaskSlot {
         let domain_id = self
             .executor_domain_id()
             .expect("task domain missing while polling");
-        let _context_guard = CurrentExecutorContextGuard::enter(CurrentExecutorContext {
+        let _context_guard = CurrentExecutorContextGuard::<E>::enter(CurrentExecutorContext {
             task_id: encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
             domain_id: domain_id.raw(),
         });
         if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
             unsafe {
-                self.cancel_owned(encode_slab_task_ptr(
+                self.cancel_owned::<E>(encode_slab_task_ptr(
                     shard_idx as u8,
                     local_idx as u32,
                     generation,
@@ -261,7 +262,7 @@ impl TaskSlot {
         } else {
             if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
                 unsafe {
-                    self.cancel_owned(encode_slab_task_ptr(
+                    self.cancel_owned::<E>(encode_slab_task_ptr(
                         shard_idx as u8,
                         local_idx as u32,
                         generation,
@@ -278,16 +279,16 @@ impl TaskSlot {
             if let Err(STATE_NOTIFIED) = prev {
                 self.state.store(STATE_QUEUED, Ordering::Release);
                 let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
-                submit_global_to_executor_domain(domain_id, encoded);
+                submit_global_to_executor_domain::<E>(domain_id, encoded);
                 return PollResult::Requeued;
             }
             PollResult::Pending
         }
     }
 
-    pub(crate) unsafe fn cancel_owned(&self, token: usize) {
+    pub(crate) unsafe fn cancel_owned<E: ExecutorPlatform>(&self, token: usize) {
         let _context = self.executor_domain_id().map(|domain_id| {
-            CurrentExecutorContextGuard::enter(CurrentExecutorContext {
+            CurrentExecutorContextGuard::<E>::enter(CurrentExecutorContext {
                 task_id: token,
                 domain_id: domain_id.raw(),
             })

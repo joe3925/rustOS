@@ -98,8 +98,12 @@ fn spawn_blocking_runs_job_and_join_consumes_result() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let join = spawn_blocking(|| 21usize * 2);
-    assert_eq!(block_on(join).expect("blocking task cancelled"), 42);
+    let join = spawn_blocking::<crate::test_support::TestExecutorPlatform, _, _>(|| 21usize * 2);
+    assert_eq!(
+        block_on::<crate::test_support::TestExecutorPlatform, _>(join)
+            .expect("blocking task cancelled"),
+        42
+    );
 }
 
 // This test covers the wake contract for BlockingJoin directly. Once a blocking
@@ -114,7 +118,7 @@ fn blocking_join_pending_poll_wakes_registered_waiter_on_completion() {
     let started = Arc::new(AtomicUsize::new(0));
     let release_for_worker = release.clone();
     let started_for_worker = started.clone();
-    let mut join = spawn_blocking(move || {
+    let mut join = spawn_blocking::<crate::test_support::TestExecutorPlatform, _, _>(move || {
         started_for_worker.fetch_add(1, Ordering::AcqRel);
         while !release_for_worker.load(Ordering::Acquire) {
             std::thread::yield_now();
@@ -155,7 +159,7 @@ fn blocking_join_completion_uses_latest_registered_waiter() {
     let started = Arc::new(AtomicUsize::new(0));
     let release_for_worker = release.clone();
     let started_for_worker = started.clone();
-    let mut join = spawn_blocking(move || {
+    let mut join = spawn_blocking::<crate::test_support::TestExecutorPlatform, _, _>(move || {
         started_for_worker.fetch_add(1, Ordering::AcqRel);
         while !release_for_worker.load(Ordering::Acquire) {
             std::thread::yield_now();
@@ -211,8 +215,11 @@ fn spawn_blocking_many_preserves_join_order_under_thread_pool_load() {
         })
         .collect();
 
-    let joins = spawn_blocking_many(funcs);
-    let results: Vec<_> = joins.into_iter().map(block_on).collect();
+    let joins = spawn_blocking_many::<crate::test_support::TestExecutorPlatform, _, _>(funcs);
+    let results: Vec<_> = joins
+        .into_iter()
+        .map(block_on::<crate::test_support::TestExecutorPlatform, _>)
+        .collect();
 
     assert_eq!(results.len(), count);
     for (i, value) in results.into_iter().enumerate() {
@@ -224,7 +231,10 @@ fn spawn_blocking_many_preserves_join_order_under_thread_pool_load() {
 // should allocate no joins and should not require any worker jobs to run.
 #[test]
 fn spawn_blocking_many_empty_returns_empty_join_list() {
-    let joins = spawn_blocking_many(Vec::<fn() -> usize>::new());
+    let joins = spawn_blocking_many::<crate::test_support::TestExecutorPlatform, _, _>(Vec::<
+        fn() -> usize,
+    >::new(
+    ));
     assert!(joins.is_empty());
 }
 
@@ -237,11 +247,11 @@ fn runtime_tasks_can_await_blocking_work_under_load() {
     super::support::init_threaded_runtime();
 
     let count = super::support::stress_task_count(128);
-    let results = block_on(async {
+    let results = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
         let handles = (0..count)
             .map(|i| {
-                spawn(async move {
-                    let blocking = spawn_blocking(move || {
+                spawn::<crate::test_support::TestExecutorPlatform, _, _>(async move {
+                    let blocking = spawn_blocking::<crate::test_support::TestExecutorPlatform, _, _>(move || {
                         std::thread::yield_now();
                         i + 1
                     });
@@ -272,7 +282,7 @@ fn dropping_blocking_join_before_completion_does_not_leak_result() {
     let join = {
         let drops = drops.clone();
         let started = started.clone();
-        spawn_blocking(move || {
+        spawn_blocking::<crate::test_support::TestExecutorPlatform, _, _>(move || {
             started.fetch_add(1, Ordering::AcqRel);
             for _ in 0..256 {
                 std::thread::yield_now();

@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
 use async_lock::Barrier;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -288,7 +289,7 @@ pub(super) extern "C" fn multi_file_suite(handle: BenchRunHandle) -> AbiFuture<B
         });
         let mut workers = Vec::with_capacity(WORKERS);
         for input in inputs {
-            workers.push(spawn_join_owned(run_worker(input, shared.clone())));
+            workers.push(spawn_join_owned::<KernelExecutorPlatform, _, _>(run_worker(input, shared.clone())));
         }
         shared.barrier.wait().await;
         println!("[multi-file-ready] workers={} files={} file_bytes={} duration_ns={}",

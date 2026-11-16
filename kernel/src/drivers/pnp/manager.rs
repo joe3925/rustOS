@@ -3,6 +3,7 @@ use crate::drivers::pnp::device::DevNodeExt;
 use crate::error::error_with_message;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::manager::{OBJECT_MANAGER, ObjRef, Object, ObjectPayload};
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use kernel_types::error::{DriverErrorKind, KernelError, ResultErrorContext};
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;
@@ -223,7 +224,7 @@ impl PnpManager {
     fn rescan_buses_started(&self, dn: &Arc<DevNode>) {
         if dn.get_state() == DevNodeState::Started {
             let dn2 = dn.clone();
-            spawn_detached(async move {
+            spawn_detached::<KernelExecutorPlatform, _>(async move {
                 let _ = PNP_MANAGER
                     .invalidate_device_relations_for_node(&dn2, DeviceRelationType::BusRelations)
                     .await;
@@ -1093,7 +1094,7 @@ impl PnpManager {
             .collect();
         for child_dn in children_to_start {
             let dn = child_dn.clone();
-            spawn_detached(async move {
+            spawn_detached::<KernelExecutorPlatform, _>(async move {
                 let status = PNP_MANAGER.bind_and_start(&dn).await;
                 if let Some(err) = status.err() {
                     println!(

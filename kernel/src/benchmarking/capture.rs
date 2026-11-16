@@ -7,6 +7,7 @@ use crate::memory::{
     paging::frame_alloc::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::backtrace::{Backtrace, BacktraceStatus, MAX_BACKTRACE_DEPTH};
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
@@ -1802,7 +1803,7 @@ async fn build_exports_for_window(
         let st = state;
         let last_seq = *last_export_seq.get(core).unwrap_or(&0);
 
-        gather_joins.push(kernel_executor::runtime::runtime::spawn_blocking(
+        gather_joins.push(kernel_executor::runtime::runtime::spawn_blocking::<KernelExecutorPlatform, _, _>(
             move || -> Vec<BenchEvent> {
                 let events = st.drain_core_events(core);
 
@@ -2253,11 +2254,11 @@ impl BenchWindow {
 
         if let Some(timeout_ms) = timeout_ms_opt {
             let this = self.clone();
-            spawn_blocking(move || {
+            spawn_blocking::<KernelExecutorPlatform, _, _>(move || {
                 platform::wait_duration(timeout_ms);
                 this.stop();
                 println!("starting timeout persist");
-                block_on(this.persist());
+                block_on::<KernelExecutorPlatform, _>(this.persist());
                 println!("timeout done");
             });
         }
@@ -2267,7 +2268,7 @@ impl BenchWindow {
                 let interval = secs;
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
-                spawn_blocking(move || {
+                spawn_blocking::<KernelExecutorPlatform, _, _>(move || {
                     loop {
                         platform::wait_duration(interval);
 
@@ -2283,7 +2284,7 @@ impl BenchWindow {
                         }
 
                         let moved = Arc::clone(&this_arc);
-                        block_on(moved.persist());
+                        block_on::<KernelExecutorPlatform, _>(moved.persist());
                     }
                 });
             }
@@ -2640,8 +2641,8 @@ impl Drop for BenchWindow {
 
         if do_flush {
             let this = self.clone();
-            spawn_blocking(move || {
-                block_on(this.persist());
+            spawn_blocking::<KernelExecutorPlatform, _, _>(move || {
+                block_on::<KernelExecutorPlatform, _>(this.persist());
             });
         }
 
@@ -2801,7 +2802,7 @@ fn fill_disk_bench_pattern(buf: &mut [u8]) {
 }
 
 pub fn bench_c_drive_io(write_through: bool, bytes_per_pass: usize, total_bytes: usize) {
-    spawn_detached(async move {
+    spawn_detached::<KernelExecutorPlatform, _>(async move {
         let _ = bench_c_drive_io_inner(write_through, false, None, bytes_per_pass, total_bytes).await;
     });
 }

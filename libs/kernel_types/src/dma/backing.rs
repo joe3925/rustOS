@@ -196,9 +196,9 @@ impl LeaseSlot {
         self.state.store(LEASE_FREE, Ordering::Release);
     }
 
-    fn begin_release(&self, generation: u32) -> Option<usize> {
+    fn begin_release(&self, generation: usize) -> Option<usize> {
         if self.state.load(Ordering::Acquire) != LEASE_ACTIVE
-            || self.generation.load(Ordering::Acquire) != generation
+            || self.generation.load(Ordering::Acquire) as usize != generation
         {
             return None;
         }
@@ -246,7 +246,7 @@ pub(super) struct LeaseSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LeaseHandle {
     pub(super) index: usize,
-    pub(super) generation: u32,
+    pub(super) generation: usize,
     pub(super) range: LeaseChunkRange,
 }
 
@@ -373,7 +373,20 @@ impl<'data> IoBufferBacking<'data> {
             frames.clear();
 
             let mut leases = leases;
-            for slot in leases.iter_mut() {
+            let (groups, remainder) = leases.as_chunks_mut::<8>();
+            for slots in groups {
+                let state = slots
+                    .iter_mut()
+                    .fold(LEASE_FREE, |state, slot| state | *slot.state.get_mut());
+                if state != LEASE_FREE {
+                    for slot in slots {
+                        if *slot.state.get_mut() != LEASE_FREE {
+                            *slot = LeaseSlot::free();
+                        }
+                    }
+                }
+            }
+            for slot in remainder {
                 if *slot.state.get_mut() != LEASE_FREE {
                     *slot = LeaseSlot::free();
                 }
@@ -456,6 +469,7 @@ impl<'data> IoBufferBacking<'data> {
         Ok(IoBuffer::new(self, handle, offset, len))
     }
 
+    #[inline(always)]
     pub fn create_to_device<'backing>(
         &'backing self,
         offset: usize,
@@ -537,8 +551,9 @@ impl<'data> IoBufferBacking<'data> {
         let mut reserved = None;
         let mut index = start_index;
         for _ in 0..capacity {
-            if let Some(generation) = self.leases[index].try_reserve() {
-                reserved = Some((index, generation));
+            let slot = &self.leases[index];
+            if let Some(generation) = slot.try_reserve() {
+                reserved = Some((index, generation, slot));
                 break;
             }
             index += 1;
@@ -546,9 +561,8 @@ impl<'data> IoBufferBacking<'data> {
                 index = 0;
             }
         }
-        let (index, generation) =
+        let (index, generation, slot) =
             reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
-        let slot = &self.leases[index];
 
         if let Err(error) = self.overlap.try_claim_chunks(range.first, range.count) {
             slot.cancel_reservation();
@@ -568,7 +582,7 @@ impl<'data> IoBufferBacking<'data> {
         slot.publish(range, access, dma_record);
         Ok(LeaseHandle {
             index,
-            generation,
+            generation: generation as usize,
             range,
         })
     }
@@ -704,8 +718,9 @@ impl<'data> IoBufferBacking<'data> {
         let mut reserved = None;
         let mut index = start_index;
         for _ in 0..capacity {
-            if let Some(generation) = self.leases[index].try_reserve() {
-                reserved = Some((index, generation));
+            let slot = &self.leases[index];
+            if let Some(generation) = slot.try_reserve() {
+                reserved = Some((index, generation, slot));
                 break;
             }
             index += 1;
@@ -713,9 +728,8 @@ impl<'data> IoBufferBacking<'data> {
                 index = 0;
             }
         }
-        let (index, generation) =
+        let (index, generation, slot) =
             reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
-        let slot = &self.leases[index];
         if let Err(error) = unsafe {
             self.overlap.split_claim(
                 handle.range.first,
@@ -738,7 +752,7 @@ impl<'data> IoBufferBacking<'data> {
         parent.chunk_count.store(left_count, Ordering::Release);
         Ok(LeaseHandle {
             index,
-            generation,
+            generation: generation as usize,
             range: right_range,
         })
     }

@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -10,14 +11,18 @@ use spin::Mutex;
 pub struct UserExecutorDomain {
     owner_pid: u64,
     id: ExecutorDomainId,
-    domain: Arc<ExecutorDomain>,
+    domain: Arc<ExecutorDomain<KernelExecutorPlatform>>,
     user_handles: AtomicUsize,
     draining: AtomicBool,
     config_lock: Mutex<()>,
 }
 
 impl UserExecutorDomain {
-    pub fn new(owner_pid: u64, id: ExecutorDomainId, domain: Arc<ExecutorDomain>) -> Arc<Self> {
+    pub fn new(
+        owner_pid: u64,
+        id: ExecutorDomainId,
+        domain: Arc<ExecutorDomain<KernelExecutorPlatform>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             owner_pid,
             id,
@@ -68,7 +73,8 @@ impl UserExecutorDomain {
         if self.draining.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = GlobalAsyncExecutor::global().destroy_executor_domain(self.id);
+        let _ = GlobalAsyncExecutor::<KernelExecutorPlatform>::global()
+            .destroy_executor_domain(self.id);
     }
 }
 
@@ -85,7 +91,7 @@ impl core::fmt::Debug for UserExecutorDomain {
 impl Drop for UserExecutorDomain {
     fn drop(&mut self) {
         if !self.draining.load(Ordering::Acquire) {
-            match GlobalAsyncExecutor::global().destroy_executor_domain(self.id) {
+            match GlobalAsyncExecutor::<KernelExecutorPlatform>::global().destroy_executor_domain(self.id) {
                 Ok(_) | Err(DestroyExecutorDomainError::StaleDomain) => {}
                 Err(_) => {}
             }

@@ -1,4 +1,5 @@
 use crate::global_async::CacheAligned;
+use crate::platform::ExecutorPlatform;
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use alloc::boxed::Box;
@@ -220,12 +221,12 @@ pub struct ExecutorDomainInfo {
     pub ready_shards: usize,
 }
 
-pub struct ExecutorDomain {
+pub struct ExecutorDomain<E: ExecutorPlatform> {
     id: ExecutorDomainId,
     ready_heads: Box<[ReadyHead]>,
     pub(crate) batches: Box<[BatchSlot]>,
     pub(crate) help_requested: AtomicBool,
-    reclamation: Arc<DomainReclamation>,
+    reclamation: Arc<DomainReclamation<E>>,
     cleanup: UnsafeCell<DomainCleanup>,
 
     state: AtomicU8,
@@ -239,13 +240,13 @@ pub struct ExecutorDomain {
     deficit: CacheAligned,
 }
 
-unsafe impl Sync for ExecutorDomain {}
+unsafe impl<E: ExecutorPlatform> Sync for ExecutorDomain<E> {}
 
-impl ExecutorDomain {
+impl<E: ExecutorPlatform> ExecutorDomain<E> {
     fn new(
         id: ExecutorDomainId,
         config: ExecutorDomainConfig,
-        reclamation: Arc<DomainReclamation>,
+        reclamation: Arc<DomainReclamation<E>>,
         workers: usize,
     ) -> Self {
         let config = config.normalized();
@@ -343,7 +344,7 @@ impl ExecutorDomain {
         else {
             return None;
         };
-        let slab = crate::runtime::slab::task_slab::get_task_table();
+        let slab = crate::runtime::slab::task_slab::get_task_table::<E>();
         let Some(slot) = slab.get_slot(shard, local, generation) else {
             return None;
         };
@@ -454,37 +455,38 @@ impl ExecutorDomain {
     }
 }
 
-struct DomainReclamation {
+struct DomainReclamation<E: ExecutorPlatform> {
+    _platform: core::marker::PhantomData<fn() -> E>,
     pending: AtomicBool,
     candidates: [AtomicUsize; MAX_DOMAIN_SLOTS.div_ceil(usize::BITS as usize)],
 }
 
-impl DomainReclamation {
+impl<E: ExecutorPlatform> DomainReclamation<E> {
     fn request(&self, index: usize) {
         self.candidates[index / usize::BITS as usize]
             .fetch_or(1usize << (index % usize::BITS as usize), Ordering::Release);
         self.pending.store(true, Ordering::Release);
-        crate::global_async::GlobalAsyncExecutor::global().try_schedule::<true>();
+        crate::global_async::GlobalAsyncExecutor::<E>::global().try_schedule::<true>();
     }
 }
 
-pub(crate) struct DomainBorrow<'a> {
-    domain: *const ExecutorDomain,
-    slot: &'a DomainSlot,
-    reclamation: &'a DomainReclamation,
+pub(crate) struct DomainBorrow<'a, E: ExecutorPlatform> {
+    domain: *const ExecutorDomain<E>,
+    slot: &'a DomainSlot<E>,
+    reclamation: &'a DomainReclamation<E>,
     pinned: bool,
     notify: bool,
 }
 
-impl core::ops::Deref for DomainBorrow<'_> {
-    type Target = ExecutorDomain;
+impl<E: ExecutorPlatform> core::ops::Deref for DomainBorrow<'_, E> {
+    type Target = ExecutorDomain<E>;
 
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.domain }
     }
 }
 
-impl Drop for DomainBorrow<'_> {
+impl<E: ExecutorPlatform> Drop for DomainBorrow<'_, E> {
     fn drop(&mut self) {
         if self.pinned {
             let index = self.id.slot() as usize;
@@ -502,14 +504,14 @@ impl Drop for DomainBorrow<'_> {
     }
 }
 
-struct DomainSlot {
+struct DomainSlot<E: ExecutorPlatform> {
     state: AtomicUsize,
     readers: AtomicUsize,
     generation: AtomicUsize,
-    domain: AtomicPtr<ExecutorDomain>,
+    domain: AtomicPtr<ExecutorDomain<E>>,
 }
 
-impl DomainSlot {
+impl<E: ExecutorPlatform> DomainSlot<E> {
     fn new() -> Self {
         Self {
             state: AtomicUsize::new(DOMAIN_SLOT_EMPTY),
@@ -525,12 +527,12 @@ impl DomainSlot {
     }
 
     #[inline]
-    fn load_domain_ptr(&self) -> *mut ExecutorDomain {
+    fn load_domain_ptr(&self) -> *mut ExecutorDomain<E> {
         self.domain.load(Ordering::Acquire)
     }
 
     #[inline]
-    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> {
+    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain<E>) -> Arc<ExecutorDomain<E>> {
         unsafe {
             Arc::increment_strong_count(ptr);
             Arc::from_raw(ptr)
@@ -538,29 +540,30 @@ impl DomainSlot {
     }
 }
 
-struct DomainChunk {
-    slots: [DomainSlot; DOMAIN_CHUNK_SIZE],
+struct DomainChunk<E: ExecutorPlatform> {
+    slots: [DomainSlot<E>; DOMAIN_CHUNK_SIZE],
 }
 
-impl DomainChunk {
+impl<E: ExecutorPlatform> DomainChunk<E> {
     fn new() -> Self {
         Self {
-            slots: core::array::from_fn(|_| DomainSlot::new()),
+            slots: core::array::from_fn(|_| DomainSlot::<E>::new()),
         }
     }
 }
 
-pub struct ExecutorDomainTable {
-    reclamation: Arc<DomainReclamation>,
+pub struct ExecutorDomainTable<E: ExecutorPlatform> {
+    reclamation: Arc<DomainReclamation<E>>,
     next_slot: AtomicUsize,
-    chunks: [AtomicPtr<DomainChunk>; MAX_DOMAIN_CHUNKS],
+    chunks: [AtomicPtr<DomainChunk<E>>; MAX_DOMAIN_CHUNKS],
     workers: usize,
 }
 
-impl ExecutorDomainTable {
+impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
     pub(crate) fn new(cpu_count: usize) -> Self {
         let table = Self {
-            reclamation: Arc::new(DomainReclamation {
+            reclamation: Arc::new(DomainReclamation::<E> {
+                _platform: core::marker::PhantomData,
                 pending: AtomicBool::new(false),
                 candidates: core::array::from_fn(|_| AtomicUsize::new(0)),
             }),
@@ -613,7 +616,7 @@ impl ExecutorDomainTable {
         }
     }
 
-    fn get_or_create_chunk(&self, chunk_idx: usize) -> *mut DomainChunk {
+    fn get_or_create_chunk(&self, chunk_idx: usize) -> *mut DomainChunk<E> {
         assert!(
             chunk_idx < MAX_DOMAIN_CHUNKS,
             "executor domain table exhausted"
@@ -624,7 +627,7 @@ impl ExecutorDomainTable {
             return existing;
         }
 
-        let new_chunk = Box::into_raw(Box::new(DomainChunk::new()));
+        let new_chunk = Box::into_raw(Box::new(DomainChunk::<E>::new()));
 
         match self.chunks[chunk_idx].compare_exchange(
             ptr::null_mut(),
@@ -643,7 +646,7 @@ impl ExecutorDomainTable {
         }
     }
 
-    fn get_existing_chunk(&self, chunk_idx: usize) -> Option<*mut DomainChunk> {
+    fn get_existing_chunk(&self, chunk_idx: usize) -> Option<*mut DomainChunk<E>> {
         if chunk_idx >= MAX_DOMAIN_CHUNKS {
             return None;
         }
@@ -652,14 +655,14 @@ impl ExecutorDomainTable {
         (!chunk.is_null()).then_some(chunk)
     }
 
-    fn get_or_create_slot(&self, slot_idx: usize) -> &DomainSlot {
+    fn get_or_create_slot(&self, slot_idx: usize) -> &DomainSlot<E> {
         let chunk = self.get_or_create_chunk(Self::chunk_index(slot_idx));
         let idx = Self::chunk_slot_index(slot_idx);
 
         unsafe { &(*chunk).slots[idx] }
     }
 
-    fn get_existing_slot(&self, slot_idx: usize) -> Option<&DomainSlot> {
+    fn get_existing_slot(&self, slot_idx: usize) -> Option<&DomainSlot<E>> {
         let chunk = self.get_existing_chunk(Self::chunk_index(slot_idx))?;
         let idx = Self::chunk_slot_index(slot_idx);
 
@@ -675,13 +678,13 @@ impl ExecutorDomainTable {
         slot.generation
             .store(BUILTIN_GENERATION as usize, Ordering::Release);
 
-        let domain = Arc::new(ExecutorDomain::new(
+        let domain = Arc::new(ExecutorDomain::<E>::new(
             id,
             config,
             self.reclamation.clone(),
             self.workers,
         ));
-        let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
+        let raw = Arc::into_raw(domain) as *mut ExecutorDomain<E>;
 
         slot.domain.store(raw, Ordering::Release);
         slot.state.store(DOMAIN_SLOT_BUILTIN, Ordering::Release);
@@ -721,7 +724,7 @@ impl ExecutorDomainTable {
         }
     }
 
-    fn reserve_reusable_slot(&self) -> Option<(usize, &DomainSlot)> {
+    fn reserve_reusable_slot(&self) -> Option<(usize, &DomainSlot<E>)> {
         let limit = self.next_slot.load(Ordering::Acquire);
         let mut idx = 0usize;
 
@@ -753,19 +756,19 @@ impl ExecutorDomainTable {
     fn install_user_domain(
         &self,
         idx: usize,
-        slot: &DomainSlot,
+        slot: &DomainSlot<E>,
         config: ExecutorDomainConfig,
     ) -> ExecutorDomainId {
         let generation = slot.generation.load(Ordering::Acquire).max(1) as u32;
         let id = ExecutorDomainId::from_parts(idx as u32, generation);
 
-        let domain = Arc::new(ExecutorDomain::new(
+        let domain = Arc::new(ExecutorDomain::<E>::new(
             id,
             config,
             self.reclamation.clone(),
             self.workers,
         ));
-        let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
+        let raw = Arc::into_raw(domain) as *mut ExecutorDomain<E>;
 
         slot.domain.store(raw, Ordering::Release);
         slot.state.store(DOMAIN_SLOT_ACTIVE, Ordering::Release);
@@ -798,7 +801,7 @@ impl ExecutorDomainTable {
         domain.move_to_draining();
         self.reclamation.request(domain_id.slot() as usize);
         drop(domain);
-        if !crate::platform::in_interrupt_context() {
+        if !E::in_interrupt_context() {
             self.drain_retired();
         }
         if slot.generation() != domain_id.generation()
@@ -816,7 +819,7 @@ impl ExecutorDomainTable {
     pub(crate) fn borrow_executor_domain(
         &self,
         domain_id: ExecutorDomainId,
-    ) -> Option<DomainBorrow<'_>> {
+    ) -> Option<DomainBorrow<'_, E>> {
         if !domain_id.is_valid() {
             return None;
         }
@@ -854,9 +857,12 @@ impl ExecutorDomainTable {
         })
     }
 
-    pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
+    pub fn get_executor_domain(
+        &self,
+        domain_id: ExecutorDomainId,
+    ) -> Option<Arc<ExecutorDomain<E>>> {
         let domain = self.borrow_executor_domain(domain_id)?;
-        Some(unsafe { DomainSlot::clone_domain_from_ptr(ptr::from_ref(&*domain).cast_mut()) })
+        Some(unsafe { DomainSlot::<E>::clone_domain_from_ptr(ptr::from_ref(&*domain).cast_mut()) })
     }
 
     pub(crate) fn has_retired(&self) -> bool {
@@ -930,7 +936,7 @@ impl ExecutorDomainTable {
                 {
                     let domain = unsafe { &*slot.load_domain_ptr() };
                     let cleanup = unsafe { &mut *domain.cleanup.get() };
-                    let table = crate::runtime::slab::task_slab::get_task_table();
+                    let table = crate::runtime::slab::task_slab::get_task_table::<E>();
                     let mut remaining = 256usize;
                     let queues = domain.ready_heads.len() + domain.batches.len() * 2;
                     while remaining != 0
@@ -1004,7 +1010,7 @@ impl ExecutorDomainTable {
                                                         generation,
                                                     );
                                                 unsafe {
-                                                    task.cancel_owned(token);
+                                                    task.cancel_owned::<E>(token);
                                                 }
                                                 table.decrement_ref::<true>(
                                                     shard, local, generation,
@@ -1021,7 +1027,7 @@ impl ExecutorDomainTable {
                         );
                     }
                     let finished = cleanup.tasks_done
-                        && crate::runtime::blocking::cancel_domain_jobs(
+                        && crate::runtime::blocking::cancel_domain_jobs::<E>(
                             domain.id(),
                             &mut cleanup.blocking_cursor,
                             remaining,

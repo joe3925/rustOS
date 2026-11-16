@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -106,7 +107,7 @@ impl CompletionQueue {
             opcode,
             user_token,
         };
-        let task = match try_spawn_to_port_in_executor_domain(
+        let task = match try_spawn_to_port_in_executor_domain::<KernelExecutorPlatform, _, _, _>(
             self.bound_executor_domain,
             async move { op.execute().await },
             request_id,

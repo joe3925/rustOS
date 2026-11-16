@@ -1,5 +1,6 @@
 use crate::domain::{ACTIVE_UNIT, BATCH_EMPTY, BATCH_OWNED, BATCH_READY, RUN_PENDING};
-use crate::platform::{self, ExecutorBatchGuard, Job, SlabCache, with_executor_local};
+use crate::platform::ExecutorPlatform;
+use crate::platform::{ExecutorBatchGuard, Job, SlabCache, with_executor_local};
 use crate::runtime::runtime::{drain_retired_block_on_states, has_retired_block_on_states};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
@@ -46,16 +47,17 @@ pub(crate) struct WorkerShared {
     claimed: AtomicBool,
 }
 
-struct WorkerGuard<'a> {
+struct WorkerGuard<'a, E: ExecutorPlatform> {
     worker: Option<&'a WorkerShared>,
     previous: *const WorkerShared,
     previous_caches: Option<[SlabCache; 1]>,
+    _platform: core::marker::PhantomData<fn() -> E>,
 }
 
-impl Drop for WorkerGuard<'_> {
+impl<E: ExecutorPlatform> Drop for WorkerGuard<'_, E> {
     fn drop(&mut self) {
-        GlobalAsyncExecutor::global().release_local_batch::<false>(true);
-        with_executor_local(|tls| {
+        GlobalAsyncExecutor::<E>::global().release_local_batch::<false>(true);
+        with_executor_local::<E, _>(|tls| {
             let mut caches = tls.caches.borrow_mut();
             for cache in &mut *caches {
                 if let Some(flush) = cache.flush.take() {
@@ -74,17 +76,17 @@ impl Drop for WorkerGuard<'_> {
     }
 }
 
-struct ExecutorRuntime {
-    domains: ExecutorDomainTable,
+struct ExecutorRuntime<E: ExecutorPlatform> {
+    domains: ExecutorDomainTable<E>,
     workers: Box<[WorkerShared]>,
     run_queue: DomainRunQueue,
     run_overflow: AtomicBool,
 }
 
-impl ExecutorRuntime {
+impl<E: ExecutorPlatform> ExecutorRuntime<E> {
     fn new(cpu_count: usize) -> Self {
         Self {
-            domains: ExecutorDomainTable::new(cpu_count),
+            domains: ExecutorDomainTable::<E>::new(cpu_count),
             workers: (0..cpu_count)
                 .map(|_| WorkerShared {
                     claimed: AtomicBool::new(false),
@@ -96,42 +98,51 @@ impl ExecutorRuntime {
     }
 }
 
-pub struct GlobalAsyncExecutor {
-    runtime: Once<ExecutorRuntime>,
+pub struct GlobalAsyncExecutor<E: ExecutorPlatform> {
+    runtime: Once<ExecutorRuntime<E>>,
+    pub(crate) task_table: Once<crate::runtime::slab::task_slab::TaskTable<E>>,
+    pub(crate) retired_block_on_states: core::sync::atomic::AtomicUsize,
+    pub(crate) blocking_tasks:
+        crate::sync::Mutex<alloc::vec::Vec<Option<crate::runtime::blocking::BlockingEntry>>>,
     active_pumps: CacheAligned,
     max_pumps: CacheAligned,
 }
 
-impl GlobalAsyncExecutor {
-    pub fn global() -> &'static GlobalAsyncExecutor {
-        static EXEC: Once<GlobalAsyncExecutor> = Once::new();
-
-        EXEC.call_once(|| GlobalAsyncExecutor {
+impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
+    pub fn new() -> Self {
+        Self {
             runtime: Once::new(),
             active_pumps: CacheAligned(AtomicUsize::new(0)),
             max_pumps: CacheAligned(AtomicUsize::new(0)),
-        })
+            task_table: Once::new(),
+            retired_block_on_states: core::sync::atomic::AtomicUsize::new(0),
+            blocking_tasks: crate::sync::Mutex::new(alloc::vec::Vec::new()),
+        }
+    }
+
+    pub fn global() -> &'static Self {
+        E::global_executor()
     }
 
     pub fn init(&self, shards: usize, initial_task_capacity: usize) {
         let shards = shards.clamp(1, MAX_SHARDS);
 
-        crate::runtime::slab::task_slab::init_task_table_with(|config| {
+        crate::runtime::slab::task_slab::init_task_table_with::<E, _>(|config| {
             config.capacity(initial_task_capacity)
         });
 
-        self.runtime.call_once(|| ExecutorRuntime::new(shards));
+        self.runtime.call_once(|| ExecutorRuntime::<E>::new(shards));
 
-        platform::init_blocking(shards);
-        platform::init_runtime(shards, shards);
+        E::init_blocking(shards);
+        E::init_runtime(shards, shards);
 
         self.max_pumps.0.store(shards, Ordering::Release);
         fence(Ordering::SeqCst);
 
         if self.has_runnable_domains() {
             self.try_schedule::<false>();
-        } else if crate::runtime::slab::task_slab::get_task_table().has_retired()
-            || has_retired_block_on_states()
+        } else if crate::runtime::slab::task_slab::get_task_table::<E>().has_retired()
+            || has_retired_block_on_states::<E>()
             || self.runtime().domains.has_retired()
         {
             self.try_schedule::<true>();
@@ -139,7 +150,7 @@ impl GlobalAsyncExecutor {
     }
 
     #[inline]
-    fn runtime(&self) -> &ExecutorRuntime {
+    fn runtime(&self) -> &ExecutorRuntime<E> {
         self.runtime
             .get()
             .expect("global async executor not initialized")
@@ -155,9 +166,12 @@ impl GlobalAsyncExecutor {
                 if domain.state() != ExecutorDomainState::Active {
                     return false;
                 }
-                let local = !crate::platform::in_interrupt_context()
-                    && with_executor_local(|tls| {
-                        if tls.active_domain.get() != domain as *const ExecutorDomain {
+                let local = !E::in_interrupt_context()
+                    && with_executor_local::<E, _>(|tls| {
+                        if tls.active_domain.get() != domain as *const ExecutorDomain<E> {
+                            return false;
+                        }
+                        if tls.current.get().is_none_or(|context| context.task_id != task_id) {
                             return false;
                         }
                         let Some(slot) = (unsafe { tls.batch.get().as_ref() }) else {
@@ -187,7 +201,7 @@ impl GlobalAsyncExecutor {
             if let Some((shard, local, generation)) =
                 crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
             {
-                crate::runtime::slab::task_slab::get_task_table()
+                crate::runtime::slab::task_slab::get_task_table::<E>()
                     .decrement_ref::<false>(shard, local, generation);
             }
         }
@@ -196,9 +210,9 @@ impl GlobalAsyncExecutor {
     pub(crate) fn with_executor_domain<R>(
         &self,
         domain_id: ExecutorDomainId,
-        f: impl FnOnce(&ExecutorDomain) -> R,
+        f: impl FnOnce(&ExecutorDomain<E>) -> R,
     ) -> Option<R> {
-        let cached = with_executor_local(|tls| tls.active_domain.get());
+        let cached = with_executor_local::<E, _>(|tls| tls.active_domain.get());
         if let Some(domain) = unsafe { cached.as_ref() } {
             if domain.id() == domain_id && domain.state() != ExecutorDomainState::Dead {
                 return Some(f(domain));
@@ -209,10 +223,10 @@ impl GlobalAsyncExecutor {
     }
 
     pub(crate) fn release_local_batch<const CHECK_IRQ: bool>(&self, notify: bool) {
-        if CHECK_IRQ && crate::platform::in_interrupt_context() {
+        if CHECK_IRQ && E::in_interrupt_context() {
             return;
         }
-        let owned = with_executor_local(|tls| {
+        let owned = with_executor_local::<E, _>(|tls| {
             let slot = tls.batch.replace(core::ptr::null());
             unsafe { Some((slot.as_ref()?, tls.active_domain.get().as_ref()?)) }
         });
@@ -236,7 +250,7 @@ impl GlobalAsyncExecutor {
                     )
                     .is_ok()
             }) {
-                let table = crate::runtime::slab::task_slab::get_task_table();
+                let table = crate::runtime::slab::task_slab::get_task_table::<E>();
                 let mut last = batch.current;
                 for _ in 1..domain.quantum().min(32) {
                     let (shard, local, generation) =
@@ -298,7 +312,10 @@ impl GlobalAsyncExecutor {
         self.runtime().domains.destroy_executor_domain(domain_id)
     }
 
-    pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
+    pub fn get_executor_domain(
+        &self,
+        domain_id: ExecutorDomainId,
+    ) -> Option<Arc<ExecutorDomain<E>>> {
         self.runtime().domains.get_executor_domain(domain_id)
     }
 
@@ -313,9 +330,9 @@ impl GlobalAsyncExecutor {
     #[inline]
     fn schedule_domain_if_needed<const RELEASE_ACTIVE: bool>(
         &self,
-        runtime: &ExecutorRuntime,
+        runtime: &ExecutorRuntime<E>,
         domain_id: ExecutorDomainId,
-        domain: &ExecutorDomain,
+        domain: &ExecutorDomain<E>,
     ) {
         if domain.state() != ExecutorDomainState::Active {
             if RELEASE_ACTIVE {
@@ -373,8 +390,8 @@ impl GlobalAsyncExecutor {
             return;
         }
 
-        if !platform::submit_runtime(Job {
-            f: pump_trampoline,
+        if !E::submit_runtime(Job {
+            f: pump_trampoline::<E>,
             a: 0,
         }) {
             self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
@@ -389,7 +406,7 @@ impl GlobalAsyncExecutor {
 
     fn pump(&self) {
         self.release_local_batch::<false>(true);
-        let task_table = crate::runtime::slab::task_slab::get_task_table();
+        let task_table = crate::runtime::slab::task_slab::get_task_table::<E>();
         let worker = self
             .runtime()
             .workers
@@ -401,7 +418,7 @@ impl GlobalAsyncExecutor {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             });
-        let (previous, previous_caches) = with_executor_local(|tls| {
+        let (previous, previous_caches) = with_executor_local::<E, _>(|tls| {
             if let Some((index, _)) = worker {
                 tls.ready_cursor.set(index);
                 tls.allocation_cursor.set(index);
@@ -416,12 +433,13 @@ impl GlobalAsyncExecutor {
                 .then(|| core::mem::replace(&mut *caches, [const { SlabCache::new() }; 1]));
             (previous, previous_caches)
         });
-        let worker_guard = WorkerGuard {
+        let worker_guard = WorkerGuard::<E> {
             worker: worker.map(|(_, worker)| worker),
             previous,
             previous_caches,
+            _platform: core::marker::PhantomData,
         };
-        let mut cached_domain: Option<crate::domain::DomainBorrow<'_>> = None;
+        let mut cached_domain: Option<crate::domain::DomainBorrow<'_, E>> = None;
 
         loop {
             let runtime = self.runtime();
@@ -463,7 +481,7 @@ impl GlobalAsyncExecutor {
             let budget = self.pick_domain_budget(domain);
             let ran = self.run_domain_batch(domain, budget);
             task_table.drain_retired();
-            drain_retired_block_on_states();
+            drain_retired_block_on_states::<E>();
 
             self.after_domain_batch(runtime, domain_id, domain, ran);
             if domain.state() != ExecutorDomainState::Active {
@@ -474,7 +492,7 @@ impl GlobalAsyncExecutor {
 
         drop(cached_domain);
         task_table.drain_retired();
-        drain_retired_block_on_states();
+        drain_retired_block_on_states::<E>();
         drop(worker_guard);
         self.runtime().domains.drain_retired();
         self.exit_pump();
@@ -483,7 +501,7 @@ impl GlobalAsyncExecutor {
         if self.has_runnable_domains() {
             self.try_schedule::<false>();
         } else if task_table.has_retired()
-            || has_retired_block_on_states()
+            || has_retired_block_on_states::<E>()
             || self.runtime().domains.has_retired()
         {
             self.try_schedule::<true>();
@@ -491,7 +509,7 @@ impl GlobalAsyncExecutor {
     }
 
     #[inline]
-    fn pick_domain_budget(&self, domain: &ExecutorDomain) -> usize {
+    fn pick_domain_budget(&self, domain: &ExecutorDomain<E>) -> usize {
         let quantum = domain.quantum();
         let weight = domain.weight();
         if weight >= quantum {
@@ -501,8 +519,8 @@ impl GlobalAsyncExecutor {
         }
     }
 
-    fn run_domain_batch(&self, domain: &ExecutorDomain, budget: usize) -> usize {
-        let start = with_executor_local(|tls| {
+    fn run_domain_batch(&self, domain: &ExecutorDomain<E>, budget: usize) -> usize {
+        let start = with_executor_local::<E, _>(|tls| {
             let cursor = tls.ready_cursor.get();
             tls.ready_cursor.set(cursor.wrapping_add(1));
             cursor % domain.batches.len()
@@ -532,20 +550,20 @@ impl GlobalAsyncExecutor {
         if !domain.is_at_active_limit() && domain.has_queued_work() {
             self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
         }
-        let (previous_domain, previous_batch) = with_executor_local(|tls| {
+        let (previous_domain, previous_batch) = with_executor_local::<E, _>(|tls| {
             (tls.active_domain.replace(domain), tls.batch.replace(owned))
         });
-        let _batch = ExecutorBatchGuard {
+        let _batch = ExecutorBatchGuard::<E> {
             previous_domain,
             previous_batch,
         };
         let mut ran = 0usize;
         let budget = budget.max(1);
-        let table = crate::runtime::slab::task_slab::get_task_table();
+        let table = crate::runtime::slab::task_slab::get_task_table::<E>();
 
         while ran < budget {
             if domain.state() != ExecutorDomainState::Active
-                || with_executor_local(|tls| tls.batch.get().is_null())
+                || with_executor_local::<E, _>(|tls| tls.batch.get().is_null())
             {
                 break;
             }
@@ -579,7 +597,7 @@ impl GlobalAsyncExecutor {
                 domain.help_requested.store(true, Ordering::Release);
                 break;
             }
-            crate::runtime::slab::ptr::slab_task_poll_trampoline(task_id);
+            crate::runtime::slab::ptr::slab_task_poll_trampoline::<E>(task_id);
             ran += 1;
         }
 
@@ -589,9 +607,9 @@ impl GlobalAsyncExecutor {
     #[inline]
     fn after_domain_batch(
         &self,
-        runtime: &ExecutorRuntime,
+        runtime: &ExecutorRuntime<E>,
         domain_id: ExecutorDomainId,
-        domain: &ExecutorDomain,
+        domain: &ExecutorDomain<E>,
         ran_count: usize,
     ) {
         if domain.weight() < domain.quantum() && (ran_count != 0 || domain.is_runnable_for_policy())
@@ -604,6 +622,6 @@ impl GlobalAsyncExecutor {
 }
 
 #[inline(never)]
-pub extern "C" fn pump_trampoline(_ctx: usize) {
-    GlobalAsyncExecutor::global().pump();
+pub extern "C" fn pump_trampoline<E: ExecutorPlatform>(_ctx: usize) {
+    GlobalAsyncExecutor::<E>::global().pump();
 }

@@ -5,6 +5,7 @@ use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::layout::{base_page_size, kernel_space_base};
 use crate::memory::paging::stack::StackSize;
 use crate::platform::{self, resolve_mapping_in_root};
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
@@ -926,7 +927,7 @@ pub(crate) fn sys_executor_domain_create(
         Ok(current) => current,
         Err(err) => return err,
     };
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
+    let domain_id = GlobalAsyncExecutor::<KernelExecutorPlatform>::global().create_executor_domain(ExecutorDomainConfig {
         max_active: if config.max_active_tasks == 0 {
             usize::MAX
         } else {
@@ -935,12 +936,14 @@ pub(crate) fn sys_executor_domain_create(
         quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
         weight: ExecutorDomainClass::ProcessIo.default_weight(),
         ready_shards: if config.ready_shards == 0 {
-            GlobalAsyncExecutor::global().worker_count()
+            GlobalAsyncExecutor::<KernelExecutorPlatform>::global().worker_count()
         } else {
             config.ready_shards
         },
     });
-    let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) else {
+    let Some(domain) =
+        GlobalAsyncExecutor::<KernelExecutorPlatform>::global().get_executor_domain(domain_id)
+    else {
         return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
     };
     let user_domain = UserExecutorDomain::new(caller_pid, domain_id, domain);

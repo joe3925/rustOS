@@ -1,3 +1,4 @@
+use crate::platform::ExecutorPlatform;
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::UnsafeCell;
 use core::ptr;
@@ -308,15 +309,16 @@ impl<T> Drop for SlabShard<T> {
     }
 }
 
-pub struct GrowableSlab<T> {
+pub struct GrowableSlab<T, E: ExecutorPlatform> {
+    _platform: core::marker::PhantomData<fn() -> E>,
     shards: Box<[SlabShard<T>]>,
     shard_hint: AtomicUsize,
 }
 
-unsafe impl<T: Send> Send for GrowableSlab<T> {}
-unsafe impl<T: Send> Sync for GrowableSlab<T> {}
+unsafe impl<T: Send, E: ExecutorPlatform> Send for GrowableSlab<T, E> {}
+unsafe impl<T: Send, E: ExecutorPlatform> Sync for GrowableSlab<T, E> {}
 
-impl<T> GrowableSlab<T> {
+impl<T, E: ExecutorPlatform> GrowableSlab<T, E> {
     pub fn new(
         shard_count: usize,
         slots_per_chunk: usize,
@@ -330,16 +332,17 @@ impl<T> GrowableSlab<T> {
             shards.push(SlabShard::new(slots_per_chunk, max_chunks_per_shard, init));
         }
         Self {
+            _platform: core::marker::PhantomData,
             shards: shards.into_boxed_slice(),
             shard_hint: AtomicUsize::new(0),
         }
     }
 
     pub fn reserve(&self) -> Option<SlabHandle> {
-        let start = if crate::platform::in_interrupt_context() {
+        let start = if E::in_interrupt_context() {
             self.shard_hint.fetch_add(1, Ordering::Relaxed) % self.shards.len()
         } else {
-            crate::platform::with_executor_local(|tls| {
+            crate::platform::with_executor_local::<E, _>(|tls| {
                 let hint = tls.allocation_cursor.get();
                 tls.allocation_cursor.set(hint.wrapping_add(1));
                 hint % self.shards.len()
@@ -359,10 +362,10 @@ impl<T> GrowableSlab<T> {
         cache_index: usize,
         limit: usize,
     ) -> Option<SlabHandle> {
-        if crate::platform::in_interrupt_context() {
+        if E::in_interrupt_context() {
             return self.reserve();
         }
-        crate::platform::with_executor_local(|tls| {
+        crate::platform::with_executor_local::<E, _>(|tls| {
             if tls.active_domain.get().is_null() {
                 return self.reserve();
             }
@@ -405,10 +408,10 @@ impl<T> GrowableSlab<T> {
         cache_index: usize,
         limit: usize,
     ) -> bool {
-        if crate::platform::in_interrupt_context() {
+        if E::in_interrupt_context() {
             return unsafe { self.release(handle) };
         }
-        crate::platform::with_executor_local(|tls| {
+        crate::platform::with_executor_local::<E, _>(|tls| {
             if tls.active_domain.get().is_null() {
                 return unsafe { self.release(handle) };
             }
@@ -558,7 +561,7 @@ mod tests {
 
     #[test]
     fn grows_preserves_addresses_reuses_and_rejects_stale_handles() {
-        let slab = GrowableSlab::new(1, 2, 4, zero);
+        let slab = GrowableSlab::<_, crate::test_support::TestExecutorPlatform>::new(1, 2, 4, zero);
         let first = slab.reserve().unwrap();
         let first_ptr = slab.get(first).unwrap() as *const usize;
         let second = slab.reserve().unwrap();
@@ -584,7 +587,9 @@ mod tests {
 
     #[test]
     fn concurrent_growth_publishes_initialized_slots() {
-        let slab = std::sync::Arc::new(GrowableSlab::new(2, 2, 32, zero));
+        let slab = std::sync::Arc::new(
+            GrowableSlab::<_, crate::test_support::TestExecutorPlatform>::new(2, 2, 32, zero),
+        );
         let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         std::thread::scope(|scope| {
             for _ in 0..8 {

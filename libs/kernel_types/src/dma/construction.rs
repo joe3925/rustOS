@@ -469,7 +469,7 @@ pub(super) fn validate_snapshot(
     backing_len: usize,
 ) -> Result<LeaseSnapshot, IoBufferError> {
     let snapshot = slot.snapshot().ok_or(IoBufferError::InvalidLease)?;
-    if snapshot.generation != handle.generation {
+    if snapshot.generation as usize != handle.generation {
         return Err(IoBufferError::InvalidLease);
     }
     let start = snapshot

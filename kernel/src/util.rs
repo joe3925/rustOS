@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 extern crate rand_xoshiro;
 
 use crate::benchmarking::BenchWindow;
@@ -157,7 +158,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
     ));
-    GlobalAsyncExecutor::global().init(processor_count(), 1024);
+    GlobalAsyncExecutor::<KernelExecutorPlatform>::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
     #[cfg(feature = "kernel-self-tests")]
     test_kernel_tls_runtime();
@@ -182,7 +183,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
 
-    spawn_detached(async move {
+    spawn_detached::<KernelExecutorPlatform, _>(async move {
         init_registry().await.expect("Failed to init registry");
         install_prepacked_drivers()
             .await

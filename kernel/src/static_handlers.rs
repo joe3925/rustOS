@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use core::{
     alloc::{GlobalAlloc, Layout},
     sync::atomic::{AtomicU32, Ordering},
@@ -507,7 +508,7 @@ pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<bool> {
-    let handle = kernel_spawn(fut);
+    let handle = kernel_spawn::<KernelExecutorPlatform, _, _>(fut);
     async move {
         matches!(
             handle.await,
@@ -519,14 +520,14 @@ pub extern "C" fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<boo
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_detached_abi(fut: AbiFuture<()>) {
-    kernel_spawn_detached(fut);
+    kernel_spawn_detached::<KernelExecutorPlatform, _>(fut);
 }
 
 #[unsafe(no_mangle)]
 #[cfg_attr(irq_check, irq::forbidden)]
 pub extern "C" fn kernel_block_on_context() -> BlockOnContext {
     let state = scheduling::tls::current_block_on_thread_state();
-    let waker = block_on_waker(Some(state.clone()));
+    let waker = block_on_waker::<KernelExecutorPlatform>(Some(state.clone()));
     BlockOnContext { state, waker }
 }
 
@@ -544,7 +545,7 @@ impl Drop for RawBlockingJob {
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize, bool), ctx: usize) {
     let job = RawBlockingJob { trampoline, ctx };
-    kernel_spawn_blocking(move || {
+    kernel_spawn_blocking::<KernelExecutorPlatform, _, _>(move || {
         let job = core::mem::ManuallyDrop::new(job);
         (job.trampoline)(job.ctx, true);
     });

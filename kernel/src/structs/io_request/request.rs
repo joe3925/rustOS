@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -623,7 +624,7 @@ impl IoRequestTable {
                         .is_ok()
                     {
                         if let Some(task) = TaskToken::from_raw(slot.task.load(Ordering::Acquire)) {
-                            let _ = kernel_executor::runtime::runtime::abort_task(task);
+                            let _ = kernel_executor::runtime::runtime::abort_task::<KernelExecutorPlatform>(task);
                         }
                         return Ok(());
                     }
@@ -658,7 +659,7 @@ impl IoRequestTable {
                             if let Some(task) =
                                 TaskToken::from_raw(slot.task.load(Ordering::Acquire))
                             {
-                                let _ = kernel_executor::runtime::runtime::abort_task(task);
+                                let _ = kernel_executor::runtime::runtime::abort_task::<KernelExecutorPlatform>(task);
                             }
                             break;
                         }
@@ -676,7 +677,7 @@ impl IoRequestTable {
             if IoRequestState::from_u8(slot.state.load(Ordering::Acquire))
                 == IoRequestState::CancelRequested
             {
-                let _ = kernel_executor::runtime::runtime::abort_task(task);
+                let _ = kernel_executor::runtime::runtime::abort_task::<KernelExecutorPlatform>(task);
             }
         }
     }

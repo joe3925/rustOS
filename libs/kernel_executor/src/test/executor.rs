@@ -633,13 +633,13 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
                 assert_future_exceeds_joinable_inline_storage(&future);
                 saw_large = true;
             }
-            handles.push(spawn(future));
+            handles.push(spawn::<crate::test_support::TestExecutorPlatform, _, _>(future));
         } else {
             if !saw_inline {
                 assert_future_fits_joinable_inline_storage(&future);
                 saw_inline = true;
             }
-            handles.push(spawn(future));
+            handles.push(spawn::<crate::test_support::TestExecutorPlatform, _, _>(future));
         }
 
         progress.fetch_add(1, Ordering::AcqRel);
@@ -655,7 +655,9 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
     progress.fetch_add(1, Ordering::AcqRel);
 
     let watchdog = ProgressWatchdog::start(future_set.label(), progress.clone());
-    let results = block_on(async { JoinAll::new(handles).await });
+    let results = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
+        JoinAll::new(handles).await
+    });
     drop(watchdog);
 
     assert_eq!(results.len(), task_count);
