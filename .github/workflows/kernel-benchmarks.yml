@@ -21,7 +21,8 @@ jobs:
   benchmark:
     if: >-
       (github.event_name == 'push' &&
-       contains(github.event.head_commit.message, '[bench]')) ||
+       (contains(github.event.head_commit.message, '[bench]') ||
+        github.run_attempt > 1)) ||
       (github.event_name == 'workflow_dispatch' &&
        inputs.accept_run_id == '')
     runs-on: [self-hosted, linux, x64, rustos-bench]
@@ -117,6 +118,9 @@ jobs:
                 [[ "$(jq -r '.environment_version // empty' "$manifest")" == "$BENCH_ENV_VERSION" ]] &&
                 [[ "$(jq -r --arg default_branch "$DEFAULT_BRANCH" '.branch // $default_branch' "$manifest")" == "$baseline_branch" ]] &&
                 jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+                baseline_commit="$(jq -r '.commit // empty' "$manifest")"
+                [[ -n "$baseline_commit" && "$baseline_commit" != "$GITHUB_SHA" ]] || continue
+                git merge-base --is-ancestor "$baseline_commit" "$GITHUB_SHA" || continue
                 acceptance="$(jq -r '.accepted_by_run' "$manifest")"
                 if [[ "$acceptance" =~ ^[0-9]+$ ]] && (( acceptance > best_acceptance )); then
                   best_acceptance="$acceptance"
@@ -139,6 +143,8 @@ jobs:
             list_runs "$DEFAULT_BRANCH" success |
               jq -r '.workflow_runs[] | [.id, .head_sha] | @tsv' > "$trusted_candidates"
             while IFS=$'\t' read -r run_id commit; do
+              [[ "$run_id" == "$GITHUB_RUN_ID" || "$commit" == "$GITHUB_SHA" ]] && continue
+              git merge-base --is-ancestor "$commit" "$GITHUB_SHA" || continue
               run_dir="$baseline_cache/main-${run_id}"
               mkdir -p "$run_dir"
               if ! gh run download "$run_id" --name kernel-benchmarks --dir "$run_dir"; then
@@ -188,7 +194,7 @@ jobs:
             fi
           done < "$previous_candidates"
 
-      - name: Prepare default branch baseline when no artifact is available
+      - name: Prepare earlier default branch baseline when no artifact is available
         id: main-baseline
         if: steps.baselines.outputs.trusted_available != 'true' && github.ref_name != github.event.repository.default_branch
         shell: bash
@@ -197,10 +203,14 @@ jobs:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
         run: |
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          if ! commit="$(git merge-base "${GITHUB_SHA}^" "origin/$DEFAULT_BRANCH")"; then
+            echo "No earlier common commit is available for a default branch baseline."
+            exit 0
+          fi
           baseline_worktree="$RUNNER_TEMP/rustos-main-$GITHUB_RUN_ID"
           baseline_image="$GITHUB_WORKSPACE/target/bench/trusted/boot.img"
-          git worktree add --detach "$baseline_worktree" "origin/$DEFAULT_BRANCH"
-          commit="$(git -C "$baseline_worktree" rev-parse HEAD)"
+          git worktree add --detach "$baseline_worktree" "$commit"
           trap 'git -C "$GITHUB_WORKSPACE" worktree remove --force "$baseline_worktree"' EXIT
           cd "$baseline_worktree"
           bash "$GITHUB_WORKSPACE/.github/scripts/prepare-pgo-tools.sh"
@@ -293,7 +303,7 @@ jobs:
         shell: bash
         env:
           TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available == 'true' || steps.main-baseline.outputs.available == 'true' }}
-          TRUSTED_RUN_ID: ${{ steps.baselines.outputs.trusted_run_id || 'current default branch build' }}
+          TRUSTED_RUN_ID: ${{ steps.baselines.outputs.trusted_run_id || 'earlier default branch build' }}
           TRUSTED_COMMIT: ${{ steps.baselines.outputs.trusted_commit || steps.main-baseline.outputs.commit }}
           PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
           PREVIOUS_RUN_ID: ${{ steps.baselines.outputs.previous_run_id }}
@@ -323,7 +333,7 @@ jobs:
             {
               echo "## Against trusted baseline"
               echo
-              echo "No compatible baseline is available for this branch or the default branch. Dispatch this workflow on this branch with a completed run ID in \`accept_run_id\` to create one."
+              echo "No compatible earlier baseline is available for this branch or the default branch. Run this workflow with \`accept_run_id\` set to a completed benchmark run from an earlier ancestor commit."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
