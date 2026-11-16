@@ -81,7 +81,7 @@ impl ReaderPool {
             let mut old = self.state.load(Ordering::Acquire);
             loop {
                 let before = ReaderPoolState::unpack(old);
-                if before.idle >= before.pending.max(1) {
+                if before.idle >= before.pending.max(16) {
                     unsafe { drop(Box::from_raw(node)) };
                     break;
                 }

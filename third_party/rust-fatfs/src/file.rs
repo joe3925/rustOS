@@ -43,6 +43,13 @@ pub struct CachedFileState {
 }
 
 impl CachedFileState {
+    pub fn size(&self) -> u64 {
+        self.entry
+            .as_ref()
+            .and_then(|entry| entry.inner().size())
+            .unwrap_or(0) as u64
+    }
+
     /// Recreates a [`File`] from cached open state.
     #[must_use]
     pub fn into_file<'a, IO: ReadWriteSeek, TP, OCC>(self, fs: &'a FileSystem<IO, TP, OCC>) -> File<'a, IO, TP, OCC> {
@@ -727,6 +734,120 @@ where
         }
 
         Ok((current_cluster, write_size))
+    }
+
+    pub async fn reserve_len(&mut self, end: u64) -> Result<(), Error<IO::Error>> {
+        if end > u64::from(MAX_FILE_SIZE) {
+            return Err(Error::FileTooLarge);
+        }
+        self.fs.set_dirty_flag(true).await?;
+        let saved_offset = self.offset;
+        let saved_cluster = self.current_cluster;
+        let result = async {
+            self.seek(SeekFrom::End(0)).await?;
+            let cluster_size = u64::from(self.fs.cluster_size());
+            let mut offset = self.offset;
+            let mut previous = self.current_cluster;
+            while u64::from(offset) < end {
+                let (cluster, bytes) = self
+                    .prepare_write_run(offset, previous, (end - u64::from(offset)) as usize)
+                    .await?;
+                let within = u64::from(offset) % cluster_size;
+                previous = Some(cluster + ((within + bytes as u64 - 1) / cluster_size) as u32);
+                offset += bytes as u32;
+            }
+            Ok(())
+        }
+        .await;
+        self.offset = saved_offset;
+        self.current_cluster = saved_cluster;
+        result
+    }
+
+    pub async fn write_iobuffer_with<'buffer, R>(
+        &mut self,
+        disk: &mut R,
+        buffer: IoBuffer<'buffer, 'buffer, ToDevice>,
+        kind: IoKind,
+    ) -> Result<usize, Error<IO::Error>>
+    where
+        R: ReadWriteSeek<Error = IO::Error> + WriteIoBuffer,
+    {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if buffer.len() as u64 > u64::from(MAX_FILE_SIZE - self.offset) {
+            return Err(Error::FileTooLarge);
+        }
+        let cluster_size = self.fs.cluster_size();
+        let total_len = buffer.len();
+        let mut total_written = 0usize;
+        let mut remaining_buffer = Some(buffer);
+        while total_written < total_len {
+            let offset_in_cluster = self.offset % cluster_size;
+            let current_cluster = if offset_in_cluster == 0 {
+                match self.current_cluster {
+                    None => self.first_cluster.ok_or(Error::CorruptedFileSystem)?,
+                    Some(previous) => {
+                        match self.fs.cluster_iter_with(&mut *disk, previous).next().await {
+                            Some(cluster) => cluster?,
+                            None => return Err(Error::CorruptedFileSystem),
+                        }
+                    }
+                }
+            } else {
+                self.current_cluster.ok_or(Error::CorruptedFileSystem)?
+            };
+            let remaining = total_len - total_written;
+            let mut write_size = remaining.min((cluster_size - offset_in_cluster) as usize);
+            let mut last_cluster = current_cluster;
+            while write_size < remaining {
+                let next = match self
+                    .fs
+                    .cluster_iter_with(&mut *disk, last_cluster)
+                    .next()
+                    .await
+                {
+                    Some(cluster) => cluster?,
+                    None => return Err(Error::CorruptedFileSystem),
+                };
+                if next != last_cluster + 1 {
+                    break;
+                }
+                last_cluster = next;
+                write_size += (remaining - write_size).min(cluster_size as usize);
+            }
+            let current = remaining_buffer.take().ok_or(Error::InvalidInput)?;
+            let (piece, tail) = if write_size == current.len() {
+                (current, None)
+            } else {
+                let (piece, tail) = current
+                    .split_at(write_size)
+                    .map_err(|_| Error::InvalidInput)?;
+                (piece, Some(tail))
+            };
+            let physical =
+                self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+            disk.seek(SeekFrom::Start(physical))?;
+            let written = disk.write_iobuffer(piece, kind).await?;
+            if written > write_size {
+                return Err(Error::InvalidInput);
+            }
+            if written == 0 {
+                break;
+            }
+            let advance = ((u64::from(offset_in_cluster) + written as u64 - 1)
+                / u64::from(cluster_size)) as u32;
+            self.offset += written as u32;
+            self.current_cluster = Some(current_cluster + advance);
+            self.update_dir_entry_after_write();
+            total_written += written;
+            if written != write_size {
+                break;
+            }
+            remaining_buffer = tail;
+        }
+        Ok(total_written)
     }
 
     /// Writes opaque file payload from an owned I/O buffer.

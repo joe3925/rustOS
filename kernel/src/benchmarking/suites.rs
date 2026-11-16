@@ -336,6 +336,9 @@ extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatu
         let mode_count = modes.len();
         modes.rotate_left(repetition.saturating_sub(1) as usize % mode_count);
         for (case_name, bytes_per_pass, total_bytes) in modes {
+            if option_env!("RUSTOS_BENCH_C_DRIVE_CASE").is_some_and(|selected| selected != case_name) {
+                continue;
+            }
             if !bench_case_start(handle, case_name.to_string()) {
                 return BenchSuiteStatus::Failed;
             }

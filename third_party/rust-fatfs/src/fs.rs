@@ -595,7 +595,7 @@ impl<IO: Read + Write + Seek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<
         Ok(())
     }
 
-    pub(crate) async fn set_dirty_flag(&self, dirty: bool) -> Result<(), IO::Error> {
+    pub async fn set_dirty_flag(&self, dirty: bool) -> Result<(), IO::Error> {
         // Do not overwrite flags read from BPB on mount
         let mut flags = self.bpb.status_flags();
         flags.dirty |= dirty;

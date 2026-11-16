@@ -17,10 +17,20 @@ pub(super) enum FlushFilter {
 
 impl FlushFilter {
     pub(super) fn matches(&self, _lba: u64, page: &CachePage) -> bool {
+        self.mask(page) != 0
+    }
+
+    pub(super) fn mask(&self, page: &CachePage) -> u64 {
         match self {
-            FlushFilter::All => true,
+            FlushFilter::All => page.dirty_mask.load(Ordering::Acquire),
             FlushFilter::Owner(owner) => {
-                *owner != 0 && page.owner.load(Ordering::Acquire) == *owner
+                let dirty = page.dirty_lock.lock();
+                dirty
+                    .owners
+                    .iter()
+                    .chain(dirty.extra_owners.iter())
+                    .filter(|(id, _)| id == owner)
+                    .fold(0, |mask, (_, bits)| mask | bits)
             }
         }
     }
@@ -33,7 +43,6 @@ pub(super) struct PreparedFlushExtent {
     pub(super) granule_start: usize,
     pub(super) granule_count: usize,
     pub(super) bits: u64,
-    pub(super) wb_generation: u64,
 }
 
 pub(super) struct PreparedRun {
@@ -42,6 +51,7 @@ pub(super) struct PreparedRun {
 }
 
 pub(super) struct FlushScratch {
+    pub(super) targets: Vec<(Arc<CachePage>, u64, u64)>,
     pub(super) keys: Vec<u64>,
     pub(super) prepared: Vec<PreparedFlushExtent>,
     pub(super) runs: Vec<PreparedRun>,
@@ -51,6 +61,8 @@ pub(super) struct FlushScratch {
 
 impl FlushScratch {
     pub(super) fn new(capacity_blocks: usize, prepared_capacity: usize) -> Result<Self, ()> {
+        let mut targets = Vec::new();
+        targets.try_reserve_exact(capacity_blocks).map_err(|_| ())?;
         let mut keys = Vec::new();
         let mut prepared = Vec::new();
         let mut runs = Vec::new();
@@ -67,12 +79,31 @@ impl FlushScratch {
             .map_err(|_| ())?;
 
         Ok(Self {
+            targets,
             keys,
             prepared,
             runs,
             extents,
             writes: Some(Box::new(core::array::from_fn(|_| None))),
         })
+    }
+}
+
+pub(super) struct FlushSnapshotLease<'a> {
+    pub(super) scratch: &'a Mutex<FlushScratch>,
+    pub(super) targets: Vec<(Arc<CachePage>, u64, u64)>,
+    pub(super) notifier: &'a super::notify::WritebackNotifier,
+}
+
+impl Drop for FlushSnapshotLease<'_> {
+    fn drop(&mut self) {
+        self.targets.clear();
+        let mut scratch = self.scratch.lock();
+        if scratch.targets.capacity() < self.targets.capacity() {
+            scratch.targets = core::mem::take(&mut self.targets);
+        }
+        drop(scratch);
+        self.notifier.notify_all();
     }
 }
 
