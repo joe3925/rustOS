@@ -4,42 +4,10 @@ pub mod atomic {
         AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering, fence,
     };
 
-    pub struct AtomicU128(loom::sync::Mutex<u128>);
-
-    impl AtomicU128 {
-        pub fn new(value: u128) -> Self {
-            Self(loom::sync::Mutex::new(value))
-        }
-
-        pub fn load(&self, _order: Ordering) -> u128 {
-            *self.0.lock().expect("loom atomic mutex poisoned")
-        }
-
-        pub fn compare_exchange(
-            &self,
-            current: u128,
-            new: u128,
-            _success: Ordering,
-            _failure: Ordering,
-        ) -> Result<u128, u128> {
-            let mut value = self.0.lock().expect("loom atomic mutex poisoned");
-            if *value == current {
-                *value = new;
-                Ok(current)
-            } else {
-                Err(*value)
-            }
-        }
-    }
 }
 
 #[cfg(not(any(loom, feature = "loom")))]
 pub mod atomic {
-    #[cfg(target_has_atomic = "128")]
-    pub use core::sync::atomic::AtomicU128;
-    #[cfg(not(target_has_atomic = "128"))]
-    pub use portable_atomic::AtomicU128;
-
     pub use core::sync::atomic::{
         AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering, fence,
     };

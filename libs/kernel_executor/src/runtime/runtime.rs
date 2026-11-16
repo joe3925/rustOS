@@ -1,3 +1,4 @@
+use crate::thread_state::BlockOnThreadState;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -5,14 +6,14 @@ use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
-use crate::thread_state::BlockOnThreadState;
+pub use kernel_sync::completion::TaskOutcome;
+use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskToken};
 
 pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
 use crate::future_allocation::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
-use crate::platform::{Job, platform};
+use crate::platform::{self, Job};
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
@@ -23,24 +24,24 @@ pub(crate) fn submit_global_to_executor_domain(domain_id: ExecutorDomainId, ctx:
 }
 
 pub(crate) fn submit_blocking(trampoline: extern "C" fn(usize), ctx: usize) {
-    platform().submit_blocking(Job {
+    platform::submit_blocking(Job {
         f: trampoline,
         a: ctx,
     });
 }
 
 pub(crate) fn submit_blocking_many(jobs: &[Job]) {
-    platform().submit_blocking_many(jobs);
+    platform::submit_blocking_many(jobs);
 }
 
 pub fn yield_now() {
     let _suspend = crate::platform::ExecutorSuspendGuard::enter();
-    platform().yield_now();
+    platform::yield_now();
 }
 
 pub extern "C" fn try_steal_blocking_one() -> bool {
     let _suspend = crate::platform::ExecutorSuspendGuard::enter();
-    platform().try_steal_blocking_one()
+    platform::try_steal_blocking_one()
 }
 
 struct BlockOnWakeState {
@@ -198,7 +199,7 @@ where
 }
 
 pub struct JoinStorage<T> {
-    output: UnsafeCell<MaybeUninit<T>>,
+    output: UnsafeCell<MaybeUninit<TaskOutcome<T>>>,
     _pin: core::marker::PhantomPinned,
 }
 
@@ -210,13 +211,13 @@ impl<T> JoinStorage<T> {
         }
     }
 
-    pub(crate) unsafe fn write(&self, output: T) {
+    pub(crate) unsafe fn write(&self, output: TaskOutcome<T>) {
         unsafe {
             (*self.output.get()).write(output);
         }
     }
 
-    unsafe fn take(&self) -> T {
+    unsafe fn take(&self) -> TaskOutcome<T> {
         unsafe { (*self.output.get()).assume_init_read() }
     }
 
@@ -242,12 +243,13 @@ where
     )
 }
 
-fn reserve_future<F>(future: F) -> (FutureAllocation, &'static TaskTable, SlotHandle) {
-    let allocation = FutureAllocation::allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-        .expect("future heap allocation failed");
+fn reserve_future<F>(future: F, refs: u32) -> (FutureAllocation, &'static TaskTable, SlotHandle) {
+    let allocation =
+        FutureAllocation::allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
+            .expect("future heap allocation failed");
     unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
     let slab = get_task_table();
-    let slot_handle = match slab.allocate() {
+    let slot_handle = match slab.allocate_with_refs(refs) {
         Some(handle) => handle,
         None => unsafe {
             release_unpublished_future::<F>(allocation);
@@ -270,35 +272,44 @@ where
         !crate::platform::in_interrupt_context(),
         "attempted to spawn a task from interrupt context"
     );
+    let storage_ptr = unsafe { storage.get_unchecked_mut() as *mut JoinStorage<T> };
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
-            let (allocation, slab, slot_handle) = reserve_future(future);
+            if domain.state() != crate::domain::ExecutorDomainState::Active {
+                return None;
+            }
+            let (allocation, slab, slot_handle) = reserve_future(future, 3);
 
             let (shard_idx, local_idx, generation) = slot_handle.indices();
 
             let slot = slab
                 .get_slot(shard_idx, local_idx, generation)
                 .expect("reserved task slot disappeared before initialization");
-            let storage_ptr = unsafe { storage.get_unchecked_mut() as *mut JoinStorage<T> };
             unsafe { slot.init_joinable::<F, T>(domain_id, allocation, storage_ptr) };
-            domain.retain_task();
-
-            slab.increment_ref(shard_idx, local_idx, generation);
-            slab.increment_ref(shard_idx, local_idx, generation);
 
             let encoded = slot_handle.encoded_ptr();
             submit_global_to_executor_domain(domain_id, encoded);
 
-            JoinHandle {
+            Some(JoinHandle {
                 shard_idx: shard_idx as u8,
                 local_idx: local_idx as u32,
                 generation,
                 consumed: false,
+                registered: true,
                 storage: storage_ptr,
                 _marker: PhantomData,
-            }
+            })
         })
-        .expect("invalid executor domain")
+        .flatten()
+        .unwrap_or(JoinHandle {
+            shard_idx: 0,
+            local_idx: 0,
+            generation: 0,
+            consumed: false,
+            registered: false,
+            storage: storage_ptr,
+            _marker: PhantomData,
+        })
 }
 
 pub struct JoinHandle<'a, T: Send + 'static> {
@@ -306,6 +317,7 @@ pub struct JoinHandle<'a, T: Send + 'static> {
     local_idx: u32,
     generation: u32,
     consumed: bool,
+    registered: bool,
     storage: *mut JoinStorage<T>,
     _marker: PhantomData<&'a mut JoinStorage<T>>,
 }
@@ -313,13 +325,17 @@ pub struct JoinHandle<'a, T: Send + 'static> {
 unsafe impl<T: Send + 'static> Send for JoinHandle<'_, T> {}
 
 impl<T: Send + 'static> Future for JoinHandle<'_, T> {
-    type Output = T;
+    type Output = TaskOutcome<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.consumed {
             panic!("JoinHandle polled after completion");
+        }
+        if !this.registered {
+            this.consumed = true;
+            return Poll::Ready(TaskOutcome::Cancelled);
         }
 
         let slab = get_task_table();
@@ -366,7 +382,7 @@ impl<T: Send + 'static> Future for JoinHandle<'_, T> {
 
 impl<T: Send + 'static> Drop for JoinHandle<'_, T> {
     fn drop(&mut self) {
-        if !self.consumed {
+        if self.registered && !self.consumed {
             let slab = get_task_table();
             if let Some(slot) = slab.get_slot(
                 self.shard_idx as usize,
@@ -414,9 +430,9 @@ pub struct OwnedJoinHandle<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> Future for OwnedJoinHandle<T> {
-    type Output = T;
+    type Output = TaskOutcome<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         unsafe { Pin::new_unchecked(&mut this.handle) }.poll(cx)
     }
@@ -470,21 +486,21 @@ where
     );
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
-            let (allocation, slab, slot_handle) = reserve_future(future);
+            if domain.state() != crate::domain::ExecutorDomainState::Active {
+                return;
+            }
+            let (allocation, slab, slot_handle) = reserve_future(future, 2);
             let (shard_idx, local_idx, generation) = slot_handle.indices();
 
             let slot = slab
                 .get_slot(shard_idx, local_idx, generation)
                 .expect("reserved task slot disappeared before initialization");
             unsafe { slot.init_detached::<F>(domain_id, allocation) };
-            domain.retain_task();
-
-            slab.increment_ref(shard_idx, local_idx, generation);
 
             let encoded = slot_handle.encoded_ptr();
             submit_global_to_executor_domain(domain_id, encoded);
         })
-        .expect("invalid executor domain")
+        .unwrap_or(())
 }
 
 unsafe fn release_unpublished_future<F>(allocation: FutureAllocation) {
@@ -621,6 +637,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnToPortError {
     InvalidDomain,
+    DomainClosing,
     InterruptContext,
     FutureAllocationFailed,
     TaskAllocationFailed,
@@ -642,6 +659,9 @@ where
     }
     GlobalAsyncExecutor::global()
         .with_executor_domain(domain_id, |domain| {
+            if domain.state() != crate::domain::ExecutorDomainState::Active {
+                return Err(SpawnToPortError::DomainClosing);
+            }
             let allocation = FutureAllocation::allocate(
                 core::mem::size_of::<PortFuture<F, P, T>>(),
                 core::mem::align_of::<PortFuture<F, P, T>>(),
@@ -675,8 +695,7 @@ where
             let slot = slab
                 .get_slot(shard, local, generation)
                 .expect("reserved task slot disappeared");
-            unsafe { slot.init_abortable::<PortFuture<F, P, T>>(domain_id, allocation) };
-            domain.retain_task();
+            unsafe { slot.init_detached::<PortFuture<F, P, T>>(domain_id, allocation) };
             slab.increment_ref(shard, local, generation);
             submit_global_to_executor_domain(domain_id, handle.encoded_ptr());
             Ok(token)

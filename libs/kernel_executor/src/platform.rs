@@ -1,8 +1,7 @@
-use crate::domain::ExecutorDomain;
+use crate::domain::{BatchSlot, ExecutorDomain};
 use crate::global_async::WorkerShared;
 use crate::growable_slab::SlabHandle;
 use core::cell::{Cell, RefCell};
-use spin::Once;
 
 pub type JobFn = extern "C" fn(usize);
 
@@ -37,6 +36,7 @@ impl SlabCache {
 pub(crate) struct ExecutorThreadLocal {
     pub current: Cell<Option<CurrentExecutorContext>>,
     pub worker: Cell<*const WorkerShared>,
+    pub batch: Cell<*const BatchSlot>,
     pub active_domain: Cell<*const ExecutorDomain>,
     pub ready_cursor: Cell<usize>,
     pub allocation_cursor: Cell<usize>,
@@ -48,6 +48,7 @@ impl ExecutorThreadLocal {
         Self {
             current: Cell::new(None),
             worker: Cell::new(core::ptr::null()),
+            batch: Cell::new(core::ptr::null()),
             active_domain: Cell::new(core::ptr::null()),
             ready_cursor: Cell::new(0),
             allocation_cursor: Cell::new(0),
@@ -78,24 +79,15 @@ pub(crate) fn with_executor_local<R>(f: impl FnOnce(&ExecutorThreadLocal) -> R) 
 
 pub(crate) struct ExecutorBatchGuard {
     pub previous_domain: *const ExecutorDomain,
-    pub previous_caches: Option<[SlabCache; 1]>,
+    pub previous_batch: *const BatchSlot,
 }
 
 impl Drop for ExecutorBatchGuard {
     fn drop(&mut self) {
-        crate::global_async::GlobalAsyncExecutor::global().flush_local_task();
+        crate::global_async::GlobalAsyncExecutor::global().release_local_batch::<false>(false);
         with_executor_local(|tls| {
-            let mut caches = tls.caches.borrow_mut();
-            for cache in &mut *caches {
-                if let Some(flush) = cache.flush.take() {
-                    unsafe { flush(cache.owner, &mut cache.handles) };
-                    cache.owner = core::ptr::null();
-                }
-            }
-            if let Some(previous) = self.previous_caches.take() {
-                *caches = previous;
-            }
             tls.active_domain.set(self.previous_domain);
+            tls.batch.set(self.previous_batch);
         });
     }
 }
@@ -107,7 +99,7 @@ pub(crate) struct ExecutorSuspendGuard {
 
 impl ExecutorSuspendGuard {
     pub(crate) fn enter() -> Self {
-        crate::global_async::GlobalAsyncExecutor::global().flush_local_task();
+        crate::global_async::GlobalAsyncExecutor::global().release_local_batch::<true>(true);
         with_executor_local(|tls| Self {
             worker: tls.worker.replace(core::ptr::null()),
             domain: tls.active_domain.replace(core::ptr::null()),
@@ -124,39 +116,30 @@ impl Drop for ExecutorSuspendGuard {
     }
 }
 
-pub trait ExecutorPlatform: Send + Sync {
-    fn init_runtime(&self, max_threads: usize, max_jobs: usize);
-    fn init_blocking(&self, max_threads: usize);
-    fn submit_runtime(&self, job: Job) -> bool;
-    fn submit_blocking(&self, job: Job);
-    fn submit_blocking_many(&self, jobs: &[Job]);
-    fn try_steal_blocking_one(&self) -> bool;
-    fn yield_now(&self);
-    fn print(&self, string: &str);
+unsafe extern "Rust" {
+    #[link_name = "__kernel_executor_platform_init_runtime"]
+    pub safe fn init_runtime(max_threads: usize, max_jobs: usize);
+    #[link_name = "__kernel_executor_platform_init_blocking"]
+    pub safe fn init_blocking(max_threads: usize);
+    #[link_name = "__kernel_executor_platform_submit_runtime"]
+    pub safe fn submit_runtime(job: Job) -> bool;
+    #[link_name = "__kernel_executor_platform_submit_blocking"]
+    pub safe fn submit_blocking(job: Job);
+    #[link_name = "__kernel_executor_platform_submit_blocking_many"]
+    pub safe fn submit_blocking_many(jobs: &[Job]);
+    #[link_name = "__kernel_executor_platform_try_steal_blocking_one"]
+    pub safe fn try_steal_blocking_one() -> bool;
+    #[link_name = "__kernel_executor_platform_yield_now"]
+    pub safe fn yield_now();
+    #[link_name = "__kernel_executor_platform_print"]
+    pub safe fn print(string: &str);
+    #[link_name = "__kernel_executor_platform_in_interrupt_context"]
     #[cfg_attr(irq_check, irq::context)]
-    fn in_interrupt_context(&self) -> bool;
-}
-pub static PLATFORM: Once<&'static dyn ExecutorPlatform> = Once::new();
-
-pub fn init(platform: &'static dyn ExecutorPlatform) {
-    PLATFORM.call_once(|| platform);
-}
-
-pub fn platform() -> &'static dyn ExecutorPlatform {
-    PLATFORM
-        .get()
-        .copied()
-        .expect("executor platform not initialized")
+    pub safe fn in_interrupt_context() -> bool;
 }
 
 pub fn current_executor_context() -> Option<CurrentExecutorContext> {
     with_executor_local(|tls| tls.current.get())
-}
-
-pub fn in_interrupt_context() -> bool {
-    PLATFORM
-        .get()
-        .is_some_and(|platform| platform.in_interrupt_context())
 }
 
 pub struct CurrentExecutorContextGuard {

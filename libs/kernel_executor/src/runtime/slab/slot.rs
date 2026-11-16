@@ -5,11 +5,12 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use crate::future_allocation::FutureAllocation;
-use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
+use crate::global_async::ExecutorDomainId;
 use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
 use crate::runtime::runtime::submit_global_to_executor_domain;
-use crate::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
+use kernel_sync::completion::TaskOutcome;
 
 use super::super::runtime::JoinStorage;
 use super::super::task::{
@@ -17,16 +18,17 @@ use super::super::task::{
 };
 use super::ptr::encode_slab_task_ptr;
 use super::storage::drop_inline;
-use super::task_slab::get_task_table;
-
-const CW_NONE: u8 = 0;
-const CW_UPDATING: u8 = 1;
-const CW_SET: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WakeAction {
     Enqueue,
     Represented,
+    Completed,
+}
+
+pub enum PollResult {
+    Pending,
+    Requeued,
     Completed,
 }
 
@@ -71,21 +73,18 @@ fn write_drop_fn(c: &UnsafeCell<Option<TaskDropFn>>, v: Option<TaskDropFn>) {
 #[repr(C, align(64))]
 pub struct TaskSlot {
     pub(super) gen_ref: AtomicU32,
-    pub(super) state: AtomicU8,
+    pub(crate) state: AtomicU8,
     pub(super) control: AtomicU8,
     pub(super) waker_state: AtomicU8,
-    pub(super) cached_waker_state: AtomicU8,
-    pub(super) _pad: u8,
     pub(crate) ready_next: AtomicUsize,
     pub(super) retired_next: AtomicUsize,
-    pub(super) domain_id: UnsafeCell<Option<ExecutorDomainId>>,
+    pub(crate) domain_id: AtomicU64,
     pub(super) future: UnsafeCell<Option<FutureAllocation>>,
     pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
     pub(super) drop_fn: UnsafeCell<Option<TaskDropFn>>,
     pub(super) cancel_fn: UnsafeCell<Option<TaskCancelFn>>,
     pub(crate) result_ptr: AtomicUsize,
     pub(super) join_waker: UnsafeCell<MaybeUninit<Waker>>,
-    pub(super) cached_waker: UnsafeCell<MaybeUninit<Waker>>,
 }
 
 unsafe impl Sync for TaskSlot {}
@@ -97,18 +96,15 @@ impl TaskSlot {
             state: AtomicU8::new(STATE_IDLE),
             control: AtomicU8::new(0),
             waker_state: AtomicU8::new(WAKER_NONE),
-            cached_waker_state: AtomicU8::new(CW_NONE),
-            _pad: 0,
             ready_next: AtomicUsize::new(0),
             retired_next: AtomicUsize::new(0),
-            domain_id: UnsafeCell::new(None),
+            domain_id: AtomicU64::new(0),
             future: UnsafeCell::new(None),
             poll_fn: UnsafeCell::new(None),
             drop_fn: UnsafeCell::new(None),
             cancel_fn: UnsafeCell::new(None),
             result_ptr: AtomicUsize::new(RESULT_ABANDONED),
             join_waker: UnsafeCell::new(MaybeUninit::uninit()),
-            cached_waker: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -117,7 +113,6 @@ impl TaskSlot {
         self.state.store(STATE_IDLE, Ordering::Relaxed);
         self.control.store(0, Ordering::Relaxed);
         self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
-        self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
         self.ready_next.store(0, Ordering::Relaxed);
         self.retired_next.store(0, Ordering::Relaxed);
         write_poll_fn(&self.poll_fn, None);
@@ -125,9 +120,9 @@ impl TaskSlot {
         unsafe { *self.cancel_fn.get() = None };
         self.result_ptr.store(RESULT_ABANDONED, Ordering::Relaxed);
         unsafe {
-            *self.domain_id.get() = None;
             *self.future.get() = None;
         }
+        self.domain_id.store(0, Ordering::Release);
     }
 
     #[inline]
@@ -144,15 +139,6 @@ impl TaskSlot {
         write_drop_fn(&self.drop_fn, None);
         unsafe { *self.cancel_fn.get() = None };
 
-        let cws = self.cached_waker_state.load(Ordering::Acquire);
-        if cws == CW_SET {
-            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
-            unsafe {
-                core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
-            }
-        }
-        self.cached_waker_state.store(CW_NONE, Ordering::Release);
-
         let ws = self.waker_state.load(Ordering::Acquire);
         if ws == WAKER_SET {
             #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
@@ -166,11 +152,7 @@ impl TaskSlot {
         self.result_ptr.store(RESULT_ABANDONED, Ordering::Release);
         self.state.store(STATE_IDLE, Ordering::Release);
         self.ready_next.store(0, Ordering::Relaxed);
-        if let Some(domain_id) = unsafe { (&mut *self.domain_id.get()).take() } {
-            GlobalAsyncExecutor::global().with_executor_domain(domain_id, |domain| {
-                domain.release_task();
-            });
-        }
+        self.domain_id.store(0, Ordering::Release);
     }
 
     pub unsafe fn init_joinable<F, T>(
@@ -181,22 +163,27 @@ impl TaskSlot {
     ) where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
-    { unsafe {
-        self.result_ptr
-            .store(result_ptr as usize, Ordering::Release);
-        self.init_internal::<F, T>(domain_id, allocation, poll_joinable::<F, T>);
-    }}
+    {
+        unsafe {
+            self.result_ptr
+                .store(result_ptr as usize, Ordering::Release);
+            self.init_internal::<F, T>(domain_id, allocation, poll_joinable::<F, T>);
+        }
+    }
 
     pub fn executor_domain_id(&self) -> Option<ExecutorDomainId> {
-        unsafe { *self.domain_id.get() }
+        let raw = self.domain_id.load(Ordering::Acquire);
+        (raw != 0).then_some(ExecutorDomainId::from_raw(raw))
     }
 
     pub unsafe fn init_detached<F>(&self, domain_id: ExecutorDomainId, allocation: FutureAllocation)
     where
         F: Future<Output = ()> + Send + 'static,
-    { unsafe {
-        self.init_internal::<F, ()>(domain_id, allocation, poll_detached::<F>);
-    }}
+    {
+        unsafe {
+            self.init_internal::<F, ()>(domain_id, allocation, poll_detached::<F>);
+        }
+    }
 
     unsafe fn init_internal<F, T>(
         &self,
@@ -206,17 +193,19 @@ impl TaskSlot {
     ) where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
-    { unsafe {
-        *self.domain_id.get() = Some(domain_id);
-        *self.future.get() = Some(allocation);
-        write_poll_fn(&self.poll_fn, Some(poll_fn));
-        write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
+    {
+        unsafe {
+            *self.future.get() = Some(allocation);
+            write_poll_fn(&self.poll_fn, Some(poll_fn));
+            write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
+            *self.cancel_fn.get() = Some(cancel_future::<F, T>);
 
-        self.waker_state.store(WAKER_NONE, Ordering::Release);
-        self.cached_waker_state.store(CW_NONE, Ordering::Release);
+            self.waker_state.store(WAKER_NONE, Ordering::Release);
 
-        self.state.store(STATE_QUEUED, Ordering::Release);
-    }}
+            self.state.store(STATE_QUEUED, Ordering::Release);
+            self.domain_id.store(domain_id.raw(), Ordering::Release);
+        }
+    }
 
     pub fn poll_once(
         &self,
@@ -224,7 +213,7 @@ impl TaskSlot {
         shard_idx: usize,
         local_idx: usize,
         generation: u32,
-    ) -> bool {
+    ) -> PollResult {
         let prev = self.state.compare_exchange(
             STATE_QUEUED,
             STATE_POLLING,
@@ -233,53 +222,52 @@ impl TaskSlot {
         );
 
         if prev.is_err() {
-            return false;
+            return PollResult::Pending;
         }
 
         let mut cx = Context::from_waker(waker);
 
         let Some(poll_fn) = read_poll_fn(&self.poll_fn) else {
             self.state.store(STATE_COMPLETED, Ordering::Release);
-            return true;
+            return PollResult::Completed;
         };
 
-        let domain_id =
-            unsafe { *self.domain_id.get() }.expect("task domain missing while polling");
+        let domain_id = self
+            .executor_domain_id()
+            .expect("task domain missing while polling");
         let _context_guard = CurrentExecutorContextGuard::enter(CurrentExecutorContext {
             task_id: encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
             domain_id: domain_id.raw(),
         });
         if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
-            if let Some(cancel) = unsafe { *self.cancel_fn.get() } {
-                unsafe {
-                    cancel(
-                        self,
-                        encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
-                    )
-                };
-                self.state.store(STATE_COMPLETED, Ordering::Release);
-                return true;
+            unsafe {
+                self.cancel_owned(encode_slab_task_ptr(
+                    shard_idx as u8,
+                    local_idx as u32,
+                    generation,
+                ));
             }
+            return PollResult::Completed;
         }
         let is_ready = unsafe { poll_fn(self, &mut cx) };
 
         if is_ready {
             write_poll_fn(&self.poll_fn, None);
             self.state.store(STATE_COMPLETED, Ordering::Release);
-            self.wake_join_handle();
-            true
+            if self.result_ptr.load(Ordering::Acquire) != RESULT_ABANDONED {
+                self.wake_join_handle();
+            }
+            PollResult::Completed
         } else {
             if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
-                if let Some(cancel) = unsafe { *self.cancel_fn.get() } {
-                    unsafe {
-                        cancel(
-                            self,
-                            encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
-                        )
-                    };
-                    self.state.store(STATE_COMPLETED, Ordering::Release);
-                    return true;
+                unsafe {
+                    self.cancel_owned(encode_slab_task_ptr(
+                        shard_idx as u8,
+                        local_idx as u32,
+                        generation,
+                    ));
                 }
+                return PollResult::Completed;
             }
             let prev = self.state.compare_exchange(
                 STATE_POLLING,
@@ -289,25 +277,29 @@ impl TaskSlot {
             );
             if let Err(STATE_NOTIFIED) = prev {
                 self.state.store(STATE_QUEUED, Ordering::Release);
-                let slab = get_task_table();
-                slab.increment_ref(shard_idx, local_idx, generation);
                 let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
                 submit_global_to_executor_domain(domain_id, encoded);
+                return PollResult::Requeued;
             }
-            false
+            PollResult::Pending
         }
     }
 
-    pub unsafe fn init_abortable<F>(
-        &self,
-        domain_id: ExecutorDomainId,
-        allocation: FutureAllocation,
-    ) where
-        F: Future<Output = ()> + Send + 'static,
-    { unsafe {
-        self.init_detached::<F>(domain_id, allocation);
-        *self.cancel_fn.get() = Some(cancel_future::<F>);
-    }}
+    pub(crate) unsafe fn cancel_owned(&self, token: usize) {
+        let _context = self.executor_domain_id().map(|domain_id| {
+            CurrentExecutorContextGuard::enter(CurrentExecutorContext {
+                task_id: token,
+                domain_id: domain_id.raw(),
+            })
+        });
+        if let Some(cancel) = unsafe { *self.cancel_fn.get() } {
+            unsafe {
+                cancel(self, token);
+            }
+        }
+        self.state.store(STATE_COMPLETED, Ordering::Release);
+        self.wake_join_handle();
+    }
 
     pub fn request_abort(&self) -> bool {
         if self.state.load(Ordering::Acquire) == STATE_COMPLETED {
@@ -435,33 +427,6 @@ impl TaskSlot {
         }
     }
 
-    pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        loop {
-            let s = self.cached_waker_state.load(Ordering::Acquire);
-            if s == CW_SET {
-                return unsafe { (*self.cached_waker.get()).assume_init_ref().clone() };
-            }
-            if s == CW_UPDATING {
-                spin_loop();
-                continue;
-            }
-            if self
-                .cached_waker_state
-                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-
-            let w = super::super::waker::create_slab_task_waker(shard_idx, local_idx, generation);
-            unsafe {
-                (*self.cached_waker.get()).write(w.clone());
-            }
-            self.cached_waker_state.store(CW_SET, Ordering::Release);
-            return w;
-        }
-    }
-
     #[inline]
     pub fn is_completed(&self) -> bool {
         self.state.load(Ordering::Acquire) == STATE_COMPLETED
@@ -508,12 +473,13 @@ unsafe fn poll_joinable<F, T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
     F: Future<Output = T>,
     T: Send + 'static,
-{ unsafe {
-    let allocation = (&mut *slot.future.get())
-        .as_mut()
-        .expect("task future allocation missing");
-    let future = &mut *(allocation.ptr.as_ptr() as *mut F);
-    let poll_res = Pin::new_unchecked(&mut *future).poll(cx);
+{
+    unsafe {
+        let allocation = (&mut *slot.future.get())
+            .as_mut()
+            .expect("task future allocation missing");
+        let future = &mut *(allocation.ptr.as_ptr() as *mut F);
+        let poll_res = Pin::new_unchecked(&mut *future).poll(cx);
 
         match poll_res {
             Poll::Ready(result) => {
@@ -536,7 +502,7 @@ where
                         .compare_exchange(ptr, RESULT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        (*(ptr as *mut JoinStorage<T>)).write(result);
+                        (*(ptr as *mut JoinStorage<T>)).write(TaskOutcome::Completed(result));
                         break;
                     }
                 }
@@ -570,7 +536,7 @@ where
     }
 }
 
-unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) {
+unsafe fn cancel_future<F, T>(slot: &TaskSlot, _token: usize) {
     unsafe {
         if let Some(allocation) = (&mut *slot.future.get()).take() {
             core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
@@ -579,5 +545,20 @@ unsafe fn cancel_future<F>(slot: &TaskSlot, _token: usize) {
         write_poll_fn(&slot.poll_fn, None);
         write_drop_fn(&slot.drop_fn, None);
         *slot.cancel_fn.get() = None;
+        loop {
+            let ptr = slot.result_ptr.load(Ordering::Acquire);
+            if ptr == RESULT_ABANDONED {
+                break;
+            }
+            assert_ne!(ptr, RESULT_CLAIMED);
+            if slot
+                .result_ptr
+                .compare_exchange(ptr, RESULT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                (*(ptr as *mut JoinStorage<T>)).write(TaskOutcome::Cancelled);
+                break;
+            }
+        }
     }
 }

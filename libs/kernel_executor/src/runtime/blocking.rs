@@ -6,21 +6,27 @@ use core::pin::Pin;
 use core::ptr;
 use core::task::{Context, Poll, Waker};
 
-use crate::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 
+use crate::domain::{ExecutorDomainId, ExecutorDomainState};
+use crate::global_async::GlobalAsyncExecutor;
 use crate::platform::Job;
 use crate::runtime::runtime::{submit_blocking, submit_blocking_many};
+use kernel_sync::completion::TaskOutcome;
 
 const STATE_PENDING: u8 = 0;
 const STATE_COMPLETE: u8 = 1;
 const STATE_CONSUMED: u8 = 2;
 const STATE_RUNNING: u8 = 3;
+const STATE_CANCELLED: u8 = 4;
 
 pub struct SharedTaskHeader<R> {
     result: UnsafeCell<MaybeUninit<R>>,
     state: AtomicU8,
     waker: Mutex<Option<Waker>>,
+    domain_id: AtomicU64,
+    registry_index: AtomicUsize,
 }
 
 impl<R> SharedTaskHeader<R> {
@@ -29,6 +35,8 @@ impl<R> SharedTaskHeader<R> {
             result: UnsafeCell::new(MaybeUninit::uninit()),
             state: AtomicU8::new(STATE_PENDING),
             waker: Mutex::new(None),
+            domain_id: AtomicU64::new(0),
+            registry_index: AtomicUsize::new(0),
         }
     }
 
@@ -51,14 +59,18 @@ impl<R> SharedTaskHeader<R> {
             .is_ok()
     }
 
-    fn take_result(&self) -> Option<R> {
-        if self.state.load(Ordering::Acquire) != STATE_COMPLETE {
+    fn take_result(&self) -> Option<TaskOutcome<R>> {
+        let state = self.state.load(Ordering::Acquire);
+        if state != STATE_COMPLETE && state != STATE_CANCELLED {
             return None;
         }
 
         self.state.store(STATE_CONSUMED, Ordering::Release);
-        // SAFETY: state prevents double-read; result was written exactly once.
-        Some(unsafe { (*self.result.get()).assume_init_read() })
+        Some(if state == STATE_CANCELLED {
+            TaskOutcome::Cancelled
+        } else {
+            TaskOutcome::Completed(unsafe { (*self.result.get()).assume_init_read() })
+        })
     }
 
     fn register_waker(&self, waker: &Waker) {
@@ -101,6 +113,77 @@ unsafe impl<F: Send, R: Send> Send for SharedTask<F, R> {}
 unsafe impl<F: Send, R: Send> Sync for SharedTask<F, R> {}
 unsafe impl<R: Send> Send for SharedTaskHeader<R> {}
 unsafe impl<R: Send> Sync for SharedTaskHeader<R> {}
+
+struct BlockingEntry {
+    domain_id: ExecutorDomainId,
+    ptr: *const (),
+    cancel: unsafe fn(*const ()),
+}
+
+unsafe impl Send for BlockingEntry {}
+
+#[cfg(not(any(loom, feature = "loom")))]
+static BLOCKING_TASKS: Mutex<Vec<Option<BlockingEntry>>> = Mutex::new(Vec::new());
+
+#[cfg(any(loom, feature = "loom"))]
+loom::lazy_static! {
+    static ref BLOCKING_TASKS: Mutex<Vec<Option<BlockingEntry>>> = Mutex::new(Vec::new());
+}
+
+unsafe fn cancel_registered<F, R>(ptr: *const ()) {
+    let task = unsafe { Arc::from_raw(ptr.cast::<SharedTask<F, R>>()) };
+    if task.header.try_start_running() {
+        let raw = task.header.domain_id.load(Ordering::Acquire);
+        let _context = (raw != 0).then(|| {
+            crate::platform::CurrentExecutorContextGuard::enter(
+                crate::platform::CurrentExecutorContext {
+                    task_id: 0,
+                    domain_id: raw,
+                },
+            )
+        });
+        drop(unsafe { (*task.future.get()).take() });
+        task.header.state.store(STATE_CANCELLED, Ordering::Release);
+        if let Some(waker) = task.header.take_waker() {
+            waker.wake();
+        }
+    }
+}
+
+pub(crate) fn cancel_domain_jobs(
+    domain_id: ExecutorDomainId,
+    cursor: &mut [usize; 2],
+    mut remaining: usize,
+) -> bool {
+    if cursor[1] == usize::MAX {
+        cursor[1] = BLOCKING_TASKS.lock().len();
+    }
+    while cursor[0] < cursor[1] {
+        if remaining == 0 {
+            return false;
+        }
+        let entry = {
+            let mut entries = BLOCKING_TASKS.lock();
+            let entry = &mut entries[cursor[0]];
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.domain_id == domain_id)
+            {
+                entry.take()
+            } else {
+                None
+            }
+        };
+        cursor[0] += 1;
+        remaining -= 1;
+        if let Some(entry) = entry {
+            unsafe {
+                (entry.cancel)(entry.ptr);
+            }
+        }
+    }
+    true
+}
 
 #[cfg(miri)]
 #[derive(Clone, Copy)]
@@ -186,9 +269,9 @@ unsafe impl<R: Send + 'static> Send for BlockingJoin<R> {}
 unsafe impl<R: Send + 'static> Sync for BlockingJoin<R> {}
 
 impl<R: Send + 'static> Future for BlockingJoin<R> {
-    type Output = R;
+    type Output = TaskOutcome<R>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let header = unsafe { &*self.ptr };
         if let Some(res) = header.take_result() {
             return Poll::Ready(res);
@@ -227,23 +310,103 @@ where
 
     #[cfg(not(miri))]
     let task = unsafe { Arc::from_raw(ctx as *const SharedTask<F, R>) };
-    let header = &task.header;
-
-    // Ensure the blocking task runs at most once. If a steal path races a worker and
-    // re-enters with the same ctx, bail out instead of double-running and panicking.
-    if !header.try_start_running() {
-        return;
+    let raw = task.header.domain_id.load(Ordering::Acquire);
+    let run = || {
+        let header = &task.header;
+        if !header.try_start_running() {
+            return;
+        }
+        let registry = header.registry_index.swap(0, Ordering::AcqRel);
+        if registry != 0 {
+            let entry = BLOCKING_TASKS.lock()[registry - 1].take();
+            if let Some(entry) = entry {
+                unsafe {
+                    (entry.cancel)(entry.ptr);
+                }
+            }
+        }
+        let _context = (raw != 0).then(|| {
+            crate::platform::CurrentExecutorContextGuard::enter(
+                crate::platform::CurrentExecutorContext {
+                    task_id: 0,
+                    domain_id: raw,
+                },
+            )
+        });
+        let f = unsafe { (*task.future.get()).take() }.expect("blocking func missing");
+        header.store_result(f());
+        if let Some(waker) = header.take_waker() {
+            waker.wake();
+        }
+    };
+    if raw == 0 {
+        run();
+    } else {
+        GlobalAsyncExecutor::global().with_executor_domain(
+            ExecutorDomainId::from_raw(raw),
+            |domain| {
+                if domain.state() == ExecutorDomainState::Active {
+                    run();
+                }
+            },
+        );
     }
+}
 
-    // SAFETY: Only this worker thread accesses the function slot.
-    let f = unsafe { (*task.future.get()).take() }.expect("blocking func missing");
-    let result = f();
-
-    header.store_result(result);
-
-    if let Some(w) = header.take_waker() {
-        w.wake();
+fn prepare_blocking<F, R>(func: F) -> (BlockingJoin<R>, Option<Job>)
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let task = Arc::new(SharedTask::<F, R>::new(func));
+    let join_ptr = Arc::into_raw(task.clone()) as *const SharedTaskHeader<R>;
+    let raw = crate::platform::current_executor_context().map_or(0, |context| context.domain_id);
+    task.header.domain_id.store(raw, Ordering::Release);
+    let prepare = || {
+        if raw != 0 && ExecutorDomainId::from_raw(raw).slot() >= 4 {
+            let entry = BlockingEntry {
+                domain_id: ExecutorDomainId::from_raw(raw),
+                ptr: Arc::into_raw(task.clone()).cast(),
+                cancel: cancel_registered::<F, R>,
+            };
+            let mut entries = BLOCKING_TASKS.lock();
+            let index = entries
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or(entries.len());
+            if index == entries.len() {
+                entries.push(Some(entry));
+            } else {
+                entries[index] = Some(entry);
+            }
+            task.header
+                .registry_index
+                .store(index + 1, Ordering::Release);
+        }
+        #[cfg(miri)]
+        let ptr = register_blocking_task(task.clone());
+        #[cfg(not(miri))]
+        let ptr = Arc::into_raw(task.clone()) as usize;
+        Job {
+            f: blocking_trampoline::<F, R>,
+            a: ptr,
+        }
+    };
+    let job = if raw == 0 {
+        Some(prepare())
+    } else {
+        GlobalAsyncExecutor::global()
+            .with_executor_domain(ExecutorDomainId::from_raw(raw), |domain| {
+                (domain.state() == ExecutorDomainState::Active).then(prepare)
+            })
+            .flatten()
+    };
+    if job.is_none() {
+        unsafe {
+            cancel_registered::<F, R>(Arc::into_raw(task.clone()).cast());
+        }
     }
+    (BlockingJoin::new(join_ptr, drop_shared_task::<F, R>), job)
 }
 
 pub fn spawn_blocking<F, R>(func: F) -> BlockingJoin<R>
@@ -251,17 +414,11 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let task = Arc::new(SharedTask::<F, R>::new(func));
-    let join_ptr = Arc::into_raw(task.clone()) as *const SharedTaskHeader<R>;
-
-    #[cfg(miri)]
-    let ptr = register_blocking_task(task);
-
-    #[cfg(not(miri))]
-    let ptr = Arc::into_raw(task) as usize;
-
-    submit_blocking(blocking_trampoline::<F, R>, ptr);
-    BlockingJoin::new(join_ptr, drop_shared_task::<F, R>)
+    let (join, job) = prepare_blocking(func);
+    if let Some(job) = job {
+        submit_blocking(job.f, job.a);
+    }
+    join
 }
 
 pub fn spawn_blocking_many<F, R>(funcs: Vec<F>) -> Vec<BlockingJoin<R>>
@@ -278,20 +435,9 @@ where
     let mut jobs = Vec::with_capacity(count);
 
     for func in funcs {
-        let task = Arc::new(SharedTask::<F, R>::new(func));
-        let join_ptr = Arc::into_raw(task.clone()) as *const SharedTaskHeader<R>;
-
-        #[cfg(miri)]
-        let ptr = register_blocking_task(task);
-
-        #[cfg(not(miri))]
-        let ptr = Arc::into_raw(task) as usize;
-
-        jobs.push(Job {
-            f: blocking_trampoline::<F, R>,
-            a: ptr,
-        });
-        joins.push(BlockingJoin::new(join_ptr, drop_shared_task::<F, R>));
+        let (join, job) = prepare_blocking(func);
+        if let Some(job) = job { jobs.push(job); }
+        joins.push(join);
     }
 
     submit_blocking_many(&jobs);
@@ -316,7 +462,7 @@ mod tests {
         blocking_trampoline::<F, usize>(ctx2);
 
         let header = unsafe { &*header };
-        assert_eq!(header.take_result(), Some(321));
+        assert_eq!(header.take_result(), Some(TaskOutcome::Completed(321)));
     }
 
     // This test covers the blocking trampoline's reentry guard. If a worker and
@@ -421,7 +567,7 @@ mod loom_tests {
             runner_b.join().expect("runner B panicked");
 
             assert_eq!(runs.load(Ordering::Acquire), 1);
-            assert!(matches!(header.take_result(), Some(11 | 22)));
+            assert!(matches!(header.take_result(), Some(TaskOutcome::Completed(11 | 22))));
         });
     }
 
@@ -464,7 +610,7 @@ mod loom_tests {
 
             if returned_pending.load(Ordering::Acquire) {
                 assert_eq!(counter.wakes.load(Ordering::Acquire), 1);
-                assert_eq!(header.take_result(), Some(33));
+                assert_eq!(header.take_result(), Some(TaskOutcome::Completed(33)));
             }
         });
     }

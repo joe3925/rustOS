@@ -506,9 +506,15 @@ pub extern "C" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()> {
+pub extern "C" fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<bool> {
     let handle = kernel_spawn(fut);
-    handle.into_abi()
+    async move {
+        matches!(
+            handle.await,
+            kernel_sync::completion::TaskOutcome::Completed(())
+        )
+    }
+    .into_abi()
 }
 
 #[unsafe(no_mangle)]
@@ -524,11 +530,23 @@ pub extern "C" fn kernel_block_on_context() -> BlockOnContext {
     BlockOnContext { state, waker }
 }
 
+struct RawBlockingJob {
+    trampoline: extern "C" fn(usize, bool),
+    ctx: usize,
+}
+
+impl Drop for RawBlockingJob {
+    fn drop(&mut self) {
+        (self.trampoline)(self.ctx, false);
+    }
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize) {
-    // Wrap the raw trampoline in the kernel-side blocking executor
+pub extern "C" fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize, bool), ctx: usize) {
+    let job = RawBlockingJob { trampoline, ctx };
     kernel_spawn_blocking(move || {
-        (trampoline)(ctx);
+        let job = core::mem::ManuallyDrop::new(job);
+        (job.trampoline)(job.ctx, true);
     });
 }
 

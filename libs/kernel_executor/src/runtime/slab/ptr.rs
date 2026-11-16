@@ -1,5 +1,5 @@
 use super::super::runtime::submit_global_to_executor_domain;
-use super::slot::WakeAction;
+use super::slot::{PollResult, WakeAction};
 use super::task_slab::get_task_table;
 
 const PTR_SHARD_BITS: usize = 3;
@@ -45,15 +45,14 @@ fn poll_slab_task(ctx: usize) {
         return;
     };
 
-    let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
+    let waker = super::super::waker::create_slab_task_waker(shard_idx, local_idx, generation);
 
-    let completed = slot.poll_once(&waker, shard_idx, local_idx, generation);
-
-    slab.decrement_ref::<true>(shard_idx, local_idx, generation);
-
-    if completed {
-        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
-    }
+    let refs = match slot.poll_once(&waker, shard_idx, local_idx, generation) {
+        PollResult::Pending => 1,
+        PollResult::Completed => 2,
+        PollResult::Requeued => return,
+    };
+    slab.decrement_refs::<true>(shard_idx, local_idx, generation, refs);
 }
 
 #[inline(always)]
@@ -72,10 +71,11 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
     match slot.record_wake() {
         WakeAction::Enqueue => {
             let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
-            let domain_id = slot
-                .executor_domain_id()
-                .expect("queued slab task has no executor domain");
-            submit_global_to_executor_domain(domain_id, encoded);
+            if let Some(domain_id) = slot.executor_domain_id() {
+                submit_global_to_executor_domain(domain_id, encoded);
+            } else {
+                slab.decrement_ref::<false>(shard_idx, local_idx, generation);
+            }
         }
         WakeAction::Represented | WakeAction::Completed => {
             slab.decrement_ref::<false>(shard_idx, local_idx, generation);

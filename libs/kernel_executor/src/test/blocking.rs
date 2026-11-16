@@ -99,7 +99,7 @@ fn spawn_blocking_runs_job_and_join_consumes_result() {
     super::support::init_threaded_runtime();
 
     let join = spawn_blocking(|| 21usize * 2);
-    assert_eq!(block_on(join), 42);
+    assert_eq!(block_on(join).expect("blocking task cancelled"), 42);
 }
 
 // This test covers the wake contract for BlockingJoin directly. Once a blocking
@@ -139,7 +139,7 @@ fn blocking_join_pending_poll_wakes_registered_waiter_on_completion() {
     );
     assert!(matches!(
         poll_once(&mut join, &waiter.waker()),
-        Poll::Ready(123)
+        Poll::Ready(crate::runtime::runtime::TaskOutcome::Completed(123))
     ));
 }
 
@@ -190,7 +190,7 @@ fn blocking_join_completion_uses_latest_registered_waiter() {
     );
     assert!(matches!(
         poll_once(&mut join, &latest_waiter.waker()),
-        Poll::Ready(456)
+        Poll::Ready(crate::runtime::runtime::TaskOutcome::Completed(456))
     ));
 }
 
@@ -216,7 +216,7 @@ fn spawn_blocking_many_preserves_join_order_under_thread_pool_load() {
 
     assert_eq!(results.len(), count);
     for (i, value) in results.into_iter().enumerate() {
-        assert_eq!(value, i.wrapping_mul(3));
+        assert_eq!(value.expect("blocking task cancelled"), i.wrapping_mul(3));
     }
 }
 
@@ -245,7 +245,7 @@ fn runtime_tasks_can_await_blocking_work_under_load() {
                         std::thread::yield_now();
                         i + 1
                     });
-                    blocking.await * 2
+                    blocking.await.expect("blocking task cancelled") * 2
                 })
             })
             .collect();
@@ -254,7 +254,7 @@ fn runtime_tasks_can_await_blocking_work_under_load() {
 
     assert_eq!(results.len(), count);
     for (i, value) in results.into_iter().enumerate() {
-        assert_eq!(value, (i + 1) * 2);
+        assert_eq!(value.expect("runtime task cancelled"), (i + 1) * 2);
     }
 }
 

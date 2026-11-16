@@ -1,15 +1,16 @@
-use crate::platform::{ExecutorBatchGuard, Job, SlabCache, platform, with_executor_local};
+use crate::domain::{ACTIVE_UNIT, BATCH_EMPTY, BATCH_OWNED, BATCH_READY, RUN_PENDING};
+use crate::platform::{self, ExecutorBatchGuard, Job, SlabCache, with_executor_local};
 use crate::runtime::runtime::{drain_retired_block_on_states, has_retired_block_on_states};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use alloc::boxed::Box;
-use kernel_sync::queues::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
+use crossbeam_queue::ArrayQueue;
 use spin::Once;
 
 pub use crate::domain::{
     DRIVER_EXECUTOR_DOMAIN, DestroyExecutorDomainError, DestroyExecutorDomainResult,
     ExecutorDomain, ExecutorDomainClass, ExecutorDomainConfig, ExecutorDomainId,
-    ExecutorDomainState, ExecutorDomainStats, ExecutorDomainTable,
+    ExecutorDomainInfo, ExecutorDomainState, ExecutorDomainTable,
     KERNEL_BACKGROUND_EXECUTOR_DOMAIN, KERNEL_HIGH_EXECUTOR_DOMAIN, KERNEL_NORMAL_EXECUTOR_DOMAIN,
 };
 
@@ -19,63 +20,54 @@ pub(crate) struct CacheAligned(pub(crate) AtomicUsize);
 const MAX_SHARDS: usize = 32;
 
 struct DomainRunQueue {
-    queue: BoundedMpmcQueue<ExecutorDomainId>,
+    queue: ArrayQueue<ExecutorDomainId>,
 }
 
 impl DomainRunQueue {
     fn new(capacity: usize) -> Self {
         Self {
-            queue: BoundedMpmcQueue::new(capacity.max(1)),
+            queue: ArrayQueue::new(capacity.max(1)),
         }
     }
 
     #[inline]
-    fn push(&self, domain_id: ExecutorDomainId) {
-        match self.queue.try_push(domain_id) {
-            Ok(()) => {}
-            Err(BoundedMpmcPushError::Full(_)) => {
-                panic!("executor run queue full; scheduler token invariant is broken")
-            }
-            _ => unreachable!(),
-        }
+    fn push(&self, domain_id: ExecutorDomainId) -> bool {
+        self.queue.push(domain_id).is_ok()
     }
 
     #[inline]
     fn pop(&self) -> Option<ExecutorDomainId> {
-        self.queue.try_pop()
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.queue.len()
+        self.queue.pop()
     }
 }
 
 #[repr(align(64))]
 pub(crate) struct WorkerShared {
     claimed: AtomicBool,
-    next_task: AtomicUsize,
-}
-
-impl WorkerShared {
-    fn take_task(&self) -> usize {
-        if self.next_task.load(Ordering::Acquire) == 0 {
-            0
-        } else {
-            self.next_task.swap(0, Ordering::AcqRel)
-        }
-    }
 }
 
 struct WorkerGuard<'a> {
     worker: Option<&'a WorkerShared>,
     previous: *const WorkerShared,
+    previous_caches: Option<[SlabCache; 1]>,
 }
 
 impl Drop for WorkerGuard<'_> {
     fn drop(&mut self) {
-        GlobalAsyncExecutor::global().flush_local_task();
-        with_executor_local(|tls| tls.worker.set(self.previous));
+        GlobalAsyncExecutor::global().release_local_batch::<false>(true);
+        with_executor_local(|tls| {
+            let mut caches = tls.caches.borrow_mut();
+            for cache in &mut *caches {
+                if let Some(flush) = cache.flush.take() {
+                    unsafe { flush(cache.owner, &mut cache.handles) };
+                    cache.owner = core::ptr::null();
+                }
+            }
+            if let Some(previous) = self.previous_caches.take() {
+                *caches = previous;
+            }
+            tls.worker.set(self.previous);
+        });
         if let Some(worker) = self.worker {
             worker.claimed.store(false, Ordering::Release);
         }
@@ -86,6 +78,7 @@ struct ExecutorRuntime {
     domains: ExecutorDomainTable,
     workers: Box<[WorkerShared]>,
     run_queue: DomainRunQueue,
+    run_overflow: AtomicBool,
 }
 
 impl ExecutorRuntime {
@@ -95,10 +88,10 @@ impl ExecutorRuntime {
             workers: (0..cpu_count)
                 .map(|_| WorkerShared {
                     claimed: AtomicBool::new(false),
-                    next_task: AtomicUsize::new(0),
                 })
                 .collect(),
             run_queue: DomainRunQueue::new(crate::runtime::slab::constants::MAX_TASK_SLOTS),
+            run_overflow: AtomicBool::new(false),
         }
     }
 }
@@ -129,13 +122,13 @@ impl GlobalAsyncExecutor {
 
         self.runtime.call_once(|| ExecutorRuntime::new(shards));
 
-        platform().init_blocking(shards);
-        platform().init_runtime(shards, shards);
+        platform::init_blocking(shards);
+        platform::init_runtime(shards, shards);
 
         self.max_pumps.0.store(shards, Ordering::Release);
         fence(Ordering::SeqCst);
 
-        if self.runnable_executor_domain_count() != 0 {
+        if self.has_runnable_domains() {
             self.try_schedule::<false>();
         } else if crate::runtime::slab::task_slab::get_task_table().has_retired()
             || has_retired_block_on_states()
@@ -157,33 +150,47 @@ impl GlobalAsyncExecutor {
         domain_id: ExecutorDomainId,
         task_id: usize,
     ) {
-        self.with_executor_domain(domain_id, |domain| {
-            let local = !crate::platform::in_interrupt_context()
-                && with_executor_local(|tls| {
-                    if tls.active_domain.get() != domain as *const ExecutorDomain {
-                        return false;
-                    }
-                    let Some(worker) = (unsafe { tls.worker.get().as_ref() }) else {
-                        return false;
-                    };
-                    worker
-                        .next_task
-                        .compare_exchange(0, task_id, Ordering::Release, Ordering::Relaxed)
-                        .is_ok()
-                });
-            if local {
-                if !domain.is_at_active_limit() {
-                    self.try_schedule::<false>();
+        let accepted = self
+            .with_executor_domain(domain_id, |domain| {
+                if domain.state() != ExecutorDomainState::Active {
+                    return false;
                 }
-            } else {
-                assert!(
-                    domain.enqueue_task(task_id),
-                    "failed to enqueue executor task"
-                );
-                self.schedule_domain_if_needed(self.runtime(), domain_id, domain);
+                let local = !crate::platform::in_interrupt_context()
+                    && with_executor_local(|tls| {
+                        if tls.active_domain.get() != domain as *const ExecutorDomain {
+                            return false;
+                        }
+                        let Some(slot) = (unsafe { tls.batch.get().as_ref() }) else {
+                            return false;
+                        };
+                        let batch = unsafe { &mut *slot.batch.get() };
+                        if batch.local_task != 0 {
+                            return false;
+                        }
+                        batch.local_task = task_id;
+                        true
+                    });
+                if local {
+                    return true;
+                }
+                match domain.enqueue_task(task_id) {
+                    Some(true) => {
+                        self.schedule_domain_if_needed::<false>(self.runtime(), domain_id, domain)
+                    }
+                    Some(false) => {}
+                    None => return false,
+                }
+                true
+            })
+            .unwrap_or(false);
+        if !accepted {
+            if let Some((shard, local, generation)) =
+                crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
+            {
+                crate::runtime::slab::task_slab::get_task_table()
+                    .decrement_ref::<false>(shard, local, generation);
             }
-        })
-        .expect("invalid executor domain for task wake");
+        }
     }
 
     pub(crate) fn with_executor_domain<R>(
@@ -201,31 +208,79 @@ impl GlobalAsyncExecutor {
         Some(f(&domain))
     }
 
-    pub(crate) fn publish_claimed_task(&self, task_id: usize) {
-        if task_id == 0 {
+    pub(crate) fn release_local_batch<const CHECK_IRQ: bool>(&self, notify: bool) {
+        if CHECK_IRQ && crate::platform::in_interrupt_context() {
             return;
         }
-        let (shard, local, generation) =
-            crate::runtime::slab::ptr::decode_slab_task_ptr(task_id).expect("invalid local task");
-        let slot = crate::runtime::slab::task_slab::get_task_table()
-            .get_slot(shard, local, generation)
-            .expect("local task reference lost");
-        let domain_id = slot.executor_domain_id().expect("local task domain lost");
-        self.with_executor_domain(domain_id, |domain| {
-            assert!(domain.enqueue_task(task_id), "failed to publish local task");
-            self.schedule_domain_if_needed(self.runtime(), domain_id, domain);
-        })
-        .expect("local task domain disappeared");
-    }
-
-    pub(crate) fn flush_local_task(&self) {
-        if crate::platform::in_interrupt_context() {
-            return;
-        }
-        let task = with_executor_local(|tls| {
-            unsafe { tls.worker.get().as_ref() }.map_or(0, WorkerShared::take_task)
+        let owned = with_executor_local(|tls| {
+            let slot = tls.batch.replace(core::ptr::null());
+            unsafe { Some((slot.as_ref()?, tls.active_domain.get().as_ref()?)) }
         });
-        self.publish_claimed_task(task);
+        let Some((slot, domain)) = owned else {
+            return;
+        };
+        let batch = unsafe { &mut *slot.batch.get() };
+        if batch.current != 0
+            && domain.state() == ExecutorDomainState::Active
+            && domain.help_requested.load(Ordering::Acquire)
+            && domain.help_requested.swap(false, Ordering::AcqRel)
+        {
+            if let Some(other) = domain.batches.iter().find(|other| {
+                other
+                    .state
+                    .compare_exchange(
+                        BATCH_EMPTY,
+                        BATCH_OWNED,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            }) {
+                let table = crate::runtime::slab::task_slab::get_task_table();
+                let mut last = batch.current;
+                for _ in 1..domain.quantum().min(32) {
+                    let (shard, local, generation) =
+                        crate::runtime::slab::ptr::decode_slab_task_ptr(last)
+                            .expect("invalid batch task");
+                    let task = table
+                        .get_slot(shard, local, generation)
+                        .expect("batch task missing");
+                    let next = task.ready_next.load(Ordering::Relaxed);
+                    if next == 0 {
+                        break;
+                    }
+                    last = next;
+                }
+                let (shard, local, generation) =
+                    crate::runtime::slab::ptr::decode_slab_task_ptr(last)
+                        .expect("invalid batch split");
+                let task = table
+                    .get_slot(shard, local, generation)
+                    .expect("batch split missing");
+                let next = unsafe { &mut *other.batch.get() };
+                next.current = task.ready_next.load(Ordering::Relaxed);
+                task.ready_next.store(0, Ordering::Relaxed);
+                next.local_task = 0;
+                next.local_runs = 0;
+                next.shard_cursor = batch.shard_cursor;
+                other.state.store(
+                    if next.current == 0 {
+                        BATCH_EMPTY
+                    } else {
+                        BATCH_READY
+                    },
+                    Ordering::Release,
+                );
+            }
+        }
+        let ready = batch.current != 0 || batch.local_task != 0;
+        slot.state.store(
+            if ready { BATCH_READY } else { BATCH_EMPTY },
+            Ordering::Release,
+        );
+        if ready && notify {
+            self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
+        }
     }
 
     pub fn create_executor_domain(&self, config: ExecutorDomainConfig) -> ExecutorDomainId {
@@ -247,28 +302,52 @@ impl GlobalAsyncExecutor {
         self.runtime().domains.get_executor_domain(domain_id)
     }
 
-    pub fn runnable_executor_domain_count(&self) -> usize {
+    fn has_runnable_domains(&self) -> bool {
         let Some(runtime) = self.runtime.get() else {
-            return 0;
+            return false;
         };
 
-        runtime.run_queue.len()
+        !runtime.run_queue.queue.is_empty() || runtime.run_overflow.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn schedule_domain_if_needed(
+    fn schedule_domain_if_needed<const RELEASE_ACTIVE: bool>(
         &self,
         runtime: &ExecutorRuntime,
         domain_id: ExecutorDomainId,
         domain: &ExecutorDomain,
     ) {
-        if !domain.is_schedulable_for_policy() {
+        if domain.state() != ExecutorDomainState::Active {
+            if RELEASE_ACTIVE {
+                domain.release_active();
+                domain.maybe_finish_draining();
+            }
             return;
         }
 
-        while domain.try_reserve_schedule_token() {
-            runtime.run_queue.push(domain_id);
+        let previous = if RELEASE_ACTIVE {
+            domain
+                .schedule_state
+                .0
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    Some((state - ACTIVE_UNIT) | RUN_PENDING)
+                })
+                .unwrap()
+        } else {
+            domain
+                .schedule_state
+                .0
+                .fetch_or(RUN_PENDING, Ordering::AcqRel)
+        };
+        if previous & RUN_PENDING == 0 {
+            if !runtime.run_queue.push(domain_id) {
+                domain.run_overflow.store(true, Ordering::Release);
+                runtime.run_overflow.store(true, Ordering::Release);
+            }
             self.try_schedule::<false>();
+        }
+        if RELEASE_ACTIVE {
+            domain.maybe_finish_draining();
         }
     }
 
@@ -294,7 +373,7 @@ impl GlobalAsyncExecutor {
             return;
         }
 
-        if !platform().submit_runtime(Job {
+        if !platform::submit_runtime(Job {
             f: pump_trampoline,
             a: 0,
         }) {
@@ -309,7 +388,7 @@ impl GlobalAsyncExecutor {
     }
 
     fn pump(&self) {
-        self.flush_local_task();
+        self.release_local_batch::<false>(true);
         let task_table = crate::runtime::slab::task_slab::get_task_table();
         let worker = self
             .runtime()
@@ -322,66 +401,78 @@ impl GlobalAsyncExecutor {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             });
-        let previous = with_executor_local(|tls| {
+        let (previous, previous_caches) = with_executor_local(|tls| {
             if let Some((index, _)) = worker {
                 tls.ready_cursor.set(index);
                 tls.allocation_cursor.set(index);
             }
-            tls.worker
-                .replace(worker.map_or(core::ptr::null(), |(_, worker)| worker))
+            let previous = tls
+                .worker
+                .replace(worker.map_or(core::ptr::null(), |(_, worker)| worker));
+            let mut caches = tls.caches.borrow_mut();
+            let previous_caches = caches
+                .iter()
+                .any(|cache| !cache.owner.is_null())
+                .then(|| core::mem::replace(&mut *caches, [const { SlabCache::new() }; 1]));
+            (previous, previous_caches)
         });
         let worker_guard = WorkerGuard {
             worker: worker.map(|(_, worker)| worker),
             previous,
+            previous_caches,
         };
+        let mut cached_domain: Option<crate::domain::DomainBorrow<'_>> = None;
 
         loop {
             let runtime = self.runtime();
 
-            let domain_id = match runtime.run_queue.pop() {
-                Some(domain_id) => domain_id,
-                None => {
-                    for worker in &runtime.workers {
-                        self.publish_claimed_task(worker.take_task());
-                    }
-                    let Some(domain_id) = runtime.run_queue.pop() else {
-                        break;
-                    };
-                    domain_id
-                }
-            };
-
-            let Some(domain) = runtime.domains.borrow_executor_domain(domain_id) else {
-                continue;
-            };
-
-            if !domain.is_schedulable_for_policy() {
-                domain.release_schedule_token();
-                self.schedule_domain_if_needed(runtime, domain_id, &domain);
-                continue;
+            if runtime.run_overflow.load(Ordering::Acquire)
+                && runtime.run_overflow.swap(false, Ordering::AcqRel)
+                && runtime
+                    .domains
+                    .recover_runs(|id| runtime.run_queue.push(id))
+            {
+                runtime.run_overflow.store(true, Ordering::Release);
             }
+            let Some(domain_id) = runtime.run_queue.pop() else {
+                break;
+            };
+
+            if cached_domain
+                .as_ref()
+                .is_none_or(|domain| domain.id() != domain_id)
+            {
+                cached_domain = runtime.domains.borrow_executor_domain(domain_id);
+            }
+            let Some(domain) = cached_domain.as_ref() else {
+                continue;
+            };
 
             if !domain.try_reserve_active() {
-                domain.release_schedule_token();
-                self.schedule_domain_if_needed(runtime, domain_id, &domain);
+                cached_domain = None;
                 continue;
             }
 
-            domain.release_schedule_token();
+            if !domain.is_runnable_for_policy() {
+                domain.release_active();
+                domain.maybe_finish_draining();
+                cached_domain = None;
+                continue;
+            }
 
-            let budget = self.pick_domain_budget(&domain);
-            let ran = self.run_domain_batch(&domain, budget);
+            let budget = self.pick_domain_budget(domain);
+            let ran = self.run_domain_batch(domain, budget);
             task_table.drain_retired();
             drain_retired_block_on_states();
 
-            domain.release_active();
-            domain.maybe_finish_draining();
-
-            self.after_domain_batch(runtime, domain_id, &domain, ran);
-            drop(domain);
+            self.after_domain_batch(runtime, domain_id, domain, ran);
+            if domain.state() != ExecutorDomainState::Active {
+                cached_domain = None;
+            }
             runtime.domains.drain_retired();
         }
 
+        drop(cached_domain);
         task_table.drain_retired();
         drain_retired_block_on_states();
         drop(worker_guard);
@@ -389,7 +480,7 @@ impl GlobalAsyncExecutor {
         self.exit_pump();
         fence(Ordering::SeqCst);
 
-        if self.runnable_executor_domain_count() != 0 {
+        if self.has_runnable_domains() {
             self.try_schedule::<false>();
         } else if task_table.has_retired()
             || has_retired_block_on_states()
@@ -401,54 +492,93 @@ impl GlobalAsyncExecutor {
 
     #[inline]
     fn pick_domain_budget(&self, domain: &ExecutorDomain) -> usize {
-        let deficit = domain.add_deficit(domain.weight());
-        deficit.min(domain.quantum()).max(1)
+        let quantum = domain.quantum();
+        let weight = domain.weight();
+        if weight >= quantum {
+            quantum
+        } else {
+            domain.add_deficit(weight).min(quantum).max(1)
+        }
     }
 
     fn run_domain_batch(&self, domain: &ExecutorDomain, budget: usize) -> usize {
-        let (previous_domain, previous_caches) = with_executor_local(|tls| {
-            let mut caches = tls.caches.borrow_mut();
-            let previous_caches = caches
-                .iter()
-                .any(|cache| !cache.owner.is_null())
-                .then(|| core::mem::replace(&mut *caches, [const { SlabCache::new() }; 1]));
-            (tls.active_domain.replace(domain), previous_caches)
+        let start = with_executor_local(|tls| {
+            let cursor = tls.ready_cursor.get();
+            tls.ready_cursor.set(cursor.wrapping_add(1));
+            cursor % domain.batches.len()
+        });
+        let mut owned = None;
+        for state in [BATCH_READY, BATCH_EMPTY] {
+            for offset in 0..domain.batches.len() {
+                let slot = &domain.batches[(start + offset) % domain.batches.len()];
+                if slot.state.load(Ordering::Relaxed) == state
+                    && slot
+                        .state
+                        .compare_exchange(state, BATCH_OWNED, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    owned = Some(slot);
+                    break;
+                }
+            }
+            if owned.is_some() {
+                break;
+            }
+        }
+        let Some(owned) = owned else {
+            domain.help_requested.store(true, Ordering::Release);
+            return 0;
+        };
+        if !domain.is_at_active_limit() && domain.has_queued_work() {
+            self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
+        }
+        let (previous_domain, previous_batch) = with_executor_local(|tls| {
+            (tls.active_domain.replace(domain), tls.batch.replace(owned))
         });
         let _batch = ExecutorBatchGuard {
             previous_domain,
-            previous_caches,
+            previous_batch,
         };
         let mut ran = 0usize;
-        let mut local_runs = 0usize;
         let budget = budget.max(1);
+        let table = crate::runtime::slab::task_slab::get_task_table();
 
         while ran < budget {
-            let local_task = if local_runs < 3 {
-                with_executor_local(|tls| {
-                    unsafe { tls.worker.get().as_ref() }.map_or(0, WorkerShared::take_task)
-                })
-            } else {
-                0
-            };
-            let task_id = if local_task != 0 {
-                local_runs += 1;
-                local_task
-            } else {
-                local_runs = 0;
-                match domain.pop_task() {
-                    Some(task_id) => task_id,
-                    None => {
-                        let task = with_executor_local(|tls| {
-                            unsafe { tls.worker.get().as_ref() }.map_or(0, WorkerShared::take_task)
-                        });
-                        if task == 0 {
-                            break;
-                        }
-                        task
+            if domain.state() != ExecutorDomainState::Active
+                || with_executor_local(|tls| tls.batch.get().is_null())
+            {
+                break;
+            }
+            let task_id = {
+                let batch = unsafe { &mut *owned.batch.get() };
+                if batch.local_runs < 3 && batch.local_task != 0 {
+                    batch.local_runs += 1;
+                    core::mem::take(&mut batch.local_task)
+                } else {
+                    if batch.current == 0 {
+                        domain.refill_batch(batch);
+                    }
+                    if batch.current != 0 {
+                        let task_id = batch.current;
+                        let (shard, local, generation) =
+                            crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
+                                .expect("invalid ready task");
+                        let task = table
+                            .get_slot(shard, local, generation)
+                            .expect("ready task missing");
+                        batch.current = task.ready_next.load(Ordering::Relaxed);
+                        task.ready_next.store(0, Ordering::Relaxed);
+                        batch.local_runs = 0;
+                        task_id
+                    } else {
+                        core::mem::take(&mut batch.local_task)
                     }
                 }
             };
-
+            if task_id == 0 {
+                domain.help_requested.store(true, Ordering::Release);
+                break;
+            }
             crate::runtime::slab::ptr::slab_task_poll_trampoline(task_id);
             ran += 1;
         }
@@ -464,11 +594,12 @@ impl GlobalAsyncExecutor {
         domain: &ExecutorDomain,
         ran_count: usize,
     ) {
-        if ran_count != 0 || domain.is_runnable_for_policy() {
+        if domain.weight() < domain.quantum() && (ran_count != 0 || domain.is_runnable_for_policy())
+        {
             domain.spend_deficit(ran_count.max(1));
         }
 
-        self.schedule_domain_if_needed(runtime, domain_id, domain);
+        self.schedule_domain_if_needed::<true>(runtime, domain_id, domain);
     }
 }
 

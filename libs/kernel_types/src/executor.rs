@@ -24,9 +24,7 @@ pub struct UserExecutorDomainInfo {
     pub state: u32,
     pub reserved: u32,
     pub max_active_tasks: u64,
-    pub queued_tasks: u64,
-    pub active_tasks: u64,
-    pub live_tasks: u64,
+    pub reserved_stats: [u64; 3],
     pub reserved2: [u64; 2],
     pub ready_shards: u64,
 }

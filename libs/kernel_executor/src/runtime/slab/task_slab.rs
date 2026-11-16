@@ -38,7 +38,7 @@ static TASK_TABLE_PTR: Once<&'static TaskTable> = Once::new();
 static mut TASK_TABLE_STORAGE: MaybeUninit<TaskTable> = MaybeUninit::uninit();
 
 pub struct TaskTable {
-    slab: GrowableSlab<TaskSlot>,
+    pub(crate) slab: GrowableSlab<TaskSlot>,
     retired_head: AtomicUsize,
 }
 
@@ -60,6 +60,11 @@ impl TaskTable {
     }
 
     pub fn allocate(&self) -> Option<SlotHandle> {
+        self.allocate_with_refs(1)
+    }
+
+    pub(crate) fn allocate_with_refs(&self, refs: u32) -> Option<SlotHandle> {
+        assert!(refs != 0 && refs <= REF_MASK);
         let handle = if TASK_TABLE_PTR
             .get()
             .is_some_and(|table| core::ptr::eq(*table, self))
@@ -71,7 +76,7 @@ impl TaskTable {
         let slot = self.slab.get(handle)?;
         slot.prepare_for_allocation();
         slot.gen_ref
-            .store(pack_gen_ref(handle.generation, 1), Ordering::Release);
+            .store(pack_gen_ref(handle.generation, refs), Ordering::Release);
         Some(SlotHandle { handle })
     }
 
@@ -138,6 +143,16 @@ impl TaskTable {
         local_idx: usize,
         expected_gen: u32,
     ) {
+        self.decrement_refs::<RECLAIM>(shard_idx, local_idx, expected_gen, 1);
+    }
+
+    pub(crate) fn decrement_refs<const RECLAIM: bool>(
+        &self,
+        shard_idx: usize,
+        local_idx: usize,
+        expected_gen: u32,
+        count: u32,
+    ) {
         let Some(handle) = self.make_handle(shard_idx, local_idx, expected_gen) else {
             return;
         };
@@ -151,17 +166,17 @@ impl TaskTable {
                 return;
             }
             let refs = unpack_ref(current);
-            if refs == 0 {
+            if refs < count {
                 return;
             }
             match slot.gen_ref.compare_exchange(
                 current,
-                pack_gen_ref(expected_gen, refs - 1),
+                pack_gen_ref(expected_gen, refs - count),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if refs == 1 {
+                    if refs == count {
                         if RECLAIM {
                             self.release_slot(handle, slot);
                         } else {
@@ -224,12 +239,15 @@ impl TaskTable {
         core::hint::cold_path();
         let mut retired = self.retired_head.swap(0, Ordering::Acquire);
         while retired != 0 {
-            let (shard, local, generation) = decode_slab_task_ptr(retired - 1)
-                .expect("invalid retired task");
+            let (shard, local, generation) =
+                decode_slab_task_ptr(retired - 1).expect("invalid retired task");
             let handle = self
                 .make_handle(shard, local, generation)
                 .expect("invalid retired task handle");
-            let slot = self.slab.get(handle).expect("retired task slot disappeared");
+            let slot = self
+                .slab
+                .get(handle)
+                .expect("retired task slot disappeared");
             retired = slot.retired_next.load(Ordering::Relaxed);
             self.release_slot(handle, slot);
         }

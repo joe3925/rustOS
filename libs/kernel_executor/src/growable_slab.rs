@@ -494,6 +494,51 @@ impl<T> GrowableSlab<T> {
         shard.release(handle)
     }}
 
+    pub(crate) fn scan_slots(
+        &self,
+        cursor: &mut [usize; 3],
+        remaining: &mut usize,
+        mut visit: impl FnMut(SlabHandle, &T),
+    ) -> bool
+    where
+        T: Sync,
+    {
+        while cursor[0] < self.shards.len() {
+            let shard = &self.shards[cursor[0]];
+            if cursor[1] >= shard.published_chunks.load(Ordering::Acquire) {
+                cursor[0] += 1;
+                cursor[1] = 0;
+                cursor[2] = 0;
+                continue;
+            }
+            let chunk = unsafe { &*shard.chunks[cursor[1]].load(Ordering::Acquire) };
+            if cursor[2] == chunk.slots.len() {
+                cursor[1] += 1;
+                cursor[2] = 0;
+                continue;
+            }
+            if *remaining == 0 {
+                return false;
+            }
+            let index = cursor[2];
+            cursor[2] += 1;
+            *remaining -= 1;
+            let slot = &chunk.slots[index];
+            let state = slot.state.load(Ordering::Acquire);
+            if state & 1 != 0 {
+                visit(
+                    SlabHandle {
+                        shard: cursor[0] as u8,
+                        local_index: (cursor[1] * shard.slots_per_chunk + index) as u32,
+                        generation: state >> 1,
+                    },
+                    unsafe { &*slot.value.get() },
+                );
+            }
+        }
+        true
+    }
+
     pub fn capacity(&self) -> usize {
         self.shards
             .iter()

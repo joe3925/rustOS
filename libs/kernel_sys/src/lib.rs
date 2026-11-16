@@ -244,10 +244,10 @@ unsafe extern "C" {
     pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
 
     // Async Runtime (global)
-    pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()>;
+    pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<bool>;
     pub fn kernel_spawn_detached_abi(fut: AbiFuture<()>);
     pub fn kernel_block_on_context() -> BlockOnContext;
-    pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize);
+    pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize, bool), ctx: usize);
 
     // Routing FFI (sync - for kernel_routing crate)
     pub fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget>;

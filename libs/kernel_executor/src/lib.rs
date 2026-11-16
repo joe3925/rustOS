@@ -1,6 +1,8 @@
 #![no_std]
-#![cfg_attr(all(feature = "executor", target_has_atomic = "128"), feature(integer_atomics))]
-#![cfg_attr(all(feature = "executor", not(any(test, loom, feature = "loom"))), feature(thread_local))]
+#![cfg_attr(
+    all(feature = "executor", not(any(test, loom, feature = "loom"))),
+    feature(thread_local)
+)]
 
 extern crate alloc;
 #[cfg(any(test, loom, feature = "loom"))]
@@ -26,18 +28,22 @@ mod sync;
 #[cfg(all(test, feature = "executor", not(any(loom, feature = "loom"))))]
 mod test;
 
+#[cfg(all(test, feature = "executor", any(loom, feature = "loom")))]
+#[path = "test/support.rs"]
+mod test_support;
+
 #[cfg(feature = "executor")]
 #[macro_export]
 macro_rules! println {
     () => {
-        $crate::platform::platform().print("\n")
+        $crate::platform::print("\n")
     };
     ($($arg:tt)*) => {{
         use core::fmt::Write;
         let mut buf = alloc::string::String::new();
         core::write!(&mut buf, $($arg)*).unwrap();
         buf.push('\n');
-        $crate::platform::platform().print(&buf);
+        $crate::platform::print(&buf);
     }};
 }
 

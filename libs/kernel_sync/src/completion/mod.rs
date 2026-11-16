@@ -29,6 +29,15 @@ pub enum TaskOutcome<T> {
     Cancelled,
 }
 
+impl<T> TaskOutcome<T> {
+    pub fn expect(self, message: &str) -> T {
+        match self {
+            Self::Completed(value) => value,
+            Self::Cancelled => panic!("{message}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskCompletion<T> {
     pub task: TaskToken,

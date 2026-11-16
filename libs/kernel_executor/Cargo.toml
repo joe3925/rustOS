@@ -10,14 +10,14 @@ license = "Apache-2.0"
 crate-type = ["rlib"]
 
 [dependencies]
+crossbeam-queue = { version = "0.3.12", default-features = false, features = ["alloc"], optional = true }
 kernel_sync = { path = "../kernel_sync", default-features = false, optional = true }
 spin = { version = "0.10", optional = true }
-portable-atomic = { version = "1", optional = true }
 loom = { version = "0.7", optional = true }
 
 [features]
 default = ["executor"]
-executor = ["dep:kernel_sync", "dep:spin", "dep:portable-atomic"]
+executor = ["dep:kernel_sync", "dep:spin", "dep:crossbeam-queue"]
 loom = ["executor", "dep:loom"]
 
 [lints.rust]

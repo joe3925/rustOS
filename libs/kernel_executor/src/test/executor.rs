@@ -660,7 +660,7 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
 
     assert_eq!(results.len(), task_count);
     for (task_id, value) in results.into_iter().enumerate() {
-        assert_eq!(value, expected_task_checksum(task_id));
+        assert_eq!(value.expect("checksum task cancelled"), expected_task_checksum(task_id));
     }
 }
 

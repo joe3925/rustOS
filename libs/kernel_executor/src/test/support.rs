@@ -1,88 +1,71 @@
 extern crate std;
 
-use crate::platform::{ExecutorPlatform, Job};
+use crate::platform::Job;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const EXECUTOR_MAX_SHARDS: usize = 32;
 
-struct ThreadPoolPlatform {
-    runtime_pool: OnceLock<threadpool::ThreadPool>,
-    blocking_pool: OnceLock<threadpool::ThreadPool>,
+pub(crate) static RUNTIME_POOL: OnceLock<threadpool::ThreadPool> = OnceLock::new();
+static BLOCKING_POOL: OnceLock<threadpool::ThreadPool> = OnceLock::new();
+
+#[unsafe(export_name = "__kernel_executor_platform_init_runtime")]
+fn init_runtime(max_threads: usize, _max_jobs: usize) {
+    let threads = max_threads.max(1);
+    let _ = RUNTIME_POOL.set(threadpool::ThreadPool::new(threads));
 }
 
-impl ThreadPoolPlatform {
-    const fn new() -> Self {
-        Self {
-            runtime_pool: OnceLock::new(),
-            blocking_pool: OnceLock::new(),
-        }
-    }
-
-    fn runtime_pool(&self) -> &threadpool::ThreadPool {
-        self.runtime_pool
-            .get()
-            .expect("runtime executor pool not initialized")
-    }
-
-    fn blocking_pool(&self) -> &threadpool::ThreadPool {
-        self.blocking_pool
-            .get()
-            .expect("blocking executor pool not initialized")
-    }
+#[unsafe(export_name = "__kernel_executor_platform_init_blocking")]
+fn init_blocking(max_threads: usize) {
+    let threads = max_threads.max(1);
+    let _ = BLOCKING_POOL.set(threadpool::ThreadPool::new(threads));
 }
 
-impl ExecutorPlatform for ThreadPoolPlatform {
-    fn init_runtime(&self, max_threads: usize, _max_jobs: usize) {
-        let threads = max_threads.max(1);
-        let _ = self.runtime_pool.set(threadpool::ThreadPool::new(threads));
-    }
+#[unsafe(export_name = "__kernel_executor_platform_submit_runtime")]
+fn submit_runtime(job: Job) -> bool {
+    RUNTIME_POOL
+        .get()
+        .expect("runtime executor pool not initialized")
+        .execute(move || (job.f)(job.a));
+    true
+}
 
-    fn init_blocking(&self, max_threads: usize) {
-        let threads = max_threads.max(1);
-        let _ = self.blocking_pool.set(threadpool::ThreadPool::new(threads));
-    }
+#[unsafe(export_name = "__kernel_executor_platform_submit_blocking")]
+fn submit_blocking(job: Job) {
+    BLOCKING_POOL
+        .get()
+        .expect("blocking executor pool not initialized")
+        .execute(move || (job.f)(job.a));
+}
 
-    fn submit_runtime(&self, job: Job) -> bool {
-        self.runtime_pool().execute(move || {
-            (job.f)(job.a);
-        });
-        true
-    }
-
-    fn submit_blocking(&self, job: Job) {
-        self.blocking_pool().execute(move || {
-            (job.f)(job.a);
-        });
-    }
-
-    fn submit_blocking_many(&self, jobs: &[Job]) {
-        for job in jobs.iter().copied() {
-            self.submit_blocking(job);
-        }
-    }
-
-    fn try_steal_blocking_one(&self) -> bool {
-        false
-    }
-
-    fn yield_now(&self) {
-        std::thread::yield_now();
-    }
-
-    fn print(&self, string: &str) {
-        std::print!("{string}");
-    }
-
-    fn in_interrupt_context(&self) -> bool {
-        false
+#[unsafe(export_name = "__kernel_executor_platform_submit_blocking_many")]
+fn submit_blocking_many(jobs: &[Job]) {
+    let pool = BLOCKING_POOL
+        .get()
+        .expect("blocking executor pool not initialized");
+    for job in jobs.iter().copied() {
+        pool.execute(move || (job.f)(job.a));
     }
 }
 
-static THREAD_POOL_PLATFORM: ThreadPoolPlatform = ThreadPoolPlatform::new();
+#[unsafe(export_name = "__kernel_executor_platform_try_steal_blocking_one")]
+fn try_steal_blocking_one() -> bool {
+    false
+}
 
-fn init_test_platform() {
-    crate::platform::init(&THREAD_POOL_PLATFORM);
+#[unsafe(export_name = "__kernel_executor_platform_yield_now")]
+fn yield_now() {
+    std::thread::yield_now();
+}
+
+#[unsafe(export_name = "__kernel_executor_platform_print")]
+fn print(string: &str) {
+    std::print!("{string}");
+}
+
+#[unsafe(export_name = "__kernel_executor_platform_in_interrupt_context")]
+fn in_interrupt_context() -> bool {
+    false
 }
 
 pub(super) fn test_shard_count() -> usize {
@@ -97,7 +80,6 @@ pub(super) fn stress_task_count(multiplier: usize) -> usize {
 }
 
 pub(crate) fn init_threaded_runtime() {
-    init_test_platform();
     crate::global_async::GlobalAsyncExecutor::global().init(test_shard_count(), 1024);
 }
 

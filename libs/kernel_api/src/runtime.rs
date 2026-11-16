@@ -9,6 +9,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
+pub use kernel_sync::completion::TaskOutcome;
 use kernel_sys::kernel_cycle_counter_frequency_hz;
 use kernel_types::arch::{Platform, PlatformInfo};
 use spin::Mutex;
@@ -22,11 +23,18 @@ use kernel_types::runtime::{BlockOnContext, BlockOnThreadState};
 
 /// Spawn an async task on the kernel executor (shared singleton in the kernel) and
 /// return a join handle that can be awaited for completion.
-pub fn spawn<F>(future: F) -> AbiFuture<()>
+pub fn spawn<F>(future: F) -> impl Future<Output = TaskOutcome<()>> + Send
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    unsafe { kernel_spawn_joinable_abi(future.into_abi()) }
+    let handle = unsafe { kernel_spawn_joinable_abi(future.into_abi()) };
+    async move {
+        if handle.await {
+            TaskOutcome::Completed(())
+        } else {
+            TaskOutcome::Cancelled
+        }
+    }
 }
 
 /// Spawn a detached async task (fire-and-forget).
@@ -81,7 +89,7 @@ pub struct BlockingJoin<R> {
 }
 
 struct BlockingState<R> {
-    result: Mutex<Option<R>>,
+    result: Mutex<Option<TaskOutcome<R>>>,
     ready: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
@@ -95,7 +103,7 @@ impl<R> BlockingState<R> {
         }
     }
 
-    fn store(&self, value: R) {
+    fn store(&self, value: TaskOutcome<R>) {
         *self.result.lock() = Some(value);
         self.ready.store(true, Ordering::Release);
 
@@ -106,9 +114,9 @@ impl<R> BlockingState<R> {
 }
 
 impl<R> Future for BlockingJoin<R> {
-    type Output = R;
+    type Output = TaskOutcome<R>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.state.ready.load(Ordering::Acquire) {
             if let Some(v) = self.state.result.lock().take() {
                 return Poll::Ready(v);
@@ -127,7 +135,7 @@ impl<R> Future for BlockingJoin<R> {
     }
 }
 
-extern "C" fn blocking_trampoline<F, R>(ctx: usize)
+extern "C" fn blocking_trampoline<F, R>(ctx: usize, run: bool)
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -136,9 +144,12 @@ where
     let boxed = unsafe { Box::from_raw(ptr) };
     let (state, func_opt) = *boxed;
 
-    if let Some(f) = func_opt {
+    if !run {
+        drop(func_opt);
+        state.store(TaskOutcome::Cancelled);
+    } else if let Some(f) = func_opt {
         let res = f();
-        state.store(res);
+        state.store(TaskOutcome::Completed(res));
     }
 }
 

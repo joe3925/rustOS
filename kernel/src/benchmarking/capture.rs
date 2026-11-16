@@ -1839,7 +1839,7 @@ async fn build_exports_for_window(
     let mut total_events = 0usize;
 
     for (core, j) in gather_joins.into_iter().enumerate() {
-        let events = j.await;
+        let events = j.await.expect("capture task cancelled");
         total_events += events.len();
         if !events.is_empty() {
             iterators.push(CoreIterator {

@@ -8,13 +8,13 @@ use std::sync::{Condvar, Mutex};
 use std::task::Wake;
 use std::time::Duration;
 
+use crate::async_ffi::{AbiFuture, FutureExt};
 use crate::global_async::{ExecutorDomainConfig, GlobalAsyncExecutor};
 use crate::runtime::runtime::{
-    block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
-    spawn_join_owned_in_executor_domain as spawn_in_executor_domain, JoinAll,
+    JoinAll, TaskOutcome, block_on, spawn_detached, spawn_detached_in_executor_domain,
+    spawn_join_owned as spawn, spawn_join_owned_in_executor_domain as spawn_in_executor_domain,
 };
 use crate::runtime::slab::constants::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
-use crate::async_ffi::{AbiFuture, FutureExt};
 
 fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
     unsafe fn clone(ptr: *const ()) -> RawWaker {
@@ -45,9 +45,12 @@ fn caller_storage_and_spawn_join_macro_return_results() {
 
     let mut storage = core::pin::pin!(crate::runtime::runtime::JoinStorage::<usize>::new());
     let explicit = crate::runtime::runtime::spawn(storage.as_mut(), async { 41usize });
-    assert_eq!(block_on(explicit), 41);
+    assert_eq!(block_on(explicit), TaskOutcome::Completed(41));
 
-    assert_eq!(block_on(crate::spawn_join!(async { 42usize })), 42);
+    assert_eq!(
+        block_on(crate::spawn_join!(async { 42usize })),
+        TaskOutcome::Completed(42)
+    );
 }
 
 fn poll_once<F: Future + Unpin>(future: &mut F, waker: &Waker) -> Poll<F::Output> {
@@ -380,10 +383,10 @@ fn spawn_joinhandle_completes_small_and_large_heap_storage_paths() {
         let over_aligned = spawn(OverAlignedJoinFuture { value: 44 });
 
         (
-            inline.await,
-            large_future.await,
-            large_result.await,
-            over_aligned.await,
+            inline.await.expect("inline task cancelled"),
+            large_future.await.expect("large future cancelled"),
+            large_result.await.expect("large result cancelled"),
+            over_aligned.await.expect("aligned task cancelled"),
         )
     });
 
@@ -436,7 +439,7 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     assert_eq!(completed.load(Ordering::Acquire), 1);
     assert!(matches!(
         poll_once(&mut handle, &join_wake.waker()),
-        Poll::Ready(77)
+        Poll::Ready(TaskOutcome::Completed(77))
     ));
 }
 
@@ -482,7 +485,7 @@ fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     assert_eq!(completed.load(Ordering::Acquire), 1);
     assert!(matches!(
         poll_once(&mut handle, &join_wake.waker()),
-        Poll::Ready(88)
+        Poll::Ready(TaskOutcome::Completed(88))
     ));
 }
 
@@ -537,7 +540,7 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
     );
     assert!(matches!(
         poll_once(&mut handle, &latest_waiter.waker()),
-        Poll::Ready(99)
+        Poll::Ready(TaskOutcome::Completed(99))
     ));
 }
 
@@ -588,7 +591,7 @@ fn joinhandle_completion_uses_latest_registered_waiter() {
     );
     assert!(matches!(
         poll_once(&mut handle, &latest_waiter.waker()),
-        Poll::Ready(100)
+        Poll::Ready(TaskOutcome::Completed(100))
     ));
 }
 
@@ -784,7 +787,10 @@ fn slab_joinhandle_panics_when_polled_after_completion() {
     super::support::init_threaded_runtime();
 
     let mut handle = spawn(async { 5usize });
-    assert_eq!(block_on(async { (&mut handle).await }), 5);
+    assert_eq!(
+        block_on(async { (&mut handle).await }),
+        TaskOutcome::Completed(5)
+    );
     drop(guard);
 
     let wake_count = Arc::new(AtomicUsize::new(0));
@@ -832,7 +838,13 @@ fn many_joinable_tasks_reschedule_across_core_count_shards() {
     });
 
     assert_eq!(results.len(), tasks);
-    assert_eq!(results.into_iter().sum::<usize>(), expected);
+    assert_eq!(
+        results
+            .into_iter()
+            .map(|value| value.expect("task cancelled"))
+            .sum::<usize>(),
+        expected
+    );
 }
 
 #[test]
@@ -905,7 +917,7 @@ fn externally_woken_future_is_rescheduled_by_executor_waker() {
         .await
     });
 
-    assert_eq!(value, 1);
+    assert_eq!(value, TaskOutcome::Completed(1));
 }
 
 // This test exists to cover the ABI spawn entrypoint used by external crates.
@@ -999,20 +1011,17 @@ fn abi_future_polls_inline_with_exact_parent_context() {
         },
     ));
 
-    super::support::wait_until(Duration::from_secs(5), || {
-        GlobalAsyncExecutor::global()
-            .get_executor_domain(domain_id)
-            .is_some_and(|domain| domain.live_task_count() == 0)
-    });
-    let domain = GlobalAsyncExecutor::global()
-        .get_executor_domain(domain_id)
+    GlobalAsyncExecutor::global()
+        .destroy_executor_domain(domain_id)
         .unwrap();
+    super::support::wait_until(Duration::from_secs(5), || {
+        GlobalAsyncExecutor::global().get_executor_domain(domain_id).is_none()
+    });
     assert_eq!(
         parent_context.load(Ordering::Acquire),
         child_context.load(Ordering::Acquire)
     );
     assert_eq!(child_drops.load(Ordering::Acquire), 1);
-    assert_eq!(domain.live_task_count(), 0);
 }
 
 #[test]
@@ -1024,12 +1033,13 @@ fn spawn_in_executor_domain_completes_joinhandle() {
         GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
 
     let value = block_on(async { spawn_in_executor_domain(domain_id, async { 1234usize }).await });
-    assert_eq!(value, 1234);
+    assert_eq!(value, TaskOutcome::Completed(1234));
 
+    GlobalAsyncExecutor::global()
+        .destroy_executor_domain(domain_id)
+        .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::global()
-            .get_executor_domain(domain_id)
-            .is_some_and(|domain| domain.live_task_count() == 0)
+        GlobalAsyncExecutor::global().get_executor_domain(domain_id).is_none()
     });
 }
 
@@ -1051,9 +1061,10 @@ fn spawn_detached_in_executor_domain_executes_work() {
         counter.load(Ordering::Acquire) == 1
     });
 
+    GlobalAsyncExecutor::global()
+        .destroy_executor_domain(domain_id)
+        .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::global()
-            .get_executor_domain(domain_id)
-            .is_some_and(|domain| domain.live_task_count() == 0)
+        GlobalAsyncExecutor::global().get_executor_domain(domain_id).is_none()
     });
 }

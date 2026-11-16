@@ -31,7 +31,6 @@ use crate::platform::{
 };
 use crate::profiling::backtrace::{self, Backtrace};
 use crate::registry::init as init_registry;
-use crate::scheduling::runtime::runtime::init_executor_platform;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::scheduler::{SCHEDULER, Scheduler, scheduler};
 use crate::scheduling::state::State;
@@ -158,7 +157,6 @@ pub extern "C" fn kernel_main(ctx: usize) {
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
     ));
-    init_executor_platform();
     GlobalAsyncExecutor::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
     #[cfg(feature = "kernel-self-tests")]

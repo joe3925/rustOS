@@ -302,7 +302,7 @@ pub(super) extern "C" fn multi_file_suite(handle: BenchRunHandle) -> AbiFuture<B
         shared.barrier.wait().await;
         let mut results = Vec::with_capacity(WORKERS);
         for worker in workers {
-            results.push(worker.await);
+            results.push(worker.await.expect("benchmark worker cancelled"));
         }
         let mut passed = true;
         let mut total_read = 0u64;

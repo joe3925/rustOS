@@ -309,7 +309,10 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> Result<(), KernelError
         }));
     }
     for join in joins {
-        for p in join.await {
+        let kernel_api::runtime::TaskOutcome::Completed(devices) = join.await else {
+            continue;
+        };
+        for p in devices {
             make_pdo_for_function(&devnode, &p);
         }
     }

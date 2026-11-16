@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kernel_executor::global_async::{
-    DestroyExecutorDomainError, ExecutorDomain, ExecutorDomainId, ExecutorDomainStats,
+    DestroyExecutorDomainError, ExecutorDomain, ExecutorDomainId, ExecutorDomainInfo,
     GlobalAsyncExecutor,
 };
 use spin::Mutex;
@@ -40,9 +40,9 @@ impl UserExecutorDomain {
         self.draining.load(Ordering::Acquire)
     }
 
-    pub fn stats(&self) -> ExecutorDomainStats {
+    pub fn info(&self) -> ExecutorDomainInfo {
         let _guard = self.config_lock.lock();
-        self.domain.stats()
+        self.domain.info()
     }
 
     pub fn update_config(&self, max_active: Option<usize>) {
