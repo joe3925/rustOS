@@ -60,9 +60,7 @@ impl ExecutorPlatform for KernelExecutorPlatform {
         let pool = BLOCKING_POOL
             .get()
             .expect("blocking executor pool not initialized");
-        for job in jobs {
-            pool.submit(job.f, job.a);
-        }
+        pool.submit_many(jobs);
     }
 
     fn try_steal_blocking_one() -> bool {

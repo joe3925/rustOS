@@ -50,6 +50,11 @@ pub trait JobQueue<P: Platform>: 'static {
 
     fn channel(config: Self::Config) -> (Self::Sender, Self::Receiver);
     fn send(sender: &Self::Sender, job: Job) -> Result<(), QueueSendError>;
+    fn send_many(sender: &Self::Sender, jobs: &[Job]) -> usize {
+        jobs.iter()
+            .filter(|&&job| Self::send(sender, job).is_ok())
+            .count()
+    }
     fn recv(receiver: &Self::Receiver) -> Result<Job, RecvError>;
     fn try_recv(receiver: &Self::Receiver) -> Result<Job, TryRecvError>;
 }
@@ -69,8 +74,12 @@ impl<P: Platform> JobQueue<P> for UnboundedJobs<P> {
         sender.send(job).map_err(|_| QueueSendError::Disconnected)
     }
 
+    fn send_many(sender: &Self::Sender, jobs: &[Job]) -> usize {
+        sender.send_many(jobs)
+    }
+
     fn recv(receiver: &Self::Receiver) -> Result<Job, RecvError> {
-        receiver.recv()
+        receiver.recv_with_spin(128)
     }
 
     fn try_recv(receiver: &Self::Receiver) -> Result<Job, TryRecvError> {
@@ -99,8 +108,12 @@ impl<P: Platform> JobQueue<P> for BoundedJobs<P> {
         })
     }
 
+    fn send_many(sender: &Self::Sender, jobs: &[Job]) -> usize {
+        sender.send_many(jobs)
+    }
+
     fn recv(receiver: &Self::Receiver) -> Result<Job, RecvError> {
-        receiver.recv()
+        receiver.recv_with_spin(128)
     }
 
     fn try_recv(receiver: &Self::Receiver) -> Result<Job, TryRecvError> {
@@ -254,13 +267,7 @@ where
             .work_amount_hint
             .fetch_add(jobs.len(), Ordering::Relaxed);
 
-        let mut sent = 0usize;
-
-        for &job in jobs {
-            if Q::send(&self.sender, job).is_ok() {
-                sent += 1;
-            }
-        }
+        let sent = Q::send_many(&self.sender, jobs);
 
         let failed = jobs.len() - sent;
 

@@ -54,10 +54,10 @@ impl<E: ExecutorPlatform> TaskTable<E> {
     }
 
     pub fn allocate(&self) -> Option<SlotHandle> {
-        self.allocate_with_refs(1)
+        self.allocate_with_refs(1).map(|(handle, _)| handle)
     }
 
-    pub(crate) fn allocate_with_refs(&self, refs: u32) -> Option<SlotHandle> {
+    pub(crate) fn allocate_with_refs(&self, refs: u32) -> Option<(SlotHandle, &TaskSlot)> {
         assert!(refs != 0 && refs <= REF_MASK);
         let handle = if GlobalAsyncExecutor::<E>::global().task_table
             .get()
@@ -71,7 +71,7 @@ impl<E: ExecutorPlatform> TaskTable<E> {
         slot.prepare_for_allocation();
         slot.gen_ref
             .store(pack_gen_ref(handle.generation, refs), Ordering::Release);
-        Some(SlotHandle { handle })
+        Some((SlotHandle { handle }, slot))
     }
 
     #[inline]
@@ -204,6 +204,30 @@ impl<E: ExecutorPlatform> TaskTable<E> {
                 Err(next) if unpack_gen(next) != expected_gen => return,
                 Err(_) => core::hint::spin_loop(),
             }
+        }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn decrement_owned_refs(
+        &self,
+        slot: &TaskSlot,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+        count: u32,
+    ) {
+        let previous = slot.gen_ref.fetch_sub(count, Ordering::AcqRel);
+        debug_assert!(count != 0 && unpack_ref(previous) >= count);
+        debug_assert_eq!(unpack_gen(previous), generation & GEN_MASK);
+        if unpack_ref(previous) == count {
+            self.release_slot(
+                SlabHandle {
+                    shard: shard_idx as u8,
+                    local_index: local_idx as u32,
+                    generation: generation & GEN_MASK,
+                },
+                slot,
+            );
         }
     }
 

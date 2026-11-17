@@ -3,13 +3,7 @@ use crate::global_async::WorkerShared;
 use crate::growable_slab::SlabHandle;
 use core::cell::{Cell, RefCell};
 
-pub type JobFn = extern "C" fn(usize);
-
-#[derive(Clone, Copy)]
-pub struct Job {
-    pub f: JobFn,
-    pub a: usize,
-}
+pub use kernel_sync::workers::thread_pool::{Job, JobFn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CurrentExecutorContext {

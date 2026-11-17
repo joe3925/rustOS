@@ -43,13 +43,18 @@ struct ReadyHead(AtomicUsize);
 pub(crate) struct ReadyBatch {
     pub current: usize,
     pub local_task: usize,
+    pub local_slot: Option<&'static crate::runtime::slab::slot::TaskSlot>,
     pub local_runs: u8,
     pub shard_cursor: usize,
+    pub pending_head: usize,
+    pub pending_tail: usize,
+    pub pending_count: usize,
 }
 
 #[repr(align(64))]
 pub(crate) struct BatchSlot {
     pub state: AtomicU8,
+    pub index: usize,
     pub batch: UnsafeCell<ReadyBatch>,
 }
 
@@ -224,6 +229,7 @@ pub struct ExecutorDomainInfo {
 pub struct ExecutorDomain<E: ExecutorPlatform> {
     id: ExecutorDomainId,
     ready_heads: Box<[ReadyHead]>,
+    pub(crate) ready_batches: CacheAligned,
     pub(crate) batches: Box<[BatchSlot]>,
     pub(crate) help_requested: AtomicBool,
     reclamation: Arc<DomainReclamation<E>>,
@@ -257,14 +263,20 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
                 .map(|_| ReadyHead(AtomicUsize::new(0)))
                 .collect::<alloc::vec::Vec<_>>()
                 .into_boxed_slice(),
+            ready_batches: CacheAligned(AtomicUsize::new(0)),
             batches: (0..workers.max(1))
                 .map(|index| BatchSlot {
                     state: AtomicU8::new(BATCH_EMPTY),
+                    index,
                     batch: UnsafeCell::new(ReadyBatch {
                         current: 0,
                         local_task: 0,
+                        local_slot: None,
                         local_runs: 0,
                         shard_cursor: index % config.ready_shards,
+                        pending_head: 0,
+                        pending_tail: 0,
+                        pending_count: 0,
                     }),
                 })
                 .collect(),
@@ -325,33 +337,33 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
     }
 
     pub fn has_queued_work(&self) -> bool {
-        self.ready_heads
-            .iter()
-            .any(|head| head.0.load(Ordering::Acquire) != 0)
+        self.ready_batches.0.load(Ordering::Acquire) != 0
             || self
-                .batches
+                .ready_heads
                 .iter()
-                .any(|slot| slot.state.load(Ordering::Acquire) == BATCH_READY)
+                .any(|head| head.0.load(Ordering::Acquire) != 0)
     }
 
     #[inline]
-    pub(crate) fn enqueue_task(&self, task_id: usize) -> Option<bool> {
+    pub(crate) fn enqueue_tasks(
+        &self,
+        task_id: usize,
+        tail: &crate::runtime::slab::slot::TaskSlot,
+        shard_hint: Option<usize>,
+    ) -> Option<bool> {
         if self.state() != ExecutorDomainState::Active || task_id == 0 {
             return None;
         }
-        let Some((shard, local, generation)) =
+        let Some((shard, local, _)) =
             crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
         else {
             return None;
         };
-        let slab = crate::runtime::slab::task_slab::get_task_table::<E>();
-        let Some(slot) = slab.get_slot(shard, local, generation) else {
-            return None;
-        };
-        let ready_head = &self.ready_heads[(shard ^ local) % self.ready_heads.len()];
+        let ready_head =
+            &self.ready_heads[shard_hint.unwrap_or(shard ^ local) % self.ready_heads.len()];
         let mut head = ready_head.0.load(Ordering::Relaxed);
         loop {
-            slot.ready_next.store(head, Ordering::Relaxed);
+            tail.ready_next.store(head, Ordering::Relaxed);
             match ready_head
                 .0
                 .compare_exchange(head, task_id, Ordering::Release, Ordering::Relaxed)
@@ -364,7 +376,7 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
 
     pub(crate) fn refill_batch(&self, batch: &mut ReadyBatch) -> bool {
         let shard_count = self.ready_heads.len();
-        let start = batch.shard_cursor;
+        let start = batch.shard_cursor % shard_count;
         for offset in 0..shard_count {
             let index = (start + offset) % shard_count;
             let head = &self.ready_heads[index].0;

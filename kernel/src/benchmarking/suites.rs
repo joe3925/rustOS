@@ -66,7 +66,14 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
             "executor.spawn",
             "Kernel executor spawn call cost",
             vec!["ci".to_string(), "executor".to_string()],
-            super::spawn::suite,
+            super::spawn::suite::<false>,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
+            "executor.spawn-latency",
+            "Async spawn to first poll with one task in flight",
+            vec!["ci".to_string(), "executor".to_string()],
+            super::spawn::suite::<true>,
         )
         .with_independent_boots(INDEPENDENT_BOOTS),
         BenchSuiteDescriptor::new(

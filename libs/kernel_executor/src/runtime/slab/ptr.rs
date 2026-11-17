@@ -1,6 +1,6 @@
 use super::super::runtime::submit_global_to_executor_domain;
-use super::slot::{PollResult, WakeAction};
-use super::task_slab::get_task_table;
+use super::slot::{PollResult, TaskSlot, WakeAction};
+use super::task_slab::{TaskTable, get_task_table};
 use crate::platform::ExecutorPlatform;
 
 const PTR_SHARD_BITS: usize = 3;
@@ -35,14 +35,17 @@ pub fn decode_slab_task_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
     Some((shard_idx, local_idx, generation))
 }
 
-#[inline(always)]
-fn poll_slab_task<E: ExecutorPlatform>(ctx: usize) {
+#[inline(never)]
+pub(crate) extern "C" fn poll_slab_task<E: ExecutorPlatform>(
+    slab: &TaskTable<E>,
+    ctx: usize,
+    cached_slot: Option<&TaskSlot>,
+) {
     let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(ctx) else {
         return;
     };
 
-    let slab = get_task_table::<E>();
-    let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
+    let Some(slot) = cached_slot.or_else(|| slab.get_slot(shard_idx, local_idx, generation)) else {
         return;
     };
 
@@ -53,7 +56,7 @@ fn poll_slab_task<E: ExecutorPlatform>(ctx: usize) {
         PollResult::Completed => 2,
         PollResult::Requeued => return,
     };
-    slab.decrement_refs::<true>(shard_idx, local_idx, generation, refs);
+    unsafe { slab.decrement_owned_refs(slot, shard_idx, local_idx, generation, refs) };
 }
 
 #[inline(always)]
@@ -86,7 +89,7 @@ pub fn enqueue_slab_task<E: ExecutorPlatform>(shard_idx: usize, local_idx: usize
 
 #[inline(never)]
 pub extern "C" fn slab_task_poll_trampoline<E: ExecutorPlatform>(ctx: usize) {
-    poll_slab_task::<E>(ctx);
+    poll_slab_task::<E>(get_task_table::<E>(), ctx, None);
 }
 
 #[cfg(test)]

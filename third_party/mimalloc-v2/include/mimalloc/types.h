@@ -332,6 +332,9 @@ typedef struct mi_page_s {
   uint8_t               free_is_zero:1;    // `true` if the blocks in the free list are zero initialized
   uint8_t               retire_expire:7;   // expiration count for retired blocks
 
+#if defined(MI_RUSTOS_HIGH_HALF)
+  _Alignas(64)
+#endif
   mi_block_t*           free;              // list of available free blocks (`malloc` allocates from this list)
   mi_block_t*           local_free;        // list of deferred free blocks by this thread (migrates to `free`)
   uint16_t              used;              // number of blocks in use (including blocks in `thread_free`)
@@ -345,6 +348,9 @@ typedef struct mi_page_s {
   uintptr_t             keys[2];           // two random keys to encode the free lists (see `_mi_block_next`) or padding canary
   #endif
 
+#if defined(MI_RUSTOS_HIGH_HALF)
+  _Alignas(64)
+#endif
   _Atomic(mi_thread_free_t) xthread_free;  // list of deferred free blocks freed by other threads
   _Atomic(uintptr_t)        xheap;
 

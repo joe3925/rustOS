@@ -15,6 +15,7 @@ use kernel_types::{
 };
 
 use crate::{
+    platform,
     scheduling::runtime::runtime::KernelExecutorPlatform,
     structs::stopwatch::Stopwatch,
 };
@@ -28,28 +29,38 @@ const TASKS: usize = 256;
 const TRIALS: usize = 15;
 const TOLERANCE_PERCENT: f64 = 5.0;
 
-pub(super) extern "C" fn suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {
+pub(super) extern "C" fn suite<const LATENCY: bool>(
+    handle: BenchRunHandle,
+) -> AbiFuture<BenchSuiteStatus> {
     async move {
         let mut cases = [
+            "spawn_to_run",
             "spawn",
             "spawn_join_owned",
             "spawn_detached",
             "spawn_blocking",
             "spawn_blocking_many",
         ];
+        let cases = if LATENCY { &mut cases[..1] } else { &mut cases[1..] };
         let repetition = super::boot_state::current_repetition().await;
         let case_count = cases.len();
         cases.rotate_left(repetition.saturating_sub(1) as usize % case_count);
 
-        for case in cases {
+        for &case in cases.iter() {
             if !bench_case_start(handle, case.to_string()) {
                 return BenchSuiteStatus::Failed;
             }
 
             let mut timer_ns = 0;
             for _ in 0..TASKS {
-                let timer = Stopwatch::start();
-                timer_ns += black_box(timer.elapsed_nanos());
+                timer_ns += if LATENCY {
+                    let started = platform::ordered_cycle_counter();
+                    let finished = platform::ordered_cycle_counter();
+                    black_box(Stopwatch::from_cycles(finished - started).as_nanos() as u64)
+                } else {
+                    let timer = Stopwatch::start();
+                    black_box(timer.elapsed_nanos())
+                };
             }
             bench_measure(
                 handle,
@@ -63,6 +74,60 @@ pub(super) extern "C" fn suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteSt
                 let mut elapsed = 0;
                 let mut completed = 0;
                 match case {
+                    "spawn_to_run" => {
+                        let mut storage = Box::pin(JoinStorage::new());
+                        let mut samples = Vec::with_capacity(TASKS);
+                        for _ in 0..TASKS {
+                            let storage = storage.as_mut();
+                            let future = async { platform::ordered_cycle_counter() };
+                            let started = platform::ordered_cycle_counter();
+                            let outcome =
+                                spawn::<KernelExecutorPlatform, _, _>(storage, future).await;
+                            let TaskOutcome::Completed(running) = outcome else {
+                                bench_case_fail(handle, "spawn_to_run: task did not complete".into());
+                                bench_case_end(handle);
+                                return BenchSuiteStatus::Failed;
+                            };
+                            let Some(cycles) = running.checked_sub(started) else {
+                                bench_case_fail(
+                                    handle,
+                                    "spawn_to_run: cycle counter moved backwards".into(),
+                                );
+                                bench_case_end(handle);
+                                return BenchSuiteStatus::Failed;
+                            };
+                            let nanos = Stopwatch::from_cycles(cycles).as_nanos() as u64;
+                            samples.push(nanos);
+                            elapsed += nanos;
+                            completed += 1;
+                        }
+                        if trial != 0 {
+                            samples.sort_unstable();
+                            for (metric, value) in [
+                                (
+                                    "spawn_to_run_p50_ns",
+                                    (samples[TASKS / 2 - 1] as f64 + samples[TASKS / 2] as f64) / 2.0,
+                                ),
+                                (
+                                    "spawn_to_run_p95_ns",
+                                    samples[(TASKS * 95).div_ceil(100) - 1] as f64,
+                                ),
+                                (
+                                    "spawn_to_run_p99_ns",
+                                    samples[(TASKS * 99).div_ceil(100) - 1] as f64,
+                                ),
+                            ] {
+                                bench_measure_with_tolerance(
+                                    handle,
+                                    metric.to_string(),
+                                    value,
+                                    BenchMetricUnit::Nanoseconds,
+                                    BenchMetricDirection::LowerIsBetter,
+                                    Some(TOLERANCE_PERCENT),
+                                );
+                            }
+                        }
+                    }
                     "spawn" => {
                         let mut storage: Vec<_> = (0..TASKS)
                             .map(|_| Box::pin(JoinStorage::new()))
@@ -154,7 +219,7 @@ pub(super) extern "C" fn suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteSt
                 if trial != 0 {
                     bench_measure_with_tolerance(
                         handle,
-                        "submit_ns_per_task".to_string(),
+                        if LATENCY { "spawn_to_run_ns" } else { "submit_ns_per_task" }.to_string(),
                         elapsed as f64 / TASKS as f64,
                         BenchMetricUnit::Nanoseconds,
                         BenchMetricDirection::LowerIsBetter,

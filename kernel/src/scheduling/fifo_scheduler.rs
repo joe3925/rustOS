@@ -157,7 +157,10 @@ impl SchedulerClass for FifoClass {
 
         if matches!(
             reason,
-            EnqueueReason::Preempted | EnqueueReason::Yielded | EnqueueReason::Migrated
+            EnqueueReason::Wakeup
+                | EnqueueReason::Preempted
+                | EnqueueReason::Yielded
+                | EnqueueReason::Migrated
         ) {
             if hint_cpu < n
                 && cpus.contains(hint_cpu)

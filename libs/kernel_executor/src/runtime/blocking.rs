@@ -377,29 +377,33 @@ where
                 .registry_index
                 .store(index + 1, Ordering::Release);
         }
-        #[cfg(miri)]
-        let ptr = register_blocking_task(task.clone());
-        #[cfg(not(miri))]
-        let ptr = Arc::into_raw(task.clone()) as usize;
-        Job {
-            f: blocking_trampoline::<E, F, R>,
-            a: ptr,
-        }
     };
-    let job = if raw == 0 {
-        Some(prepare())
+    let accepted = if raw == 0 {
+        prepare();
+        true
     } else {
         GlobalAsyncExecutor::<E>::global()
             .with_executor_domain(ExecutorDomainId::from_raw(raw), |domain| {
                 (domain.state() == ExecutorDomainState::Active).then(prepare)
             })
             .flatten()
+            .is_some()
     };
-    if job.is_none() {
+    let job = if accepted {
+        #[cfg(miri)]
+        let ptr = register_blocking_task(task);
+        #[cfg(not(miri))]
+        let ptr = Arc::into_raw(task) as usize;
+        Some(Job {
+            f: blocking_trampoline::<E, F, R>,
+            a: ptr,
+        })
+    } else {
         unsafe {
-            cancel_registered::<E, F, R>(Arc::into_raw(task.clone()).cast());
+            cancel_registered::<E, F, R>(Arc::into_raw(task).cast());
         }
-    }
+        None
+    };
     (BlockingJoin::new(join_ptr, drop_shared_task::<F, R>), job)
 }
 
