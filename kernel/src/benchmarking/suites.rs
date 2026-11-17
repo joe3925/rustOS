@@ -63,6 +63,13 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
         )
         .with_independent_boots(INDEPENDENT_BOOTS),
         BenchSuiteDescriptor::new(
+            "executor.spawn",
+            "Kernel executor spawn call cost",
+            vec!["ci".to_string(), "executor".to_string()],
+            super::spawn::suite,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
             "io.c-drive",
             "End-to-end C drive read/write workload",
             vec!["ci".to_string(), "io".to_string()],

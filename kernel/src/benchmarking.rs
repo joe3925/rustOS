@@ -18,6 +18,8 @@ mod multi_file;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod runner;
 #[cfg(feature = "kernel-bench")]
+mod spawn;
+#[cfg(feature = "kernel-bench")]
 mod suites;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod task_batch;
