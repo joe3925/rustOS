@@ -210,6 +210,7 @@ fn stamp() -> Result<u128, String> {
 
 pub fn collect(
     report: &Value,
+    report_directory: &Path,
     output: &Path,
     plan: &BuildPlan,
     release: bool,
@@ -261,6 +262,32 @@ pub fn collect(
                 return Err("Invalid profile component name".to_string());
             }
             match kind {
+                "pgo_file" => {
+                    if completed.contains(component) || captures.contains_key(component) {
+                        return Err(format!("Duplicate profile for {component}"));
+                    }
+                    let expected = payload["bytes"].as_u64()
+                        .filter(|bytes| *bytes > 0 && *bytes <= 128 * 1024 * 1024)
+                        .ok_or_else(|| format!("Invalid profile size for {component}"))?;
+                    let file = payload["file"].as_str()
+                        .ok_or_else(|| format!("Missing profile filename for {component}"))?;
+                    let relative = Path::new(file);
+                    if relative.is_absolute() || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+                        return Err(format!("Invalid profile path for {component}"));
+                    }
+                    let source = report_directory.join(relative);
+                    let path = profiles_dir.join(format!("{component}-{run_index}.profraw"));
+                    if fs::metadata(&source).map_err(|error| error.to_string())?.len() != expected {
+                        return Err(format!("Incomplete profile for {component}"));
+                    }
+                    let copied = fs::copy(&source, &path)
+                        .map_err(|error| format!("Cannot copy {}: {error}", source.display()))?;
+                    if copied != expected {
+                        return Err(format!("Incomplete profile copy for {component}"));
+                    }
+                    raw_profiles.entry(component.to_string()).or_default().push(path);
+                    completed.insert(component.to_string());
+                }
                 "pgo_start" => {
                     let expected = payload["bytes"]
                         .as_u64()

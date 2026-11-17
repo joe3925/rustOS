@@ -15,7 +15,7 @@ permissions:
   actions: read
 
 env:
-  BENCH_ENV_VERSION: "3"
+  BENCH_ENV_VERSION: "5"
 
 jobs:
   benchmark:
@@ -119,7 +119,7 @@ jobs:
                 [[ "$(jq -r --arg default_branch "$DEFAULT_BRANCH" '.branch // $default_branch' "$manifest")" == "$baseline_branch" ]] &&
                 jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
                 baseline_commit="$(jq -r '.commit // empty' "$manifest")"
-                [[ -n "$baseline_commit" && "$baseline_commit" != "$GITHUB_SHA" ]] || continue
+                [[ -n "$baseline_commit" ]] || continue
                 git merge-base --is-ancestor "$baseline_commit" "$GITHUB_SHA" || continue
                 acceptance="$(jq -r '.accepted_by_run' "$manifest")"
                 if [[ "$acceptance" =~ ^[0-9]+$ ]] && (( acceptance > best_acceptance )); then
@@ -143,7 +143,7 @@ jobs:
             list_runs "$DEFAULT_BRANCH" success |
               jq -r '.workflow_runs[] | [.id, .head_sha] | @tsv' > "$trusted_candidates"
             while IFS=$'\t' read -r run_id commit; do
-              [[ "$run_id" == "$GITHUB_RUN_ID" || "$commit" == "$GITHUB_SHA" ]] && continue
+              [[ "$run_id" == "$GITHUB_RUN_ID" ]] && continue
               git merge-base --is-ancestor "$commit" "$GITHUB_SHA" || continue
               run_dir="$baseline_cache/main-${run_id}"
               mkdir -p "$run_dir"
@@ -213,11 +213,15 @@ jobs:
           git worktree add --detach "$baseline_worktree" "$commit"
           trap 'git -C "$GITHUB_WORKSPACE" worktree remove --force "$baseline_worktree"' EXIT
           cd "$baseline_worktree"
+          if ! grep -Fqx "  BENCH_ENV_VERSION: \"$BENCH_ENV_VERSION\"" .github/workflows/kernel-benchmarks.yml; then
+            echo "The earlier default branch baseline uses a different benchmark environment version."
+            exit 0
+          fi
           bash "$GITHUB_WORKSPACE/.github/scripts/prepare-pgo-tools.sh"
           if grep -q -- '"--pgo-output"' tooling/xtask/src/bench.rs; then
             cargo run --release -p xtask -- bench \
               --platform x86_64-uefi --profile release \
-              --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 1 \
+              --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 5 \
               --pgo --merge --pgo-output target/bench/training/profiles \
               --output target/bench/training/results.json
             RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- pgo \
@@ -241,7 +245,7 @@ jobs:
         run: |
           cargo run --release -p xtask -- bench \
             --platform x86_64-uefi --profile release \
-            --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 1 \
+            --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 5 \
             --pgo --merge --pgo-output target/bench/training/profiles \
             --output target/bench/training/results.json
           RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- pgo \
@@ -333,7 +337,7 @@ jobs:
             {
               echo "## Against trusted baseline"
               echo
-              echo "No compatible earlier baseline is available for this branch or the default branch. Run this workflow with \`accept_run_id\` set to a completed benchmark run from an earlier ancestor commit."
+              echo "No compatible baseline is available for this branch or the default branch. Set \`accept_run_id\` to a completed benchmark run from the current commit or an ancestor, with the current benchmark environment version."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -366,6 +370,7 @@ jobs:
             target/bench/**/*.json
             target/bench/**/*.md
             target/bench/**/*.log
+            target/bench/**/*.profraw
             target/bench/head/boot.img
             target/bench/head/environment-version
             !target/bench/baselines/**
