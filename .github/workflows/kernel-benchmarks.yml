@@ -42,6 +42,18 @@ jobs:
           sudo chmod 666 /dev/kvm
           ls -l /dev/kvm
 
+      - name: Check disk capacity
+        shell: bash
+        run: |
+          find "$RUNNER_TEMP" -maxdepth 1 -type d \( -name 'rustos-baselines-*' -o -name 'rustos-benchmark-source.*' \) -exec rm -rf -- {} +
+          rm -f -- "$RUNNER_TEMP/rustos-ci-seed.img"
+          available="$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -1)"
+          if (( available < 10 * 1024 * 1024 * 1024 )); then
+            echo "::error::Benchmarks require at least 10 GiB of free disk space before the build."
+            df -h "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+
       - name: Verify benchmark host
         shell: bash
         run: |
@@ -83,6 +95,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           baseline_cache="$(mktemp -d "$RUNNER_TEMP/rustos-baselines-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")"
+          trap 'rm -rf -- "$baseline_cache"' EXIT
           mkdir -p "$baseline_cache" target/bench
 
           list_runs() {
@@ -108,6 +121,7 @@ jobs:
               if ! gh run download "$run_id" \
                 --name kernel-benchmark-anchor \
                 --dir "$run_dir"; then
+                rm -rf -- "$run_dir"
                 continue
               fi
 
@@ -119,13 +133,21 @@ jobs:
                 [[ "$(jq -r --arg default_branch "$DEFAULT_BRANCH" '.branch // $default_branch' "$manifest")" == "$baseline_branch" ]] &&
                 jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
                 baseline_commit="$(jq -r '.commit // empty' "$manifest")"
-                [[ -n "$baseline_commit" ]] || continue
-                git merge-base --is-ancestor "$baseline_commit" "$GITHUB_SHA" || continue
+                if [[ -z "$baseline_commit" ]] || ! git merge-base --is-ancestor "$baseline_commit" "$GITHUB_SHA"; then
+                  rm -rf -- "$run_dir"
+                  continue
+                fi
                 acceptance="$(jq -r '.accepted_by_run' "$manifest")"
                 if [[ "$acceptance" =~ ^[0-9]+$ ]] && (( acceptance > best_acceptance )); then
+                  if [[ -n "$best_dir" ]]; then
+                    rm -rf -- "$best_dir"
+                  fi
                   best_acceptance="$acceptance"
                   best_dir="$run_dir"
                 fi
+              fi
+              if [[ "$run_dir" != "$best_dir" ]]; then
+                rm -rf -- "$run_dir"
               fi
             done < "$trusted_candidates"
             if [[ -n "$best_dir" ]]; then
@@ -283,6 +305,12 @@ jobs:
           run_variant() {
             local variant="$1"
             local boot_image="$2"
+            local available
+            available="$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -1)"
+            if (( available < 7 * 1024 * 1024 * 1024 )); then
+              echo "::error::Benchmarks require 7 GiB of free disk space for the 5 GiB image and runner output."
+              return 1
+            fi
             mkdir -p "target/bench/${variant}"
             cargo run --release -p xtask -- bench \
               --platform x86_64-uefi --profile release \
@@ -418,6 +446,16 @@ jobs:
           if-no-files-found: ignore
           overwrite: true
           retention-days: 90
+
+      - name: Remove temporary benchmark files
+        if: always()
+        shell: bash
+        run: |
+          find "$RUNNER_TEMP" -maxdepth 1 -type d \( -name 'rustos-baselines-*' -o -name 'rustos-benchmark-source.*' \) -exec rm -rf -- {} +
+          rm -f -- "$RUNNER_TEMP/rustos-ci-seed.img"
+          if [[ -d target/bench ]]; then
+            find target/bench -type f -name 'system-*cpu.img' -delete
+          fi
 
   accept-baseline:
     if: github.event_name == 'workflow_dispatch' && inputs.accept_run_id != ''

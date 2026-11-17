@@ -4,6 +4,7 @@ commit="$1"
 destination="$2"
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
 download="$(mktemp -d "$RUNNER_TEMP/rustos-benchmark-source.XXXXXX")"
+trap 'rm -rf -- "$download"' EXIT
 
 for artifact_name in "kernel-benchmark-source-v${BENCH_ENV_VERSION}-${commit}" kernel-benchmarks; do
   gh api --paginate \
@@ -14,7 +15,8 @@ for artifact_name in "kernel-benchmark-source-v${BENCH_ENV_VERSION}-${commit}" k
     | sort_by(.created_at, .id) | reverse | .[].id
   ' "$download/artifacts.json" > "$download/candidates.txt"
   while read -r artifact_id; do
-    source_dir="$download/$artifact_id"
+    source_dir="$download/candidate"
+    rm -rf -- "$source_dir" "$source_dir.zip"
     gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$source_dir.zip"
     unzip -q "$source_dir.zip" -d "$source_dir"
     if [[ "$artifact_name" == kernel-benchmarks ]]; then

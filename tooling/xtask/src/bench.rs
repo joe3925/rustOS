@@ -368,7 +368,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
     let mut runs = Vec::new();
     for cpus in options.cpus {
         let disk_path = bench_dir.join(format!("system-{cpus}cpu.img"));
-        if !options.correctness && seed_disk.format != "raw" {
+        if !options.correctness {
             let sibling = qemu.with_file_name(format!("qemu-img{}", std::env::consts::EXE_SUFFIX));
             let image_tool = if sibling.is_file() {
                 sibling
@@ -377,10 +377,11 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                     .ok_or_else(|| "Install qemu-img to convert the benchmark disk to raw format".to_string())?
             };
             let status = Command::new(image_tool)
-                .args(["convert", "-f", &seed_disk.format, "-O", "raw"])
+                .args(["convert", "-f", &seed_disk.format, "-O", "raw", "-S", "4k"])
                 .arg(&seed_disk.path).arg(&disk_path)
                 .status().map_err(|error| format!("Cannot convert the benchmark disk: {error}"))?;
             if !status.success() {
+                let _ = fs::remove_file(&disk_path);
                 return Err(format!("Benchmark disk conversion failed: {status}"));
             }
         } else {
