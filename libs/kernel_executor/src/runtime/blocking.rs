@@ -337,7 +337,7 @@ where
     } else {
         GlobalAsyncExecutor::<E>::global().with_executor_domain(
             ExecutorDomainId::from_raw(raw),
-            |domain| {
+            |domain, _| {
                 if domain.state() == ExecutorDomainState::Active {
                     run();
                 }
@@ -383,7 +383,7 @@ where
         true
     } else {
         GlobalAsyncExecutor::<E>::global()
-            .with_executor_domain(ExecutorDomainId::from_raw(raw), |domain| {
+            .with_executor_domain(ExecutorDomainId::from_raw(raw), |domain, _| {
                 (domain.state() == ExecutorDomainState::Active).then(prepare)
             })
             .flatten()

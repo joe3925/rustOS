@@ -54,21 +54,34 @@ impl<E: ExecutorPlatform> TaskTable<E> {
     }
 
     pub fn allocate(&self) -> Option<SlotHandle> {
-        self.allocate_with_refs(1).map(|(handle, _)| handle)
+        if E::in_interrupt_context() {
+            self.allocate_with_refs::<false>(1, None).map(|(handle, _)| handle)
+        } else {
+            crate::platform::with_executor_local::<E, _>(|local| {
+                self.allocate_with_refs::<false>(1, Some(local)).map(|(handle, _)| handle)
+            })
+        }
     }
 
-    pub(crate) fn allocate_with_refs(&self, refs: u32) -> Option<(SlotHandle, &TaskSlot)> {
+    #[inline(always)]
+    pub(crate) fn allocate_with_refs<const GLOBAL: bool>(
+        &self,
+        refs: u32,
+        local: Option<&crate::platform::ExecutorThreadLocal<E>>,
+    ) -> Option<(SlotHandle, &TaskSlot)> {
         assert!(refs != 0 && refs <= REF_MASK);
-        let handle = if GlobalAsyncExecutor::<E>::global().task_table
-            .get()
-            .is_some_and(|table| core::ptr::eq(table, self))
+        let (handle, slot) = if local.is_some()
+            && (GLOBAL
+                || GlobalAsyncExecutor::<E>::global()
+                    .task_table
+                    .get()
+                    .is_some_and(|table| core::ptr::eq(table, self)))
         {
-            unsafe { self.slab.reserve_cached(0, 8)? }
+            unsafe { self.slab.reserve_cached(local.unwrap(), 0, 8)? }
         } else {
-            self.slab.reserve()?
+            let handle = self.slab.reserve()?;
+            (handle, self.slab.get(handle)?)
         };
-        let slot = self.slab.get(handle)?;
-        slot.prepare_for_allocation();
         slot.gen_ref
             .store(pack_gen_ref(handle.generation, refs), Ordering::Release);
         Some((SlotHandle { handle }, slot))

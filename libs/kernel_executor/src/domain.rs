@@ -47,7 +47,7 @@ pub(crate) struct ReadyBatch {
     pub local_runs: u8,
     pub shard_cursor: usize,
     pub pending_head: usize,
-    pub pending_tail: usize,
+    pub pending_tail: Option<&'static crate::runtime::slab::slot::TaskSlot>,
     pub pending_count: usize,
 }
 
@@ -231,7 +231,7 @@ pub struct ExecutorDomain<E: ExecutorPlatform> {
     ready_heads: Box<[ReadyHead]>,
     pub(crate) ready_batches: CacheAligned,
     pub(crate) batches: Box<[BatchSlot]>,
-    pub(crate) help_requested: AtomicBool,
+    pub(crate) help_requested: CacheAligned,
     reclamation: Arc<DomainReclamation<E>>,
     cleanup: UnsafeCell<DomainCleanup>,
 
@@ -275,12 +275,12 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
                         local_runs: 0,
                         shard_cursor: index % config.ready_shards,
                         pending_head: 0,
-                        pending_tail: 0,
+                        pending_tail: None,
                         pending_count: 0,
                     }),
                 })
                 .collect(),
-            help_requested: AtomicBool::new(false),
+            help_requested: CacheAligned(AtomicUsize::new(0)),
             reclamation,
             cleanup: UnsafeCell::new(DomainCleanup {
                 queue_index: 0,
@@ -349,7 +349,7 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
         &self,
         task_id: usize,
         tail: &crate::runtime::slab::slot::TaskSlot,
-        shard_hint: Option<usize>,
+        shard_hint: Option<&mut usize>,
     ) -> Option<bool> {
         if self.state() != ExecutorDomainState::Active || task_id == 0 {
             return None;
@@ -359,8 +359,11 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
         else {
             return None;
         };
-        let ready_head =
-            &self.ready_heads[shard_hint.unwrap_or(shard ^ local) % self.ready_heads.len()];
+        let shard_index = match &shard_hint {
+            Some(cursor) => **cursor,
+            None => (shard ^ local) % self.ready_heads.len(),
+        };
+        let ready_head = &self.ready_heads[shard_index];
         let mut head = ready_head.0.load(Ordering::Relaxed);
         loop {
             tail.ready_next.store(head, Ordering::Relaxed);
@@ -368,7 +371,16 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
                 .0
                 .compare_exchange(head, task_id, Ordering::Release, Ordering::Relaxed)
             {
-                Ok(_) => return Some(head == 0),
+                Ok(_) => {
+                    if let Some(cursor) = shard_hint {
+                        *cursor = if shard_index + 1 == self.ready_heads.len() {
+                            0
+                        } else {
+                            shard_index + 1
+                        };
+                    }
+                    return Some(head == 0);
+                }
                 Err(actual) => head = actual,
             }
         }
@@ -376,16 +388,19 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
 
     pub(crate) fn refill_batch(&self, batch: &mut ReadyBatch) -> bool {
         let shard_count = self.ready_heads.len();
-        let start = batch.shard_cursor % shard_count;
-        for offset in 0..shard_count {
-            let index = (start + offset) % shard_count;
+        let mut index = batch.shard_cursor;
+        for _ in 0..shard_count {
             let head = &self.ready_heads[index].0;
+            index += 1;
+            if index == shard_count {
+                index = 0;
+            }
             if head.load(Ordering::Relaxed) == 0 {
                 continue;
             }
             batch.current = head.swap(0, Ordering::Acquire);
             if batch.current != 0 {
-                batch.shard_cursor = (index + 1) % shard_count;
+                batch.shard_cursor = index;
                 return true;
             }
         }

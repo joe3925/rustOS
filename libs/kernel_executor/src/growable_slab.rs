@@ -1,4 +1,4 @@
-use crate::platform::ExecutorPlatform;
+use crate::platform::{ExecutorPlatform, ExecutorThreadLocal, SlabCacheEntry};
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::UnsafeCell;
 use core::ptr;
@@ -188,7 +188,8 @@ impl<T> SlabShard<T> {
         self.grow_chunk().then(|| self.try_reserve(shard)).flatten()
     }
 
-    fn reserve_batch(&self, shard: u8, handles: &mut [Option<SlabHandle>]) -> bool {
+    #[inline(never)]
+    fn reserve_batch(&self, shard: u8, entries: &mut [SlabCacheEntry]) -> usize {
         let published = self.published_chunks.load(Ordering::Acquire);
         let words_per_chunk = self.slots_per_chunk.div_ceil(64);
         let total_words = published * words_per_chunk;
@@ -207,7 +208,7 @@ impl<T> SlabShard<T> {
             while bits != 0 {
                 let mut remaining = bits;
                 let mut selected = 0u64;
-                for _ in 0..handles.len() {
+                for _ in 0..entries.len() {
                     if remaining == 0 {
                         break;
                     }
@@ -227,22 +228,30 @@ impl<T> SlabShard<T> {
                             let bit = selected.trailing_zeros() as usize;
                             selected &= !(1u64 << bit);
                             let local = local_word * 64 + bit;
-                            handles[count] = Some(SlabHandle {
-                                shard,
-                                local_index: (chunk_index * self.slots_per_chunk + local) as u32,
-                                generation: chunk.slots[local].state.load(Ordering::Relaxed) >> 1,
-                            });
+                            let slot = &chunk.slots[local];
+                            entries[count] = SlabCacheEntry {
+                                handle: SlabHandle {
+                                    shard,
+                                    local_index: (chunk_index * self.slots_per_chunk + local) as u32,
+                                    generation: slot.state.load(Ordering::Relaxed) >> 1,
+                                },
+                                slot: ptr::from_ref(slot).cast(),
+                            };
                             count += 1;
                         }
                         self.alloc_hint
                             .store(global_word * 64 + 64, Ordering::Relaxed);
-                        return true;
+                        return count;
                     }
                     Err(actual) => bits = actual,
                 }
             }
         }
-        self.grow_chunk() && self.reserve_batch(shard, handles)
+        if self.grow_chunk() {
+            self.reserve_batch(shard, entries)
+        } else {
+            0
+        }
     }
 
     fn cached_slot(&self, handle: SlabHandle) -> Option<&StableSlot<T>> {
@@ -357,49 +366,65 @@ impl<T, E: ExecutorPlatform> GrowableSlab<T, E> {
         None
     }
 
+    #[inline(always)]
     pub(crate) unsafe fn reserve_cached(
         &self,
+        tls: &ExecutorThreadLocal<E>,
         cache_index: usize,
         limit: usize,
-    ) -> Option<SlabHandle> {
-        if E::in_interrupt_context() {
-            return self.reserve();
+    ) -> Option<(SlabHandle, &T)> {
+        let uncached = || {
+            let handle = self.reserve()?;
+            Some((handle, self.get(handle)?))
+        };
+        debug_assert!(!E::in_interrupt_context());
+        if tls.active_domain.get().is_null() {
+            return uncached();
         }
-        crate::platform::with_executor_local::<E, _>(|tls| {
-            if tls.active_domain.get().is_null() {
-                return self.reserve();
-            }
-            let mut caches = tls.caches.borrow_mut();
-            let cache = &mut caches[cache_index];
-            let owner = self as *const Self as *const ();
-            if !cache.owner.is_null() && cache.owner != owner {
-                return self.reserve();
-            }
+        let mut caches = tls.caches.borrow_mut();
+        let cache = &mut caches[cache_index];
+        let owner = self as *const Self as *const ();
+        if cache.owner.is_null() {
             cache.owner = owner;
             cache.flush = Some(Self::return_cached_batch);
-            let handles = &mut cache.handles[..limit];
-            let handle = handles.iter_mut().find_map(Option::take).or_else(|| {
-                let start = tls.allocation_cursor.get() % self.shards.len();
-                for offset in 0..self.shards.len() {
-                    let shard = (start + offset) % self.shards.len();
-                    if self.shards[shard].reserve_batch(shard as u8, handles) {
-                        tls.allocation_cursor.set(shard);
-                        return handles.iter_mut().find_map(Option::take);
-                    }
+        } else if cache.owner != owner {
+            return uncached();
+        }
+        if cache.len == 0 {
+            let shard_count = self.shards.len();
+            let mut shard = tls.allocation_cursor.get();
+            if shard >= shard_count {
+                shard %= shard_count;
+            }
+            for _ in 0..shard_count {
+                cache.len = self.shards[shard]
+                    .reserve_batch(shard as u8, &mut cache.entries[..limit]);
+                if cache.len != 0 {
+                    tls.allocation_cursor.set(shard);
+                    break;
                 }
-                None
-            })?;
-            let shard = &self.shards[handle.shard as usize];
-            let slot = shard
-                .cached_slot(handle)
-                .expect("cached slab slot disappeared");
-            let generation = (handle.generation + 1) & 0xffff;
-            slot.state.store((generation << 1) | 1, Ordering::Release);
-            Some(SlabHandle {
+                shard += 1;
+                if shard == shard_count {
+                    shard = 0;
+                }
+            }
+            if cache.len == 0 {
+                return None;
+            }
+        }
+        cache.len -= 1;
+        let entry = cache.entries[cache.len];
+        let handle = entry.handle;
+        let slot = unsafe { &*entry.slot.cast::<StableSlot<T>>() };
+        let generation = (handle.generation + 1) & 0xffff;
+        slot.state.store((generation << 1) | 1, Ordering::Release);
+        Some((
+            SlabHandle {
                 generation,
                 ..handle
-            })
-        })
+            },
+            unsafe { &*slot.value.get() },
+        ))
     }
 
     pub(crate) unsafe fn release_cached(
@@ -441,35 +466,43 @@ impl<T, E: ExecutorPlatform> GrowableSlab<T, E> {
             }
             cache.owner = owner;
             cache.flush = Some(Self::return_cached_batch);
-            let handles = &mut cache.handles[..limit];
-            if handles.iter().all(Option::is_some) {
-                unsafe { Self::return_cached_batch(owner, handles) };
+            if cache.len == limit {
+                unsafe { Self::return_cached_batch(owner, &mut cache.entries[..cache.len]) };
+                cache.len = 0;
             }
-            *handles.iter_mut().find(|entry| entry.is_none()).unwrap() = Some(handle);
+            let index = cache.len;
+            cache.entries[index] = SlabCacheEntry {
+                handle,
+                slot: ptr::from_ref(slot).cast(),
+            };
+            cache.len = index + 1;
             true
         })
     }
 
-    unsafe fn return_cached_batch(owner: *const (), handles: &mut [Option<SlabHandle>]) {
+    unsafe fn return_cached_batch(owner: *const (), entries: &mut [SlabCacheEntry]) {
         let slab = unsafe { &*owner.cast::<Self>() };
-        for index in 0..handles.len() {
-            let Some(handle) = handles[index].take() else {
+        for index in 0..entries.len() {
+            if entries[index].slot.is_null() {
                 continue;
-            };
+            }
+            let handle = entries[index].handle;
+            entries[index].slot = ptr::null();
             let shard = &slab.shards[handle.shard as usize];
             let local = handle.local_index as usize;
             let chunk_index = local / shard.slots_per_chunk;
             let word = (local % shard.slots_per_chunk) / 64;
             let mut mask = 1u64 << (local % shard.slots_per_chunk % 64);
-            for other in &mut handles[index + 1..] {
-                if let Some(candidate) = *other {
+            for other in &mut entries[index + 1..] {
+                if !other.slot.is_null() {
+                    let candidate = other.handle;
                     let candidate_local = candidate.local_index as usize;
                     if candidate.shard == handle.shard
                         && candidate_local / shard.slots_per_chunk == chunk_index
                         && (candidate_local % shard.slots_per_chunk) / 64 == word
                     {
                         mask |= 1u64 << (candidate_local % shard.slots_per_chunk % 64);
-                        *other = None;
+                        other.slot = ptr::null();
                     }
                 }
             }

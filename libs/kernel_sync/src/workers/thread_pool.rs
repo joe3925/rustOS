@@ -113,7 +113,7 @@ impl<P: Platform> JobQueue<P> for BoundedJobs<P> {
     }
 
     fn recv(receiver: &Self::Receiver) -> Result<Job, RecvError> {
-        receiver.recv_with_spin(128)
+        receiver.recv_with_spin(2048)
     }
 
     fn try_recv(receiver: &Self::Receiver) -> Result<Job, TryRecvError> {

@@ -110,23 +110,6 @@ impl TaskSlot {
     }
 
     #[inline]
-    pub(super) fn prepare_for_allocation(&self) {
-        self.state.store(STATE_IDLE, Ordering::Relaxed);
-        self.control.store(0, Ordering::Relaxed);
-        self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
-        self.ready_next.store(0, Ordering::Relaxed);
-        self.retired_next.store(0, Ordering::Relaxed);
-        write_poll_fn(&self.poll_fn, None);
-        write_drop_fn(&self.drop_fn, None);
-        unsafe { *self.cancel_fn.get() = None };
-        self.result_ptr.store(RESULT_ABANDONED, Ordering::Relaxed);
-        unsafe {
-            *self.future.get() = None;
-        }
-        self.domain_id.store(0, Ordering::Release);
-    }
-
-    #[inline]
     #[cfg_attr(irq_check, irq::forbidden)]
     pub(super) fn release_last_ref(&self) {
         if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
@@ -153,6 +136,8 @@ impl TaskSlot {
         self.result_ptr.store(RESULT_ABANDONED, Ordering::Release);
         self.state.store(STATE_IDLE, Ordering::Release);
         self.ready_next.store(0, Ordering::Relaxed);
+        self.retired_next.store(0, Ordering::Relaxed);
+        self.control.store(0, Ordering::Relaxed);
         self.domain_id.store(0, Ordering::Release);
     }
 
@@ -200,8 +185,6 @@ impl TaskSlot {
             write_poll_fn(&self.poll_fn, Some(poll_fn));
             write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
             *self.cancel_fn.get() = Some(cancel_future::<F, T>);
-
-            self.waker_state.store(WAKER_NONE, Ordering::Release);
 
             self.state.store(STATE_QUEUED, Ordering::Release);
             self.domain_id.store(domain_id.raw(), Ordering::Release);

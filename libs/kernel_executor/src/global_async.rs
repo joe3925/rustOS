@@ -1,6 +1,6 @@
 use crate::domain::{ACTIVE_UNIT, BATCH_EMPTY, BATCH_OWNED, BATCH_READY, RUN_PENDING, ReadyBatch};
 use crate::platform::ExecutorPlatform;
-use crate::platform::{ExecutorBatchGuard, Job, SlabCache, with_executor_local};
+use crate::platform::{ExecutorBatchGuard, ExecutorThreadLocal, Job, SlabCache, with_executor_local};
 use crate::runtime::runtime::{drain_retired_block_on_states, has_retired_block_on_states};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
@@ -62,7 +62,8 @@ impl<E: ExecutorPlatform> Drop for WorkerGuard<'_, E> {
             let mut caches = tls.caches.borrow_mut();
             for cache in &mut *caches {
                 if let Some(flush) = cache.flush.take() {
-                    unsafe { flush(cache.owner, &mut cache.handles) };
+                    unsafe { flush(cache.owner, &mut cache.entries[..cache.len]) };
+                    cache.len = 0;
                     cache.owner = core::ptr::null();
                 }
             }
@@ -163,7 +164,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         task_id: usize,
     ) {
         let accepted = self
-            .with_executor_domain(domain_id, |domain| {
+            .with_executor_domain(domain_id, |domain, tls| {
                 if domain.state() != ExecutorDomainState::Active {
                     return false;
                 }
@@ -199,7 +200,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 else {
                     return false;
                 };
-                self.enqueue_task::<false, false>(domain, task_id, slot);
+                self.enqueue_task::<false, false>(domain, tls, task_id, slot);
                 true
             })
             .unwrap_or(false);
@@ -213,16 +214,17 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn enqueue_task<const SPAWN: bool, const POLL_INLINE: bool>(
         &self,
         domain: &ExecutorDomain<E>,
+        tls: &ExecutorThreadLocal<E>,
         task_id: usize,
         slot: &'static crate::runtime::slab::slot::TaskSlot,
     ) {
         if SPAWN
             && POLL_INLINE
-            && with_executor_local::<E, _>(|tls| tls.current.get().is_none())
+            && tls.current.get().is_none()
             && domain.state() == ExecutorDomainState::Active
             && domain.try_reserve_active::<true>()
         {
@@ -240,7 +242,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             return;
         }
         let local = if task_id != 0 && (SPAWN || !E::in_interrupt_context()) {
-            with_executor_local::<E, _>(|tls| {
+            (|| {
                 if tls.active_domain.get() != domain as *const ExecutorDomain<E> {
                     return None;
                 }
@@ -259,7 +261,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 }
                 slot.ready_next.store(batch.pending_head, Ordering::Relaxed);
                 if batch.pending_head == 0 {
-                    batch.pending_tail = task_id;
+                    batch.pending_tail = Some(slot);
                 }
                 batch.pending_head = task_id;
                 batch.pending_count += 1;
@@ -267,7 +269,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                     return Some(false);
                 }
                 Some(self.publish_spawn_batch(domain, batch))
-            })
+            })()
         } else {
             None
         };
@@ -297,36 +299,32 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         if batch.pending_head == 0 {
             return false;
         }
-        let (shard, local, generation) =
-            crate::runtime::slab::ptr::decode_slab_task_ptr(batch.pending_tail)
-                .expect("invalid pending task");
-        let tail = crate::runtime::slab::task_slab::get_task_table::<E>()
-            .get_slot(shard, local, generation)
-            .expect("pending task missing");
-        let Some(notify) = domain.enqueue_tasks(batch.pending_head, tail, Some(batch.shard_cursor))
+        let tail = batch.pending_tail.expect("pending task missing");
+        let Some(notify) = domain.enqueue_tasks(batch.pending_head, tail, Some(&mut batch.shard_cursor))
         else {
             return false;
         };
         batch.pending_head = 0;
-        batch.pending_tail = 0;
+        batch.pending_tail = None;
         batch.pending_count = 0;
-        batch.shard_cursor = batch.shard_cursor.wrapping_add(1);
         notify
     }
 
+    #[inline]
     pub(crate) fn with_executor_domain<R>(
         &self,
         domain_id: ExecutorDomainId,
-        f: impl FnOnce(&ExecutorDomain<E>) -> R,
+        f: impl FnOnce(&ExecutorDomain<E>, &ExecutorThreadLocal<E>) -> R,
     ) -> Option<R> {
-        let cached = with_executor_local::<E, _>(|tls| tls.active_domain.get());
-        if let Some(domain) = unsafe { cached.as_ref() } {
-            if domain.id() == domain_id && domain.state() != ExecutorDomainState::Dead {
-                return Some(f(domain));
+        with_executor_local::<E, _>(|tls| {
+            if let Some(domain) = unsafe { tls.active_domain.get().as_ref() } {
+                if domain.id() == domain_id {
+                    return Some(f(domain, tls));
+                }
             }
-        }
-        let domain = self.runtime().domains.borrow_executor_domain(domain_id)?;
-        Some(f(&domain))
+            let domain = self.runtime().domains.borrow_executor_domain(domain_id)?;
+            Some(f(&domain, tls))
+        })
     }
 
     pub(crate) fn release_local_batch<const CHECK_IRQ: bool>(&self, notify: bool) {
@@ -342,21 +340,16 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         };
         let batch = unsafe { &mut *slot.batch.get() };
         if batch.pending_head != 0 {
-            let (shard, local, generation) =
-                crate::runtime::slab::ptr::decode_slab_task_ptr(batch.pending_tail)
-                    .expect("invalid pending task");
-            let tail = crate::runtime::slab::task_slab::get_task_table::<E>()
-                .get_slot(shard, local, generation)
-                .expect("pending task missing");
+            let tail = batch.pending_tail.expect("pending task missing");
             tail.ready_next.store(batch.current, Ordering::Relaxed);
             batch.current = core::mem::take(&mut batch.pending_head);
-            batch.pending_tail = 0;
+            batch.pending_tail = None;
             batch.pending_count = 0;
         }
         if batch.current != 0
             && domain.state() == ExecutorDomainState::Active
-            && domain.help_requested.load(Ordering::Acquire)
-            && domain.help_requested.swap(false, Ordering::AcqRel)
+            && domain.help_requested.0.load(Ordering::Acquire) != 0
+            && domain.help_requested.0.swap(0, Ordering::AcqRel) != 0
         {
             if let Some(other) = domain.batches.iter().find(|other| {
                 other
@@ -709,7 +702,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             }
         }
         let Some(owned) = owned else {
-            domain.help_requested.store(true, Ordering::Release);
+            domain.help_requested.0.store(1, Ordering::Release);
             return 0;
         };
         if !domain.is_at_active_limit() && domain.has_queued_work() {
@@ -760,7 +753,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 }
             };
             if task_id == 0 {
-                domain.help_requested.store(true, Ordering::Release);
+                domain.help_requested.0.store(1, Ordering::Release);
                 break;
             }
             crate::runtime::slab::ptr::poll_slab_task::<E>(table, task_id, slot);

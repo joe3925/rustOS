@@ -11,17 +11,32 @@ pub struct CurrentExecutorContext {
     pub domain_id: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SlabCacheEntry {
+    pub handle: SlabHandle,
+    pub slot: *const (),
+}
+
 pub(crate) struct SlabCache {
     pub owner: *const (),
-    pub handles: [Option<SlabHandle>; 8],
-    pub flush: Option<unsafe fn(*const (), &mut [Option<SlabHandle>])>,
+    pub entries: [SlabCacheEntry; 8],
+    pub len: usize,
+    pub flush: Option<unsafe fn(*const (), &mut [SlabCacheEntry])>,
 }
 
 impl SlabCache {
     pub const fn new() -> Self {
         Self {
             owner: core::ptr::null(),
-            handles: [None; 8],
+            entries: [SlabCacheEntry {
+                handle: SlabHandle {
+                    shard: 0,
+                    local_index: 0,
+                    generation: 0,
+                },
+                slot: core::ptr::null(),
+            }; 8],
+            len: 0,
             flush: None,
         }
     }
