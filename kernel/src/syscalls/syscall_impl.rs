@@ -1205,16 +1205,16 @@ pub(crate) fn sys_io_enqueue<const WAIT: bool>(
         },
     };
 
-    let request_id = match queue.enqueue(op) {
-        Ok(id) => id,
-        Err(err) => return map_cq_error(err),
-    };
     if WAIT {
-        let out = unsafe { &mut *out_completion };
-        *out = UserIoCompletion::default();
-        queue.wait_completions(core::slice::from_mut(out), timeout_ns);
+        let (request_id, completion) = match queue.enqueue_wait(op, timeout_ns) {
+            Ok(result) => result,
+            Err(err) => return map_cq_error(err),
+        };
+        unsafe { out_completion.write(completion.unwrap_or_default()) };
+        request_id
+    } else {
+        queue.enqueue(op).map_or_else(map_cq_error, |id| id)
     }
-    request_id
 }
 
 pub(crate) fn sys_io_enqueue_many(

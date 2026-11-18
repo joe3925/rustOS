@@ -26,69 +26,49 @@ pub fn syscall_init() {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SyscallFrame {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
     pub r11: u64,
     pub r10: u64,
     pub r9: u64,
     pub r8: u64,
-    pub rdi: u64,
-    pub rsi: u64,
     pub rdx: u64,
     pub rcx: u64,
     pub rbx: u64,
-    pub rbp: u64,
     pub rax: u64,
 }
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_entry() -> ! {
     naked_asm!(
         "push rax",
-        "push rbp",
         "push rbx",
         "push rcx",
         "push rdx",
-        "push rsi",
-        "push rdi",
         "push r8",
         "push r9",
         "push r10",
         "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-
-        crate::x86_entry_fpu_save!(0, 0),
+        "mov rbx, rsp",
+        "cld",
+        "and rsp, -16",
+        "sub rsp, {entry_frame_size}",
+        "fxsave64 [rsp + {fpu_state_offset}]",
         "mov  rcx, rbx",
         "call {handler}",
-        crate::x86_entry_fpu_restore!(),
-
-        "pop  r15",
-        "pop  r14",
-        "pop  r13",
-        "pop  r12",
+        "fxrstor64 [rsp + {fpu_state_offset}]",
+        "mov rsp, rbx",
         "pop  r11",
         "pop  r10",
         "pop  r9",
         "pop  r8",
-        "pop  rdi",
-        "pop  rsi",
         "pop  rdx",
         "pop  rcx",
         "pop  rbx",
-        "pop  rbp",
         "pop  rax",
 
         "sysretq",
 
-        entry_frame_size = const super::super::interrupts::entry::ENTRY_FRAME_SIZE,
+        entry_frame_size = const super::super::interrupts::entry::FPU_STATE_OFFSET
+            + core::mem::size_of::<super::super::scheduling::state::FpuState>(),
         fpu_state_offset = const super::super::interrupts::entry::FPU_STATE_OFFSET,
-        previous_fpu_frame_offset = const super::super::interrupts::entry::PREVIOUS_FPU_FRAME_OFFSET,
-        percpu_self_offset = const crate::structs::per_cpu::PERCPU_SELF_POINTER_OFF,
-        active_fpu_offset = const crate::structs::per_cpu::PERCPU_ACTIVE_EXCEPTION_FPU_OFF,
         handler = sym syscall_handler,
     );
 }
