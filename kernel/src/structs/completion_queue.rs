@@ -1,5 +1,6 @@
 use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::sync::Arc;
+use core::future::Future;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel_executor::global_async::ExecutorDomainId;
@@ -13,7 +14,7 @@ use crate::structs::executor_domain::UserExecutorDomain;
 
 use super::io_request::request::{
     CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable, KernelIoOp,
-    RequestId, RequestTableError, UserIoCompletion,
+    RequestId, RequestTableError, UserIoCompletion, run_file_read, run_file_write,
 };
 
 pub struct CompletionQueue {
@@ -107,19 +108,42 @@ impl CompletionQueue {
             opcode,
             user_token,
         };
-        let task = match try_spawn_to_port_in_executor_domain::<KernelExecutorPlatform, _, _, _>(
+        match op {
+            KernelIoOp::FileRead { file, buffer, offset, .. } => {
+                self.enqueue_future(request_id, permit, true, move || {
+                    run_file_read(file, buffer, offset)
+                })
+            }
+            KernelIoOp::FileWrite { file, buffer, offset, .. } => {
+                self.enqueue_future(request_id, permit, true, move || {
+                    run_file_write(file, buffer, offset)
+                })
+            }
+            op => self.enqueue_future(request_id, permit, false, move || op.execute()),
+        }
+    }
+
+    #[inline(never)]
+    fn enqueue_future<F: Future<Output = IoRequestOutput> + Send + 'static>(
+        self: &Arc<Self>,
+        request_id: RequestId,
+        permit: IoCompletionPermit,
+        poll_inline: bool,
+        make_future: impl FnOnce() -> F,
+    ) -> Result<RequestId, CompletionQueueError> {
+        if try_spawn_to_port_in_executor_domain::<KernelExecutorPlatform, _, _, _>(
             self.bound_executor_domain,
-            async move { op.execute().await },
+            make_future,
             request_id,
             permit,
-        ) {
-            Ok(task) => task,
-            Err(_) => {
-                self.request_table.reap_submitted(request_id);
-                return Err(CompletionQueueError::RequestTableFull);
-            }
-        };
-        self.request_table.install_task(request_id, task);
+            poll_inline,
+            |task| self.request_table.install_task(request_id, task),
+        )
+        .is_err()
+        {
+            self.request_table.reap_submitted(request_id);
+            return Err(CompletionQueueError::RequestTableFull);
+        }
         Ok(request_id)
     }
 
@@ -243,8 +267,11 @@ impl CompletionQueue {
 
     fn reclaim_completion_capacity(&self) {
         let capacity = self.completion_port.capacity();
+        if capacity <= self.completion_capacity {
+            return;
+        }
         let outstanding = self.completion_port.outstanding();
-        if capacity <= self.completion_capacity || outstanding.saturating_mul(2) > capacity {
+        if outstanding.saturating_mul(2) > capacity {
             return;
         }
         if self

@@ -21,6 +21,7 @@ pub const USER_DOMAIN_ID: DomainId = DomainId(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnqueueReason {
     New,
+    NewOnCpu,
     Wakeup,
     Preempted,
     Yielded,

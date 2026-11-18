@@ -1,9 +1,13 @@
 use alloc::sync::Arc;
+use core::cell::Cell;
 
 use crate::platform::{self, ActivePlatform, TaskPlatform};
 use kernel_types::runtime::BlockOnThreadState;
 
 pub type KernelTls = <ActivePlatform as TaskPlatform>::KernelTls;
+
+#[thread_local]
+pub(crate) static CURRENT_PROCESS_ID: Cell<u64> = Cell::new(0);
 
 #[inline(always)]
 pub(crate) unsafe fn activate(thread_pointer: u64) {

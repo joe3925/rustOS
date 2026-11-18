@@ -28,6 +28,16 @@ impl Platform for KernelPlatform {
     }
 
     #[inline]
+    fn current_cpu_id() -> usize {
+        platform::current_cpu_id()
+    }
+
+    #[inline]
+    fn processor_count() -> usize {
+        platform::processor_count()
+    }
+
+    #[inline]
     fn mark_waiting(task: &Self::Task, wait_queue_id: u64) -> bool {
         task.wait_next.mark(wait_queue_id)
     }
@@ -67,9 +77,9 @@ impl Platform for KernelPlatform {
         platform::enable_interrupts();
     }
 
-    fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
+    fn spawn_thread(name: String, entry: ThreadEntry, context: usize, cpu: usize) {
         let task = Task::new_kernel_mode(entry, context, StackSize::Tiny, name, 0);
-        scheduler().add_task(task);
+        scheduler().add_task_on(task, Some(cpu));
     }
 
     #[inline]

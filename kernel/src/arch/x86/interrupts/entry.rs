@@ -21,10 +21,14 @@ macro_rules! x86_entry_fpu_save {
             cld
             and rsp, -16
             sub rsp, {entry_frame_size}
+            "#,
+            ".if ", stringify!($publish), "\n",
+            r#"
             lea rdi, [rsp + {fpu_state_offset}]
             xor eax, eax
             mov ecx, 64
             rep stosq
+            .endif
             fxsave64 [rsp + {fpu_state_offset}]
             xor r12d, r12d
             "#,

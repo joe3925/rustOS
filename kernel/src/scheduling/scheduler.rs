@@ -274,6 +274,10 @@ impl Scheduler {
     }
 
     pub fn add_task(&self, task: TaskHandle) -> u64 {
+        self.add_task_on(task, None)
+    }
+
+    pub fn add_task_on(&self, task: TaskHandle, cpu: Option<usize>) -> u64 {
         let n = self.num_cores();
         if n == 0 {
             return 0;
@@ -289,8 +293,12 @@ impl Scheduler {
         self.domains.enqueue(
             update.domain_id(),
             &mut update,
-            EnqueueReason::New,
-            self.new_task_placement_start(),
+            if cpu.is_some() {
+                EnqueueReason::NewOnCpu
+            } else {
+                EnqueueReason::New
+            },
+            cpu.unwrap_or_else(|| self.new_task_placement_start()),
         );
         id
     }
@@ -481,6 +489,7 @@ impl Scheduler {
         let mut selected_context = None;
         let mut selected_fpu = None;
         let mut selected_root = None;
+        let mut selected_pid = 0;
         for _ in 0..TASK_TABLE_INITIAL_SLOTS {
             let Some(mut candidate) = self.domains.pick_next(access, now_cycles) else {
                 break;
@@ -523,11 +532,11 @@ impl Scheduler {
                         Err(()) => None,
                     }
                 };
-                root.map(|root| (inner.context, inner.fpu_state.clone(), root))
+                root.map(|root| (inner.context, inner.fpu_state.clone(), root, inner.parent_pid))
             } else {
                 None
             };
-            let Some((context, fpu, root)) = prepared else {
+            let Some((context, fpu, root, pid)) = prepared else {
                 let hint = candidate.target_cpu();
                 self.domains.enqueue(
                     candidate.domain_id(),
@@ -540,6 +549,7 @@ impl Scheduler {
             selected_context = Some(context);
             selected_fpu = Some(fpu);
             selected_root = Some(root);
+            selected_pid = pid;
             selected = Some(candidate);
             break;
         }
@@ -566,6 +576,7 @@ impl Scheduler {
                 selected_context = Some(inner.context);
                 selected_fpu = Some(inner.fpu_state.clone());
                 selected_root = Some(kernel_address_space_root());
+                selected_pid = inner.parent_pid;
             }
             selected = Some(idle);
         }
@@ -609,6 +620,9 @@ impl Scheduler {
 
         unsafe { switch_address_space_root(selected_root.unwrap()) };
         self.restore_thread_local_storage(&next);
+        if next.tls_thread_pointer.load(Ordering::Relaxed) != 0 {
+            tls::CURRENT_PROCESS_ID.set(selected_pid);
+        }
         unsafe { platform::restore_task_context(&selected_context.unwrap(), state) };
         local.return_fpu = selected_fpu;
         access.state.current = Some((*next).clone());
@@ -697,11 +711,7 @@ impl Scheduler {
 
     #[inline(always)]
     pub fn restore_thread_local_storage(&self, task_handle: &TaskHandle) {
-        let thread_pointer = if task_handle.is_kernel_mode() {
-            task_handle.tls_thread_pointer.load(Ordering::Relaxed)
-        } else {
-            0
-        };
+        let thread_pointer = task_handle.tls_thread_pointer.load(Ordering::Relaxed);
 
         // SAFETY: kernel tasks retain their KernelTls allocation in TaskInner
         // for as long as this thread pointer can be scheduled.

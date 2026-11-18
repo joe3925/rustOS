@@ -113,7 +113,7 @@ impl Platform for ModelPlatform {
 
     fn enable_interrupts() {}
 
-    fn spawn_thread(_name: String, _entry: ThreadEntry, _context: usize) {
+    fn spawn_thread(_name: String, _entry: ThreadEntry, _context: usize, _cpu: usize) {
         panic!("thread-pool spawning is not used by primitive loom models")
     }
 

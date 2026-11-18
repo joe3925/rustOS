@@ -53,7 +53,7 @@ impl<T> QueueSlot<T> {
 unsafe impl<T: Send> Send for QueueSlot<T> {}
 unsafe impl<T: Send> Sync for QueueSlot<T> {}
 
-struct MpmcRing<T> {
+pub(crate) struct MpmcRing<T> {
     slots: Vec<QueueSlot<T>>,
     push_pos: AtomicUsize,
     pop_pos: AtomicUsize,

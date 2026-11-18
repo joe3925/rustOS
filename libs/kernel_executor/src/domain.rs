@@ -400,7 +400,14 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
         self.active_count() >= self.max_active()
     }
 
-    pub(crate) fn try_reserve_active(&self) -> bool {
+    pub(crate) fn try_reserve_active<const IDLE_ONLY: bool>(&self) -> bool {
+        if IDLE_ONLY {
+            return self
+                .schedule_state
+                .0
+                .compare_exchange(0, ACTIVE_UNIT, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        }
         let mut reserved = false;
         let _ = self
             .schedule_state

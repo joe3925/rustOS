@@ -83,7 +83,7 @@ impl Platform for StdPlatform {
     #[inline]
     fn enable_interrupts() {}
 
-    fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
+    fn spawn_thread(name: String, entry: ThreadEntry, context: usize, _cpu: usize) {
         ::std::thread::Builder::new()
             .name(name)
             .spawn(move || entry(context))

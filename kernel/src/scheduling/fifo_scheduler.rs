@@ -157,7 +157,8 @@ impl SchedulerClass for FifoClass {
 
         if matches!(
             reason,
-            EnqueueReason::Wakeup
+            EnqueueReason::NewOnCpu
+                | EnqueueReason::Wakeup
                 | EnqueueReason::Preempted
                 | EnqueueReason::Yielded
                 | EnqueueReason::Migrated

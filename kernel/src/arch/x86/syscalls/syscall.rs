@@ -144,7 +144,22 @@ make_wrapper!(
     *mut u8,
     usize
 );
-make_wrapper!(wrap_io_enqueue, sys_io_enqueue, UserHandle, *const UserIoOp);
+make_wrapper!(
+    wrap_io_enqueue,
+    sys_io_enqueue::<false>,
+    UserHandle,
+    *const UserIoOp,
+    *mut UserIoCompletion,
+    u64
+);
+make_wrapper!(
+    wrap_io_enqueue_wait,
+    sys_io_enqueue::<true>,
+    UserHandle,
+    *const UserIoOp,
+    *mut UserIoCompletion,
+    u64
+);
 make_wrapper!(
     wrap_io_enqueue_many,
     sys_io_enqueue_many,
@@ -234,6 +249,7 @@ const SYSCALL_TABLE: &[Handler] = &[
     wrap_executor_domain_create,
     wrap_executor_domain_configure,
     wrap_object_query,
+    wrap_io_enqueue_wait,
 ];
 
 #[unsafe(no_mangle)]

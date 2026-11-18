@@ -1,4 +1,5 @@
 use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -459,10 +460,28 @@ impl IoRequestSlot {
 
 pub struct IoRequestTable {
     slots: RwLock<Vec<Arc<IoRequestSlot>>>,
+    initial_slots: Box<[Arc<IoRequestSlot>]>,
     initial_capacity: usize,
+    capacity: core::sync::atomic::AtomicUsize,
     next_generation: core::sync::atomic::AtomicU32,
     live: core::sync::atomic::AtomicUsize,
     maintenance: core::sync::atomic::AtomicBool,
+}
+
+enum IoRequestSlotRef<'a> {
+    Initial(&'a IoRequestSlot),
+    Grown(Arc<IoRequestSlot>),
+}
+
+impl core::ops::Deref for IoRequestSlotRef<'_> {
+    type Target = IoRequestSlot;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Initial(slot) => slot,
+            Self::Grown(slot) => slot,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,8 +505,10 @@ impl IoRequestTable {
         }
 
         Self {
+            initial_slots: slots.clone().into_boxed_slice(),
             slots: RwLock::new(slots),
             initial_capacity: capacity,
+            capacity: core::sync::atomic::AtomicUsize::new(capacity),
             next_generation: core::sync::atomic::AtomicU32::new(1),
             live: core::sync::atomic::AtomicUsize::new(0),
             maintenance: core::sync::atomic::AtomicBool::new(false),
@@ -495,34 +516,49 @@ impl IoRequestTable {
     }
 
     pub fn capacity(&self) -> usize {
-        self.slots.read().len()
+        self.capacity.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    fn allocate_from(&self, slots: &[Arc<IoRequestSlot>], base: usize) -> Option<RequestId> {
+        use core::sync::atomic::Ordering;
+
+        for (index, slot) in slots.iter().enumerate() {
+            if slot
+                .state
+                .compare_exchange(
+                    IoRequestState::Free as u8,
+                    IoRequestState::Submitted as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let generation = self.next_generation.fetch_add(1, Ordering::AcqRel).max(1);
+            slot.generation.store(generation, Ordering::Release);
+            let request_id = ((generation as u64) << 32) | ((base + index) as u64 + 1);
+            slot.request_id.store(request_id, Ordering::Release);
+            slot.task.store(0, Ordering::Release);
+            self.live.fetch_add(1, Ordering::AcqRel);
+            return Some(request_id);
+        }
+        None
     }
 
     pub fn allocate(&self) -> Result<RequestId, RequestTableError> {
         use core::sync::atomic::Ordering;
 
         loop {
+            if let Some(request_id) = self.allocate_from(&self.initial_slots, 0) {
+                return Ok(request_id);
+            }
             let slots = self.slots.read();
-            for (index, slot) in slots.iter().enumerate() {
-                if slot
-                    .state
-                    .compare_exchange(
-                        IoRequestState::Free as u8,
-                        IoRequestState::Submitted as u8,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-
-                let generation = self.next_generation.fetch_add(1, Ordering::AcqRel).max(1);
-                slot.generation.store(generation, Ordering::Release);
-                let request_id = ((generation as u64) << 32) | ((index as u64) + 1);
-                slot.request_id.store(request_id, Ordering::Release);
-                slot.task.store(0, Ordering::Release);
-                self.live.fetch_add(1, Ordering::AcqRel);
+            if let Some(request_id) = self.allocate_from(
+                &slots[self.initial_capacity..],
+                self.initial_capacity,
+            ) {
                 return Ok(request_id);
             }
             let current = slots.len();
@@ -538,6 +574,7 @@ impl IoRequestTable {
             for _ in 0..add {
                 slots.push(Arc::new(IoRequestSlot::new()));
             }
+            self.capacity.store(slots.len(), Ordering::Release);
         }
     }
 
@@ -715,16 +752,22 @@ impl IoRequestTable {
         };
         if slot
             .state
-            .compare_exchange(
-                IoRequestState::Submitted as u8,
-                IoRequestState::Free as u8,
+            .fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
+                |state| {
+                    matches!(
+                        IoRequestState::from_u8(state),
+                        IoRequestState::Submitted | IoRequestState::CancelRequested
+                    )
+                    .then_some(IoRequestState::Reaped as u8)
+                },
             )
             .is_ok()
         {
             slot.task.store(0, Ordering::Release);
             slot.request_id.store(0, Ordering::Release);
+            slot.state.store(IoRequestState::Free as u8, Ordering::Release);
             self.live.fetch_sub(1, Ordering::AcqRel);
             self.shrink_if_underused();
         }
@@ -754,10 +797,11 @@ impl IoRequestTable {
             }
             slots.pop();
         }
+        self.capacity.store(slots.len(), Ordering::Release);
         self.maintenance.store(false, Ordering::Release);
     }
 
-    fn find_slot(&self, request_id: RequestId) -> Result<Arc<IoRequestSlot>, RequestTableError> {
+    fn find_slot(&self, request_id: RequestId) -> Result<IoRequestSlotRef<'_>, RequestTableError> {
         use core::sync::atomic::Ordering;
 
         let raw_index = request_id as u32;
@@ -765,12 +809,17 @@ impl IoRequestTable {
             return Err(RequestTableError::NotFound);
         }
         let index = raw_index as usize - 1;
-        let slot = self
-            .slots
-            .read()
-            .get(index)
-            .cloned()
-            .ok_or(RequestTableError::NotFound)?;
+        let slot = if let Some(slot) = self.initial_slots.get(index) {
+            IoRequestSlotRef::Initial(slot)
+        } else {
+            IoRequestSlotRef::Grown(
+                self.slots
+                    .read()
+                    .get(index)
+                    .cloned()
+                    .ok_or(RequestTableError::NotFound)?,
+            )
+        };
         if slot.request_id.load(Ordering::Acquire) == request_id {
             Ok(slot)
         } else {
@@ -917,7 +966,7 @@ async fn run_file_open(
     }
 }
 
-async fn run_file_read(
+pub(crate) async fn run_file_read(
     file: Arc<FileObject>,
     buffer: OwnedIoBuffer<FromDevice>,
     offset: u64,
@@ -938,7 +987,7 @@ async fn run_file_read(
     IoRequestOutput::success(n as u64, 0)
 }
 
-async fn run_file_write(
+pub(crate) async fn run_file_write(
     file: Arc<FileObject>,
     buffer: OwnedIoBuffer<ToDevice>,
     offset: u64,

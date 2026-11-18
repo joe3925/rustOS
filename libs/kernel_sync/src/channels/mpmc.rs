@@ -60,13 +60,35 @@ struct ReceiverBlock<P: Platform> {
     slots: Vec<ReceiverSlot<P>>,
     waiting: AtomicUsize,
     spinning: AtomicUsize,
+    local_waiting: Vec<AtomicUsize>,
     next: AtomicPtr<ReceiverBlock<P>>,
+}
+
+impl<P: Platform> ReceiverBlock<P> {
+    fn new(capacity: usize) -> Self {
+        let cpus = P::processor_count();
+        Self {
+            slots: (0..capacity)
+                .map(|_| ReceiverSlot {
+                    state: AtomicUsize::new(WAITER_EMPTY),
+                    task: UnsafeCell::new(None),
+                })
+                .collect(),
+            waiting: AtomicUsize::new(0),
+            spinning: AtomicUsize::new(0),
+            local_waiting: (0..if cpus > 1 { cpus } else { 0 })
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
+            next: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
 }
 
 struct ReceiverRegistration<'a, P: Platform> {
     slot: &'a ReceiverSlot<P>,
     waiting: &'a AtomicUsize,
     spinning: &'a AtomicUsize,
+    local_waiting: Option<&'a AtomicUsize>,
     mask: usize,
 }
 
@@ -87,6 +109,9 @@ impl<P: Platform> Drop for ReceiverRegistration<'_, P> {
             {
                 self.waiting.fetch_and(!self.mask, Ordering::AcqRel);
                 self.spinning.fetch_and(!self.mask, Ordering::AcqRel);
+                if let Some(local) = self.local_waiting {
+                    local.fetch_and(!self.mask, Ordering::AcqRel);
+                }
                 unsafe {
                     drop((*self.slot.task.get()).take());
                 }
@@ -116,7 +141,8 @@ impl<P: Platform, T> MpmcInner<P, T> {
         while !block.is_null() {
             let receivers = unsafe { &*block };
             let mut visited = 0;
-            for candidates in [&receivers.spinning, &receivers.waiting] {
+            let local = receivers.local_waiting.get(P::current_cpu_id());
+            for (candidates, preferred) in [(&receivers.spinning, None), (&receivers.waiting, local)] {
                 loop {
                     if !wake_all && self.queue.is_empty() {
                         return;
@@ -124,7 +150,13 @@ impl<P: Platform, T> MpmcInner<P, T> {
                     let mut selected = 0;
                     let _ =
                         candidates.fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
-                            let eligible = waiting & !visited;
+                            let mut eligible = waiting & !visited;
+                            if let Some(preferred) = preferred {
+                                let local = eligible & preferred.load(Ordering::Relaxed);
+                                if local != 0 {
+                                    eligible = local;
+                                }
+                            }
                             let mut next = eligible;
                             if remaining == 1 {
                                 next &= next.wrapping_sub(1);
@@ -241,19 +273,7 @@ pub(crate) fn channel<P: Platform, T, const GROWABLE: bool>(
     assert!(max_consumers > 0);
     let max_consumers = max_consumers.min(usize::BITS as usize);
     let queue = MpmcQueue::with_growth(capacity, GROWABLE);
-    let mut slots = Vec::with_capacity(max_consumers);
-    for _ in 0..max_consumers {
-        slots.push(ReceiverSlot {
-            state: AtomicUsize::new(WAITER_EMPTY),
-            task: UnsafeCell::new(None),
-        });
-    }
-    let receivers = Box::into_raw(Box::new(ReceiverBlock {
-        slots,
-        waiting: AtomicUsize::new(0),
-        spinning: AtomicUsize::new(0),
-        next: AtomicPtr::new(ptr::null_mut()),
-    }));
+    let receivers = Box::into_raw(Box::new(ReceiverBlock::new(max_consumers)));
     let inner = Arc::new(MpmcInner {
         queue,
         receivers: AtomicPtr::new(receivers),
@@ -436,6 +456,7 @@ impl<P: Platform, T, const GROWABLE: bool> Receiver<P, T, GROWABLE> {
                             slot,
                             waiting: &receivers.waiting,
                             spinning: &receivers.spinning,
+                            local_waiting: receivers.local_waiting.get(P::current_cpu_id()),
                             mask: 1usize << index,
                         });
                         break;
@@ -446,19 +467,9 @@ impl<P: Platform, T, const GROWABLE: bool> Receiver<P, T, GROWABLE> {
                 }
                 let next = receivers.next.load(Ordering::Acquire);
                 if next.is_null() {
-                    let mut slots = Vec::with_capacity(self.inner.receiver_block_capacity);
-                    for _ in 0..self.inner.receiver_block_capacity {
-                        slots.push(ReceiverSlot {
-                            state: AtomicUsize::new(WAITER_EMPTY),
-                            task: UnsafeCell::new(None),
-                        });
-                    }
-                    let allocated = Box::into_raw(Box::new(ReceiverBlock {
-                        slots,
-                        waiting: AtomicUsize::new(0),
-                        spinning: AtomicUsize::new(0),
-                        next: AtomicPtr::new(ptr::null_mut()),
-                    }));
+                    let allocated = Box::into_raw(Box::new(ReceiverBlock::new(
+                        self.inner.receiver_block_capacity,
+                    )));
                     block = match receivers.next.compare_exchange(
                         ptr::null_mut(),
                         allocated,
@@ -523,6 +534,9 @@ impl<P: Platform, T, const GROWABLE: bool> Receiver<P, T, GROWABLE> {
             {
                 drop(registration);
                 continue;
+            }
+            if let Some(local) = registration.local_waiting {
+                local.fetch_or(registration.mask, Ordering::Release);
             }
             registration
                 .waiting

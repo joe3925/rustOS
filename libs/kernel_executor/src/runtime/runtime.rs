@@ -303,7 +303,7 @@ where
             unsafe { slot.init_joinable::<F, T>(domain_id, allocation, storage_ptr) };
 
             let encoded = slot_handle.encoded_ptr();
-            GlobalAsyncExecutor::<E>::global().enqueue_task::<true>(domain, encoded, slot);
+            GlobalAsyncExecutor::<E>::global().enqueue_task::<true, false>(domain, encoded, slot);
 
             Some(JoinHandle {
                 shard_idx: shard_idx as u8,
@@ -515,7 +515,7 @@ pub fn spawn_detached_in_executor_domain<E: ExecutorPlatform, F>(
             unsafe { slot.init_detached::<F>(domain_id, allocation) };
 
             let encoded = slot_handle.encoded_ptr();
-            GlobalAsyncExecutor::<E>::global().enqueue_task::<true>(domain, encoded, slot);
+            GlobalAsyncExecutor::<E>::global().enqueue_task::<true, false>(domain, encoded, slot);
         })
         .unwrap_or(())
 }
@@ -662,9 +662,11 @@ pub enum SpawnToPortError {
 
 pub fn try_spawn_to_port_in_executor_domain<E: ExecutorPlatform, F, P, T>(
     domain_id: ExecutorDomainId,
-    future: F,
+    make_future: impl FnOnce() -> F,
     completion_key: u64,
     permit: P,
+    poll_inline: bool,
+    on_spawn: impl FnOnce(TaskToken),
 ) -> Result<TaskToken, SpawnToPortError>
 where
     F: Future<Output = T> + Send + 'static,
@@ -690,7 +692,7 @@ where
                     .as_ptr()
                     .cast::<PortFuture<F, P, T>>()
                     .write(PortFuture {
-                        future,
+                        future: make_future(),
                         permit: Some(permit),
                         key: completion_key,
                         token: 0,
@@ -709,7 +711,20 @@ where
             };
             unsafe { (*allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>()).token = token.raw() };
             unsafe { slot.init_detached::<PortFuture<F, P, T>>(domain_id, allocation) };
-            GlobalAsyncExecutor::<E>::global().enqueue_task::<true>(domain, handle.encoded_ptr(), slot);
+            on_spawn(token);
+            if poll_inline {
+                GlobalAsyncExecutor::<E>::global().enqueue_task::<true, true>(
+                    domain,
+                    handle.encoded_ptr(),
+                    slot,
+                );
+            } else {
+                GlobalAsyncExecutor::<E>::global().enqueue_task::<true, false>(
+                    domain,
+                    handle.encoded_ptr(),
+                    slot,
+                );
+            }
             Ok(token)
         })
         .ok_or(SpawnToPortError::InvalidDomain)?

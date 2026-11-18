@@ -538,11 +538,16 @@ impl Task {
         let guard_page = initial_guard_page(stack_top, stack_size);
         let state = platform::new_user_task_context(entry_point, context, stack_pointer);
 
+        let kernel_tls = platform::new_kernel_tls();
+        let tls_thread_pointer = kernel_tls
+            .as_ref()
+            .map_or(0, platform::kernel_tls_thread_pointer);
+
         let inner_task = Task {
             name,
             context: state,
             fpu_state: FpuState::default(),
-            kernel_tls: None,
+            kernel_tls,
             parent_pid,
             executer_id: None,
         };
@@ -563,7 +568,7 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size),
             kernel_stack: Mutex::new(None),
-            tls_thread_pointer: AtomicU64::new(0),
+            tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
             sched_binding: RwLock::new(sched_binding),
             active_domain_id: AtomicU32::new(active_domain_id.0 as u32),
             pending_sched_binding: Mutex::new(None),

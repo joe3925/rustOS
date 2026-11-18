@@ -214,7 +214,12 @@ where
             });
 
             let name: String = alloc::format!("thread_pool_worker_{i}");
-            P::spawn_thread(name, worker_entry::<P, Q>, Box::into_raw(ctx) as usize);
+            P::spawn_thread(
+                name,
+                worker_entry::<P, Q>,
+                Box::into_raw(ctx) as usize,
+                i % P::processor_count().max(1),
+            );
         }
 
         Self {

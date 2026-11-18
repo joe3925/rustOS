@@ -90,6 +90,17 @@ impl PhysicalMemoryIter {
     }
     /// While an iter can be created for any sized virtual range, its returned extents will always be page aligned and at least page sized.
     pub fn new(addr_space_root: AddressSpaceRoot, base_address: VirtAddr, len: u64) -> Self {
+        let page_size = crate::memory::paging::layout::base_page_size();
+        let page_offset = base_address.as_u64() % page_size;
+        let base_address = VirtAddr::new(base_address.as_u64() - page_offset);
+        let len = if len == 0 {
+            0
+        } else {
+            crate::memory::paging::layout::align_up_to_base_page(
+                len.checked_add(page_offset).expect("physical range length"),
+            )
+            .expect("physical range page length")
+        };
         Self {
             next_frame: None,
             addr_space_root,
@@ -104,6 +115,9 @@ impl Iterator for PhysicalMemoryIter {
     type Item = PhysicalFrameExtent;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.next_frame.is_none() && self.cursor - self.base_address >= self.len {
+            return None;
+        }
         let mapping = match self.next_frame.take() {
             Some(mapping) => mapping,
             None => {

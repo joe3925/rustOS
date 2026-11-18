@@ -199,7 +199,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 else {
                     return false;
                 };
-                self.enqueue_task::<false>(domain, task_id, slot);
+                self.enqueue_task::<false, false>(domain, task_id, slot);
                 true
             })
             .unwrap_or(false);
@@ -214,12 +214,31 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
     }
 
     #[inline]
-    pub(crate) fn enqueue_task<const SPAWN: bool>(
+    pub(crate) fn enqueue_task<const SPAWN: bool, const POLL_INLINE: bool>(
         &self,
         domain: &ExecutorDomain<E>,
         task_id: usize,
         slot: &'static crate::runtime::slab::slot::TaskSlot,
     ) {
+        if SPAWN
+            && POLL_INLINE
+            && with_executor_local::<E, _>(|tls| tls.current.get().is_none())
+            && domain.state() == ExecutorDomainState::Active
+            && domain.try_reserve_active::<true>()
+        {
+            crate::runtime::slab::ptr::poll_slab_task::<E>(
+                crate::runtime::slab::task_slab::get_task_table::<E>(),
+                task_id,
+                Some(slot),
+            );
+            domain.release_active();
+            fence(Ordering::SeqCst);
+            if domain.is_runnable_for_policy() {
+                self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
+            }
+            domain.maybe_finish_draining();
+            return;
+        }
         let local = if task_id != 0 && (SPAWN || !E::in_interrupt_context()) {
             with_executor_local::<E, _>(|tls| {
                 if tls.active_domain.get() != domain as *const ExecutorDomain<E> {
@@ -578,7 +597,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 continue;
             };
 
-            if !domain.try_reserve_active() {
+            if !domain.try_reserve_active::<false>() {
                 cached_domain = None;
                 continue;
             }

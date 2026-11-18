@@ -13,6 +13,14 @@ pub trait Platform: Sized + 'static {
     fn task_id(task: &Self::Task) -> u64;
     fn same_task(a: &Self::Task, b: &Self::Task) -> bool;
 
+    fn current_cpu_id() -> usize {
+        0
+    }
+
+    fn processor_count() -> usize {
+        1
+    }
+
     fn mark_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
     fn clear_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
     fn is_waiting(task: &Self::Task, wait_queue_id: u64) -> bool;
@@ -25,7 +33,7 @@ pub trait Platform: Sized + 'static {
     fn disable_interrupts();
     fn enable_interrupts();
 
-    fn spawn_thread(name: String, entry: ThreadEntry, context: usize);
+    fn spawn_thread(name: String, entry: ThreadEntry, context: usize, cpu: usize);
 
     #[inline]
     fn prepare_blocking_worker() {}
