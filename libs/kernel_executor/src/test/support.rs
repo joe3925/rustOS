@@ -1,12 +1,17 @@
 extern crate std;
 
 use crate::platform::{ExecutorPlatform, ExecutorThreadLocal, Job};
+use crate::worker_pool::{RuntimePool, WorkerPlatform};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+use worker_platform::StdWorkerPlatform;
+
+#[path = "worker_platform.rs"]
+mod worker_platform;
 
 const EXECUTOR_MAX_SHARDS: usize = 32;
 
-pub(crate) static RUNTIME_POOL: OnceLock<threadpool::ThreadPool> = OnceLock::new();
+pub(crate) static RUNTIME_POOL: OnceLock<RuntimePool<StdWorkerPlatform>> = OnceLock::new();
 static BLOCKING_POOL: OnceLock<threadpool::ThreadPool> = OnceLock::new();
 
 pub enum TestExecutorPlatform {}
@@ -18,6 +23,8 @@ std::thread_local! {
 }
 
 impl ExecutorPlatform for TestExecutorPlatform {
+    const PERSISTENT_RUNTIME_WORKERS: bool = true;
+
     fn global_executor() -> &'static GlobalAsyncExecutor {
         static EXECUTOR: spin::Once<GlobalAsyncExecutor> = spin::Once::new();
         EXECUTOR.call_once(GlobalAsyncExecutor::new)
@@ -27,9 +34,9 @@ impl ExecutorPlatform for TestExecutorPlatform {
         EXECUTOR_CONTEXT.with(f)
     }
 
-    fn init_runtime(max_threads: usize, _max_jobs: usize) {
+    fn init_runtime(max_threads: usize, max_jobs: usize) {
         let threads = max_threads.max(1);
-        let _ = RUNTIME_POOL.set(threadpool::ThreadPool::new(threads));
+        let _ = RUNTIME_POOL.set(RuntimePool::new(threads, max_jobs.max(1)));
     }
 
     fn init_blocking(max_threads: usize) {
@@ -41,8 +48,7 @@ impl ExecutorPlatform for TestExecutorPlatform {
         RUNTIME_POOL
             .get()
             .expect("runtime executor pool not initialized")
-            .execute(move || (job.f)(job.a));
-        true
+            .submit(job.f, job.a)
     }
 
     fn submit_blocking(job: Job) {
@@ -50,6 +56,20 @@ impl ExecutorPlatform for TestExecutorPlatform {
             .get()
             .expect("blocking executor pool not initialized")
             .execute(move || (job.f)(job.a));
+    }
+
+    fn wake_runtime_worker<const IDLE_ONLY: bool>(active: usize) -> bool {
+        RUNTIME_POOL
+            .get()
+            .is_some_and(|pool| pool.wake(IDLE_ONLY, active))
+    }
+
+    fn wait_for_runtime_work(work_pending: impl FnOnce() -> bool) -> bool {
+        RUNTIME_POOL.get().unwrap().wait(work_pending)
+    }
+
+    fn runtime_search<const START: bool>() {
+        RUNTIME_POOL.get().unwrap().search::<START>();
     }
 
     fn submit_blocking_many(jobs: &[Job]) {

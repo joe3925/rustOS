@@ -470,6 +470,11 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         if IDLE_ONLY {
             fence(Ordering::SeqCst);
         }
+        if E::PERSISTENT_RUNTIME_WORKERS
+            && E::wake_runtime_worker::<IDLE_ONLY>(self.active_pumps.0.load(Ordering::Acquire))
+        {
+            return;
+        }
         let mut max = self.max_pumps.0.load(Ordering::Acquire);
         if max == 0 {
             fence(Ordering::SeqCst);
@@ -541,6 +546,9 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
 
         loop {
             let runtime = self.runtime();
+            if E::PERSISTENT_RUNTIME_WORKERS {
+                E::runtime_search::<true>();
+            }
 
             if runtime.run_overflow.load(Ordering::Acquire)
                 && runtime.run_overflow.swap(false, Ordering::AcqRel)
@@ -551,6 +559,24 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 runtime.run_overflow.store(true, Ordering::Release);
             }
             let Some(domain_id) = runtime.run_queue.pop() else {
+                if E::PERSISTENT_RUNTIME_WORKERS {
+                    E::runtime_search::<false>();
+                    if self.has_runnable_domains() {
+                        self.try_schedule::<false>();
+                    }
+                    drop(cached_domain.take());
+                    task_table.drain_retired();
+                    drain_retired_block_on_states::<E>();
+                    runtime.domains.drain_retired();
+                    if E::wait_for_runtime_work(|| {
+                        self.has_runnable_domains()
+                            || task_table.has_retired()
+                            || has_retired_block_on_states::<E>()
+                            || runtime.domains.has_retired()
+                    }) {
+                        continue;
+                    }
+                }
                 break;
             };
 
@@ -576,9 +602,15 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 continue;
             }
 
+            if E::PERSISTENT_RUNTIME_WORKERS {
+                E::runtime_search::<false>();
+            }
             loop {
                 let budget = self.pick_domain_budget(domain);
                 let ran = self.run_domain_batch(domain, budget);
+                if E::PERSISTENT_RUNTIME_WORKERS && self.has_runnable_domains() {
+                    self.try_schedule::<false>();
+                }
                 task_table.drain_retired();
                 drain_retired_block_on_states::<E>();
                 if ran != 0
@@ -679,7 +711,10 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             domain.help_requested.0.store(1, Ordering::Release);
             return 0;
         };
-        if !domain.is_at_active_limit() && domain.has_queued_work() {
+        if !E::PERSISTENT_RUNTIME_WORKERS
+            && !domain.is_at_active_limit()
+            && domain.has_queued_work()
+        {
             self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
         }
         let (previous_domain, previous_batch) = with_executor_local::<E, _>(|tls| {
@@ -762,6 +797,13 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             if task_id == 0 {
                 domain.help_requested.0.store(1, Ordering::Release);
                 break;
+            }
+            if E::PERSISTENT_RUNTIME_WORKERS && ran == 0 {
+                if !domain.is_at_active_limit() && domain.has_queued_work() {
+                    self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
+                } else if self.has_runnable_domains() {
+                    self.try_schedule::<false>();
+                }
             }
             crate::runtime::slab::ptr::poll_slab_task::<E>(table, task_id, slot);
             ran += 1;

@@ -138,11 +138,20 @@ impl<E: ExecutorPlatform> Drop for CurrentExecutorContextGuard<E> {
 }
 
 pub trait ExecutorPlatform: Sized + Send + Sync + 'static {
+    const PERSISTENT_RUNTIME_WORKERS: bool = false;
+
     fn global_executor() -> &'static crate::global_async::GlobalAsyncExecutor<Self>;
     fn with_executor_local<R>(f: impl FnOnce(&ExecutorThreadLocal<Self>) -> R) -> R;
     fn init_runtime(max_threads: usize, max_jobs: usize);
     fn init_blocking(max_threads: usize);
     fn submit_runtime(job: Job) -> bool;
+    fn wake_runtime_worker<const IDLE_ONLY: bool>(_active: usize) -> bool {
+        false
+    }
+    fn wait_for_runtime_work(_work_pending: impl FnOnce() -> bool) -> bool {
+        false
+    }
+    fn runtime_search<const START: bool>() {}
     fn submit_blocking(job: Job);
     fn submit_blocking_many(jobs: &[Job]);
     fn try_steal_blocking_one() -> bool;

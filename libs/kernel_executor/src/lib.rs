@@ -55,3 +55,6 @@ macro_rules! spawn_join {
         $crate::runtime::runtime::spawn_join_owned_in_executor_domain::<$platform, _, _>($domain, $future)
     };
 }
+
+#[cfg(feature = "executor")]
+pub mod worker_pool;
