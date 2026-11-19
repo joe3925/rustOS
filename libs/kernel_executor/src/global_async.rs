@@ -1,4 +1,4 @@
-use crate::domain::{ACTIVE_UNIT, BATCH_EMPTY, BATCH_OWNED, BATCH_READY, RUN_PENDING, ReadyBatch};
+use crate::domain::{ACTIVE_UNIT, BATCH_EMPTY, BATCH_OWNED, BATCH_READY, RUN_PENDING};
 use crate::platform::ExecutorPlatform;
 use crate::platform::{ExecutorBatchGuard, ExecutorThreadLocal, Job, SlabCache, with_executor_local};
 use crate::runtime::runtime::{drain_retired_block_on_states, has_retired_block_on_states};
@@ -19,7 +19,6 @@ pub use crate::domain::{
 pub(crate) struct CacheAligned(pub(crate) AtomicUsize);
 
 const MAX_SHARDS: usize = 32;
-const MAX_SPAWN_BATCH: usize = 32;
 
 struct DomainRunQueue {
     queue: ArrayQueue<ExecutorDomainId>,
@@ -251,24 +250,21 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 if domain.state() != ExecutorDomainState::Active {
                     return None;
                 }
-                if batch.local_task == 0 && batch.current == 0 && batch.pending_head == 0 {
+                if SPAWN {
+                    slot.ready_next.store(0, Ordering::Relaxed);
+                    if unsafe { owned.spawned.push(task_id) } {
+                        // RUN_PENDING coalesces requests. At the active limit,
+                        // the already running pumps will check visible work.
+                        return Some(!domain.is_at_active_limit());
+                    }
+                    return None; // Bounded queue overflow uses the shared heads.
+                }
+                if batch.local_task == 0 && batch.current == 0 {
                     batch.local_task = task_id;
                     batch.local_slot = Some(slot);
                     return Some(false);
                 }
-                if !SPAWN {
-                    return None;
-                }
-                slot.ready_next.store(batch.pending_head, Ordering::Relaxed);
-                if batch.pending_head == 0 {
-                    batch.pending_tail = Some(slot);
-                }
-                batch.pending_head = task_id;
-                batch.pending_count += 1;
-                if batch.pending_count < MAX_SPAWN_BATCH {
-                    return Some(false);
-                }
-                Some(self.publish_spawn_batch(domain, batch))
+                None
             })()
         } else {
             None
@@ -293,21 +289,6 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 }
             }
         }
-    }
-
-    fn publish_spawn_batch(&self, domain: &ExecutorDomain<E>, batch: &mut ReadyBatch) -> bool {
-        if batch.pending_head == 0 {
-            return false;
-        }
-        let tail = batch.pending_tail.expect("pending task missing");
-        let Some(notify) = domain.enqueue_tasks(batch.pending_head, tail, Some(&mut batch.shard_cursor))
-        else {
-            return false;
-        };
-        batch.pending_head = 0;
-        batch.pending_tail = None;
-        batch.pending_count = 0;
-        notify
     }
 
     #[inline]
@@ -339,13 +320,6 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             return;
         };
         let batch = unsafe { &mut *slot.batch.get() };
-        if batch.pending_head != 0 {
-            let tail = batch.pending_tail.expect("pending task missing");
-            tail.ready_next.store(batch.current, Ordering::Relaxed);
-            batch.current = core::mem::take(&mut batch.pending_head);
-            batch.pending_tail = None;
-            batch.pending_count = 0;
-        }
         if batch.current != 0
             && domain.state() == ExecutorDomainState::Active
             && domain.help_requested.0.load(Ordering::Acquire) != 0
@@ -403,7 +377,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 }
             }
         }
-        let ready = batch.current != 0 || batch.local_task != 0;
+        let ready = batch.current != 0 || batch.local_task != 0 || slot.spawned.has_work();
         slot.state.store(
             if ready { BATCH_READY } else { BATCH_EMPTY },
             Ordering::Release,
@@ -727,7 +701,18 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             }
             let (task_id, slot) = {
                 let batch = unsafe { &mut *owned.batch.get() };
-                if batch.local_runs < 3 && batch.local_task != 0 {
+                let spawned = if batch.local_runs < 3
+                    && batch.local_task == 0
+                    && owned.spawned.has_work()
+                {
+                    unsafe { owned.spawned.pop() }
+                } else {
+                    None
+                };
+                if let Some(task_id) = spawned {
+                    batch.local_runs += 1;
+                    (task_id, None)
+                } else if batch.local_runs < 3 && batch.local_task != 0 {
                     batch.local_runs += 1;
                     (core::mem::take(&mut batch.local_task), batch.local_slot.take())
                 } else {
@@ -747,8 +732,30 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                         batch.local_runs = 0;
                         (task_id, Some(task))
                     } else {
+                        // Keep the local LIFO preference bounded even when no
+                        // helper is available. A self-wake must not bypass
+                        // the oldest spawn after three local polls.
+                        let oldest_first = batch.local_runs >= 3;
                         batch.local_runs = 1;
-                        (core::mem::take(&mut batch.local_task), batch.local_slot.take())
+                        let task_id = if oldest_first {
+                            owned.spawned.steal()
+                        } else {
+                            unsafe { owned.spawned.pop() }
+                        };
+                        if let Some(task_id) = task_id {
+                            (task_id, None)
+                        } else if batch.local_task != 0 {
+                            (core::mem::take(&mut batch.local_task), batch.local_slot.take())
+                        } else {
+                            // Thieves read only atomic indices and slab IDs,
+                            // never the owner's private intrusive chain.
+                            let task_id = (1..domain.batches.len()).find_map(|offset| {
+                                domain.batches[(owned.index + offset) % domain.batches.len()]
+                                    .spawned
+                                    .steal()
+                            });
+                            (task_id.unwrap_or(0), None)
+                        }
                     }
                 }
             };
@@ -757,12 +764,6 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 break;
             }
             crate::runtime::slab::ptr::poll_slab_task::<E>(table, task_id, slot);
-            if with_executor_local::<E, _>(|tls| core::ptr::eq(tls.batch.get(), owned)) {
-                let batch = unsafe { &mut *owned.batch.get() };
-                if self.publish_spawn_batch(domain, batch) {
-                    self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
-                }
-            }
             ran += 1;
         }
 

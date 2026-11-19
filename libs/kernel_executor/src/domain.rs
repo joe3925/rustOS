@@ -46,9 +46,6 @@ pub(crate) struct ReadyBatch {
     pub local_slot: Option<&'static crate::runtime::slab::slot::TaskSlot>,
     pub local_runs: u8,
     pub shard_cursor: usize,
-    pub pending_head: usize,
-    pub pending_tail: Option<&'static crate::runtime::slab::slot::TaskSlot>,
-    pub pending_count: usize,
 }
 
 #[repr(align(64))]
@@ -56,6 +53,7 @@ pub(crate) struct BatchSlot {
     pub state: AtomicU8,
     pub index: usize,
     pub batch: UnsafeCell<ReadyBatch>,
+    pub spawned: crate::steal_queue::StealQueue<256>,
 }
 
 unsafe impl Sync for BatchSlot {}
@@ -274,10 +272,8 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
                         local_slot: None,
                         local_runs: 0,
                         shard_cursor: index % config.ready_shards,
-                        pending_head: 0,
-                        pending_tail: None,
-                        pending_count: 0,
                     }),
+                    spawned: crate::steal_queue::StealQueue::new(),
                 })
                 .collect(),
             help_requested: CacheAligned(AtomicUsize::new(0)),
@@ -342,6 +338,7 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
                 .ready_heads
                 .iter()
                 .any(|head| head.0.load(Ordering::Acquire) != 0)
+            || self.batches.iter().any(|batch| batch.spawned.has_work())
     }
 
     #[inline]
@@ -972,7 +969,7 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
                     let cleanup = unsafe { &mut *domain.cleanup.get() };
                     let table = crate::runtime::slab::task_slab::get_task_table::<E>();
                     let mut remaining = 256usize;
-                    let queues = domain.ready_heads.len() + domain.batches.len() * 2;
+                    let queues = domain.ready_heads.len() + domain.batches.len() * 3;
                     while remaining != 0
                         && (cleanup.queue_head != 0 || cleanup.queue_index < queues)
                     {
@@ -984,11 +981,19 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
                                     domain.ready_heads[queue].0.swap(0, Ordering::Acquire);
                             } else {
                                 let queue = queue - domain.ready_heads.len();
-                                let batch = unsafe { &mut *domain.batches[queue / 2].batch.get() };
-                                cleanup.queue_head = if queue % 2 == 0 {
-                                    core::mem::take(&mut batch.current)
-                                } else {
-                                    core::mem::take(&mut batch.local_task)
+                                let owned = &domain.batches[queue / 3];
+                                let batch = unsafe { &mut *owned.batch.get() };
+                                cleanup.queue_head = match queue % 3 {
+                                    0 => core::mem::take(&mut batch.current),
+                                    1 => core::mem::take(&mut batch.local_task),
+                                    _ => {
+                                        // All readers and owners have left the domain.
+                                        let task = unsafe { owned.spawned.pop() }.unwrap_or(0);
+                                        if task != 0 {
+                                            cleanup.queue_index -= 1;
+                                        }
+                                        task
+                                    }
                                 };
                             }
                             continue;

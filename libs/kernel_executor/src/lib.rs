@@ -19,6 +19,8 @@ pub mod platform;
 #[cfg(feature = "executor")]
 pub mod runtime;
 #[cfg(feature = "executor")]
+mod steal_queue;
+#[cfg(feature = "executor")]
 mod sync;
 
 #[cfg(all(test, feature = "executor", not(any(loom, feature = "loom"))))]
