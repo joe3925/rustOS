@@ -1,20 +1,26 @@
 use crate::platform::ExecutorPlatform;
 use crate::thread_state::BlockOnThreadState;
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, task::Wake, vec::Vec};
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use crossbeam_queue::ArrayQueue;
+#[cfg(not(any(loom, feature = "loom")))]
+use futures_core::task::__internal::AtomicWaker;
 pub use kernel_sync::completion::TaskOutcome;
 use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskToken};
+#[cfg(any(loom, feature = "loom"))]
+use loom::future::AtomicWaker;
 
 pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
 use crate::future_allocation::FutureAllocation;
 use crate::global_async::{ExecutorDomainId, GlobalAsyncExecutor};
 use crate::platform::Job;
+use crate::sync::Mutex;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED, TaskSlot};
@@ -94,6 +100,7 @@ pub(crate) fn has_retired_block_on_states<E: ExecutorPlatform>() -> bool {
 
 #[cfg_attr(irq_check, irq::forbidden)]
 pub(crate) fn drain_retired_block_on_states<E: ExecutorPlatform>() {
+    drain_retired_join_wakers();
     if !has_retired_block_on_states::<E>() {
         return;
     }
@@ -537,17 +544,142 @@ enum FutureSlot<F: Future> {
     Done(Option<F::Output>),
 }
 
+struct JoinAllReady {
+    ready: ArrayQueue<usize>,
+    waker: AtomicWaker,
+    closed: AtomicBool,
+}
+
+struct JoinAllWaker {
+    index: usize,
+    state: Arc<JoinAllReady>,
+    queued: AtomicBool,
+}
+
+struct RetiredJoinWakers {
+    pending: AtomicBool,
+    entries: Mutex<VecDeque<Arc<JoinAllWaker>>>,
+}
+
+#[cfg(not(any(loom, feature = "loom")))]
+static RETIRED_JOIN_WAKERS: RetiredJoinWakers = RetiredJoinWakers {
+    pending: AtomicBool::new(false),
+    entries: Mutex::new(VecDeque::new()),
+};
+
+#[cfg(any(loom, feature = "loom"))]
+loom::lazy_static! {
+    static ref RETIRED_JOIN_WAKERS: RetiredJoinWakers = RetiredJoinWakers {
+        pending: AtomicBool::new(false),
+        entries: Mutex::new(VecDeque::new()),
+    };
+}
+
+#[cfg_attr(irq_check, irq::forbidden)]
+fn drain_retired_join_wakers() {
+    if !RETIRED_JOIN_WAKERS.pending.load(Ordering::Acquire) {
+        return;
+    }
+
+    let released = {
+        let mut entries = RETIRED_JOIN_WAKERS.entries.lock();
+        let mut released = Vec::new();
+        let budget = entries.len().min(128);
+        for _ in 0..budget {
+            let waker = entries.pop_front().expect("retired join waker missing");
+            if Arc::strong_count(&waker) == 1 {
+                released.push(waker);
+            } else {
+                entries.push_back(waker);
+            }
+        }
+        RETIRED_JOIN_WAKERS
+            .pending
+            .store(!entries.is_empty(), Ordering::Release);
+        released
+    };
+    drop(released);
+}
+
+impl Wake for JoinAllWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.state.closed.load(Ordering::Acquire)
+            || self.queued.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        self.state
+            .ready
+            .push(self.index)
+            .expect("join ready queue full");
+        self.state.waker.wake();
+    }
+}
+
 pub struct JoinAll<F: Future> {
     slots: Vec<FutureSlot<F>>,
+    wakers: Vec<Arc<JoinAllWaker>>,
+    state: Arc<JoinAllReady>,
     remaining: usize,
 }
 
 impl<F: Future> JoinAll<F> {
     pub fn new(fs: Vec<F>) -> Self {
+        drain_retired_join_wakers();
         let remaining = fs.len();
         let slots = fs.into_iter().map(FutureSlot::Running).collect();
+        let state = Arc::new(JoinAllReady {
+            ready: ArrayQueue::new(remaining.max(1)),
+            waker: AtomicWaker::new(),
+            closed: AtomicBool::new(false),
+        });
+        let wakers = (0..remaining)
+            .map(|index| {
+                state.ready.push(index).expect("join ready queue full");
+                Arc::new(JoinAllWaker {
+                    index,
+                    state: state.clone(),
+                    queued: AtomicBool::new(true),
+                })
+            })
+            .collect();
 
-        Self { slots, remaining }
+        Self {
+            slots,
+            wakers,
+            state,
+            remaining,
+        }
+    }
+}
+
+impl<F: Future> Drop for JoinAll<F> {
+    #[cfg_attr(irq_check, irq::forbidden)]
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+        #[cfg(not(any(loom, feature = "loom")))]
+        self.state.waker.take();
+        #[cfg(any(loom, feature = "loom"))]
+        self.state.waker.take_waker();
+
+        self.slots.clear();
+        let mut outstanding = Vec::new();
+        for waker in self.wakers.drain(..) {
+            if Arc::strong_count(&waker) != 1 {
+                outstanding.push(waker);
+            }
+        }
+        if !outstanding.is_empty() {
+            let mut entries = RETIRED_JOIN_WAKERS.entries.lock();
+            entries.extend(outstanding);
+            RETIRED_JOIN_WAKERS.pending.store(true, Ordering::Release);
+        }
+        drain_retired_join_wakers();
     }
 }
 
@@ -561,14 +693,27 @@ impl<F: Future> Future for JoinAll<F> {
             return Poll::Ready(join_all_take_output(&mut this.slots));
         }
 
-        let mut i = 0usize;
-        while i < this.slots.len() {
+        #[cfg(not(any(loom, feature = "loom")))]
+        this.state.waker.register(cx.waker());
+        #[cfg(any(loom, feature = "loom"))]
+        this.state.waker.register_by_ref(cx.waker());
+
+        let budget = this.state.ready.len().min(128);
+        for _ in 0..budget {
+            let Some(i) = this.state.ready.pop() else {
+                break;
+            };
             let slot = &mut this.slots[i];
 
             if let FutureSlot::Running(fut) = slot {
+                let child = &this.wakers[i];
+                child.queued.swap(false, Ordering::AcqRel);
+                let waker = Waker::from(child.clone());
+                let mut child_cx = Context::from_waker(&waker);
                 let pinned = unsafe { Pin::new_unchecked(fut) };
 
-                if let Poll::Ready(result) = pinned.poll(cx) {
+                if let Poll::Ready(result) = pinned.poll(&mut child_cx) {
+                    child.queued.store(true, Ordering::Release);
                     *slot = FutureSlot::Done(Some(result));
                     this.remaining -= 1;
 
@@ -577,11 +722,11 @@ impl<F: Future> Future for JoinAll<F> {
                     }
                 }
             }
-
-            i += 1;
         }
 
-        cx.waker().wake_by_ref();
+        if !this.state.ready.is_empty() {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 }

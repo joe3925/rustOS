@@ -11,13 +11,14 @@ crate-type = ["rlib"]
 
 [dependencies]
 crossbeam-queue = { version = "0.3.12", default-features = false, features = ["alloc"], optional = true }
+futures-core = { version = "0.3.32", default-features = false, optional = true }
 kernel_sync = { path = "../kernel_sync", default-features = false, optional = true }
 spin = { version = "0.10", optional = true }
-loom = { version = "0.7", optional = true }
+loom = { version = "0.7", features = ["futures"], optional = true }
 
 [features]
 default = ["executor"]
-executor = ["dep:kernel_sync", "dep:spin", "dep:crossbeam-queue"]
+executor = ["dep:kernel_sync", "dep:spin", "dep:crossbeam-queue", "dep:futures-core"]
 loom = ["executor", "dep:loom"]
 
 [lints.rust]
