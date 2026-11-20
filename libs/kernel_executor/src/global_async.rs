@@ -252,6 +252,16 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 }
                 if SPAWN {
                     slot.ready_next.store(0, Ordering::Relaxed);
+                    let sequence = owned.next_task.sequence.load(Ordering::Acquire);
+                    if sequence & 1 == 0
+                        && slot.result_ptr.load(Ordering::Relaxed)
+                            != crate::runtime::slab::slot::RESULT_ABANDONED
+                    {
+                        owned.next_task.slot.store(core::ptr::from_ref(slot).cast_mut(), Ordering::Relaxed);
+                        owned.next_task.task.store(task_id, Ordering::Relaxed);
+                        owned.next_task.sequence.store(sequence.wrapping_add(1), Ordering::Release);
+                        return Some(!domain.is_at_active_limit());
+                    }
                     if unsafe { owned.spawned.push(task_id) } {
                         // RUN_PENDING coalesces requests. At the active limit,
                         // the already running pumps will check visible work.
@@ -377,7 +387,10 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 }
             }
         }
-        let ready = batch.current != 0 || batch.local_task != 0 || slot.spawned.has_work();
+        let ready = batch.current != 0
+            || batch.local_task != 0
+            || slot.next_task.sequence.load(Ordering::Acquire) & 1 != 0
+            || slot.spawned.has_work();
         slot.state.store(
             if ready { BATCH_READY } else { BATCH_EMPTY },
             Ordering::Release,
@@ -436,6 +449,15 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                 domain.maybe_finish_draining();
             }
             return;
+        }
+
+        if !RELEASE_ACTIVE
+            && domain.schedule_state.0.load(Ordering::Acquire) & RUN_PENDING != 0
+        {
+            fence(Ordering::SeqCst);
+            if domain.schedule_state.0.load(Ordering::Acquire) & RUN_PENDING != 0 {
+                return;
+            }
         }
 
         let previous = if RELEASE_ACTIVE {
@@ -725,6 +747,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             previous_batch,
         };
         let mut ran = 0usize;
+        let mut empty_searches = 0usize;
         let budget = budget.max(1);
         let table = crate::runtime::slab::task_slab::get_task_table::<E>();
 
@@ -736,17 +759,20 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             }
             let (task_id, slot) = {
                 let batch = unsafe { &mut *owned.batch.get() };
-                let spawned = if batch.local_runs < 3
-                    && batch.local_task == 0
-                    && owned.spawned.has_work()
-                {
-                    unsafe { owned.spawned.pop() }
+                let spawned = if batch.local_runs < 3 {
+                    owned.take_next().map(|(task, slot)| (task, Some(slot))).or_else(|| {
+                        if batch.local_task == 0 && owned.spawned.has_work() {
+                            unsafe { owned.spawned.pop() }.map(|task| (task, None))
+                        } else {
+                            None
+                        }
+                    })
                 } else {
                     None
                 };
-                if let Some(task_id) = spawned {
+                if let Some(task) = spawned {
                     batch.local_runs += 1;
-                    (task_id, None)
+                    task
                 } else if batch.local_runs < 3 && batch.local_task != 0 {
                     batch.local_runs += 1;
                     (core::mem::take(&mut batch.local_task), batch.local_slot.take())
@@ -773,31 +799,42 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                         let oldest_first = batch.local_runs >= 3;
                         batch.local_runs = 1;
                         let task_id = if oldest_first {
-                            owned.spawned.steal()
+                            owned.spawned.steal().map(|task| (task, None))
+                                .or_else(|| owned.take_next().map(|(task, slot)| (task, Some(slot))))
                         } else {
-                            unsafe { owned.spawned.pop() }
+                            owned.take_next().map(|(task, slot)| (task, Some(slot)))
+                                .or_else(|| unsafe { owned.spawned.pop() }.map(|task| (task, None)))
                         };
-                        if let Some(task_id) = task_id {
-                            (task_id, None)
+                        if let Some(task) = task_id {
+                            task
                         } else if batch.local_task != 0 {
                             (core::mem::take(&mut batch.local_task), batch.local_slot.take())
                         } else {
                             // Thieves read only atomic indices and slab IDs,
                             // never the owner's private intrusive chain.
                             let task_id = (1..domain.batches.len()).find_map(|offset| {
-                                domain.batches[(owned.index + offset) % domain.batches.len()]
-                                    .spawned
-                                    .steal()
+                                let victim = &domain.batches[(owned.index + offset) % domain.batches.len()];
+                                victim.take_next().map(|(task, slot)| (task, Some(slot)))
+                                    .or_else(|| victim.spawned.steal().map(|task| (task, None)))
                             });
-                            (task_id.unwrap_or(0), None)
+                            task_id.unwrap_or((0, None))
                         }
                     }
                 }
             };
             if task_id == 0 {
+                if E::PERSISTENT_RUNTIME_WORKERS
+                    && empty_searches < 32
+                    && !self.has_runnable_domains()
+                {
+                    empty_searches += 1;
+                    core::hint::spin_loop();
+                    continue;
+                }
                 domain.help_requested.0.store(1, Ordering::Release);
                 break;
             }
+            empty_searches = 0;
             if E::PERSISTENT_RUNTIME_WORKERS && ran == 0 {
                 if !domain.is_at_active_limit() && domain.has_queued_work() {
                     self.schedule_domain_if_needed::<false>(self.runtime(), domain.id(), domain);
@@ -805,8 +842,12 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
                     self.try_schedule::<false>();
                 }
             }
-            crate::runtime::slab::ptr::poll_slab_task::<E>(table, task_id, slot);
-            ran += 1;
+            ran += with_executor_local::<E, _>(|tls| {
+                let inline = (budget - ran - 1).min(3) as u8;
+                let previous = tls.inline_budget.replace(inline);
+                crate::runtime::slab::ptr::poll_slab_task::<E>(table, task_id, slot);
+                1 + (inline - tls.inline_budget.replace(previous)) as usize
+            });
         }
 
         ran

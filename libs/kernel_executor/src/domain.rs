@@ -49,14 +49,37 @@ pub(crate) struct ReadyBatch {
 }
 
 #[repr(align(64))]
+pub(crate) struct NextTask {
+    pub sequence: AtomicUsize,
+    pub task: AtomicUsize,
+    pub slot: AtomicPtr<crate::runtime::slab::slot::TaskSlot>,
+}
+
+#[repr(align(64))]
 pub(crate) struct BatchSlot {
     pub state: AtomicU8,
     pub index: usize,
     pub batch: UnsafeCell<ReadyBatch>,
+    pub next_task: NextTask,
     pub spawned: crate::steal_queue::StealQueue<256>,
 }
 
 unsafe impl Sync for BatchSlot {}
+
+impl BatchSlot {
+    #[inline]
+    pub(crate) fn take_next(&self) -> Option<(usize, &'static crate::runtime::slab::slot::TaskSlot)> {
+        let sequence = self.next_task.sequence.load(Ordering::Acquire);
+        if sequence & 1 == 0 {
+            return None;
+        }
+        let task = self.next_task.task.load(Ordering::Relaxed);
+        let slot = self.next_task.slot.load(Ordering::Relaxed);
+        self.next_task.sequence.compare_exchange(
+            sequence, sequence.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed,
+        ).ok().map(|_| (task, unsafe { &*slot }))
+    }
+}
 
 struct DomainCleanup {
     queue_index: usize,
@@ -273,6 +296,11 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
                         local_runs: 0,
                         shard_cursor: index % config.ready_shards,
                     }),
+                    next_task: NextTask {
+                        sequence: AtomicUsize::new(0),
+                        task: AtomicUsize::new(0),
+                        slot: AtomicPtr::new(core::ptr::null_mut()),
+                    },
                     spawned: crate::steal_queue::StealQueue::new(),
                 })
                 .collect(),
@@ -338,7 +366,9 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
                 .ready_heads
                 .iter()
                 .any(|head| head.0.load(Ordering::Acquire) != 0)
-            || self.batches.iter().any(|batch| batch.spawned.has_work())
+            || self.batches.iter().any(|batch| {
+                batch.next_task.sequence.load(Ordering::Acquire) & 1 != 0 || batch.spawned.has_work()
+            })
     }
 
     #[inline]
@@ -424,7 +454,7 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
         let _ = self
             .schedule_state
             .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .fetch_update(Ordering::SeqCst, Ordering::Acquire, |state| {
                 reserved = state / ACTIVE_UNIT < self.max_active();
                 Some((state & !RUN_PENDING) + if reserved { ACTIVE_UNIT } else { 0 })
             });
@@ -969,7 +999,7 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
                     let cleanup = unsafe { &mut *domain.cleanup.get() };
                     let table = crate::runtime::slab::task_slab::get_task_table::<E>();
                     let mut remaining = 256usize;
-                    let queues = domain.ready_heads.len() + domain.batches.len() * 3;
+                    let queues = domain.ready_heads.len() + domain.batches.len() * 4;
                     while remaining != 0
                         && (cleanup.queue_head != 0 || cleanup.queue_index < queues)
                     {
@@ -981,11 +1011,12 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
                                     domain.ready_heads[queue].0.swap(0, Ordering::Acquire);
                             } else {
                                 let queue = queue - domain.ready_heads.len();
-                                let owned = &domain.batches[queue / 3];
+                                let owned = &domain.batches[queue / 4];
                                 let batch = unsafe { &mut *owned.batch.get() };
-                                cleanup.queue_head = match queue % 3 {
+                                cleanup.queue_head = match queue % 4 {
                                     0 => core::mem::take(&mut batch.current),
                                     1 => core::mem::take(&mut batch.local_task),
+                                    2 => owned.take_next().map_or(0, |(task, _)| task),
                                     _ => {
                                         // All readers and owners have left the domain.
                                         let task = unsafe { owned.spawned.pop() }.unwrap_or(0);

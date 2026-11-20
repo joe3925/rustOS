@@ -155,6 +155,9 @@ impl<P: WorkerPlatform> RuntimePool<P> {
                 == active
                 && self.shared.wake_one::<false>(&self.shared.resident_idle);
         }
+        if self.shared.resident_idle.load(Ordering::Acquire) == 0 {
+            return active == self.shared.workers.len();
+        }
         if self
             .shared
             .notified
@@ -181,12 +184,14 @@ impl<P: WorkerPlatform> RuntimePool<P> {
         self.shared
             .searching
             .fetch_and(!(1usize << index), Ordering::SeqCst);
-        let _ = self.shared.notified.compare_exchange(
-            index + 1,
-            0,
-            Ordering::SeqCst,
-            Ordering::Acquire,
-        );
+        if self.shared.notified.load(Ordering::Acquire) == index + 1 {
+            let _ = self.shared.notified.compare_exchange(
+                index + 1,
+                0,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            );
+        }
     }
 
     pub fn wait(&self, work_pending: impl FnOnce() -> bool) -> bool {

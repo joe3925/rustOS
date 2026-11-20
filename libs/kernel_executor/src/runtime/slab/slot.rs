@@ -77,11 +77,12 @@ pub struct TaskSlot {
     pub(crate) state: AtomicU8,
     pub(super) control: AtomicU8,
     pub(super) waker_state: AtomicU8,
+    pub(crate) domain_id: AtomicU64,
+    pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
+    pub(super) future: UnsafeCell<Option<FutureAllocation>>,
+    pub(crate) inline_future: UnsafeCell<MaybeUninit<[usize; 3]>>,
     pub(crate) ready_next: AtomicUsize,
     pub(super) retired_next: AtomicUsize,
-    pub(crate) domain_id: AtomicU64,
-    pub(super) future: UnsafeCell<Option<FutureAllocation>>,
-    pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
     pub(super) drop_fn: UnsafeCell<Option<TaskDropFn>>,
     pub(super) cancel_fn: UnsafeCell<Option<TaskCancelFn>>,
     pub(crate) result_ptr: AtomicUsize,
@@ -106,19 +107,20 @@ impl TaskSlot {
             cancel_fn: UnsafeCell::new(None),
             result_ptr: AtomicUsize::new(RESULT_ABANDONED),
             join_waker: UnsafeCell::new(MaybeUninit::uninit()),
+            inline_future: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
     #[inline]
     #[cfg_attr(irq_check, irq::forbidden)]
     pub(super) fn release_last_ref(&self) {
-        if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
-            unsafe {
-                if let Some(allocation) = (&mut *self.future.get()).take() {
+        unsafe {
+            if let Some(allocation) = (&mut *self.future.get()).take() {
+                if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
                     drop_fn(allocation.ptr.as_ptr());
-                    allocation.release();
                 }
-            };
+                allocation.release();
+            }
         }
         write_drop_fn(&self.drop_fn, None);
         unsafe { *self.cancel_fn.get() = None };
@@ -141,7 +143,7 @@ impl TaskSlot {
         self.domain_id.store(0, Ordering::Release);
     }
 
-    pub unsafe fn init_joinable<F, T>(
+    pub unsafe fn init_joinable<F, T, const OWNED: bool>(
         &self,
         domain_id: ExecutorDomainId,
         allocation: FutureAllocation,
@@ -153,7 +155,7 @@ impl TaskSlot {
         unsafe {
             self.result_ptr
                 .store(result_ptr as usize, Ordering::Release);
-            self.init_internal::<F, T>(domain_id, allocation, poll_joinable::<F, T>);
+            self.init_internal::<F, T, OWNED>(domain_id, allocation, poll_joinable::<F, T, OWNED>);
         }
     }
 
@@ -167,11 +169,11 @@ impl TaskSlot {
         F: Future<Output = ()> + Send + 'static,
     {
         unsafe {
-            self.init_internal::<F, ()>(domain_id, allocation, poll_detached::<F>);
+            self.init_internal::<F, (), false>(domain_id, allocation, poll_detached::<F>);
         }
     }
 
-    unsafe fn init_internal<F, T>(
+    unsafe fn init_internal<F, T, const OWNED: bool>(
         &self,
         domain_id: ExecutorDomainId,
         allocation: FutureAllocation,
@@ -184,7 +186,7 @@ impl TaskSlot {
             *self.future.get() = Some(allocation);
             write_poll_fn(&self.poll_fn, Some(poll_fn));
             write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
-            *self.cancel_fn.get() = Some(cancel_future::<F, T>);
+            *self.cancel_fn.get() = Some(cancel_future::<F, T, OWNED>);
 
             self.state.store(STATE_QUEUED, Ordering::Release);
             self.domain_id.store(domain_id.raw(), Ordering::Release);
@@ -453,7 +455,7 @@ impl TaskSlot {
     }
 }
 
-unsafe fn poll_joinable<F, T>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
+unsafe fn poll_joinable<F, T, const OWNED: bool>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
 where
     F: Future<Output = T>,
     T: Send + 'static,
@@ -468,10 +470,14 @@ where
         match poll_res {
             Poll::Ready(result) => {
                 core::ptr::drop_in_place(future);
-                let allocation = (&mut *slot.future.get())
-                    .take()
-                    .expect("task future allocation missing on completion");
-                allocation.release();
+                if OWNED {
+                    write_drop_fn(&slot.drop_fn, None);
+                } else {
+                    let allocation = (&mut *slot.future.get())
+                        .take()
+                        .expect("task future allocation missing on completion");
+                    allocation.release();
+                }
                 loop {
                     let ptr = slot.result_ptr.load(Ordering::Acquire);
                     if ptr == RESULT_ABANDONED {
@@ -520,9 +526,13 @@ where
     }
 }
 
-unsafe fn cancel_future<F, T>(slot: &TaskSlot, _token: usize) {
+unsafe fn cancel_future<F, T, const OWNED: bool>(slot: &TaskSlot, _token: usize) {
     unsafe {
-        if let Some(allocation) = (&mut *slot.future.get()).take() {
+        if OWNED {
+            if let Some(allocation) = (&*slot.future.get()).as_ref() {
+                core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
+            }
+        } else if let Some(allocation) = (&mut *slot.future.get()).take() {
             core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
             allocation.release();
         }

@@ -1,6 +1,7 @@
 use crate::platform::ExecutorPlatform;
 use crate::thread_state::BlockOnThreadState;
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, task::Wake, vec::Vec};
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -270,18 +271,30 @@ fn reserve_future<E: ExecutorPlatform, F>(
     local: &crate::platform::ExecutorThreadLocal<E>,
     future: F,
     refs: u32,
+    layout: Layout,
 ) -> (FutureAllocation, SlotHandle, &'static TaskSlot) {
-    let allocation =
-        FutureAllocation::allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-            .expect("future heap allocation failed");
-    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
+    let allocation = if layout.size() <= core::mem::size_of::<[usize; 3]>()
+        && layout.align() <= core::mem::align_of::<usize>()
+    {
+        None
+    } else {
+        Some(FutureAllocation::allocate(layout.size(), layout.align())
+            .expect("future heap allocation failed"))
+    };
     let (slot_handle, slot) = match slab.allocate_with_refs::<true>(refs, Some(local)) {
         Some(reserved) => reserved,
         None => unsafe {
-            release_unpublished_future::<F>(allocation);
+            if let Some(allocation) = allocation {
+                allocation.release();
+            }
             panic!("task table allocation failed");
         },
     };
+    let allocation = allocation.unwrap_or_else(|| FutureAllocation {
+        ptr: unsafe { core::ptr::NonNull::new_unchecked(slot.inline_future.get().cast::<u8>()) },
+        layout: Layout::new::<()>(),
+    });
+    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
     (allocation, slot_handle, slot)
 }
 
@@ -306,11 +319,12 @@ where
                 return None;
             }
             let slab = executor.task_table.get().expect("task table not initialized");
-            let (allocation, slot_handle, slot) = reserve_future::<E, _>(slab, local, future, 3);
+            let (allocation, slot_handle, slot) =
+                reserve_future::<E, _>(slab, local, future, 3, Layout::new::<F>());
 
             let (shard_idx, local_idx, generation) = slot_handle.indices();
 
-            unsafe { slot.init_joinable::<F, T>(domain_id, allocation, storage_ptr) };
+            unsafe { slot.init_joinable::<F, T, false>(domain_id, allocation, storage_ptr) };
 
             let encoded = slot_handle.encoded_ptr();
             executor.enqueue_task::<true, false>(domain, local, encoded, slot);
@@ -379,6 +393,41 @@ impl<T: Send + 'static, E: ExecutorPlatform> Future for JoinHandle<'_, T, E> {
             this.consumed = true;
             Poll::Ready(result)
         } else {
+            if !E::in_interrupt_context() {
+                let claimed = crate::platform::with_executor_local::<E, _>(|tls| {
+                    let budget = tls.inline_budget.get();
+                    if budget == 0 || tls.current.get().is_none() {
+                        return None;
+                    }
+                    let (Some(domain), Some(owned)) = (unsafe {
+                        (tls.active_domain.get().as_ref(), tls.batch.get().as_ref())
+                    }) else {
+                        return None;
+                    };
+                    if domain.state() != crate::domain::ExecutorDomainState::Active
+                        || slot.executor_domain_id() != Some(domain.id())
+                    {
+                        return None;
+                    }
+                    let task = super::slab::ptr::encode_slab_task_ptr(
+                        this.shard_idx, this.local_idx, this.generation,
+                    );
+                    let sequence = owned.next_task.sequence.load(Ordering::Acquire);
+                    if sequence & 1 == 0
+                        || owned.next_task.task.load(Ordering::Relaxed) != task
+                        || owned.next_task.sequence.compare_exchange(
+                            sequence, sequence.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed,
+                        ).is_err()
+                    {
+                        return None;
+                    }
+                    tls.inline_budget.set(budget - 1);
+                    Some(task)
+                });
+                if let Some(task) = claimed {
+                    super::slab::ptr::poll_slab_task::<E>(get_task_table::<E>(), task, Some(slot));
+                }
+            }
             slot.update_join_waker(cx.waker());
 
             if slot.is_completed() {
@@ -445,12 +494,8 @@ impl<T: Send + 'static, E: ExecutorPlatform> Drop for JoinHandle<'_, T, E> {
     }
 }
 
-#[repr(align(64))]
-struct OwnedJoinStorage<T>(JoinStorage<T>);
-
 pub struct OwnedJoinHandle<T: Send + 'static, E: ExecutorPlatform> {
     handle: JoinHandle<'static, T, E>,
-    _storage: Pin<Box<OwnedJoinStorage<T>>>,
 }
 
 impl<T: Send + 'static, E: ExecutorPlatform> Future for OwnedJoinHandle<T, E> {
@@ -483,17 +528,51 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let mut storage = Box::pin(OwnedJoinStorage(JoinStorage::new()));
-    let storage_ref = unsafe {
-        core::mem::transmute::<Pin<&mut JoinStorage<T>>, Pin<&'static mut JoinStorage<T>>>(
-            storage.as_mut().map_unchecked_mut(|storage| &mut storage.0),
-        )
-    };
-    let handle = spawn_in_executor_domain::<E, _, _>(domain_id, storage_ref, future);
-    OwnedJoinHandle {
-        handle,
-        _storage: storage,
-    }
+    assert!(
+        !E::in_interrupt_context(),
+        "attempted to spawn a task from interrupt context"
+    );
+    let executor = GlobalAsyncExecutor::<E>::global();
+    let handle = executor
+        .with_executor_domain(domain_id, |domain, local| {
+            if domain.state() != crate::domain::ExecutorDomainState::Active {
+                return None;
+            }
+            let slab = executor.task_table.get().expect("task table not initialized");
+            let layout = Layout::from_size_align(
+                core::mem::size_of::<F>().max(core::mem::size_of::<JoinStorage<T>>()),
+                core::mem::align_of::<F>().max(core::mem::align_of::<JoinStorage<T>>()),
+            )
+                .expect("owned task layout overflow");
+            let (allocation, slot_handle, slot) =
+                reserve_future::<E, _>(slab, local, future, 3, layout.pad_to_align());
+            let storage = allocation.ptr.as_ptr().cast::<JoinStorage<T>>();
+            let (shard_idx, local_idx, generation) = slot_handle.indices();
+            unsafe {
+                slot.init_joinable::<F, T, true>(domain_id, allocation, storage);
+            }
+            executor.enqueue_task::<true, false>(domain, local, slot_handle.encoded_ptr(), slot);
+            Some(JoinHandle {
+                shard_idx: shard_idx as u8,
+                local_idx: local_idx as u32,
+                generation,
+                consumed: false,
+                slot: Some(slot),
+                storage,
+                _marker: PhantomData,
+            })
+        })
+        .flatten()
+        .unwrap_or(JoinHandle {
+            shard_idx: 0,
+            local_idx: 0,
+            generation: 0,
+            consumed: false,
+            slot: None,
+            storage: core::ptr::null_mut(),
+            _marker: PhantomData,
+        });
+    OwnedJoinHandle { handle }
 }
 
 pub fn spawn_detached<E: ExecutorPlatform, F>(future: F)
@@ -523,7 +602,8 @@ pub fn spawn_detached_in_executor_domain<E: ExecutorPlatform, F>(
                 return;
             }
             let slab = executor.task_table.get().expect("task table not initialized");
-            let (allocation, slot_handle, slot) = reserve_future::<E, _>(slab, local, future, 2);
+            let (allocation, slot_handle, slot) =
+                reserve_future::<E, _>(slab, local, future, 2, Layout::new::<F>());
             unsafe { slot.init_detached::<F>(domain_id, allocation) };
 
             let encoded = slot_handle.encoded_ptr();

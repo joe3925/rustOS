@@ -49,6 +49,7 @@ pub struct ExecutorThreadLocal<E: ExecutorPlatform> {
     pub(crate) active_domain: Cell<*const ExecutorDomain<E>>,
     pub(crate) ready_cursor: Cell<usize>,
     pub(crate) allocation_cursor: Cell<usize>,
+    pub(crate) inline_budget: Cell<u8>,
     pub(crate) caches: RefCell<[SlabCache; 1]>,
 }
 
@@ -61,6 +62,7 @@ impl<E: ExecutorPlatform> ExecutorThreadLocal<E> {
             active_domain: Cell::new(core::ptr::null()),
             ready_cursor: Cell::new(0),
             allocation_cursor: Cell::new(0),
+            inline_budget: Cell::new(0),
             caches: RefCell::new([const { SlabCache::new() }; 1]),
         }
     }
