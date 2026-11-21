@@ -83,6 +83,11 @@ pub fn configure(
     command.env("CFLAGS", cflags).env("AR", archiver);
     if generate || profile.is_some() {
         let mut flags = "-Clinker-plugin-lto\x1f-Clto=fat\x1f-Clink-arg=/opt:lldlto=3".to_string();
+        // Favor runtime savings over code size in both rustc and linker LTO.
+        flags.push_str(concat!(
+            "\x1f-Cllvm-args=-inline-savings-multiplier=16",
+            "\x1f-Clink-arg=/mllvm:-inline-savings-multiplier=16",
+        ));
         if llvm_target.starts_with("aarch64") {
             flags.push_str("\x1f--cfg\x1fportable_atomic_no_outline_atomics");
         }

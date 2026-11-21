@@ -534,7 +534,6 @@ impl<'data> IoBufferBacking<'data> {
         let handle = self.create_lease(offset, len, ACCESS_BIDIRECTIONAL)?;
         Ok(IoBuffer::new(self, handle, offset, len))
     }
-    #[inline(always)]
     fn create_lease(
         &self,
         start: usize,
@@ -758,7 +757,6 @@ impl<'data> IoBufferBacking<'data> {
         })
     }
 
-    #[inline(always)]
     pub(super) fn release_lease(&self, handle: LeaseHandle) {
         let Some(slot) = self.leases.get(handle.index) else {
             return;
