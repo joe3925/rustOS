@@ -228,7 +228,7 @@ jobs:
         run: |
           cargo run --release -p xtask -- bench \
             --platform x86_64-uefi --profile release \
-            --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 5 \
+            --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 1 \
             --pgo --merge --pgo-output target/bench/training/profiles \
             --output target/bench/training/results.json
           RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- pgo \
