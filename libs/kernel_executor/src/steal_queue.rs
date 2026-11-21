@@ -5,6 +5,28 @@ use loom::cell::UnsafeCell;
 #[cfg(not(any(loom, feature = "loom")))]
 use core::cell::UnsafeCell;
 
+pub(crate) struct OverflowTasks<'a, const N: usize> {
+    queue: &'a StealQueue<N>,
+    cursor: u32,
+    remaining: usize,
+    last: Option<usize>,
+}
+
+impl<const N: usize> Iterator for OverflowTasks<'_, N> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining != 0 {
+            self.remaining -= 1;
+            let task = unsafe { self.queue.read(self.cursor) };
+            self.cursor = self.cursor.wrapping_add(1);
+            Some(task)
+        } else {
+            self.last.take()
+        }
+    }
+}
+
 pub(crate) struct StealQueue<const N: usize> {
     head: AtomicU64,
     tail: AtomicU32,
@@ -80,7 +102,7 @@ impl<const N: usize> StealQueue<N> {
     pub unsafe fn push_or_overflow(
         &self,
         task: usize,
-        overflow: impl FnOnce(&mut dyn Iterator<Item = usize>),
+        overflow: impl FnOnce(&mut OverflowTasks<'_, N>),
     ) {
         loop {
             let head = self.head.load(Ordering::Acquire);
@@ -92,7 +114,7 @@ impl<const N: usize> StealQueue<N> {
                 return;
             }
             if steal != real {
-                overflow(&mut core::iter::once(task));
+                overflow(&mut OverflowTasks { queue: self, cursor: 0, remaining: 0, last: Some(task) });
                 return;
             }
             if self.head.compare_exchange_weak(
@@ -101,9 +123,12 @@ impl<const N: usize> StealQueue<N> {
                 continue;
             }
             self.tail.store(tail.wrapping_add((N / 2) as u32), Ordering::Release);
-            let mut tasks = (0..N / 2)
-                .map(|offset| unsafe { self.read(real.wrapping_add((N / 2 + offset) as u32)) })
-                .chain(core::iter::once(task));
+            let mut tasks = OverflowTasks {
+                queue: self,
+                cursor: real.wrapping_add((N / 2) as u32),
+                remaining: N / 2,
+                last: Some(task),
+            };
             overflow(&mut tasks);
             return;
         }

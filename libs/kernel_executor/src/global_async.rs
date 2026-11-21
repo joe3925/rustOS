@@ -231,7 +231,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         }
     }
 
-    fn inject_tasks(&self, domain: &ExecutorDomain<E>, tasks: &mut dyn Iterator<Item = usize>) {
+    fn inject_tasks<I: Iterator<Item = usize>>(&self, domain: &ExecutorDomain<E>, tasks: &mut I) {
         let Some(first) = tasks.next() else { return; };
         let mut tail = unsafe { &*(first as *const crate::runtime::slab::slot::TaskSlot) };
         let mut count = 1;
