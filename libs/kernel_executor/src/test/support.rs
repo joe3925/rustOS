@@ -12,6 +12,8 @@ mod worker_platform;
 const EXECUTOR_MAX_SHARDS: usize = 32;
 
 pub(crate) static RUNTIME_POOL: OnceLock<RuntimePool<StdWorkerPlatform>> = OnceLock::new();
+static DEFAULT_DOMAIN: OnceLock<std::sync::Arc<crate::global_async::ExecutorDomain<TestExecutorPlatform>>> = OnceLock::new();
+static CANCELLATION_DOMAIN: OnceLock<std::sync::Arc<crate::global_async::ExecutorDomain<TestExecutorPlatform>>> = OnceLock::new();
 static BLOCKING_POOL: OnceLock<threadpool::ThreadPool> = OnceLock::new();
 
 pub enum TestExecutorPlatform {}
@@ -30,11 +32,25 @@ impl ExecutorPlatform for TestExecutorPlatform {
         EXECUTOR.call_once(GlobalAsyncExecutor::new)
     }
 
+    fn default_domain() -> &'static crate::global_async::ExecutorDomain<Self> {
+        DEFAULT_DOMAIN.get().expect("default domain not initialized").as_ref()
+    }
+
+    fn cancellation_domain() -> &'static crate::global_async::ExecutorDomain<Self> {
+        CANCELLATION_DOMAIN.get().expect("cancellation domain not initialized").as_ref()
+    }
+
     fn with_executor_local<R>(f: impl FnOnce(&ExecutorThreadLocal<Self>) -> R) -> R {
         EXECUTOR_CONTEXT.with(f)
     }
 
     fn init_runtime(max_threads: usize, max_jobs: usize) {
+        DEFAULT_DOMAIN.get_or_init(|| Self::global_executor().create_executor_domain(
+            crate::global_async::ExecutorDomainConfig::default(),
+        ));
+        CANCELLATION_DOMAIN.get_or_init(|| Self::global_executor().create_executor_domain(
+            crate::global_async::ExecutorDomainConfig::default(),
+        ));
         let threads = max_threads.max(1);
         let _ = RUNTIME_POOL.set(RuntimePool::new(threads, max_jobs.max(1)));
     }
@@ -68,8 +84,8 @@ impl ExecutorPlatform for TestExecutorPlatform {
         RUNTIME_POOL.get().unwrap().wait(work_pending)
     }
 
-    fn runtime_search<const START: bool>() {
-        RUNTIME_POOL.get().unwrap().search::<START>();
+    fn runtime_search<const START: bool>() -> bool {
+        RUNTIME_POOL.get().unwrap().search::<START>()
     }
 
     fn submit_blocking_many(jobs: &[Job]) {

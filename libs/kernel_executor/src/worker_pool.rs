@@ -1,11 +1,16 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering, fence};
 use crossbeam_queue::ArrayQueue;
 
 pub use kernel_sync::platform::worker::WorkerPlatform;
 
+const UNPARKED: usize = 1 << 16;
+const SEARCH_MASK: usize = UNPARKED - 1;
+
 #[repr(align(64))]
 struct Worker<P: WorkerPlatform> {
+    registered: AtomicBool,
+    searching: AtomicBool,
     sleeping: AtomicU32,
     wait_handle: P::WaitHandle,
 }
@@ -18,9 +23,7 @@ impl<P: WorkerPlatform> Worker<P> {
             }
             core::hint::spin_loop();
         }
-        let _ = self
-            .sleeping
-            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self.sleeping.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
         while self.sleeping.load(Ordering::Acquire) != 0 {
             P::wait(&self.wait_handle);
         }
@@ -36,38 +39,27 @@ impl<P: WorkerPlatform> Worker<P> {
 struct Shared<P: WorkerPlatform> {
     jobs: ArrayQueue<(extern "C" fn(usize), usize)>,
     idle: AtomicUsize,
-    resident_idle: AtomicUsize,
-    searching: AtomicUsize,
-    notified: AtomicUsize,
-    preferred: AtomicUsize,
+    state: AtomicUsize,
+    sleepers: crate::sync::SchedulerMutex<Vec<usize>>,
     stopping: AtomicBool,
     workers: Box<[Worker<P>]>,
 }
 
 impl<P: WorkerPlatform> Shared<P> {
-    fn wake_one<const RESIDENT: bool>(&self, mask: &AtomicUsize) -> bool {
-        let mut idle = mask.load(Ordering::Acquire);
+    fn wake_bootstrap(&self) {
+        let mut idle = self.idle.load(Ordering::Acquire);
         while idle != 0 {
-            let preferred = self.preferred.load(Ordering::Relaxed);
-            let index = if idle & (1usize << preferred) != 0 {
-                preferred
-            } else {
-                idle.trailing_zeros() as usize
-            };
-            let bit = 1usize << index;
-            match mask.compare_exchange_weak(idle, idle & !bit, Ordering::AcqRel, Ordering::Acquire)
-            {
+            let index = idle.trailing_zeros() as usize;
+            match self.idle.compare_exchange_weak(
+                idle, idle & !(1usize << index), Ordering::AcqRel, Ordering::Acquire,
+            ) {
                 Ok(_) => {
-                    if RESIDENT {
-                        self.notified.store(index + 1, Ordering::Release);
-                    }
                     self.workers[index].wake();
-                    return true;
+                    return;
                 }
                 Err(actual) => idle = actual,
             }
         }
-        false
     }
 }
 
@@ -81,20 +73,15 @@ impl<P: WorkerPlatform> RuntimePool<P> {
         let shared = Arc::new(Shared::<P> {
             jobs: ArrayQueue::new(capacity),
             idle: AtomicUsize::new(0),
-            resident_idle: AtomicUsize::new(0),
-            searching: AtomicUsize::new(0),
-            notified: AtomicUsize::new(0),
-            preferred: AtomicUsize::new(0),
+            state: AtomicUsize::new(0),
+            sleepers: crate::sync::SchedulerMutex::new(Vec::with_capacity(workers)),
             stopping: AtomicBool::new(false),
-            workers: (0..workers)
-                .map(|_| {
-                    let wait_handle = P::create_wait_handle();
-                    Worker::<P> {
-                        sleeping: AtomicU32::new(0),
-                        wait_handle,
-                    }
-                })
-                .collect(),
+            workers: (0..workers).map(|_| Worker {
+                registered: AtomicBool::new(false),
+                searching: AtomicBool::new(false),
+                sleeping: AtomicU32::new(0),
+                wait_handle: P::create_wait_handle(),
+            }).collect(),
         });
         for index in 0..workers {
             let shared = shared.clone();
@@ -109,7 +96,6 @@ impl<P: WorkerPlatform> RuntimePool<P> {
                     }
                     worker.sleeping.store(1, Ordering::Release);
                     shared.idle.fetch_or(bit, Ordering::SeqCst);
-                    shared.preferred.store(index, Ordering::Relaxed);
                     if let Some((function, context)) = shared.jobs.pop() {
                         if shared.idle.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
                             worker.wait();
@@ -135,82 +121,115 @@ impl<P: WorkerPlatform> RuntimePool<P> {
             return false;
         }
         fence(Ordering::SeqCst);
-        self.shared.wake_one::<false>(&self.shared.idle);
+        self.shared.wake_bootstrap();
         true
     }
 
     pub fn wake(&self, idle_only: bool, active: usize) -> bool {
-        fence(Ordering::SeqCst);
-        if self.shared.searching.load(Ordering::Acquire) != 0
-            || self.shared.notified.load(Ordering::Acquire) != 0
-        {
+        let state = self.shared.state.fetch_add(0, Ordering::SeqCst);
+        if state & SEARCH_MASK != 0 || state / UNPARKED >= self.shared.workers.len() {
             return true;
         }
-        if idle_only {
-            return self
-                .shared
-                .resident_idle
-                .load(Ordering::Acquire)
-                .count_ones() as usize
-                == active
-                && self.shared.wake_one::<false>(&self.shared.resident_idle);
+        if idle_only && state / UNPARKED != 0 {
+            return false;
         }
-        if self.shared.resident_idle.load(Ordering::Acquire) == 0 {
-            return active == self.shared.workers.len();
+        let notified = P::with_scheduler_critical(|| {
+            let mut sleepers = self.shared.sleepers.lock();
+            let state = self.shared.state.fetch_add(0, Ordering::SeqCst);
+            if state & SEARCH_MASK != 0 || state / UNPARKED >= self.shared.workers.len()
+                || (idle_only && state / UNPARKED != 0)
+            {
+                return (None, true);
+            }
+            let Some(index) = sleepers.pop() else {
+                return (None, active == self.shared.workers.len());
+            };
+            self.shared.state.fetch_add(UNPARKED + 1, Ordering::SeqCst);
+            self.shared.workers[index].searching.store(true, Ordering::Release);
+            (Some(index), true)
+        });
+        if let Some(index) = notified.0 {
+            self.shared.workers[index].wake();
         }
-        if self
-            .shared
-            .notified
-            .compare_exchange(0, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return true;
-        }
-        if self.shared.wake_one::<true>(&self.shared.resident_idle) {
-            return true;
-        }
-        self.shared.notified.store(0, Ordering::Release);
-        false
+        notified.1
     }
 
-    pub fn search<const START: bool>(&self) {
-        let index = P::worker_index();
-        if START {
-            self.shared
-                .searching
-                .fetch_or(1usize << index, Ordering::SeqCst);
-            return;
+    pub fn search<const START: bool>(&self) -> bool {
+        let worker = &self.shared.workers[P::worker_index()];
+        if !worker.registered.load(Ordering::Relaxed) {
+            worker.registered.store(true, Ordering::Relaxed);
+            self.shared.state.fetch_add(UNPARKED, Ordering::SeqCst);
         }
-        self.shared
-            .searching
-            .fetch_and(!(1usize << index), Ordering::SeqCst);
-        if self.shared.notified.load(Ordering::Acquire) == index + 1 {
-            let _ = self.shared.notified.compare_exchange(
-                index + 1,
-                0,
-                Ordering::SeqCst,
-                Ordering::Acquire,
-            );
+        if START {
+            if worker.searching.load(Ordering::Acquire) {
+                return true;
+            }
+            let state = self.shared.state.load(Ordering::SeqCst);
+            if 2 * (state & SEARCH_MASK) >= self.shared.workers.len() {
+                return false;
+            }
+            self.shared.state.fetch_add(1, Ordering::SeqCst);
+            worker.searching.store(true, Ordering::Relaxed);
+            return true;
+        }
+        if worker.searching.swap(false, Ordering::Relaxed) {
+            self.shared.state.fetch_sub(1, Ordering::SeqCst) & SEARCH_MASK == 1
+        } else {
+            false
         }
     }
 
     pub fn wait(&self, work_pending: impl FnOnce() -> bool) -> bool {
         let index = P::worker_index();
         let worker = &self.shared.workers[index];
-        let bit = 1usize << index;
         worker.sleeping.store(1, Ordering::Release);
-        self.shared.resident_idle.fetch_or(bit, Ordering::SeqCst);
-        self.shared.preferred.store(index, Ordering::Relaxed);
-        let pending = work_pending();
+        let last = P::with_scheduler_critical(|| {
+            let mut sleepers = self.shared.sleepers.lock();
+            debug_assert!(!sleepers.contains(&index));
+            debug_assert!(sleepers.len() < sleepers.capacity());
+            let searching = worker.searching.swap(false, Ordering::Relaxed);
+            let previous = self.shared.state.fetch_sub(UNPARKED + usize::from(searching), Ordering::SeqCst);
+            sleepers.push(index);
+            previous & SEARCH_MASK == usize::from(searching)
+        });
+        let pending = last && work_pending();
         let stopping = self.shared.stopping.load(Ordering::Acquire);
-        if !pending && !stopping {
-            worker.wait();
+        if last && pending {
+            self.wake(false, self.shared.workers.len());
         }
-        if self.shared.resident_idle.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
-            worker.wait();
+        if pending || stopping {
+            let removed = P::with_scheduler_critical(|| {
+                let mut sleepers = self.shared.sleepers.lock();
+                if let Some(position) = sleepers.iter().position(|&worker| worker == index) {
+                    sleepers.swap_remove(position);
+                    self.shared.state.fetch_add(UNPARKED, Ordering::SeqCst);
+                    true
+                } else {
+                    false
+                }
+            });
+            if !removed {
+                worker.wait();
+            }
+            worker.sleeping.store(0, Ordering::Release);
+            return !stopping;
         }
-        worker.sleeping.store(0, Ordering::Release);
-        !stopping
+        loop {
+            worker.wait();
+            let stopping = self.shared.stopping.load(Ordering::Acquire);
+            let parked = P::with_scheduler_critical(|| {
+                let mut sleepers = self.shared.sleepers.lock();
+                let position = sleepers.iter().position(|&worker| worker == index);
+                if stopping && let Some(position) = position {
+                    sleepers.swap_remove(position);
+                    self.shared.state.fetch_add(UNPARKED, Ordering::SeqCst);
+                }
+                position.is_some()
+            });
+            if stopping || !parked {
+                return !stopping;
+            }
+        }
     }
 }
 

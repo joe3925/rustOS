@@ -444,14 +444,7 @@ impl ObjectBehavior for Arc<UserExecutorDomain> {
                 ExecutorDomainState::Dead => 2,
             },
             reserved: 0,
-            max_active_tasks: if info.max_active == usize::MAX {
-                0
-            } else {
-                info.max_active as u64
-            },
-            reserved_stats: [0; 3],
-            reserved2: [0; 2],
-            ready_shards: info.ready_shards as u64,
+            weight: info.weight as u64,
         })
     }
 }

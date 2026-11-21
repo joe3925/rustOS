@@ -1,10 +1,11 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(any(test, loom, feature = "loom"))]
+#[cfg(any(test, loom, feature = "loom", feature = "hosted"))]
 extern crate std;
 
 pub mod async_ffi;
+pub mod cancellation;
 pub mod thread_state;
 
 #[cfg(feature = "executor")]

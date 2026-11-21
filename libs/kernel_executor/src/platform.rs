@@ -5,6 +5,8 @@ use core::cell::{Cell, RefCell};
 
 pub use kernel_sync::workers::thread_pool::{Job, JobFn};
 
+pub(crate) const POLL_NOTIFIED: usize = 1usize << (usize::BITS - 1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CurrentExecutorContext {
     pub task_id: usize,
@@ -44,12 +46,12 @@ impl SlabCache {
 
 pub struct ExecutorThreadLocal<E: ExecutorPlatform> {
     pub(crate) current: Cell<Option<CurrentExecutorContext>>,
+    pub(crate) current_wake: Cell<usize>,
     pub(crate) worker: Cell<*const WorkerShared>,
     pub(crate) batch: Cell<*const BatchSlot>,
     pub(crate) active_domain: Cell<*const ExecutorDomain<E>>,
     pub(crate) ready_cursor: Cell<usize>,
     pub(crate) allocation_cursor: Cell<usize>,
-    pub(crate) inline_budget: Cell<u8>,
     pub(crate) caches: RefCell<[SlabCache; 1]>,
 }
 
@@ -57,12 +59,12 @@ impl<E: ExecutorPlatform> ExecutorThreadLocal<E> {
     pub const fn new() -> Self {
         Self {
             current: Cell::new(None),
+            current_wake: Cell::new(0),
             worker: Cell::new(core::ptr::null()),
             batch: Cell::new(core::ptr::null()),
             active_domain: Cell::new(core::ptr::null()),
             ready_cursor: Cell::new(0),
             allocation_cursor: Cell::new(0),
-            inline_budget: Cell::new(0),
             caches: RefCell::new([const { SlabCache::new() }; 1]),
         }
     }
@@ -75,8 +77,8 @@ pub(crate) fn with_executor_local<E: ExecutorPlatform, R>(
 }
 
 pub(crate) struct ExecutorBatchGuard<E: ExecutorPlatform> {
-    pub previous_domain: *const ExecutorDomain<E>,
     pub previous_batch: *const BatchSlot,
+    pub previous_domain: *const ExecutorDomain<E>,
 }
 
 impl<E: ExecutorPlatform> Drop for ExecutorBatchGuard<E> {
@@ -139,10 +141,30 @@ impl<E: ExecutorPlatform> Drop for CurrentExecutorContextGuard<E> {
     }
 }
 
+pub(crate) struct PollContextGuard<E: ExecutorPlatform> {
+    pub(crate) previous: Option<CurrentExecutorContext>,
+    pub(crate) previous_wake: usize,
+    pub(crate) _platform: core::marker::PhantomData<(fn() -> E, *const ())>,
+}
+
+impl<E: ExecutorPlatform> Drop for PollContextGuard<E> {
+    fn drop(&mut self) {
+        with_executor_local::<E, _>(|tls| {
+            tls.current.set(self.previous);
+            tls.current_wake.set(self.previous_wake);
+        });
+    }
+}
+
 pub trait ExecutorPlatform: Sized + Send + Sync + 'static {
     const PERSISTENT_RUNTIME_WORKERS: bool = false;
 
+    #[cfg(not(any(test, loom, feature = "loom", feature = "hosted")))]
+    fn scheduler_time_ns() -> u64;
+
     fn global_executor() -> &'static crate::global_async::GlobalAsyncExecutor<Self>;
+    fn default_domain() -> &'static ExecutorDomain<Self>;
+    fn cancellation_domain() -> &'static ExecutorDomain<Self>;
     fn with_executor_local<R>(f: impl FnOnce(&ExecutorThreadLocal<Self>) -> R) -> R;
     fn init_runtime(max_threads: usize, max_jobs: usize);
     fn init_blocking(max_threads: usize);
@@ -153,7 +175,9 @@ pub trait ExecutorPlatform: Sized + Send + Sync + 'static {
     fn wait_for_runtime_work(_work_pending: impl FnOnce() -> bool) -> bool {
         false
     }
-    fn runtime_search<const START: bool>() {}
+    fn runtime_search<const START: bool>() -> bool { false }
+
+    fn with_scheduler_critical<R>(f: impl FnOnce() -> R) -> R { f() }
     fn submit_blocking(job: Job);
     fn submit_blocking_many(jobs: &[Job]);
     fn try_steal_blocking_one() -> bool;

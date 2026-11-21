@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 pub use kernel_executor::thread_state::BlockOnThreadState;
+pub use kernel_executor::cancellation::TaskCancellationGuard;
 use core::task::Waker;
 use core::time::Duration;
 

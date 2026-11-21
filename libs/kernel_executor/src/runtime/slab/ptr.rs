@@ -1,7 +1,7 @@
-use super::super::runtime::submit_global_to_executor_domain;
 use super::slot::{PollResult, TaskSlot, WakeAction};
 use super::task_slab::{TaskTable, get_task_table};
 use crate::platform::ExecutorPlatform;
+use crate::platform::POLL_NOTIFIED;
 
 const PTR_SHARD_BITS: usize = 3;
 const PTR_LOCAL_BITS: usize = 32;
@@ -16,6 +16,7 @@ const PTR_LOCAL_MASK: usize = (1usize << PTR_LOCAL_BITS) - 1;
 const PTR_GEN_MASK: usize = (1usize << PTR_GEN_BITS) - 1;
 
 const _: () = assert!(usize::BITS as usize > PTR_GEN_SHIFT + PTR_GEN_BITS);
+const _: () = assert!(POLL_NOTIFIED > 1usize << (PTR_GEN_SHIFT + PTR_GEN_BITS));
 
 #[inline]
 pub fn encode_slab_task_ptr(shard_idx: u8, local_idx: u32, generation: u32) -> usize {
@@ -37,9 +38,9 @@ pub fn decode_slab_task_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
 
 #[inline(never)]
 pub(crate) extern "C" fn poll_slab_task<E: ExecutorPlatform>(
-    slab: &TaskTable<E>,
+    slab: &'static TaskTable<E>,
     ctx: usize,
-    cached_slot: Option<&TaskSlot>,
+    cached_slot: Option<&'static TaskSlot>,
 ) {
     let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(ctx) else {
         return;
@@ -59,32 +60,30 @@ pub(crate) extern "C" fn poll_slab_task<E: ExecutorPlatform>(
     unsafe { slab.decrement_owned_refs(slot, shard_idx, local_idx, generation, refs) };
 }
 
-#[inline(always)]
+#[inline(never)]
 pub fn enqueue_slab_task<E: ExecutorPlatform>(shard_idx: usize, local_idx: usize, generation: u32) {
     let slab = get_task_table::<E>();
 
-    if !slab.increment_ref(shard_idx, local_idx, generation) {
-        return;
-    }
-
     let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
-        slab.decrement_ref::<false>(shard_idx, local_idx, generation);
         return;
     };
-
-    match slot.record_wake() {
-        WakeAction::Enqueue => {
-            let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
-            if let Some(domain_id) = slot.executor_domain_id() {
-                submit_global_to_executor_domain::<E>(domain_id, encoded);
-            } else {
-                slab.decrement_ref::<false>(shard_idx, local_idx, generation);
+    if !slab.increment_slot_ref(slot, generation) {
+        return;
+    }
+    if slot.record_wake() == WakeAction::Enqueue {
+        if let Some(domain_id) = slot.executor_domain_id() {
+            let task_id = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
+            let executor = crate::global_async::GlobalAsyncExecutor::<E>::global();
+            let accepted = executor.with_executor_domain(domain_id, |domain, tls| {
+                executor.enqueue_task::<false, false, false>(domain, tls, task_id, slot);
+                true
+            }).unwrap_or(false);
+            if accepted {
+                return;
             }
         }
-        WakeAction::Represented | WakeAction::Completed => {
-            slab.decrement_ref::<false>(shard_idx, local_idx, generation);
-        }
     }
+    slab.decrement_ref::<false>(shard_idx, local_idx, generation);
 }
 
 #[inline(never)]

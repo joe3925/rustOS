@@ -1,6 +1,7 @@
 use alloc::{boxed::Box, format, sync::Arc};
 use core::cell::Cell;
 
+use kernel_executor::global_async::{ExecutorDomain, ExecutorDomainConfig};
 use kernel_executor::platform::{ExecutorPlatform, ExecutorThreadLocal, Job};
 use kernel_executor::worker_pool::{RuntimePool, WorkerPlatform};
 use spin::Once;
@@ -12,6 +13,8 @@ use crate::scheduling::task::{Task, TaskHandle};
 use crate::sync_platform::ThreadPool;
 
 static RUNTIME_POOL: Once<RuntimePool<KernelExecutorPlatform>> = Once::new();
+static KERNEL_NORMAL: Once<Arc<ExecutorDomain<KernelExecutorPlatform>>> = Once::new();
+static DRIVER: Once<Arc<ExecutorDomain<KernelExecutorPlatform>>> = Once::new();
 static BLOCKING_POOL: Once<Arc<ThreadPool>> = Once::new();
 
 pub fn yield_now() {
@@ -73,9 +76,23 @@ impl WorkerPlatform for KernelExecutorPlatform {
     fn worker_index() -> usize {
         WORKER_INDEX.get()
     }
+
+    fn with_scheduler_critical<R>(f: impl FnOnce() -> R) -> R {
+        crate::platform::with_interrupts_disabled(f)
+    }
 }
 
 impl ExecutorPlatform for KernelExecutorPlatform {
+    fn scheduler_time_ns() -> u64 {
+        let frequency = crate::platform::cycle_counter_frequency_hz();
+        assert!(frequency != 0);
+        (crate::platform::cycle_counter() as u128 * 1_000_000_000 / frequency as u128) as u64
+    }
+
+    fn with_scheduler_critical<R>(f: impl FnOnce() -> R) -> R {
+        crate::platform::with_interrupts_disabled(f)
+    }
+
     const PERSISTENT_RUNTIME_WORKERS: bool = true;
 
     fn global_executor() -> &'static GlobalAsyncExecutor {
@@ -83,11 +100,25 @@ impl ExecutorPlatform for KernelExecutorPlatform {
         EXECUTOR.call_once(GlobalAsyncExecutor::new)
     }
 
+    fn default_domain() -> &'static ExecutorDomain<Self> {
+        KERNEL_NORMAL.get().expect("kernel normal domain not initialized").as_ref()
+    }
+
+    fn cancellation_domain() -> &'static ExecutorDomain<Self> {
+        DRIVER.get().expect("driver domain not initialized").as_ref()
+    }
+
     fn with_executor_local<R>(f: impl FnOnce(&ExecutorThreadLocal<Self>) -> R) -> R {
         f(&EXECUTOR_CONTEXT)
     }
 
     fn init_runtime(max_threads: usize, max_jobs: usize) {
+        KERNEL_NORMAL.call_once(|| Self::global_executor().create_executor_domain(
+            ExecutorDomainConfig { weight: 32 },
+        ));
+        DRIVER.call_once(|| Self::global_executor().create_executor_domain(
+            ExecutorDomainConfig { weight: 48 },
+        ));
         let threads = max_threads.max(1);
         let jobs = max_jobs.max(1);
         RUNTIME_POOL.call_once(|| RuntimePool::new(threads, jobs));
@@ -115,8 +146,8 @@ impl ExecutorPlatform for KernelExecutorPlatform {
         RUNTIME_POOL.get().unwrap().wait(work_pending)
     }
 
-    fn runtime_search<const START: bool>() {
-        RUNTIME_POOL.get().unwrap().search::<START>();
+    fn runtime_search<const START: bool>() -> bool {
+        RUNTIME_POOL.get().unwrap().search::<START>()
     }
 
     fn submit_blocking(job: Job) {

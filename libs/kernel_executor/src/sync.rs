@@ -72,3 +72,23 @@ where
 
     builder.check(f);
 }
+
+#[cfg(any(loom, feature = "loom"))]
+pub(crate) type SchedulerMutex<T> = Mutex<T>;
+
+#[cfg(all(not(any(loom, feature = "loom")), not(any(test, loom, feature = "loom", feature = "hosted"))))]
+pub(crate) type SchedulerMutex<T> = spin::Mutex<T>;
+
+#[cfg(all(not(any(loom, feature = "loom")), any(test, loom, feature = "loom", feature = "hosted")))]
+pub(crate) struct SchedulerMutex<T>(std::sync::Mutex<T>);
+
+#[cfg(all(not(any(loom, feature = "loom")), any(test, loom, feature = "loom", feature = "hosted")))]
+impl<T> SchedulerMutex<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}

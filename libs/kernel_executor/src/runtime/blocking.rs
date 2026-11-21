@@ -116,7 +116,7 @@ unsafe impl<R: Send> Send for SharedTaskHeader<R> {}
 unsafe impl<R: Send> Sync for SharedTaskHeader<R> {}
 
 pub(crate) struct BlockingEntry {
-    domain_id: ExecutorDomainId,
+    pub(crate) domain_id: ExecutorDomainId,
     ptr: *const (),
     cancel: unsafe fn(*const ()),
 }
@@ -141,41 +141,6 @@ unsafe fn cancel_registered<E: ExecutorPlatform, F, R>(ptr: *const ()) {
             waker.wake();
         }
     }
-}
-
-pub(crate) fn cancel_domain_jobs<E: ExecutorPlatform>(
-    domain_id: ExecutorDomainId,
-    cursor: &mut [usize; 2],
-    mut remaining: usize,
-) -> bool {
-    if cursor[1] == usize::MAX {
-        cursor[1] = GlobalAsyncExecutor::<E>::global().blocking_tasks.lock().len();
-    }
-    while cursor[0] < cursor[1] {
-        if remaining == 0 {
-            return false;
-        }
-        let entry = {
-            let mut entries = GlobalAsyncExecutor::<E>::global().blocking_tasks.lock();
-            let entry = &mut entries[cursor[0]];
-            if entry
-                .as_ref()
-                .is_some_and(|entry| entry.domain_id == domain_id)
-            {
-                entry.take()
-            } else {
-                None
-            }
-        };
-        cursor[0] += 1;
-        remaining -= 1;
-        if let Some(entry) = entry {
-            unsafe {
-                (entry.cancel)(entry.ptr);
-            }
-        }
-    }
-    true
 }
 
 #[cfg(miri)]
@@ -338,7 +303,7 @@ where
         GlobalAsyncExecutor::<E>::global().with_executor_domain(
             ExecutorDomainId::from_raw(raw),
             |domain, _| {
-                if domain.state() == ExecutorDomainState::Active {
+                if domain.state() != ExecutorDomainState::Dead {
                     run();
                 }
             },
@@ -357,7 +322,7 @@ where
         crate::platform::current_executor_context::<E>().map_or(0, |context| context.domain_id);
     task.header.domain_id.store(raw, Ordering::Release);
     let prepare = || {
-        if raw != 0 && ExecutorDomainId::from_raw(raw).slot() >= 4 {
+        if raw != 0 {
             let entry = BlockingEntry {
                 domain_id: ExecutorDomainId::from_raw(raw),
                 ptr: Arc::into_raw(task.clone()).cast(),
@@ -384,7 +349,7 @@ where
     } else {
         GlobalAsyncExecutor::<E>::global()
             .with_executor_domain(ExecutorDomainId::from_raw(raw), |domain, _| {
-                (domain.state() == ExecutorDomainState::Active).then(prepare)
+                (domain.state() != ExecutorDomainState::Dead).then(prepare)
             })
             .flatten()
             .is_some()

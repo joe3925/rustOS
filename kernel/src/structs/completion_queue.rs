@@ -183,7 +183,7 @@ impl CompletionQueue {
         make_future: impl FnOnce() -> F,
     ) -> Result<RequestId, CompletionQueueError> {
         if try_spawn_to_port_in_executor_domain::<KernelExecutorPlatform, _, _, _>(
-            self.bound_executor_domain,
+            &self.executor_domain.domain,
             make_future,
             request_id,
             permit,
@@ -384,10 +384,12 @@ impl CompletionPermit<IoRequestOutput> for IoCompletionPermit {
             .request_table
             .complete(completion.key)
             .unwrap_or(CompleteTransition::Cancelled);
-        let output = match transition {
+        let output = if self.queue.executor_domain.is_draining() {
+            IoRequestOutput::error(IO_STATUS_CANCELLED)
+        } else { match transition {
             CompleteTransition::Normal => output,
             CompleteTransition::Cancelled => IoRequestOutput::error(IO_STATUS_CANCELLED),
-        };
+        }};
         let user = UserIoCompletion {
             request_id: completion.key,
             user_token: self.user_token,

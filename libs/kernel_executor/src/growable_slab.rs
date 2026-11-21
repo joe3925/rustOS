@@ -378,7 +378,7 @@ impl<T, E: ExecutorPlatform> GrowableSlab<T, E> {
             Some((handle, self.get(handle)?))
         };
         debug_assert!(!E::in_interrupt_context());
-        if tls.active_domain.get().is_null() {
+        if tls.batch.get().is_null() {
             return uncached();
         }
         let mut caches = tls.caches.borrow_mut();
@@ -437,7 +437,7 @@ impl<T, E: ExecutorPlatform> GrowableSlab<T, E> {
             return unsafe { self.release(handle) };
         }
         crate::platform::with_executor_local::<E, _>(|tls| {
-            if tls.active_domain.get().is_null() {
+            if tls.batch.get().is_null() {
                 return unsafe { self.release(handle) };
             }
             let mut caches = tls.caches.borrow_mut();

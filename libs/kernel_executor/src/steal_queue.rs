@@ -1,111 +1,183 @@
-//! Bounded Chase-Lev queue of slab IDs: one owner, multiple thieves.
-//! Atomic slots allow a losing thief to read a slot while the owner reuses it.
-//! Overflow goes to the domain's existing intrusive queues; no resizing or
-//! allocation occurs on push, pop, or steal.
-
-use crate::sync::atomic::{AtomicUsize, Ordering, fence};
-
-#[repr(align(64))]
-struct Index(AtomicUsize);
+use alloc::boxed::Box;
+use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(any(loom, feature = "loom"))]
+use loom::cell::UnsafeCell;
+#[cfg(not(any(loom, feature = "loom")))]
+use core::cell::UnsafeCell;
 
 pub(crate) struct StealQueue<const N: usize> {
-    top: Index,
-    bottom: Index,
-    slots: [AtomicUsize; N],
+    head: AtomicU64,
+    tail: AtomicU32,
+    slots: Box<[UnsafeCell<usize>; N]>,
+}
+
+unsafe impl<const N: usize> Send for StealQueue<N> {}
+unsafe impl<const N: usize> Sync for StealQueue<N> {}
+
+#[inline]
+fn pack(steal: u32, real: u32) -> u64 {
+    u64::from(real) | (u64::from(steal) << 32)
+}
+
+#[inline]
+fn unpack(head: u64) -> (u32, u32) {
+    ((head >> 32) as u32, head as u32)
 }
 
 impl<const N: usize> StealQueue<N> {
     pub fn new() -> Self {
-        assert!(N.is_power_of_two() && N <= isize::MAX as usize);
+        assert!(N >= 2 && N.is_power_of_two() && N <= u32::MAX as usize / 2);
         Self {
-            top: Index(AtomicUsize::new(0)),
-            bottom: Index(AtomicUsize::new(0)),
-            slots: core::array::from_fn(|_| AtomicUsize::new(0)),
+            head: AtomicU64::new(0),
+            tail: AtomicU32::new(0),
+            slots: Box::new(core::array::from_fn(|_| UnsafeCell::new(0))),
         }
+    }
+
+    #[inline]
+    unsafe fn read(&self, position: u32) -> usize {
+        let slot = &self.slots[position as usize & (N - 1)];
+        #[cfg(any(loom, feature = "loom"))]
+        { slot.with(|ptr| unsafe { *ptr }) }
+        #[cfg(not(any(loom, feature = "loom")))]
+        { unsafe { *slot.get() } }
+    }
+
+    #[inline]
+    unsafe fn write(&self, position: u32, task: usize) {
+        let slot = &self.slots[position as usize & (N - 1)];
+        #[cfg(any(loom, feature = "loom"))]
+        slot.with_mut(|ptr| unsafe { *ptr = task });
+        #[cfg(not(any(loom, feature = "loom")))]
+        unsafe { *slot.get() = task };
+    }
+
+    pub fn len(&self) -> usize {
+        let (_, head) = unpack(self.head.load(Ordering::Acquire));
+        self.tail.load(Ordering::Acquire).wrapping_sub(head) as usize
     }
 
     pub fn has_work(&self) -> bool {
-        let top = self.top.0.load(Ordering::Acquire);
-        let bottom = self.bottom.0.load(Ordering::Acquire);
-        (bottom.wrapping_sub(top) as isize) > 0
+        self.len() != 0
     }
 
-    /// # Safety
-    /// Only the current batch owner may push/pop, with ownership handed over
-    /// using the batch state/ready bitmap's release/acquire protocol.
+    pub fn remaining_slots(&self) -> usize {
+        let (steal, _) = unpack(self.head.load(Ordering::Acquire));
+        N - self.tail.load(Ordering::Relaxed).wrapping_sub(steal) as usize
+    }
+
     pub unsafe fn push(&self, task: usize) -> bool {
-        let bottom = self.bottom.0.load(Ordering::Relaxed);
-        let top = self.top.0.load(Ordering::Acquire);
-        if bottom.wrapping_sub(top) >= N {
+        let (steal, _) = unpack(self.head.load(Ordering::Acquire));
+        let tail = self.tail.load(Ordering::Relaxed);
+        if tail.wrapping_sub(steal) as usize >= N {
             return false;
         }
-        self.slots[bottom & (N - 1)].store(task, Ordering::Relaxed);
-        fence(Ordering::Release);
-        self.bottom
-            .0
-            .store(bottom.wrapping_add(1), Ordering::Relaxed);
+        unsafe { self.write(tail, task) };
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
         true
     }
 
-    /// # Safety
-    /// See `push`. Cleanup may also pop after all domain readers have left.
-    pub unsafe fn pop(&self) -> Option<usize> {
-        let bottom = self.bottom.0.load(Ordering::Relaxed).wrapping_sub(1);
-        self.bottom.0.store(bottom, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        let top = self.top.0.load(Ordering::Acquire);
-        let size = bottom.wrapping_sub(top) as isize;
-        if size < 0 {
-            self.bottom
-                .0
-                .store(bottom.wrapping_add(1), Ordering::Relaxed);
-            return None;
+    pub unsafe fn push_or_overflow(
+        &self,
+        task: usize,
+        overflow: impl FnOnce(&mut dyn Iterator<Item = usize>),
+    ) {
+        loop {
+            let head = self.head.load(Ordering::Acquire);
+            let (steal, real) = unpack(head);
+            let tail = self.tail.load(Ordering::Relaxed);
+            if (tail.wrapping_sub(steal) as usize) < N {
+                unsafe { self.write(tail, task) };
+                self.tail.store(tail.wrapping_add(1), Ordering::Release);
+                return;
+            }
+            if steal != real {
+                overflow(&mut core::iter::once(task));
+                return;
+            }
+            if self.head.compare_exchange_weak(
+                head, pack(tail, tail), Ordering::Release, Ordering::Relaxed,
+            ).is_err() {
+                continue;
+            }
+            self.tail.store(tail.wrapping_add((N / 2) as u32), Ordering::Release);
+            let mut tasks = (0..N / 2)
+                .map(|offset| unsafe { self.read(real.wrapping_add((N / 2 + offset) as u32)) })
+                .chain(core::iter::once(task));
+            overflow(&mut tasks);
+            return;
         }
-        let task = self.slots[bottom & (N - 1)].load(Ordering::Relaxed);
-        if size == 0 {
-            let won = self
-                .top
-                .0
-                .compare_exchange(
-                    top,
-                    top.wrapping_add(1),
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                )
-                .is_ok();
-            self.bottom
-                .0
-                .store(bottom.wrapping_add(1), Ordering::Relaxed);
-            if !won {
+    }
+
+    pub unsafe fn pop(&self) -> Option<usize> {
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            let (steal, real) = unpack(head);
+            if real == self.tail.load(Ordering::Relaxed) {
                 return None;
+            }
+            let next_real = real.wrapping_add(1);
+            let next = pack(if steal == real { next_real } else { steal }, next_real);
+            match self.head.compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(unsafe { self.read(real) }),
+                Err(actual) => head = actual,
+            }
+        }
+    }
+
+    pub unsafe fn steal<const COPY_FIRST: bool>(&self, destination: Option<&Self>) -> Option<usize> {
+        debug_assert!(!COPY_FIRST || destination.is_some());
+        let tail = if let Some(target) = destination {
+            debug_assert!(!core::ptr::eq(self, target));
+            let tail = target.tail.load(Ordering::Relaxed);
+            let (steal, _) = unpack(target.head.load(Ordering::Acquire));
+            if tail.wrapping_sub(steal) as usize > N / 2 {
+                return None;
+            }
+            tail
+        } else {
+            0
+        };
+        let mut previous = self.head.load(Ordering::Acquire);
+        let (first, count, mut claimed) = loop {
+            let (steal, real) = unpack(previous);
+            if steal != real {
+                return None;
+            }
+            let available = self.tail.load(Ordering::Acquire).wrapping_sub(real);
+            if available == 0 {
+                return None;
+            }
+            let count = if destination.is_some() { available - available / 2 } else { 1 };
+            let next = pack(steal, real.wrapping_add(count));
+            match self.head.compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break (real, count, next),
+                Err(actual) => previous = actual,
+            }
+        };
+        let mut task = 0;
+        for offset in 0..count {
+            task = unsafe { self.read(first.wrapping_add(offset)) };
+            if let Some(target) = destination {
+                unsafe { target.write(tail.wrapping_add(offset), task) };
+            }
+        }
+        loop {
+            let (_, real) = unpack(claimed);
+            match self.head.compare_exchange_weak(
+                claimed, pack(real, real), Ordering::AcqRel, Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => claimed = actual,
+            }
+        }
+        if let Some(target) = destination {
+            let published = count - u32::from(!COPY_FIRST);
+            if published != 0 {
+                target.tail.store(tail.wrapping_add(published), Ordering::Release);
             }
         }
         Some(task)
-    }
-
-    pub fn steal(&self) -> Option<usize> {
-        loop {
-            let top = self.top.0.load(Ordering::Acquire);
-            fence(Ordering::SeqCst);
-            let bottom = self.bottom.0.load(Ordering::Acquire);
-            if (bottom.wrapping_sub(top) as isize) <= 0 {
-                return None;
-            }
-            let task = self.slots[top & (N - 1)].load(Ordering::Relaxed);
-            if self
-                .top
-                .0
-                .compare_exchange(
-                    top,
-                    top.wrapping_add(1),
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                return Some(task);
-            }
-        }
     }
 }
 
@@ -117,18 +189,18 @@ mod tests {
     #[test]
     fn order_overflow_and_counter_wrap() {
         let q = StealQueue::<4>::new();
-        q.top.0.store(usize::MAX - 1, Ordering::Relaxed);
-        q.bottom.0.store(usize::MAX - 1, Ordering::Relaxed);
+        q.head.store(pack(u32::MAX - 1, u32::MAX - 1), Ordering::Relaxed);
+        q.tail.store(u32::MAX - 1, Ordering::Relaxed);
         unsafe {
             assert_eq!(q.pop(), None);
             for id in 1..=4 {
                 assert!(q.push(id));
             }
             assert!(!q.push(5));
-            assert_eq!(q.steal(), Some(1));
+            assert_eq!(q.steal::<false>(None), Some(1));
+            assert_eq!(q.pop(), Some(2));
+            assert_eq!(q.steal::<false>(None), Some(3));
             assert_eq!(q.pop(), Some(4));
-            assert_eq!(q.steal(), Some(2));
-            assert_eq!(q.pop(), Some(3));
             assert_eq!(q.pop(), None);
         }
         assert!(!q.has_work());
@@ -146,7 +218,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut ids = std::vec::Vec::new();
                     while !done.load(Ordering::Acquire) || q.has_work() {
-                        if let Some(id) = q.steal() {
+                        if let Some(id) = unsafe { q.steal::<false>(None) } {
                             ids.push(id);
                         } else {
                             std::thread::yield_now();
@@ -192,7 +264,7 @@ mod loom_tests {
             let q = Arc::new(StealQueue::<2>::new());
             assert!(unsafe { q.push(1) });
             let other = q.clone();
-            let thief = thread::spawn(move || [other.steal(), other.steal()]);
+            let thief = thread::spawn(move || unsafe { [other.steal::<false>(None), other.steal::<false>(None)] });
             let a = unsafe { q.pop() };
             assert!(unsafe { q.push(2) });
             let b = unsafe { q.pop() };
@@ -214,7 +286,7 @@ mod loom_tests {
             assert!(unsafe { q.push(1) });
             assert!(unsafe { q.push(2) });
             let other = q.clone();
-            let thief = thread::spawn(move || [other.steal(), other.steal()]);
+            let thief = thread::spawn(move || unsafe { [other.steal::<false>(None), other.steal::<false>(None)] });
             let a = unsafe { q.pop() };
             // Reuse a ring slot while a thief may still be reading it.
             assert!(unsafe { q.push(3) });

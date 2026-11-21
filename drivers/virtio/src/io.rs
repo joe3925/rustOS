@@ -340,8 +340,12 @@ where
     }
 
     let mut cursor = PendingBlockCursor::new(ops);
+    let cancellation = kernel_api::runtime::task_cancellation_guard();
 
     while !cursor.done(ops) {
+        if cancellation.is_cancelled() {
+            return Err(error(DriverErrorKind::DeviceError));
+        }
         let mut completions = SubmittedCompletionBatch::new(&qs.submitted_completions);
         let mut submitted_any = false;
         let mut queue_or_slot_pressure = false;

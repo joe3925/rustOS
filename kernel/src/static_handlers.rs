@@ -531,6 +531,11 @@ pub extern "C" fn kernel_block_on_context() -> BlockOnContext {
     BlockOnContext { state, waker }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_task_cancellation_guard() -> kernel_types::runtime::TaskCancellationGuard {
+    kernel_executor::runtime::runtime::task_cancellation_guard::<KernelExecutorPlatform>()
+}
+
 struct RawBlockingJob {
     trampoline: extern "C" fn(usize, bool),
     ctx: usize,

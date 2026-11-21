@@ -19,8 +19,6 @@ impl FutureAllocation {
 
     #[inline]
     pub(crate) unsafe fn release(self) {
-        if self.layout.size() != 0 {
-            unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
-        }
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }

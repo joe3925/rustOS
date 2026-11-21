@@ -1,21 +1,16 @@
-pub const USER_EXECUTOR_UPDATE_MAX_ACTIVE: u32 = 1 << 0;
+pub const USER_EXECUTOR_UPDATE_WEIGHT: u32 = 1 << 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UserExecutorDomainCreate {
-    /// Zero means unlimited.
-    pub max_active_tasks: usize,
-    /// Zero selects the executor CPU count. Other values are clamped to the
-    /// kernel's supported ready-shard range.
-    pub ready_shards: usize,
+    pub weight: usize,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UserExecutorDomainUpdate {
     pub fields: u32,
-    /// Zero means unlimited.
-    pub max_active_tasks: usize,
+    pub weight: usize,
 }
 
 #[repr(C)]
@@ -23,8 +18,5 @@ pub struct UserExecutorDomainUpdate {
 pub struct UserExecutorDomainInfo {
     pub state: u32,
     pub reserved: u32,
-    pub max_active_tasks: u64,
-    pub reserved_stats: [u64; 3],
-    pub reserved2: [u64; 2],
-    pub ready_shards: u64,
+    pub weight: u64,
 }

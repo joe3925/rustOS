@@ -247,6 +247,7 @@ unsafe extern "C" {
     pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<bool>;
     pub fn kernel_spawn_detached_abi(fut: AbiFuture<()>);
     pub fn kernel_block_on_context() -> BlockOnContext;
+    pub fn kernel_task_cancellation_guard() -> kernel_types::runtime::TaskCancellationGuard;
     pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize, bool), ctx: usize);
 
     // Routing FFI (sync - for kernel_routing crate)

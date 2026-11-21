@@ -82,6 +82,10 @@ impl<E: ExecutorPlatform> TaskTable<E> {
             let handle = self.slab.reserve()?;
             (handle, self.slab.get(handle)?)
         };
+        slot.task_id.store(
+            encode_slab_task_ptr(handle.shard, handle.local_index, handle.generation) as u64,
+            Ordering::Relaxed,
+        );
         slot.gen_ref
             .store(pack_gen_ref(handle.generation, refs), Ordering::Release);
         Some((SlotHandle { handle }, slot))
@@ -121,6 +125,10 @@ impl<E: ExecutorPlatform> TaskTable<E> {
         let Some(slot) = self.get_slot(shard_idx, local_idx, expected_gen) else {
             return false;
         };
+        self.increment_slot_ref(slot, expected_gen)
+    }
+
+    pub(crate) fn increment_slot_ref(&self, slot: &TaskSlot, expected_gen: u32) -> bool {
         let expected_gen = expected_gen & GEN_MASK;
         loop {
             let current = slot.gen_ref.load(Ordering::Acquire);

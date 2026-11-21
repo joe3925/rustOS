@@ -93,6 +93,7 @@ export! {
     kernel_spawn_joinable_abi,
     kernel_spawn_detached_abi,
     kernel_block_on_context,
+    kernel_task_cancellation_guard,
     kernel_spawn_blocking_raw,
 
     bench_kernel_span_end,

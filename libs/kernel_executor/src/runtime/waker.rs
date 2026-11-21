@@ -1,4 +1,5 @@
 use crate::platform::ExecutorPlatform;
+use crate::platform::{POLL_NOTIFIED, with_executor_local};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use super::slab::ptr::{decode_slab_task_ptr, encode_slab_task_ptr, enqueue_slab_task};
@@ -17,7 +18,7 @@ fn waker_ptr_to_encoded(ptr: *const ()) -> usize {
 impl<E: ExecutorPlatform> crate::global_async::GlobalAsyncExecutor<E> {
     const SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
         slab_clone_waker::<E>,
-        slab_wake::<E>,
+        slab_wake_by_ref::<E>,
         slab_wake_by_ref::<E>,
         slab_drop_waker::<E>,
     );
@@ -46,16 +47,23 @@ unsafe fn slab_clone_waker<E: ExecutorPlatform>(ptr: *const ()) -> RawWaker {
 }
 
 #[cfg_attr(irq_check, irq::context)]
-unsafe fn slab_wake<E: ExecutorPlatform>(ptr: *const ()) {
-    let encoded = waker_ptr_to_encoded(ptr);
-    if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(encoded) {
-        enqueue_slab_task::<E>(shard_idx, local_idx, generation);
-    }
-}
-
-#[cfg_attr(irq_check, irq::context)]
 unsafe fn slab_wake_by_ref<E: ExecutorPlatform>(ptr: *const ()) {
     let encoded = waker_ptr_to_encoded(ptr);
+    if encoded == 0 {
+        return;
+    }
+    if !E::in_interrupt_context()
+        && with_executor_local::<E, _>(|tls| {
+            let current = tls.current_wake.get();
+            if current & !POLL_NOTIFIED != encoded {
+                return false;
+            }
+            tls.current_wake.set(current | POLL_NOTIFIED);
+            true
+        })
+    {
+        return;
+    }
     if let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(encoded) {
         enqueue_slab_task::<E>(shard_idx, local_idx, generation);
     }

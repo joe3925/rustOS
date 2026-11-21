@@ -20,12 +20,12 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_executor::global_async::{
-    ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor,
+    ExecutorDomainConfig, GlobalAsyncExecutor,
 };
 use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::dma::{IoBufferError, PhysicalFrameExtent};
 use kernel_types::executor::{
-    USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainUpdate,
+    USER_EXECUTOR_UPDATE_WEIGHT, UserExecutorDomainCreate, UserExecutorDomainUpdate,
 };
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::guid_to_string;
@@ -35,7 +35,7 @@ use crate::object_manager::manager::{
     AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
     ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, TaskQueueRef,
 };
-use crate::structs::executor_domain::UserExecutorDomain;
+use crate::structs::executor_domain::{DEFAULT_PROCESS_IO_WEIGHT, UserExecutorDomain};
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let process_dir = alloc::format!("\\Process\\{}", pid);
@@ -943,26 +943,14 @@ pub(crate) fn sys_executor_domain_create(
         Ok(current) => current,
         Err(err) => return err,
     };
-    let domain_id = GlobalAsyncExecutor::<KernelExecutorPlatform>::global().create_executor_domain(ExecutorDomainConfig {
-        max_active: if config.max_active_tasks == 0 {
-            usize::MAX
+    let domain = GlobalAsyncExecutor::<KernelExecutorPlatform>::global().create_executor_domain(ExecutorDomainConfig {
+        weight: if config.weight == 0 {
+            DEFAULT_PROCESS_IO_WEIGHT
         } else {
-            config.max_active_tasks
-        },
-        quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
-        weight: ExecutorDomainClass::ProcessIo.default_weight(),
-        ready_shards: if config.ready_shards == 0 {
-            GlobalAsyncExecutor::<KernelExecutorPlatform>::global().worker_count()
-        } else {
-            config.ready_shards
+            config.weight
         },
     });
-    let Some(domain) =
-        GlobalAsyncExecutor::<KernelExecutorPlatform>::global().get_executor_domain(domain_id)
-    else {
-        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
-    };
-    let user_domain = UserExecutorDomain::new(caller_pid, domain_id, domain);
+    let user_domain = UserExecutorDomain::new(caller_pid, domain);
     let object = Object::new(
         ObjectTag::ExecutorDomain,
         ObjectPayload::ExecutorDomain(user_domain),
@@ -980,7 +968,7 @@ pub(crate) fn sys_executor_domain_configure(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let update = unsafe { *update_ptr };
-    if update.fields != USER_EXECUTOR_UPDATE_MAX_ACTIVE {
+    if update.fields != USER_EXECUTOR_UPDATE_WEIGHT {
         return make_err(
             ErrClass::Common,
             CommonErr::InvalidPtr as u16,
@@ -999,14 +987,11 @@ pub(crate) fn sys_executor_domain_configure(
     if domain.is_draining() {
         return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
     }
-    let max_active = (update.fields & USER_EXECUTOR_UPDATE_MAX_ACTIVE != 0).then_some(
-        if update.max_active_tasks == 0 {
-            usize::MAX
-        } else {
-            update.max_active_tasks
-        },
-    );
-    domain.update_config(max_active);
+    domain.update_config(if update.weight == 0 {
+        DEFAULT_PROCESS_IO_WEIGHT
+    } else {
+        update.weight
+    });
     0
 }
 

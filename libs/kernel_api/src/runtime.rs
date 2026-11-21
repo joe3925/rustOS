@@ -21,6 +21,10 @@ use kernel_sys::{
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
 use kernel_types::runtime::{BlockOnContext, BlockOnThreadState};
 
+pub fn task_cancellation_guard() -> kernel_types::runtime::TaskCancellationGuard {
+    unsafe { kernel_sys::kernel_task_cancellation_guard() }
+}
+
 /// Spawn an async task on the kernel executor (shared singleton in the kernel) and
 /// return a join handle that can be awaited for completion.
 pub fn spawn<F>(future: F) -> impl Future<Output = TaskOutcome<()>> + Send

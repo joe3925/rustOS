@@ -1015,14 +1015,14 @@ fn abi_future_polls_inline_with_exact_parent_context() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+    let domain = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
         .create_executor_domain(ExecutorDomainConfig::default());
     let parent_context = Arc::new(AtomicUsize::new(0));
     let child_context = Arc::new(AtomicUsize::new(0));
     let child_drops = Arc::new(AtomicUsize::new(0));
 
     block_on::<crate::test_support::TestExecutorPlatform, _>(spawn_in_executor_domain::<crate::test_support::TestExecutorPlatform, _, _>(
-        domain_id,
+        &domain,
         RootAbiProbe {
             parent_context: parent_context.clone(),
             child_context: child_context.clone(),
@@ -1032,10 +1032,10 @@ fn abi_future_polls_inline_with_exact_parent_context() {
     ));
 
     GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
-        .destroy_executor_domain(domain_id)
+        .destroy_executor_domain(domain.id())
         .unwrap();
     super::support::wait_until(Duration::from_secs(5), || {
-        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain_id).is_none()
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain.id()).is_none()
     });
     assert_eq!(
         parent_context.load(Ordering::Acquire),
@@ -1049,12 +1049,12 @@ fn spawn_in_executor_domain_completes_joinhandle() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+    let domain = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
         .create_executor_domain(ExecutorDomainConfig::default());
 
     let value = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
         spawn_in_executor_domain::<crate::test_support::TestExecutorPlatform, _, _>(
-            domain_id,
+            &domain,
             async { 1234usize },
         )
         .await
@@ -1062,10 +1062,10 @@ fn spawn_in_executor_domain_completes_joinhandle() {
     assert_eq!(value, TaskOutcome::Completed(1234));
 
     GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
-        .destroy_executor_domain(domain_id)
+        .destroy_executor_domain(domain.id())
         .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain_id).is_none()
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain.id()).is_none()
     });
 }
 
@@ -1074,13 +1074,13 @@ fn spawn_detached_in_executor_domain_executes_work() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+    let domain = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
         .create_executor_domain(ExecutorDomainConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_for_task = counter.clone();
 
     spawn_detached_in_executor_domain::<crate::test_support::TestExecutorPlatform, _>(
-        domain_id,
+        &domain,
         async move {
         counter_for_task.fetch_add(1, Ordering::AcqRel);
     },
@@ -1091,9 +1091,9 @@ fn spawn_detached_in_executor_domain_executes_work() {
     });
 
     GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
-        .destroy_executor_domain(domain_id)
+        .destroy_executor_domain(domain.id())
         .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain_id).is_none()
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain.id()).is_none()
     });
 }

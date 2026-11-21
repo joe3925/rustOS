@@ -7,8 +7,10 @@ use core::task::{Context, Poll, Waker};
 
 use crate::future_allocation::FutureAllocation;
 use crate::global_async::ExecutorDomainId;
-use crate::platform::{CurrentExecutorContext, CurrentExecutorContextGuard};
-use crate::runtime::runtime::submit_global_to_executor_domain;
+use crate::platform::{
+    CurrentExecutorContext, CurrentExecutorContextGuard, POLL_NOTIFIED, PollContextGuard,
+    with_executor_local,
+};
 use crate::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::spin_loop;
 use kernel_sync::completion::TaskOutcome;
@@ -18,7 +20,7 @@ use super::super::task::{
     STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED,
 };
 use super::ptr::encode_slab_task_ptr;
-use super::storage::drop_inline;
+use super::storage::drop_future;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WakeAction {
@@ -77,21 +79,28 @@ pub struct TaskSlot {
     pub(crate) state: AtomicU8,
     pub(super) control: AtomicU8,
     pub(super) waker_state: AtomicU8,
-    pub(crate) domain_id: AtomicU64,
+    pub(crate) task_id: AtomicU64,
     pub(super) poll_fn: UnsafeCell<Option<TaskPollFn>>,
     pub(super) future: UnsafeCell<Option<FutureAllocation>>,
-    pub(crate) inline_future: UnsafeCell<MaybeUninit<[usize; 3]>>,
     pub(crate) ready_next: AtomicUsize,
     pub(super) retired_next: AtomicUsize,
     pub(super) drop_fn: UnsafeCell<Option<TaskDropFn>>,
     pub(super) cancel_fn: UnsafeCell<Option<TaskCancelFn>>,
     pub(crate) result_ptr: AtomicUsize,
     pub(super) join_waker: UnsafeCell<MaybeUninit<Waker>>,
+    pub(crate) domain_id: AtomicU64,
+    pub(crate) cancellation_guards: AtomicUsize,
 }
 
 unsafe impl Sync for TaskSlot {}
 
 impl TaskSlot {
+    #[inline]
+    pub(crate) unsafe fn from_queued_pointer(pointer: usize) -> (usize, Option<&'static Self>) {
+        let slot = unsafe { &*(pointer as *const Self) };
+        (slot.task_id.load(Ordering::Relaxed) as usize, Some(slot))
+    }
+
     pub(super) fn new() -> Self {
         Self {
             gen_ref: AtomicU32::new(0),
@@ -100,14 +109,15 @@ impl TaskSlot {
             waker_state: AtomicU8::new(WAKER_NONE),
             ready_next: AtomicUsize::new(0),
             retired_next: AtomicUsize::new(0),
+            task_id: AtomicU64::new(0),
             domain_id: AtomicU64::new(0),
+            cancellation_guards: AtomicUsize::new(0),
             future: UnsafeCell::new(None),
             poll_fn: UnsafeCell::new(None),
             drop_fn: UnsafeCell::new(None),
             cancel_fn: UnsafeCell::new(None),
             result_ptr: AtomicUsize::new(RESULT_ABANDONED),
             join_waker: UnsafeCell::new(MaybeUninit::uninit()),
-            inline_future: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -160,8 +170,8 @@ impl TaskSlot {
     }
 
     pub fn executor_domain_id(&self) -> Option<ExecutorDomainId> {
-        let raw = self.domain_id.load(Ordering::Acquire);
-        (raw != 0).then_some(ExecutorDomainId::from_raw(raw))
+        let id = ExecutorDomainId::from_raw(self.domain_id.load(Ordering::Acquire));
+        id.is_valid().then_some(id)
     }
 
     pub unsafe fn init_detached<F>(&self, domain_id: ExecutorDomainId, allocation: FutureAllocation)
@@ -185,7 +195,7 @@ impl TaskSlot {
         unsafe {
             *self.future.get() = Some(allocation);
             write_poll_fn(&self.poll_fn, Some(poll_fn));
-            write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
+            write_drop_fn(&self.drop_fn, Some(drop_future::<F>));
             *self.cancel_fn.get() = Some(cancel_future::<F, T, OWNED>);
 
             self.state.store(STATE_QUEUED, Ordering::Release);
@@ -194,7 +204,7 @@ impl TaskSlot {
     }
 
     pub fn poll_once<E: ExecutorPlatform>(
-        &self,
+        &'static self,
         waker: &Waker,
         shard_idx: usize,
         local_idx: usize,
@@ -221,11 +231,16 @@ impl TaskSlot {
         let domain_id = self
             .executor_domain_id()
             .expect("task domain missing while polling");
-        let _context_guard = CurrentExecutorContextGuard::<E>::enter(CurrentExecutorContext {
+        let context = CurrentExecutorContext {
             task_id: encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation),
             domain_id: domain_id.raw(),
+        };
+        let _context_guard = with_executor_local::<E, _>(|tls| PollContextGuard::<E> {
+            previous: tls.current.replace(Some(context)),
+            previous_wake: tls.current_wake.replace(context.task_id),
+            _platform: core::marker::PhantomData,
         });
-        if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
+        if self.cancellation_requested() && self.cancellation_guards.load(Ordering::Acquire) == 0 {
             unsafe {
                 self.cancel_owned::<E>(encode_slab_task_ptr(
                     shard_idx as u8,
@@ -245,7 +260,10 @@ impl TaskSlot {
             }
             PollResult::Completed
         } else {
-            if self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0 {
+            let notified = with_executor_local::<E, _>(|tls| {
+                tls.current_wake.replace(0) & POLL_NOTIFIED != 0
+            });
+            if self.cancellation_requested() && self.cancellation_guards.load(Ordering::Acquire) == 0 {
                 unsafe {
                     self.cancel_owned::<E>(encode_slab_task_ptr(
                         shard_idx as u8,
@@ -255,16 +273,21 @@ impl TaskSlot {
                 }
                 return PollResult::Completed;
             }
-            let prev = self.state.compare_exchange(
-                STATE_POLLING,
-                STATE_IDLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let prev = if notified {
+                Err(STATE_NOTIFIED)
+            } else {
+                self.state.compare_exchange(
+                    STATE_POLLING,
+                    STATE_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+            };
             if let Err(STATE_NOTIFIED) = prev {
                 self.state.store(STATE_QUEUED, Ordering::Release);
                 let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
-                submit_global_to_executor_domain::<E>(domain_id, encoded);
+                crate::global_async::GlobalAsyncExecutor::<E>::global()
+                    .enqueue_task_to_executor_domain::<true>(domain_id, encoded, self);
                 return PollResult::Requeued;
             }
             PollResult::Pending
@@ -294,6 +317,10 @@ impl TaskSlot {
         self.control
             .fetch_or(CONTROL_ABORT_REQUESTED, Ordering::AcqRel);
         true
+    }
+
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        self.control.load(Ordering::Acquire) & CONTROL_ABORT_REQUESTED != 0
     }
 
     pub fn set_join_waker(&self, waker: &Waker) {
@@ -442,17 +469,7 @@ impl TaskSlot {
         }
     }
 
-    #[inline]
-    pub fn try_start_inline_poll(&self) -> bool {
-        self.state
-            .compare_exchange(
-                STATE_IDLE,
-                STATE_POLLING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
+
 }
 
 unsafe fn poll_joinable<F, T, const OWNED: bool>(slot: &TaskSlot, cx: &mut Context<'_>) -> bool
@@ -492,7 +509,12 @@ where
                         .compare_exchange(ptr, RESULT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        (*(ptr as *mut JoinStorage<T>)).write(TaskOutcome::Completed(result));
+                        (*(ptr as *mut JoinStorage<T>)).write(if slot.cancellation_requested() {
+                            drop(result);
+                            TaskOutcome::Cancelled
+                        } else {
+                            TaskOutcome::Completed(result)
+                        });
                         break;
                     }
                 }

@@ -9,4 +9,8 @@ pub trait WorkerPlatform: Send + Sync + 'static {
     fn signal(wait_handle: &Self::WaitHandle);
     fn spawn_worker(index: usize, work: impl FnOnce() + Send + 'static);
     fn worker_index() -> usize;
+
+    fn with_scheduler_critical<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
 }

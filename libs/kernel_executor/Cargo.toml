@@ -18,6 +18,7 @@ loom = { version = "0.7", features = ["futures"], optional = true }
 
 [features]
 default = ["executor"]
+hosted = ["executor"]
 executor = ["dep:kernel_sync", "dep:spin", "dep:crossbeam-queue", "dep:futures-core"]
 loom = ["executor", "dep:loom"]
 
