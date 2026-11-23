@@ -3,6 +3,7 @@
 name = "ide"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 autotests = false
 
 [lib]
@@ -15,4 +16,5 @@ test = false
 configuration = "src/ide.toml"
 
 [dependencies]
+kernel_sync = { path = "../../libs/kernel_sync", default-features = false }
 kernel_api = { workspace = true }

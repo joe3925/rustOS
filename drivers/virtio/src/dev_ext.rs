@@ -64,9 +64,17 @@ pub struct DevExtInner {
 impl DevExtInner {
     #[inline]
     pub fn select_queue(&self) -> usize {
+        if self.queue_count == 1 {
+            return 0;
+        }
         match self.queue_strategy {
             QueueSelectionStrategy::RoundRobin => {
-                self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.queue_count
+                let next = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                if self.queue_count.is_power_of_two() {
+                    next & (self.queue_count - 1)
+                } else {
+                    next % self.queue_count
+                }
             }
         }
     }

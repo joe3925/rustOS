@@ -1,0 +1,12 @@
+rust-fatfs
+
+Upstream code keeps its MIT license and copyright notices. See LICENSE.txt.
+
+Original changes whose copyright is owned by Boden are licensed under the
+Apache License, Version 2.0. See LICENSE-APACHE.
+
+The package contains code under both licenses. Its license expression is
+MIT AND Apache-2.0. The Apache grant does not apply to upstream code or to
+changes owned by other contributors.
+
+Earlier MIT license grants remain in effect.

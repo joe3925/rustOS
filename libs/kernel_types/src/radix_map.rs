@@ -1,11 +1,14 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::state_map::{AtomicStateMap, AtomicStateMapError};
-
-const RADIX_BITS: usize = 4;
-const RADIX: usize = 1 << RADIX_BITS;
+const RADIX_BITS: u32 = 3;
+const CHUNKS_PER_LEAF: usize = u64::BITS as usize;
+const LEAF_BITS: u32 = CHUNKS_PER_LEAF.ilog2();
+const WHOLE_CLAIM: u64 = u64::MAX;
+// This retry delay improved contended throughput on the tested EPYC host,
+// at the cost of higher tail latency. It is not an operation-latency bound.
+const CAS_RETRY_PAUSES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RadixMapError {
@@ -25,26 +28,24 @@ pub struct RadixMapStorageRequirements {
     pub total_bytes: usize,
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RadixState {
-    Empty = 0b00,
-    Partial = 0b01,
-    Full = 0b10,
-    Updating = 0b11,
+#[derive(Clone, Copy)]
+struct RadixNode {
+    level: usize,
+    word: usize,
+    start: usize,
+    end: usize,
 }
 
 struct RadixLevel {
-    entry_offset: usize,
-    entry_count: usize,
+    word_offset: usize,
     shift: u32,
 }
 
 pub struct RadixMap {
     byte_len: usize,
     granularity: usize,
-    terminal: AtomicStateMap<1>,
-    internal: AtomicStateMap<2>,
+    chunks: usize,
+    words: Box<[AtomicU64]>,
     levels: Box<[RadixLevel]>,
 }
 
@@ -52,39 +53,28 @@ pub fn required_storage(
     byte_len: usize,
     granularity: usize,
 ) -> Result<RadixMapStorageRequirements, RadixMapError> {
-    if granularity == 0 || !granularity.is_power_of_two() {
+    if !granularity.is_power_of_two() {
         return Err(RadixMapError::InvalidGranularity);
     }
-    let terminal_entries = if byte_len == 0 {
-        0
-    } else {
-        byte_len
-            .checked_add(granularity - 1)
-            .ok_or(RadixMapError::LengthOverflow)?
-            / granularity
-    };
-    let terminal_words = AtomicStateMap::<1>::required_words(terminal_entries)
-        .ok_or(RadixMapError::LengthOverflow)?;
-    let mut levels = 0usize;
-    let mut internal_entries = 0usize;
-    let mut entries = terminal_entries;
+    let terminal_entries = byte_len
+        .checked_add(granularity - 1)
+        .ok_or(RadixMapError::LengthOverflow)?
+        / granularity;
+    let terminal_words = terminal_entries
+        .checked_add(CHUNKS_PER_LEAF - 1)
+        .ok_or(RadixMapError::LengthOverflow)?
+        / CHUNKS_PER_LEAF;
+    let mut entries = terminal_words;
+    let mut internal_entries = 0;
+    let mut levels = 0;
     while entries > 1 {
-        entries = entries
-            .checked_add(RADIX - 1)
-            .ok_or(RadixMapError::LengthOverflow)?
-            / RADIX;
-        levels = levels.checked_add(1).ok_or(RadixMapError::LengthOverflow)?;
-        internal_entries = internal_entries
-            .checked_add(entries)
-            .ok_or(RadixMapError::LengthOverflow)?;
+        entries = entries.div_ceil(1 << RADIX_BITS);
+        internal_entries += entries;
+        levels += 1;
     }
-    let internal_words = AtomicStateMap::<2>::required_words(internal_entries)
-        .ok_or(RadixMapError::LengthOverflow)?;
-    let total_words = terminal_words
-        .checked_add(internal_words)
-        .ok_or(RadixMapError::LengthOverflow)?;
+    let total_words = terminal_words + internal_entries;
     let total_bytes = total_words
-        .checked_mul(core::mem::size_of::<u64>())
+        .checked_mul(core::mem::size_of::<AtomicU64>())
         .ok_or(RadixMapError::LengthOverflow)?;
     Ok(RadixMapStorageRequirements {
         levels,
@@ -97,47 +87,34 @@ pub fn required_storage(
 
 impl RadixMap {
     pub fn try_new(byte_len: usize, granularity: usize) -> Result<Self, RadixMapError> {
-        let requirements = required_storage(byte_len, granularity)?;
-        let terminal = AtomicStateMap::try_new(requirements.terminal_entries).map_err(map_alloc)?;
-        let mut descriptions = Vec::new();
-        descriptions
-            .try_reserve_exact(requirements.levels)
+        let storage = required_storage(byte_len, granularity)?;
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(storage.total_words)
             .map_err(|_| RadixMapError::AllocationFailed)?;
-        let mut child_entries = requirements.terminal_entries;
-        let mut shift = 0u32;
-        while child_entries > 1 {
-            let entries = child_entries
-                .checked_add(RADIX - 1)
-                .ok_or(RadixMapError::LengthOverflow)?
-                / RADIX;
-            shift = shift
-                .checked_add(RADIX_BITS as u32)
-                .ok_or(RadixMapError::LengthOverflow)?;
-            descriptions.push((entries, shift));
-            child_entries = entries;
-        }
-        descriptions.reverse();
-        let internal = AtomicStateMap::try_new(requirements.internal_entries).map_err(map_alloc)?;
+        words.resize_with(storage.total_words, || AtomicU64::new(0));
+
         let mut levels = Vec::new();
         levels
-            .try_reserve_exact(descriptions.len())
+            .try_reserve_exact(storage.levels + usize::from(storage.terminal_entries != 0))
             .map_err(|_| RadixMapError::AllocationFailed)?;
-        let mut entry_offset = 0usize;
-        for (entries, shift) in descriptions {
-            levels.push(RadixLevel {
-                entry_offset,
-                entry_count: entries,
-                shift,
-            });
-            entry_offset = entry_offset
-                .checked_add(entries)
-                .ok_or(RadixMapError::LengthOverflow)?;
+        let mut entries = storage.terminal_entries.div_ceil(CHUNKS_PER_LEAF);
+        let mut word_offset = 0;
+        let mut shift = LEAF_BITS;
+        while entries > 0 {
+            levels.push(RadixLevel { word_offset, shift });
+            if entries == 1 {
+                break;
+            }
+            word_offset += entries;
+            shift += RADIX_BITS;
+            entries = entries.div_ceil(1 << RADIX_BITS);
         }
         Ok(Self {
             byte_len,
             granularity,
-            terminal,
-            internal,
+            chunks: storage.terminal_entries,
+            words: words.into_boxed_slice(),
             levels: levels.into_boxed_slice(),
         })
     }
@@ -151,7 +128,7 @@ impl RadixMap {
     }
 
     pub const fn level_count(&self) -> usize {
-        self.levels.len()
+        self.levels.len().saturating_sub(1)
     }
 
     pub fn try_claim_range(&self, start: usize, len: usize) -> Result<(), RadixMapError> {
@@ -159,39 +136,30 @@ impl RadixMap {
         self.try_claim_chunks(first, end - first)
     }
 
+    #[inline(always)]
     pub fn try_claim_chunks(&self, first: usize, count: usize) -> Result<(), RadixMapError> {
         let end = first
             .checked_add(count)
             .ok_or(RadixMapError::LengthOverflow)?;
-        if end > self.terminal.len() {
+        if end > self.chunks {
             return Err(RadixMapError::InvalidRange);
         }
-        if count == 0 {
-            return Ok(());
-        }
-        let mut cursor = first;
-        while cursor < end {
-            let (target, units) = self.batch_chunk(cursor, end);
-            let units = if target.is_none() {
-                units.max((end - cursor).min(RADIX - cursor % RADIX))
-            } else {
-                units
-            };
-            let result = match target {
-                Some(level_index) => self.claim_chunk(
-                    cursor,
-                    target,
-                    (units >> self.levels[level_index].shift).max(1),
-                ),
-                None => self.claim_terminal_range(cursor, units),
-            };
-            if result.is_err() {
-                if cursor != first {
-                    unsafe { self.release_chunks(first, cursor - first) };
-                }
-                return Err(RadixMapError::Conflict);
+        if count != 0 {
+            if count == self.chunks && self.levels.len() > 1 {
+                return self.words[self.levels.last().unwrap().word_offset]
+                    .compare_exchange(0, WHOLE_CLAIM, Ordering::AcqRel, Ordering::Relaxed)
+                    .map(|_| ())
+                    .map_err(|_| RadixMapError::Conflict);
             }
-            cursor += units;
+            if self.is_partial_branch_run(first, end) {
+                self.claim_branch_run(first, end)?;
+            } else if first >> LEAF_BITS == (end - 1) >> LEAF_BITS {
+                self.claim_single_leaf(first, end)?;
+            } else if self.is_partial_leaf_run(first, end) {
+                self.claim_leaf_run(first, end)?;
+            } else {
+                self.claim(self.root(), first, end)?;
+            }
         }
         Ok(())
     }
@@ -214,52 +182,28 @@ impl RadixMap {
     /// # Safety
     /// The exact chunk range must have been successfully claimed by the
     /// caller's logical owner, remain owned, and be released exactly once.
+    #[inline(always)]
     pub unsafe fn release_chunks(&self, first: usize, count: usize) {
-        let Some(end) = first.checked_add(count) else {
+        let Some(end) = first.checked_add(count).filter(|&end| end <= self.chunks) else {
             debug_assert!(false);
             return;
         };
-        if end > self.terminal.len() {
-            debug_assert!(false);
-            return;
-        }
-        if count == 0 {
-            return;
-        }
-        let mut cursor = first;
-        while cursor < end {
-            let (target, units) = self.batch_chunk(cursor, end);
-            let units = if target.is_none() {
-                units.max((end - cursor).min(RADIX - cursor % RADIX))
+        if count != 0 {
+            if count == self.chunks && self.levels.len() > 1 {
+                let word = &self.words[self.levels.last().unwrap().word_offset];
+                if word.load(Ordering::Relaxed) == WHOLE_CLAIM {
+                    word.store(0, Ordering::Release);
+                    return;
+                }
+            }
+            if self.is_partial_branch_run(first, end) {
+                self.release_branch_run(first, end);
+            } else if first >> LEAF_BITS == (end - 1) >> LEAF_BITS {
+                self.release_single_leaf(first, end);
+            } else if self.is_partial_leaf_run(first, end) {
+                self.release_leaf_run(first, end);
             } else {
-                units
-            };
-            match target {
-                Some(level_index) => unsafe {
-                    self.release_target(
-                        cursor,
-                        target,
-                        (units >> self.levels[level_index].shift).max(1),
-                    )
-                },
-                None => unsafe { self.release_terminal_range(cursor, units) },
-            }
-            cursor += units;
-        }
-        if first == 0 && end == self.terminal.len() {
-            return;
-        }
-        for level_index in (0..self.levels.len()).rev() {
-            let shift = self.levels[level_index].shift;
-            let mask = (1usize << shift) - 1;
-            let left = first >> shift;
-            let right = (end - 1) >> shift;
-            let repair_left = first & mask != 0;
-            if repair_left {
-                self.repair_entry(level_index, left);
-            }
-            if end & mask != 0 && (!repair_left || right != left) {
-                self.repair_entry(level_index, right);
+                self.release(self.root(), first, end);
             }
         }
     }
@@ -281,418 +225,534 @@ impl RadixMap {
         let boundary = first
             .checked_add(left_count)
             .ok_or(RadixMapError::LengthOverflow)?;
-        if count == 0 || left_count > count || end > self.terminal.len() {
+        if count == 0 || boundary > end || end > self.chunks {
             return Err(RadixMapError::InvalidRange);
         }
         if boundary == first || boundary == end {
             return Ok(());
         }
-        let mut cursor = first;
-        while cursor < end {
-            let (target, units) = self.chunk(cursor, end);
-            let chunk_end = cursor + units;
-            if boundary == cursor || boundary == chunk_end {
-                return Ok(());
+        let mut node = self.root();
+        while node.level != 0 {
+            let word = &self.words[node.word];
+            if word.load(Ordering::Relaxed) == WHOLE_CLAIM {
+                for child in self.children(node, node.start, node.end) {
+                    let state = if child.level == 0 {
+                        leaf_mask(child.start, child.end)
+                    } else {
+                        WHOLE_CLAIM
+                    };
+                    self.words[child.word].store(state, Ordering::Relaxed);
+                }
+                word.store((node.end - node.start) as u64, Ordering::Release);
             }
-            if boundary > cursor && boundary < chunk_end {
-                let Some(mut level_index) = target else {
-                    return Err(RadixMapError::InvalidRange);
-                };
-                let mut entry_index = cursor >> self.levels[level_index].shift;
-                loop {
-                    self.expand_full(level_index, entry_index)?;
-                    let child_shift = self.levels[level_index].shift - RADIX_BITS as u32;
-                    let child_span = 1usize << child_shift;
-                    if boundary % child_span == 0 {
-                        return Ok(());
+            node = self
+                .children(node, boundary, boundary + 1)
+                .next()
+                .expect("interior split boundary has a child");
+            if boundary == node.start {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn root(&self) -> RadixNode {
+        RadixNode {
+            level: self.levels.len() - 1,
+            word: self.words.len() - 1,
+            start: 0,
+            end: self.chunks,
+        }
+    }
+
+    fn children(
+        &self,
+        node: RadixNode,
+        first: usize,
+        end: usize,
+    ) -> impl Iterator<Item = RadixNode> {
+        let level = node.level - 1;
+        let RadixLevel { word_offset, shift } = self.levels[level];
+        let span = 1usize << shift;
+        (first >> shift..=(end - 1) >> shift).map(move |index| {
+            let start = index << shift;
+            RadixNode {
+                level,
+                word: word_offset + index,
+                start,
+                end: node.end.min(start.saturating_add(span)),
+            }
+        })
+    }
+
+    #[inline(always)]
+    fn reserve_ancestor(word: &AtomicU64, count: u64) -> Result<(), RadixMapError> {
+        let mut reserved = word.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = reserved.checked_add(count).filter(|&next| next != WHOLE_CLAIM) else {
+                return Err(RadixMapError::Conflict);
+            };
+            match word.compare_exchange_weak(reserved, next, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(()),
+                Err(current) => {
+                    if current.checked_add(count).filter(|&next| next != WHOLE_CLAIM).is_none() {
+                        return Err(RadixMapError::Conflict);
                     }
-                    level_index += 1;
-                    if level_index >= self.levels.len() {
-                        return Err(RadixMapError::InvalidRange);
+                    for _ in 0..CAS_RETRY_PAUSES {
+                        core::hint::spin_loop();
                     }
-                    entry_index = boundary >> self.levels[level_index].shift;
+                    // A failed CAS snapshot can become stale during backoff.
+                    // Reload after pausing, including the zero-pause control.
+                    reserved = word.load(Ordering::Relaxed);
                 }
             }
-            cursor = chunk_end;
         }
-        Err(RadixMapError::InvalidRange)
+    }
+
+    #[inline(always)]
+    fn ancestor_word(&self, level: usize, first: usize) -> &AtomicU64 {
+        let info = &self.levels[level];
+        // A final root level can span more than usize::MAX chunks.
+        let index = first.checked_shr(info.shift).unwrap_or(0);
+        &self.words[info.word_offset + index]
+    }
+
+    #[inline(always)]
+    fn single_leaf_node(&self, first: usize) -> RadixNode {
+        let start = first & !(CHUNKS_PER_LEAF - 1);
+        RadixNode {
+            level: 0,
+            word: first >> LEAF_BITS,
+            start,
+            end: self.chunks.min(start.saturating_add(CHUNKS_PER_LEAF)),
+        }
+    }
+
+    #[inline(always)]
+    fn is_partial_branch_run(&self, first: usize, end: usize) -> bool {
+        const BRANCH_BITS: u32 = LEAF_BITS + RADIX_BITS;
+        const BRANCH_SPAN: usize = 1usize << BRANCH_BITS;
+        const PARENT_BITS: u32 = BRANCH_BITS + RADIX_BITS;
+        const PARENT_SPAN: usize = 1usize << PARENT_BITS;
+        if (first | end) & (BRANCH_SPAN - 1) != 0 || self.levels.len() < 3 {
+            return false;
+        }
+        let start = first & !(PARENT_SPAN - 1);
+        let parent_end = self.chunks.min(start.saturating_add(PARENT_SPAN));
+        first >> PARENT_BITS == (end - 1) >> PARENT_BITS
+            && (first != start || end != parent_end)
+    }
+
+    fn claim_branch_run(&self, first: usize, end: usize) -> Result<(), RadixMapError> {
+        const BRANCH_BITS: u32 = LEAF_BITS + RADIX_BITS;
+        let count = (end - first) as u64;
+        // Every complete L1 branch shares the same L2-and-up ancestor chain.
+        for level in (2..self.levels.len()).rev() {
+            let result = Self::reserve_ancestor(self.ancestor_word(level, first), count);
+            if result.is_err() {
+                for acquired in level + 1..self.levels.len() {
+                    self.ancestor_word(acquired, first)
+                        .fetch_sub(count, Ordering::Release);
+                }
+                return Err(RadixMapError::Conflict);
+            }
+        }
+        let first_branch = first >> BRANCH_BITS;
+        let end_branch = end >> BRANCH_BITS;
+        let word_offset = self.levels[1].word_offset;
+        for index in first_branch..end_branch {
+            if self.words[word_offset + index]
+                .compare_exchange(0, WHOLE_CLAIM, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                // These earlier branches are still exclusively ours and
+                // have not been published to a caller that could split them.
+                for prior in first_branch..index {
+                    self.words[word_offset + prior].store(0, Ordering::Release);
+                }
+                for level in 2..self.levels.len() {
+                    self.ancestor_word(level, first)
+                        .fetch_sub(count, Ordering::Release);
+                }
+                return Err(RadixMapError::Conflict);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn release_branch_run(&self, first: usize, end: usize) {
+        const BRANCH_BITS: u32 = LEAF_BITS + RADIX_BITS;
+        const BRANCH_SPAN: usize = 1usize << BRANCH_BITS;
+        // Check retained truncated ancestor sentinels before any mutation.
+        if end == self.chunks {
+            for level in (2..self.levels.len()).rev() {
+                if self.ancestor_word(level, first).load(Ordering::Relaxed) == WHOLE_CLAIM {
+                    self.release(self.root(), first, end);
+                    return;
+                }
+            }
+        }
+        let word_offset = self.levels[1].word_offset;
+        for index in first >> BRANCH_BITS..end >> BRANCH_BITS {
+            let word_index = word_offset + index;
+            let word = &self.words[word_index];
+            if word.load(Ordering::Relaxed) == WHOLE_CLAIM {
+                word.store(0, Ordering::Release);
+            } else {
+                // A prior split may have materialized this owned branch.
+                let start = index << BRANCH_BITS;
+                let node = RadixNode {
+                    level: 1,
+                    word: word_index,
+                    start,
+                    end: start + BRANCH_SPAN,
+                };
+                self.release(node, node.start, node.end);
+            }
+        }
+        let count = (end - first) as u64;
+        for level in 2..self.levels.len() {
+            let previous = self.ancestor_word(level, first)
+                .fetch_sub(count, Ordering::Release);
+            debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+        }
+    }
+
+    #[inline(always)]
+    fn is_partial_leaf_run(&self, first: usize, end: usize) -> bool {
+        const BRANCH_BITS: u32 = LEAF_BITS + RADIX_BITS;
+        const BRANCH_SPAN: usize = 1usize << BRANCH_BITS;
+        let start = first & !(BRANCH_SPAN - 1);
+        let branch_end = self.chunks.min(start.saturating_add(BRANCH_SPAN));
+        first >> BRANCH_BITS == (end - 1) >> BRANCH_BITS
+            && (first != start || end != branch_end)
+    }
+
+    fn claim_leaf_run(&self, first: usize, end: usize) -> Result<(), RadixMapError> {
+        let count = (end - first) as u64;
+        // Every leaf in this partial branch has the same ancestor chain.
+        // Keep the recursive algorithm's root-to-leaf reservation order.
+        for level in (1..self.levels.len()).rev() {
+            let result = Self::reserve_ancestor(self.ancestor_word(level, first), count);
+            if result.is_err() {
+                for acquired in level + 1..self.levels.len() {
+                    self.ancestor_word(acquired, first)
+                        .fetch_sub(count, Ordering::Release);
+                }
+                return Err(RadixMapError::Conflict);
+            }
+        }
+        let first_leaf = first >> LEAF_BITS;
+        let last_leaf = (end - 1) >> LEAF_BITS;
+        for index in first_leaf..=last_leaf {
+            let node = self.single_leaf_node(index << LEAF_BITS);
+            let result = self.claim_leaf(node, first.max(node.start), end.min(node.end));
+            if let Err(error) = result {
+                for prior_index in first_leaf..index {
+                    let prior = self.single_leaf_node(prior_index << LEAF_BITS);
+                    self.release_leaf(prior, first.max(prior.start), end.min(prior.end));
+                }
+                for level in 1..self.levels.len() {
+                    self.ancestor_word(level, first)
+                        .fetch_sub(count, Ordering::Release);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn release_leaf_run(&self, first: usize, end: usize) {
+        // Splitting a partial branch materializes its descendants. Preserve
+        // the generic fallback for any retained truncated-tail sentinel,
+        // checking every ancestor before changing any bitmap or counter.
+        if end == self.chunks {
+            for level in (1..self.levels.len()).rev() {
+                if self.ancestor_word(level, first).load(Ordering::Relaxed) == WHOLE_CLAIM {
+                    self.release(self.root(), first, end);
+                    return;
+                }
+            }
+        }
+        for index in first >> LEAF_BITS..=(end - 1) >> LEAF_BITS {
+            let node = self.single_leaf_node(index << LEAF_BITS);
+            self.release_leaf(node, first.max(node.start), end.min(node.end));
+        }
+        let count = (end - first) as u64;
+        for level in 1..self.levels.len() {
+            let previous = self.ancestor_word(level, first)
+                .fetch_sub(count, Ordering::Release);
+            debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+        }
+    }
+
+    fn claim_single_leaf(&self, first: usize, end: usize) -> Result<(), RadixMapError> {
+        let count = (end - first) as u64;
+        if self.levels.len() == 4 {
+            // Resolve all immutable metadata and addresses before the first RMW.
+            let root = self.ancestor_word(3, first);
+            let parent = self.ancestor_word(2, first);
+            let branch = self.ancestor_word(1, first);
+            let node = self.single_leaf_node(first);
+            let leaf = &self.words[node.word];
+            let mask = leaf_mask(first, end);
+            let whole_leaf = first == node.start && end == node.end;
+            let reserve = |word: &AtomicU64| Self::reserve_ancestor(word, count);
+            reserve(root)?;
+            if reserve(parent).is_err() {
+                root.fetch_sub(count, Ordering::Release);
+                return Err(RadixMapError::Conflict);
+            }
+            if reserve(branch).is_err() {
+                parent.fetch_sub(count, Ordering::Release);
+                root.fetch_sub(count, Ordering::Release);
+                return Err(RadixMapError::Conflict);
+            }
+            let result = if whole_leaf {
+                leaf.compare_exchange(0, mask, Ordering::AcqRel, Ordering::Relaxed)
+            } else {
+                leaf.try_update(Ordering::AcqRel, Ordering::Relaxed, |bits| {
+                    (bits & mask == 0).then_some(bits | mask)
+                })
+            }.map(|_| ()).map_err(|_| RadixMapError::Conflict);
+            if result.is_err() {
+                branch.fetch_sub(count, Ordering::Release);
+                parent.fetch_sub(count, Ordering::Release);
+                root.fetch_sub(count, Ordering::Release);
+            }
+            return result;
+        }
+        // Reserve ancestors before touching the leaf, exactly as recursion does.
+        for level in (1..self.levels.len()).rev() {
+            let result = Self::reserve_ancestor(self.ancestor_word(level, first), count);
+            if result.is_err() {
+                for acquired in level + 1..self.levels.len() {
+                    self.ancestor_word(acquired, first)
+                        .fetch_sub(count, Ordering::Release);
+                }
+                return Err(RadixMapError::Conflict);
+            }
+        }
+        let result = self.claim_leaf(self.single_leaf_node(first), first, end);
+        if result.is_err() {
+            for level in 1..self.levels.len() {
+                self.ancestor_word(level, first)
+                    .fetch_sub(count, Ordering::Release);
+            }
+        }
+        result
+    }
+
+    fn release_single_leaf(&self, first: usize, end: usize) {
+        if self.levels.len() == 4 {
+            // Resolve every address before clearing the bitmap or counters.
+            let root = self.ancestor_word(3, first);
+            let parent = self.ancestor_word(2, first);
+            let branch = self.ancestor_word(1, first);
+            let node = self.single_leaf_node(first);
+            let leaf = &self.words[node.word];
+            let mask = leaf_mask(first, end);
+            let whole_leaf = first == node.start && end == node.end;
+            let count = (end - first) as u64;
+            if end == self.chunks
+                && (root.load(Ordering::Relaxed) == WHOLE_CLAIM
+                    || parent.load(Ordering::Relaxed) == WHOLE_CLAIM
+                    || branch.load(Ordering::Relaxed) == WHOLE_CLAIM)
+            {
+                self.release(self.root(), first, end);
+                return;
+            }
+            if whole_leaf {
+                debug_assert_eq!(leaf.load(Ordering::Relaxed), mask);
+                leaf.store(0, Ordering::Release);
+            } else {
+                let previous = leaf.fetch_and(!mask, Ordering::Release);
+                debug_assert_eq!(previous & mask, mask);
+            }
+            let previous = branch.fetch_sub(count, Ordering::Release);
+            debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+            let previous = parent.fetch_sub(count, Ordering::Release);
+            debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+            let previous = root.fetch_sub(count, Ordering::Release);
+            debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+            return;
+        }
+        // An internal whole claim fits one leaf only when its node is
+        // truncated at the backing end. Other subranges require split
+        // materialization before release, so their ancestors cannot be WHOLE.
+        if end == self.chunks {
+            for level in (1..self.levels.len()).rev() {
+                if self.ancestor_word(level, first).load(Ordering::Relaxed) == WHOLE_CLAIM {
+                    self.release(self.root(), first, end);
+                    return;
+                }
+            }
+        }
+        self.release_leaf(self.single_leaf_node(first), first, end);
+        let count = (end - first) as u64;
+        for level in 1..self.levels.len() {
+            let previous = self.ancestor_word(level, first)
+                .fetch_sub(count, Ordering::Release);
+            debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+        }
+    }
+
+    #[inline(always)]
+    fn claim_leaf(&self, node: RadixNode, first: usize, end: usize) -> Result<(), RadixMapError> {
+        let word = &self.words[node.word];
+        let mask = leaf_mask(first, end);
+        if first == node.start && end == node.end {
+            return word
+                .compare_exchange(0, mask, Ordering::AcqRel, Ordering::Relaxed)
+                .map(|_| ())
+                .map_err(|_| RadixMapError::Conflict);
+        }
+        word.try_update(Ordering::AcqRel, Ordering::Relaxed, |bits| {
+            (bits & mask == 0).then_some(bits | mask)
+        })
+        .map(|_| ())
+        .map_err(|_| RadixMapError::Conflict)
+    }
+
+    #[inline(always)]
+    fn claim_partial_branch(
+        &self, node: RadixNode, first: usize, end: usize,
+    ) -> Result<(), RadixMapError> {
+        debug_assert_eq!(node.level, 1);
+        debug_assert!(first != node.start || end != node.end);
+        let word = &self.words[node.word];
+        let count = (end - first) as u64;
+        Self::reserve_ancestor(word, count)?;
+        let first_leaf = first >> LEAF_BITS;
+        let last_leaf = (end - 1) >> LEAF_BITS;
+        for index in first_leaf..=last_leaf {
+            let leaf = self.single_leaf_node(index << LEAF_BITS);
+            if let Err(error) = self.claim_leaf(leaf, first.max(leaf.start), end.min(leaf.end)) {
+                for prior_index in first_leaf..index {
+                    let prior = self.single_leaf_node(prior_index << LEAF_BITS);
+                    self.release_leaf(prior, first.max(prior.start), end.min(prior.end));
+                }
+                word.fetch_sub(count, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn release_materialized_branch(&self, node: RadixNode, first: usize, end: usize) {
+        debug_assert_eq!(node.level, 1);
+        // A complete WHOLE child was handled by the caller. Other releases
+        // have materialized descendants from their claim or a required split.
+        for index in first >> LEAF_BITS..=(end - 1) >> LEAF_BITS {
+            let leaf = self.single_leaf_node(index << LEAF_BITS);
+            self.release_leaf(leaf, first.max(leaf.start), end.min(leaf.end));
+        }
+        let count = (end - first) as u64;
+        let previous = self.words[node.word].fetch_sub(count, Ordering::Release);
+        debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+    }
+
+    fn claim(&self, node: RadixNode, first: usize, end: usize) -> Result<(), RadixMapError> {
+        let word = &self.words[node.word];
+        if node.level == 0 {
+            return self.claim_leaf(node, first, end);
+        }
+        if first == node.start && end == node.end {
+            return word
+                .compare_exchange(0, WHOLE_CLAIM, Ordering::AcqRel, Ordering::Relaxed)
+                .map(|_| ())
+                .map_err(|_| RadixMapError::Conflict);
+        }
+
+        let count = (end - first) as u64;
+        Self::reserve_ancestor(word, count)?;
+
+        for child in self.children(node, first, end) {
+            let result = if child.level == 0 {
+                self.claim_leaf(child, first.max(child.start), end.min(child.end))
+            } else if first <= child.start && end >= child.end {
+                self.words[child.word]
+                    .compare_exchange(0, WHOLE_CLAIM, Ordering::AcqRel, Ordering::Relaxed)
+                    .map(|_| ())
+                    .map_err(|_| RadixMapError::Conflict)
+            } else if child.level == 1 {
+                self.claim_partial_branch(child, first.max(child.start), end.min(child.end))
+            } else {
+                self.claim(child, first.max(child.start), end.min(child.end))
+            };
+            if let Err(error) = result {
+                if child.start > first {
+                    for prior in self.children(node, first, child.start) {
+                        self.release(prior, first.max(prior.start), prior.end);
+                    }
+                }
+                word.fetch_sub(count, Ordering::Release);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn release_leaf(&self, node: RadixNode, first: usize, end: usize) {
+        let word = &self.words[node.word];
+        let mask = leaf_mask(first, end);
+        if first == node.start && end == node.end {
+            // Exclusive ownership covers every valid bit in this leaf.
+            debug_assert_eq!(word.load(Ordering::Relaxed), mask);
+            word.store(0, Ordering::Release);
+        } else {
+            let previous = word.fetch_and(!mask, Ordering::Release);
+            debug_assert_eq!(previous & mask, mask);
+        }
+    }
+
+    fn release(&self, node: RadixNode, first: usize, end: usize) {
+        let word = &self.words[node.word];
+        if node.level == 0 {
+            self.release_leaf(node, first, end);
+        } else if first == node.start
+            && end == node.end
+            && word.load(Ordering::Relaxed) == WHOLE_CLAIM
+        {
+            word.store(0, Ordering::Release);
+        } else {
+            for child in self.children(node, first, end) {
+                if child.level == 0 {
+                    self.release_leaf(child, first.max(child.start), end.min(child.end));
+                } else if first <= child.start
+                    && end >= child.end
+                    && self.words[child.word].load(Ordering::Relaxed) == WHOLE_CLAIM
+                {
+                    self.words[child.word].store(0, Ordering::Release);
+                } else if child.level == 1 {
+                    self.release_materialized_branch(child, first.max(child.start), end.min(child.end));
+                } else {
+                    self.release(child, first.max(child.start), end.min(child.end));
+                }
+            }
+            let count = (end - first) as u64;
+            let previous = word.fetch_sub(count, Ordering::Release);
+            debug_assert!(previous != WHOLE_CLAIM && previous >= count);
+        }
     }
 
     fn rounded_range(&self, start: usize, len: usize) -> Result<(usize, usize), RadixMapError> {
         if len == 0 || start >= self.byte_len {
             return Err(RadixMapError::InvalidRange);
         }
-        let byte_end = start
+        let end = start
             .checked_add(len)
             .ok_or(RadixMapError::LengthOverflow)?;
-        if byte_end > self.byte_len {
+        if end > self.byte_len {
             return Err(RadixMapError::InvalidRange);
         }
-        let end = byte_end
-            .checked_add(self.granularity - 1)
-            .ok_or(RadixMapError::LengthOverflow)?
-            / self.granularity;
-        Ok((start / self.granularity, end))
-    }
-
-    fn chunk(&self, cursor: usize, end: usize) -> (Option<usize>, usize) {
-        let Some(root) = self.levels.first() else {
-            return (None, 1);
-        };
-        if cursor == 0 && end == self.terminal.len() {
-            return (Some(0), end);
-        }
-        let remaining = end - cursor;
-        let length_shift = usize::BITS - 1 - remaining.leading_zeros();
-        let alignment_shift = if cursor == 0 {
-            usize::BITS - 1
-        } else {
-            cursor.trailing_zeros()
-        };
-        let shift = length_shift.min(alignment_shift).min(root.shift);
-        let shift = shift - shift % RADIX_BITS as u32;
-        if shift >= RADIX_BITS as u32 {
-            let level_index = ((root.shift - shift) / RADIX_BITS as u32) as usize;
-            let span = 1usize << shift;
-            if level_index < self.levels.len() && span <= remaining {
-                return (Some(level_index), span);
-            }
-        }
-        (None, 1)
-    }
-
-    fn batch_chunk(&self, cursor: usize, end: usize) -> (Option<usize>, usize) {
-        let (target, units) = self.chunk(cursor, end);
-        let Some(level_index) = target else {
-            return (target, units);
-        };
-        if cursor == 0 && end == self.terminal.len() {
-            return (target, units);
-        }
-        let index = cursor >> self.levels[level_index].shift;
-        let state_index = self.levels[level_index].entry_offset + index;
-        let entries = ((end - cursor) / units)
-            .min(RADIX - index % RADIX)
-            .min(32 - state_index % 32);
-        (target, units * entries)
-    }
-
-    fn claim_chunk(
-        &self,
-        terminal_index: usize,
-        target: Option<usize>,
-        count: usize,
-    ) -> Result<(), ()> {
-        let ancestor_end = target.unwrap_or(self.levels.len());
-        if ancestor_end != 0 {
-            let level_index = 0;
-            let index = terminal_index >> self.levels[level_index].shift;
-            let state_index = self.levels[level_index].entry_offset + index;
-            loop {
-                match self.internal.load(state_index, Ordering::Acquire) {
-                    state if state == RadixState::Full as usize => return Err(()),
-                    state if state == RadixState::Updating as usize => {
-                        self.help_update(level_index, index)
-                    }
-                    _ => break,
-                }
-            }
-        }
-        let claimed = match target {
-            Some(level_index) => {
-                let index = terminal_index >> self.levels[level_index].shift;
-                let state_index = self.levels[level_index].entry_offset + index;
-                let word_index = state_index / 32;
-                let shift = (state_index % 32) * 2;
-                let mask = ((1u64 << (count * 2)) - 1) << shift;
-                let full = mask & 0xaaaa_aaaa_aaaa_aaaa;
-                let mut observed = self.internal.load_word(word_index, Ordering::Acquire);
-                loop {
-                    if observed & mask != 0 {
-                        break Err(0);
-                    }
-                    match self.internal.compare_exchange_weak_word(
-                        word_index,
-                        observed,
-                        observed | full,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break Ok(0),
-                        Err(next) => observed = next,
-                    }
-                }
-            }
-            None => self.terminal.compare_exchange(
-                terminal_index,
-                0,
-                1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ),
-        };
-        if claimed.is_err() {
-            return Err(());
-        }
-        for level_index in (0..ancestor_end).rev() {
-            let index = terminal_index >> self.levels[level_index].shift;
-            let state_index = self.levels[level_index].entry_offset + index;
-            loop {
-                let state = self.internal.load(state_index, Ordering::Acquire);
-                if state == RadixState::Partial as usize {
-                    break;
-                }
-                if state == RadixState::Full as usize {
-                    unsafe { self.release_target(terminal_index, target, count) };
-                    self.repair_ancestors(terminal_index, ancestor_end);
-                    return Err(());
-                }
-                if state == RadixState::Updating as usize {
-                    self.help_update(level_index, index);
-                    continue;
-                }
-                if self
-                    .internal
-                    .compare_exchange(
-                        state_index,
-                        RadixState::Empty as usize,
-                        RadixState::Partial as usize,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn claim_terminal_range(&self, first: usize, count: usize) -> Result<(), ()> {
-        if !self.levels.is_empty() {
-            let index = first >> self.levels[0].shift;
-            let state_index = self.levels[0].entry_offset + index;
-            loop {
-                match self.internal.load(state_index, Ordering::Acquire) {
-                    state if state == RadixState::Full as usize => return Err(()),
-                    state if state == RadixState::Updating as usize => self.help_update(0, index),
-                    _ => break,
-                }
-            }
-        }
-        let word_index = first / 64;
-        let shift = first % 64;
-        let mask = ((1u64 << count) - 1) << shift;
-        let mut observed = self.terminal.load_word(word_index, Ordering::Acquire);
-        loop {
-            if observed & mask != 0 {
-                return Err(());
-            }
-            match self.terminal.compare_exchange_weak_word(
-                word_index,
-                observed,
-                observed | mask,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(next) => observed = next,
-            }
-        }
-        for level_index in (0..self.levels.len()).rev() {
-            let index = first >> self.levels[level_index].shift;
-            let state_index = self.levels[level_index].entry_offset + index;
-            loop {
-                let state = self.internal.load(state_index, Ordering::Acquire);
-                if state == RadixState::Partial as usize {
-                    break;
-                }
-                if state == RadixState::Full as usize {
-                    self.terminal
-                        .fetch_and_word(word_index, !mask, Ordering::AcqRel);
-                    self.repair_ancestors(first, self.levels.len());
-                    return Err(());
-                }
-                if state == RadixState::Updating as usize {
-                    self.help_update(level_index, index);
-                    continue;
-                }
-                if self
-                    .internal
-                    .compare_exchange(
-                        state_index,
-                        RadixState::Empty as usize,
-                        RadixState::Partial as usize,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    unsafe fn release_terminal_range(&self, first: usize, count: usize) {
-        let word_index = first / 64;
-        let shift = first % 64;
-        let mask = ((1u64 << count) - 1) << shift;
-        let previous = self
-            .terminal
-            .fetch_and_word(word_index, !mask, Ordering::AcqRel);
-        debug_assert_eq!(previous & mask, mask);
-    }
-
-    unsafe fn release_target(&self, terminal_index: usize, target: Option<usize>, count: usize) {
-        let result = match target {
-            Some(level_index) => {
-                let index = terminal_index >> self.levels[level_index].shift;
-                let state_index = self.levels[level_index].entry_offset + index;
-                let word_index = state_index / 32;
-                let shift = (state_index % 32) * 2;
-                let mask = ((1u64 << (count * 2)) - 1) << shift;
-                let full = mask & 0xaaaa_aaaa_aaaa_aaaa;
-                let mut observed = self.internal.load_word(word_index, Ordering::Acquire);
-                loop {
-                    if observed & mask != full {
-                        break Err(0);
-                    }
-                    match self.internal.compare_exchange_weak_word(
-                        word_index,
-                        observed,
-                        observed & !mask,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break Ok(0),
-                        Err(next) => observed = next,
-                    }
-                }
-            }
-            None => self.terminal.compare_exchange(
-                terminal_index,
-                1,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ),
-        };
-        debug_assert!(result.is_ok());
-    }
-
-    fn repair_ancestors(&self, terminal_index: usize, ancestor_end: usize) {
-        for level_index in (0..ancestor_end).rev() {
-            let index = terminal_index >> self.levels[level_index].shift;
-            self.repair_entry(level_index, index);
-        }
-    }
-
-    fn repair_entry(&self, level_index: usize, index: usize) {
-        if self
-            .internal
-            .compare_exchange(
-                self.levels[level_index].entry_offset + index,
-                RadixState::Partial as usize,
-                RadixState::Updating as usize,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.help_update(level_index, index);
-        }
-    }
-
-    fn help_update(&self, level_index: usize, index: usize) {
-        if self.internal.load(
-            self.levels[level_index].entry_offset + index,
-            Ordering::Acquire,
-        ) != RadixState::Updating as usize
-        {
-            return;
-        }
-        let first_child = index * RADIX;
-        let occupied = if level_index + 1 < self.levels.len() {
-            let children = &self.levels[level_index + 1];
-            let end = first_child.saturating_add(RADIX).min(children.entry_count);
-            self.internal.any_nonzero(
-                children.entry_offset + first_child,
-                end - first_child,
-                Ordering::Acquire,
-            )
-        } else {
-            let end = first_child.saturating_add(RADIX).min(self.terminal.len());
-            self.terminal
-                .any_nonzero(first_child, end - first_child, Ordering::Acquire)
-        };
-        let next = if occupied {
-            RadixState::Partial
-        } else {
-            RadixState::Empty
-        };
-        let _ = self.internal.compare_exchange(
-            self.levels[level_index].entry_offset + index,
-            RadixState::Updating as usize,
-            next as usize,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
-    }
-
-    fn expand_full(&self, level_index: usize, index: usize) -> Result<(), RadixMapError> {
-        if self.internal.load(
-            self.levels[level_index].entry_offset + index,
-            Ordering::Acquire,
-        ) != RadixState::Full as usize
-        {
-            return Err(RadixMapError::Conflict);
-        }
-        let first_child = index
-            .checked_mul(RADIX)
-            .ok_or(RadixMapError::LengthOverflow)?;
-        if level_index + 1 < self.levels.len() {
-            let children = &self.levels[level_index + 1];
-            let end = first_child.saturating_add(RADIX).min(children.entry_count);
-            for child in first_child..end {
-                self.internal
-                    .compare_exchange(
-                        children.entry_offset + child,
-                        RadixState::Empty as usize,
-                        RadixState::Full as usize,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .map_err(|_| RadixMapError::Conflict)?;
-            }
-        } else {
-            let end = first_child.saturating_add(RADIX).min(self.terminal.len());
-            for child in first_child..end {
-                self.terminal
-                    .compare_exchange(child, 0, 1, Ordering::AcqRel, Ordering::Acquire)
-                    .map_err(|_| RadixMapError::Conflict)?;
-            }
-        }
-        self.internal
-            .compare_exchange(
-                self.levels[level_index].entry_offset + index,
-                RadixState::Full as usize,
-                RadixState::Partial as usize,
-                Ordering::Release,
-                Ordering::Acquire,
-            )
-            .map_err(|_| RadixMapError::Conflict)?;
-        Ok(())
+        Ok((start / self.granularity, end.div_ceil(self.granularity)))
     }
 }
 
-fn map_alloc(error: AtomicStateMapError) -> RadixMapError {
-    match error {
-        AtomicStateMapError::AllocationFailed => RadixMapError::AllocationFailed,
-        AtomicStateMapError::InvalidBits | AtomicStateMapError::LengthOverflow => {
-            RadixMapError::LengthOverflow
-        }
-    }
+fn leaf_mask(first: usize, end: usize) -> u64 {
+    (u64::MAX >> (CHUNKS_PER_LEAF - (end - first))) << (first % CHUNKS_PER_LEAF)
 }

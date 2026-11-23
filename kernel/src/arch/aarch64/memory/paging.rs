@@ -458,6 +458,7 @@ impl PagingPlatform for Aarch64Platform {
     }
 
     fn local_flush_tlb_all(_include_global: bool) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
                 "dsb ishst",
@@ -486,9 +487,11 @@ impl PagingPlatform for Aarch64Platform {
             return;
         };
 
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
         while address < end {
             let operand = (address >> Granule::SHIFT) & ((1u64 << 44) - 1);
+            #[cfg_attr(irq_check, irq::trusted(unsafe))]
             unsafe {
                 asm!(
                     "tlbi vaae1, {operand}",
@@ -502,6 +505,7 @@ impl PagingPlatform for Aarch64Platform {
             };
             address = next;
         }
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!("dsb ish", "isb", options(nostack, preserves_flags));
         }

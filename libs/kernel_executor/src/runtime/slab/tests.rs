@@ -2,7 +2,7 @@
 mod threaded {
     use crate::runtime::slab::config::SlabConfigBuilder;
     use crate::runtime::slab::ptr::enqueue_slab_task;
-    use crate::runtime::slab::task_slab::{get_task_table, slab_stats};
+    use crate::runtime::slab::task_slab::get_task_table;
     use alloc::{sync::Arc, vec::Vec};
     use core::future::Future;
     use core::pin::Pin;
@@ -48,40 +48,37 @@ mod threaded {
         assert!(config.slots_per_shard <= 4096);
     }
 
-    // This test covers cached waker initialization on joinable slab slots. Many
-    // threads racing to fetch the cached waker must all get equivalent wakers for
-    // the same slot, with no partially initialized waker visible.
     #[test]
-    fn joinable_slot_cached_waker_initializes_once_under_thread_contention() {
+    fn joinable_slot_wakers_are_equivalent_under_thread_contention() {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let slab = get_task_table();
+        let slab = get_task_table::<crate::test_support::TestExecutorPlatform>();
         let handle = slab.allocate().expect("expected a joinable slab slot");
         let (shard_idx, local_idx, generation) = handle.indices();
-        let slot = slab
-            .get_slot(shard_idx, local_idx, generation)
-            .expect("allocated joinable slot missing");
+        assert!(slab.get_slot(shard_idx, local_idx, generation).is_some());
         let wakers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         std::thread::scope(|scope| {
             for _ in 0..32 {
                 let wakers = wakers.clone();
                 scope.spawn(move || {
-                    let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
-                    wakers.lock().expect("cached waker result lock").push(waker);
+                    let waker = crate::runtime::waker::create_slab_task_waker::<crate::test_support::TestExecutorPlatform>(
+                        shard_idx, local_idx, generation,
+                    );
+                    wakers.lock().expect("waker result lock").push(waker);
                 });
             }
         });
 
-        let wakers = wakers.lock().expect("cached waker result lock");
+        let wakers = wakers.lock().expect("waker result lock");
         assert_eq!(wakers.len(), 32);
         for waker in wakers.iter().skip(1) {
             assert!(wakers[0].will_wake(waker));
         }
         drop(wakers);
 
-        slab.decrement_ref(shard_idx, local_idx, generation);
+        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
     }
 
     // This test covers stale generation protection for joinable slab slots. Once a
@@ -92,35 +89,33 @@ mod threaded {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let slab = get_task_table();
+        let slab = get_task_table::<crate::test_support::TestExecutorPlatform>();
         let handle = slab.allocate().expect("expected a joinable slab slot");
         let (shard_idx, local_idx, generation) = handle.indices();
 
         assert!(slab.increment_ref(shard_idx, local_idx, generation));
-        slab.decrement_ref(shard_idx, local_idx, generation);
-        slab.decrement_ref(shard_idx, local_idx, generation);
+        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
+        slab.decrement_ref::<true>(shard_idx, local_idx, generation);
 
         assert!(
             !slab.increment_ref(shard_idx, local_idx, generation),
             "stale joinable generation reacquired a freed slot"
         );
-        enqueue_slab_task(shard_idx, local_idx, generation);
+        enqueue_slab_task::<crate::test_support::TestExecutorPlatform>(
+            shard_idx, local_idx, generation,
+        );
         assert!(
             !slab.increment_ref(shard_idx, local_idx, generation),
             "stale joinable wake resurrected a freed slot"
         );
     }
 
-    // This test exists to make sure the global slab initializes under the threaded
-    // runtime and reports sane capacity/allocation counters after startup.
     #[test]
-    fn global_slab_stats_are_readable_after_default_initialization() {
+    fn global_slab_has_capacity_after_default_initialization() {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let stats = slab_stats();
-        assert!(stats.total_capacity >= 64);
-        assert!(stats.currently_allocated <= stats.total_capacity);
+        assert!(get_task_table::<crate::test_support::TestExecutorPlatform>().capacity() >= 64);
     }
 
     // This test exists to verify the detached slab exhaustion path. It holds every
@@ -130,14 +125,13 @@ mod threaded {
         let _guard = crate::test::support::global_runtime_lock();
         crate::test::support::init_threaded_runtime();
 
-        let stats = slab_stats();
-        let tasks = stats.total_capacity + 64;
+        let tasks = get_task_table::<crate::test_support::TestExecutorPlatform>().capacity() + 64;
         let gate = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicUsize::new(0));
         let wakers = Arc::new(Mutex::new(Vec::with_capacity(tasks)));
 
         for _ in 0..tasks {
-            spawn_detached(GatedDetachedFuture {
+            spawn_detached::<crate::test_support::TestExecutorPlatform, _>(GatedDetachedFuture {
                 gate: gate.clone(),
                 wakers: wakers.clone(),
                 completed: completed.clone(),
@@ -170,32 +164,25 @@ mod threaded {
 
 #[cfg(any(loom, feature = "loom"))]
 mod loom {
-    use super::super::slot::{TaskSlot, WakeAction, WAKER_SET, WAKER_TAKEN, WAKER_UPDATING};
+    use super::super::slot::{TaskSlot, WAKER_SET, WAKER_TAKEN, WAKER_UPDATING, WakeAction};
     use crate::sync::exhaustive_model;
     use core::mem::ManuallyDrop;
     use core::task::{RawWaker, RawWakerVTable, Waker};
-
-    const MODEL_ID_MASK: u128 = u64::MAX as u128;
-    const MODEL_TAG_SHIFT: u32 = 64;
 
     struct ReadyNode {
         next: crate::sync::atomic::AtomicUsize,
     }
 
-    fn model_push(head: &crate::sync::atomic::AtomicU128, node: &ReadyNode, id: usize) {
-        let mut current = head.load(crate::sync::atomic::Ordering::Acquire);
+    fn model_push(head: &crate::sync::atomic::AtomicUsize, node: &ReadyNode, id: usize) {
+        let mut current = head.load(crate::sync::atomic::Ordering::Relaxed);
         loop {
-            node.next.store(
-                (current & MODEL_ID_MASK) as usize,
-                crate::sync::atomic::Ordering::Relaxed,
-            );
-            let tag = ((current >> MODEL_TAG_SHIFT) as u64).wrapping_add(1);
-            let replacement = ((tag as u128) << MODEL_TAG_SHIFT) | id as u128;
+            node.next
+                .store(current, crate::sync::atomic::Ordering::Relaxed);
             match head.compare_exchange(
                 current,
-                replacement,
+                id,
                 crate::sync::atomic::Ordering::Release,
-                crate::sync::atomic::Ordering::Acquire,
+                crate::sync::atomic::Ordering::Relaxed,
             ) {
                 Ok(_) => return,
                 Err(actual) => current = actual,
@@ -204,36 +191,27 @@ mod loom {
     }
 
     fn model_pop(
-        head: &crate::sync::atomic::AtomicU128,
+        head: &crate::sync::atomic::AtomicUsize,
+        current: &mut usize,
         first: &ReadyNode,
         second: &ReadyNode,
     ) -> Option<usize> {
-        let mut current = head.load(crate::sync::atomic::Ordering::Acquire);
-        loop {
-            let id = (current & MODEL_ID_MASK) as usize;
-            if id == 0 {
-                return None;
-            }
-            let node = if id == 1 { first } else { second };
-            let next = node.next.load(crate::sync::atomic::Ordering::Acquire);
-            let tag = ((current >> MODEL_TAG_SHIFT) as u64).wrapping_add(1);
-            let replacement = ((tag as u128) << MODEL_TAG_SHIFT) | next as u128;
-            match head.compare_exchange(
-                current,
-                replacement,
-                crate::sync::atomic::Ordering::AcqRel,
-                crate::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(id),
-                Err(actual) => current = actual,
-            }
+        if *current == 0 {
+            *current = head.swap(0, crate::sync::atomic::Ordering::Acquire);
         }
+        let id = *current;
+        if id == 0 {
+            return None;
+        }
+        let node = if id == 1 { first } else { second };
+        *current = node.next.load(crate::sync::atomic::Ordering::Relaxed);
+        Some(id)
     }
 
     #[test]
     fn loom_intrusive_ready_stack_publishes_each_task_once() {
         exhaustive_model(|| {
-            let head = crate::sync::Arc::new(crate::sync::atomic::AtomicU128::new(0));
+            let head = crate::sync::Arc::new(crate::sync::atomic::AtomicUsize::new(0));
             let first = crate::sync::Arc::new(ReadyNode {
                 next: crate::sync::atomic::AtomicUsize::new(0),
             });
@@ -251,10 +229,11 @@ mod loom {
             producer_a.join().expect("first producer panicked");
             producer_b.join().expect("second producer panicked");
 
-            let a = model_pop(&head, &first, &second).expect("first task missing");
-            let b = model_pop(&head, &first, &second).expect("second task missing");
+            let mut current = 0;
+            let a = model_pop(&head, &mut current, &first, &second).expect("first task missing");
+            let b = model_pop(&head, &mut current, &first, &second).expect("second task missing");
             assert_eq!((1usize << a) | (1usize << b), (1 << 1) | (1 << 2));
-            assert!(model_pop(&head, &first, &second).is_none());
+            assert!(model_pop(&head, &mut current, &first, &second).is_none());
         });
     }
 
@@ -262,8 +241,8 @@ mod loom {
     fn loom_sharded_ready_heads_preserve_cross_shard_work() {
         exhaustive_model(|| {
             let heads = crate::sync::Arc::new([
-                crate::sync::atomic::AtomicU128::new(0),
-                crate::sync::atomic::AtomicU128::new(0),
+                crate::sync::atomic::AtomicUsize::new(0),
+                crate::sync::atomic::AtomicUsize::new(0),
             ]);
             let first = crate::sync::Arc::new(ReadyNode {
                 next: crate::sync::atomic::AtomicUsize::new(0),
@@ -286,7 +265,7 @@ mod loom {
             let consumer_seen = seen.clone();
             let consumer = loom::thread::spawn(move || {
                 for head in consumer_heads.iter() {
-                    if let Some(id) = model_pop(head, &consumer_first, &consumer_second) {
+                    if let Some(id) = model_pop(head, &mut 0, &consumer_first, &consumer_second) {
                         let bit = 1usize << id;
                         let previous =
                             consumer_seen.fetch_or(bit, crate::sync::atomic::Ordering::AcqRel);
@@ -300,7 +279,7 @@ mod loom {
             consumer.join().expect("consumer panicked");
 
             for head in heads.iter() {
-                if let Some(id) = model_pop(head, &first, &second) {
+                if let Some(id) = model_pop(head, &mut 0, &first, &second) {
                     let bit = 1usize << id;
                     let previous = seen.fetch_or(bit, crate::sync::atomic::Ordering::AcqRel);
                     assert_eq!(previous & bit, 0);

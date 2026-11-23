@@ -4,24 +4,28 @@ cargo-features = ["profile-rustflags"]
 name = "kernel_executor"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
-spin = "0.10"
-portable-atomic = "1"
-kernel_types = { path = "../kernel_types" }
-loom = { version = "0.7", optional = true }
+crossbeam-queue = { version = "0.3.12", default-features = false, features = ["alloc"], optional = true }
+futures-core = { version = "0.3.32", default-features = false, optional = true }
+kernel_sync = { path = "../kernel_sync", default-features = false, optional = true }
+spin = { version = "0.10", optional = true }
+loom = { version = "0.7", features = ["futures"], optional = true }
 
 [features]
-loom = ["dep:loom"]
+default = ["executor"]
+hosted = ["executor"]
+executor = ["dep:kernel_sync", "dep:spin", "dep:crossbeam-queue", "dep:futures-core"]
+loom = ["executor", "dep:loom"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(irq_check)'] }
 
 [dev-dependencies]
-kernel_types = { path = "../kernel_types", features = ["hosted-tests"] }
 threadpool = "1.8"
 tokio = { version = "1.45", features = [
     "io-util",

@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     future::{Future, poll_fn},
@@ -24,8 +25,8 @@ impl Future for YieldOnce {
     }
 }
 
-fn yield_once() -> YieldOnce {
-    YieldOnce(false)
+pub(super) async fn yield_once() {
+    YieldOnce(false).await
 }
 
 #[repr(align(64))]
@@ -57,7 +58,7 @@ pub(super) async fn run_task_batch(
 
     for value in 0..task_count as u64 {
         let batch = batch.clone();
-        spawn_detached(async move {
+        spawn_detached::<KernelExecutorPlatform, _>(async move {
             yield_once().await;
             let cpu = crate::platform::current_cpu_id();
             batch.results[value as usize].store(operation(value), Ordering::Relaxed);

@@ -1,7 +1,8 @@
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64};
+use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::AtomicU64;
 
 use fatfs::{Error, FileSystem, FsOptions, IoKind, Read};
+use kernel_api::error::{DriverErrorKind, KernelError, ResultErrorContext, error};
 use kernel_api::{
     device::{
         DevExtRef, DeviceInit, DeviceObject, DriverObject, ProtocolHandle,
@@ -9,7 +10,6 @@ use kernel_api::{
     },
     kernel_types::{
         async_ffi::{AbiFuture, FutureExt},
-        async_types::AsyncMutex,
         pnp::{ProbeContext, ProbeOutcome},
         protocol::volmgr::VolumeProtocol,
     },
@@ -19,14 +19,16 @@ use kernel_api::{
     },
     request_handler,
 };
-use kernel_api::error::{error, DriverErrorKind, KernelError, ResultErrorContext};
+use kernel_sync::locks::AsyncRwLock;
+use portable_atomic::AtomicU128;
 use spin::Mutex;
 
 use crate::{
-    block_dev::{BlockDev, flush},
+    block_dev::BlockDev,
+    reader_pool::{ReaderPool, ReaderSlot},
     volume::{
-        FILE_HANDLE_CAPACITY, Fat32Fs, FileHandleTable, METADATA_OWNER_ID, MountedFat32,
-        VolCtrlDevExt,
+        FILE_HANDLE_CAPACITY, FIRST_FILE_OWNER_ID, Fat32Fs, FileHandleTable, METADATA_OWNER_ID,
+        MountedFat32, VolCtrlDevExt,
     },
 };
 
@@ -36,9 +38,7 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
         .expect("failed to get FAT32 device extension")
 }
 
-fn volume_geometry(
-    protocol: &ProtocolHandle<VolumeProtocol>,
-) -> Result<(u16, u64), KernelError> {
+fn volume_geometry(protocol: &ProtocolHandle<VolumeProtocol>) -> Result<(u16, u64), KernelError> {
     let info = (protocol.partition_info)(protocol.provider())
         .with_context(|| "querying FAT32 volume partition information")?;
     let entry = info.gpt_entry.ok_or_else(|| {
@@ -82,21 +82,18 @@ extern "C" fn fat32_probe(
             Err(kind) => {
                 return ProbeOutcome::Error(
                     error(kind).with_context("opening the FAT32 probe volume protocol"),
-                )
+                );
             }
         };
         let (sector_size, sectors) = match volume_geometry(&protocol) {
             Ok(geometry) => geometry,
             Err(err) => return ProbeOutcome::Error(err),
         };
-        let should_flush = Arc::new(AtomicBool::new(false));
-        let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
         let mut probe_block = match BlockDev::new(
             context.lower_target.clone(),
             sector_size,
             sectors,
-            should_flush.clone(),
-            current_owner.clone(),
+            METADATA_OWNER_ID,
         ) {
             Ok(block) => block,
             Err(err) => return ProbeOutcome::Error(err),
@@ -128,8 +125,7 @@ extern "C" fn fat32_probe(
             context.lower_target,
             sector_size,
             sectors,
-            should_flush,
-            current_owner,
+            METADATA_OWNER_ID,
         ) {
             Ok(block) => block,
             Err(err) => return ProbeOutcome::Error(err),
@@ -176,7 +172,7 @@ async fn fat32_start(
         Ok(protocol) => protocol,
         Err(kind) => {
             return Err(error(kind))
-                .with_context(|| "opening the lower volume protocol while starting FAT32")
+                .with_context(|| "opening the lower volume protocol while starting FAT32");
         }
     };
     let (sector_size, sectors) = match volume_geometry(&protocol) {
@@ -188,14 +184,11 @@ async fn fat32_start(
             .with_context(|| "starting FAT32 without a lower volume target");
     };
 
-    let should_flush = Arc::new(AtomicBool::new(false));
-    let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
     let block = BlockDev::new(
         volume_target.clone(),
         sector_size,
         sectors,
-        should_flush.clone(),
-        current_owner.clone(),
+        METADATA_OWNER_ID,
     )?;
     let filesystem = match FileSystem::new(
         block,
@@ -204,23 +197,42 @@ async fn fat32_start(
     .await
     {
         Ok(filesystem) => filesystem,
-        Err(Error::Io(err)) => {
-            return Err(err.0).with_context(|| "mounting the FAT32 filesystem")
-        }
+        Err(Error::Io(err)) => return Err(err.0).with_context(|| "mounting the FAT32 filesystem"),
         Err(other) => {
             return Err(error(DriverErrorKind::DeviceError))
-                .with_context(|| alloc::format!("mounting the FAT32 filesystem: {other:?}"))
+                .with_context(|| alloc::format!("mounting the FAT32 filesystem: {other:?}"));
         }
     };
 
+    filesystem.set_dirty_flag(true).await.map_err(|err| err.0)?;
+
+    if !AtomicU128::is_lock_free() {
+        return Err(error(DriverErrorKind::NotImplemented))
+            .with_context(|| "FAT32 reader pool requires native 128-bit atomics");
+    }
+    let readers = ReaderPool {
+        state: AtomicU128::new(0),
+    };
+    readers.put(Box::new(ReaderSlot {
+        reader: BlockDev::new(
+            volume_target.clone(),
+            sector_size,
+            sectors,
+            METADATA_OWNER_ID,
+        )?,
+        next: 0,
+    }));
     let mounted = MountedFat32 {
-        fs: Arc::new(AsyncMutex::new(filesystem)),
+        fs: Arc::new(filesystem),
+        metadata: AsyncRwLock::new(()),
+        readers,
         handles: Mutex::new(FileHandleTable::with_capacity(FILE_HANDLE_CAPACITY)),
         volume_target,
-        should_flush,
-        pending_flush_owner: Arc::new(AtomicU64::new(0)),
-        pending_flush_block: Arc::new(AtomicBool::new(false)),
-        current_owner,
+        sector_size,
+        total_sectors: sectors,
+        files: Mutex::new(alloc::collections::BTreeMap::new()),
+        namespace: AsyncRwLock::new(()),
+        next_owner: AtomicU64::new(FIRST_FILE_OWNER_ID),
     };
     if ext_mut::<VolCtrlDevExt>(device).mount(mounted).is_err() {
         return Err(error(DriverErrorKind::InvalidParameter))
@@ -236,13 +248,17 @@ async fn fat32_remove(
     _request: &mut RemoveDevice,
 ) -> Result<DriverStep, kernel_api::error::KernelError> {
     if device.is_started() {
-        flush(&ext_mut::<VolCtrlDevExt>(device));
+        let vdx = ext_mut::<VolCtrlDevExt>(device);
+        let mut request = kernel_api::request::Flush { should_block: true };
+        kernel_api::pnp::io::send_down_stack(vdx.volume_target.clone(), &mut request).await?;
     }
     Ok(DriverStep::Complete)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn DriverEntry(driver: &Arc<DriverObject>) -> Result<(), kernel_api::error::KernelError> {
+pub extern "C" fn DriverEntry(
+    driver: &Arc<DriverObject>,
+) -> Result<(), kernel_api::error::KernelError> {
     driver_set_evt_probe_device(driver, fat32_probe);
     driver_set_evt_device_add(driver, fat32_device_add);
     Ok(())

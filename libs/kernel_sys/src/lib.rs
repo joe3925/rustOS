@@ -5,7 +5,7 @@ extern crate alloc;
 use acpi::PhysicalMapping;
 use alloc::string::String;
 use alloc::collections::btree_map::BTreeMap;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::panic::PanicInfo;
@@ -23,23 +23,21 @@ use kernel_types::dma::{
 };
 use kernel_types::error::{DriverErrorKind, ErrorBacktrace, KernelError};
 use kernel_types::irq::{
-    DropHook, HardwareInterruptId, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult,
+    DropHook, HardwareInterruptId, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult,
     MsiBinding, MsiBindingRequest,
 };
 use kernel_types::object_manager::OmError;
 use kernel_types::pci::PciConfigAddress;
-use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
+use kernel_types::runtime::BlockOnContext;
 
 use kernel_types::arch::{AddressSpaceRoot, PageFlags, PhysAddr, VirtAddr};
-use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_types::device::{DevNode, DeviceInit, DeviceObject};
 use kernel_types::fdt::FdtHeader;
 use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
 use kernel_types::status::{Data, PageMapError, TaskError};
-use kernel_types::{
-    ClassEventCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverProbeDevice, EvtDriverUnload,
-};
+use kernel_types::{ClassEventCallback, DpcFn};
 
 #[link(name = "kernel")]
 unsafe extern "C" {
@@ -54,9 +52,6 @@ unsafe extern "C" {
     pub fn get_device_tree_blob() -> Option<*const FdtHeader>;
     pub unsafe fn get_current_cpu_id() -> usize;
     pub unsafe fn get_current_platform_cpu_id() -> usize;
-    pub fn stopwatch_new() -> Stopwatch;
-    pub fn elapsed(s: &Stopwatch) -> Duration;
-    pub fn kernel_cycle_counter() -> u64;
     pub fn kernel_cycle_counter_frequency_hz() -> u64;
     pub fn kernel_capture_error_backtrace(output: &mut ErrorBacktrace);
     pub fn kernel_resolve_error_context_module(instruction_pointer: usize) -> Option<String>;
@@ -80,14 +75,7 @@ unsafe extern "C" {
         ctx: usize,
         out: &mut MsiBinding,
     ) -> bool;
-    pub fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta);
-    pub fn kernel_irq_borrowed_signal_n(handle: IrqBorrowedHandle, meta: IrqMeta, n: u32);
-    pub fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta);
-    pub fn kernel_irq_borrowed_ensure_signal(handle: IrqBorrowedHandle, meta: IrqMeta);
     pub fn irq_handle_create(drop_hook: DropHook) -> IrqHandle;
-
-    pub fn irq_handle_clone(h: &IrqHandle) -> IrqHandle;
-    pub fn irq_handle_drop(h: IrqHandle);
 
     pub fn irq_handle_unregister(h: &IrqHandle);
     pub fn irq_handle_is_closed(h: &IrqHandle) -> bool;
@@ -138,7 +126,6 @@ unsafe extern "C" {
         size: u64,
         cache: kernel_types::memory::PhysicalMappingCache,
     ) -> Result<kernel_types::memory::KernelMapping, PageMapError>;
-    pub fn virt_to_phys(root: AddressSpaceRoot, addr: VirtAddr) -> Option<(u64, PhysAddr)>;
     pub fn resolve_virtual_range_frame(
         root: AddressSpaceRoot,
         addr: VirtAddr,
@@ -172,11 +159,6 @@ unsafe extern "C" {
     pub fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize);
 
     // PnP / Device Management
-    pub fn driver_get_name(driver: &Arc<DriverObject>) -> String;
-    pub fn driver_get_flags(driver: &Arc<DriverObject>) -> u32;
-    pub fn driver_set_evt_device_add(driver: &Arc<DriverObject>, callback: EvtDriverDeviceAdd);
-    pub fn driver_set_evt_probe_device(driver: &Arc<DriverObject>, callback: EvtDriverProbeDevice);
-    pub fn driver_set_evt_driver_unload(driver: &Arc<DriverObject>, callback: EvtDriverUnload);
 
     pub fn pnp_create_pdo(
         parent_devnode: &Arc<DevNode>,
@@ -262,18 +244,14 @@ unsafe extern "C" {
     pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
 
     // Async Runtime (global)
-    pub fn kernel_spawn_abi(fut: AbiFuture<()>);
-    pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<()>;
+    pub fn kernel_spawn_joinable_abi(fut: AbiFuture<()>) -> AbiFuture<bool>;
     pub fn kernel_spawn_detached_abi(fut: AbiFuture<()>);
-    pub fn kernel_block_on_abi(fut: AbiFuture<()>);
-    pub fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState>;
-    pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize), ctx: usize);
+    pub fn kernel_block_on_context() -> BlockOnContext;
+    pub fn kernel_task_cancellation_guard() -> kernel_types::runtime::TaskCancellationGuard;
+    pub fn kernel_spawn_blocking_raw(trampoline: extern "C" fn(usize, bool), ctx: usize);
 
     // Routing FFI (sync - for kernel_routing crate)
     pub fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget>;
-    pub fn routing_get_stack_top_from_weak(
-        dev_node_weak: &Weak<DevNode>,
-    ) -> Option<Arc<DeviceObject>>;
 
 }
 

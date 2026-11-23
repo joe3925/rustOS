@@ -1,10 +1,9 @@
 use alloc::string::String;
-use alloc::sync::Arc;
 use kernel_sync::{Platform, ThreadEntry};
 
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::{Task, TaskHandle};
 use crate::scheduling::tls;
 
@@ -15,8 +14,7 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn current_task() -> Option<Self::Task> {
-        let cpu_id = platform::current_cpu_id();
-        SCHEDULER.get_current_task(cpu_id)
+        scheduler().get_local_current_task()
     }
 
     #[inline]
@@ -26,7 +24,17 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn same_task(a: &Self::Task, b: &Self::Task) -> bool {
-        Arc::ptr_eq(a, b)
+        TaskHandle::ptr_eq(a, b)
+    }
+
+    #[inline]
+    fn current_cpu_id() -> usize {
+        platform::current_cpu_id()
+    }
+
+    #[inline]
+    fn processor_count() -> usize {
+        platform::processor_count()
     }
 
     #[inline]
@@ -46,17 +54,32 @@ impl Platform for KernelPlatform {
 
     #[inline]
     fn unpark(task: &Self::Task) {
-        SCHEDULER.unpark(task);
+        scheduler().unpark(task);
     }
 
     #[inline]
     fn park_current() {
-        SCHEDULER.park_current();
+        scheduler().park_current();
     }
 
-    fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
+    #[inline]
+    fn interrupts_enabled() -> bool {
+        platform::interrupts_enabled()
+    }
+
+    #[inline]
+    fn disable_interrupts() {
+        platform::disable_interrupts();
+    }
+
+    #[inline]
+    fn enable_interrupts() {
+        platform::enable_interrupts();
+    }
+
+    fn spawn_thread(name: String, entry: ThreadEntry, context: usize, cpu: usize) {
         let task = Task::new_kernel_mode(entry, context, StackSize::Tiny, name, 0);
-        SCHEDULER.add_task(task);
+        scheduler().add_task_on(task, Some(cpu));
     }
 
     #[inline]
@@ -65,20 +88,22 @@ impl Platform for KernelPlatform {
     }
 }
 
-pub type WaitQueue = kernel_sync::WaitQueue<KernelPlatform>;
-pub type BoundedWaitQueue = kernel_sync::BoundedWaitQueue<KernelPlatform>;
-pub type MpmcSender<T> = kernel_sync::mpmc::Sender<KernelPlatform, T>;
-pub type MpmcReceiver<T> = kernel_sync::mpmc::Receiver<KernelPlatform, T>;
-pub type BoundedMpmcSender<T> = kernel_sync::bounded_mpmc::BoundedSender<KernelPlatform, T>;
-pub type BoundedMpmcReceiver<T> = kernel_sync::bounded_mpmc::BoundedReceiver<KernelPlatform, T>;
-pub type CompletionPort<T> = kernel_sync::CompletionPort<KernelPlatform, T>;
-pub type CompletionPortPermit<T> = kernel_sync::PortPermit<KernelPlatform, T>;
-pub type ThreadPool = kernel_sync::thread_pool::ThreadPool<KernelPlatform>;
-pub type BoundedThreadPool = kernel_sync::thread_pool::BoundedThreadPool<KernelPlatform>;
+pub type WaitQueue = kernel_sync::queues::WaitQueue<KernelPlatform>;
+pub type BoundedWaitQueue = kernel_sync::queues::BoundedWaitQueue<KernelPlatform>;
+pub type MpmcSender<T> = kernel_sync::channels::mpmc::Sender<KernelPlatform, T>;
+pub type MpmcReceiver<T> = kernel_sync::channels::mpmc::Receiver<KernelPlatform, T>;
+pub type BoundedMpmcSender<T> = kernel_sync::channels::mpmc::BoundedSender<KernelPlatform, T>;
+pub type BoundedMpmcReceiver<T> = kernel_sync::channels::mpmc::BoundedReceiver<KernelPlatform, T>;
+pub type CompletionPort<T> = kernel_sync::completion::CompletionPort<KernelPlatform, T>;
+pub type CompletionPortPermit<T> = kernel_sync::completion::PortPermit<KernelPlatform, T>;
+pub type ThreadPool = kernel_sync::workers::thread_pool::ThreadPool<KernelPlatform>;
+pub type BoundedThreadPool = kernel_sync::workers::thread_pool::BoundedThreadPool<KernelPlatform>;
+pub type IrqSafeMutex<T> = kernel_sync::locks::IrqSafeMutex<KernelPlatform, T>;
+pub type IrqSafeRwLock<T> = kernel_sync::locks::IrqSafeRwLock<KernelPlatform, T>;
 
 #[inline]
 pub fn mpmc_channel<T>() -> (MpmcSender<T>, MpmcReceiver<T>) {
-    kernel_sync::mpmc::mpmc_channel::<KernelPlatform, T>()
+    kernel_sync::channels::mpmc::mpmc_channel::<KernelPlatform, T>()
 }
 
 #[inline]
@@ -86,5 +111,5 @@ pub fn bounded_mpmc_channel<T>(
     capacity: usize,
     max_consumers: usize,
 ) -> (BoundedMpmcSender<T>, BoundedMpmcReceiver<T>) {
-    kernel_sync::bounded_mpmc::bounded_mpmc_channel::<KernelPlatform, T>(capacity, max_consumers)
+    kernel_sync::channels::mpmc::bounded_mpmc_channel::<KernelPlatform, T>(capacity, max_consumers)
 }

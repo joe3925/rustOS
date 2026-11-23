@@ -4,7 +4,7 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -12,13 +12,26 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     QemuOptions, SystemDisk, assert_exists, build_platform, config, find_firmware, find_qemu,
     qemu_args, system_disk,
 };
+
+// Console output is optional: a closed pipe or non-blocking terminal must not
+// abort a benchmark or discard the profiles being collected.
+pub(super) fn best_effort_output(writer: &mut impl Write, args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{args}");
+}
+
+macro_rules! print_status {
+    ($($args:tt)*) => {
+        $crate::bench::best_effort_output(&mut std::io::stdout().lock(), format_args!($($args)*))
+    };
+}
+pub(crate) use print_status;
 
 const MAX_ACTION_ANNOTATIONS: usize = 3;
 static ACTION_ANNOTATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -30,6 +43,10 @@ pub enum BenchCommand {
 
 pub struct BenchOptions {
     correctness: bool,
+    pgo: bool,
+    merge: bool,
+    pgo_output: Option<PathBuf>,
+    release: bool,
     platform: String,
     launch: String,
     host: Option<String>,
@@ -39,10 +56,10 @@ pub struct BenchOptions {
     output: PathBuf,
     boot_image: Option<PathBuf>,
     export_boot_image: Option<PathBuf>,
-    prepare_only: bool,
     boot_timeout: Duration,
     timeout: Duration,
     offline: bool,
+    max_repetitions: Option<usize>,
 }
 
 pub fn parse<I>(args: I, correctness: bool) -> Result<BenchCommand, String>
@@ -52,7 +69,7 @@ where
     let mut args = args.into_iter().peekable();
     if args.peek().map(String::as_str) == Some("compare") {
         if correctness {
-            return Err("correctness does not support baseline comparison".to_string());
+            return Err("this command does not support baseline comparison".to_string());
         }
         args.next();
         CompareOptions::parse(args).map(BenchCommand::Compare)
@@ -84,9 +101,15 @@ impl BenchOptions {
         I: IntoIterator<Item = String>,
     {
         let mut platform = "x86_64-uefi".to_string();
+        let mut release = true;
+        let mut all = false;
+        let mut pgo = false;
+        let mut merge = false;
+        let mut pgo_output = None;
         let mut launch = "qemu-x86_64-q35-ci".to_string();
         let mut host = None;
         let mut cpus = vec![1, 2, 4];
+        let mut cpus_explicit = false;
         let mut suites = Vec::new();
         let mut tags = Vec::new();
         let mut output = PathBuf::from(if correctness {
@@ -96,14 +119,25 @@ impl BenchOptions {
         });
         let mut boot_image = None;
         let mut export_boot_image = None;
-        let mut prepare_only = false;
         let mut boot_timeout = Duration::from_secs(2 * 60);
         let mut timeout = Duration::from_secs(15 * 60);
         let mut offline = false;
+        let mut max_repetitions = None;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--all" => all = true,
+                "--pgo" if !correctness => pgo = true,
+                "--merge" if !correctness => merge = true,
+                "--pgo-output" if !correctness => pgo_output = Some(PathBuf::from(next_value(&mut args, "--pgo-output")?)),
+                "--profile" => {
+                    release = match next_value(&mut args, "--profile")?.as_str() {
+                        "release" => true,
+                        "dev" | "debug" => false,
+                        value => return Err(format!("Unsupported build profile `{value}`")),
+                    };
+                }
                 "--platform" => {
                     platform = next_value(&mut args, "--platform")?;
                 }
@@ -112,6 +146,7 @@ impl BenchOptions {
                 }
                 "--host" => host = Some(next_value(&mut args, "--host")?),
                 "--cpus" => {
+                    cpus_explicit = true;
                     let value = next_value(&mut args, "--cpus")?;
                     cpus = value
                         .split(',')
@@ -124,8 +159,21 @@ impl BenchOptions {
                         return Err("--cpus requires positive comma-separated counts".to_string());
                     }
                 }
-                "--suite" => suites.push(next_value(&mut args, "--suite")?),
-                "--tag" => tags.push(next_value(&mut args, "--tag")?),
+                "--suite" | "--tag" => {
+                    let value = next_value(&mut args, &arg)?;
+                    let selection = if arg == "--suite" { &mut suites } else { &mut tags };
+                    for name in value.split(',').map(str::trim) {
+                        if name.is_empty() || name.len() > 128 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/')) {
+                            return Err(format!("Invalid {arg} value `{name}`; expected comma-separated names"));
+                        }
+                        if !selection.iter().any(|existing| existing == name) {
+                            selection.push(name.to_string());
+                        }
+                    }
+                    if selection.join(";").len() > 4095 {
+                        return Err(format!("{arg} selection is too long (maximum 4095 bytes)"));
+                    }
+                }
                 "--output" => output = PathBuf::from(next_value(&mut args, "--output")?),
                 "--boot-image" => {
                     boot_image = Some(PathBuf::from(next_value(&mut args, "--boot-image")?))
@@ -134,7 +182,6 @@ impl BenchOptions {
                     export_boot_image =
                         Some(PathBuf::from(next_value(&mut args, "--export-boot-image")?))
                 }
-                "--prepare-only" => prepare_only = true,
                 "--boot-timeout-secs" => {
                     let value = next_value(&mut args, "--boot-timeout-secs")?;
                     boot_timeout = Duration::from_secs(
@@ -152,16 +199,41 @@ impl BenchOptions {
                     );
                 }
                 "--offline" => offline = true,
+                "--max-repetitions" => {
+                    let value = next_value(&mut args, "--max-repetitions")?;
+                    let count = value.parse::<usize>()
+                        .map_err(|_| "Invalid repetition count".to_string())?;
+                    if count == 0 {
+                        return Err("Repetition count must be positive".to_string());
+                    }
+                    max_repetitions = Some(count);
+                }
                 other => return Err(format!("unknown bench argument `{other}`")),
             }
         }
 
-        if suites.is_empty() && tags.is_empty() {
+        if (merge || pgo_output.is_some()) && !pgo {
+            return Err("--merge and --pgo-output require --pgo".to_string());
+        }
+        if all && (!suites.is_empty() || !tags.is_empty()) {
+            return Err("Use --all without --suite or --tag".to_string());
+        }
+        if correctness && !all && suites.is_empty() && tags.is_empty() {
             tags.push("ci".to_string());
+        }
+        if pgo {
+            if !cpus_explicit {
+                cpus = vec![4];
+            }
+            max_repetitions.get_or_insert(5);
         }
 
         Ok(Self {
             correctness,
+            pgo,
+            merge,
+            pgo_output,
+            release,
             platform,
             launch,
             host,
@@ -171,10 +243,10 @@ impl BenchOptions {
             output,
             boot_image,
             export_boot_image,
-            prepare_only,
             boot_timeout,
             timeout,
             offline,
+            max_repetitions,
         })
     }
 }
@@ -210,6 +282,12 @@ struct ProtocolEvent {
     payload: Value,
 }
 
+fn existing_image(root: &Path, platform: &config::BuildPlan, release: bool) -> Result<PathBuf, String> {
+    crate::load_artifact_manifest(root, platform, release)
+        .map(|artifacts| artifacts.boot_image)
+        .map_err(|error| format!("{error}\nBuild a benchmark image explicitly with: cargo xtask build --platform {}{} --kernel-feature kernel-bench", platform.id, if release { " --release" } else { "" }))
+}
+
 fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
     let mode = if options.correctness {
         "correctness"
@@ -222,6 +300,17 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         "RUSTOS_BENCH\t"
     };
     let platform = config::load_platform(root, &options.platform)?;
+    if options.merge {
+        crate::pgo::check_merge_tool()?;
+    }
+    let pgo_output = if options.pgo {
+        let directory = match &options.pgo_output {
+            Some(path) => resolve(root, path),
+            None => crate::pgo::default_output(root, &platform, options.release)?,
+        };
+        if directory.exists() { return Err(format!("Use a new PGO output directory: {}", directory.display())); }
+        Some(directory)
+    } else { None };
     let launch = config::load_launch(root, &options.launch)?;
     let host = config::load_host(
         root,
@@ -230,42 +319,24 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
 
     let boot_image = if let Some(path) = &options.boot_image {
         resolve(root, path)
+    } else if options.correctness {
+        unsafe {
+            std::env::set_var("RUSTOS_CORRECTNESS_SUITES", options.suites.join(","));
+            std::env::set_var("RUSTOS_CORRECTNESS_TAGS", options.tags.join(","));
+        }
+        build_platform(root, &platform, options.release, options.offline, &["kernel-correctness".to_string()])?;
+        crate::load_artifact_manifest(root, &platform, options.release)?.boot_image
     } else {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
+        if options.pgo {
+            crate::pgo::enable_generation();
+        }
         unsafe {
-            std::env::set_var(
-                if options.correctness {
-                    "RUSTOS_CORRECTNESS_SUITES"
-                } else {
-                    "RUSTOS_BENCH_SUITES"
-                },
-                options.suites.join(","),
-            )
-        };
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe {
-            std::env::set_var(
-                if options.correctness {
-                    "RUSTOS_CORRECTNESS_TAGS"
-                } else {
-                    "RUSTOS_BENCH_TAGS"
-                },
-                options.tags.join(","),
-            )
-        };
-        build_platform(
-            root,
-            &platform,
-            true,
-            options.offline,
-            &[if options.correctness {
-                "kernel-correctness"
-            } else {
-                "kernel-bench"
-            }
-            .to_string()],
-        )?;
-        crate::load_artifact_manifest(root, &platform, true)?.boot_image
+            std::env::set_var("RUSTOS_BENCH_SUITES", options.suites.join(","));
+            std::env::set_var("RUSTOS_BENCH_TAGS", options.tags.join(","));
+            std::env::set_var("RUSTOS_BENCH_AUTORUN", "1");
+        }
+        build_platform(root, &platform, options.release, options.offline, &["kernel-bench".to_string()])?;
+        existing_image(root, &platform, options.release)?
     };
     let qemu = find_qemu(&launch, &host)?;
     let firmware = find_firmware(&launch, &host, &qemu)?;
@@ -282,9 +353,6 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         fs::copy(&boot_image, &export)
             .map_err(|err| format!("failed to export boot image to {}: {err}", export.display()))?;
     }
-    if options.prepare_only {
-        return Ok(());
-    }
 
     let output = if options.output.is_absolute() {
         options.output.clone()
@@ -300,24 +368,42 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
     let mut runs = Vec::new();
     for cpus in options.cpus {
         let disk_path = bench_dir.join(format!("system-{cpus}cpu.img"));
-        fs::copy(&seed_disk.path, &disk_path).map_err(|err| {
-            format!(
-                "failed to clone benchmark disk {} to {}: {err}",
-                seed_disk.path.display(),
-                disk_path.display()
-            )
-        })?;
+        if !options.correctness {
+            let sibling = qemu.with_file_name(format!("qemu-img{}", std::env::consts::EXE_SUFFIX));
+            let image_tool = if sibling.is_file() {
+                sibling
+            } else {
+                crate::find_tool_in_augmented_path("qemu-img")
+                    .ok_or_else(|| "Install qemu-img to convert the benchmark disk to raw format".to_string())?
+            };
+            let status = Command::new(image_tool)
+                .args(["convert", "-f", &seed_disk.format, "-O", "raw", "-S", "4k"])
+                .arg(&seed_disk.path).arg(&disk_path)
+                .status().map_err(|error| format!("Cannot convert the benchmark disk: {error}"))?;
+            if !status.success() {
+                let _ = fs::remove_file(&disk_path);
+                return Err(format!("Benchmark disk conversion failed: {status}"));
+            }
+        } else {
+            fs::copy(&seed_disk.path, &disk_path).map_err(|err| {
+                format!(
+                    "failed to clone benchmark disk {} to {}: {err}",
+                    seed_disk.path.display(),
+                    disk_path.display()
+                )
+            })?;
+        }
         let disk = SystemDisk {
             path: disk_path,
-            format: seed_disk.format.clone(),
+            format: if options.correctness { seed_disk.format.clone() } else { "raw".to_string() },
         };
         let mut repetition = 1;
         let mut suite_boots = Vec::<(String, usize)>::new();
         loop {
-            if repetition > 1 && !suite_boots.iter().any(|(_, boots)| *boots >= repetition) {
+            if repetition > 1 && !options.pgo && !suite_boots.iter().any(|(_, boots)| *boots >= repetition) {
                 break;
             }
-            println!("==> {mode} with {cpus} vCPU(s), repetition {repetition}");
+            print_status!("==> {mode} with {cpus} vCPU(s), repetition {repetition}");
             let serial_log =
                 bench_dir.join(format!("{cpus}cpu-repetition-{repetition}.serial.log"));
             let topology = run_topology(
@@ -329,6 +415,10 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                 &boot_image,
                 &disk,
                 cpus,
+                repetition,
+                &options.suites,
+                &options.tags,
+                options.pgo,
                 options.boot_timeout,
                 options.timeout,
                 serial_log,
@@ -337,8 +427,7 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
             let topology = match topology {
                 Ok(topology) => topology,
                 Err(error) => {
-                    let _ = fs::remove_file(&disk.path);
-                    return Err(error);
+                    return Err(format!("{error}\nBenchmark disk kept at {}", disk.path.display()));
                 }
             };
             if repetition == 1 && !options.correctness {
@@ -351,6 +440,9 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
                 };
             }
             runs.push(topology);
+            if options.max_repetitions.is_some_and(|limit| repetition >= limit) {
+                break;
+            }
             repetition += 1;
         }
         if let Err(err) = fs::remove_file(&disk.path) {
@@ -381,11 +473,26 @@ fn run(root: &Path, options: BenchOptions) -> Result<(), String> {
         .iter()
         .all(|run| run.complete && run.status == "passed")
     {
-        println!("{mode} results: {}", output.display());
+        if let Some(directory) = &pgo_output {
+            crate::pgo::collect(&serde_json::to_value(&report).map_err(|error| error.to_string())?, bench_dir, directory, &platform, options.release, options.merge)?;
+        }
+        print_status!("{mode} results: {}", output.display());
         Ok(())
     } else {
+        let failures = report.runs.iter()
+            .filter(|run| !run.complete || run.status != "passed")
+            .map(|run| {
+                let reason = run.events.iter()
+                    .find(|event| event.kind == "case_failure")
+                    .map(|event| format!("{} / {}: {}",
+                        event.payload["suite"].as_str().unwrap_or("unknown suite"),
+                        event.payload["case"].as_str().unwrap_or("unknown case"),
+                        event.payload["reason"].as_str().unwrap_or("case failed")))
+                    .unwrap_or_else(|| run.status.clone());
+                format!("{} vCPU(s): {reason}; serial log: {}", run.cpus, run.serial_log.display())
+            }).collect::<Vec<_>>().join("\n");
         Err(format!(
-            "one or more {mode} CPU configurations failed; partial results: {}",
+            "one or more {mode} CPU configurations failed:\n{failures}\npartial results: {}",
             output.display()
         ))
     }
@@ -401,6 +508,10 @@ fn run_topology(
     boot_image: &Path,
     disk: &SystemDisk,
     cpus: usize,
+    repetition: usize,
+    suite_names: &[String],
+    tags: &[String],
+    pgo: bool,
     boot_timeout: Duration,
     timeout: Duration,
     serial_log: PathBuf,
@@ -422,8 +533,33 @@ fn run_topology(
     unsafe { std::env::set_var("RUSTOS_QEMU_SMP", cpus.to_string()) };
     // FIXME: Audit that the environment access only happens in single-threaded code.
     unsafe { std::env::set_var("RUSTOS_QEMU_SERIAL", "stdio") };
-    let args = qemu_args(root, launch, firmware, boot_image, disk, &qemu_options)?;
+    let mut args = qemu_args(root, launch, firmware, boot_image, disk, &qemu_options)?;
+    let output_id = format!("run-{:x}-{}-{cpus}-{repetition}",
+        SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos(),
+        std::process::id());
+    if protocol_prefix == "RUSTOS_BENCH\t" {
+        args.push("-fw_cfg".into());
+        args.push(format!("name=opt/rustos/bench-output,string={output_id}").into());
+        args.push("-fw_cfg".into());
+        args.push(format!("name=opt/rustos/bench-repetition,string={repetition}").into());
+        if pgo {
+            args.push("-fw_cfg".into());
+            args.push("name=opt/rustos/bench-pgo,string=1".into());
+        }
+        if !suite_names.is_empty() || !tags.is_empty() {
+            for (key, values) in [("bench-suites", suite_names), ("bench-tags", tags)] {
+                args.push("-fw_cfg".into());
+                // QEMU rejects string= with no value. A separator encodes an
+                // empty selection while still overriding the image defaults.
+                let selection = if values.is_empty() { ";".to_string() } else { values.join(";") };
+                args.push(format!("name=opt/rustos/{key},string={selection}").into());
+            }
+        }
+    }
 
+    // Write each serial line as it arrives rather than waiting for QEMU to exit.
+    let mut serial_output = fs::File::create(&serial_log)
+        .map_err(|err| format!("failed to create {}: {err}", serial_log.display()))?;
     let mut child = Command::new(qemu)
         .args(args)
         .current_dir(root)
@@ -438,7 +574,12 @@ fn run_topology(
     let (sender, receiver) = mpsc::channel();
     let reader_thread = thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
-            if sender.send(line).is_err() {
+            let line = line.and_then(|line| {
+                writeln!(serial_output, "{line}")?;
+                Ok(line)
+            });
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
                 break;
             }
         }
@@ -452,11 +593,20 @@ fn run_topology(
     let mut panic_lines = Vec::new();
     let mut panic_seen_at = None;
     let mut benchmark_started = false;
+    let mut selection_error = None;
 
     loop {
         while let Ok(line) = receiver.try_recv() {
             let line = line.map_err(|err| format!("failed reading QEMU serial output: {err}"))?;
-            println!("{line}");
+            // Profile payloads are transport data. Keep them in the serial log
+            // and event stream, but only mirror progress records to the terminal.
+            let profile_chunk = line
+                .strip_prefix(protocol_prefix)
+                .and_then(|record| record.split_once('\t'))
+                .is_some_and(|(_, record)| record.starts_with("pgo_chunk\t"));
+            if !profile_chunk {
+                print_status!("{line}");
+            }
             benchmark_started |= record_serial_line(
                 &line,
                 protocol_prefix,
@@ -467,6 +617,28 @@ fn run_topology(
                 &mut panic_lines,
                 &mut panic_seen_at,
             )?;
+        }
+
+        if protocol_prefix == "RUSTOS_BENCH\t" && (!suite_names.is_empty() || !tags.is_empty()) && benchmark_started {
+            if let Some(start) = events.iter().find(|event| event.kind == "run_start") {
+                if start.payload.get("requested_suites") != Some(&serde_json::json!(suite_names))
+                    || start.payload.get("requested_tags") != Some(&serde_json::json!(tags))
+                {
+                    selection_error = Some("The image does not acknowledge the requested benchmark filter; rebuild it with runtime selection support".to_string());
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
+
+        if pgo && benchmark_started {
+            if let Some(start) = events.iter().find(|event| event.kind == "run_start") {
+                if start.payload.get("pgo") != Some(&Value::Bool(true)) {
+                    selection_error = Some("bench --pgo requires an instrumented image with runtime PGO support; use build --pgo --kernel-feature kernel-bench first".to_string());
+                    let _ = child.kill();
+                    break;
+                }
+            }
         }
 
         if panic_seen_at.is_some_and(|seen| seen.elapsed() >= Duration::from_secs(1)) {
@@ -513,8 +685,25 @@ fn run_topology(
             &mut panic_seen_at,
         )?;
     }
-    fs::write(&serial_log, serial)
-        .map_err(|err| format!("failed to write {}: {err}", serial_log.display()))?;
+
+    if let Some(error) = selection_error { return Err(error); }
+
+    let disk_output = events.iter().any(|event| event.kind == "run_start"
+        && event.payload["output_transport"] == "disk");
+    if disk_output && panic_lines.is_empty() && !matches!(status.as_str(), "timeout" | "boot_timeout") {
+        if let Some(error) = events.iter().find(|event| event.kind == "output_error") {
+            return Err(format!("The kernel could not save benchmark output: {}", error.payload["reason"]));
+        }
+        let imported = read_disk_output(&disk.path, &serial_log, &output_id, cpus, repetition)?;
+        let end = imported.last().ok_or_else(|| "The disk report has no events".to_string())?;
+        let disk_status = end.payload["status"].as_str().unwrap_or("failed").to_string();
+        if complete && status != disk_status {
+            return Err("The serial status does not match the disk report".to_string());
+        }
+        events = imported;
+        complete = true;
+        status = disk_status;
+    }
 
     let panic = (!panic_lines.is_empty()).then(|| panic_lines.join("\n"));
     if let Some(details) = &panic {
@@ -545,6 +734,10 @@ fn run_topology(
         );
     }
 
+    if pgo && !events.iter().any(|event| matches!(event.kind.as_str(), "pgo_end" | "pgo_file") && event.payload["component"] == "kernel") {
+        return Err("The benchmark did not finish collecting the kernel PGO profile".to_string());
+    }
+
     Ok(TopologyRun {
         cpus,
         status,
@@ -553,6 +746,143 @@ fn run_topology(
         serial_log,
         panic,
     })
+}
+
+fn read_disk_output(
+    disk_path: &Path,
+    serial_log: &Path,
+    output_id: &str,
+    cpus: usize,
+    repetition: usize,
+) -> Result<Vec<ProtocolEvent>, String> {
+    let disk_size = fs::metadata(disk_path)
+        .map_err(|error| format!("Cannot read {}: {error}", disk_path.display()))?.len();
+    let mut partitions = Vec::new();
+    for block_size in [gpt::disk::LogicalBlockSize::Lb512, gpt::disk::LogicalBlockSize::Lb4096] {
+        if let Ok(disk) = gpt::GptConfig::new().writable(false).logical_block_size(block_size).open(disk_path) {
+            let sector_size = u64::from(block_size);
+            for partition in disk.partitions().values() {
+                let start = partition.first_lba.checked_mul(sector_size);
+                let end = partition.last_lba.checked_add(1).and_then(|lba| lba.checked_mul(sector_size));
+                if let (Some(start), Some(end)) = (start, end) {
+                    if start < end && end <= disk_size {
+                        partitions.push((start, end));
+                    }
+                }
+            }
+            break;
+        }
+    }
+    if partitions.is_empty() {
+        let mut disk = fs::File::open(disk_path).map_err(|error| error.to_string())?;
+        let mut mbr = [0; 512];
+        disk.read_exact(&mut mbr).map_err(|error| format!("Cannot read the disk header: {error}"))?;
+        if mbr[510..] == [0x55, 0xaa] {
+            for entry in mbr[446..510].chunks_exact(16) {
+                if !matches!(entry[4], 0x01 | 0x04 | 0x06 | 0x0b | 0x0c | 0x0e) {
+                    continue;
+                }
+                let start = u64::from(u32::from_le_bytes(entry[8..12].try_into().unwrap())) * 512;
+                let length = u64::from(u32::from_le_bytes(entry[12..16].try_into().unwrap())) * 512;
+                if length > 0 && start + length <= disk_size {
+                    partitions.push((start, start + length));
+                }
+            }
+        }
+        if partitions.is_empty() {
+            partitions.push((0, disk_size));
+        }
+    }
+
+    let report_path = format!("bench/{output_id}/results.json");
+    let output_directory = serial_log.parent().ok_or_else(|| "The serial log has no parent directory".to_string())?;
+    let files_directory = format!("{cpus}cpu-repetition-{repetition}.files");
+    let destination = output_directory.join(&files_directory);
+    for (start, end) in partitions {
+        let disk = fs::File::open(disk_path).map_err(|error| error.to_string())?;
+        let partition = fscommon::StreamSlice::new(disk, start, end).map_err(|error| error.to_string())?;
+        let filesystem = match fatfs::FileSystem::new(partition, fatfs::FsOptions::new().update_accessed_date(false)) {
+            Ok(filesystem) => filesystem,
+            Err(_) => continue,
+        };
+        let root = filesystem.root_dir();
+        let report_file = match root.open_file(&report_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Cannot open {report_path}: {error}")),
+        };
+        let mut encoded = Vec::new();
+        report_file.take(16 * 1024 * 1024 + 1).read_to_end(&mut encoded)
+            .map_err(|error| format!("Cannot read {report_path}: {error}"))?;
+        if encoded.len() > 16 * 1024 * 1024 {
+            return Err("The disk report exceeds 16 MiB".to_string());
+        }
+        let report: Value = serde_json::from_slice(&encoded)
+            .map_err(|error| format!("Invalid disk report: {error}"))?;
+        if report["schema"] != "rustos.bench-disk.v1" || report["output_id"] != output_id {
+            return Err("The disk report does not match this boot".to_string());
+        }
+        let mut events: Vec<ProtocolEvent> = serde_json::from_value(report["events"].clone())
+            .map_err(|error| format!("Invalid disk report events: {error}"))?;
+        let first = events.first().ok_or_else(|| "The disk report has no events".to_string())?;
+        if first.kind != "run_start" || first.payload["output_id"] != output_id
+            || first.payload["output_transport"] != "disk"
+            || first.payload["cpu_count"].as_u64() != Some(cpus as u64)
+            || first.payload["repetition"].as_u64() != Some(repetition as u64)
+        {
+            return Err("The disk report has incorrect boot metadata".to_string());
+        }
+        let last = events.last().ok_or_else(|| "The disk report has no completion event".to_string())?;
+        if last.kind != "run_end" || !matches!(last.payload["status"].as_str(), Some("passed" | "failed"))
+            || events.iter().filter(|event| event.kind == "run_start").count() != 1
+            || events.iter().filter(|event| event.kind == "run_end").count() != 1
+        {
+            return Err("The disk report is incomplete".to_string());
+        }
+        fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+        fs::write(destination.join("results.json"), &encoded).map_err(|error| error.to_string())?;
+        let mut components = BTreeSet::new();
+        let mut total_bytes = 0u64;
+        for event in &mut events {
+            if event.kind != "pgo_file" {
+                continue;
+            }
+            let component = event.payload["component"].as_str()
+                .ok_or_else(|| "The profile has no component name".to_string())?;
+            if component.is_empty() || component.len() > 128
+                || !component.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || !components.insert(component.to_string())
+            {
+                return Err("Invalid or duplicate profile component".to_string());
+            }
+            let file_name = format!("{component}.profraw");
+            if event.payload["file"] != file_name {
+                return Err(format!("Invalid profile filename for {component}"));
+            }
+            let expected = event.payload["bytes"].as_u64()
+                .filter(|bytes| *bytes > 0 && *bytes <= 128 * 1024 * 1024)
+                .ok_or_else(|| format!("Invalid profile size for {component}"))?;
+            total_bytes += expected;
+            if total_bytes > 512 * 1024 * 1024 {
+                return Err("The boot profiles exceed 512 MiB".to_string());
+            }
+            let path = format!("bench/{output_id}/{file_name}");
+            let profile = root.open_file(&path)
+                .map_err(|error| format!("Cannot open {path}: {error}"))?;
+            let mut bytes = Vec::new();
+            profile.take(expected + 1).read_to_end(&mut bytes)
+                .map_err(|error| format!("Cannot read {path}: {error}"))?;
+            if bytes.len() as u64 != expected {
+                return Err(format!("Incomplete profile for {component}"));
+            }
+            fs::write(destination.join(&file_name), &bytes)
+                .map_err(|error| format!("Cannot save {file_name}: {error}"))?;
+            event.payload["file"] = serde_json::json!(format!("{files_directory}/{file_name}"));
+        }
+        print_status!("Disk output: {}", destination.display());
+        return Ok(events);
+    }
+    Err(format!("Cannot find {report_path} in {}", disk_path.display()))
 }
 
 fn suite_boot_plan(run: &TopologyRun) -> Result<Vec<(String, usize)>, String> {
@@ -686,7 +1016,7 @@ fn reserve_action_annotation() -> bool {
     ACTION_ANNOTATIONS.fetch_max(persisted, Ordering::Relaxed);
 
     let Ok(previous) =
-        ACTION_ANNOTATIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        ACTION_ANNOTATIONS.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < MAX_ACTION_ANNOTATIONS).then_some(count + 1)
         })
     else {
@@ -951,7 +1281,7 @@ fn compare(root: &Path, options: CompareOptions) -> Result<(), String> {
     }
     fs::write(&output_path, markdown)
         .map_err(|err| format!("failed to write {}: {err}", output_path.display()))?;
-    println!("benchmark comparison: {}", output_path.display());
+    print_status!("benchmark comparison: {}", output_path.display());
     if options.annotations {
         for (key, regression, tolerance) in &regressions {
             annotate_error(
@@ -1195,5 +1525,106 @@ fn median(values: &[f64]) -> f64 {
         0 => 0.0,
         len if len % 2 == 1 => values[len / 2],
         len => (values[len / 2 - 1] + values[len / 2]) / 2.0,
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn console_write_errors_do_not_abort_benchmarks() {
+        struct FailingOutput(std::io::ErrorKind);
+        impl Write for FailingOutput {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for kind in [std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::WouldBlock] {
+            best_effort_output(&mut FailingOutput(kind), format_args!("benchmark sample {}", 4));
+        }
+        let mut output = Vec::new();
+        best_effort_output(&mut output, format_args!("benchmark sample {}", 4));
+        assert_eq!(output, b"benchmark sample 4\n");
+    }
+
+    #[test]
+    fn benchmark_names_are_optional_and_comma_separated() {
+        assert!(BenchOptions::parse(Vec::new(), false).unwrap().suites.is_empty());
+        let options = BenchOptions::parse([
+            "--suite", "heap.mimalloc, io.iobuffer,heap.mimalloc", "--tag", "io,heap", "--tag", "ci"
+        ].map(str::to_string), false).unwrap();
+        assert_eq!(options.suites, ["heap.mimalloc", "io.iobuffer"]);
+        assert_eq!(options.tags, ["io", "heap", "ci"]);
+        for value in ["", "heap.mimalloc,", "bad;name"] {
+            assert!(BenchOptions::parse(["--suite", value].map(str::to_string), false).is_err());
+        }
+    }
+
+    #[test]
+    fn benchmark_pgo_collection_is_opt_in() {
+        assert!(!BenchOptions::parse(Vec::new(), false).unwrap().pgo);
+        assert!(BenchOptions::parse(["--pgo".to_string()], false).unwrap().pgo);
+    }
+
+    #[test]
+    fn pgo_defaults_to_five_training_boots_and_preserves_overrides() {
+        let normal = BenchOptions::parse(Vec::new(), false).unwrap();
+        assert_eq!(normal.cpus, [1, 2, 4]);
+        assert_eq!(normal.max_repetitions, None);
+        let pgo = BenchOptions::parse(["--pgo"].map(str::to_string), false).unwrap();
+        assert_eq!(pgo.cpus, [4]);
+        assert_eq!(pgo.max_repetitions, Some(5));
+        for args in [
+            vec!["--pgo", "--cpus", "1,4"],
+            vec!["--cpus", "1,4", "--pgo"],
+        ] {
+            let options = BenchOptions::parse(args.into_iter().map(str::to_string), false).unwrap();
+            assert_eq!(options.cpus, [1, 4]);
+            assert_eq!(options.max_repetitions, Some(5));
+        }
+        let options = BenchOptions::parse(
+            ["--max-repetitions", "2", "--pgo"].map(str::to_string), false
+        ).unwrap();
+        assert_eq!(options.max_repetitions, Some(2));
+    }
+
+    #[test]
+    fn benchmark_accepts_build_and_collection_options() {
+        let options = BenchOptions::parse([
+            "--all", "--offline", "--pgo", "--merge"
+        ].map(str::to_string), false).unwrap();
+        assert!(options.offline && options.pgo && options.merge);
+        assert!(options.boot_image.is_none());
+    }
+
+    #[test]
+    fn existing_image_uses_platform_and_profile_without_building() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let root = std::env::temp_dir().join(format!("rustos-bench-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        for platform in ["aarch64-uefi", "x86_64-uefi"] {
+            let plan = config::load_platform(repository, platform).unwrap();
+            for release in [false, true] {
+                // A missing build must fail without creating any build output.
+                assert!(existing_image(&root, &plan, release).is_err());
+                let directory = root.join("target/rustos").join(platform).join(crate::profile(release));
+                assert!(!directory.exists());
+                fs::create_dir_all(&directory).unwrap();
+                for name in ["kernel.exe", "boot.img", "kernel.def", "kernel.lib", "stub"] {
+                    fs::write(directory.join(name), b"existing artifact").unwrap();
+                }
+                let manifest = serde_json::json!({
+                    "schema": 2, "platform": platform, "profile": crate::profile(release),
+                    "kernel": {"image": "kernel.exe", "debug": null},
+                    "sdk": {"definition_file": "kernel.def", "import_library": "kernel.lib"},
+                    "stub": "stub", "boot_image": "boot.img", "boot_packages": [], "debug_search_paths": []
+                });
+                fs::write(directory.join("artifacts.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+                assert_eq!(existing_image(&root, &plan, release).unwrap(), directory.join("boot.img"));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

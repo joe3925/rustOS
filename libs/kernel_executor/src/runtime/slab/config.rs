@@ -49,10 +49,3 @@ impl SlabConfigBuilder {
         self.config
     }
 }
-
-#[derive(Debug, Clone)]
-pub struct SlabStats {
-    pub total_capacity: usize,
-    pub currently_allocated: usize,
-    pub total_allocations: u64,
-}

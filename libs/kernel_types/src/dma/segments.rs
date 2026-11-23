@@ -64,7 +64,7 @@ impl<'a> Iterator for IoBufferRegionIter<'a> {
     type Item = IoBufferRegion<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.next_extent < self.extents.len() {
+        while self.next_extent < self.extents.len() && self.logical_cursor < self.view_end {
             let extent = self.extents[self.next_extent];
             let extent_start = self.logical_cursor;
             let extent_end = extent_start.checked_add(extent.byte_len)?;
@@ -678,7 +678,7 @@ impl<'a, 'view> DmaBufferRegionIter<'a, 'view> {
         extents: &'a [IoBufferExtent],
         frames: &'a [PhysicalFrameExtent],
     ) -> Option<DmaBufferRegion<'a>> {
-        while self.extent_index < extents.len() {
+        while self.extent_index < extents.len() && self.logical_cursor < self.view_end {
             let extent = extents[self.extent_index];
 
             let extent_start = self.logical_cursor;

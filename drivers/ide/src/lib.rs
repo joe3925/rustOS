@@ -244,6 +244,7 @@ fn write_buffer_cursor<'backing, 'data>(
     PhysCursor::from_buffer(buffer, len)
 }
 
+#[cfg_attr(irq_check, irq::context)]
 extern "C" fn ide_isr(
     _interrupt_id: u32,
     _cpu: u32,

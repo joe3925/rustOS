@@ -196,9 +196,9 @@ impl LeaseSlot {
         self.state.store(LEASE_FREE, Ordering::Release);
     }
 
-    fn begin_release(&self, generation: u32) -> Option<usize> {
+    fn begin_release(&self, generation: usize) -> Option<usize> {
         if self.state.load(Ordering::Acquire) != LEASE_ACTIVE
-            || self.generation.load(Ordering::Acquire) != generation
+            || self.generation.load(Ordering::Acquire) as usize != generation
         {
             return None;
         }
@@ -220,10 +220,6 @@ impl LeaseSlot {
     }
 
     fn finish_release(&self) {
-        self.first_chunk.store(0, Ordering::Relaxed);
-        self.chunk_count.store(0, Ordering::Relaxed);
-        self.access.store(0, Ordering::Relaxed);
-        self.dma_record.store(NO_DMA_RECORD, Ordering::Relaxed);
         let generation = self.generation.load(Ordering::Relaxed);
         self.generation
             .store(generation.wrapping_add(1), Ordering::Relaxed);
@@ -250,7 +246,7 @@ pub(super) struct LeaseSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LeaseHandle {
     pub(super) index: usize,
-    pub(super) generation: u32,
+    pub(super) generation: usize,
     pub(super) range: LeaseChunkRange,
 }
 
@@ -377,8 +373,23 @@ impl<'data> IoBufferBacking<'data> {
             frames.clear();
 
             let mut leases = leases;
-            for slot in leases.iter_mut() {
-                *slot = LeaseSlot::free();
+            let (groups, remainder) = leases.as_chunks_mut::<8>();
+            for slots in groups {
+                let state = slots
+                    .iter_mut()
+                    .fold(LEASE_FREE, |state, slot| state | *slot.state.get_mut());
+                if state != LEASE_FREE {
+                    for slot in slots {
+                        if *slot.state.get_mut() != LEASE_FREE {
+                            *slot = LeaseSlot::free();
+                        }
+                    }
+                }
+            }
+            for slot in remainder {
+                if *slot.state.get_mut() != LEASE_FREE {
+                    *slot = LeaseSlot::free();
+                }
             }
 
             let mut dma_records = dma_records.into_vec();
@@ -458,6 +469,7 @@ impl<'data> IoBufferBacking<'data> {
         Ok(IoBuffer::new(self, handle, offset, len))
     }
 
+    #[inline(always)]
     pub fn create_to_device<'backing>(
         &'backing self,
         offset: usize,
@@ -539,8 +551,9 @@ impl<'data> IoBufferBacking<'data> {
         let mut reserved = None;
         let mut index = start_index;
         for _ in 0..capacity {
-            if let Some(generation) = self.leases[index].try_reserve() {
-                reserved = Some((index, generation));
+            let slot = &self.leases[index];
+            if let Some(generation) = slot.try_reserve() {
+                reserved = Some((index, generation, slot));
                 break;
             }
             index += 1;
@@ -548,9 +561,8 @@ impl<'data> IoBufferBacking<'data> {
                 index = 0;
             }
         }
-        let (index, generation) =
+        let (index, generation, slot) =
             reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
-        let slot = &self.leases[index];
 
         if let Err(error) = self.overlap.try_claim_chunks(range.first, range.count) {
             slot.cancel_reservation();
@@ -570,7 +582,7 @@ impl<'data> IoBufferBacking<'data> {
         slot.publish(range, access, dma_record);
         Ok(LeaseHandle {
             index,
-            generation,
+            generation: generation as usize,
             range,
         })
     }
@@ -680,23 +692,22 @@ impl<'data> IoBufferBacking<'data> {
             .get(handle.index)
             .ok_or(IoBufferError::InvalidLease)?;
         let snapshot = validate_snapshot(parent, handle, self.overlap_granularity, self.byte_len)?;
-        let slot_snapshot = parent.snapshot().ok_or(IoBufferError::InvalidLease)?;
 
         if mid > snapshot.len {
             return Err(IoBufferError::InvalidRange);
         }
-        if mid % self.overlap_granularity != 0 {
+        if mid & (self.overlap_granularity - 1) != 0 {
             return Err(IoBufferError::InvalidRange);
         }
 
-        let left_count = mid / self.overlap_granularity;
+        let left_count = mid >> self.overlap_granularity.trailing_zeros();
         let right_range = LeaseChunkRange {
-            first: slot_snapshot
+            first: handle
                 .range
                 .first
                 .checked_add(left_count)
                 .ok_or(IoBufferError::LengthOverflow)?,
-            count: slot_snapshot.range.count - left_count,
+            count: handle.range.count - left_count,
         };
         let capacity = self.leases.len();
         if capacity == 0 {
@@ -707,8 +718,9 @@ impl<'data> IoBufferBacking<'data> {
         let mut reserved = None;
         let mut index = start_index;
         for _ in 0..capacity {
-            if let Some(generation) = self.leases[index].try_reserve() {
-                reserved = Some((index, generation));
+            let slot = &self.leases[index];
+            if let Some(generation) = slot.try_reserve() {
+                reserved = Some((index, generation, slot));
                 break;
             }
             index += 1;
@@ -716,18 +728,17 @@ impl<'data> IoBufferBacking<'data> {
                 index = 0;
             }
         }
-        let (index, generation) =
+        let (index, generation, slot) =
             reserved.ok_or(IoBufferError::LeaseCapacityExceeded { capacity })?;
-        let slot = &self.leases[index];
         if let Err(error) = unsafe {
             self.overlap.split_claim(
-                slot_snapshot.range.first,
-                slot_snapshot.range.count,
+                handle.range.first,
+                handle.range.count,
                 left_count,
             )
         } {
             slot.cancel_reservation();
-            return Err(self.map_radix_error(error, slot_snapshot.range));
+            return Err(self.map_radix_error(error, handle.range));
         }
 
         if snapshot.dma_record != NO_DMA_RECORD {
@@ -741,7 +752,7 @@ impl<'data> IoBufferBacking<'data> {
         parent.chunk_count.store(left_count, Ordering::Release);
         Ok(LeaseHandle {
             index,
-            generation,
+            generation: generation as usize,
             range: right_range,
         })
     }
@@ -842,7 +853,7 @@ impl<'data> IoBufferBacking<'data> {
         Err(IoBufferError::DmaRecordCapacityExceeded { capacity })
     }
 
-    fn retain_dma_record(&self, index: usize) -> Result<(), IoBufferError> {
+    pub(super) fn retain_dma_record(&self, index: usize) -> Result<(), IoBufferError> {
         let record = self
             .dma_records
             .get(index)
@@ -862,7 +873,7 @@ impl<'data> IoBufferBacking<'data> {
         }
     }
 
-    fn dma_record_snapshot(
+    pub(super) fn dma_record_snapshot(
         &self,
         index: usize,
     ) -> Result<(usize, usize, IoBufferDmaMappingLayout), IoBufferError> {
@@ -947,20 +958,20 @@ impl<'data> IoBufferBacking<'data> {
         let end = start
             .checked_add(len)
             .ok_or(IoBufferError::LengthOverflow)?;
-        if start % self.overlap_granularity != 0
-            || (len % self.overlap_granularity != 0 && end != self.byte_len)
-        {
+        let mask = self.overlap_granularity - 1;
+        let shift = self.overlap_granularity.trailing_zeros();
+        if start & mask != 0 || (len & mask != 0 && end != self.byte_len) {
             return Err(IoBufferError::InvalidRange);
         }
         let count = if len == 0 {
             0
         } else {
-            len.checked_add(self.overlap_granularity - 1)
+            len.checked_add(mask)
                 .ok_or(IoBufferError::LengthOverflow)?
-                / self.overlap_granularity
+                >> shift
         };
         Ok(LeaseChunkRange {
-            first: start / self.overlap_granularity,
+            first: start >> shift,
             count,
         })
     }

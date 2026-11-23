@@ -1,11 +1,12 @@
 use alloc::sync::Arc;
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 use kernel_types::arch::VirtAddr;
 use kernel_types::runtime::BlockOnThreadState;
 use spin::Mutex;
 
 use crate::platform::{CpuPlatform, TaskPlatform};
-use crate::structs::per_cpu::PERCPU_TLS_ARRAY_POINTER_OFF;
+use crate::structs::per_cpu::{PERCPU_MIMALLOC_HEAP_OFF, PERCPU_TLS_ARRAY_POINTER_OFF};
 
 use super::state::{FpuState, State};
 use super::tls;
@@ -83,10 +84,40 @@ impl TaskPlatform for X86Platform {
     }
 
     fn save_fpu_state(state: &mut Self::FpuState) {
+        let active_exception_fpu = Self::current_percpu()
+            .active_exception_fpu
+            .load(Ordering::Relaxed);
+
+        if active_exception_fpu != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    active_exception_fpu as *const FpuState,
+                    state as *mut FpuState,
+                    1,
+                );
+            }
+            return;
+        }
+
         state.save();
     }
 
     fn restore_fpu_state(state: &Self::FpuState) {
+        let active_exception_fpu = Self::current_percpu()
+            .active_exception_fpu
+            .load(Ordering::Relaxed);
+
+        if active_exception_fpu != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    state as *const FpuState,
+                    active_exception_fpu as *mut FpuState,
+                    1,
+                );
+            }
+            return;
+        }
+
         state.restore();
     }
 
@@ -99,11 +130,16 @@ impl TaskPlatform for X86Platform {
     }
 
     unsafe fn activate_kernel_tls(thread_pointer: u64) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
+            let heap = crate::arch::tls::mimalloc_heap_for_thread(thread_pointer);
             asm!(
                 "mov qword ptr gs:[{off}], {tls}",
+                "mov qword ptr gs:[{heap_off}], {heap}",
                 off = const PERCPU_TLS_ARRAY_POINTER_OFF,
+                heap_off = const PERCPU_MIMALLOC_HEAP_OFF,
                 tls = in(reg) thread_pointer,
+                heap = in(reg) heap,
                 options(nostack, preserves_flags)
             );
         }

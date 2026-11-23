@@ -126,9 +126,13 @@ where
             return None;
         }
 
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % capacity;
-        for offset in 0..capacity {
-            let index = (start + offset) % capacity;
+        let cursor = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let mut index = if capacity.is_power_of_two() {
+            cursor & (capacity - 1)
+        } else {
+            cursor % capacity
+        };
+        for _ in 0..capacity {
             let slot = &self.slots[index];
 
             if slot
@@ -148,6 +152,10 @@ where
                     active: true,
                     _data: PhantomData,
                 });
+            }
+            index += 1;
+            if index == capacity {
+                index = 0;
             }
         }
 
@@ -307,9 +315,13 @@ impl SubmittedCompletionPool {
             return None;
         }
 
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % capacity;
-        for offset in 0..capacity {
-            let index = (start + offset) % capacity;
+        let cursor = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let mut index = if capacity.is_power_of_two() {
+            cursor & (capacity - 1)
+        } else {
+            cursor % capacity
+        };
+        for _ in 0..capacity {
             let slot = &self.slots[index];
 
             if slot
@@ -329,6 +341,10 @@ impl SubmittedCompletionPool {
                     active: true,
                     _completion: PhantomData,
                 });
+            }
+            index += 1;
+            if index == capacity {
+                index = 0;
             }
         }
 

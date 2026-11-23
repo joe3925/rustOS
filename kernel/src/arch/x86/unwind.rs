@@ -58,6 +58,7 @@ impl UnwindPlatform for X86Platform {
         };
         let context_ptr = &mut context as *mut UnwindContext;
 
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             core::arch::asm!(
                 "lea rax, [rip + 2f]",

@@ -26,6 +26,8 @@ struct RunState {
 static SUITES: Once<Mutex<BTreeMap<String, BenchSuiteDescriptor>>> = Once::new();
 static RUNS: Once<Mutex<BTreeMap<u32, RunState>>> = Once::new();
 static NEXT_RUN: AtomicU32 = AtomicU32::new(1);
+#[cfg(feature = "kernel-bench")]
+static OUTPUT_EVENTS: Mutex<Option<Vec<serde_json::Value>>> = Mutex::new(None);
 
 fn suites() -> &'static Mutex<BTreeMap<String, BenchSuiteDescriptor>> {
     SUITES.call_once(|| Mutex::new(BTreeMap::new()))
@@ -36,6 +38,13 @@ fn runs() -> &'static Mutex<BTreeMap<u32, RunState>> {
 }
 
 fn emit(kind: &str, payload: serde_json::Value) {
+    #[cfg(feature = "kernel-bench")]
+    if let Some(events) = OUTPUT_EVENTS.lock().as_mut() {
+        events.push(json!({ "kind": kind, "payload": &payload }));
+        if !matches!(kind, "run_start" | "suite_start" | "suite_end" | "case_failure" | "selection_error" | "pgo_error") {
+            return;
+        }
+    }
     let prefix = if cfg!(feature = "kernel-correctness") {
         "RUSTOS_CORRECTNESS"
     } else {
@@ -207,35 +216,165 @@ fn matches_selection(descriptor: &BenchSuiteDescriptor, names: &[String], tags: 
             .any(|tag| descriptor.tags.iter().any(|candidate| candidate == tag))
 }
 
+#[cfg(feature = "kernel-bench")]
+async fn persist_output(output_id: &str, profiles: Vec<(String, Vec<u8>)>, passed: bool) -> bool {
+    use crate::file_system::file::File;
+    use kernel_types::fs::{OpenFlags, Path};
+
+    let directory = alloc::format!("C:\\bench\\{output_id}");
+    let result: Result<(), String> = async {
+        File::make_dir(&Path::from_string(&directory)).await
+            .map_err(|error| alloc::format!("Cannot create {directory}: {error:?}"))?;
+        let mut files = Vec::new();
+        let mut components = alloc::collections::btree_set::BTreeSet::new();
+        for (component, bytes) in profiles {
+            let component = component.trim_end_matches(".dll");
+            if component.is_empty() || component.len() > 128
+                || !component.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || !components.insert(component.to_string())
+                || bytes.is_empty() || bytes.len() > 128 * 1024 * 1024
+            {
+                return Err(alloc::format!("Invalid profile for {component}"));
+            }
+            let name = alloc::format!("{component}.profraw");
+            emit("pgo_file", json!({ "component": component, "bytes": bytes.len(), "file": &name }));
+            files.push((name, bytes));
+        }
+        emit("run_end", json!({ "status": if passed { "passed" } else { "failed" } }));
+        let events = OUTPUT_EVENTS.lock().take().unwrap_or_default();
+        let report = serde_json::to_vec(&json!({
+            "schema": "rustos.bench-disk.v1",
+            "output_id": output_id,
+            "events": events,
+        })).map_err(|error| alloc::format!("Cannot encode benchmark results: {error}"))?;
+        files.push((String::from("results.json"), report));
+
+        for (name, bytes) in files {
+            let path = Path::from_string(&alloc::format!("{directory}\\{name}"));
+            let mut file = File::open(&path, &[OpenFlags::CreateNew, OpenFlags::ReadWrite]).await
+                .map_err(|error| alloc::format!("Cannot create {name}: {error:?}"))?;
+            let written: Result<(), String> = async {
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let end = bytes.len().min(offset + 1024 * 1024);
+                    let count = file.write_at(offset as u64, &bytes[offset..end]).await
+                        .map_err(|error| alloc::format!("Cannot write {name}: {error:?}"))?;
+                    if count == 0 || count > end - offset {
+                        return Err(alloc::format!("Incomplete write to {name}"));
+                    }
+                    offset += count;
+                }
+                Ok(())
+            }.await;
+            let closed = file.close().await;
+            written?;
+            closed.map_err(|error| alloc::format!("Cannot close {name}: {error:?}"))?;
+        }
+        Ok(())
+    }.await;
+    let _ = OUTPUT_EVENTS.lock().take();
+    if let Err(error) = result {
+        emit("output_error", json!({ "output_id": output_id, "reason": error }));
+        emit("run_end", json!({ "status": "failed" }));
+        return false;
+    }
+    emit("output_ready", json!({ "output_id": output_id, "directory": directory }));
+    emit("run_end", json!({ "status": if passed { "passed" } else { "failed" } }));
+    passed
+}
+
 async fn run_selected_suites_for_repetition(
     names: &[String],
     tags: &[String],
     repetition: usize,
     persist_repetition: bool,
+    capture_profiles: bool,
 ) -> bool {
+    #[cfg(feature = "kernel-bench")]
+    let output_id = {
+        let id = match boot_state::host_file(b"opt/rustos/bench-output", 128) {
+            Some(bytes) => String::from_utf8(bytes).unwrap_or_default().trim_end_matches('\0').to_string(),
+            None => alloc::format!("run-{:x}", crate::platform::ordered_cycle_counter()),
+        };
+        if id.is_empty() || id.len() > 128
+            || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            emit("run_end", json!({ "status": "failed" }));
+            return false;
+        }
+        let mut output = OUTPUT_EVENTS.lock();
+        if output.is_some() {
+            return false;
+        }
+        *output = Some(Vec::new());
+        id
+    };
     let selected: Vec<BenchSuiteDescriptor> = suites()
         .lock()
         .values()
         .filter(|suite| matches_selection(suite, names, tags))
-        .filter(|suite| usize::from(suite.independent_boots) >= repetition)
+        .filter(|suite| capture_profiles || usize::from(suite.independent_boots) >= repetition)
         .cloned()
         .collect();
 
-    emit(
-        "run_start",
-        json!({
-            "suite_count": selected.len(),
-            "cpu_count": crate::platform::processor_count(),
-            "repetition": repetition,
-            "suites": selected.iter().map(|suite| {
-                if cfg!(feature = "kernel-correctness") {
-                    json!({ "name": suite.name })
-                } else {
-                    json!({ "name": suite.name, "independent_boots": suite.independent_boots })
-                }
-            }).collect::<Vec<_>>(),
-        }),
-    );
+    #[cfg(feature = "kernel-pgo")]
+    let pgo_available = minicov::coverage_enabled();
+    #[cfg(not(feature = "kernel-pgo"))]
+    let pgo_available = false;
+
+    let metadata = json!({
+        "suite_count": selected.len(),
+        "requested_suites": names,
+        "requested_tags": tags,
+        "pgo": capture_profiles && pgo_available,
+        "cpu_count": crate::platform::processor_count(),
+        "repetition": repetition,
+        "suites": selected.iter().map(|suite| {
+            if cfg!(feature = "kernel-correctness") {
+                json!({ "name": suite.name })
+            } else {
+                json!({ "name": suite.name, "independent_boots": suite.independent_boots })
+            }
+        }).collect::<Vec<_>>(),
+    });
+    #[cfg(feature = "kernel-bench")]
+    let metadata = {
+        let mut metadata = metadata;
+        metadata["output_transport"] = json!("disk");
+        metadata["output_id"] = json!(&output_id);
+        metadata
+    };
+    emit("run_start", metadata);
+
+    if capture_profiles && !pgo_available {
+        emit("pgo_error", json!({ "component": "kernel", "reason": "image is not instrumented" }));
+        #[cfg(feature = "kernel-bench")]
+        return persist_output(&output_id, Vec::new(), false).await;
+        #[cfg(not(feature = "kernel-bench"))]
+        {
+            emit("run_end", json!({ "status": "failed" }));
+            return false;
+        }
+    }
+
+    let unknown: Vec<_> = {
+        let registry = suites().lock();
+        names.iter().filter(|name| !registry.contains_key(name.as_str())).collect()
+    };
+    let unknown_tags: Vec<_> = {
+        let registry = suites().lock();
+        tags.iter().filter(|tag| !registry.values().any(|suite| suite.tags.contains(tag))).collect()
+    };
+    if !unknown.is_empty() || !unknown_tags.is_empty() {
+        emit("selection_error", json!({ "unknown_suites": unknown, "unknown_tags": unknown_tags }));
+        #[cfg(feature = "kernel-bench")]
+        return persist_output(&output_id, Vec::new(), false).await;
+        #[cfg(not(feature = "kernel-bench"))]
+        {
+            emit("run_end", json!({ "status": "failed" }));
+            return false;
+        }
+    }
 
     let mut passed = !selected.is_empty();
     for suite in selected {
@@ -273,19 +412,56 @@ async fn run_selected_suites_for_repetition(
     #[cfg(not(feature = "kernel-bench"))]
     let _ = persist_repetition;
 
-    emit(
-        "run_end",
-        json!({ "status": if passed { "passed" } else { "failed" } }),
-    );
-    passed
+    #[cfg(feature = "kernel-bench")]
+    let profiles = {
+        #[cfg(feature = "kernel-pgo")]
+        let mut profiles = Vec::new();
+        #[cfg(not(feature = "kernel-pgo"))]
+        let profiles = Vec::new();
+        #[cfg(feature = "kernel-pgo")]
+        if capture_profiles {
+            if minicov::coverage_enabled() {
+                let mut profile = Vec::new();
+                unsafe { minicov::capture_coverage(&mut profile).unwrap() };
+                profiles.push((String::from("kernel"), profile));
+            }
+            let program = crate::executable::program::PROGRAM_MANAGER.get(0).unwrap();
+            let modules = program.read().modules.read().clone();
+            for module in modules {
+                let (component, capture) = {
+                    let module = module.read();
+                    let Some((_, rva)) = module.exports.iter().find(|(name, _)| name == "RustosPgoCapture") else {
+                        continue;
+                    };
+                    let capture: unsafe extern "C" fn(&mut Vec<u8>) -> bool = unsafe {
+                        core::mem::transmute((module.image_base.as_u64() + *rva as u64) as *const ())
+                    };
+                    (module.title.to_ascii_lowercase(), capture)
+                };
+                let mut profile = Vec::new();
+                if unsafe { capture(&mut profile) } {
+                    profiles.push((component, profile));
+                }
+            }
+        }
+        profiles
+    };
+
+    #[cfg(feature = "kernel-bench")]
+    return persist_output(&output_id, profiles, passed).await;
+    #[cfg(not(feature = "kernel-bench"))]
+    {
+        emit("run_end", json!({ "status": if passed { "passed" } else { "failed" } }));
+        passed
+    }
 }
 
 pub async fn run_selected_suites(names: &[String], tags: &[String]) -> bool {
-    run_selected_suites_for_repetition(names, tags, 1, false).await
+    run_selected_suites_for_repetition(names, tags, 1, false, false).await
 }
 
 pub async fn run_configured_suites() -> bool {
-    let names = if cfg!(feature = "kernel-correctness") {
+    let mut names = if cfg!(feature = "kernel-correctness") {
         option_env!("RUSTOS_CORRECTNESS_SUITES")
     } else {
         option_env!("RUSTOS_BENCH_SUITES")
@@ -295,7 +471,7 @@ pub async fn run_configured_suites() -> bool {
     .filter(|value| !value.is_empty())
     .map(ToString::to_string)
     .collect::<Vec<_>>();
-    let tags = if cfg!(feature = "kernel-correctness") {
+    let mut tags = if cfg!(feature = "kernel-correctness") {
         option_env!("RUSTOS_CORRECTNESS_TAGS")
     } else {
         option_env!("RUSTOS_BENCH_TAGS")
@@ -307,11 +483,30 @@ pub async fn run_configured_suites() -> bool {
     .collect::<Vec<_>>();
     #[cfg(feature = "kernel-correctness")]
     {
-        run_selected_suites_for_repetition(&names, &tags, 1, false).await
+        run_selected_suites_for_repetition(&names, &tags, 1, false, false).await
     }
     #[cfg(not(feature = "kernel-correctness"))]
     {
+        if let Some(bytes) = boot_state::host_file(b"opt/rustos/bench-suites", 4096) {
+            let Ok(selection) = core::str::from_utf8(&bytes) else {
+                emit("run_end", json!({ "status": "failed" }));
+                return false;
+            };
+            names = selection.trim_end_matches('\0').split(';')
+                .filter(|name| !name.is_empty()).map(ToString::to_string).collect();
+            tags.clear();
+            if let Some(bytes) = boot_state::host_file(b"opt/rustos/bench-tags", 4096) {
+                let Ok(selection) = core::str::from_utf8(&bytes) else {
+                    emit("run_end", json!({ "status": "failed" }));
+                    return false;
+                };
+                tags = selection.trim_end_matches('\0').split(';')
+                    .filter(|tag| !tag.is_empty()).map(ToString::to_string).collect();
+            }
+        }
         let repetition = boot_state::current_repetition().await;
-        run_selected_suites_for_repetition(&names, &tags, repetition, true).await
+        let capture_profiles = boot_state::host_file(b"opt/rustos/bench-pgo", 2)
+            .is_some_and(|value| value == b"1\0" || value == b"1");
+        run_selected_suites_for_repetition(&names, &tags, repetition, true, capture_profiles).await
     }
 }

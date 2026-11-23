@@ -5,6 +5,7 @@
 #![allow(unused_variables)]
 #![feature(custom_test_frameworks)]
 #![feature(allocator_api)]
+#![feature(core_intrinsics)]
 #![test_runner(crate::test_runner)]
 #![allow(static_mut_refs)]
 #![allow(improper_ctypes_definitions)]
@@ -263,9 +264,6 @@ fn copy_framebuffer(src: &Optional<FrameBuffer>) -> Optional<FrameBuffer> {
     }
 }
 
-pub extern "C" fn function(x: i64) -> i64 {
-    (x - 10) / 10
-}
 #[cfg(test)]
 pub fn test_runner(tests: &[&dyn Fn()]) {
     println!("Running {} tests", tests.len());
@@ -280,11 +278,11 @@ const fn get_rva(addr: usize) -> usize {
 }
 #[macro_export]
 macro_rules! export {
-    ($($name:ident),* $(,)?) => {
+    ($($name:ident $(::<$($arg:ty),+>)?),* $(,)?) => {
         lazy_static::lazy_static! {
             pub static ref EXPORTS: Vec<(String, usize)> = vec![
                 $(
-                    (stringify!($name).to_string(), get_rva($name as *const () as usize)),
+                    (stringify!($name).to_string(), get_rva($name $(::<$($arg),+>)? as *const () as usize)),
                 )*
             ];
         }

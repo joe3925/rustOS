@@ -2,9 +2,11 @@ mod artifacts;
 mod bench;
 mod config;
 mod driver;
+mod pgo;
 
 use artifacts::{
-    ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel, StubArtifact,
+    ArtifactManifest, BootArtifact, KernelArtifact, KernelSdkArtifact, PublishedKernel,
+    StubArtifact,
 };
 use config::{BootPackageSource, BuildPlan, HostPlan, LaunchPlan};
 use serde::Serialize;
@@ -34,6 +36,12 @@ fn try_main() -> Result<(), String> {
 
     match cli.command {
         CliCommand::Build(options) => {
+            if options.pgo {
+                if options.kernel_features.iter().any(|feature| feature == "kernel-correctness") {
+                    return Err("build --pgo cannot be combined with kernel-correctness".to_string());
+                }
+                pgo::enable_generation();
+            }
             let platform = options
                 .platform
                 .as_deref()
@@ -45,8 +53,75 @@ fn try_main() -> Result<(), String> {
                 options.release,
                 options.offline,
                 &options.kernel_features,
-            )
-            .map(|_| ())
+            )?;
+            Ok(())
+        }
+        CliCommand::IrqCheck(options) => {
+            let platform = options.platform.as_deref()
+                .ok_or_else(|| "irq-check requires --platform NAME|FILE".to_string())?;
+            let plan = config::load_platform(&root, platform)?;
+            let output = root.join("target/irq-check").join(&plan.id).join(profile(options.release));
+            fs::create_dir_all(&output)
+                .map_err(|error| format!("failed to create {}: {error}", output.display()))?;
+            fs::write(output.join("results.json"), b"{\"schema\":\"rustos.irq-check.v1\",\"complete\":false,\"results\":[]}")
+                .map_err(|error| format!("failed to initialize IRQ results: {error}"))?;
+            let mut kernel = kernel_command(
+                &root, &plan, options.release, options.offline, &options.kernel_features, "check",
+            )?;
+            configure_irq_check(&mut kernel, &root, &plan, "kernel")?;
+            let mut checks = vec![("kernel".to_string(), plan.kernel.target.clone(), kernel)];
+            let sdk = create_kernel_sdk(&root, &plan, options.release)?;
+            for source in &plan.drivers.boot_packages {
+                let manifest = match source {
+                    BootPackageSource::LocalCargo { manifest } => manifest.clone(),
+                    BootPackageSource::GitCargo { repository, revision, manifest } => {
+                        let checkout = driver::checkout_git(&root, repository, revision, options.offline)?;
+                        let checkout = dunce::canonicalize(&checkout)
+                            .map_err(|error| format!("failed to resolve driver checkout: {error}"))?;
+                        let manifest = dunce::canonicalize(checkout.join(manifest))
+                            .map_err(|error| format!("failed to resolve driver manifest: {error}"))?;
+                        if !manifest.starts_with(&checkout) || !manifest.is_file() {
+                            return Err(format!("git driver manifest escapes its checkout: {}", manifest.display()));
+                        }
+                        manifest
+                    }
+                    BootPackageSource::LocalFiles { .. } => continue,
+                };
+                let (package_id, package_name) = driver::cargo_package_identity(&manifest)?;
+                let mut command = cargo(&root);
+                command.arg("check")
+                    .arg("--manifest-path").arg(&manifest)
+                    .args(["-p", &package_id, "--target"]).arg(&plan.drivers.target)
+                    .arg("--lib").args(build_std_args())
+                    .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
+                if options.release { command.arg("--release"); }
+                if options.offline { command.arg("--offline"); }
+                configure_irq_check(&mut command, &root, &plan, "drivers")?;
+                checks.push((package_name, plan.drivers.target.clone(), command));
+            }
+            let mut results = Vec::new();
+            let mut failed = 0;
+            let total = checks.len();
+            for (component, target, command) in checks {
+                let started = Instant::now();
+                let result = run(command, &format!("checking IRQ paths for {component}"));
+                if result.is_err() { failed += 1; }
+                results.push(serde_json::json!({
+                    "component": component, "target": target,
+                    "passed": result.is_ok(), "error": result.err(),
+                    "seconds": started.elapsed().as_secs_f64(),
+                }));
+                let report = serde_json::json!({
+                    "schema": "rustos.irq-check.v1", "platform": plan.id,
+                    "profile": profile(options.release), "complete": results.len() == total,
+                    "passed": results.len() == total && failed == 0, "results": results,
+                });
+                let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+                fs::write(output.join("results.json"), bytes)
+                    .map_err(|error| format!("failed to write IRQ results: {error}"))?;
+            }
+            println!("IRQ results: {}", output.join("results.json").display());
+            if failed == 0 { Ok(()) } else { Err(format!("IRQ checks failed for {failed} component(s)")) }
         }
         CliCommand::Qemu {
             options,
@@ -67,6 +142,7 @@ fn try_main() -> Result<(), String> {
             run_qemu(&root, &plan, &launch, &host, options, file_serial)
         }
         CliCommand::Bench(command) => bench::execute(&root, command),
+        CliCommand::Pgo(args) => pgo::execute(&root, args).map(|_| ()),
         CliCommand::Cargo(options) => {
             let platform = options
                 .platform
@@ -97,7 +173,9 @@ fn try_main() -> Result<(), String> {
                         .args(build_std_args())
                         .env(
                             "CARGO_TARGET_DIR",
-                            root.join("target/cargo").join(&plan.id).join("kernel"),
+                            root.join("target/cargo")
+                                .join(&plan.id)
+                                .join("kernel"),
                         );
                     if plan.kernel.no_default_features {
                         command.arg("--no-default-features");
@@ -129,7 +207,7 @@ fn try_main() -> Result<(), String> {
                             .args(build_std_args())
                             .env(
                                 "CARGO_TARGET_DIR",
-                                root.join("target/cargo").join(&plan.id).join("drivers"),
+                                driver::cargo_target_dir(&root, &plan.id, manifest),
                             )
                             .env("RUSTOS_KERNEL_IMPORT_LIBRARY", &sdk.import_library);
                         run(
@@ -188,11 +266,13 @@ struct Cli {
 
 enum CliCommand {
     Build(BuildOptions),
+    IrqCheck(BuildOptions),
     Qemu {
         options: QemuOptions,
         file_serial: Option<PathBuf>,
     },
     Bench(bench::BenchCommand),
+    Pgo(Vec<String>),
     Cargo(CargoOptions),
 }
 
@@ -204,6 +284,7 @@ struct CargoOptions {
 
 struct BuildOptions {
     release: bool,
+    pgo: bool,
     offline: bool,
     platform: Option<String>,
     kernel_features: Vec<String>,
@@ -230,16 +311,22 @@ impl Cli {
         let mut args = args.into_iter().peekable();
 
         match args.peek().map(String::as_str) {
-            Some("build") => {
+            Some("pgo") => {
                 args.next();
+                Ok(Self { command: CliCommand::Pgo(args.collect()) })
+            }
+            Some("build" | "irq-check") => {
+                let command = args.next().unwrap();
                 let mut release = false;
                 let mut offline = false;
                 let mut platform = None;
                 let mut kernel_features = Vec::new();
+                let mut pgo = false;
 
                 while let Some(arg) = args.next() {
                     match arg.as_str() {
                         "--release" => release = true,
+                        "--pgo" if command == "build" => pgo = true,
                         "--drivers" => {}
                         "--offline" => offline = true,
                         "--platform" => {
@@ -254,19 +341,15 @@ impl Cli {
                         }
                         "-h" | "--help" => return Err(usage()),
                         other => {
-                            return Err(format!("unknown build argument `{other}`\n\n{}", usage()));
+                            return Err(format!("unknown {command} argument `{other}`\n\n{}", usage()));
                         }
                     }
                 }
 
-                Ok(Self {
-                    command: CliCommand::Build(BuildOptions {
-                        release,
-                        offline,
-                        platform,
-                        kernel_features,
-                    }),
-                })
+                let options = BuildOptions { release, pgo, offline, platform, kernel_features };
+                Ok(Self { command: if command == "irq-check" {
+                    CliCommand::IrqCheck(options)
+                } else { CliCommand::Build(options) } })
             }
             Some("qemu") => {
                 args.next();
@@ -340,8 +423,8 @@ impl Cli {
                 })
             }
             Some("bench" | "correctness") => {
-                let correctness = args.next().as_deref() == Some("correctness");
-                bench::parse(args, correctness).map(|command| Self {
+                let command = args.next().unwrap();
+                bench::parse(args, command == "correctness").map(|command| Self {
                     command: CliCommand::Bench(command),
                 })
             }
@@ -390,13 +473,21 @@ impl Cli {
 fn usage() -> String {
     [
         "usage:",
-        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
+        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--pgo] [--offline] [--kernel-feature NAME]",
+        "  cargo run -p xtask -- irq-check --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta]",
-        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N]",
+        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--profile dev|release] [--cpus 1,2,4] [--suite NAME,NAME] [--tag TAG,TAG] [--pgo [--merge] [--pgo-output DIR]] [--boot-image FILE] [--export-boot-image FILE] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N] [--max-repetitions N] [--offline]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "  cargo run -p xtask -- correctness [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE]",
         "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
+        "  cargo xtask pgo --platform NAME|FILE --profiles DIR [--profile dev|release] [--kernel-feature NAME] [--offline]",
+        "  bench builds the selected platform/profile image before running; --boot-image skips building",
+        "  build --kernel-feature kernel-bench creates a benchmark image; RUSTOS_BENCH_TAGS and RUSTOS_BENCH_SUITES select its benchmarks",
         "",
+        "  build always ignores profiles; build --pgo instruments the kernel and drivers",
+        "  bench --pgo builds an instrumented image and writes raw profiles; add --merge to merge them",
+        "  PGO defaults to five boots with 4 CPUs; --cpus and --max-repetitions override this",
+        "  pgo --profiles DIR builds using those merged profiles; it never runs benchmarks",
         "environment:",
         "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",
         "  RUSTOS_FIRMWARE   direct firmware path; bypasses candidate discovery",
@@ -492,7 +583,7 @@ fn build_platform(
         .map_err(|err| format!("failed to create {}: {err}", output.display()))?;
 
     println!("==> building kernel");
-    let kernel_artifact = build_kernel(root, plan, release, kernel_features)?;
+    let kernel_artifact = build_kernel(root, plan, release, offline, kernel_features)?;
 
     println!("==> generating kernel SDK");
     let sdk = create_kernel_sdk(root, plan, release)?;
@@ -537,21 +628,26 @@ fn build_platform(
         &debug_search_paths,
     )?;
 
+    let metadata = output.join("pgo.json");
+    if metadata.exists() { fs::remove_file(metadata).map_err(|error| error.to_string())?; }
     Ok(boot)
 }
 fn artifact_root(root: &Path, plan: &BuildPlan, release: bool) -> PathBuf {
-    root.join("target")
-        .join("rustos")
+    env::var_os("RUSTOS_PGO_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target/rustos"))
         .join(&plan.id)
         .join(profile(release))
 }
 
-fn build_kernel(
+fn kernel_command(
     root: &Path,
     plan: &BuildPlan,
     release: bool,
+    offline: bool,
     extra_features: &[String],
-) -> Result<KernelArtifact, String> {
+    action: &str,
+) -> Result<Command, String> {
     let (package_id, package_name) = driver::cargo_package_identity(&plan.kernel.manifest)?;
     if package_name != plan.kernel.package {
         return Err(format!(
@@ -561,27 +657,30 @@ fn build_kernel(
     }
     let mut kernel = cargo(root);
     kernel
-        .arg("build")
+        .arg(action)
         .args(["--manifest-path"])
         .arg(&plan.kernel.manifest)
         .args(["-p", &package_id, "--target"])
         .arg(&plan.kernel.target)
+        .args(["--bin", &plan.kernel.binary])
         .args(build_std_args())
-        .args([
-            "--message-format",
-            "json-render-diagnostics",
-            "--color",
-            "always",
-        ])
         .env(
             "CARGO_TARGET_DIR",
-            root.join("target/cargo").join(&plan.id).join("kernel"),
+            root.join("target/cargo")
+                .join(&plan.id)
+                .join("kernel"),
         );
 
     if plan.kernel.no_default_features {
         kernel.arg("--no-default-features");
     }
     let mut features = plan.kernel.features.clone();
+    if !extra_features.iter().any(|feature| feature == "kernel-correctness")
+        && pgo::configure(&mut kernel, root, plan, release, "kernel", &plan.kernel.target)?
+    {
+        features.push("kernel-pgo".to_string());
+        kernel.env("RUSTOS_BENCH_AUTORUN", if extra_features.iter().any(|feature| feature == "kernel-bench") { "1" } else { "0" });
+    }
     for feature in extra_features {
         if !features.contains(feature) {
             features.push(feature.clone());
@@ -593,6 +692,22 @@ fn build_kernel(
     if release {
         kernel.arg("--release");
     }
+    if offline {
+        kernel.arg("--offline");
+    }
+    Ok(kernel)
+}
+
+fn build_kernel(
+    root: &Path,
+    plan: &BuildPlan,
+    release: bool,
+    offline: bool,
+    extra_features: &[String],
+) -> Result<KernelArtifact, String> {
+    let mut kernel = kernel_command(root, plan, release, offline, extra_features, "build")?;
+    kernel.args(["--message-format", "json-render-diagnostics", "--color", "always"]);
+    let (package_id, _) = driver::cargo_package_identity(&plan.kernel.manifest)?;
     let kernel_pe = driver::cargo_artifact(
         kernel,
         &package_id,
@@ -679,8 +794,12 @@ fn create_kernel_sdk(
     let target_dir = artifact_root(root, plan, release).join("sdk");
     let kernel_lib = target_dir.join("kernel.lib");
     let exports_path = root.join("kernel").join("src").join("exports.rs");
+    let sdk_generator_path = root.join("tooling/xtask/src/main.rs");
 
-    if kernel_lib.is_file() && !is_source_newer(&exports_path, &kernel_lib)? {
+    if kernel_lib.is_file()
+        && !is_source_newer(&exports_path, &kernel_lib)?
+        && !is_source_newer(&sdk_generator_path, &kernel_lib)?
+    {
         return Ok(KernelSdkArtifact {
             definition_file: target_dir.join("kernel.def"),
             import_library: kernel_lib,
@@ -753,7 +872,8 @@ fn generate_kernel_def(root: &Path, def_path: &Path) -> Result<(), String> {
         let trimmed = line.trim().trim_end_matches(',');
 
         if !trimmed.is_empty() {
-            lines.push(format!("    {trimmed}"));
+            let name = trimmed.split_once("::").map_or(trimmed, |(name, _)| name).trim();
+            lines.push(format!("    {name}"));
         }
     }
 
@@ -896,6 +1016,97 @@ fn cargo(dir: &Path) -> Command {
     }
 
     command
+}
+
+fn configure_irq_check(
+    command: &mut Command,
+    root: &Path,
+    plan: &BuildPlan,
+    component: &str,
+) -> Result<(), String> {
+    let executable = env::var_os("IRQ_CHECK").unwrap_or_else(|| "irq-check".into());
+    let instructions = "Install the interrupt checker from the rustOS repository root with the compiler selected by rust-toolchain.toml:\n  rustup component add rustc-dev llvm-tools-preview\n  cargo install --locked --force --git https://github.com/joe3925/irq-check.git --tag v0.1.4 --bins irq-check\nAdd the Cargo bin directory to PATH, or set IRQ_CHECK to the full path of irq-check.";
+    let output = Command::new(&executable)
+        .arg("--version")
+        .output()
+        .map_err(|error| {
+            format!(
+                "Cannot start {}: {error}.\n{instructions}",
+                Path::new(&executable).display()
+            )
+        })?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success()
+        || !version.starts_with("irq-check 0.1.4 ")
+    {
+        return Err(format!(
+            "The interrupt checker version is incompatible: {version}\n{instructions}"
+        ));
+    }
+    let interface = Command::new(&executable)
+        .arg("--interface")
+        .output()
+        .map_err(|error| {
+            format!("Cannot check the irq-check interface: {error}.\n{instructions}")
+        })?;
+    if !interface.status.success()
+        || String::from_utf8_lossy(&interface.stdout).trim() != "strict-blocks-4"
+    {
+        return Err(format!(
+            "The interrupt checker does not support strict block checks. Rebuild it from the current source.\n{instructions}"
+        ));
+    }
+    let readiness = Command::new(&executable)
+        .arg("--self-check")
+        .output()
+        .map_err(|error| format!("Cannot check irq-check: {error}.\n{instructions}"))?;
+    if !readiness.status.success()
+        || !String::from_utf8_lossy(&readiness.stdout).contains("strict-blocks-4")
+    {
+        return Err(format!(
+            "The interrupt checker cannot load its compiler driver: {}\n{instructions}",
+            String::from_utf8_lossy(&readiness.stderr)
+        ));
+    }
+    if let Some(wrapper) = env::var_os("RUSTC_WRAPPER") {
+        if !wrapper.is_empty() && wrapper != executable {
+            return Err(
+                "RUSTC_WRAPPER is already set. Clear it so irq-check can check every dependency."
+                    .into(),
+            );
+        }
+    }
+    let mut checked = Command::new(&executable);
+    checked
+        .arg("--cargo")
+        .args(command.get_args())
+        .current_dir(command.get_current_dir().unwrap_or(root))
+        .env("IRQ_CHECK_CARGO", command.get_program());
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            checked.env(name, value);
+        } else {
+            checked.env_remove(name);
+        }
+    }
+    checked.env(
+        "IRQ_CHECK_REQUIRED_CRATE",
+        if component == "kernel" {
+            plan.kernel.package.as_str()
+        } else {
+            ""
+        },
+    );
+    checked.env("CARGO_TARGET_DIR", root.join("target/cargo").join(&plan.id).join(format!("irq-check-{component}")));
+    for (name, value) in [
+        ("IRQ_CHECK_QUERY_STEPS", "1000000"),
+        ("IRQ_CHECK_SCALAR_STEPS", "1000000"),
+        ("IRQ_CHECK_ALTERNATIVES", "160"),
+    ] {
+        if env::var_os(name).is_none() { checked.env(name, value); }
+    }
+    *command = checked;
+    Ok(())
 }
 
 fn path_with_rust_linkers() -> Option<OsString> {

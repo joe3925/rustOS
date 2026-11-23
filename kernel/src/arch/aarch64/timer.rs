@@ -7,7 +7,7 @@ use aarch64_cpu::asm::barrier::{SY, isb};
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 use crate::idt::interrupt_impl::InterruptGuard;
 use crate::platform::{self, TimerPlatform};
-use crate::scheduling::scheduler::{KernelFpuGuard, SCHEDULER};
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::state::State;
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::KERNEL_INITIALIZED;
@@ -32,6 +32,7 @@ fn counter_frequency_hz() -> u64 {
         return cached;
     }
     let frequency: u64;
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!("mrs {frequency}, cntfrq_el0", frequency = out(reg) frequency, options(nomem, nostack, preserves_flags));
     }
@@ -51,11 +52,13 @@ fn duration_ticks(time: Duration) -> u64 {
 
 fn program_period() {
     let ticks = duration_ticks(Duration::from_nanos(TIMER_PERIOD_NS)).max(1);
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!("msr cntv_tval_el0, {ticks}", ticks = in(reg) ticks, options(nomem, nostack, preserves_flags));
         asm!("msr cntv_ctl_el0, {control}", control = in(reg) CNTV_CTL_ENABLE, options(nomem, nostack, preserves_flags));
     }
-    isb(SY);
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+    unsafe { isb(SY) };
 }
 
 pub(super) unsafe fn handle_interrupt(state: *mut State) {
@@ -65,7 +68,7 @@ pub(super) unsafe fn handle_interrupt(state: *mut State) {
     }
 
     let _interrupt_guard = InterruptGuard::new();
-    let Some(_fpu_guard) = KernelFpuGuard::try_new() else {
+    let Some(mut scheduling) = scheduler().try_local_scheduler() else {
         return;
     };
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -73,7 +76,7 @@ pub(super) unsafe fn handle_interrupt(state: *mut State) {
     bench_submit_interrupt_sample_current_core(unsafe { &*state });
 
     let stopwatch = Stopwatch::start();
-    let previous = unsafe { SCHEDULER.on_timer_tick(state, cpu_id) };
+    let previous = unsafe { scheduling.on_timer_tick(state) };
     TIMER_TIME_SCHED[cpu_id].fetch_add(stopwatch.elapsed_nanos() as usize, Ordering::Relaxed);
     if previous.is_some() {
         PER_CORE_SWITCHES[cpu_id].fetch_add(1, Ordering::Relaxed);
@@ -102,6 +105,7 @@ impl TimerPlatform for Aarch64Platform {
 
     fn cycle_counter() -> u64 {
         let value: u64;
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!("mrs {value}, cntvct_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
         }

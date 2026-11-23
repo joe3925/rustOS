@@ -1,17 +1,21 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::sync::Arc;
+use core::cell::Cell;
+use core::future::Future;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel_executor::global_async::ExecutorDomainId;
 use kernel_executor::runtime::runtime::try_spawn_to_port_in_executor_domain;
-use kernel_sync::{PortReserveError, mpmc::TryRecvError};
-use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome};
+use kernel_sync::completion::PortReserveError;
+use kernel_sync::channels::mpmc::TryRecvError;
+use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskOutcome};
 
 use crate::sync_platform::{CompletionPort as KernelCompletionPort, CompletionPortPermit};
 use crate::structs::executor_domain::UserExecutorDomain;
 
 use super::io_request::request::{
     CompleteTransition, IO_STATUS_CANCELLED, IoOpcode, IoRequestOutput, IoRequestTable, KernelIoOp,
-    RequestId, RequestTableError, UserIoCompletion,
+    RequestId, RequestTableError, UserIoCompletion, run_file_read, run_file_write,
 };
 
 pub struct CompletionQueue {
@@ -27,6 +31,24 @@ pub struct CompletionQueue {
     completion_chunk_capacity: usize,
     resizing_completion_port: AtomicBool,
     closed: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct DirectCompletion {
+    queue: *const CompletionQueue,
+    request_id: RequestId,
+    output: *const Cell<Option<UserIoCompletion>>,
+}
+
+#[thread_local]
+static DIRECT_COMPLETION: Cell<Option<DirectCompletion>> = Cell::new(None);
+
+struct DirectCompletionGuard(Option<DirectCompletion>);
+
+impl Drop for DirectCompletionGuard {
+    fn drop(&mut self) {
+        DIRECT_COMPLETION.set(self.0);
+    }
 }
 
 impl core::fmt::Debug for CompletionQueue {
@@ -84,6 +106,14 @@ impl CompletionQueue {
     }
 
     pub fn enqueue(self: &Arc<Self>, op: KernelIoOp) -> Result<RequestId, CompletionQueueError> {
+        self.enqueue_inner(op, None)
+    }
+
+    fn enqueue_inner(
+        self: &Arc<Self>,
+        op: KernelIoOp,
+        direct: Option<&Cell<Option<UserIoCompletion>>>,
+    ) -> Result<RequestId, CompletionQueueError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(CompletionQueueError::Closed);
         }
@@ -97,6 +127,14 @@ impl CompletionQueue {
             .allocate()
             .map_err(|_| CompletionQueueError::RequestTableFull)?;
 
+        let _guard = direct.map(|output| {
+            DirectCompletionGuard(DIRECT_COMPLETION.replace(Some(DirectCompletion {
+                queue: Arc::as_ptr(self),
+                request_id,
+                output,
+            })))
+        });
+
         let opcode = op.opcode();
         let user_token = op.user_token();
         let permit = IoCompletionPermit {
@@ -105,19 +143,58 @@ impl CompletionQueue {
             opcode,
             user_token,
         };
-        let task = match try_spawn_to_port_in_executor_domain(
-            self.bound_executor_domain,
-            async move { op.execute().await },
+        match op {
+            KernelIoOp::FileRead { file, buffer, offset, .. } => {
+                self.enqueue_future(request_id, permit, true, move || {
+                    run_file_read(file, buffer, offset)
+                })
+            }
+            KernelIoOp::FileWrite { file, buffer, offset, .. } => {
+                self.enqueue_future(request_id, permit, true, move || {
+                    run_file_write(file, buffer, offset)
+                })
+            }
+            op => self.enqueue_future(request_id, permit, false, move || op.execute()),
+        }
+    }
+
+    pub fn enqueue_wait(
+        self: &Arc<Self>,
+        op: KernelIoOp,
+        timeout_ns: u64,
+    ) -> Result<(RequestId, Option<UserIoCompletion>), CompletionQueueError> {
+        let completed = Cell::new(None);
+        let request = self.enqueue_inner(op, Some(&completed))?;
+        let completion = if let Some(completion) = completed.take() {
+            Some(completion)
+        } else {
+            let mut out = [UserIoCompletion::default()];
+            (self.wait_completions(&mut out, timeout_ns) != 0).then_some(out[0])
+        };
+        Ok((request, completion))
+    }
+
+    #[inline(never)]
+    fn enqueue_future<F: Future<Output = IoRequestOutput> + Send + 'static>(
+        self: &Arc<Self>,
+        request_id: RequestId,
+        permit: IoCompletionPermit,
+        poll_inline: bool,
+        make_future: impl FnOnce() -> F,
+    ) -> Result<RequestId, CompletionQueueError> {
+        if try_spawn_to_port_in_executor_domain::<KernelExecutorPlatform, _, _, _>(
+            &self.executor_domain.domain,
+            make_future,
             request_id,
             permit,
-        ) {
-            Ok(task) => task,
-            Err(_) => {
-                self.request_table.reap_submitted(request_id);
-                return Err(CompletionQueueError::RequestTableFull);
-            }
-        };
-        self.request_table.install_task(request_id, task);
+            poll_inline,
+            |task| self.request_table.install_task(request_id, task),
+        )
+        .is_err()
+        {
+            self.request_table.reap_submitted(request_id);
+            return Err(CompletionQueueError::RequestTableFull);
+        }
         Ok(request_id)
     }
 
@@ -241,8 +318,11 @@ impl CompletionQueue {
 
     fn reclaim_completion_capacity(&self) {
         let capacity = self.completion_port.capacity();
+        if capacity <= self.completion_capacity {
+            return;
+        }
         let outstanding = self.completion_port.outstanding();
-        if capacity <= self.completion_capacity || outstanding.saturating_mul(2) > capacity {
+        if outstanding.saturating_mul(2) > capacity {
             return;
         }
         if self
@@ -304,10 +384,12 @@ impl CompletionPermit<IoRequestOutput> for IoCompletionPermit {
             .request_table
             .complete(completion.key)
             .unwrap_or(CompleteTransition::Cancelled);
-        let output = match transition {
+        let output = if self.queue.executor_domain.is_draining() {
+            IoRequestOutput::error(IO_STATUS_CANCELLED)
+        } else { match transition {
             CompleteTransition::Normal => output,
             CompleteTransition::Cancelled => IoRequestOutput::error(IO_STATUS_CANCELLED),
-        };
+        }};
         let user = UserIoCompletion {
             request_id: completion.key,
             user_token: self.user_token,
@@ -317,6 +399,15 @@ impl CompletionPermit<IoRequestOutput> for IoCompletionPermit {
             result: output.result,
             extra: output.extra,
         };
+        if let Some(direct) = DIRECT_COMPLETION.get() {
+            if direct.queue == Arc::as_ptr(&self.queue) && direct.request_id == completion.key {
+                drop(self.port_permit.take().expect("I/O port permit missing"));
+                self.queue.request_table.reap(completion.key);
+                self.queue.reclaim_completion_capacity();
+                unsafe { (*direct.output).set(Some(user)) };
+                return;
+            }
+        }
         self.port_permit
             .take()
             .expect("I/O port permit missing")

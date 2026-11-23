@@ -448,11 +448,11 @@ mod tests {
 
         assert_eq!(platform.id, "x86_64-uefi");
         assert!(tcg.capabilities.debug);
-        assert!(!whpx.capabilities.debug);
+        assert!(whpx.capabilities.debug);
         assert_eq!(aarch64.id, "aarch64-uefi");
         assert!(aarch64.kernel.no_default_features);
         assert!(aarch64_tcg.capabilities.debug);
-        assert!(!aarch64_hvf.capabilities.debug);
+        assert!(aarch64_hvf.capabilities.debug);
         assert!(!aarch64_kvm.capabilities.debug);
         assert_eq!(windows.id, "windows");
         assert_eq!(windows.os, "windows");

@@ -146,7 +146,8 @@ impl GicV3 {
 
     pub(super) fn end_interrupt(&self, token: InterruptToken) {
         unsafe { write_icc_eoir1_el1(token.raw) };
-        isb(SY);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { isb(SY) };
     }
 
     pub(super) fn send_ipi(&self, target: PlatformCpuId, vector: u8) -> bool {
@@ -172,14 +173,16 @@ impl GicV3 {
             | (vector as u64) << 24
             | 1 << aff0;
         unsafe { write_icc_sgi1r_el1(value) };
-        isb(SY);
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { isb(SY) };
         true
     }
 
     pub(super) fn broadcast_ipi(&self, vector: u8) {
         if vector < 16 {
             unsafe { write_icc_sgi1r_el1((vector as u64) << 24 | 1 << 40) };
-            isb(SY);
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { isb(SY) };
         }
     }
 
@@ -332,12 +335,14 @@ fn route_affinity(target: PlatformCpuId) -> Option<u64> {
 
 unsafe fn read_icc_iar1_el1() -> u32 {
     let value: u64;
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!("mrs {value}, ICC_IAR1_EL1", value = out(reg) value, options(nomem, nostack, preserves_flags))
     };
     value as u32
 }
 unsafe fn write_icc_eoir1_el1(value: u32) {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!("msr ICC_EOIR1_EL1, {value}", value = in(reg) value as u64, options(nomem, nostack, preserves_flags))
     }
@@ -370,6 +375,7 @@ unsafe fn write_icc_igrpen1_el1(value: u64) {
     }
 }
 unsafe fn write_icc_sgi1r_el1(value: u64) {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!("msr ICC_SGI1R_EL1, {value}", value = in(reg) value, options(nomem, nostack, preserves_flags))
     }

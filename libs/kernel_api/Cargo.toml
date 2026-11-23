@@ -4,21 +4,26 @@ cargo-features = ["profile-rustflags"]
 name = "kernel_api"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
+minicov = { version = "=0.3.9", optional = true }
+kernel_executor = { path = "../kernel_executor", default-features = false }
 acpi = { git = "https://github.com/rust-osdev/acpi", rev = "09d5c67" }
 spin = "0.10.0"
 kernel_macros = { path = "../kernel_macros" }
 kernel_types = { path = "../kernel_types", default-features = false }
 kernel_sys = { path = "../kernel_sys" }
+kernel_sync = { path = "../kernel_sync", default-features = false }
 kernel_routing = { path = "../kernel_routing" }
 libm = { version = "0.2", default-features = false }
 
 [features]
 default = []
+driver-pgo = ["dep:minicov"]
 [profile.dev]
 opt-level = 3
 lto = true

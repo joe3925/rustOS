@@ -12,7 +12,7 @@ use super::timer::{
 };
 use crate::KERNEL_INITIALIZED;
 use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::util::{CORE_LOCK, CPU_ID, INIT_LOCK, boot_info};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -454,7 +454,7 @@ extern "C" fn ap_startup() -> ! {
         // Register while still holding the lock that assigned this CPU's ID.
         // Scheduler storage requires contiguous insertion order; calibration
         // can finish in a different order on each AP.
-        SCHEDULER.init_core(current_cpu_id());
+        scheduler().init_core(current_cpu_id());
     }
     // Timer storage was allocated for all CPUs before AP startup. Each AP
     // measures its own local timer without holding up the other APs.

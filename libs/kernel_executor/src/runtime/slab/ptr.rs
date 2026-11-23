@@ -1,9 +1,11 @@
-use super::super::runtime::submit_global_to_executor_domain;
-use super::slot::WakeAction;
-use super::task_slab::get_task_table;
+use super::slot::{PollResult, TaskSlot, WakeAction};
+use super::task_slab::{TaskTable, get_task_table};
+use crate::growable_slab::MAX_LOCAL_SLOTS;
+use crate::platform::ExecutorPlatform;
+use crate::platform::POLL_NOTIFIED;
 
 const PTR_SHARD_BITS: usize = 3;
-const PTR_LOCAL_BITS: usize = 32;
+const PTR_LOCAL_BITS: usize = MAX_LOCAL_SLOTS.ilog2() as usize;
 const PTR_GEN_BITS: usize = crate::growable_slab::SLAB_GENERATION_BITS as usize;
 
 const PTR_SHARD_SHIFT: usize = 0;
@@ -14,17 +16,20 @@ const PTR_SHARD_MASK: usize = (1usize << PTR_SHARD_BITS) - 1;
 const PTR_LOCAL_MASK: usize = (1usize << PTR_LOCAL_BITS) - 1;
 const PTR_GEN_MASK: usize = (1usize << PTR_GEN_BITS) - 1;
 
-const _: () = assert!(usize::BITS as usize >= PTR_GEN_SHIFT + PTR_GEN_BITS);
+const _: () = assert!(usize::BITS as usize > PTR_GEN_SHIFT + PTR_GEN_BITS);
+const _: () = assert!(POLL_NOTIFIED > 1usize << (PTR_GEN_SHIFT + PTR_GEN_BITS));
+
 #[inline]
 pub fn encode_slab_task_ptr(shard_idx: u8, local_idx: u32, generation: u32) -> usize {
     let shard_bits = ((shard_idx as usize) & PTR_SHARD_MASK) << PTR_SHARD_SHIFT;
     let local_bits = ((local_idx as usize) & PTR_LOCAL_MASK) << PTR_LOCAL_SHIFT;
     let gen_bits = ((generation as usize) & PTR_GEN_MASK) << PTR_GEN_SHIFT;
-    gen_bits | local_bits | shard_bits
+    (gen_bits | local_bits | shard_bits) + 1
 }
 
 #[inline]
 pub fn decode_slab_task_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
+    let ptrv = ptrv.checked_sub(1)?;
     let shard_idx = (ptrv >> PTR_SHARD_SHIFT) & PTR_SHARD_MASK;
     let local_idx = (ptrv >> PTR_LOCAL_SHIFT) & PTR_LOCAL_MASK;
     let generation = ((ptrv >> PTR_GEN_SHIFT) & PTR_GEN_MASK) as u32;
@@ -32,70 +37,72 @@ pub fn decode_slab_task_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
     Some((shard_idx, local_idx, generation))
 }
 
-#[inline(always)]
-fn poll_slab_task(ctx: usize) {
+#[inline(never)]
+pub(crate) extern "C" fn poll_slab_task<E: ExecutorPlatform>(
+    slab: &'static TaskTable<E>,
+    ctx: usize,
+    cached_slot: Option<&'static TaskSlot>,
+) {
     let Some((shard_idx, local_idx, generation)) = decode_slab_task_ptr(ctx) else {
         return;
     };
 
-    let slab = get_task_table();
-    let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
+    let Some(slot) = cached_slot.or_else(|| slab.get_slot(shard_idx, local_idx, generation)) else {
         return;
     };
 
-    let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
+    let waker = super::super::waker::create_slab_task_waker::<E>(shard_idx, local_idx, generation);
 
-    let completed = slot.poll_once(&waker, shard_idx, local_idx, generation);
-
-    slab.decrement_ref(shard_idx, local_idx, generation);
-
-    if completed {
-        slab.decrement_ref(shard_idx, local_idx, generation);
-    }
-}
-
-#[inline(always)]
-pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
-    let slab = get_task_table();
-
-    if !slab.increment_ref(shard_idx, local_idx, generation) {
-        return;
-    }
-
-    let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
-        slab.decrement_ref(shard_idx, local_idx, generation);
-        return;
+    let refs = match slot.poll_once::<E>(&waker, shard_idx, local_idx, generation) {
+        PollResult::Pending => 1,
+        PollResult::Completed => 2,
+        PollResult::Requeued => return,
     };
-
-    match slot.record_wake() {
-        WakeAction::Enqueue => {
-            let encoded = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
-            let domain_id = slot
-                .executor_domain_id()
-                .expect("queued slab task has no executor domain");
-            submit_global_to_executor_domain(domain_id, encoded);
-        }
-        WakeAction::Represented | WakeAction::Completed => {
-            slab.decrement_ref(shard_idx, local_idx, generation);
-        }
-    }
+    unsafe { slab.decrement_owned_refs(slot, shard_idx, local_idx, generation, refs) };
 }
 
 #[inline(never)]
-pub extern "C" fn slab_task_poll_trampoline(ctx: usize) {
-    poll_slab_task(ctx);
+pub fn enqueue_slab_task<E: ExecutorPlatform>(shard_idx: usize, local_idx: usize, generation: u32) {
+    let slab = get_task_table::<E>();
+
+    let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
+        return;
+    };
+    if !slab.increment_slot_ref(slot, generation) {
+        return;
+    }
+    if slot.record_wake() == WakeAction::Enqueue {
+        if let Some(domain_id) = slot.executor_domain_id() {
+            let task_id = encode_slab_task_ptr(shard_idx as u8, local_idx as u32, generation);
+            let executor = crate::global_async::GlobalAsyncExecutor::<E>::global();
+            let accepted = executor.with_executor_domain(domain_id, |domain, tls| {
+                executor.enqueue_task::<false, false, false>(domain, tls, task_id, slot);
+                true
+            }).unwrap_or(false);
+            if accepted {
+                return;
+            }
+        }
+    }
+    slab.decrement_ref::<false>(shard_idx, local_idx, generation);
+}
+
+#[inline(never)]
+pub extern "C" fn slab_task_poll_trampoline<E: ExecutorPlatform>(ctx: usize) {
+    poll_slab_task::<E>(get_task_table::<E>(), ctx, None);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_slab_task_ptr, encode_slab_task_ptr};
+    use super::{MAX_LOCAL_SLOTS, POLL_NOTIFIED, PTR_GEN_MASK, decode_slab_task_ptr, encode_slab_task_ptr};
 
     #[test]
-    fn task_pointer_round_trips_u32_local_index() {
-        let encoded = encode_slab_task_ptr(7, 0xFEDC_BA98, 0x7654_3210);
+    fn task_pointer_round_trips_max_slab_indices() {
+        let encoded = encode_slab_task_ptr(7, (MAX_LOCAL_SLOTS - 1) as u32, u32::MAX);
         assert_eq!(
             decode_slab_task_ptr(encoded),
-            Some((7, 0xFEDC_BA98, 0x1654_3210))
+            Some((7, MAX_LOCAL_SLOTS - 1, PTR_GEN_MASK as u32))
         );
+        assert_eq!(encoded & POLL_NOTIFIED, 0);
     }
 }

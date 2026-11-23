@@ -46,6 +46,8 @@ impl BootstrapAllocator {
 }
 
 unsafe impl GlobalAlloc for BootstrapAllocator {
+    #[cold]
+    #[inline(never)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         self.ensure_init();
         with_interrupts_disabled(|| self.inner.lock().alloc(layout))
@@ -61,6 +63,8 @@ unsafe impl GlobalAlloc for BootstrapAllocator {
         ptr
     }}
 
+    #[cold]
+    #[inline(never)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { unsafe {
         self.ensure_init();
         with_interrupts_disabled(|| {

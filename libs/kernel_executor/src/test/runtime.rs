@@ -8,14 +8,13 @@ use std::sync::{Condvar, Mutex};
 use std::task::Wake;
 use std::time::Duration;
 
-use crate::global_async::{ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor};
-use crate::runtime::abi_spawn::kernel_spawn_abi_internal;
+use crate::async_ffi::{AbiFuture, FutureExt};
+use crate::global_async::{ExecutorDomainConfig, GlobalAsyncExecutor};
 use crate::runtime::runtime::{
-    block_on, spawn_detached, spawn_detached_in_executor_domain, spawn_join_owned as spawn,
-    spawn_join_owned_in_executor_domain as spawn_in_executor_domain, JoinAll,
+    JoinAll, TaskOutcome, block_on, spawn_detached, spawn_detached_in_executor_domain,
+    spawn_join_owned as spawn, spawn_join_owned_in_executor_domain as spawn_in_executor_domain,
 };
 use crate::runtime::slab::constants::{INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
-use kernel_types::async_ffi::{AbiFuture, FutureExt};
 
 fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
     unsafe fn clone(ptr: *const ()) -> RawWaker {
@@ -45,10 +44,19 @@ fn caller_storage_and_spawn_join_macro_return_results() {
     super::support::init_threaded_runtime();
 
     let mut storage = core::pin::pin!(crate::runtime::runtime::JoinStorage::<usize>::new());
-    let explicit = crate::runtime::runtime::spawn(storage.as_mut(), async { 41usize });
-    assert_eq!(block_on(explicit), 41);
+    let explicit = crate::runtime::runtime::spawn::<crate::test_support::TestExecutorPlatform, _, _>(
+        storage.as_mut(),
+        async { 41usize },
+    );
+    assert_eq!(
+        block_on::<crate::test_support::TestExecutorPlatform, _>(explicit),
+        TaskOutcome::Completed(41)
+    );
 
-    assert_eq!(block_on(crate::spawn_join!(async { 42usize })), 42);
+    assert_eq!(
+        block_on::<crate::test_support::TestExecutorPlatform, _>(crate::spawn_join!(crate::test_support::TestExecutorPlatform; async { 42usize })),
+        TaskOutcome::Completed(42)
+    );
 }
 
 fn poll_once<F: Future + Unpin>(future: &mut F, waker: &Waker) -> Poll<F::Output> {
@@ -328,7 +336,10 @@ fn take_child_waker(slot: &Arc<Mutex<Option<Waker>>>) -> Waker {
 // should complete without requiring the platform or global executor to be initialized.
 #[test]
 fn block_on_returns_immediately_for_ready_future() {
-    assert_eq!(block_on(async { 123usize }), 123);
+    assert_eq!(
+        block_on::<crate::test_support::TestExecutorPlatform, _>(async { 123usize }),
+        123
+    );
 }
 
 // This test exists to cover JoinAll's local polling contract. It proves that a
@@ -363,7 +374,7 @@ fn join_all_polls_ready_queue_after_child_wakes_parent() {
 // thread pool: inline futures, oversized futures, oversized results, and
 // over-aligned futures all have to complete through the same public spawn API.
 #[test]
-fn spawn_joinhandle_completes_small_and_large_arena_storage_paths() {
+fn spawn_joinhandle_completes_small_and_large_heap_storage_paths() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
@@ -371,20 +382,25 @@ fn spawn_joinhandle_completes_small_and_large_arena_storage_paths() {
     assert!(size_of::<LargeResult>() > JOINABLE_STORAGE_SIZE);
     assert!(align_of::<OverAlignedJoinFuture>() > INLINE_FUTURE_ALIGN);
 
-    let result = block_on(async {
-        let inline = spawn(async { 11usize });
-        let large_future = spawn(LargeJoinFuture {
+    let result = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
+        let inline = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async { 11usize });
+        let large_future = spawn::<crate::test_support::TestExecutorPlatform, _, _>(LargeJoinFuture {
             _padding: [0; JOINABLE_STORAGE_SIZE + 1],
             value: 22,
         });
-        let large_result = spawn(async { LargeResult([33usize; 128]) });
-        let over_aligned = spawn(OverAlignedJoinFuture { value: 44 });
+        let large_result = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async {
+            LargeResult([33usize; 128])
+        });
+        let over_aligned =
+            spawn::<crate::test_support::TestExecutorPlatform, _, _>(OverAlignedJoinFuture {
+                value: 44,
+            });
 
         (
-            inline.await,
-            large_future.await,
-            large_result.await,
-            over_aligned.await,
+            inline.await.expect("inline task cancelled"),
+            large_future.await.expect("large future cancelled"),
+            large_result.await.expect("large result cancelled"),
+            over_aligned.await.expect("aligned task cancelled"),
         )
     });
 
@@ -407,7 +423,7 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed.clone(),
@@ -437,12 +453,10 @@ fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     assert_eq!(completed.load(Ordering::Acquire), 1);
     assert!(matches!(
         poll_once(&mut handle, &join_wake.waker()),
-        Poll::Ready(77)
+        Poll::Ready(TaskOutcome::Completed(77))
     ));
 }
 
-// This test mirrors the slab wake contract on the large arena-backed path. It prevents
-// the large-future path from depending on eager repolling by block_on/JoinAll.
 #[test]
 fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
     let _guard = super::support::global_runtime_lock();
@@ -460,7 +474,7 @@ fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
         ),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let join_wake = WakeSignal::new();
     assert!(matches!(
@@ -480,12 +494,12 @@ fn joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
 
     assert!(
         join_wake.wait_for_wakes(1, Duration::from_secs(10)),
-        "large arena-backed JoinHandle was not woken after its child completed"
+        "large-future JoinHandle was not woken after its child completed"
     );
     assert_eq!(completed.load(Ordering::Acquire), 1);
     assert!(matches!(
         poll_once(&mut handle, &join_wake.waker()),
-        Poll::Ready(88)
+        Poll::Ready(TaskOutcome::Completed(88))
     ));
 }
 
@@ -500,7 +514,7 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
     let ready = Arc::new(AtomicBool::new(false));
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed,
@@ -540,13 +554,10 @@ fn slab_joinhandle_completion_uses_latest_registered_waiter() {
     );
     assert!(matches!(
         poll_once(&mut handle, &latest_waiter.waker()),
-        Poll::Ready(99)
+        Poll::Ready(TaskOutcome::Completed(99))
     ));
 }
 
-// This test protects waker replacement on large arena-backed JoinHandles. The fallback
-// JoinableTask path uses a different waker store than slab slots, so it needs the
-// same stale-waiter check independently.
 #[test]
 fn joinhandle_completion_uses_latest_registered_waiter() {
     let _guard = super::support::global_runtime_lock();
@@ -559,7 +570,7 @@ fn joinhandle_completion_uses_latest_registered_waiter() {
         inner: ControlledFuture::new(ready.clone(), child_waker.clone(), completed, 100usize),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let stale_waiter = WakeSignal::new();
     let latest_waiter = WakeSignal::new();
@@ -585,16 +596,16 @@ fn joinhandle_completion_uses_latest_registered_waiter() {
 
     assert!(
         latest_waiter.wait_for_wakes(1, Duration::from_secs(10)),
-        "latest large arena-backed JoinHandle waiter was not woken"
+        "latest large-future JoinHandle waiter was not woken"
     );
     assert_eq!(
         stale_waiter.wake_count(),
         0,
-        "stale large arena-backed JoinHandle waiter was woken after replacement"
+        "stale large-future JoinHandle waiter was woken after replacement"
     );
     assert!(matches!(
         poll_once(&mut handle, &latest_waiter.waker()),
-        Poll::Ready(100)
+        Poll::Ready(TaskOutcome::Completed(100))
     ));
 }
 
@@ -610,7 +621,7 @@ fn dropping_completed_slab_joinhandle_drops_unconsumed_result_once() {
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed.clone(),
@@ -658,7 +669,7 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
     let child_waker = Arc::new(Mutex::new(None));
     let completed = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut handle = spawn(ControlledFuture::new(
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(ControlledFuture::new(
         ready.clone(),
         child_waker.clone(),
         completed.clone(),
@@ -688,9 +699,6 @@ fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
     });
 }
 
-// This test covers the large arena-backed completed-but-unawaited cleanup path. Large
-// futures store their result in JoinableTask; dropping the unconsumed handle must
-// still drop that result exactly once.
 #[test]
 fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
     let _guard = super::support::global_runtime_lock();
@@ -711,7 +719,7 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
         ),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let join_wake = WakeSignal::new();
     assert!(matches!(
@@ -729,7 +737,7 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
     take_child_waker(&child_waker).wake();
     assert!(
         join_wake.wait_for_wakes(1, Duration::from_secs(10)),
-        "large arena-backed JoinHandle did not wake after storing an unconsumed result"
+        "large-future JoinHandle did not wake after storing an unconsumed result"
     );
     assert_eq!(completed.load(Ordering::Acquire), 1);
 
@@ -740,9 +748,6 @@ fn dropping_completed_joinhandle_drops_unconsumed_result_once() {
     });
 }
 
-// This test covers the large arena-backed pending-then-dropped cleanup path. Dropping
-// the JoinHandle must not cancel a large future, and its eventual result must be
-// dropped when the task finishes with no waiter left.
 #[test]
 fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
     let _guard = super::support::global_runtime_lock();
@@ -763,7 +768,7 @@ fn dropping_pending_joinhandle_drops_result_after_task_finishes() {
         ),
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
     };
-    let mut handle = spawn(future);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(future);
 
     let join_wake = WakeSignal::new();
     assert!(matches!(
@@ -795,8 +800,11 @@ fn slab_joinhandle_panics_when_polled_after_completion() {
     let guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let mut handle = spawn(async { 5usize });
-    assert_eq!(block_on(async { (&mut handle).await }), 5);
+    let mut handle = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async { 5usize });
+    assert_eq!(
+        block_on::<crate::test_support::TestExecutorPlatform, _>(async { (&mut handle).await }),
+        TaskOutcome::Completed(5)
+    );
     drop(guard);
 
     let wake_count = Arc::new(AtomicUsize::new(0));
@@ -831,10 +839,10 @@ fn many_joinable_tasks_reschedule_across_core_count_shards() {
     let tasks = super::support::stress_task_count(256);
     let expected = tasks * (tasks - 1) / 2;
 
-    let results = block_on(async {
+    let results = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
         let handles = (0..tasks)
             .map(|i| {
-                spawn(YieldMany {
+                spawn::<crate::test_support::TestExecutorPlatform, _, _>(YieldMany {
                     remaining: i % 5,
                     value: i,
                 })
@@ -844,14 +852,17 @@ fn many_joinable_tasks_reschedule_across_core_count_shards() {
     });
 
     assert_eq!(results.len(), tasks);
-    assert_eq!(results.into_iter().sum::<usize>(), expected);
+    assert_eq!(
+        results
+            .into_iter()
+            .map(|value| value.expect("task cancelled"))
+            .sum::<usize>(),
+        expected
+    );
 }
 
-// This test exists to cover detached work on both slab-inline and large arena-backed
-// storage. Detached tasks have no JoinHandle, so completion is observed through
-// shared state instead.
 #[test]
-fn spawn_detached_runs_size_class_and_large_direct_futures() {
+fn spawn_detached_runs_small_and_large_heap_futures() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
@@ -862,12 +873,12 @@ fn spawn_detached_runs_size_class_and_large_direct_futures() {
 
     for _ in 0..inline_tasks {
         let counter = counter.clone();
-        spawn_detached(async move {
+        spawn_detached::<crate::test_support::TestExecutorPlatform, _>(async move {
             counter.fetch_add(1, Ordering::AcqRel);
         });
     }
 
-    spawn_detached(LargeDetachedFuture {
+    spawn_detached::<crate::test_support::TestExecutorPlatform, _>(LargeDetachedFuture {
         _padding: [0; 4097],
         counter: counter.clone(),
     });
@@ -877,9 +888,6 @@ fn spawn_detached_runs_size_class_and_large_direct_futures() {
     });
 }
 
-// This test exists to prove that dropping a JoinHandle does not cancel already
-// queued work. It covers both the slab-backed small future and the large-future path
-// oversized future cleanup paths.
 #[test]
 fn dropping_joinhandles_does_not_cancel_queued_work() {
     let _guard = super::support::global_runtime_lock();
@@ -888,12 +896,12 @@ fn dropping_joinhandles_does_not_cancel_queued_work() {
     let completed = Arc::new(AtomicUsize::new(0));
 
     let small_completed = completed.clone();
-    let small = spawn(async move {
+    let small = spawn::<crate::test_support::TestExecutorPlatform, _, _>(async move {
         small_completed.fetch_add(1, Ordering::AcqRel);
         1usize
     });
 
-    let large = spawn(LargeCountingJoinFuture {
+    let large = spawn::<crate::test_support::TestExecutorPlatform, _, _>(LargeCountingJoinFuture {
         _padding: [0; JOINABLE_STORAGE_SIZE + 1],
         counter: completed.clone(),
         value: 2,
@@ -915,15 +923,15 @@ fn externally_woken_future_is_rescheduled_by_executor_waker() {
     super::support::init_threaded_runtime();
 
     let ready = Arc::new(AtomicBool::new(false));
-    let value = block_on(async {
-        spawn(ExternalWakeFuture {
+    let value = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
+        spawn::<crate::test_support::TestExecutorPlatform, _, _>(ExternalWakeFuture {
             started: false,
             ready,
         })
         .await
     });
 
-    assert_eq!(value, 1);
+    assert_eq!(value, TaskOutcome::Completed(1));
 }
 
 // This test exists to cover the ABI spawn entrypoint used by external crates.
@@ -936,12 +944,18 @@ fn abi_spawn_internal_runs_owned_abi_future() {
 
     let completed = Arc::new(AtomicUsize::new(0));
     let completed_for_future = completed.clone();
-    block_on(spawn(async move {
+    block_on::<crate::test_support::TestExecutorPlatform, _>(spawn::<
+        crate::test_support::TestExecutorPlatform,
+        _,
+        _,
+    >(async move {
         let future = async move {
             completed_for_future.fetch_add(1, Ordering::AcqRel);
         }
         .into_abi();
-        kernel_spawn_abi_internal(future);
+        crate::runtime::runtime::spawn_detached::<crate::test_support::TestExecutorPlatform, _>(
+            future,
+        );
     }));
 
     super::support::wait_until(Duration::from_secs(10), || {
@@ -997,21 +1011,18 @@ impl Future for RootAbiProbe {
 }
 
 #[test]
-fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
+fn abi_future_polls_inline_with_exact_parent_context() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id =
-        GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig::default());
-    let before = GlobalAsyncExecutor::global()
-        .executor_domain_stats(domain_id)
-        .unwrap();
+    let domain = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .create_executor_domain(ExecutorDomainConfig::default());
     let parent_context = Arc::new(AtomicUsize::new(0));
     let child_context = Arc::new(AtomicUsize::new(0));
     let child_drops = Arc::new(AtomicUsize::new(0));
 
-    block_on(spawn_in_executor_domain(
-        domain_id,
+    block_on::<crate::test_support::TestExecutorPlatform, _>(spawn_in_executor_domain::<crate::test_support::TestExecutorPlatform, _, _>(
+        &domain,
         RootAbiProbe {
             parent_context: parent_context.clone(),
             child_context: child_context.clone(),
@@ -1020,22 +1031,17 @@ fn abi_future_polls_inline_with_exact_parent_context_and_no_child_work_item() {
         },
     ));
 
-    super::support::wait_until(Duration::from_secs(5), || {
-        GlobalAsyncExecutor::global()
-            .executor_domain_stats(domain_id)
-            .is_some_and(|stats| stats.live_task_count == 0)
-    });
-    let after = GlobalAsyncExecutor::global()
-        .executor_domain_stats(domain_id)
+    GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .destroy_executor_domain(domain.id())
         .unwrap();
+    super::support::wait_until(Duration::from_secs(5), || {
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain.id()).is_none()
+    });
     assert_eq!(
         parent_context.load(Ordering::Acquire),
         child_context.load(Ordering::Acquire)
     );
     assert_eq!(child_drops.load(Ordering::Acquire), 1);
-    assert_eq!(after.submitted - before.submitted, 1);
-    assert_eq!(after.live_future_count, 0);
-    assert_eq!(after.live_task_count, 0);
 }
 
 #[test]
@@ -1043,18 +1049,23 @@ fn spawn_in_executor_domain_completes_joinhandle() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::KernelHigh,
-        ..ExecutorDomainConfig::default()
+    let domain = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .create_executor_domain(ExecutorDomainConfig::default());
+
+    let value = block_on::<crate::test_support::TestExecutorPlatform, _>(async {
+        spawn_in_executor_domain::<crate::test_support::TestExecutorPlatform, _, _>(
+            &domain,
+            async { 1234usize },
+        )
+        .await
     });
+    assert_eq!(value, TaskOutcome::Completed(1234));
 
-    let value = block_on(async { spawn_in_executor_domain(domain_id, async { 1234usize }).await });
-    assert_eq!(value, 1234);
-
+    GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .destroy_executor_domain(domain.id())
+        .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::global()
-            .executor_domain_stats(domain_id)
-            .is_some_and(|stats| stats.completed >= 1)
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain.id()).is_none()
     });
 }
 
@@ -1063,24 +1074,26 @@ fn spawn_detached_in_executor_domain_executes_work() {
     let _guard = super::support::global_runtime_lock();
     super::support::init_threaded_runtime();
 
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::KernelBackground,
-        ..ExecutorDomainConfig::default()
-    });
+    let domain = GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .create_executor_domain(ExecutorDomainConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_for_task = counter.clone();
 
-    spawn_detached_in_executor_domain(domain_id, async move {
+    spawn_detached_in_executor_domain::<crate::test_support::TestExecutorPlatform, _>(
+        &domain,
+        async move {
         counter_for_task.fetch_add(1, Ordering::AcqRel);
-    });
+    },
+    );
 
     super::support::wait_until(Duration::from_secs(10), || {
         counter.load(Ordering::Acquire) == 1
     });
 
+    GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global()
+        .destroy_executor_domain(domain.id())
+        .unwrap();
     super::support::wait_until(Duration::from_secs(10), || {
-        GlobalAsyncExecutor::global()
-            .executor_domain_stats(domain_id)
-            .is_some_and(|stats| stats.completed >= 1)
+        GlobalAsyncExecutor::<crate::test_support::TestExecutorPlatform>::global().get_executor_domain(domain.id()).is_none()
     });
 }

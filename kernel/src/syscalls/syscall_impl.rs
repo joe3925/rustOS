@@ -1,11 +1,12 @@
 use crate::executable::program::{
-    Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
+    HandleTable, Message, MessageId, PROGRAM_MANAGER, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
 };
 use crate::memory::io_buffer::{MappedIoBufferBacking, UserBufferAccess};
 use crate::memory::paging::layout::{base_page_size, kernel_space_base};
 use crate::memory::paging::stack::StackSize;
 use crate::platform::{self, resolve_mapping_in_root};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::Task;
 use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
 use crate::structs::io_request::message::MessageDelivery;
@@ -19,12 +20,12 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_executor::global_async::{
-    ExecutorDomainClass, ExecutorDomainConfig, GlobalAsyncExecutor,
+    ExecutorDomainConfig, GlobalAsyncExecutor,
 };
 use kernel_types::arch::{PhysAddr, VirtAddr};
 use kernel_types::dma::{IoBufferError, PhysicalFrameExtent};
 use kernel_types::executor::{
-    USER_EXECUTOR_UPDATE_MAX_ACTIVE, UserExecutorDomainCreate, UserExecutorDomainUpdate,
+    USER_EXECUTOR_UPDATE_WEIGHT, UserExecutorDomainCreate, UserExecutorDomainUpdate,
 };
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::guid_to_string;
@@ -34,7 +35,7 @@ use crate::object_manager::manager::{
     AccessContext, InterfaceMask, OBJECT_MANAGER, Object, ObjectOperation, ObjectPayload,
     ObjectQueryBuffer, ObjectQueryContext, ObjectQueryError, TaskQueueRef,
 };
-use crate::structs::executor_domain::UserExecutorDomain;
+use crate::structs::executor_domain::{DEFAULT_PROCESS_IO_WEIGHT, UserExecutorDomain};
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let process_dir = alloc::format!("\\Process\\{}", pid);
@@ -229,12 +230,7 @@ fn invalid_handle(handle: UserHandle) -> u64 {
 }
 
 fn current_process() -> Result<(u64, ProgramHandle), u64> {
-    let caller_pid = SCHEDULER
-        .get_current_task(platform::current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
+    let caller_pid = crate::scheduling::tls::CURRENT_PROCESS_ID.get();
 
     match PROGRAM_MANAGER.get(caller_pid) {
         Some(handle) => Ok((caller_pid, handle)),
@@ -249,14 +245,13 @@ fn current_process() -> Result<(u64, ProgramHandle), u64> {
 fn resolve_completion_queue(
     handle: UserHandle,
     caller_pid: u64,
-    caller: &ProgramHandle,
+    handles: &HandleTable,
 ) -> Result<Arc<CompletionQueue>, u64> {
-    let obj = caller
-        .read()
-        .resolve_handle(handle)
+    let entry = handles
+        .resolve_entry(handle)
         .ok_or_else(|| invalid_handle(handle))?;
 
-    let queue = match &obj.payload {
+    let queue = match &entry.object.payload {
         ObjectPayload::CompletionQueue(queue) => queue.clone(),
         _ => {
             return Err(invalid_handle(handle));
@@ -275,12 +270,13 @@ fn resolve_completion_queue(
 }
 
 fn resolve_file_object(handle: UserHandle, caller: &ProgramHandle) -> Result<Arc<FileObject>, u64> {
-    let obj = caller
-        .read()
-        .resolve_handle(handle)
+    let program = caller.read();
+    let handles = program.handle_table.read();
+    let entry = handles
+        .resolve_entry(handle)
         .ok_or_else(|| invalid_handle(handle))?;
 
-    match &obj.payload {
+    match &entry.object.payload {
         ObjectPayload::File(file) => Ok(file.clone()),
         _ => Err(invalid_handle(handle)),
     }
@@ -290,9 +286,10 @@ fn resolve_io_buffer_backing(
     caller: &ProgramHandle,
     handle: UserHandle,
 ) -> Result<Arc<MappedIoBufferBacking>, u64> {
-    let entry = caller
-        .read()
-        .resolve_handle_entry(handle)
+    let program = caller.read();
+    let handles = program.handle_table.read();
+    let entry = handles
+        .resolve_entry(handle)
         .ok_or_else(|| invalid_handle(handle))?;
     if !entry
         .object
@@ -363,7 +360,7 @@ pub(crate) fn sys_io_buffer_register(user_address: u64, length: usize, access: u
         let program = caller.read();
         let mut user_memory = program.user_memory.lock();
 
-        let Some(pin) = user_memory.pin(user_address, length as u64).ok() else {
+        let Some(pin) = user_memory.pin(user_address, end).ok() else {
             return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
         };
         pin
@@ -546,6 +543,61 @@ fn copy_user_path_descriptors(addr: u64, count: usize) -> Result<Vec<String>, u6
     Ok(paths)
 }
 
+fn build_file_io_op(
+    handles: &HandleTable,
+    opcode: IoOpcode,
+    op: UserIoOp,
+) -> Result<KernelIoOp, u64> {
+    let length = usize::try_from(op.length)
+        .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
+    let (file, backing) = {
+        let backing_entry = handles
+            .resolve_entry(op.buffer)
+            .ok_or_else(|| invalid_handle(op.buffer))?;
+        if !backing_entry.object.behavior().matches(
+            backing_entry.interface,
+            ObjectOperation::Submit,
+        ) {
+            return Err(make_err(
+                ErrClass::Common,
+                CommonErr::AccessDenied as u16,
+                op.buffer as u32,
+            ));
+        }
+        let backing = match &backing_entry.object.payload {
+            ObjectPayload::IoBufferBacking(backing) => backing.clone(),
+            _ => return Err(invalid_handle(op.buffer)),
+        };
+        let file_entry = handles
+            .resolve_entry(op.target_handle)
+            .ok_or_else(|| invalid_handle(op.target_handle))?;
+        let file = match &file_entry.object.payload {
+            ObjectPayload::File(file) => file.clone(),
+            _ => return Err(invalid_handle(op.target_handle)),
+        };
+        (file, backing)
+    };
+    if opcode == IoOpcode::FileRead {
+        Ok(KernelIoOp::FileRead {
+            file,
+            buffer: backing
+                .create_from_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?,
+            offset: op.offset,
+            user_token: op.user_token,
+        })
+    } else {
+        Ok(KernelIoOp::FileWrite {
+            file,
+            buffer: backing
+                .create_to_device(op.extra0 as usize, length)
+                .map_err(map_io_buffer_error)?,
+            offset: op.offset,
+            user_token: op.user_token,
+        })
+    }
+}
+
 fn build_kernel_io_op(
     caller_pid: u64,
     caller: &ProgramHandle,
@@ -596,33 +648,10 @@ fn build_kernel_io_op(
                 user_token: op.user_token,
             })
         }
-        IoOpcode::FileRead => {
-            let length = usize::try_from(op.length)
-                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
-            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
-            let buffer = backing
-                .create_from_device(op.extra0 as usize, length)
-                .map_err(map_io_buffer_error)?;
-            Ok(KernelIoOp::FileRead {
-                file: resolve_file_object(op.target_handle, caller)?,
-                buffer,
-                offset: op.offset,
-                user_token: op.user_token,
-            })
-        }
-        IoOpcode::FileWrite => {
-            let length = usize::try_from(op.length)
-                .map_err(|_| make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0))?;
-            let backing = resolve_io_buffer_backing(caller, op.buffer)?;
-            let buffer = backing
-                .create_to_device(op.extra0 as usize, length)
-                .map_err(map_io_buffer_error)?;
-            Ok(KernelIoOp::FileWrite {
-                file: resolve_file_object(op.target_handle, caller)?,
-                buffer,
-                offset: op.offset,
-                user_token: op.user_token,
-            })
+        IoOpcode::FileRead | IoOpcode::FileWrite => {
+            let program = caller.read();
+            let handles = program.handle_table.read();
+            build_file_io_op(&handles, opcode, op)
         }
         IoOpcode::FileDelete => {
             if op.target_handle != 0 {
@@ -810,7 +839,7 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
     }
 }
 pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -856,7 +885,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
         );
     }
     let tid = th.task_id();
-    match SCHEDULER.delete_task(tid) {
+    match scheduler().delete_task(tid) {
         Ok(_) => {
             let _ = OBJECT_MANAGER.unlink_object(&obj);
             obj.mark_dead();
@@ -868,21 +897,9 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
 
 pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     let stack_size = StackSize::Medium.as_bytes();
-    let caller_pid = SCHEDULER
-        .get_current_task(platform::current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
-    let caller = match PROGRAM_MANAGER.get(caller_pid) {
-        Some(p) => p,
-        None => {
-            return make_err(
-                ErrClass::Program,
-                ProgErr::NotFound as u16,
-                caller_pid as u32,
-            );
-        }
+    let (caller_pid, caller) = match current_process() {
+        Ok(caller) => caller,
+        Err(err) => return err,
     };
     let managed = { caller.read().managed_threads.lock().len() };
     let stack = if let Some(range) = caller.write().tracker.alloc_auto(stack_size) {
@@ -907,7 +924,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         stack.into(),
         caller_pid,
     );
-    SCHEDULER.add_task(task.clone());
+    scheduler().add_task(task.clone());
 
     let obj = ensure_thread_object(caller_pid, &task);
     caller.read().create_user_handle_for_object(obj)
@@ -926,26 +943,14 @@ pub(crate) fn sys_executor_domain_create(
         Ok(current) => current,
         Err(err) => return err,
     };
-    let domain_id = GlobalAsyncExecutor::global().create_executor_domain(ExecutorDomainConfig {
-        class: ExecutorDomainClass::ProcessIo,
-        max_active: if config.max_active_tasks == 0 {
-            usize::MAX
+    let domain = GlobalAsyncExecutor::<KernelExecutorPlatform>::global().create_executor_domain(ExecutorDomainConfig {
+        weight: if config.weight == 0 {
+            DEFAULT_PROCESS_IO_WEIGHT
         } else {
-            config.max_active_tasks
-        },
-        quantum: ExecutorDomainClass::ProcessIo.default_quantum(),
-        weight: ExecutorDomainClass::ProcessIo.default_weight(),
-        future_arena: Default::default(),
-        ready_shards: if config.ready_shards == 0 {
-            GlobalAsyncExecutor::global().worker_count()
-        } else {
-            config.ready_shards
+            config.weight
         },
     });
-    let Some(domain) = GlobalAsyncExecutor::global().get_executor_domain(domain_id) else {
-        return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, 0);
-    };
-    let user_domain = UserExecutorDomain::new(caller_pid, domain_id, domain);
+    let user_domain = UserExecutorDomain::new(caller_pid, domain);
     let object = Object::new(
         ObjectTag::ExecutorDomain,
         ObjectPayload::ExecutorDomain(user_domain),
@@ -963,7 +968,7 @@ pub(crate) fn sys_executor_domain_configure(
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let update = unsafe { *update_ptr };
-    if update.fields != USER_EXECUTOR_UPDATE_MAX_ACTIVE {
+    if update.fields != USER_EXECUTOR_UPDATE_WEIGHT {
         return make_err(
             ErrClass::Common,
             CommonErr::InvalidPtr as u16,
@@ -982,14 +987,11 @@ pub(crate) fn sys_executor_domain_configure(
     if domain.is_draining() {
         return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
     }
-    let max_active = (update.fields & USER_EXECUTOR_UPDATE_MAX_ACTIVE != 0).then_some(
-        if update.max_active_tasks == 0 {
-            usize::MAX
-        } else {
-            update.max_active_tasks
-        },
-    );
-    domain.update_config(max_active);
+    domain.update_config(if update.weight == 0 {
+        DEFAULT_PROCESS_IO_WEIGHT
+    } else {
+        update.weight
+    });
     0
 }
 
@@ -1140,27 +1142,64 @@ pub(crate) fn sys_completion_queue_create(
     handle
 }
 
-pub(crate) fn sys_io_enqueue(completion_queue_handle: UserHandle, op_ptr: *const UserIoOp) -> u64 {
+pub(crate) fn sys_io_enqueue<const WAIT: bool>(
+    completion_queue_handle: UserHandle,
+    op_ptr: *const UserIoOp,
+    out_completion: *mut UserIoCompletion,
+    timeout_ns: u64,
+) -> u64 {
     if op_ptr.is_null() || !user_ptr_ok(op_ptr, core::mem::size_of::<UserIoOp>()) {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    if WAIT
+        && (out_completion.is_null()
+            || !user_ptr_ok(out_completion, core::mem::size_of::<UserIoCompletion>())
+            || !out_completion.is_aligned())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 1);
     }
 
     let (caller_pid, caller) = match current_process() {
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
-        Ok(queue) => queue,
-        Err(err) => return err,
-    };
-
     let user_op = unsafe { core::ptr::read_unaligned(op_ptr) };
-    let op = match build_kernel_io_op(caller_pid, &caller, user_op) {
-        Ok(op) => op,
-        Err(err) => return err,
+    let (queue, prepared) = {
+        let program = caller.read();
+        let handles = program.handle_table.read();
+        let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &handles) {
+            Ok(queue) => queue,
+            Err(err) => return err,
+        };
+        let prepared = match IoOpcode::from_raw(user_op.opcode) {
+            Some(opcode @ (IoOpcode::FileRead | IoOpcode::FileWrite)) => {
+                match build_file_io_op(&handles, opcode, user_op) {
+                    Ok(op) => Some(op),
+                    Err(err) => return err,
+                }
+            }
+            _ => None,
+        };
+        (queue, prepared)
+    };
+    let op = match prepared {
+        Some(op) => op,
+        None => match build_kernel_io_op(caller_pid, &caller, user_op) {
+            Ok(op) => op,
+            Err(err) => return err,
+        },
     };
 
-    queue.enqueue(op).map_or_else(map_cq_error, |id| id)
+    if WAIT {
+        let (request_id, completion) = match queue.enqueue_wait(op, timeout_ns) {
+            Ok(result) => result,
+            Err(err) => return map_cq_error(err),
+        };
+        unsafe { out_completion.write(completion.unwrap_or_default()) };
+        request_id
+    } else {
+        queue.enqueue(op).map_or_else(map_cq_error, |id| id)
+    }
 }
 
 pub(crate) fn sys_io_enqueue_many(
@@ -1194,7 +1233,11 @@ pub(crate) fn sys_io_enqueue_many(
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
+    let queue = match resolve_completion_queue(
+        completion_queue_handle,
+        caller_pid,
+        &caller.read().handle_table.read(),
+    ) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -1263,7 +1306,11 @@ pub(crate) fn sys_completion_wait(
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
+    let queue = match resolve_completion_queue(
+        completion_queue_handle,
+        caller_pid,
+        &caller.read().handle_table.read(),
+    ) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -1277,7 +1324,11 @@ pub(crate) fn sys_io_cancel(completion_queue_handle: UserHandle, request_id: Req
         Ok(current) => current,
         Err(err) => return err,
     };
-    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid, &caller) {
+    let queue = match resolve_completion_queue(
+        completion_queue_handle,
+        caller_pid,
+        &caller.read().handle_table.read(),
+    ) {
         Ok(queue) => queue,
         Err(err) => return err,
     };
@@ -1286,7 +1337,7 @@ pub(crate) fn sys_io_cancel(completion_queue_handle: UserHandle, request_id: Req
 }
 
 pub(crate) fn sys_get_thread() -> UserHandle {
-    let task = SCHEDULER
+    let task = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap();
     let caller_pid = task.inner.read().parent_pid;
@@ -1303,7 +1354,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
     }
     let msg = unsafe { &mut *message_ptr };
 
-    let sender_pid = SCHEDULER
+    let sender_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1348,7 +1399,7 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
     }
     let rule_u = unsafe { &*rule_ptr };
 
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1463,7 +1514,7 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     }
     let rule_u = unsafe { &*rule_ptr };
 
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1492,7 +1543,7 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
 }
 
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1507,7 +1558,7 @@ pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
 }
 
 pub(crate) fn sys_create_mq() -> UserHandle {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner
@@ -1529,7 +1580,7 @@ pub(crate) fn sys_create_mq() -> UserHandle {
 }
 
 pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
-    let caller_pid = SCHEDULER
+    let caller_pid = scheduler()
         .get_current_task(platform::current_cpu_id())
         .unwrap()
         .inner

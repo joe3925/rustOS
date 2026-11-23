@@ -18,18 +18,18 @@ impl FpuState {
 
         unsafe {
             asm!(
-                "fxsave [{}]",
+                "fxsave64 [{}]",
                 in(reg) current.area.as_mut_ptr(),
                 options(nostack, preserves_flags)
             );
             asm!("fninit", options(nostack, preserves_flags));
             asm!(
-                "fxsave [{}]",
+                "fxsave64 [{}]",
                 in(reg) init.area.as_mut_ptr(),
                 options(nostack, preserves_flags)
             );
             asm!(
-                "fxrstor [{}]",
+                "fxrstor64 [{}]",
                 in(reg) current.area.as_ptr(),
                 options(nostack, preserves_flags)
             );
@@ -40,9 +40,10 @@ impl FpuState {
 
     #[inline(always)]
     pub fn save(&mut self) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
-                "fxsave [{}]",
+                "fxsave64 [{}]",
                 in(reg) self.area.as_mut_ptr(),
                 options(nostack, preserves_flags)
             );
@@ -51,9 +52,10 @@ impl FpuState {
 
     #[inline(always)]
     pub fn restore(&self) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
-                "fxrstor [{}]",
+                "fxrstor64 [{}]",
                 in(reg) self.area.as_ptr(),
                 options(nostack, preserves_flags)
             );

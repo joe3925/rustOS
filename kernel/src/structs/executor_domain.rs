@@ -1,26 +1,30 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kernel_executor::global_async::{
-    DestroyExecutorDomainError, ExecutorDomain, ExecutorDomainId, ExecutorDomainStats,
+    DestroyExecutorDomainError, ExecutorDomain, ExecutorDomainId, ExecutorDomainInfo,
     GlobalAsyncExecutor,
 };
 use spin::Mutex;
 
+pub(crate) const DEFAULT_PROCESS_IO_WEIGHT: usize = 24;
+
 pub struct UserExecutorDomain {
     owner_pid: u64,
-    id: ExecutorDomainId,
-    domain: Arc<ExecutorDomain>,
+    pub(crate) domain: Arc<ExecutorDomain<KernelExecutorPlatform>>,
     user_handles: AtomicUsize,
     draining: AtomicBool,
     config_lock: Mutex<()>,
 }
 
 impl UserExecutorDomain {
-    pub fn new(owner_pid: u64, id: ExecutorDomainId, domain: Arc<ExecutorDomain>) -> Arc<Self> {
+    pub fn new(
+        owner_pid: u64,
+        domain: Arc<ExecutorDomain<KernelExecutorPlatform>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             owner_pid,
-            id,
             domain,
             user_handles: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
@@ -33,23 +37,21 @@ impl UserExecutorDomain {
     }
 
     pub fn id(&self) -> ExecutorDomainId {
-        self.id
+        self.domain.id()
     }
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
     }
 
-    pub fn stats(&self) -> ExecutorDomainStats {
+    pub fn info(&self) -> ExecutorDomainInfo {
         let _guard = self.config_lock.lock();
-        self.domain.stats()
+        self.domain.info()
     }
 
-    pub fn update_config(&self, max_active: Option<usize>) {
+    pub fn update_config(&self, weight: usize) {
         let _guard = self.config_lock.lock();
-        if let Some(max_active) = max_active {
-            self.domain.set_max_active(max_active);
-        }
+        self.domain.set_weight(weight);
     }
 
     pub fn user_handle_opened(&self) {
@@ -68,7 +70,8 @@ impl UserExecutorDomain {
         if self.draining.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = GlobalAsyncExecutor::global().destroy_executor_domain(self.id);
+        let _ = GlobalAsyncExecutor::<KernelExecutorPlatform>::global()
+            .destroy_executor_domain(self.domain.id());
     }
 }
 
@@ -76,7 +79,7 @@ impl core::fmt::Debug for UserExecutorDomain {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserExecutorDomain")
             .field("owner_pid", &self.owner_pid)
-            .field("id", &self.id)
+            .field("id", &self.domain.id())
             .field("draining", &self.is_draining())
             .finish_non_exhaustive()
     }
@@ -85,7 +88,7 @@ impl core::fmt::Debug for UserExecutorDomain {
 impl Drop for UserExecutorDomain {
     fn drop(&mut self) {
         if !self.draining.load(Ordering::Acquire) {
-            match GlobalAsyncExecutor::global().destroy_executor_domain(self.id) {
+            match GlobalAsyncExecutor::<KernelExecutorPlatform>::global().destroy_executor_domain(self.domain.id()) {
                 Ok(_) | Err(DestroyExecutorDomainError::StaleDomain) => {}
                 Err(_) => {}
             }

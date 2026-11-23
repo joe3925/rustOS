@@ -112,16 +112,19 @@ pub fn pnp_add_class_listener(
     unsafe { kernel_sys::pnp_add_class_listener(class, callback, dev_obj) }
 }
 
+#[inline]
 pub fn driver_set_evt_device_add(driver: &Arc<DriverObject>, callback: EvtDriverDeviceAdd) {
-    unsafe { kernel_sys::driver_set_evt_device_add(driver, callback) }
+    *driver.evt_device_add.write() = Some(callback);
 }
 
+#[inline]
 pub fn driver_set_evt_probe_device(driver: &Arc<DriverObject>, callback: EvtDriverProbeDevice) {
-    unsafe { kernel_sys::driver_set_evt_probe_device(driver, callback) }
+    *driver.evt_probe_device.write() = Some(callback);
 }
 
+#[inline]
 pub fn driver_set_evt_driver_unload(driver: &Arc<DriverObject>, callback: EvtDriverUnload) {
-    unsafe { kernel_sys::driver_set_evt_driver_unload(driver, callback) }
+    *driver.evt_driver_unload.write() = Some(callback);
 }
 
 pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>> {

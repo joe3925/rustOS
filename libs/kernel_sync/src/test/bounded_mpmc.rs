@@ -1,10 +1,10 @@
-use crate::bounded_mpmc::BoundedSendError;
-use crate::mpmc::{RecvError, TryRecvError};
+use crate::channels::mpmc::BoundedSendError;
+use crate::channels::mpmc::{RecvError, TryRecvError};
 use crate::test::support::{recv_timeout, P};
 
 #[test]
 fn capacity_len_and_fifo_progress() {
-    let (sender, receiver) = crate::bounded_mpmc::bounded_mpmc_channel::<P, i32>(2, 1);
+    let (sender, receiver) = crate::channels::mpmc::bounded_mpmc_channel::<P, i32>(2, 1);
 
     assert_eq!(sender.capacity(), 2);
     assert!(sender.is_empty());
@@ -21,7 +21,7 @@ fn capacity_len_and_fifo_progress() {
 
 #[test]
 fn disconnect_paths_match_unbounded_mpmc() {
-    let (sender, receiver) = crate::bounded_mpmc::bounded_mpmc_channel::<P, i32>(2, 1);
+    let (sender, receiver) = crate::channels::mpmc::bounded_mpmc_channel::<P, i32>(2, 1);
 
     sender.try_send(10).unwrap();
     drop(sender);
@@ -29,7 +29,7 @@ fn disconnect_paths_match_unbounded_mpmc() {
     assert_eq!(receiver.recv(), Err(RecvError));
     assert_eq!(receiver.try_recv(), Err(TryRecvError::Disconnected));
 
-    let (sender, receiver) = crate::bounded_mpmc::bounded_mpmc_channel::<P, i32>(2, 1);
+    let (sender, receiver) = crate::channels::mpmc::bounded_mpmc_channel::<P, i32>(2, 1);
     drop(receiver);
     assert_eq!(sender.try_send(11), Err(BoundedSendError::Disconnected(11)));
     assert!(sender.is_disconnected());
@@ -37,7 +37,7 @@ fn disconnect_paths_match_unbounded_mpmc() {
 
 #[test]
 fn blocking_recv_is_woken_by_try_send() {
-    let (sender, receiver) = crate::bounded_mpmc::bounded_mpmc_channel::<P, usize>(4, 1);
+    let (sender, receiver) = crate::channels::mpmc::bounded_mpmc_channel::<P, usize>(4, 1);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
 
@@ -55,7 +55,7 @@ fn blocking_recv_is_woken_by_try_send() {
 
 #[test]
 fn concurrent_producers_and_consumers_transfer_all_values() {
-    let (sender, receiver) = crate::bounded_mpmc::bounded_mpmc_channel::<P, usize>(64, 4);
+    let (sender, receiver) = crate::channels::mpmc::bounded_mpmc_channel::<P, usize>(64, 4);
     let producers = 4usize;
     let consumers = 4usize;
     let per_producer = 96usize;

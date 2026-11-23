@@ -1,3 +1,7 @@
+pub mod port;
+
+pub use port::{CompletionPort, PortPermit, PortReserveError, PortResizeError};
+
 use core::num::NonZeroUsize;
 
 #[repr(transparent)]
@@ -23,6 +27,15 @@ impl TaskToken {
 pub enum TaskOutcome<T> {
     Completed(T),
     Cancelled,
+}
+
+impl<T> TaskOutcome<T> {
+    pub fn expect(self, message: &str) -> T {
+        match self {
+            Self::Completed(value) => value,
+            Self::Cancelled => panic!("{message}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

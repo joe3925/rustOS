@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use kernel_types::irq::IrqSafeMutex;
+use crate::sync_platform::IrqSafeMutex;
 use x86_64::PhysAddr;
 
 use crate::machine::MachineInterruptInfo;

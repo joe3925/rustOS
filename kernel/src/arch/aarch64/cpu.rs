@@ -13,7 +13,7 @@ use kernel_types::irq::PlatformCpuId;
 use crate::machine::{PsciConduit, machine_info};
 use crate::memory::paging::stack::{StackSize, allocate_kernel_stack};
 use crate::platform::{AddressSpacePlatform, CpuPlatform, CpuStartupError};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::structs::per_cpu::{PerCpu, alloc_or_get_percpu};
 use crate::util::{CORE_LOCK, KERNEL_INITIALIZED};
 
@@ -162,7 +162,11 @@ unsafe fn set_per_cpu(ptr: *const PerCpu) {
 
 #[inline(always)]
 fn per_cpu_ptr() -> *const PerCpu {
-    TPIDR_EL1.get() as *const PerCpu
+    let pointer = {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { TPIDR_EL1.get() }
+    };
+    pointer as *const PerCpu
 }
 
 fn mark_online(cpu_id: usize) {
@@ -226,6 +230,7 @@ impl CpuPlatform for Aarch64Platform {
         assert_eq!(processor.cpu_id, cpu_id);
         let percpu = alloc_or_get_percpu(cpu_id, processor.platform_cpu_id);
         percpu.tls_array_pointer.store(0, Ordering::Relaxed);
+        percpu.mimalloc_heap.store(0, Ordering::Relaxed);
         unsafe { set_per_cpu(percpu as *const PerCpu) };
         super::interrupts::init::init_current_cpu_interrupts();
         let exception_stack_top = Box::leak(Box::new(
@@ -308,15 +313,17 @@ impl CpuPlatform for Aarch64Platform {
 
     fn halt() -> ! {
         super::debug::init_debug_metadata_transport();
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
                 "msr daifset, #0xf",
                 options(nomem, nostack, preserves_flags)
             );
-            loop {
-                super::debug::poll_rx_once();
-                wfi();
-            }
+        }
+        loop {
+            super::debug::poll_rx_once();
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { wfi() };
         }
     }
 }
@@ -538,7 +545,7 @@ extern "C" fn aarch64_secondary_entry(cpu_id: u64) -> ! {
         core::hint::spin_loop();
     }
     crate::platform::init_periodic_timer();
-    SCHEDULER.init_core(cpu_id);
+    scheduler().init_core(cpu_id);
     AP_SCHEDULER_TURN.fetch_add(1, Ordering::Release);
     crate::platform::enable_interrupts();
     loop {

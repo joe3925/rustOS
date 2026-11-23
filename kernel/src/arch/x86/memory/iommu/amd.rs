@@ -255,23 +255,31 @@ impl AmdViBackend {
     }
 
     #[inline]
-    pub fn unmap_pages(&self, domain: &IommuDomain, iova: u64, page_count: u32) {
-        let mut cur = iova;
-        for _ in 0..page_count {
-            let _ = page_table::unmap_4k(domain.root_phys, cur, PTE_P, domain.page_table_levels);
-            cur += 0x1000;
-        }
+    pub fn unmap_pages(
+        &self,
+        domain: &IommuDomain,
+        iova: u64,
+        page_count: u32,
+    ) -> Result<(), IommuError> {
+        let result = page_table::unmap_range(
+            domain.root_phys,
+            iova,
+            page_count as u64 * 4096,
+            page_table::X86IommuPageTableFormat::Amd,
+        );
 
         let mut inner = self.inner.lock();
         let Some(unit) = inner.units.get_mut(domain.remapper_index as usize) else {
-            return;
+            return Err(IommuError::HardwareError);
         };
         if let Err(err) = submit_serialized(unit, &[invalidate_pages_cmd(domain.domain_id)]) {
             println!(
                 "iommu: AMD-Vi invalidate failed after unmap for segment {} requester {:#06x}: {:?}",
                 domain.segment, domain.requester_id, err
             );
+            return Err(err);
         }
+        result
     }
 
     pub fn invalidate(&self, domain: &IommuDomain, _iova: u64, _len: u64) {

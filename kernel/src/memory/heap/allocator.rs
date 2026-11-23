@@ -5,7 +5,7 @@ use crate::memory::paging::stack::StackSize;
 use crate::platform;
 use crate::println;
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use alloc::boxed::Box;
@@ -53,9 +53,10 @@ impl KernelAllocator {
 
     pub fn mimalloc_thread_done(&self) {
         if self.mimalloc_enabled() {
-            if platform::current_is_in_interrupt() {
-                panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "mimalloc_thread_done called from interrupt, this shouldn't happen"
+            );
             unsafe {
                 mimalloc::mimalloc_thread_done_impl();
             }
@@ -68,56 +69,60 @@ impl KernelAllocator {
 }
 
 unsafe impl GlobalAlloc for KernelAllocator {
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_alloc(layout)
         } else {
             self.bootstrap.alloc(layout)
         }
     }}
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 { unsafe {
         if self.mimalloc_enabled() {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_alloc_zeroed(layout)
         } else {
-            let ptr = self.bootstrap.alloc(layout);
-            if !ptr.is_null() {
-                core::ptr::write_bytes(ptr, 0, layout.size());
-            }
-            ptr
+            self.bootstrap.alloc_zeroed(layout)
         }
     }}
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) { unsafe {
         if ptr.is_null() {
             return;
         }
 
-        if mimalloc::ptr_is_mimalloc(ptr) {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+        if ptr.addr() >= super::heap::mimalloc_heap_start() {
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_dealloc(ptr, layout)
         } else {
             self.bootstrap.dealloc(ptr, layout)
         }
     }}
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 { unsafe {
         if ptr.is_null() {
             return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
         }
 
-        if mimalloc::ptr_is_mimalloc(ptr) {
-            if platform::current_is_in_interrupt() {
-                panic!("Cannot accses allocator from interrupt");
-            }
+        if ptr.addr() >= super::heap::mimalloc_heap_start() {
+            debug_assert!(
+                !platform::current_is_in_interrupt(),
+                "Cannot accses allocator from interrupt"
+            );
             mimalloc::mimalloc_realloc(ptr, layout, new_size)
         } else {
             let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
@@ -234,7 +239,7 @@ pub fn test_full_heap_parallel() {
             core::mem::forget(ctx_arg);
 
             tasks.push(task.clone());
-            SCHEDULER.add_task(task);
+            scheduler().add_task(task);
         }
 
         reset_parallel_heap_test_stats();
@@ -298,8 +303,8 @@ pub fn test_full_heap_parallel() {
             verify_ms,
         );
 
-        while tasks.iter().any(|task| Arc::strong_count(task) > 1) {
-            SCHEDULER.reap_retired_tasks();
+        while tasks.iter().any(|task| task.strong_count() > 1) {
+            scheduler().reap_retired_tasks();
             yield_now();
         }
 

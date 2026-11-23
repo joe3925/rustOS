@@ -1,17 +1,17 @@
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::RwLock;
-use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
-use kernel_types::completion::{CompletionPermit, TaskCompletion};
+use crate::queues::bounded_mpmc::{BoundedMpmcPopError, BoundedMpmcPushError, MpmcRing};
+use crate::completion::{CompletionPermit, TaskCompletion};
 
-use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
-use crate::mpmc::{RecvError, TryRecvError};
+use crate::queues::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
+use crate::channels::mpmc::{RecvError, TryRecvError};
 use crate::platform::contract::Platform;
 
 struct PortChunk<T> {
-    queue: BoundedMpmcQueue<TaskCompletion<T>>,
+    queue: MpmcRing<TaskCompletion<T>>,
     available: AtomicUsize,
     capacity: usize,
 }
@@ -19,7 +19,7 @@ struct PortChunk<T> {
 impl<T> PortChunk<T> {
     fn new(capacity: usize) -> Self {
         Self {
-            queue: BoundedMpmcQueue::new(capacity),
+            queue: MpmcRing::new(capacity),
             available: AtomicUsize::new(capacity),
             capacity,
         }
@@ -41,7 +41,6 @@ pub struct CompletionPort<P: Platform, T> {
     waiters: BoundedWaitQueue<P>,
     chunk_capacity: usize,
     capacity: AtomicUsize,
-    outstanding: AtomicUsize,
     reserve_hint: AtomicUsize,
     recv_hint: AtomicUsize,
     closed: AtomicBool,
@@ -84,13 +83,13 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
             waiters: BoundedWaitQueue::new_chunked(chunk_capacity, chunk_capacity),
             chunk_capacity,
             capacity: AtomicUsize::new(initial_capacity),
-            outstanding: AtomicUsize::new(0),
             reserve_hint: AtomicUsize::new(0),
             recv_hint: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         })
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_reserve(self: &Arc<Self>) -> Result<PortPermit<P, T>, PortReserveError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PortReserveError::Closed);
@@ -101,7 +100,6 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         for offset in 0..count {
             let chunk = &chunks[(start + offset) % count];
             if chunk.try_reserve() {
-                self.outstanding.fetch_add(1, Ordering::AcqRel);
                 return Ok(PortPermit {
                     port: self.clone(),
                     chunk: chunk.clone(),
@@ -112,6 +110,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         Err(PortReserveError::Full)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_grow(&self, additional_capacity: usize) -> Result<usize, PortResizeError> {
         if additional_capacity == 0 {
             return Ok(self.capacity());
@@ -139,6 +138,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
 
     /// Shrinks to `target_capacity` only when whole idle chunks reach that
     /// target exactly. Failure leaves the port unchanged.
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_shrink_to(&self, target_capacity: usize) -> Result<usize, PortResizeError> {
         let mut chunks = self.chunks.write();
         let current = self.capacity.load(Ordering::Acquire);
@@ -184,16 +184,22 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         Ok(target_capacity)
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn try_recv(&self) -> Result<TaskCompletion<T>, TryRecvError> {
         let chunks = self.chunks.read();
         let count = chunks.len();
         let start = self.recv_hint.fetch_add(1, Ordering::Relaxed);
         for offset in 0..count {
             let chunk = &chunks[(start + offset) % count];
-            if let Some(value) = chunk.queue.try_pop() {
-                chunk.available.fetch_add(1, Ordering::Release);
-                self.outstanding.fetch_sub(1, Ordering::AcqRel);
-                return Ok(value);
+            loop {
+                match chunk.queue.try_pop_wait_free() {
+                    Ok(value) => {
+                        chunk.available.fetch_add(1, Ordering::Release);
+                        return Ok(value);
+                    }
+                    Err(BoundedMpmcPopError::Empty) => break,
+                    Err(BoundedMpmcPopError::Contended) => core::hint::spin_loop(),
+                }
             }
         }
         if self.closed.load(Ordering::Acquire) {
@@ -203,6 +209,7 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
         }
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn recv(&self) -> Result<TaskCompletion<T>, RecvError> {
         loop {
             if let Ok(value) = self.try_recv() {
@@ -225,9 +232,17 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
                     continue;
                 }
             }
-            if let Ok(value) = self.try_recv() {
-                self.waiters.clear_current_if_queued();
-                return Ok(value);
+            fence(Ordering::SeqCst);
+            match self.try_recv() {
+                Ok(value) => {
+                    self.waiters.clear_current_if_queued();
+                    return Ok(value);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.waiters.clear_current_if_queued();
+                    return Err(RecvError);
+                }
+                Err(TryRecvError::Empty) => {}
             }
             if self.waiters.is_current_enqueued() {
                 P::park_current();
@@ -241,9 +256,14 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
     }
 
     pub fn outstanding(&self) -> usize {
-        self.outstanding.load(Ordering::Acquire)
+        self.chunks
+            .read()
+            .iter()
+            .map(|chunk| chunk.capacity - chunk.available.load(Ordering::Acquire))
+            .sum()
     }
 
+    #[cfg_attr(irq_check, irq::forbidden)]
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.waiters.wake_all();
@@ -251,25 +271,22 @@ impl<P: Platform, T: Send + 'static> CompletionPort<P, T> {
 }
 
 impl<P: Platform, T: Send + 'static> CompletionPermit<T> for PortPermit<P, T> {
-    fn complete(mut self, completion: TaskCompletion<T>) {
+    #[cfg_attr(irq_check, irq::forbidden)]
+    fn complete(mut self, mut completion: TaskCompletion<T>) {
         loop {
             match self.chunk.queue.try_push_wait_free(completion) {
                 Ok(()) => break,
-                Err(BoundedMpmcPushError::Contended(value)) => {
+                Err(BoundedMpmcPushError::Contended(value) | BoundedMpmcPushError::Full(value)) => {
+                    completion = value;
                     core::hint::spin_loop();
-                    // The reservation guarantees this cannot become full.
-                    if let Ok(()) = self.chunk.queue.try_push(value) {
-                        break;
-                    }
-                    unreachable!("reserved completion slot became unavailable");
-                }
-                Err(BoundedMpmcPushError::Full(_)) => {
-                    panic!("reserved completion slot became full")
                 }
             }
         }
         self.consumed = true;
-        self.port.waiters.wake_one();
+        fence(Ordering::SeqCst);
+        if !self.port.waiters.is_empty() {
+            self.port.waiters.wake_one();
+        }
     }
 }
 
@@ -277,7 +294,6 @@ impl<P: Platform, T> Drop for PortPermit<P, T> {
     fn drop(&mut self) {
         if !self.consumed {
             self.chunk.available.fetch_add(1, Ordering::Release);
-            self.port.outstanding.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }

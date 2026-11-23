@@ -4,6 +4,7 @@ cargo-features = ["profile-rustflags"]
 name = "kernel"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [[bin]]
 name = "kernel"
@@ -11,12 +12,14 @@ path = "src/main.rs"
 
 [features]
 kernel-bench = []
+kernel-pgo = ["kernel-bench", "dep:minicov"]
 kernel-correctness = ["kernel-self-tests"]
 kernel-self-tests = []
 boot-timings = []
 
 [dependencies]
-spin = "0.10.0"
+minicov = { version = "=0.3.9", optional = true }
+spin = { version = "0.10.0" }
 bitflags = "2.6.0"
 async-lock = { version = "3.4.0", default-features = false }
 rand_xoshiro = { version = "0.7.0", default-features = false }
@@ -58,7 +61,7 @@ device_tree = { path = "../third_party/device_tree" }
 
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = "=0.15.2"
+x86_64 = "=0.15.5"
 x86_64-paging = { git = "https://github.com/joe3925/x86_64-paging.git", rev = "812d744461e432978288953f5086f10ee60ac7f3" }
 raw-cpuid = "11.5.0"
 
@@ -73,6 +76,7 @@ features = ["spin_no_std"]
 
 [lints.rust]
 unused_must_use = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(irq_check)'] }
 
 [build-dependencies]
 cc = "1.2"

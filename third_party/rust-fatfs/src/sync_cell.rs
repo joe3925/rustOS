@@ -77,7 +77,8 @@ impl<T> Deref for SendRef<'_, T> {
 
 impl<T> Drop for SendRef<'_, T> {
     fn drop(&mut self) {
-        let prev = self.cell.borrows.swap(UNUSED, Ordering::Release);
+        let prev = self.cell.borrows.load(Ordering::Relaxed);
+        self.cell.borrows.store(UNUSED, Ordering::Release);
         debug_assert_eq!(prev, 1);
     }
 }
@@ -98,7 +99,8 @@ impl<T> DerefMut for SendRefMut<'_, T> {
 
 impl<T> Drop for SendRefMut<'_, T> {
     fn drop(&mut self) {
-        let prev = self.cell.borrows.swap(UNUSED, Ordering::Release);
+        let prev = self.cell.borrows.load(Ordering::Relaxed);
+        self.cell.borrows.store(UNUSED, Ordering::Release);
         debug_assert_eq!(prev, WRITING);
     }
 }

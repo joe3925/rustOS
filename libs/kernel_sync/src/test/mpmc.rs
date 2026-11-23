@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use crate::mpmc::{RecvError, SendError, TryRecvError};
+use crate::channels::mpmc::{RecvError, SendError, TryRecvError};
 use crate::test::support::{recv_timeout, P};
 
 #[test]
 fn try_recv_send_recv_and_disconnect() {
-    let (sender, receiver) = crate::mpmc::mpmc_channel::<P, i32>();
+    let (sender, receiver) = crate::channels::mpmc::mpmc_channel::<P, i32>();
 
     assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
     sender.send(1).unwrap();
@@ -23,7 +23,7 @@ fn try_recv_send_recv_and_disconnect() {
 
 #[test]
 fn dropping_receiver_disconnects_senders() {
-    let (sender, receiver) = crate::mpmc::mpmc_channel::<P, i32>();
+    let (sender, receiver) = crate::channels::mpmc::mpmc_channel::<P, i32>();
 
     drop(receiver);
 
@@ -33,7 +33,7 @@ fn dropping_receiver_disconnects_senders() {
 
 #[test]
 fn blocking_recv_is_woken_by_send() {
-    let (sender, receiver) = crate::mpmc::mpmc_channel::<P, usize>();
+    let (sender, receiver) = crate::channels::mpmc::mpmc_channel::<P, usize>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
 
@@ -51,7 +51,7 @@ fn blocking_recv_is_woken_by_send() {
 
 #[test]
 fn concurrent_producers_deliver_every_message() {
-    let (sender, receiver) = crate::mpmc::mpmc_channel::<P, usize>();
+    let (sender, receiver) = crate::channels::mpmc::mpmc_channel::<P, usize>();
     let producers = 4usize;
     let per_producer = 128usize;
     let mut handles = Vec::new();
@@ -84,7 +84,7 @@ fn concurrent_producers_deliver_every_message() {
 
 #[test]
 fn cloned_receivers_compete_without_duplicates() {
-    let (sender, receiver) = crate::mpmc::mpmc_channel::<P, usize>();
+    let (sender, receiver) = crate::channels::mpmc::mpmc_channel::<P, usize>();
     let receiver = Arc::new(receiver);
     let consumers = 4usize;
     let messages = 256usize;

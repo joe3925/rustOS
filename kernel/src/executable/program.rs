@@ -7,7 +7,8 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
-use kernel_sync::{AsyncMpmcQueue, AsyncRecvError, WaitRegistration};
+use kernel_sync::queues::{AsyncMpmcQueue, AsyncRecvError};
+use kernel_sync::queues::async_mpmc::WaitRegistration;
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::status::LoadError::NoSuchSymbol;
 use kernel_types::{
@@ -26,7 +27,7 @@ use crate::{
 use crate::{
     memory::paging::address_space::AddressSpaceRoot,
     memory::user_pins::UserMemoryPins,
-    scheduling::scheduler::SCHEDULER,
+    scheduling::scheduler::scheduler,
 };
 use kernel_types::arch::{PageFlags, VirtAddr};
 
@@ -56,7 +57,7 @@ fn obj_as_queue(obj: &ObjectRef) -> Option<QueueHandle> {
 }
 
 pub struct MessageQueue {
-    queue: AsyncMpmcQueue<Message>,
+    pub(crate) queue: AsyncMpmcQueue<Message>,
 }
 
 impl core::fmt::Debug for MessageQueue {
@@ -76,8 +77,6 @@ impl MessageQueue {
     }
 
     pub fn push_message(&self, msg: Message) {
-        // Preserve the existing closed-queue behavior: messages sent after
-        // shutdown are discarded rather than reported to the sender.
         let _ = self.queue.push(msg);
     }
 
@@ -87,7 +86,7 @@ impl MessageQueue {
 
     pub fn poll_message(
         &self,
-        registration: &WaitRegistration,
+        registration: &mut WaitRegistration,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Message, AsyncRecvError>> {
         self.queue.poll_pop(registration, cx)
@@ -593,11 +592,11 @@ impl Program {
 
             let mut running = managed.len() + 1;
 
-            if SCHEDULER.get_task_by_id(main_tid).is_none() {
+            if scheduler().get_task_by_id(main_tid).is_none() {
                 running -= 1;
             }
             for tid in &*managed {
-                if SCHEDULER
+                if scheduler()
                     .get_task_by_id(tid.inner.read().executer_id.unwrap())
                     .is_none()
                 {
@@ -770,7 +769,7 @@ impl Program {
 
 pub struct ProgramManager {
     next_pid: AtomicU64,
-    programs: RwLock<BTreeMap<u64, ProgramHandle>>,
+    pub(crate) programs: RwLock<BTreeMap<u64, ProgramHandle>>,
 }
 
 impl ProgramManager {
@@ -854,15 +853,28 @@ impl ProgramManager {
         self.programs.read().get(&pid).map(Arc::clone)
     }
 
+    pub(crate) fn try_with<R>(
+        &self,
+        pid: u64,
+        f: impl FnOnce(Option<&Program>) -> R,
+    ) -> Result<R, ()> {
+        let programs = self.programs.try_read().ok_or(())?;
+        let Some(program) = programs.get(&pid) else {
+            return Ok(f(None));
+        };
+        let program = program.try_read().ok_or(())?;
+        Ok(f(Some(&program)))
+    }
+
     pub fn start_pid(&self, pid: u64) -> Option<TaskHandle> {
         let handle = self.get(pid)?;
         let task_arc = {
             let prog = handle.write();
-            Arc::clone(prog.main_thread.as_ref()?)
+            prog.main_thread.as_ref()?.clone()
         };
         let tid = task_arc.task_id();
-        SCHEDULER.add_task(task_arc);
-        SCHEDULER.get_task_by_id(tid)
+        scheduler().add_task(task_arc);
+        scheduler().get_task_by_id(tid)
     }
 
     pub fn kill_program(&self, pid: u64) -> Result<(), LoadError> {

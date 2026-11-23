@@ -1,44 +1,15 @@
 #[cfg(any(loom, feature = "loom"))]
 pub mod atomic {
     pub use loom::sync::atomic::{
-        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering, fence,
     };
 
-    pub struct AtomicU128(loom::sync::Mutex<u128>);
-
-    impl AtomicU128 {
-        pub fn new(value: u128) -> Self {
-            Self(loom::sync::Mutex::new(value))
-        }
-
-        pub fn load(&self, _order: Ordering) -> u128 {
-            *self.0.lock().expect("loom atomic mutex poisoned")
-        }
-
-        pub fn compare_exchange(
-            &self,
-            current: u128,
-            new: u128,
-            _success: Ordering,
-            _failure: Ordering,
-        ) -> Result<u128, u128> {
-            let mut value = self.0.lock().expect("loom atomic mutex poisoned");
-            if *value == current {
-                *value = new;
-                Ok(current)
-            } else {
-                Err(*value)
-            }
-        }
-    }
 }
 
 #[cfg(not(any(loom, feature = "loom")))]
 pub mod atomic {
-    pub use portable_atomic::AtomicU128;
-
     pub use core::sync::atomic::{
-        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+        AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering, fence,
     };
 }
 
@@ -54,6 +25,10 @@ pub struct Mutex<T>(loom::sync::Mutex<T>);
 impl<T> Mutex<T> {
     pub fn new(value: T) -> Self {
         Self(loom::sync::Mutex::new(value))
+    }
+
+    pub fn try_lock(&self) -> Option<loom::sync::MutexGuard<'_, T>> {
+        self.0.try_lock().ok()
     }
 
     pub fn lock(&self) -> loom::sync::MutexGuard<'_, T> {
@@ -100,4 +75,28 @@ where
     builder.preemption_bound = None;
 
     builder.check(f);
+}
+
+#[cfg(any(loom, feature = "loom"))]
+pub(crate) type SchedulerMutex<T> = Mutex<T>;
+
+#[cfg(all(not(any(loom, feature = "loom")), not(any(test, loom, feature = "loom", feature = "hosted"))))]
+pub(crate) type SchedulerMutex<T> = spin::Mutex<T>;
+
+#[cfg(all(not(any(loom, feature = "loom")), any(test, loom, feature = "loom", feature = "hosted")))]
+pub(crate) struct SchedulerMutex<T>(std::sync::Mutex<T>);
+
+#[cfg(all(not(any(loom, feature = "loom")), any(test, loom, feature = "loom", feature = "hosted")))]
+impl<T> SchedulerMutex<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    pub(crate) fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, T>> {
+        self.0.try_lock().ok()
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }

@@ -2,7 +2,15 @@
 #![allow(non_upper_case_globals)]
 pub extern crate alloc;
 
-pub use kernel_types::{async_ffi, request, status};
+#[cfg(feature = "driver-pgo")]
+#[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
+pub unsafe extern "C" fn RustosPgoCapture(profile: &mut alloc::vec::Vec<u8>) -> bool {
+    minicov::coverage_enabled() && unsafe { minicov::capture_coverage(profile).is_ok() }
+}
+
+pub use kernel_executor::async_ffi;
+pub use kernel_types::{request, status};
 
 pub use kernel_routing;
 pub use kernel_types;

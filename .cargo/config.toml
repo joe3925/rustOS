@@ -1,3 +1,6 @@
+[alias]
+xtask = "run -p xtask --"
+
 [unstable]
 bindeps = true
 json-target-spec = true
@@ -5,6 +8,14 @@ profile-rustflags = true
 
 [target.x86_64-unknown-none]
 rustflags = ["-C", "code-model=large"]
+
+[target.x86_64-rustos-kernel]
+linker = "rust-lld"
+rustflags = ["-Clinker-plugin-lto", "-Clto=fat", "-Clink-arg=/opt:lldlto=3"]
+
+[target.aarch64-rustos-kernel]
+linker = "rust-lld"
+rustflags = ["-Clinker-plugin-lto", "-Clto=fat", "-Clink-arg=/opt:lldlto=3"]
 
 [target.'cfg(target_arch = "aarch64")']
 rustflags = ["--cfg", "portable_atomic_no_outline_atomics"]

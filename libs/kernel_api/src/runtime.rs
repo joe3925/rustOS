@@ -3,31 +3,42 @@ extern crate alloc;
 use crate::kernel_types::runtime::Stopwatch;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
-use kernel_sys::{elapsed, kernel_cycle_counter, kernel_cycle_counter_frequency_hz, stopwatch_new};
+pub use kernel_sync::completion::TaskOutcome;
+use kernel_sys::kernel_cycle_counter_frequency_hz;
 use kernel_types::arch::{Platform, PlatformInfo};
 use spin::Mutex;
 
 use kernel_sys::{
-    kernel_block_on_thread_state, kernel_spawn_blocking_raw, kernel_spawn_detached_abi,
+    kernel_block_on_context, kernel_spawn_blocking_raw, kernel_spawn_detached_abi,
     kernel_spawn_joinable_abi, try_steal_blocking_one as sys_try_steal_blocking_one,
 };
 use kernel_types::async_ffi::{AbiFuture, FutureExt};
-use kernel_types::runtime::BlockOnThreadState;
+use kernel_types::runtime::{BlockOnContext, BlockOnThreadState};
+
+pub fn task_cancellation_guard() -> kernel_types::runtime::TaskCancellationGuard {
+    unsafe { kernel_sys::kernel_task_cancellation_guard() }
+}
 
 /// Spawn an async task on the kernel executor (shared singleton in the kernel) and
 /// return a join handle that can be awaited for completion.
-pub fn spawn<F>(future: F) -> AbiFuture<()>
+pub fn spawn<F>(future: F) -> impl Future<Output = TaskOutcome<()>> + Send
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    unsafe { kernel_spawn_joinable_abi(future.into_abi()) }
+    let handle = unsafe { kernel_spawn_joinable_abi(future.into_abi()) };
+    async move {
+        if handle.await {
+            TaskOutcome::Completed(())
+        } else {
+            TaskOutcome::Cancelled
+        }
+    }
 }
 
 /// Spawn a detached async task (fire-and-forget).
@@ -54,23 +65,9 @@ impl Drop for BlockOnActiveGuard<'_> {
     }
 }
 
-struct BlockOnWaker {
-    state: Arc<BlockOnThreadState>,
-}
-
-impl Wake for BlockOnWaker {
-    fn wake(self: Arc<Self>) {
-        self.state.mark_ready();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.state.mark_ready();
-    }
-}
-
 pub fn block_on<F: Future + Send>(future: F) -> F::Output {
     let mut future = core::pin::pin!(future);
-    let state = unsafe { kernel_block_on_thread_state() };
+    let BlockOnContext { state, waker } = unsafe { kernel_block_on_context() };
 
     if !state.try_enter() {
         panic!("reentrant kernel_api::runtime::block_on is not supported");
@@ -79,9 +76,6 @@ pub fn block_on<F: Future + Send>(future: F) -> F::Output {
     let _active = BlockOnActiveGuard::new(&state);
     state.clear_ready();
 
-    let waker = Waker::from(Arc::new(BlockOnWaker {
-        state: state.clone(),
-    }));
     let mut context = Context::from_waker(&waker);
 
     loop {
@@ -99,7 +93,7 @@ pub struct BlockingJoin<R> {
 }
 
 struct BlockingState<R> {
-    result: Mutex<Option<R>>,
+    result: Mutex<Option<TaskOutcome<R>>>,
     ready: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
@@ -113,7 +107,7 @@ impl<R> BlockingState<R> {
         }
     }
 
-    fn store(&self, value: R) {
+    fn store(&self, value: TaskOutcome<R>) {
         *self.result.lock() = Some(value);
         self.ready.store(true, Ordering::Release);
 
@@ -124,9 +118,9 @@ impl<R> BlockingState<R> {
 }
 
 impl<R> Future for BlockingJoin<R> {
-    type Output = R;
+    type Output = TaskOutcome<R>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.state.ready.load(Ordering::Acquire) {
             if let Some(v) = self.state.result.lock().take() {
                 return Poll::Ready(v);
@@ -145,7 +139,7 @@ impl<R> Future for BlockingJoin<R> {
     }
 }
 
-extern "C" fn blocking_trampoline<F, R>(ctx: usize)
+extern "C" fn blocking_trampoline<F, R>(ctx: usize, run: bool)
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -154,9 +148,12 @@ where
     let boxed = unsafe { Box::from_raw(ptr) };
     let (state, func_opt) = *boxed;
 
-    if let Some(f) = func_opt {
+    if !run {
+        drop(func_opt);
+        state.store(TaskOutcome::Cancelled);
+    } else if let Some(f) = func_opt {
         let res = f();
-        state.store(res);
+        state.store(TaskOutcome::Completed(res));
     }
 }
 
@@ -206,6 +203,7 @@ pub fn cycle_counter() -> u64 {
 
 #[inline(always)]
 pub fn cycle_counter_frequency_hz() -> u64 {
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe { kernel_cycle_counter_frequency_hz() }
 }
 
@@ -216,14 +214,18 @@ pub struct KernelStopwatch {
 impl KernelStopwatch {
     #[inline(always)]
     pub fn start() -> Self {
-        Self {
-            inner: unsafe { stopwatch_new() },
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
+        unsafe {
+            let frequency_hz = kernel_cycle_counter_frequency_hz();
+            Self {
+                inner: Stopwatch::new(cycle_counter(), frequency_hz),
+            }
         }
     }
 
     #[inline(always)]
     pub fn elapsed(&self) -> Duration {
-        unsafe { elapsed(&self.inner) }
+        self.inner.elapsed_at(cycle_counter())
     }
 
     #[inline(always)]

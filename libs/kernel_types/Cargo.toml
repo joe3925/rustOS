@@ -4,12 +4,15 @@ cargo-features = ["profile-rustflags"]
 name = "kernel_types"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["rlib"]
 
 
 [dependencies]
+kernel_executor = { path = "../kernel_executor", default-features = false }
+kernel_sync = { path = "../kernel_sync", default-features = false }
 kernel_macros = { path = "../kernel_macros" }
 
 acpi = { git = "https://github.com/rust-osdev/acpi", rev = "09d5c67" }

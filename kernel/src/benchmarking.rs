@@ -11,15 +11,21 @@ compile_error!("kernel-bench and kernel-correctness require separate builds");
 mod capture;
 #[cfg(feature = "kernel-correctness")]
 mod correctness;
+#[cfg(feature = "kernel-bench")]
+mod heap;
+#[cfg(feature = "kernel-bench")]
+mod multi_file;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod runner;
+#[cfg(feature = "kernel-bench")]
+mod spawn;
 #[cfg(feature = "kernel-bench")]
 mod suites;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod task_batch;
 
 pub use capture::{
-    BENCH_ENABLED, BenchSpanGuard, BenchWindow, bench_c_drive_io_async, bench_log_span_end,
+    BENCH_ENABLED, BenchSpanGuard, BenchWindow, bench_c_drive_io_inner, bench_log_span_end,
     bench_span_guard, bench_submit_interrupt_sample_current_core, bench_submit_rip_sample,
     bench_submit_rip_sample_current_core, used_memory,
 };
@@ -36,6 +42,11 @@ pub fn exit_benchmark_vm(success: bool) -> ! {
     unsafe {
         let mut port = x86_64::instructions::port::Port::<u32>::new(0xf4);
         port.write(if success { 0x10 } else { 0x11 });
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if let Some(conduit) = crate::machine::machine_info().cpu_topology().psci_conduit {
+        crate::arch::aarch64::psci_call(conduit, 0x8400_0008, 0, 0, 0);
     }
 
     loop {

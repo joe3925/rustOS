@@ -4,6 +4,7 @@
 //! This module only contains DPC queue functionality that requires kernel internals.
 
 use crate::drivers::pnp::manager::PNP_MANAGER;
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use alloc::collections::vec_deque::VecDeque;
 use kernel_executor::runtime::runtime::spawn_detached;
 use spin::Mutex;
@@ -25,7 +26,7 @@ lazy_static::lazy_static! {
 impl PnpManager {
     pub fn queue_dpc(&self, func: extern "C" fn(usize), arg: usize) {
         GLOBAL_DPCQ.lock().push_back(Dpc { func, arg });
-        spawn_detached(PNP_MANAGER.run_one_dpc());
+        spawn_detached::<KernelExecutorPlatform, _>(PNP_MANAGER.run_one_dpc());
     }
 
     async fn run_one_dpc(&self) {

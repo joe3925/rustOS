@@ -78,7 +78,7 @@ pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     })
     .await;
 
-    let Ok(aml_ctx) = parsed else {
+    let kernel_api::runtime::TaskOutcome::Completed(Ok(aml_ctx)) = parsed else {
         return Ok(DriverStep::Continue);
     };
 

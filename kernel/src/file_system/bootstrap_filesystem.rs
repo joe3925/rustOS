@@ -95,11 +95,11 @@ impl BootstrapProvider {
             next_id: AtomicU64::new(1),
             handles: RwLock::new(BTreeMap::new()),
         };
-        prov.init_tree(&boot);
+        prov.init_tree(boot);
         prov
     }
 
-    fn init_tree(&self, boot: &[BootPkg]) {
+    fn init_tree(&self, boot: Vec<BootPkg>) {
         let mut n = self.nodes.write();
 
         for d in [
@@ -136,8 +136,8 @@ impl BootstrapProvider {
             let toml_src = norm_upcase(&alloc::format!("{}/{}", ddir, toml_name));
             let dll_src = norm_upcase(&alloc::format!("{}/{}", ddir, dll_name));
 
-            n.insert(toml_src.clone(), Node::file(DataRef::Boot(bp.toml.clone())));
-            n.insert(dll_src.clone(), Node::file(DataRef::Boot(bp.image.clone())));
+            n.insert(toml_src.clone(), Node::file(DataRef::Boot(bp.toml)));
+            n.insert(dll_src.clone(), Node::file(DataRef::Boot(bp.image)));
 
             n.get_mut(&ddir)
                 .unwrap()

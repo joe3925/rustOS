@@ -3,11 +3,13 @@ use kernel_sys::{kernel_alloc, kernel_free};
 pub struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
     #[inline]
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         unsafe { kernel_alloc(layout) }
     }
 
     #[inline]
+    #[cfg_attr(irq_check, irq::forbidden)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { kernel_free(ptr, layout) }
     }
@@ -54,7 +56,7 @@ pub fn virt_to_phys(to_phys: VirtAddr) -> Option<(u64, PhysAddr)> {
 }
 
 pub fn virt_to_phys_in(root: AddressSpaceRoot, to_phys: VirtAddr) -> Option<(u64, PhysAddr)> {
-    unsafe { kernel_sys::virt_to_phys(root, to_phys) }
+    unsafe { kernel_sys::resolve_virtual_range_frame(root, to_phys) }
 }
 
 pub fn resolve_virtual_range_frame(

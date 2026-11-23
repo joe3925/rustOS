@@ -16,7 +16,7 @@ use crate::structs::stopwatch::Stopwatch;
 
 use super::{
     bench_case_end, bench_case_fail, bench_case_start, bench_measure, bench_measure_with_tolerance,
-    capture::bench_c_drive_io_async, task_batch::run_task_batch,
+    capture::bench_c_drive_io_inner, task_batch::run_task_batch,
 };
 
 /// Independent boots dominate confidence. More boots narrow uncertainty but increase CI time.
@@ -28,7 +28,7 @@ const QUEUE_TRIALS: usize = 15;
 /// recommended; lowering it detects smaller slowdowns but demands a quieter host.
 const QUEUE_DURATION_TOLERANCE_PERCENT: f64 = 3.0;
 /// Throughput is derived from duration and tends to amplify jitter. 5–10% is recommended.
-const QUEUE_THROUGHPUT_TOLERANCE_PERCENT: f64 = 8.0;
+pub(super) const THROUGHPUT_TOLERANCE_PERCENT: f64 = 8.0;
 /// Largest disk slowdown treated as practically unchanged. Lower values catch smaller changes but
 /// warn more often; 5–10% is recommended for end-to-end virtual-disk benchmarks.
 const DISK_TOLERANCE_PERCENT: f64 = 8.0;
@@ -38,7 +38,23 @@ const IOBUFFER_LEASE_OPS: usize = 20_000;
 const IOBUFFER_SPLIT_OPS: usize = 1_000;
 
 pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
+    let heap_boots = if option_env!("RUSTOS_BENCH_TAGS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|tag| tag == "ci")
+    {
+        INDEPENDENT_BOOTS
+    } else {
+        3
+    };
     vec![
+        BenchSuiteDescriptor::new(
+            "heap.mimalloc",
+            "Parallel mimalloc allocation and free",
+            vec!["ci".to_string(), "heap".to_string()],
+            super::heap::suite,
+        )
+        .with_independent_boots(heap_boots),
         BenchSuiteDescriptor::new(
             "executor.runtime",
             "Executor queue-pressure performance",
@@ -47,10 +63,31 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
         )
         .with_independent_boots(INDEPENDENT_BOOTS),
         BenchSuiteDescriptor::new(
+            "executor.spawn",
+            "Kernel executor spawn call cost",
+            vec!["ci".to_string(), "executor".to_string()],
+            super::spawn::suite::<false>,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
+            "executor.spawn-latency",
+            "Async spawn to first poll with one task in flight",
+            vec!["ci".to_string(), "executor".to_string()],
+            super::spawn::suite::<true>,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
             "io.c-drive",
             "End-to-end C drive read/write workload",
             vec!["ci".to_string(), "io".to_string()],
             c_drive_suite,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
+            "io.multi-file",
+            "Concurrent file I/O on the kernel executor",
+            vec!["io".to_string(), "concurrent".to_string()],
+            super::multi_file::multi_file_suite,
         )
         .with_independent_boots(INDEPENDENT_BOOTS),
         BenchSuiteDescriptor::new(
@@ -284,7 +321,7 @@ async fn executor_queue_stress(handle: BenchRunHandle) -> bool {
             task_count as f64 * 1_000_000_000.0 / elapsed as f64,
             BenchMetricUnit::OperationsPerSecond,
             BenchMetricDirection::HigherIsBetter,
-            Some(QUEUE_THROUGHPUT_TOLERANCE_PERCENT),
+            Some(THROUGHPUT_TOLERANCE_PERCENT),
         );
     }
 
@@ -301,39 +338,62 @@ fn queue_value(value: u64) -> u64 {
 }
 extern "C" fn c_drive_suite(handle: BenchRunHandle) -> AbiFuture<BenchSuiteStatus> {
     async move {
-        if !bench_case_start(handle, "read-write".to_string()) {
-            return BenchSuiteStatus::Failed;
-        }
+        let repetition = super::boot_state::current_repetition().await;
+        let seed = 0x2026_1104u64.wrapping_add(repetition as u64);
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let mut modes = [
+            ("buffered", gib, gib),
+            ("cached", 10 * mib, 100 * mib),
+            ("read-write", 10 * mib, 50 * mib),
+        ];
+        let mode_count = modes.len();
+        modes.rotate_left(repetition.saturating_sub(1) as usize % mode_count);
+        for (case_name, bytes_per_pass, total_bytes) in modes {
+            if option_env!("RUSTOS_BENCH_C_DRIVE_CASE").is_some_and(|selected| selected != case_name) {
+                continue;
+            }
+            if !bench_case_start(handle, case_name.to_string()) {
+                return BenchSuiteStatus::Failed;
+            }
 
-        let Some(results) = bench_c_drive_io_async(true).await else {
-            bench_case_fail(handle, "C drive workload failed".to_string());
+            let Some(results) = bench_c_drive_io_inner(
+                case_name == "read-write",
+                case_name == "cached",
+                Some(seed),
+                bytes_per_pass,
+                total_bytes,
+            )
+            .await else {
+                bench_case_fail(handle, "C drive workload failed".to_string());
+                bench_case_end(handle);
+                return BenchSuiteStatus::Failed;
+            };
+            for result in results.sizes {
+                let size = alloc::format!("{}k", result.size_bytes / 1024);
+                for value in result.write_ns_per_op {
+                    bench_measure_with_tolerance(
+                        handle,
+                        alloc::format!("write_ns_per_op.{size}"),
+                        value as f64,
+                        BenchMetricUnit::Nanoseconds,
+                        BenchMetricDirection::LowerIsBetter,
+                        Some(DISK_TOLERANCE_PERCENT),
+                    );
+                }
+                for value in result.read_ns_per_op {
+                    bench_measure_with_tolerance(
+                        handle,
+                        alloc::format!("read_ns_per_op.{size}"),
+                        value as f64,
+                        BenchMetricUnit::Nanoseconds,
+                        BenchMetricDirection::LowerIsBetter,
+                        Some(DISK_TOLERANCE_PERCENT),
+                    );
+                }
+            }
             bench_case_end(handle);
-            return BenchSuiteStatus::Failed;
-        };
-        for result in results.sizes {
-            let size = alloc::format!("{}k", result.size_bytes / 1024);
-            for value in result.write_ns_per_op {
-                bench_measure_with_tolerance(
-                    handle,
-                    alloc::format!("write_ns_per_op.{size}"),
-                    value as f64,
-                    BenchMetricUnit::Nanoseconds,
-                    BenchMetricDirection::LowerIsBetter,
-                    Some(DISK_TOLERANCE_PERCENT),
-                );
-            }
-            for value in result.read_ns_per_op {
-                bench_measure_with_tolerance(
-                    handle,
-                    alloc::format!("read_ns_per_op.{size}"),
-                    value as f64,
-                    BenchMetricUnit::Nanoseconds,
-                    BenchMetricDirection::LowerIsBetter,
-                    Some(DISK_TOLERANCE_PERCENT),
-                );
-            }
         }
-        bench_case_end(handle);
         BenchSuiteStatus::Passed
     }
     .into_abi()

@@ -39,12 +39,17 @@ pub fn wait_cycle_idle(cycles: u128) {
 }
 
 pub fn get_cpu_info() -> CpuId<CpuIdReaderNative> {
-    CpuId::new()
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+    unsafe { CpuId::new() }
 }
 
 pub(crate) fn platform_cpu_id() -> u8 {
     let info = get_cpu_info();
-    info.get_feature_info()
+    let features = {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { info.get_feature_info() }
+    };
+    features
         .expect("cpu id not available?")
         .initial_local_apic_id()
 }
@@ -66,24 +71,6 @@ fn wrmsr(msr: u32, val: u64) {
 }
 
 #[inline(always)]
-fn rdmsr(msr: u32) -> u64 {
-    let lo: u32;
-    let hi: u32;
-
-    unsafe {
-        asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") lo,
-            out("edx") hi,
-            options(nostack, preserves_flags)
-        );
-    }
-
-    ((hi as u64) << 32) | lo as u64
-}
-
-#[inline(always)]
 /// # Safety
 /// `percpu` must be a stable, initialized per-CPU allocation that remains live
 /// while either GS base can reference it.
@@ -96,11 +83,17 @@ pub(crate) unsafe fn set_gs_bases(percpu: *const PerCpu) {
 
 #[inline(always)]
 pub fn current_percpu() -> &'static PerCpu {
-    let ptr = rdmsr(IA32_GS_BASE) as *const PerCpu;
-
-    debug_assert!(!ptr.is_null());
-
-    unsafe { &*ptr }
+    let ptr: *const PerCpu;
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
+    unsafe {
+        asm!(
+            "mov {ptr}, qword ptr gs:[{offset}]",
+            ptr = out(reg) ptr,
+            offset = const crate::structs::per_cpu::PERCPU_SELF_POINTER_OFF,
+            options(nostack, preserves_flags, readonly)
+        );
+        &*ptr
+    }
 }
 
 #[inline(always)]
@@ -111,6 +104,7 @@ pub fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
 #[inline(always)]
 pub fn current_is_in_interrupt() -> bool {
     let value: u8;
+    #[cfg_attr(irq_check, irq::trusted(unsafe))]
     unsafe {
         asm!(
             "mov {value}, byte ptr gs:[{offset}]",
@@ -126,22 +120,6 @@ extern "C" fn irq_context_query() -> bool {
     current_is_in_interrupt()
 }
 
-extern "C" fn irq_interrupts_enabled() -> bool {
-    x86_64::instructions::interrupts::are_enabled()
-}
-
-extern "C" fn irq_interrupts_disable() {
-    x86_64::instructions::interrupts::disable();
-}
-
-extern "C" fn irq_interrupts_enable() {
-    x86_64::instructions::interrupts::enable();
-}
-
-extern "C" fn irq_interrupts_enable_and_hlt() {
-    x86_64::instructions::interrupts::enable_and_hlt();
-}
-
 #[inline(always)]
 pub fn current_cpu_id() -> usize {
     *current_percpu().cpu_id.get().unwrap()
@@ -153,14 +131,9 @@ pub fn init_percpu_gs(cpu_id: usize) -> &'static PerCpu {
     let p: &'static PerCpu = alloc_or_get_percpu(cpu_id, platform_cpu_id);
     let ptr = p as *const PerCpu;
     p.tls_array_pointer.store(0, Ordering::Relaxed);
+    p.mimalloc_heap.store(0, Ordering::Relaxed);
     unsafe { set_gs_bases(ptr) };
     kernel_types::irq::set_irq_context_query(irq_context_query);
-    kernel_types::irq::set_irq_interrupt_control(
-        irq_interrupts_enabled,
-        irq_interrupts_disable,
-        irq_interrupts_enable,
-        irq_interrupts_enable_and_hlt,
-    );
     p
 }
 
@@ -250,9 +223,10 @@ impl CpuPlatform for X86Platform {
     }
 
     fn halt() -> ! {
-        unsafe {
-            loop {
-                super::debug::poll_rx_once();
+        loop {
+            super::debug::poll_rx_once();
+            #[cfg_attr(irq_check, irq::trusted(unsafe))]
+            unsafe {
                 core::arch::asm!("hlt;", options(nomem, nostack, preserves_flags));
             }
         }

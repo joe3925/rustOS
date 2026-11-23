@@ -65,4 +65,6 @@ Note: above features are enabled by default and were designed primarily for `no_
 
 License
 -------
-The MIT license. See `LICENSE.txt`.
+Upstream code uses the MIT license. See `LICENSE.txt`.
+Original changes owned by Boden use the Apache License, Version 2.0.
+See `LICENSE-APACHE` and `NOTICE`. Earlier MIT grants remain in effect.

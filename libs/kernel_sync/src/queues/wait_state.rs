@@ -7,7 +7,16 @@ pub struct WaitState {
 }
 
 impl WaitState {
+    #[cfg(not(any(loom, feature = "loom")))]
     pub const fn new(none: u64) -> Self {
+        Self {
+            value: AtomicU64::new(none),
+            none,
+        }
+    }
+
+    #[cfg(any(loom, feature = "loom"))]
+    pub fn new(none: u64) -> Self {
         Self {
             value: AtomicU64::new(none),
             none,

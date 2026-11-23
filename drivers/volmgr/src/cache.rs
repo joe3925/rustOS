@@ -8,7 +8,7 @@ pub trait CacheIndex<V>: Send {
     fn peek(&self, key: &u64) -> Option<&V>;
     fn insert(&mut self, key: u64, value: V) -> bool;
     fn remove(&mut self, key: &u64) -> Option<V>;
-    fn oldest_matching<FN>(&self, f: FN) -> Option<u64>
+    fn oldest_matching<FN>(&self, limit: usize, f: FN) -> Option<u64>
     where
         FN: FnMut(u64, &V) -> bool;
     fn for_each<FN>(&self, f: FN)
@@ -84,11 +84,11 @@ where
     }
 
     #[inline]
-    fn oldest_matching<FN>(&self, mut f: FN) -> Option<u64>
+    fn oldest_matching<FN>(&self, limit: usize, mut f: FN) -> Option<u64>
     where
         FN: FnMut(u64, &V) -> bool,
     {
-        for (k, v) in self.inner.iter().rev() {
+        for (k, v) in self.inner.iter().rev().take(limit) {
             if f(*k, v) {
                 return Some(*k);
             }

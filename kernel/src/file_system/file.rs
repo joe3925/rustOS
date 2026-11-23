@@ -1,22 +1,20 @@
-use crate::benchmarking::{bench_c_drive_io_async, used_memory};
+use crate::benchmarking::{bench_c_drive_io_inner, used_memory};
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
+use crate::{
+    file_system::file_provider, memory::paging::frame_alloc::used_bytes, println,
+    registry::rebind_and_persist_after_provider_switch, util::TOTAL_TIME,
+};
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
 use kernel_executor::runtime::runtime::block_on;
+use kernel_executor::runtime::runtime::spawn_detached;
 use kernel_types::{
     dma::{FromDevice, IoBuffer, ToDevice},
     error::{ErrorKind, FileErrorKind, KernelError},
     fs::{OpenFlags, Path},
 };
-use crate::{
-    file_system::file_provider,
-    memory::paging::frame_alloc::used_bytes,
-    println,
-    registry::rebind_and_persist_after_provider_switch,
-    util::TOTAL_TIME,
-};
-use kernel_executor::runtime::runtime::spawn_detached;
 
 #[derive(Debug)]
 pub struct File {
@@ -341,7 +339,7 @@ impl Drop for File {
             return;
         }
         // TODO: find a way so this doesnt block
-        if let Err(error) = block_on(self.provider.close_handle(id)) {
+        if let Err(error) = block_on::<KernelExecutorPlatform, _>(self.provider.close_handle(id)) {
             println!("failed to close dropped file handle {id}: {error}");
         }
     }
@@ -364,16 +362,20 @@ pub async fn switch_to_vfs() -> Result<(), KernelError> {
         secs, used_mib, heap_mib
     );
     #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
-    spawn_detached(async {
-        crate::benchmarking::register_builtin_suites();
-        let passed = crate::benchmarking::run_configured_suites().await;
-        crate::benchmarking::exit_benchmark_vm(passed);
-    });
-    #[cfg(not(any(feature = "kernel-bench", feature = "kernel-correctness")))]
-    spawn_detached(async {
+    if option_env!("RUSTOS_BENCH_AUTORUN") != Some("0") {
+        spawn_detached::<KernelExecutorPlatform, _>(async {
+            crate::benchmarking::register_builtin_suites();
+            let passed = crate::benchmarking::run_configured_suites().await;
+            crate::benchmarking::exit_benchmark_vm(passed);
+        });
+        return Ok(());
+    }
+    spawn_detached::<KernelExecutorPlatform, _>(async {
         loop {
-            bench_c_drive_io_async(true).await;
-            bench_c_drive_io_async(false).await;
+            let bytes_per_pass = 50 * 1024 * 1024;
+            let total_bytes = bytes_per_pass;
+            bench_c_drive_io_inner(true, false, None, bytes_per_pass, total_bytes).await;
+            bench_c_drive_io_inner(false, false, None, bytes_per_pass, total_bytes).await;
         }
     });
     Ok(())

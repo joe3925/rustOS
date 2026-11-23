@@ -9,8 +9,21 @@ permissions:
 
 jobs:
   correctness:
-    runs-on: [self-hosted, linux, x64, rustos-bench]
-    timeout-minutes: 30
+    name: Correctness (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: [self-hosted, linux, x64, rustos-bench]
+            platform: x86_64-uefi
+            launch: qemu-x86_64-q35-ci
+          - arch: aarch64
+            runner: ubuntu-24.04
+            platform: aarch64-uefi
+            launch: qemu-aarch64-virt-tcg
 
     steps:
       - name: Check out proposed commit
@@ -21,12 +34,14 @@ jobs:
           submodules: recursive
 
       - name: Enable KVM access
+        if: matrix.arch == 'x86_64'
         shell: bash
         run: |
           sudo chmod 666 /dev/kvm
           ls -l /dev/kvm
 
       - name: Verify correctness host
+        if: matrix.arch == 'x86_64'
         shell: bash
         run: |
           qemu-system-x86_64 --version
@@ -50,58 +65,33 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Install and verify ARM emulation
+        if: matrix.arch == 'aarch64'
+        shell: bash
+        run: bash .github/scripts/prepare-arm-runner.sh
+
       - name: Create C drive seed image
         shell: bash
-        run: |
-          image="$RUNNER_TEMP/rustos-ci-seed.img"
-          mount_dir="$RUNNER_TEMP/rustos-ci-mount"
-          loop_device=""
-
-          cleanup() {
-            if mountpoint -q "$mount_dir"; then
-              sudo umount "$mount_dir"
-            fi
-            if [[ -n "$loop_device" ]]; then
-              sudo losetup --detach "$loop_device"
-            fi
-          }
-          trap cleanup EXIT
-
-          truncate -s 2G "$image"
-          sgdisk --new=1:2048:0 --typecode=1:0700 --change-name=1:rustOS "$image"
-
-          loop_device="$(sudo losetup --find --show --partscan "$image")"
-          partition="${loop_device}p1"
-          for _ in {1..10}; do
-            [[ -b "$partition" ]] && break
-            sleep 0.2
-          done
-          [[ -b "$partition" ]]
-
-          sudo mkfs.vfat -F 32 -n RUSTOS "$partition"
-          mkdir -p "$mount_dir"
-          sudo mount "$partition" "$mount_dir"
-          sudo mkdir -p \
-            "$mount_dir/system/registry" \
-            "$mount_dir/system/toml" \
-            "$mount_dir/system/mod"
-          sync
-
-          cleanup
-          trap - EXIT
-
+        run: bash .github/scripts/create-ci-disk.sh
 
       - name: Run correctness at 1, 2, and 4 vCPUs
         env:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
-        run: cargo run --release -p xtask -- correctness --cpus 1,2,4
+        run: |
+          cargo run --release -p xtask -- correctness \
+            --platform "${{ matrix.platform }}" \
+            --launch "${{ matrix.launch }}" \
+            --cpus 1,2,4 \
+            --boot-timeout-secs 600 \
+            --timeout-secs 1200 \
+            --output "target/correctness/${{ matrix.arch }}/results.json"
 
       - name: Upload correctness results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-correctness
+          name: kernel-correctness-${{ matrix.arch }}
           path: |
             target/correctness/**/*.json
             target/correctness/**/*.log

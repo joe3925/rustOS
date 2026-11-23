@@ -1,4 +1,5 @@
 mod cpu;
+pub(crate) use cpu::psci_call;
 mod debug;
 pub(crate) mod exception_handlers;
 mod interrupts;

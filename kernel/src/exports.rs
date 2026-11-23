@@ -1,25 +1,20 @@
 use crate::alloc::string::ToString;
 use crate::error::{kernel_capture_error_backtrace, kernel_resolve_error_context_module};
 use crate::export;
-use crate::function;
 use crate::get_rva;
 use crate::idt::interrupt_impl::*;
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;
 use crate::vec;
 use alloc::string::String;
 use alloc::vec::Vec;
-use kernel_executor::runtime::abi_future::{kernel_abi_future_allocate, kernel_abi_future_free};
 use kernel_executor::runtime::runtime::try_steal_blocking_one;
 
 export! {
-    function,
     print,
     wait_duration,
-    elapsed,
-    stopwatch_new,
-    kernel_cycle_counter,
     kernel_cycle_counter_frequency_hz,
     create_kernel_task,
     kill_kernel_task_by_id,
@@ -29,16 +24,14 @@ export! {
     vfs_notify_label_published,
     vfs_notify_label_unpublished,
     panic_common,
-    try_steal_blocking_one,
+    try_steal_blocking_one::<KernelExecutorPlatform>,
     get_rsdp,
     get_acpi_tables,
     get_device_tree_blob,
-    task_yield,
     allocate_auto_kernel_mapping,
     allocate_auto_contiguous_kernel_mapping,
     map_physical_pages,
     kernel_mapping_drop,
-    virt_to_phys,
     resolve_virtual_range_frame,
     kernel_address_space_root,
     get_current_cpu_id,
@@ -46,8 +39,6 @@ export! {
 
     kernel_alloc,
     kernel_free,
-    kernel_abi_future_allocate,
-    kernel_abi_future_free,
 
     kernel_capture_error_backtrace,
     kernel_resolve_error_context_module,
@@ -62,13 +53,7 @@ export! {
 
     kernel_interrupt_bind_wired,
     kernel_interrupt_bind_msi,
-    kernel_irq_borrowed_signal,
-    kernel_irq_borrowed_ensure_signal,
-    kernel_irq_borrowed_signal_n,
-    kernel_irq_borrowed_signal_all,
     irq_handle_create,
-    irq_handle_clone,
-    irq_handle_drop,
     irq_handle_unregister,
     irq_handle_is_closed,
     irq_handle_set_user_ctx,
@@ -95,11 +80,6 @@ export! {
     pnp_create_control_device_and_link,
     pnp_invalidate_device_relations,
 
-    driver_get_name,
-    driver_get_flags,
-    driver_set_evt_device_add,
-    driver_set_evt_probe_device,
-    driver_set_evt_driver_unload,
     random_number,
 
     reg_get_value,
@@ -110,11 +90,10 @@ export! {
     reg_list_keys,
     reg_list_values,
 
-    kernel_spawn_abi,
     kernel_spawn_joinable_abi,
     kernel_spawn_detached_abi,
-    kernel_block_on_abi,
-    kernel_block_on_thread_state,
+    kernel_block_on_context,
+    kernel_task_cancellation_guard,
     kernel_spawn_blocking_raw,
 
     bench_kernel_span_end,
@@ -136,5 +115,4 @@ export! {
     kernel_pci_write_config_u32,
 
     routing_resolve_path_to_device,
-    routing_get_stack_top_from_weak,
 }

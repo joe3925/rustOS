@@ -195,16 +195,16 @@ unsafe fn map_range_inner(
                         mapped_this_leaf = true;
                         break;
                     }
+                    Err(err) if should_try_smaller_mapping(&err) => {
+                        KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
+                        continue;
+                    }
                     Err(err) if ignore_already_mapped && is_already_mapped(&err) => {
                         KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
                         virt += mapping_size.bytes;
                         remaining -= mapping_size.bytes;
                         mapped_this_leaf = true;
                         break;
-                    }
-                    Err(err) if is_frame_allocation_failure(&err) => {
-                        KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
-                        continue;
                     }
                     Err(err) => {
                         KernelFrameAllocator::release_reserved_mapping_frame(phys, *mapping_size);
@@ -281,7 +281,7 @@ pub(crate) unsafe fn map_contiguous_physical_range(
                     mapped_this_leaf = true;
                     break;
                 }
-                Err(err) if is_frame_allocation_failure(&err) => continue,
+                Err(err) if should_try_smaller_mapping(&err) => continue,
                 Err(err) => {
                     unsafe {
                         rollback_mapped_range(
@@ -593,12 +593,14 @@ unsafe fn rollback_mapped_range(
     }
 }
 
-fn is_frame_allocation_failure(err: &PageMapError) -> bool {
+fn should_try_smaller_mapping(err: &PageMapError) -> bool {
     matches!(
         err,
         PageMapError::Page4KiB(PageMapFailure::FrameAllocationFailed)
             | PageMapError::Page2MiB(PageMapFailure::FrameAllocationFailed)
             | PageMapError::Page1GiB(PageMapFailure::FrameAllocationFailed)
+            | PageMapError::Page2MiB(PageMapFailure::PageAlreadyMapped)
+            | PageMapError::Page1GiB(PageMapFailure::PageAlreadyMapped)
             | PageMapError::NoMemory()
     )
 }

@@ -10,6 +10,5 @@ fn abi_poll_has_stable_discriminants() {
 fn null_allocation_is_unambiguously_invalid() {
     let allocation = AbiFutureAllocation::null();
     assert!(allocation.ptr.is_null());
-    assert_eq!(allocation.owner_domain, 0);
-    assert_eq!(allocation.token, 0);
+    assert_eq!(allocation.reserved, [0; 2]);
 }

@@ -178,6 +178,7 @@ impl TaskPlatform for Aarch64Platform {
             return;
         }
 
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             aarch64_save_fpu_state(state);
         }
@@ -200,6 +201,7 @@ impl TaskPlatform for Aarch64Platform {
             return;
         }
 
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             aarch64_restore_fpu_state(state);
         }

@@ -11,6 +11,7 @@ use kernel_api::memory::{PhysAddr, VirtAddr};
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
 pub const VRING_DESC_F_INDIRECT: u16 = 4;
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -153,6 +154,13 @@ impl Virtqueue {
     #[inline]
     pub fn last_used_idx(&self) -> u16 {
         self.last_used_idx.load(Ordering::Acquire)
+    }
+
+    pub fn set_interrupts(&self, enabled: bool) {
+        let flags = self.avail_va().as_u64() as *const AtomicU16;
+        unsafe {
+            (*flags).store(if enabled { 0 } else { VIRTQ_AVAIL_F_NO_INTERRUPT }, Ordering::SeqCst);
+        }
     }
 
     /// Enable the queue after all configuration (including MSI-X vector) is set.

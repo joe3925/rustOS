@@ -1,7 +1,7 @@
 use crate::platform::ConsolePlatform;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::arch::PhysAddr;
-use kernel_types::irq::IrqSafeMutex;
+use crate::sync_platform::IrqSafeMutex;
 use kernel_types::memory::PhysicalMappingCache;
 use kernel_types::status::PageMapError;
 

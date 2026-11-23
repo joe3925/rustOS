@@ -5,15 +5,17 @@ use crate::memory::paging::stack::{
 };
 use crate::platform;
 use crate::scheduling::domain::{DomainId, TaskSchedBinding};
+use crate::scheduling::reclaim::{self, ReclaimNode};
 use crate::scheduling::scheduler::{kernel_task_sched_binding, user_task_sched_binding};
 use crate::scheduling::state::{FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
 use crate::vec::Vec;
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use core::ops::Deref;
+use core::ptr::NonNull;
 use core::sync::atomic::AtomicPtr;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use core::{mem, mem::ManuallyDrop, ptr};
 use kernel_types::arch::{PageFlags, VirtAddr};
 use kernel_types::status::PageMapError;
@@ -25,6 +27,9 @@ pub const IDLE_UUID_UPPER: u64 = 0x1c82f35548bcbe24;
 pub const IDLE_MAGIC_LOWER: u64 = 0x890189d70ecaca7f;
 /// Sentinel value indicating no task in wait queue
 pub const WAIT_QUEUE_NONE: u64 = 0;
+const SCHED_STATE_MASK: u8 = 7;
+const SCHED_UPDATING: u8 = 8;
+const SCHED_PERMIT: u8 = 16;
 #[derive(Debug)]
 /// TaskRef is the primary handle to a task, containing:
 /// - Atomic scheduling state accessible without locks (for scheduler hot path)
@@ -32,7 +37,10 @@ pub const WAIT_QUEUE_NONE: u64 = 0;
 ///
 /// This separation allows the scheduler to check task state and make
 /// scheduling decisions without contending on the Task RwLock.
+#[repr(C)]
 pub struct TaskRef {
+    reclaim: ReclaimNode,
+    references: AtomicUsize,
     /// Unique task identifier (immutable after creation)
     pub id: AtomicU64,
 
@@ -44,15 +52,9 @@ pub struct TaskRef {
     /// Used by unpark() to decide where to enqueue
     target_cpu: AtomicUsize,
 
-    /// Park/unpark permit token (0 or 1)
-    /// - unpark() sets this to 1
-    /// - park_current() consumes it (swap to 0)
-    /// This prevents lost wakeups via the commit-point handshake
-    permit: AtomicU8,
-
     /// Intrusive wait queue link - holds task ID of next waiter (or WAIT_QUEUE_NONE)
     /// Used for mutex, condvar, channel wait queues
-    pub wait_next: kernel_sync::WaitState,
+    pub wait_next: kernel_sync::queues::WaitState,
 
     /// Intrusive wait queue link for IPI scheduling
     pub inbound_next: AtomicU64,
@@ -92,7 +94,224 @@ pub struct TaskRef {
 }
 
 /// Handle type used throughout the scheduler
-pub type TaskHandle = Arc<TaskRef>;
+#[derive(Debug)]
+pub struct TaskHandle {
+    ptr: NonNull<TaskRef>,
+}
+
+unsafe impl Send for TaskHandle {}
+unsafe impl Sync for TaskHandle {}
+
+impl TaskHandle {
+    fn new(task: TaskRef) -> Self {
+        Self {
+            ptr: NonNull::from(Box::leak(Box::new(task))),
+        }
+    }
+
+    pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.ptr == b.ptr
+    }
+
+    pub(crate) fn strong_count(&self) -> usize {
+        self.references.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_update(&self) -> Option<TaskUpdate> {
+        let mut word = self.sched_state.load(Ordering::Acquire);
+        loop {
+            if word & SCHED_UPDATING != 0 {
+                return None;
+            }
+            match self.sched_state.compare_exchange(
+                word,
+                word | SCHED_UPDATING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(TaskUpdate {
+                        task: self.clone(),
+                        notify_cpu: None,
+                    });
+                }
+                Err(actual) => word = actual,
+            }
+        }
+    }
+}
+
+impl Clone for TaskHandle {
+    fn clone(&self) -> Self {
+        if self
+            .references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                if count != 0 && count < isize::MAX as usize {
+                    Some(count + 1)
+                } else {
+                    None
+                }
+            })
+            .is_err()
+        {
+            // TODO: FIXME
+            panic!("handle overflow");
+        }
+        Self { ptr: self.ptr }
+    }
+}
+
+impl Deref for TaskHandle {
+    type Target = TaskRef;
+
+    fn deref(&self) -> &TaskRef {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl Drop for TaskHandle {
+    #[cfg_attr(irq_check, irq::context)]
+    fn drop(&mut self) {
+        if self.references.fetch_sub(1, Ordering::Release) == 1 {
+            fence(Ordering::Acquire);
+            unsafe { reclaim::enqueue(self.ptr.cast()) };
+        }
+    }
+}
+
+#[cfg_attr(irq_check, irq::forbidden)]
+unsafe fn reclaim_task(node: *mut ReclaimNode) {
+    unsafe { drop(Box::from_raw(node.cast::<TaskRef>())) };
+}
+
+pub struct TaskUpdate {
+    task: TaskHandle,
+    notify_cpu: Option<usize>,
+}
+
+impl Deref for TaskUpdate {
+    type Target = TaskHandle;
+
+    fn deref(&self) -> &TaskHandle {
+        &self.task
+    }
+}
+
+impl TaskUpdate {
+    pub(crate) fn set_sched_state(&mut self, state: SchedState) -> bool {
+        self.task
+            .sched_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                if SchedState::from_u8(word & SCHED_STATE_MASK) == SchedState::Terminated {
+                    None
+                } else {
+                    Some((word & !SCHED_STATE_MASK) | state as u8)
+                }
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn consume_permit(&mut self) -> bool {
+        self.task
+            .sched_state
+            .fetch_and(!SCHED_PERMIT, Ordering::AcqRel)
+            & SCHED_PERMIT
+            != 0
+    }
+
+    pub(crate) fn set_target_cpu(&mut self, cpu: usize) {
+        self.task.target_cpu.store(cpu, Ordering::Relaxed);
+    }
+
+    pub(crate) fn notify_after_update(&mut self, cpu: usize) {
+        self.notify_cpu = Some(cpu);
+    }
+
+    pub(crate) fn with_class_state<T, R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let binding = self.task.sched_binding.read();
+        let ptr = binding.class_state();
+        f(unsafe { ptr.cast::<T>().as_ref() })
+    }
+
+    pub(crate) fn set_pending_sched_binding(
+        &mut self,
+        sched_binding: TaskSchedBinding,
+    ) -> Result<(), TaskSchedBinding> {
+        let mut pending = self.task.pending_sched_binding.lock();
+        if pending.is_some() {
+            return Err(sched_binding);
+        }
+
+        *pending = Some(sched_binding);
+        self.task
+            .pending_sched_binding_present
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn take_pending_sched_binding(&mut self) -> Option<TaskSchedBinding> {
+        if !self.has_pending_sched_binding() {
+            return None;
+        }
+
+        let mut pending = self.task.pending_sched_binding.lock();
+        let binding = pending.take();
+        self.task
+            .pending_sched_binding_present
+            .store(false, Ordering::Release);
+        binding
+    }
+
+    pub(crate) fn replace_sched_binding(
+        &mut self,
+        sched_binding: TaskSchedBinding,
+    ) -> TaskSchedBinding {
+        let new_domain_id = sched_binding.domain_id();
+        let mut active = self.task.sched_binding.write();
+        let old = mem::replace(&mut *active, sched_binding);
+        self.task
+            .active_domain_id
+            .store(new_domain_id.0 as u32, Ordering::Release);
+        old
+    }
+}
+
+impl Drop for TaskUpdate {
+    fn drop(&mut self) {
+        let mut word = self.task.sched_state.load(Ordering::Acquire);
+        loop {
+            if word & SCHED_STATE_MASK == SchedState::Blocked as u8 && word & SCHED_PERMIT != 0 {
+                let runnable =
+                    (word & !(SCHED_STATE_MASK | SCHED_PERMIT)) | SchedState::Runnable as u8;
+                match self.task.sched_state.compare_exchange(
+                    word,
+                    runnable,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        crate::scheduling::scheduler::scheduler().enqueue_woken_task(self);
+                        word = self.task.sched_state.load(Ordering::Acquire);
+                    }
+                    Err(actual) => word = actual,
+                }
+                continue;
+            }
+            match self.task.sched_state.compare_exchange(
+                word,
+                word & !SCHED_UPDATING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => word = actual,
+            }
+        }
+        if let Some(cpu) = self.notify_cpu.take() {
+            crate::scheduling::scheduler::scheduler().kick_remote_core(cpu);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum KernelStackFaultResolution {
@@ -104,7 +323,7 @@ pub(crate) enum KernelStackFaultResolution {
 
 pub(crate) fn resolve_current_kernel_stack_fault(fault_address: u64) -> KernelStackFaultResolution {
     let Some(task) =
-        crate::scheduling::scheduler::SCHEDULER.get_current_task(platform::current_cpu_id())
+        crate::scheduling::scheduler::scheduler().get_current_task(platform::current_cpu_id())
     else {
         return KernelStackFaultResolution::NotStack;
     };
@@ -143,40 +362,13 @@ impl TaskRef {
     /// Get the current scheduling state
     #[inline(always)]
     pub fn sched_state(&self) -> SchedState {
-        SchedState::from_u8(self.sched_state.load(Ordering::Acquire))
-    }
-
-    /// Set the scheduling state
-    #[inline(always)]
-    pub fn set_sched_state(&self, state: SchedState) {
-        self.sched_state.store(state as u8, Ordering::Release);
-    }
-
-    /// Compare-and-swap scheduling state
-    /// Returns Ok(()) if successful, Err(actual) if the current state didn't match expected
-    #[inline(always)]
-    pub fn cas_sched_state(&self, expected: SchedState, new: SchedState) -> Result<(), SchedState> {
-        match self.sched_state.compare_exchange(
-            expected as u8,
-            new as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(actual) => Err(SchedState::from_u8(actual)),
-        }
+        SchedState::from_u8(self.sched_state.load(Ordering::Acquire) & SCHED_STATE_MASK)
     }
 
     /// Get the target CPU for this task
     #[inline(always)]
     pub fn target_cpu(&self) -> usize {
         self.target_cpu.load(Ordering::Relaxed)
-    }
-
-    /// Set the target CPU for this task
-    #[inline(always)]
-    pub fn set_target_cpu(&self, cpu: usize) {
-        self.target_cpu.store(cpu, Ordering::Relaxed);
     }
 
     /// Check if task is terminated (convenience method)
@@ -188,27 +380,24 @@ impl TaskRef {
     /// Mark the task as terminated
     #[inline(always)]
     pub fn terminate(&self) {
-        self.set_sched_state(SchedState::Terminated);
+        let _ = self
+            .sched_state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                Some((word & !SCHED_STATE_MASK) | SchedState::Terminated as u8)
+            });
     }
 
     /// Deliver a wake permit (called by unpark)
     /// Returns the previous permit value
     #[inline(always)]
     pub fn grant_permit(&self) -> u8 {
-        self.permit.swap(1, Ordering::Release)
-    }
-
-    /// Consume the wake permit (called by park_current)
-    /// Returns true if a permit was available (no need to block)
-    #[inline(always)]
-    pub fn consume_permit(&self) -> bool {
-        self.permit.swap(0, Ordering::Acquire) == 1
+        (self.sched_state.fetch_or(SCHED_PERMIT, Ordering::AcqRel) & SCHED_PERMIT != 0) as u8
     }
 
     /// Check if permit is available without consuming
     #[inline(always)]
     pub fn has_permit(&self) -> bool {
-        self.permit.load(Ordering::Acquire) == 1
+        self.sched_state.load(Ordering::Acquire) & SCHED_PERMIT != 0
     }
 
     /// Get the task ID
@@ -229,59 +418,13 @@ impl TaskRef {
     }
 
     #[inline(always)]
-    pub(crate) fn with_class_state<T, R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        let binding = self.sched_binding.read();
-        let ptr = binding.class_state();
-        f(unsafe { ptr.cast::<T>().as_ref() })
-    }
-
-    #[inline(always)]
     pub fn is_kernel_mode(&self) -> bool {
         self.is_kernel_mode.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_pending_sched_binding(
-        &self,
-        sched_binding: TaskSchedBinding,
-    ) -> Result<(), TaskSchedBinding> {
-        let mut pending = self.pending_sched_binding.lock();
-        if pending.is_some() {
-            return Err(sched_binding);
-        }
-
-        *pending = Some(sched_binding);
-        self.pending_sched_binding_present
-            .store(true, Ordering::Release);
-        Ok(())
     }
 
     #[inline(always)]
     pub(crate) fn has_pending_sched_binding(&self) -> bool {
         self.pending_sched_binding_present.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn take_pending_sched_binding(&self) -> Option<TaskSchedBinding> {
-        if !self.has_pending_sched_binding() {
-            return None;
-        }
-
-        let mut pending = self.pending_sched_binding.lock();
-        let binding = pending.take();
-        self.pending_sched_binding_present
-            .store(false, Ordering::Release);
-        binding
-    }
-
-    pub(crate) fn replace_sched_binding(
-        &self,
-        sched_binding: TaskSchedBinding,
-    ) -> TaskSchedBinding {
-        let new_domain_id = sched_binding.domain_id();
-        let mut active = self.sched_binding.write();
-        let old = mem::replace(&mut *active, sched_binding);
-        self.active_domain_id
-            .store(new_domain_id.0 as u32, Ordering::Release);
-        old
     }
 
     /// Attempt to grow the kernel stack by one page.
@@ -308,6 +451,9 @@ impl TaskRef {
         unsafe {
             map_kernel_range(VirtAddr::new(gp), page_size, flags, false)?;
         }
+        if let Some(stack) = self.kernel_stack.lock().as_ref() {
+            stack.mapped_start.store(gp, Ordering::Release);
+        }
 
         let stack_top = self.stack_start.load(Ordering::Acquire);
         if stack_top != 0 && gp < stack_top {
@@ -333,7 +479,8 @@ impl TaskRef {
 
         self.guard_page.store(0, Ordering::Release);
         self.stack_size.store(0, Ordering::Release);
-        self.kernel_stack.lock().take();
+        let stack = self.kernel_stack.lock().take();
+        drop(stack);
     }
 }
 
@@ -354,11 +501,6 @@ pub struct Task {
     pub executer_id: Option<u64>,
 
     // Accounting (can be accessed via inner lock or made atomic if needed)
-    sched_in_cycles: AtomicU64,
-    last_quantum_cycles: AtomicU64,
-    total_run_cycles: AtomicU64,
-    quantum_count: AtomicU64,
-    last_cpu: AtomicUsize,
 }
 
 impl Task {
@@ -396,28 +538,29 @@ impl Task {
         let guard_page = initial_guard_page(stack_top, stack_size);
         let state = platform::new_user_task_context(entry_point, context, stack_pointer);
 
+        let kernel_tls = platform::new_kernel_tls();
+        let tls_thread_pointer = kernel_tls
+            .as_ref()
+            .map_or(0, platform::kernel_tls_thread_pointer);
+
         let inner_task = Task {
             name,
             context: state,
             fpu_state: FpuState::default(),
-            kernel_tls: None,
+            kernel_tls,
             parent_pid,
             executer_id: None,
-            sched_in_cycles: AtomicU64::new(0),
-            last_quantum_cycles: AtomicU64::new(0),
-            total_run_cycles: AtomicU64::new(0),
-            quantum_count: AtomicU64::new(0),
-            last_cpu: AtomicUsize::new(usize::MAX),
         };
 
         let active_domain_id = sched_binding.domain_id();
 
-        Arc::new(TaskRef {
+        TaskHandle::new(TaskRef {
+            reclaim: ReclaimNode::new(reclaim_task),
+            references: AtomicUsize::new(1),
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
-            permit: AtomicU8::new(0),
-            wait_next: kernel_sync::WaitState::new(WAIT_QUEUE_NONE),
+            wait_next: kernel_sync::queues::WaitState::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(false),
@@ -425,7 +568,7 @@ impl Task {
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size),
             kernel_stack: Mutex::new(None),
-            tls_thread_pointer: AtomicU64::new(0),
+            tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
             sched_binding: RwLock::new(sched_binding),
             active_domain_id: AtomicU32::new(active_domain_id.0 as u32),
             pending_sched_binding: Mutex::new(None),
@@ -477,21 +620,17 @@ impl Task {
             kernel_tls,
             parent_pid,
             executer_id: None,
-            sched_in_cycles: AtomicU64::new(0),
-            last_quantum_cycles: AtomicU64::new(0),
-            total_run_cycles: AtomicU64::new(0),
-            quantum_count: AtomicU64::new(0),
-            last_cpu: AtomicUsize::new(usize::MAX),
         };
 
         let active_domain_id = sched_binding.domain_id();
 
-        Arc::new(TaskRef {
+        TaskHandle::new(TaskRef {
+            reclaim: ReclaimNode::new(reclaim_task),
+            references: AtomicUsize::new(1),
             id: AtomicU64::new(0),
             sched_state: AtomicU8::new(SchedState::Runnable as u8),
             target_cpu: AtomicUsize::new(cpu_id),
-            permit: AtomicU8::new(0),
-            wait_next: kernel_sync::WaitState::new(WAIT_QUEUE_NONE),
+            wait_next: kernel_sync::queues::WaitState::new(WAIT_QUEUE_NONE),
             inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(true),
@@ -512,29 +651,6 @@ impl Task {
     /// current scheduling operation.
     pub unsafe fn update_from_context(&mut self, context: *mut State) {
         self.context = unsafe { *context };
-    }
-
-    #[inline(always)]
-    pub fn mark_scheduled_in(&self, cpu_id: usize, now_cycles: u64) {
-        self.last_cpu.store(cpu_id, Ordering::Relaxed);
-        self.sched_in_cycles.store(now_cycles, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn account_switched_out(&self, now_cycles: u64) {
-        let start = self.sched_in_cycles.swap(0, Ordering::Relaxed);
-        if start == 0 || now_cycles <= start {
-            return;
-        }
-        let delta = now_cycles - start;
-        self.last_quantum_cycles.store(delta, Ordering::Relaxed);
-        self.total_run_cycles.fetch_add(delta, Ordering::Relaxed);
-        self.quantum_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline(always)]
-    pub fn last_cpu(&self) -> usize {
-        self.last_cpu.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
@@ -687,7 +803,9 @@ impl TaskTable {
         let id = Self::make_id(idx, generation);
         task.set_task_id(id);
 
-        let raw = Arc::into_raw(task.clone()) as *mut TaskRef;
+        let retained = task.clone();
+        let raw = retained.ptr.as_ptr();
+        mem::forget(retained);
         slot.retired_next.store(0, Ordering::Release);
         slot.ptr.store(raw, Ordering::Release);
         slot.state.store(TASK_SLOT_LIVE, Ordering::Release);
@@ -740,13 +858,12 @@ impl TaskTable {
             return None;
         }
 
-        unsafe {
-            Arc::increment_strong_count(p);
-        }
-
+        let table_ref = ManuallyDrop::new(TaskHandle {
+            ptr: unsafe { NonNull::new_unchecked(p) },
+        });
+        let task = TaskHandle::clone(&table_ref);
         slot.readers.fetch_sub(1, Ordering::SeqCst);
-
-        unsafe { Some(Arc::from_raw(p)) }
+        Some(task)
     }
 
     #[inline(always)]
@@ -784,7 +901,7 @@ impl TaskTable {
             return false;
         }
 
-        let expected = Arc::as_ptr(task) as *mut TaskRef;
+        let expected = task.ptr.as_ptr();
         if slot.ptr.load(Ordering::Acquire) != expected {
             return false;
         }
@@ -846,19 +963,6 @@ impl TaskTable {
             return None;
         }
 
-        let p = slot.ptr.load(Ordering::Acquire);
-        let table_ref = (!p.is_null()).then(|| unsafe { ManuallyDrop::new(Arc::from_raw(p)) });
-        if table_ref
-            .as_ref()
-            .is_some_and(|task| Arc::strong_count(task) != 1)
-        {
-            slot.state.store(TASK_SLOT_RETIRED, Ordering::SeqCst);
-            if !self.push_retired_idx(idx) {
-                panic!("failed to requeue retired task slot");
-            }
-            return None;
-        }
-
         let p = slot.ptr.swap(ptr::null_mut(), Ordering::AcqRel);
 
         if slot
@@ -881,6 +985,10 @@ impl TaskTable {
         self.free_hint.store(idx, Ordering::Release);
 
         if p.is_null() { None } else { Some(p) }
+    }
+
+    pub(crate) fn has_retired(&self) -> bool {
+        self.retired_head.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn reap_retired(&self) {
@@ -906,7 +1014,9 @@ impl TaskTable {
 
             if let Some(p) = self.reap_one_retired_idx(idx) {
                 unsafe {
-                    drop(Arc::from_raw(p));
+                    drop(TaskHandle {
+                        ptr: NonNull::new_unchecked(p),
+                    });
                 }
             }
 

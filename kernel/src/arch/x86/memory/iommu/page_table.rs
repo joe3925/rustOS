@@ -187,8 +187,18 @@ pub fn ensure_iommu_2mib_mapped(
 
     let idx = iova_index(iova, 2);
     let entry = read_entry(table_phys, idx);
-
-    if entry & format.present_mask() == 0 {
+    let has_table = entry & format.present_mask() != 0
+        && match format {
+            X86IommuPageTableFormat::Intel { .. } => entry & (1 << 7) == 0,
+            X86IommuPageTableFormat::Amd => entry & (7 << 9) != 0,
+        };
+    if has_table {
+        for index in 0..512 {
+            let leaf = ((phys + index as u64 * 4096) & PTE_ADDR_MASK)
+                | format.leaf_flags(permissions, 1);
+            write_entry(entry & PTE_ADDR_MASK, index, leaf);
+        }
+    } else {
         let leaf = (phys & PTE_ADDR_MASK) | format.leaf_flags(permissions, 2);
         write_entry(table_phys, idx, leaf);
     }
@@ -228,8 +238,17 @@ pub fn ensure_iommu_1gib_mapped(
 
     let idx = iova_index(iova, 3);
     let entry = read_entry(table_phys, idx);
-
-    if entry & format.present_mask() == 0 {
+    let has_table = entry & format.present_mask() != 0
+        && match format {
+            X86IommuPageTableFormat::Intel { .. } => entry & (1 << 7) == 0,
+            X86IommuPageTableFormat::Amd => entry & (7 << 9) != 0,
+        };
+    if has_table {
+        for index in 0..512 {
+            let offset = index * 2 * 1024 * 1024;
+            ensure_iommu_2mib_mapped(root_phys, iova + offset, phys + offset, permissions, format)?;
+        }
+    } else {
         let leaf = (phys & PTE_ADDR_MASK) | format.leaf_flags(permissions, 3);
         write_entry(table_phys, idx, leaf);
     }
@@ -269,28 +288,66 @@ pub fn map_4k<F: Fn(u32) -> u64>(
     Ok(())
 }
 
-/// Clear one 4 KiB leaf. Returns the physical address that was mapped, if any.
-#[inline]
-pub fn unmap_4k(root_phys: u64, iova: u64, present_mask: u64, root_level: u32) -> Option<u64> {
-    debug_assert_eq!(iova & 0xFFF, 0);
+pub fn unmap_range(
+    root_phys: u64,
+    iova: u64,
+    len: u64,
+    format: X86IommuPageTableFormat,
+) -> Result<(), IommuError> {
+    if (iova & 0xFFF) != 0 || (len & 0xFFF) != 0 {
+        return Err(IommuError::InvalidRange);
+    }
+    let end = iova.checked_add(len).ok_or(IommuError::InvalidRange)?;
+    let mut cur = iova;
+    while cur < end {
+        let mut table_phys = root_phys;
+        for level in (1..=format.root_level()).rev() {
+            let idx = iova_index(cur, level);
+            let entry = read_entry(table_phys, idx);
+            let page_size = 1u64 << (12 + (level - 1) * 9);
+            let offset = cur & (page_size - 1);
+            if entry & format.present_mask() == 0 {
+                cur += (page_size - offset).min(end - cur);
+                break;
+            }
+            let is_leaf = level == 1
+                || match format {
+                    X86IommuPageTableFormat::Intel { .. } => entry & (1 << 7) != 0,
+                    X86IommuPageTableFormat::Amd => entry & (7 << 9) == 0,
+                };
+            if !is_leaf {
+                table_phys = entry & PTE_ADDR_MASK;
+                continue;
+            }
+            if offset == 0 && end - cur >= page_size {
+                write_entry(table_phys, idx, 0);
+                cur += page_size;
+                break;
+            }
 
-    let mut table_phys = root_phys;
-    for lvl in (2..=root_level).rev() {
-        let idx = iova_index(iova, lvl);
-        let entry = read_entry(table_phys, idx);
-        if entry & present_mask == 0 {
-            return None;
+            let child = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
+            let child_size = page_size >> 9;
+            let phys = entry & PTE_ADDR_MASK;
+            let mut leaf_flags = entry & !PTE_ADDR_MASK;
+            let table_flags = match format {
+                X86IommuPageTableFormat::Intel { .. } => {
+                    if level == 2 {
+                        leaf_flags &= !(1 << 7);
+                    }
+                    entry & (PTE_P | PTE_RW)
+                }
+                X86IommuPageTableFormat::Amd => {
+                    (entry & (PTE_P | AMD_IR | AMD_IW)) | (((level - 1) as u64) << 9)
+                }
+            };
+            for index in 0..512 {
+                write_entry(child, index, (phys + index as u64 * child_size) | leaf_flags);
+            }
+            write_entry(table_phys, idx, child | table_flags);
+            table_phys = child;
         }
-        table_phys = entry & PTE_ADDR_MASK;
     }
-
-    let idx = iova_index(iova, 1);
-    let entry = read_entry(table_phys, idx);
-    if entry & present_mask == 0 {
-        return None;
-    }
-    write_entry(table_phys, idx, 0);
-    Some(entry & PTE_ADDR_MASK)
+    Ok(())
 }
 
 /// Identity-map a byte range at 4 KiB granularity.

@@ -7,7 +7,8 @@ use core::task::{Context, Poll, Waker};
 use crate::executable::program::{Message, ProgramHandle, QueueHandle};
 use crate::object_manager::behavior::CONFIGURE_BIT;
 use crate::object_manager::manager::{InterfaceMask, Object, ObjectPayload};
-use kernel_sync::{AsyncRecvError, WaitRegistration};
+use kernel_sync::queues::AsyncRecvError;
+use kernel_sync::queues::async_mpmc::WaitRegistration;
 use kernel_types::object_manager::ObjectTag;
 use spin::Mutex;
 
@@ -130,7 +131,7 @@ impl Future for MqReceiveFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let message = match this.queue.poll_message(&this.registration, cx) {
+        let message = match this.queue.poll_message(&mut this.registration, cx) {
             Poll::Ready(Ok(message)) => message,
             Poll::Ready(Err(AsyncRecvError::Closed)) => {
                 return Poll::Ready(IoRequestOutput::error(IO_STATUS_CANCELLED));

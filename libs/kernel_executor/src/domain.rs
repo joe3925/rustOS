@@ -1,33 +1,106 @@
-use crate::future_arena::{FutureArena, FutureArenaConfig};
-use crate::global_async::CacheAligned;
+use crate::platform::ExecutorPlatform;
 use crate::sync::Arc;
-use crate::sync::atomic::{AtomicU8, AtomicU128, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 use alloc::boxed::Box;
+use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
 
-const BUILTIN_GENERATION: u32 = 1;
-const KERNEL_HIGH_SLOT: u32 = 0;
-const DRIVER_SLOT: u32 = 1;
-const KERNEL_NORMAL_SLOT: u32 = 2;
-const KERNEL_BACKGROUND_SLOT: u32 = 3;
+const INITIAL_GENERATION: u32 = 1;
 
 const DOMAIN_SLOT_EMPTY: usize = 0;
 const DOMAIN_SLOT_RESERVED: usize = 1;
 const DOMAIN_SLOT_ACTIVE: usize = 2;
-const DOMAIN_SLOT_BUILTIN: usize = 3;
+const DOMAIN_SLOT_RETIRED: usize = 4;
+const DOMAIN_SLOT_REAPING: usize = 5;
+const DOMAIN_SLOT_CLEANUP: usize = 6;
+const DOMAIN_SLOT_CLEANING: usize = 7;
+const DOMAIN_READER_CLOSED: usize = 1usize << (usize::BITS - 1);
+const DOMAIN_READER_COUNT: usize = !DOMAIN_READER_CLOSED;
 
 const DOMAIN_CHUNK_BITS: usize = 6;
 const DOMAIN_CHUNK_SIZE: usize = 1 << DOMAIN_CHUNK_BITS;
 const DOMAIN_CHUNK_MASK: usize = DOMAIN_CHUNK_SIZE - 1;
 const MAX_DOMAIN_CHUNKS: usize = 64;
 const MAX_DOMAIN_SLOTS: usize = DOMAIN_CHUNK_SIZE * MAX_DOMAIN_CHUNKS;
-const TASK_ID_MASK: u128 = u64::MAX as u128;
-const READY_TAG_SHIFT: u32 = 64;
-pub const MAX_READY_SHARDS: usize = 64;
+pub(crate) const BATCH_EMPTY: u8 = 0;
+pub(crate) const BATCH_OWNED: u8 = 2;
 
 #[repr(align(64))]
-struct ReadyHead(AtomicU128);
+pub(crate) struct ReadyBatch {
+    pub local_task: usize,
+    pub local_runs: u8,
+    pub tick: u32,
+    pub random: u64,
+    pub global_interval: u32,
+    #[cfg(any(test, loom, feature = "loom", feature = "hosted"))]
+    pub poll_started: Option<std::time::Instant>,
+    #[cfg(not(any(test, loom, feature = "loom", feature = "hosted")))]
+    pub poll_started: Option<u64>,
+    pub poll_count: usize,
+    pub elapsed_ns: u64,
+    #[cfg(any(test, loom, feature = "loom", feature = "hosted"))]
+    pub poll_time_ns: f64,
+    #[cfg(not(any(test, loom, feature = "loom", feature = "hosted")))]
+    pub poll_time_ns: u64,
+}
+
+impl ReadyBatch {
+    pub(crate) fn start_poll_sample<E: crate::platform::ExecutorPlatform>(&mut self) {
+        #[cfg(any(test, loom, feature = "loom", feature = "hosted"))]
+        { self.poll_started = Some(std::time::Instant::now()); }
+        #[cfg(not(any(test, loom, feature = "loom", feature = "hosted")))]
+        { self.poll_started = Some(E::scheduler_time_ns()); }
+        self.poll_count = 0;
+    }
+
+    pub(crate) fn finish_poll_sample<E: crate::platform::ExecutorPlatform>(&mut self) {
+        if let Some(started) = self.poll_started.take() && self.poll_count != 0 {
+            #[cfg(any(test, loom, feature = "loom", feature = "hosted"))]
+            {
+                let count = self.poll_count as f64;
+                let elapsed = started.elapsed().as_nanos() as u64;
+                self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed);
+                let mean = elapsed as f64 / count;
+                let alpha = 1.0 - 0.9_f64.powf(count);
+                self.poll_time_ns = alpha * mean + (1.0 - alpha) * self.poll_time_ns;
+            }
+            #[cfg(not(any(test, loom, feature = "loom", feature = "hosted")))]
+            {
+                const DECAY: [u32; 128] = [0, 3865470566, 3478923510, 3131031159, 2817928043, 2536135239, 2282521715, 2054269543, 1848842589, 1663958330, 1497562497, 1347806247, 1213025623, 1091723060, 982550754, 884295679, 795866111, 716279500, 644651550, 580186395, 522167755, 469950980, 422955882, 380660294, 342594264, 308334838, 277501354, 249751219, 224776097, 202298487, 182068638, 163861775, 147475597, 132728037, 119455234, 107509710, 96758739, 87082865, 78374579, 70537121, 63483409, 57135068, 51421561, 46279405, 41651465, 37486318, 33737686, 30363918, 27327526, 24594773, 22135296, 19921766, 17929590, 16136631, 14522968, 13070671, 11763604, 10587243, 9528519, 8575667, 7718100, 6946290, 6251661, 5626495, 5063846, 4557461, 4101715, 3691544, 3322389, 2990150, 2691135, 2422022, 2179820, 1961838, 1765654, 1589088, 1430180, 1287162, 1158445, 1042601, 938341, 844507, 760056, 684050, 615645, 554081, 498673, 448806, 403925, 363532, 327179, 294461, 265015, 238514, 214662, 193196, 173876, 156489, 140840, 126756, 114080, 102672, 92405, 83165, 74848, 67363, 60627, 54564, 49108, 44197, 39777, 35800, 32220, 28998, 26098, 23488, 21139, 19025, 17123, 15411, 13870, 12483, 11234, 10111, 9100, 8190, 7371, 6634];
+                let elapsed = E::scheduler_time_ns().saturating_sub(started);
+                self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed);
+                let mean = elapsed / self.poll_count as u64;
+                let weight = DECAY.get(self.poll_count).copied().unwrap_or(0) as u128;
+                self.poll_time_ns = ((((1u128 << 32) - weight) * mean as u128
+                    + weight * self.poll_time_ns as u128) >> 32) as u64;
+            }
+        }
+        self.poll_count = 0;
+    }
+}
+
+#[repr(align(64))]
+pub(crate) struct BatchSlot {
+    pub state: AtomicU8,
+    pub batch: UnsafeCell<ReadyBatch>,
+    pub spawned: crate::steal_queue::StealQueue<256>,
+}
+
+unsafe impl Sync for BatchSlot {}
+
+pub(crate) struct Injection {
+    pub head: usize,
+    pub tail: Option<&'static crate::runtime::slab::slot::TaskSlot>,
+    pub len: usize,
+}
+
+struct DomainCleanup {
+    queue_index: usize,
+    queue_head: usize,
+    task_cursor: [usize; 3],
+    tasks_done: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
@@ -59,59 +132,6 @@ impl ExecutorDomainId {
     }
 }
 
-pub const KERNEL_HIGH_EXECUTOR_DOMAIN: ExecutorDomainId =
-    ExecutorDomainId::from_parts(KERNEL_HIGH_SLOT, BUILTIN_GENERATION);
-pub const DRIVER_EXECUTOR_DOMAIN: ExecutorDomainId =
-    ExecutorDomainId::from_parts(DRIVER_SLOT, BUILTIN_GENERATION);
-pub const KERNEL_NORMAL_EXECUTOR_DOMAIN: ExecutorDomainId =
-    ExecutorDomainId::from_parts(KERNEL_NORMAL_SLOT, BUILTIN_GENERATION);
-pub const KERNEL_BACKGROUND_EXECUTOR_DOMAIN: ExecutorDomainId =
-    ExecutorDomainId::from_parts(KERNEL_BACKGROUND_SLOT, BUILTIN_GENERATION);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ExecutorDomainClass {
-    KernelHigh = 0,
-    Driver = 1,
-    KernelNormal = 2,
-    ProcessIo = 3,
-    KernelBackground = 4,
-}
-
-impl ExecutorDomainClass {
-    pub const fn default_weight(self) -> usize {
-        match self {
-            ExecutorDomainClass::KernelHigh => 8,
-            ExecutorDomainClass::Driver => 6,
-            ExecutorDomainClass::KernelNormal => 4,
-            ExecutorDomainClass::ProcessIo => 3,
-            ExecutorDomainClass::KernelBackground => 1,
-        }
-    }
-
-    pub const fn default_quantum(self) -> usize {
-        match self {
-            ExecutorDomainClass::KernelHigh => 8,
-            ExecutorDomainClass::Driver => 6,
-            ExecutorDomainClass::KernelNormal => 4,
-            ExecutorDomainClass::ProcessIo => 4,
-            ExecutorDomainClass::KernelBackground => 1,
-        }
-    }
-
-    pub fn default_max_active(self, cpu_count: usize) -> usize {
-        let cpu_count = cpu_count.max(1);
-
-        match self {
-            ExecutorDomainClass::KernelHigh => cpu_count,
-            ExecutorDomainClass::Driver => (cpu_count / 2).max(1),
-            ExecutorDomainClass::KernelNormal => cpu_count,
-            ExecutorDomainClass::ProcessIo => (cpu_count / 4).max(1),
-            ExecutorDomainClass::KernelBackground => 1,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExecutorDomainState {
@@ -132,42 +152,18 @@ impl ExecutorDomainState {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorDomainConfig {
-    pub class: ExecutorDomainClass,
-    pub max_active: usize,
-    pub quantum: usize,
     pub weight: usize,
-    pub future_arena: FutureArenaConfig,
-    pub ready_shards: usize,
 }
 
 impl ExecutorDomainConfig {
-    pub fn for_class(class: ExecutorDomainClass, cpu_count: usize) -> Self {
-        Self {
-            class,
-            max_active: class.default_max_active(cpu_count),
-            quantum: class.default_quantum(),
-            weight: class.default_weight(),
-            future_arena: FutureArenaConfig::default(),
-            ready_shards: cpu_count.clamp(1, MAX_READY_SHARDS),
-        }
-    }
-
-    pub fn kernel_normal(cpu_count: usize) -> Self {
-        Self::for_class(ExecutorDomainClass::KernelNormal, cpu_count)
-    }
-
-    fn normalized(mut self) -> Self {
-        self.max_active = self.max_active.max(1);
-        self.quantum = self.quantum.max(1);
-        self.weight = self.weight.max(1);
-        self.ready_shards = self.ready_shards.clamp(1, MAX_READY_SHARDS);
-        self
+    fn normalized(self) -> Self {
+        Self { weight: self.weight.clamp(1, u16::MAX as usize) }
     }
 }
 
 impl Default for ExecutorDomainConfig {
     fn default() -> Self {
-        Self::kernel_normal(1)
+        Self { weight: 1 }
     }
 }
 
@@ -175,7 +171,6 @@ impl Default for ExecutorDomainConfig {
 pub enum DestroyExecutorDomainError {
     InvalidDomain,
     StaleDomain,
-    BuiltinDomain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,418 +180,166 @@ pub enum DestroyExecutorDomainResult {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ExecutorDomainStats {
-    pub domain_id: ExecutorDomainId,
-    pub generation: u32,
-    pub class: ExecutorDomainClass,
+pub struct ExecutorDomainInfo {
     pub state: ExecutorDomainState,
-    pub queued_count: usize,
-    pub active_count: usize,
-    pub live_task_count: usize,
-    pub live_future_count: usize,
-    pub live_future_bytes: usize,
-    pub max_active: usize,
-    pub quantum: usize,
     pub weight: usize,
-    pub ready_shards: usize,
-    pub deficit: usize,
-    pub scheduled: bool,
-    pub submitted: usize,
-    pub completed: usize,
-    pub total_runs: usize,
-    pub scheduler_selections: usize,
-    pub last_run_tick: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GlobalExecutorStats {
-    pub active_pumps: usize,
-    pub max_pumps: usize,
-    pub runnable_executor_domain_count: usize,
-    pub domain_count: usize,
-    pub total_submissions: usize,
-    pub total_pump_runs: usize,
-}
-
-pub struct ExecutorDomain {
+#[repr(align(64))]
+pub struct ExecutorDomain<E: ExecutorPlatform> {
     id: ExecutorDomainId,
-    generation: u32,
-    class: ExecutorDomainClass,
-    ready_heads: Box<[ReadyHead]>,
-    ready_cursor: CacheAligned,
-    future_arena: FutureArena,
-    live_task_count: CacheAligned,
-
+    pub(crate) batches: Box<[BatchSlot]>,
+    pub(crate) inject: crate::sync::SchedulerMutex<Injection>,
+    pub(crate) inject_len: AtomicUsize,
+    pub(crate) incoming: AtomicUsize,
+    pub(crate) poll_time_ns: AtomicU64,
+    pub(crate) service: AtomicU64,
+    _platform: core::marker::PhantomData<fn() -> E>,
+    cleanup: UnsafeCell<DomainCleanup>,
     state: AtomicU8,
-    scheduled_count: CacheAligned,
-
-    queued_count: CacheAligned,
-    active_count: CacheAligned,
-    max_active: CacheAligned,
-
-    quantum: CacheAligned,
-    weight: CacheAligned,
-    deficit: CacheAligned,
-
-    pub(crate) submitted: CacheAligned,
-    completed: CacheAligned,
-    total_runs: CacheAligned,
-    scheduler_selections: CacheAligned,
-    last_run_tick: CacheAligned,
+    weight: AtomicUsize,
 }
 
-impl ExecutorDomain {
-    fn new(id: ExecutorDomainId, config: ExecutorDomainConfig) -> Self {
-        let config = config.normalized();
+unsafe impl<E: ExecutorPlatform> Sync for ExecutorDomain<E> {}
 
+impl<E: ExecutorPlatform> ExecutorDomain<E> {
+    fn new(
+        id: ExecutorDomainId,
+        config: ExecutorDomainConfig,
+        workers: usize,
+    ) -> Self {
+        let config = config.normalized();
         Self {
             id,
-            generation: id.generation(),
-            class: config.class,
-            ready_heads: (0..config.ready_shards)
-                .map(|_| ReadyHead(AtomicU128::new(0)))
-                .collect::<alloc::vec::Vec<_>>()
-                .into_boxed_slice(),
-            ready_cursor: CacheAligned(AtomicUsize::new(0)),
-            future_arena: FutureArena::new(id, config.future_arena),
-            live_task_count: CacheAligned(AtomicUsize::new(0)),
-
+            batches: (0..workers.max(1)).map(|index| BatchSlot {
+                state: AtomicU8::new(BATCH_EMPTY),
+                batch: UnsafeCell::new(ReadyBatch {
+                    local_task: 0,
+                    local_runs: 0,
+                    tick: 0,
+                    random: (index as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15),
+                    global_interval: 61,
+                    poll_started: None,
+                    poll_count: 0,
+                    elapsed_ns: 0,
+                    #[cfg(any(test, loom, feature = "loom", feature = "hosted"))]
+                    poll_time_ns: 200_000.0 / 61.0,
+                    #[cfg(not(any(test, loom, feature = "loom", feature = "hosted")))]
+                    poll_time_ns: 200_000 / 61,
+                }),
+                spawned: crate::steal_queue::StealQueue::new(),
+            }).collect(),
+            inject: crate::sync::SchedulerMutex::new(Injection { head: 0, tail: None, len: 0 }),
+            inject_len: AtomicUsize::new(0),
+            incoming: AtomicUsize::new(0),
+            poll_time_ns: AtomicU64::new(200_000 / 61),
+            service: AtomicU64::new(0),
+            _platform: core::marker::PhantomData,
+            cleanup: UnsafeCell::new(DomainCleanup {
+                queue_index: 0,
+                queue_head: 0,
+                task_cursor: [0; 3],
+                tasks_done: false,
+            }),
             state: AtomicU8::new(ExecutorDomainState::Active as u8),
-            scheduled_count: CacheAligned(AtomicUsize::new(0)),
-
-            queued_count: CacheAligned(AtomicUsize::new(0)),
-            active_count: CacheAligned(AtomicUsize::new(0)),
-            max_active: CacheAligned(AtomicUsize::new(config.max_active)),
-
-            quantum: CacheAligned(AtomicUsize::new(config.quantum)),
-            weight: CacheAligned(AtomicUsize::new(config.weight)),
-            deficit: CacheAligned(AtomicUsize::new(0)),
-
-            submitted: CacheAligned(AtomicUsize::new(0)),
-            completed: CacheAligned(AtomicUsize::new(0)),
-            total_runs: CacheAligned(AtomicUsize::new(0)),
-            scheduler_selections: CacheAligned(AtomicUsize::new(0)),
-            last_run_tick: CacheAligned(AtomicUsize::new(0)),
+            weight: AtomicUsize::new(config.weight),
         }
     }
 
-    #[inline]
-    pub fn is_scheduled(&self) -> bool {
-        self.scheduled_count.0.load(Ordering::Acquire) != 0
-    }
-
-    #[inline]
-    pub fn is_schedulable_for_policy(&self) -> bool {
-        self.is_runnable_for_policy() && !self.is_at_active_limit()
-    }
-
-    pub(crate) fn clear_runnable(&self) {
-        self.scheduled_count.0.store(0, Ordering::Release);
-    }
-
-    pub fn id(&self) -> ExecutorDomainId {
-        self.id
-    }
-
-    pub fn class(&self) -> ExecutorDomainClass {
-        self.class
-    }
+    pub fn id(&self) -> ExecutorDomainId { self.id }
 
     pub fn state(&self) -> ExecutorDomainState {
         ExecutorDomainState::from_u8(self.state.load(Ordering::Acquire))
     }
 
-    pub fn quantum(&self) -> usize {
-        self.quantum.0.load(Ordering::Acquire).max(1)
+    pub fn weight(&self) -> usize { self.weight.load(Ordering::Relaxed) }
+
+    pub fn set_weight(&self, weight: usize) {
+        self.weight.store(weight.clamp(1, u16::MAX as usize), Ordering::Relaxed);
     }
 
-    pub fn weight(&self) -> usize {
-        self.weight.0.load(Ordering::Acquire).max(1)
-    }
-
-    pub fn max_active(&self) -> usize {
-        self.max_active.0.load(Ordering::Acquire).max(1)
-    }
-
-    pub fn set_max_active(&self, max_active: usize) {
-        self.max_active
-            .0
-            .store(max_active.max(1), Ordering::Release);
-    }
-
-    pub fn queued_count(&self) -> usize {
-        self.queued_count.0.load(Ordering::Acquire)
-    }
-
-    pub fn active_count(&self) -> usize {
-        self.active_count.0.load(Ordering::Acquire)
-    }
-
-    pub fn future_arena(&self) -> &FutureArena {
-        &self.future_arena
-    }
-
-    pub fn live_task_count(&self) -> usize {
-        self.live_task_count.0.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn retain_task(&self) {
-        self.live_task_count.0.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn release_task(&self) {
-        self.live_task_count.0.fetch_sub(1, Ordering::AcqRel);
-        self.maybe_finish_draining();
-    }
-
-    pub fn has_queued_work(&self) -> bool {
-        self.ready_heads
-            .iter()
-            .any(|head| head.0.load(Ordering::Acquire) & TASK_ID_MASK != 0)
-    }
-
-    pub fn ready_shard_count(&self) -> usize {
-        self.ready_heads.len()
-    }
-
-    #[inline]
-    fn pack_ready(task_id: usize, tag: u64) -> u128 {
-        ((tag as u128) << READY_TAG_SHIFT) | (task_id as u128 & TASK_ID_MASK)
-    }
-
-    pub(crate) fn enqueue_task(&self, task_id: usize) -> bool {
-        if self.state() == ExecutorDomainState::Dead || task_id == 0 {
-            return false;
-        }
-        let Some((shard, local, generation)) = crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)
-        else {
-            return false;
-        };
-        let slab = crate::runtime::slab::task_slab::get_task_table();
-        let Some(slot) = slab.get_slot(shard, local, generation) else {
-            return false;
-        };
-        self.queued_count.0.fetch_add(1, Ordering::AcqRel);
-        let ready_head = &self.ready_heads[task_id % self.ready_heads.len()];
-        let mut head = ready_head.0.load(Ordering::Acquire);
-        loop {
-            let head_id = (head & TASK_ID_MASK) as usize;
-            slot.ready_next.store(head_id, Ordering::Relaxed);
-            let tag = ((head >> READY_TAG_SHIFT) as u64).wrapping_add(1);
-            let next = Self::pack_ready(task_id, tag);
-            // A failed strong CAS proves that another CPU changed this head.
-            match ready_head
-                .0
-                .compare_exchange(head, next, Ordering::Release, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    break;
-                }
-                Err(actual) => head = actual,
-            }
-        }
-        true
-    }
-
-    pub(crate) fn pop_task(&self) -> Option<usize> {
-        let shard_count = self.ready_heads.len();
-        let start = if crate::platform::in_interrupt_context() {
-            self.ready_cursor.0.fetch_add(1, Ordering::Relaxed) % shard_count
-        } else {
-            crate::platform::with_executor_local(|tls| {
-                let cursor = tls.ready_cursor.get();
-                tls.ready_cursor.set(cursor.wrapping_add(1));
-                cursor % shard_count
-            })
-        };
-
-        for offset in 0..shard_count {
-            if let Some(task_id) = self.pop_task_from_head((start + offset) % shard_count) {
-                return Some(task_id);
-            }
-        }
-        None
-    }
-
-    fn pop_task_from_head(&self, ready_shard: usize) -> Option<usize> {
-        let slab = crate::runtime::slab::task_slab::get_task_table();
-        let ready_head = &self.ready_heads[ready_shard];
-        let mut head = ready_head.0.load(Ordering::Acquire);
-        loop {
-            let task_id = (head & TASK_ID_MASK) as usize;
-            if task_id == 0 {
-                return None;
-            }
-            let (shard, local, generation) = crate::runtime::slab::ptr::decode_slab_task_ptr(task_id)?;
-            let slot = slab.get_slot(shard, local, generation)?;
-            let next_id = slot.ready_next.load(Ordering::Acquire);
-            let tag = ((head >> READY_TAG_SHIFT) as u64).wrapping_add(1);
-            let next = Self::pack_ready(next_id, tag);
-            // As on push, every retry is evidence of concurrent progress.
-            match ready_head
-                .0
-                .compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    slot.ready_next.store(0, Ordering::Relaxed);
-                    self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
-                    return Some(task_id);
-                }
-                Err(actual) => head = actual,
-            }
-        }
-    }
-
-    pub fn is_runnable_for_policy(&self) -> bool {
-        self.state() != ExecutorDomainState::Dead && self.has_queued_work()
-    }
-
-    pub fn is_at_active_limit(&self) -> bool {
-        self.active_count() >= self.max_active()
-    }
-
-    #[inline]
-    pub(crate) fn try_reserve_schedule_token(&self) -> bool {
-        let max_active = self.max_active();
-        let mut scheduled = self.scheduled_count.0.load(Ordering::Acquire);
-
-        loop {
-            let active = self.active_count();
-            if active >= max_active {
-                return false;
-            }
-
-            let queued = self.queued_count();
-            if scheduled >= queued || active.saturating_add(scheduled) >= max_active {
-                return false;
-            }
-
-            match self.scheduled_count.0.compare_exchange(
-                scheduled,
-                scheduled + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(next) => scheduled = next,
-            }
-        }
-    }
-
-    #[inline]
-    pub(crate) fn release_schedule_token(&self) {
-        let previous = self.scheduled_count.0.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous != 0, "executor domain schedule token underflow");
-    }
-
-    pub(crate) fn try_reserve_active(&self) -> bool {
-        self.active_count
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.max_active()).then_some(active + 1)
-            })
-            .is_ok()
-    }
-
-    pub(crate) fn release_active(&self) {
-        self.active_count.0.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn add_deficit(&self, amount: usize) -> usize {
-        self.deficit
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_add(amount))
-            })
-            .map(|old| old.saturating_add(amount))
-            .unwrap_or(amount)
-    }
-
-    pub(crate) fn spend_deficit(&self, amount: usize) {
-        let _ = self
-            .deficit
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(amount))
-            });
-    }
-
-    pub(crate) fn record_scheduler_selection(&self) {
-        self.scheduler_selections.0.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_run_started(&self, tick: usize) {
-        self.total_runs.0.fetch_add(1, Ordering::Relaxed);
-        self.last_run_tick.0.store(tick, Ordering::Release);
-    }
-
-    pub(crate) fn record_completed(&self) {
-        self.completed.0.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn has_queued_work(&self) -> bool {
+        self.incoming.load(Ordering::Acquire) != 0
+            || self.inject_len.load(Ordering::Acquire) != 0
+            || self.batches.iter().any(|batch| batch.spawned.has_work())
     }
 
     fn move_to_draining(&self) {
         let _ = self.state.compare_exchange(
             ExecutorDomainState::Active as u8,
             ExecutorDomainState::Draining as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
+            Ordering::AcqRel, Ordering::Acquire,
         );
     }
 
     fn move_to_dead(&self) {
-        self.state
-            .store(ExecutorDomainState::Dead as u8, Ordering::Release);
-        self.clear_runnable();
+        self.state.store(ExecutorDomainState::Dead as u8, Ordering::Release);
     }
 
-    pub(crate) fn maybe_finish_draining(&self) {
-        if self.state() == ExecutorDomainState::Draining
-            && self.queued_count() == 0
-            && self.active_count() == 0
-            && self.live_task_count() == 0
-            && self.future_arena.live_futures() == 0
+    pub fn info(&self) -> ExecutorDomainInfo {
+        ExecutorDomainInfo { state: self.state(), weight: self.weight() }
+    }
+}
+
+struct DomainReclamation<E: ExecutorPlatform> {
+    _platform: core::marker::PhantomData<fn() -> E>,
+    pending: AtomicBool,
+    candidates: [AtomicUsize; MAX_DOMAIN_SLOTS.div_ceil(usize::BITS as usize)],
+}
+
+impl<E: ExecutorPlatform> DomainReclamation<E> {
+    fn request(&self, index: usize) {
+        self.candidates[index / usize::BITS as usize]
+            .fetch_or(1usize << (index % usize::BITS as usize), Ordering::Release);
+        self.pending.store(true, Ordering::Release);
+        crate::global_async::GlobalAsyncExecutor::<E>::global().try_schedule::<true>();
+    }
+}
+
+pub(crate) struct DomainBorrow<'a, E: ExecutorPlatform> {
+    domain: *const ExecutorDomain<E>,
+    slot: &'a DomainSlot<E>,
+    reclamation: &'a DomainReclamation<E>,
+    notify: bool,
+}
+
+impl<E: ExecutorPlatform> core::ops::Deref for DomainBorrow<'_, E> {
+    type Target = ExecutorDomain<E>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.domain }
+    }
+}
+
+impl<E: ExecutorPlatform> Drop for DomainBorrow<'_, E> {
+    fn drop(&mut self) {
+        let index = self.id.slot() as usize;
+        let draining = self.notify && self.state() != ExecutorDomainState::Active;
+        if self.slot.readers.fetch_sub(1, Ordering::SeqCst) & DOMAIN_READER_COUNT == 1
+            && (draining
+                || matches!(
+                    self.slot.state.load(Ordering::SeqCst),
+                    DOMAIN_SLOT_RETIRED | DOMAIN_SLOT_REAPING
+                ))
         {
-            self.move_to_dead();
-        }
-    }
-
-    pub fn stats(&self) -> ExecutorDomainStats {
-        ExecutorDomainStats {
-            domain_id: self.id,
-            generation: self.generation,
-            class: self.class,
-            state: self.state(),
-            queued_count: self.queued_count(),
-            active_count: self.active_count(),
-            live_task_count: self.live_task_count(),
-            live_future_count: self.future_arena.live_futures(),
-            live_future_bytes: self.future_arena.live_bytes(),
-            max_active: self.max_active(),
-            quantum: self.quantum(),
-            weight: self.weight(),
-            ready_shards: self.ready_shard_count(),
-            deficit: self.deficit.0.load(Ordering::Acquire),
-            scheduled: self.is_scheduled(),
-            submitted: self.submitted.0.load(Ordering::Acquire),
-            completed: self.completed.0.load(Ordering::Acquire),
-            total_runs: self.total_runs.0.load(Ordering::Acquire),
-            scheduler_selections: self.scheduler_selections.0.load(Ordering::Acquire),
-            last_run_tick: self.last_run_tick.0.load(Ordering::Acquire),
+            self.reclamation.request(index);
         }
     }
 }
 
-struct DomainSlot {
+struct DomainSlot<E: ExecutorPlatform> {
     state: AtomicUsize,
+    readers: AtomicUsize,
     generation: AtomicUsize,
-    domain: AtomicPtr<ExecutorDomain>,
+    domain: AtomicPtr<ExecutorDomain<E>>,
 }
 
-impl DomainSlot {
+impl<E: ExecutorPlatform> DomainSlot<E> {
     fn new() -> Self {
         Self {
             state: AtomicUsize::new(DOMAIN_SLOT_EMPTY),
-            generation: AtomicUsize::new(BUILTIN_GENERATION as usize),
+            readers: AtomicUsize::new(0),
+            generation: AtomicUsize::new(INITIAL_GENERATION as usize),
             domain: AtomicPtr::new(ptr::null_mut()),
         }
     }
@@ -607,59 +350,56 @@ impl DomainSlot {
     }
 
     #[inline]
-    fn load_domain_ptr(&self) -> *mut ExecutorDomain {
+    fn load_domain_ptr(&self) -> *mut ExecutorDomain<E> {
         self.domain.load(Ordering::Acquire)
     }
 
     #[inline]
-    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> { unsafe {
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    }}
-}
-
-struct DomainChunk {
-    slots: [DomainSlot; DOMAIN_CHUNK_SIZE],
-}
-
-impl DomainChunk {
-    fn new() -> Self {
-        Self {
-            slots: core::array::from_fn(|_| DomainSlot::new()),
+    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain<E>) -> Arc<ExecutorDomain<E>> {
+        unsafe {
+            Arc::increment_strong_count(ptr);
+            Arc::from_raw(ptr)
         }
     }
 }
 
-pub struct ExecutorDomainTable {
-    next_slot: AtomicUsize,
-    chunks: [AtomicPtr<DomainChunk>; MAX_DOMAIN_CHUNKS],
+struct DomainChunk<E: ExecutorPlatform> {
+    slots: [DomainSlot<E>; DOMAIN_CHUNK_SIZE],
 }
 
-impl ExecutorDomainTable {
+impl<E: ExecutorPlatform> DomainChunk<E> {
+    fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| DomainSlot::<E>::new()),
+        }
+    }
+}
+
+pub struct ExecutorDomainTable<E: ExecutorPlatform> {
+    reclamation: Arc<DomainReclamation<E>>,
+    next_slot: AtomicUsize,
+    chunks: [AtomicPtr<DomainChunk<E>>; MAX_DOMAIN_CHUNKS],
+    workers: usize,
+    ready: [AtomicUsize; MAX_DOMAIN_SLOTS.div_ceil(usize::BITS as usize)],
+    ready_groups: AtomicU64,
+    selection: crate::sync::SchedulerMutex<u64>,
+}
+
+impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
     pub(crate) fn new(cpu_count: usize) -> Self {
-        let table = Self {
+        Self {
+            reclamation: Arc::new(DomainReclamation::<E> {
+                _platform: core::marker::PhantomData,
+                pending: AtomicBool::new(false),
+                candidates: core::array::from_fn(|_| AtomicUsize::new(0)),
+            }),
             next_slot: AtomicUsize::new(0),
             chunks: core::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-        };
-
-        table.install_builtin(
-            KERNEL_HIGH_SLOT,
-            ExecutorDomainConfig::for_class(ExecutorDomainClass::KernelHigh, cpu_count),
-        );
-        table.install_builtin(
-            DRIVER_SLOT,
-            ExecutorDomainConfig::for_class(ExecutorDomainClass::Driver, cpu_count),
-        );
-        table.install_builtin(
-            KERNEL_NORMAL_SLOT,
-            ExecutorDomainConfig::for_class(ExecutorDomainClass::KernelNormal, cpu_count),
-        );
-        table.install_builtin(
-            KERNEL_BACKGROUND_SLOT,
-            ExecutorDomainConfig::for_class(ExecutorDomainClass::KernelBackground, cpu_count),
-        );
-
-        table
+            workers: cpu_count.max(1),
+            ready: core::array::from_fn(|_| AtomicUsize::new(0)),
+            ready_groups: AtomicU64::new(0),
+            selection: crate::sync::SchedulerMutex::new(0),
+        }
     }
 
     fn chunk_index(slot_idx: usize) -> usize {
@@ -670,23 +410,7 @@ impl ExecutorDomainTable {
         slot_idx & DOMAIN_CHUNK_MASK
     }
 
-    fn publish_slot_count(&self, required: usize) {
-        let mut current = self.next_slot.load(Ordering::Acquire);
-
-        while current < required {
-            match self.next_slot.compare_exchange_weak(
-                current,
-                required,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(next) => current = next,
-            }
-        }
-    }
-
-    fn get_or_create_chunk(&self, chunk_idx: usize) -> *mut DomainChunk {
+    fn get_or_create_chunk(&self, chunk_idx: usize) -> *mut DomainChunk<E> {
         assert!(
             chunk_idx < MAX_DOMAIN_CHUNKS,
             "executor domain table exhausted"
@@ -697,7 +421,7 @@ impl ExecutorDomainTable {
             return existing;
         }
 
-        let new_chunk = Box::into_raw(Box::new(DomainChunk::new()));
+        let new_chunk = Box::into_raw(Box::new(DomainChunk::<E>::new()));
 
         match self.chunks[chunk_idx].compare_exchange(
             ptr::null_mut(),
@@ -716,7 +440,7 @@ impl ExecutorDomainTable {
         }
     }
 
-    fn get_existing_chunk(&self, chunk_idx: usize) -> Option<*mut DomainChunk> {
+    fn get_existing_chunk(&self, chunk_idx: usize) -> Option<*mut DomainChunk<E>> {
         if chunk_idx >= MAX_DOMAIN_CHUNKS {
             return None;
         }
@@ -725,39 +449,21 @@ impl ExecutorDomainTable {
         (!chunk.is_null()).then_some(chunk)
     }
 
-    fn get_or_create_slot(&self, slot_idx: usize) -> &DomainSlot {
+    fn get_or_create_slot(&self, slot_idx: usize) -> &DomainSlot<E> {
         let chunk = self.get_or_create_chunk(Self::chunk_index(slot_idx));
         let idx = Self::chunk_slot_index(slot_idx);
 
         unsafe { &(*chunk).slots[idx] }
     }
 
-    fn get_existing_slot(&self, slot_idx: usize) -> Option<&DomainSlot> {
+    fn get_existing_slot(&self, slot_idx: usize) -> Option<&DomainSlot<E>> {
         let chunk = self.get_existing_chunk(Self::chunk_index(slot_idx))?;
         let idx = Self::chunk_slot_index(slot_idx);
 
         Some(unsafe { &(*chunk).slots[idx] })
     }
 
-    fn install_builtin(&self, slot_idx: u32, config: ExecutorDomainConfig) {
-        let slot_idx = slot_idx as usize;
-        let id = ExecutorDomainId::from_parts(slot_idx as u32, BUILTIN_GENERATION);
-        let slot = self.get_or_create_slot(slot_idx);
-
-        slot.state.store(DOMAIN_SLOT_RESERVED, Ordering::Release);
-        slot.generation
-            .store(BUILTIN_GENERATION as usize, Ordering::Release);
-
-        let domain = Arc::new(ExecutorDomain::new(id, config));
-        let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
-
-        slot.domain.store(raw, Ordering::Release);
-        slot.state.store(DOMAIN_SLOT_BUILTIN, Ordering::Release);
-
-        self.publish_slot_count(slot_idx + 1);
-    }
-
-    pub fn create_executor_domain(&self, config: ExecutorDomainConfig) -> ExecutorDomainId {
+    pub fn create_executor_domain(&self, config: ExecutorDomainConfig) -> Arc<ExecutorDomain<E>> {
         let config = config.normalized();
 
         if let Some((idx, slot)) = self.reserve_reusable_slot() {
@@ -789,7 +495,7 @@ impl ExecutorDomainTable {
         }
     }
 
-    fn reserve_reusable_slot(&self) -> Option<(usize, &DomainSlot)> {
+    fn reserve_reusable_slot(&self) -> Option<(usize, &DomainSlot<E>)> {
         let limit = self.next_slot.load(Ordering::Acquire);
         let mut idx = 0usize;
 
@@ -821,19 +527,23 @@ impl ExecutorDomainTable {
     fn install_user_domain(
         &self,
         idx: usize,
-        slot: &DomainSlot,
+        slot: &DomainSlot<E>,
         config: ExecutorDomainConfig,
-    ) -> ExecutorDomainId {
+    ) -> Arc<ExecutorDomain<E>> {
         let generation = slot.generation.load(Ordering::Acquire).max(1) as u32;
         let id = ExecutorDomainId::from_parts(idx as u32, generation);
 
-        let domain = Arc::new(ExecutorDomain::new(id, config));
-        let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
+        let domain = Arc::new(ExecutorDomain::<E>::new(
+            id,
+            config,
+            self.workers,
+        ));
+        let raw = Arc::into_raw(domain.clone()) as *mut ExecutorDomain<E>;
 
         slot.domain.store(raw, Ordering::Release);
         slot.state.store(DOMAIN_SLOT_ACTIVE, Ordering::Release);
 
-        id
+        domain
     }
 
     pub fn destroy_executor_domain(
@@ -843,115 +553,391 @@ impl ExecutorDomainTable {
         let slot = self
             .get_existing_slot(domain_id.slot() as usize)
             .ok_or(DestroyExecutorDomainError::InvalidDomain)?;
-
-        let slot_state = slot.state.load(Ordering::Acquire);
-
-        if slot_state == DOMAIN_SLOT_BUILTIN {
-            return Err(DestroyExecutorDomainError::BuiltinDomain);
-        }
-
-        if slot_state != DOMAIN_SLOT_ACTIVE {
-            return Err(DestroyExecutorDomainError::InvalidDomain);
-        }
-
         if slot.generation() != domain_id.generation() {
             return Err(DestroyExecutorDomainError::StaleDomain);
         }
-
-        let Some(domain) = self.get_executor_domain(domain_id) else {
-            return Err(DestroyExecutorDomainError::InvalidDomain);
-        };
-
-        if domain.queued_count() == 0
-            && domain.active_count() == 0
-            && domain.live_task_count() == 0
-            && domain.future_arena().live_futures() == 0
-        {
-            domain.move_to_dead();
-
-            if slot
-                .state
-                .compare_exchange(
-                    DOMAIN_SLOT_ACTIVE,
-                    DOMAIN_SLOT_RESERVED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                return Err(DestroyExecutorDomainError::InvalidDomain);
-            }
-
-            slot.domain.store(ptr::null_mut(), Ordering::Release);
-
-            let next_generation = domain_id.generation().wrapping_add(1).max(1);
-            slot.generation
-                .store(next_generation as usize, Ordering::Release);
-            slot.state.store(DOMAIN_SLOT_EMPTY, Ordering::Release);
-
-            return Ok(DestroyExecutorDomainResult::Destroyed);
+        if matches!(
+            slot.state.load(Ordering::SeqCst),
+            DOMAIN_SLOT_CLEANUP | DOMAIN_SLOT_CLEANING
+        ) {
+            return Ok(DestroyExecutorDomainResult::Draining);
         }
-
+        let domain = self
+            .borrow_executor_domain(domain_id)
+            .ok_or(DestroyExecutorDomainError::InvalidDomain)?;
         domain.move_to_draining();
-        Ok(DestroyExecutorDomainResult::Draining)
+        self.reclamation.request(domain_id.slot() as usize);
+        drop(domain);
+        if !E::in_interrupt_context() {
+            self.drain_retired();
+        }
+        if slot.generation() != domain_id.generation()
+            || matches!(
+                slot.state.load(Ordering::SeqCst),
+                DOMAIN_SLOT_RETIRED | DOMAIN_SLOT_REAPING | DOMAIN_SLOT_EMPTY
+            )
+        {
+            Ok(DestroyExecutorDomainResult::Destroyed)
+        } else {
+            Ok(DestroyExecutorDomainResult::Draining)
+        }
     }
 
-    pub fn get_executor_domain(&self, domain_id: ExecutorDomainId) -> Option<Arc<ExecutorDomain>> {
+    pub(crate) fn borrow_executor_domain(
+        &self,
+        domain_id: ExecutorDomainId,
+    ) -> Option<DomainBorrow<'_, E>> {
         if !domain_id.is_valid() {
             return None;
         }
-
         let slot = self.get_existing_slot(domain_id.slot() as usize)?;
-
-        let state = slot.state.load(Ordering::Acquire);
-        if state != DOMAIN_SLOT_ACTIVE && state != DOMAIN_SLOT_BUILTIN {
+        let state = slot.state.load(Ordering::SeqCst);
+        if state != DOMAIN_SLOT_ACTIVE {
             return None;
         }
-
-        let generation = slot.generation.load(Ordering::Acquire) as u32;
-        if generation != domain_id.generation() {
+        let previous = slot.readers.fetch_add(1, Ordering::SeqCst);
+        assert!(previous & DOMAIN_READER_COUNT < DOMAIN_READER_COUNT);
+        if previous & DOMAIN_READER_CLOSED != 0 {
+            if slot.readers.fetch_sub(1, Ordering::SeqCst) & DOMAIN_READER_COUNT == 1 {
+                self.reclamation.request(domain_id.slot() as usize);
+            }
             return None;
         }
-
-        let ptr = slot.load_domain_ptr();
-        if ptr.is_null() {
-            return None;
-        }
-
-        let domain = unsafe { DomainSlot::clone_domain_from_ptr(ptr) };
-
-        let state_after = slot.state.load(Ordering::Acquire);
-        let generation_after = slot.generation.load(Ordering::Acquire) as u32;
-        let ptr_after = slot.load_domain_ptr();
-
-        if ptr_after != ptr
-            || generation_after != domain_id.generation()
-            || (state_after != DOMAIN_SLOT_ACTIVE && state_after != DOMAIN_SLOT_BUILTIN)
+        if slot.state.load(Ordering::SeqCst) != state || slot.generation() != domain_id.generation()
         {
-            drop(domain);
+            if slot.readers.fetch_sub(1, Ordering::SeqCst) & DOMAIN_READER_COUNT == 1 {
+                self.reclamation.request(domain_id.slot() as usize);
+            }
             return None;
         }
-
-        Some(domain)
+        let raw = slot.load_domain_ptr();
+        assert!(!raw.is_null());
+        Some(DomainBorrow {
+            domain: raw,
+            slot,
+            reclamation: &self.reclamation,
+            notify: true,
+        })
     }
 
-    pub fn domain_count(&self) -> usize {
-        let limit = self.next_slot.load(Ordering::Acquire);
-        let mut count = 0usize;
-        let mut idx = 0usize;
+    pub fn get_executor_domain(
+        &self,
+        domain_id: ExecutorDomainId,
+    ) -> Option<Arc<ExecutorDomain<E>>> {
+        let domain = self.borrow_executor_domain(domain_id)?;
+        Some(unsafe { DomainSlot::<E>::clone_domain_from_ptr(ptr::from_ref(&*domain).cast_mut()) })
+    }
 
-        while idx < limit {
-            if let Some(slot) = self.get_existing_slot(idx) {
-                let state = slot.state.load(Ordering::Acquire);
+    pub(crate) fn has_retired(&self) -> bool {
+        self.reclamation.pending.load(Ordering::Acquire)
+    }
 
-                if state == DOMAIN_SLOT_ACTIVE || state == DOMAIN_SLOT_BUILTIN {
-                    count += 1;
-                }
-            }
-
-            idx += 1;
+    pub(crate) fn mark_ready(&self, id: ExecutorDomainId) {
+        let index = id.slot() as usize;
+        let word = index / usize::BITS as usize;
+        let bit = 1usize << (index % usize::BITS as usize);
+        self.ready[word].fetch_or(bit, Ordering::Release);
+        if self.ready_groups.load(Ordering::Acquire) & (1u64 << word) == 0 {
+            self.ready_groups.fetch_or(1u64 << word, Ordering::Release);
         }
+    }
 
-        count
+    pub(crate) fn visit_ready<'a>(&'a self, mut visit: impl FnMut(DomainBorrow<'a, E>) -> bool) {
+        let mut groups = self.ready_groups.load(Ordering::Acquire);
+        while groups != 0 {
+            let word_index = groups.trailing_zeros() as usize;
+            groups &= groups - 1;
+            let mut bits = self.ready[word_index].load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let index = word_index * usize::BITS as usize + bit;
+                let Some(slot) = self.get_existing_slot(index) else { continue; };
+                let id = ExecutorDomainId::from_parts(index as u32, slot.generation());
+                let Some(domain) = self.borrow_executor_domain(id) else { continue; };
+                if domain.state() != ExecutorDomainState::Active { continue; }
+                if !domain.has_queued_work() {
+                    if domain.batches.iter().all(|batch| batch.state.load(Ordering::Acquire) == BATCH_EMPTY) {
+                        self.ready[word_index].fetch_and(!(1usize << bit), Ordering::AcqRel);
+                        fence(Ordering::SeqCst);
+                        if domain.has_queued_work()
+                            || domain.batches.iter().any(|batch| batch.state.load(Ordering::Acquire) != BATCH_EMPTY)
+                        {
+                            self.mark_ready(id);
+                            if !domain.has_queued_work() { continue; }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                if !visit(domain) { return; }
+            }
+        }
+    }
+
+    pub(crate) fn select_domain(
+        &self,
+        cached: Option<&ExecutorDomain<E>>,
+    ) -> Option<(DomainBorrow<'_, E>, u64, u64)> {
+        if let Some(domain) = cached
+            && domain.state() == ExecutorDomainState::Active
+            && !self.has_competition(domain.id())
+        {
+            let domain = self.borrow_executor_domain(domain.id())?;
+            if domain.state() != ExecutorDomainState::Active { return None; }
+            let weight = domain.weight() as u64;
+            return Some((domain, 0, weight));
+        }
+        let mut sole = None;
+        let mut found = false;
+        self.visit_ready(|domain| {
+            found = true;
+            if !self.has_competition(domain.id()) { sole = Some(domain); }
+            false
+        });
+        if !found { return None; }
+        if let Some(domain) = sole {
+            let weight = domain.weight() as u64;
+            return Some((domain, 0, weight));
+        }
+        {
+            let mut floor = self.selection.lock();
+            let mut selected: Option<DomainBorrow<'_, E>> = None;
+            let mut minimum = u64::MAX;
+            self.visit_ready(|domain| {
+                let service = domain.service.load(Ordering::Relaxed).max(*floor);
+                if service < minimum {
+                    minimum = service;
+                    selected = Some(domain);
+                }
+                true
+            });
+            let domain = selected?;
+            let weight = domain.weight() as u64;
+            let reservation = domain.poll_time_ns.load(Ordering::Relaxed)
+                .saturating_mul(61 * 1024) / weight;
+            *floor = minimum;
+            domain.service.fetch_max(minimum, Ordering::Relaxed);
+            domain.service.fetch_add(reservation, Ordering::Relaxed);
+            Some((domain, reservation, weight))
+        }
+    }
+
+    pub(crate) fn has_competition(&self, id: ExecutorDomainId) -> bool {
+        let index = id.slot() as usize;
+        let mut groups = self.ready_groups.load(Ordering::Acquire);
+        while groups != 0 {
+            let word = groups.trailing_zeros() as usize;
+            groups &= groups - 1;
+            let own = if word == index / usize::BITS as usize {
+                1usize << (index % usize::BITS as usize)
+            } else { 0 };
+            if self.ready[word].load(Ordering::Acquire) & !own != 0 { return true; }
+        }
+        false
+    }
+
+    pub(crate) fn drain_retired(&self) {
+        if !self.reclamation.pending.load(Ordering::Acquire)
+            || !self.reclamation.pending.swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        for (word_index, word) in self.reclamation.candidates.iter().enumerate() {
+            let mut candidates = word.swap(0, Ordering::AcqRel);
+            while candidates != 0 {
+                let bit = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                let index = word_index * usize::BITS as usize + bit;
+                let Some(slot) = self.get_existing_slot(index) else {
+                    continue;
+                };
+                if slot.state.load(Ordering::SeqCst) == DOMAIN_SLOT_ACTIVE {
+                    let id = ExecutorDomainId::from_parts(index as u32, slot.generation());
+                    if let Some(mut domain) = self.borrow_executor_domain(id) {
+                        if domain.state() == ExecutorDomainState::Draining
+                            && crate::global_async::GlobalAsyncExecutor::<E>::global().blocking_tasks.lock()
+                                .iter().flatten().any(|task| task.domain_id == domain.id())
+                        {
+                            domain.notify = false;
+                            continue;
+                        }
+                        if domain.state() == ExecutorDomainState::Draining
+                            && slot
+                                .readers
+                                .compare_exchange(
+                                    1,
+                                    DOMAIN_READER_CLOSED | 1,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                        {
+                            domain.notify = false;
+                            slot.state.store(DOMAIN_SLOT_CLEANUP, Ordering::SeqCst);
+                        }
+                    }
+                }
+                if slot
+                    .state
+                    .compare_exchange(
+                        DOMAIN_SLOT_CLEANUP,
+                        DOMAIN_SLOT_CLEANING,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    let domain = unsafe { &*slot.load_domain_ptr() };
+                    let cleanup = unsafe { &mut *domain.cleanup.get() };
+                    let table = crate::runtime::slab::task_slab::get_task_table::<E>();
+                    let mut remaining = 256usize;
+                    let queues = 2 + domain.batches.len() * 2;
+                    while remaining != 0 && (cleanup.queue_head != 0 || cleanup.queue_index < queues) {
+                        if cleanup.queue_head == 0 {
+                            let queue = cleanup.queue_index;
+                            cleanup.queue_index += 1;
+                            if queue == 0 {
+                                let mut inject = domain.inject.lock();
+                                cleanup.queue_head = core::mem::take(&mut inject.head);
+                                inject.tail = None;
+                                inject.len = 0;
+                                domain.inject_len.store(0, Ordering::Release);
+                            } else if queue == 1 {
+                                cleanup.queue_head = domain.incoming.swap(0, Ordering::Acquire);
+                            } else {
+                                let queue = queue - 2;
+                                let owned = &domain.batches[queue / 2];
+                                cleanup.queue_head = if queue % 2 == 0 {
+                                    unsafe { core::mem::take(&mut (*owned.batch.get()).local_task) }
+                                } else {
+                                    let task = unsafe { owned.spawned.pop() }.unwrap_or(0);
+                                    if task != 0 { cleanup.queue_index -= 1; }
+                                    task
+                                };
+                            }
+                            continue;
+                        }
+                        let task = unsafe { &*(cleanup.queue_head as *const crate::runtime::slab::slot::TaskSlot) };
+                        let (shard, local, generation) = crate::runtime::slab::ptr::decode_slab_task_ptr(
+                            task.task_id.load(Ordering::Relaxed) as usize,
+                        ).expect("invalid cleanup task");
+                        cleanup.queue_head = task.ready_next.swap(0, Ordering::Relaxed);
+                        table.decrement_ref::<true>(shard, local, generation);
+                        remaining -= 1;
+                    }
+                    if cleanup.queue_head == 0
+                        && cleanup.queue_index == queues
+                        && !cleanup.tasks_done
+                    {
+                        cleanup.tasks_done = table.slab.scan_slots(
+                            &mut cleanup.task_cursor,
+                            &mut remaining,
+                            |handle, task| {
+                                let shard = handle.shard as usize;
+                                let local = handle.local_index as usize;
+                                let generation = handle.generation;
+                                if task.executor_domain_id() != Some(domain.id())
+                                    || !table.increment_ref(shard, local, generation)
+                                {
+                                    return;
+                                }
+                                if task.executor_domain_id() == Some(domain.id()) {
+                                    use crate::runtime::task::{
+                                        STATE_COMPLETED, STATE_IDLE, STATE_POLLING, STATE_QUEUED,
+                                    };
+                                    let mut state = task.state.load(Ordering::Acquire);
+                                    loop {
+                                        if state == STATE_COMPLETED {
+                                            break;
+                                        }
+                                        assert!(matches!(state, STATE_IDLE | STATE_QUEUED));
+                                        match task.state.compare_exchange(
+                                            state,
+                                            STATE_POLLING,
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        ) {
+                                            Ok(_) => {
+                                                if task.cancellation_guards.load(Ordering::Acquire) != 0 {
+                                                    let target = E::cancellation_domain();
+                                                    let executor = crate::global_async::GlobalAsyncExecutor::<E>::global();
+                                                    task.domain_id.store(target.id().raw(), Ordering::Release);
+                                                    task.state.store(STATE_QUEUED, Ordering::Release);
+                                                    let queued = table.get_slot(shard, local, generation)
+                                                        .expect("protected task slot missing");
+                                                    crate::platform::with_executor_local::<E, _>(|tls| {
+                                                        executor.enqueue_task::<false, false, true>(
+                                                            target, tls,
+                                                            task.task_id.load(Ordering::Relaxed) as usize,
+                                                            queued,
+                                                        );
+                                                    });
+                                                    return;
+                                                }
+                                                let token =
+                                                    crate::runtime::slab::ptr::encode_slab_task_ptr(
+                                                        handle.shard,
+                                                        handle.local_index,
+                                                        generation,
+                                                    );
+                                                unsafe {
+                                                    task.cancel_owned::<E>(token);
+                                                }
+                                                table.decrement_ref::<true>(
+                                                    shard, local, generation,
+                                                );
+                                                break;
+                                            }
+                                            Err(actual) => state = actual,
+                                        }
+                                    }
+                                }
+                                table.decrement_ref::<true>(shard, local, generation);
+                            },
+                        );
+                    }
+                    let finished = cleanup.tasks_done;
+                    if finished {
+                        self.ready[index / usize::BITS as usize].fetch_and(
+                            !(1usize << (index % usize::BITS as usize)), Ordering::AcqRel,
+                        );
+                        domain.move_to_dead();
+                        slot.state.store(DOMAIN_SLOT_RETIRED, Ordering::SeqCst);
+                    } else {
+                        slot.state.store(DOMAIN_SLOT_CLEANUP, Ordering::SeqCst);
+                        self.reclamation.request(index);
+                    }
+                }
+                if slot
+                    .state
+                    .compare_exchange(
+                        DOMAIN_SLOT_RETIRED,
+                        DOMAIN_SLOT_REAPING,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                if slot.readers.load(Ordering::SeqCst) & DOMAIN_READER_COUNT != 0 {
+                    slot.state.store(DOMAIN_SLOT_RETIRED, Ordering::SeqCst);
+                    if slot.readers.load(Ordering::SeqCst) & DOMAIN_READER_COUNT == 0 {
+                        self.reclamation.request(index);
+                    }
+                    continue;
+                }
+                let raw = slot.domain.swap(ptr::null_mut(), Ordering::AcqRel);
+                let generation = slot.generation().wrapping_add(1).max(1);
+                slot.generation
+                    .store(generation as usize, Ordering::Release);
+                unsafe { drop(Arc::from_raw(raw)) };
+                slot.readers.store(0, Ordering::SeqCst);
+                slot.state.store(DOMAIN_SLOT_EMPTY, Ordering::SeqCst);
+            }
+        }
     }
 }

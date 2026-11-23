@@ -281,7 +281,7 @@ impl Object {
                 }
             }
             ObjectPayload::Thread(task) => {
-                match crate::scheduling::scheduler::SCHEDULER.delete_task(task.task_id()) {
+                match crate::scheduling::scheduler::scheduler().delete_task(task.task_id()) {
                     Ok(()) => IoRequestOutput::success(0, 0),
                     Err(_) => IoRequestOutput::error(IO_STATUS_INVALID_PARAMETER),
                 }
@@ -436,25 +436,15 @@ impl ObjectBehavior for Arc<UserExecutorDomain> {
         if information_class != ObjectInformationClass::ExecutorDomain as u32 {
             return Err(ObjectQueryError::UnsupportedClass);
         }
-        let stats = self.stats();
+        let info = self.info();
         output.write(&UserExecutorDomainInfo {
-            state: match stats.state {
+            state: match info.state {
                 ExecutorDomainState::Active => 0,
                 ExecutorDomainState::Draining => 1,
                 ExecutorDomainState::Dead => 2,
             },
             reserved: 0,
-            max_active_tasks: if stats.max_active == usize::MAX {
-                0
-            } else {
-                stats.max_active as u64
-            },
-            queued_tasks: stats.queued_count as u64,
-            active_tasks: stats.active_count as u64,
-            live_tasks: stats.live_task_count as u64,
-            live_futures: stats.live_future_count as u64,
-            live_future_bytes: stats.live_future_bytes as u64,
-            ready_shards: stats.ready_shards as u64,
+            weight: info.weight as u64,
         })
     }
 }

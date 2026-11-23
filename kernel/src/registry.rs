@@ -3,7 +3,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use kernel_types::async_types::AsyncMutex;
+use kernel_sync::locks::AsyncMutex;
 use kernel_types::error::{KernelError, RegistryErrorKind, ResultErrorContext};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::status::Data;

@@ -1,11 +1,11 @@
 #[cfg(any(loom, feature = "loom"))]
 pub mod atomic {
-    pub use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    pub use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 }
 
 #[cfg(not(any(loom, feature = "loom")))]
 pub mod atomic {
-    pub use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    pub use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 }
 
 #[cfg(any(loom, feature = "loom"))]

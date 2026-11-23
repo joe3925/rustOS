@@ -1,8 +1,7 @@
 use kernel_sys::{
     irq_handle_get_user_ctx, irq_handle_is_closed, irq_handle_set_user_ctx, irq_handle_unregister,
     irq_handle_wait_abi, kernel_interrupt_bind_msi, kernel_interrupt_bind_wired,
-    kernel_irq_borrowed_ensure_signal, kernel_irq_borrowed_signal, kernel_irq_borrowed_signal_all,
-    kernel_irq_borrowed_signal_n, kernel_platform_cpu_ids,
+    kernel_platform_cpu_ids,
 };
 use kernel_types::irq::IRQ_RESCUE_WAKEUP;
 pub use kernel_types::irq::{
@@ -31,16 +30,19 @@ impl IrqHandleExt for IrqHandle {
 
     #[inline]
     fn is_closed(&self) -> bool {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe { irq_handle_is_closed(self) }
     }
 
     #[inline]
     fn set_user_ctx(&self, v: usize) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe { irq_handle_set_user_ctx(self, v) };
     }
 
     #[inline]
     fn user_ctx(&self) -> usize {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe { irq_handle_get_user_ctx(self) }
     }
 
@@ -60,29 +62,41 @@ pub trait IrqBorrowedHandleExt {
 impl IrqBorrowedHandleExt for IrqBorrowedHandle {
     #[inline]
     fn signal_one(self, meta: IrqMeta) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
-            kernel_irq_borrowed_signal(self, meta);
+            if let Some(inner) = self.as_ref() {
+                inner.signal_one(meta);
+            }
         }
     }
 
     #[inline]
     fn signal_n(self, meta: IrqMeta, n: u32) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
-            kernel_irq_borrowed_signal_n(self, meta, n);
+            if let Some(inner) = self.as_ref() {
+                inner.signal_n(meta, n as usize);
+            }
         }
     }
 
     #[inline]
     fn signal_all(self, meta: IrqMeta) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
-            kernel_irq_borrowed_signal_all(self, meta);
+            if let Some(inner) = self.as_ref() {
+                inner.signal_all(meta);
+            }
         }
     }
 
     #[inline]
     fn ensure_signal_exactly_one(self, meta: IrqMeta) {
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
-            kernel_irq_borrowed_ensure_signal(self, meta);
+            if let Some(inner) = self.as_ref() {
+                inner.ensure_signal_exactly_one(meta);
+            }
         }
     }
 }

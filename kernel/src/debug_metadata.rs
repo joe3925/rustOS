@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
+#[derive(Clone, Copy)]
 pub struct DebugLoadedSection<'a> {
     pub name: &'a str,
     pub runtime_addr: u64,
@@ -111,7 +112,11 @@ fn write_quoted(buf: &mut impl core::fmt::Write, value: &str) {
     let _ = core::fmt::Write::write_fmt(buf, format_args!("\"{}\"", value));
 }
 
-fn emit_module(id: u32, module: &DebugLoadedModule<'_>) {
+fn emit_module<'a>(
+    id: u32,
+    module: &DebugLoadedModule<'_>,
+    sections: impl IntoIterator<Item = DebugLoadedSection<'a>>,
+) {
     if !debug_metadata_live_emit_allowed() {
         return;
     }
@@ -148,7 +153,7 @@ fn emit_module(id: u32, module: &DebugLoadedModule<'_>) {
         sink_write(buf.as_bytes());
     }
 
-    for section in module.sections {
+    for section in sections {
         let mut buf = arrayfmt::ArrayFmt::<256>::new();
 
         let _ = core::fmt::Write::write_fmt(
@@ -210,7 +215,7 @@ pub fn module_loaded(module: &DebugLoadedModule<'_>) {
     poll_sink();
 
     if host_was_ready {
-        emit_module(id, module);
+        emit_module(id, module, module.sections.iter().copied());
     }
 
     if debug_metadata_host_ready() {
@@ -226,15 +231,14 @@ pub fn replay_snapshot() {
     let snapshot = SNAPSHOT.lock();
 
     for module in snapshot.iter() {
-        let sections: Vec<DebugLoadedSection<'_>> = module
+        let sections = module
             .sections
             .iter()
             .map(|section| DebugLoadedSection {
                 name: section.name.as_str(),
                 runtime_addr: section.runtime_addr,
                 size: section.size,
-            })
-            .collect();
+            });
 
         emit_module(
             module.id,
@@ -243,8 +247,9 @@ pub fn replay_snapshot() {
                 path: module.path.as_deref(),
                 preferred_image_base: module.preferred_image_base,
                 loaded_image_base: module.loaded_image_base,
-                sections: &sections,
+                sections: &[],
             },
+            sections,
         );
     }
 }

@@ -1,3 +1,4 @@
+use kernel_sync::queues::stack::TreiberStack;
 use alloc::sync::Arc;
 
 use crate::async_ffi::{AbiFuture, FutureExt};
@@ -6,7 +7,7 @@ use crate::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use crate::error::{DriverErrorKind, KernelError};
 use crate::io::{
     DeviceControlHandler, DeviceControlOp, DeviceFlush, DeviceFlushOp, DeviceOps, DeviceRead,
-    DeviceReadOp, DeviceWrite, DeviceWriteOp, TreiberStack,
+    DeviceReadOp, DeviceWrite, DeviceWriteOp,
 };
 use crate::pnp::DriverStep;
 use crate::request::{DeviceControl, Flush, IoctlData, Read, Write};

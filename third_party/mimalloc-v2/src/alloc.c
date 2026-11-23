@@ -184,6 +184,16 @@ extern inline void* _mi_heap_malloc_zero_ex(mi_heap_t* heap, size_t size, bool z
     // regular allocation
     mi_assert(heap!=NULL);
     mi_assert(heap->thread_id == 0 || heap->thread_id == _mi_thread_id());   // heaps are thread local
+    #if defined(MI_SMALL_PAGE_QUEUE) && !MI_GUARDED
+    if (size <= MI_SMALL_OBJ_SIZE_MAX - MI_PADDING_SIZE && huge_alignment == 0) {
+      mi_page_t* page = MI_SMALL_PAGE_QUEUE(heap, size + MI_PADDING_SIZE)->first;
+      if (page != NULL) {
+        void* const p = _mi_page_malloc_zero(heap, page, size + MI_PADDING_SIZE, zero, usable);
+        mi_track_malloc(p,size,zero);
+        return p;
+      }
+    }
+    #endif
     void* const p = _mi_malloc_generic(heap, size + MI_PADDING_SIZE, zero, huge_alignment, usable);  // note: size can overflow but it is detected in malloc_generic
     mi_track_malloc(p,size,zero);
 

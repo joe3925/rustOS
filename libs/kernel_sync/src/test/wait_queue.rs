@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::platform::contract::Platform;
 use crate::test::support::{recv_timeout, P};
-use crate::WaitQueue;
+use crate::queues::WaitQueue;
 
 #[test]
 fn enqueue_dequeue_and_clear_current() {

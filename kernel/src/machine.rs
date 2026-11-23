@@ -8,10 +8,10 @@ use kernel_types::fdt::FdtHeader;
 use kernel_types::irq::PlatformCpuId;
 use spin::Once;
 
-static MACHINE_INFO: Once<MachineInfo> = Once::new();
+pub(crate) static MACHINE_INFO: Once<MachineInfo> = Once::new();
 
 pub fn machine_info() -> &'static MachineInfo {
-    MACHINE_INFO.call_once(MachineInfo::discover)
+    MACHINE_INFO.get().expect("machine information is not initialized")
 }
 
 pub struct MachineInfo {
@@ -21,7 +21,7 @@ pub struct MachineInfo {
 }
 
 impl MachineInfo {
-    fn discover() -> Self {
+    pub(crate) fn discover() -> Self {
         let firmware = FirmwareResources::discover();
         let cpu_topology = crate::platform::discover_cpu_topology(&firmware)
             .unwrap_or_else(|error| panic!("CPU topology discovery failed: {:?}", error));

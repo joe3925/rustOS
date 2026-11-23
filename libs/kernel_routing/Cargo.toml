@@ -4,18 +4,18 @@ cargo-features = ["profile-rustflags"]
 name = "kernel_routing"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
 default = ["ffi"]
-# When enabled, uses direct function calls via linker seams instead of FFI.
-# This should only be enabled when compiling as part of the kernel.
 kernel_link = []
 ffi = ["dep:kernel_sys"]
 
 [dependencies]
+kernel_sync = { path = "../kernel_sync", default-features = false }
 kernel_sys = { path = "../kernel_sys", optional = true }
 kernel_types = { path = "../kernel_types" }
 [profile.dev]

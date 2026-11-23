@@ -1,0 +1,15 @@
+rustOS
+Copyright 2024-2026 Boden
+
+Original project code and original changes owned by Boden are licensed under
+the Apache License, Version 2.0. See LICENSE.
+
+Third-party code keeps its existing copyright and license terms.
+
+third_party/mimalloc-v2 uses the MIT license. See its LICENSE file.
+third_party/rust-fatfs contains upstream MIT code and original Apache-2.0
+changes by Boden. See its LICENSE.txt, LICENSE-APACHE, and NOTICE files.
+third_party/device_tree declares the MIT license in its Cargo.toml file.
+
+External dependencies and tools keep their own licenses. The Apache grant
+does not change their terms.

@@ -60,6 +60,7 @@ impl UnwindPlatform for Aarch64Platform {
 
         let pointer = &mut context as *mut UnwindContext;
 
+        #[cfg_attr(irq_check, irq::trusted(unsafe))]
         unsafe {
             asm!(
                 "adr x16, 2f",

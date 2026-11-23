@@ -28,7 +28,8 @@ impl InterruptPlatform for Aarch64Platform {
         TLB_SHOOTDOWN_SGI
     }
     fn interrupts_enabled() -> bool {
-        DAIF.get() & (1 << 7) == 0
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { DAIF.get() & (1 << 7) == 0 }
     }
     fn current_is_in_interrupt() -> bool {
         Self::current_percpu()
@@ -36,10 +37,12 @@ impl InterruptPlatform for Aarch64Platform {
             .load(Ordering::Relaxed)
     }
     fn disable_interrupts() {
-        DAIF.set(DAIF.get() | (1 << 7));
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { DAIF.set(DAIF.get() | (1 << 7)) };
     }
     fn enable_interrupts() {
-        DAIF.set(DAIF.get() & !(1 << 7));
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe { DAIF.set(DAIF.get() & !(1 << 7)) };
     }
     fn with_interrupts_disabled<T>(f: impl FnOnce() -> T) -> T {
         let enabled = Self::interrupts_enabled();
@@ -52,8 +55,11 @@ impl InterruptPlatform for Aarch64Platform {
     }
     fn enable_interrupts_and_halt() {
         Self::enable_interrupts();
-        isb(SY);
-        wfi();
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe {
+            isb(SY);
+            wfi();
+        }
     }
     fn end_interrupt(_vector: u8) {}
     fn send_ipi(target: PlatformCpuId, vector: u8) -> bool {

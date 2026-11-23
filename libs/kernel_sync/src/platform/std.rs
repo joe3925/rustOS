@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::platform::contract::{Platform, ThreadEntry};
-use crate::WaitState;
+use crate::queues::WaitState;
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -72,7 +72,18 @@ impl Platform for StdPlatform {
         ::std::thread::park();
     }
 
-    fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
+    #[inline]
+    fn interrupts_enabled() -> bool {
+        false
+    }
+
+    #[inline]
+    fn disable_interrupts() {}
+
+    #[inline]
+    fn enable_interrupts() {}
+
+    fn spawn_thread(name: String, entry: ThreadEntry, context: usize, _cpu: usize) {
         ::std::thread::Builder::new()
             .name(name)
             .spawn(move || entry(context))

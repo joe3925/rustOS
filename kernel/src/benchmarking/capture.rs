@@ -7,13 +7,15 @@ use crate::memory::{
     paging::frame_alloc::{total_usable_bytes, used_bytes as physical_used_bytes},
 };
 use crate::profiling::backtrace::{Backtrace, BacktraceStatus, MAX_BACKTRACE_DEPTH};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::bench_archive::{BenchArchive, BenchArchiveRecord, bench_archive_for_path};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{TOTAL_TIME, boot_info};
 use crate::{platform, print, println, vec};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -37,9 +39,7 @@ use kernel_types::benchmark::{
     BENCH_SAMPLE_PROTO_SCHEMA_VERSION, BenchDroppedSampleCounterProto, BenchOverflowPolicy,
     BenchSampleChunkProto, BenchSampleProto, BenchWindowConfig,
 };
-use kernel_types::dma::{
-    IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc,
-};
+use kernel_types::dma::{IoBufferBacking, IoBufferBackingConfig, IoBufferBackingDesc};
 use kernel_types::error::KernelError;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
@@ -138,27 +138,34 @@ fn bench_unwind_status(status: BacktraceStatus) -> u32 {
 }
 
 fn bench_frame_kind(ip: u64) -> u32 {
-    for program in PROGRAM_MANAGER.all() {
+    let Some(programs) = PROGRAM_MANAGER.programs.try_read() else {
+        return kernel_types::benchmark::BENCH_FRAME_KIND_UNKNOWN;
+    };
+    for program in programs.values() {
         let Some(program) = program.try_read() else {
             continue;
         };
-        let Some(module) = program.module_containing(kernel_types::arch::VirtAddr::new(ip)) else {
+        let Some(modules) = program.modules.try_read() else {
             continue;
         };
-        if module
-            .try_read()
-            .and_then(|module| module.pe_info.as_ref().map(|pe| pe.is_64))
-            .unwrap_or(false)
-        {
-            return kernel_types::benchmark::BENCH_FRAME_KIND_PE_X64;
+        for module in modules.iter() {
+            let Some(module) = module.try_read() else {
+                continue;
+            };
+            let start = module.image_base.as_u64();
+            let Some(end) = start.checked_add(module.image_size) else {
+                continue;
+            };
+            if ip >= start && ip < end && module.pe_info.as_ref().is_some_and(|pe| pe.is_64) {
+                return kernel_types::benchmark::BENCH_FRAME_KIND_PE_X64;
+            }
         }
     }
     kernel_types::benchmark::BENCH_FRAME_KIND_UNKNOWN
 }
 
-//const BENCH_ENABLED: bool = cfg!(debug_assertions);
-pub const BENCH_ENABLED: bool = cfg!(feature = "kernel-bench");
-
+//pub const BENCH_ENABLED: bool = cfg!(feature = "kernel-bench");
+pub const BENCH_ENABLED: bool = true;
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
 
@@ -287,7 +294,8 @@ enum BenchPushOutcome {
 
 struct BenchRing {
     next_seq: u64,
-    buffer: Vec<BenchEvent>,
+    buffer: Box<[BenchEvent]>,
+    len: usize,
     write_idx: usize,
     wrapped: bool,
 }
@@ -296,7 +304,8 @@ impl BenchRing {
     fn new(initial_capacity: usize) -> Self {
         BenchRing {
             next_seq: 1,
-            buffer: Vec::with_capacity(initial_capacity),
+            buffer: vec![BenchEvent::default(); initial_capacity].into_boxed_slice(),
+            len: 0,
             write_idx: 0,
             wrapped: false,
         }
@@ -307,16 +316,15 @@ impl BenchRing {
         self.write_idx = 0;
         self.wrapped = false;
 
-        if self.buffer.capacity() != capacity {
-            self.buffer = Vec::with_capacity(capacity);
-        } else {
-            self.buffer.clear();
+        if self.buffer.len() != capacity {
+            self.buffer = vec![BenchEvent::default(); capacity].into_boxed_slice();
         }
+        self.len = 0;
     }
 
     fn near_full(&self) -> bool {
-        let capacity = self.buffer.capacity();
-        capacity != 0 && self.buffer.len().saturating_mul(8) >= capacity.saturating_mul(7)
+        let capacity = self.buffer.len();
+        capacity != 0 && self.len.saturating_mul(8) >= capacity.saturating_mul(7)
     }
 
     fn push_event(
@@ -324,15 +332,16 @@ impl BenchRing {
         mut event: BenchEvent,
         policy: BenchOverflowPolicy,
     ) -> BenchPushOutcome {
-        let capacity = self.buffer.capacity();
+        let capacity = self.buffer.len();
         if capacity == 0 {
             return BenchPushOutcome::DroppedFull;
         }
 
-        if self.buffer.len() < capacity {
+        if self.len < capacity {
             event.seq = self.next_seq;
             self.next_seq = self.next_seq.wrapping_add(1);
-            self.buffer.push(event);
+            self.buffer[self.len] = event;
+            self.len += 1;
             return if self.near_full() {
                 BenchPushOutcome::StoredNearFull
             } else {
@@ -396,7 +405,7 @@ impl BenchRing {
     }
 
     fn drain_events(&mut self) -> Vec<BenchEvent> {
-        let len = self.buffer.len();
+        let len = self.len;
         if len == 0 {
             return Vec::new();
         }
@@ -405,10 +414,10 @@ impl BenchRing {
         if self.wrapped && self.write_idx < len {
             out.extend_from_slice(&self.buffer[self.write_idx..]);
             out.extend_from_slice(&self.buffer[..self.write_idx]);
-            self.buffer.clear();
         } else {
-            out.append(&mut self.buffer);
+            out.extend_from_slice(&self.buffer[..len]);
         }
+        self.len = 0;
         self.write_idx = 0;
         self.wrapped = false;
         out
@@ -597,7 +606,7 @@ static ACTIVE_PAUSE_POLICY: AtomicU32 =
 static ACTIVE_PAUSE_START_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLING_STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PERTURBED_BY_WORKER: AtomicBool = AtomicBool::new(false);
-static ACTIVE_OVERFLOW_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+static OVERFLOW_WORKER: Once<crate::scheduling::task::TaskHandle> = Once::new();
 static ACTIVE_OVERFLOW_WINDOW: Once<Mutex<Option<BenchWindow>>> = Once::new();
 
 fn bench_policy_from_raw(raw: u32) -> BenchOverflowPolicy {
@@ -644,6 +653,17 @@ fn active_overflow_window() -> &'static Mutex<Option<BenchWindow>> {
 }
 
 fn set_active_overflow_window(window: BenchWindow) {
+    OVERFLOW_WORKER.call_once(|| {
+        let task = crate::scheduling::task::Task::new_kernel_mode(
+            bench_overflow_worker,
+            0,
+            crate::memory::paging::stack::StackSize::Tiny,
+            "benchmark overflow".into(),
+            0,
+        );
+        scheduler().add_task(task.clone());
+        task
+    });
     *active_overflow_window().lock() = Some(window);
 }
 
@@ -774,7 +794,9 @@ fn callchain_from_external_stack(rip: u64, stack: &[u64]) -> BenchCallchain {
 fn bench_request_drain_worker() {
     ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
     let _ = ACTIVE_DRAIN_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
-    bench_spawn_overflow_worker_if_needed();
+    if let Some(task) = OVERFLOW_WORKER.get() {
+        scheduler().unpark(task);
+    }
 }
 
 #[inline]
@@ -787,31 +809,31 @@ fn bench_request_pause_flush(policy: BenchOverflowPolicy) {
         let _ =
             ACTIVE_PAUSE_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
     }
-    bench_spawn_overflow_worker_if_needed();
+    if let Some(task) = OVERFLOW_WORKER.get() {
+        scheduler().unpark(task);
+    }
 }
 
-fn bench_spawn_overflow_worker_if_needed() {
-    if ACTIVE_OVERFLOW_WORKER_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
+extern "C" fn bench_overflow_worker(_: usize) {
+    loop {
+        if !ACTIVE_DRAIN_PENDING.load(Ordering::Acquire)
+            && !ACTIVE_PAUSE_PENDING.load(Ordering::Acquire)
+        {
+            scheduler().park_current();
+            continue;
+        }
+        let window = {
+            let active = active_overflow_window().lock();
+            active.clone()
+        };
 
-    let window = {
-        let active = active_overflow_window().lock();
-        active.clone()
-    };
+        let Some(window) = window else {
+            ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
+            ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
+            ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
+            continue;
+        };
 
-    let Some(window) = window else {
-        ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
-        ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
-        ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
-        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
-        return;
-    };
-
-    spawn_blocking(move || {
         loop {
             let mut did_work = false;
 
@@ -834,15 +856,7 @@ fn bench_spawn_overflow_worker_if_needed() {
                 break;
             }
         }
-
-        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
-
-        if ACTIVE_DRAIN_PENDING.load(Ordering::Acquire)
-            || ACTIVE_PAUSE_PENDING.load(Ordering::Acquire)
-        {
-            bench_spawn_overflow_worker_if_needed();
-        }
-    });
+    }
 }
 
 #[inline]
@@ -1039,7 +1053,7 @@ pub fn bench_submit_interrupt_sample_current_core(state: &State) {
     }
 
     let core_id = platform::current_cpu_id();
-    let task = SCHEDULER.get_current_task(core_id);
+    let task = scheduler().get_current_task(core_id);
     if task.is_none() {
         if let Some(state) = bench_state_get() {
             if let Some(drops) = state.drops_for_core(core_id) {
@@ -1789,7 +1803,7 @@ async fn build_exports_for_window(
         let st = state;
         let last_seq = *last_export_seq.get(core).unwrap_or(&0);
 
-        gather_joins.push(kernel_executor::runtime::runtime::spawn_blocking(
+        gather_joins.push(kernel_executor::runtime::runtime::spawn_blocking::<KernelExecutorPlatform, _, _>(
             move || -> Vec<BenchEvent> {
                 let events = st.drain_core_events(core);
 
@@ -1826,7 +1840,7 @@ async fn build_exports_for_window(
     let mut total_events = 0usize;
 
     for (core, j) in gather_joins.into_iter().enumerate() {
-        let events = j.await;
+        let events = j.await.expect("capture task cancelled");
         total_events += events.len();
         if !events.is_empty() {
             iterators.push(CoreIterator {
@@ -2240,11 +2254,11 @@ impl BenchWindow {
 
         if let Some(timeout_ms) = timeout_ms_opt {
             let this = self.clone();
-            spawn_blocking(move || {
+            spawn_blocking::<KernelExecutorPlatform, _, _>(move || {
                 platform::wait_duration(timeout_ms);
                 this.stop();
                 println!("starting timeout persist");
-                block_on(this.persist());
+                block_on::<KernelExecutorPlatform, _>(this.persist());
                 println!("timeout done");
             });
         }
@@ -2254,7 +2268,7 @@ impl BenchWindow {
                 let interval = secs;
                 let this = self.clone();
                 let this_arc = Arc::new(self.clone());
-                spawn_blocking(move || {
+                spawn_blocking::<KernelExecutorPlatform, _, _>(move || {
                     loop {
                         platform::wait_duration(interval);
 
@@ -2270,7 +2284,7 @@ impl BenchWindow {
                         }
 
                         let moved = Arc::clone(&this_arc);
-                        block_on(moved.persist());
+                        block_on::<KernelExecutorPlatform, _>(moved.persist());
                     }
                 });
             }
@@ -2627,8 +2641,8 @@ impl Drop for BenchWindow {
 
         if do_flush {
             let this = self.clone();
-            spawn_blocking(move || {
-                block_on(this.persist());
+            spawn_blocking::<KernelExecutorPlatform, _, _>(move || {
+                block_on::<KernelExecutorPlatform, _>(this.persist());
             });
         }
 
@@ -2706,11 +2720,6 @@ pub fn used_memory() -> usize {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
-/// Traffic generated for each block size in one boot. Raising this adds passes and smooths
-/// within-boot jitter, but cannot replace independent boots. 30–80 MiB (3–8 current passes) is a
-/// useful range.
-const DISK_BENCH_MIN_BYTES_PER_SIZE: usize = 50 * 1024 * 1024;
 const DISK_BENCH_IOBUFFER_CREATE_OPS: u64 = 1_000_000;
 
 const DISK_BENCH_SIZES: &[usize] = &[
@@ -2767,14 +2776,6 @@ fn lin_regress_overhead(bytes: &[u64], ns_per_op: &[u128]) -> Option<(f64, f64)>
 }
 
 #[inline(always)]
-fn ceil_div(a: usize, b: usize) -> usize {
-    if a == 0 {
-        return 0;
-    }
-
-    1 + ((a - 1) / b)
-}
-#[inline(always)]
 fn disk_bench_now_ns() -> u128 {
     TOTAL_TIME.get().unwrap().elapsed().as_nanos()
 }
@@ -2800,9 +2801,9 @@ fn fill_disk_bench_pattern(buf: &mut [u8]) {
     }
 }
 
-pub fn bench_c_drive_io(write_through: bool) {
-    spawn_detached(async move {
-        let _ = bench_c_drive_io_async(write_through).await;
+pub fn bench_c_drive_io(write_through: bool, bytes_per_pass: usize, total_bytes: usize) {
+    spawn_detached::<KernelExecutorPlatform, _>(async move {
+        let _ = bench_c_drive_io_inner(write_through, false, None, bytes_per_pass, total_bytes).await;
     });
 }
 
@@ -2816,8 +2817,50 @@ pub struct CDriveBenchResult {
     pub sizes: Vec<CDriveSizeResult>,
 }
 
-pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchResult> {
+/// Runs each block size for `total_bytes` measured writes and reads, excluding
+/// initialization and warmup. The file holds `bytes_per_pass` bytes; the final
+/// pass is shortened when the total is not a multiple of that size.
+/// With no order seed, sizes run in ascending order. A seed enables shuffled
+/// order and machine-readable sample records for automated suites.
+pub async fn bench_c_drive_io_inner(
+    write_through: bool,
+    cache_resident: bool,
+    order_seed: Option<u64>,
+    bytes_per_pass: usize,
+    total_bytes: usize,
+) -> Option<CDriveBenchResult> {
+    if bytes_per_pass == 0 || total_bytes == 0 {
+        println!("[disk-bench] bytes per pass and total bytes must be nonzero");
+        return None;
+    }
+    let mode = if write_through {
+        "write-through"
+    } else if cache_resident {
+        "cached"
+    } else {
+        "buffered"
+    };
+    let file_name = if cache_resident {
+        "io_cache.bin"
+    } else if write_through {
+        "io_through.bin"
+    } else {
+        DISK_BENCH_FILE
+    };
+    let passes = total_bytes.div_ceil(bytes_per_pass);
+    println!(
+        "\n[disk-bench] path={}/{} mode={} total_per_pass={} MiB passes={} total_bytes={}",
+        DISK_BENCH_DIR,
+        file_name,
+        mode,
+        bytes_per_pass / 1024 / 1024,
+        passes,
+        total_bytes
+    );
+    let setup_timer = Stopwatch::start();
     let mut dir_path = Path::from_string(DISK_BENCH_DIR);
+    println!("[disk-bench] setup: creating/opening directory");
+    let dir_timer = Stopwatch::start();
     if let Err(e) = File::make_dir(&dir_path).await {
         println!(
             "[disk-bench] failed to create bench dir {}: {:?}",
@@ -2825,9 +2868,16 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
         );
         return None;
     }
+    let dir_ns = dir_timer.elapsed_nanos();
+    println!(
+        "[disk-bench] setup: directory ready in {:.3} ms",
+        dir_ns as f64 / 1_000_000.0
+    );
 
-    dir_path.push(DISK_BENCH_FILE);
+    dir_path.push(file_name);
 
+    println!("[disk-bench] setup: opening/creating file");
+    let open_timer = Stopwatch::start();
     let mut file = match File::open(
         &dir_path,
         if write_through {
@@ -2846,14 +2896,26 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
         Err(e) => {
             println!(
                 "[disk-bench] failed to open {} for read/write: {:?}",
-                DISK_BENCH_FILE, e
+                file_name, e
             );
             return None;
         }
     };
+    let open_ns = open_timer.elapsed_nanos();
+    println!(
+        "[disk-bench] setup: file open/create took {:.3} ms, size={} bytes",
+        open_ns as f64 / 1_000_000.0,
+        file.size
+    );
 
-    let bench_len = DISK_BENCH_TOTAL_BYTES as u64;
-    if file.size != bench_len {
+    let bench_len = bytes_per_pass as u64;
+    let initialize = file.size != bench_len;
+    if initialize {
+        println!(
+            "[disk-bench] setup: resizing file from {} to {} bytes",
+            file.size, bench_len
+        );
+        let resize_timer = Stopwatch::start();
         if let Err(e) = file.set_len(bench_len).await {
             println!(
                 "[disk-bench] failed to size benchmark file to {} bytes: {:?}",
@@ -2862,7 +2924,13 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
             let _ = file.close().await;
             return None;
         }
+        let resize_ns = resize_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: set_len took {:.3} ms; flushing file sizing",
+            resize_ns as f64 / 1_000_000.0
+        );
 
+        let flush_timer = Stopwatch::start();
         if let Err(e) = file.flush().await {
             println!(
                 "[disk-bench] failed to flush benchmark file sizing: {:?}",
@@ -2871,8 +2939,17 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
             let _ = file.close().await;
             return None;
         }
+        let flush_ns = flush_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: sizing flush took {:.3} ms",
+            flush_ns as f64 / 1_000_000.0
+        );
+    } else {
+        println!("[disk-bench] setup: file size unchanged; skipping sizing and data initialization");
     }
 
+    println!("[disk-bench] setup: preparing I/O backing and data pattern");
+    let backing_timer = Stopwatch::start();
     let max_size = DISK_BENCH_SIZES.iter().copied().max().unwrap_or(4096);
     let mut buf = vec![0u8; max_size];
 
@@ -2888,23 +2965,58 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
             return None;
         }
     };
-
-    let passes = core::cmp::max(
-        1,
-        ceil_div(DISK_BENCH_MIN_BYTES_PER_SIZE, DISK_BENCH_TOTAL_BYTES),
+    let backing_ns = backing_timer.elapsed_nanos();
+    println!(
+        "[disk-bench] setup: I/O backing and data pattern took {:.3} ms",
+        backing_ns as f64 / 1_000_000.0
     );
 
+    if initialize {
+        println!("[disk-bench] setup: writing {} bytes of initial data", bench_len);
+        let initialize_timer = Stopwatch::start();
+        let mut offset = 0;
+        while offset < bench_len {
+            let len = core::cmp::min(max_size, (bench_len - offset) as usize);
+            let buffer = match io_backing.create_to_device(0, len) {
+                Ok(buffer) => buffer,
+                Err(e) => {
+                    println!("[disk-bench] initialization lease failed: {:?}", e);
+                    let _ = file.close().await;
+                    return None;
+                }
+            };
+            let result = file.write_iobuffer_at(offset, buffer).await;
+            if !matches!(result, Ok(written) if written == len) {
+                println!("[disk-bench] initialization write failed: {:?}", result);
+                let _ = file.close().await;
+                return None;
+            }
+            offset += len as u64;
+        }
+        let initialize_ns = initialize_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: initial data writes took {:.3} ms ({:.2} MiB/s); flushing data",
+            initialize_ns as f64 / 1_000_000.0,
+            mib_per_sec(bench_len, initialize_ns as u128)
+        );
+        let flush_timer = Stopwatch::start();
+        if let Err(e) = file.flush().await {
+            println!("[disk-bench] initialization flush failed: {:?}", e);
+            let _ = file.close().await;
+            return None;
+        }
+        let flush_ns = flush_timer.elapsed_nanos();
+        println!(
+            "[disk-bench] setup: initial data flush took {:.3} ms",
+            flush_ns as f64 / 1_000_000.0
+        );
+    }
+
+    let setup_ns = setup_timer.elapsed_nanos();
     println!(
-        "\n[disk-bench] path={}/{} mode={} total_per_pass={} MiB passes={}",
-        DISK_BENCH_DIR,
-        DISK_BENCH_FILE,
-        if write_through {
-            "write-through"
-        } else {
-            "buffered"
-        },
-        DISK_BENCH_TOTAL_BYTES / 1024 / 1024,
-        passes
+        "[disk-bench] setup complete in {:.3} ms; starting {} I/O buffer creations",
+        setup_ns as f64 / 1_000_000.0,
+        DISK_BENCH_IOBUFFER_CREATE_OPS
     );
 
     let create_timer = Stopwatch::start();
@@ -2931,8 +3043,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
     };
     let create_avg_ns = create_ns as f64 / DISK_BENCH_IOBUFFER_CREATE_OPS as f64;
     println!(
-        "[disk-bench] iobuffer creation: {:.2} buffers/s, {:.2} ns/buffer ({} buffers)",
-        create_ops_per_sec, create_avg_ns, DISK_BENCH_IOBUFFER_CREATE_OPS
+        "[disk-bench] iobuffer creation: {:.2} buffers/s, {:.2} ns/buffer ({} buffers, {:.3} ms total)",
+        create_ops_per_sec,
+        create_avg_ns,
+        DISK_BENCH_IOBUFFER_CREATE_OPS,
+        create_ns as f64 / 1_000_000.0
     );
 
     println!(
@@ -2945,10 +3060,20 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
     let mut read_ns_per_op = Vec::new();
     let mut results = Vec::with_capacity(DISK_BENCH_SIZES.len());
 
-    for &size in DISK_BENCH_SIZES {
+    let mut block_sizes = DISK_BENCH_SIZES.to_vec();
+    if let Some(mut seed) = order_seed {
+        for index in (1..block_sizes.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            block_sizes.swap(index, seed as usize % (index + 1));
+        }
+    }
+    for &size in &block_sizes {
         let mut write_bytes = 0u64;
         let mut write_ops = 0u64;
         let mut write_ns = 0u128;
+        let mut flush_ns = 0u128;
 
         let mut read_bytes = 0u64;
         let mut read_ops = 0u64;
@@ -2956,13 +3081,18 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
         let mut write_samples = Vec::with_capacity(passes);
         let mut read_samples = Vec::with_capacity(passes);
 
+        if let Err(e) = file.flush().await {
+            println!("[disk-bench] pre-write flush failed: {:?}", e);
+            let _ = file.close().await;
+            return None;
+        }
         if !write_through {
             let mut offset = 0u64;
             let mut ops = 0u64;
 
             while offset < bench_len {
                 let remaining = (bench_len - offset) as usize;
-                let len = core::cmp::min(size, remaining);
+                let len = core::cmp::min(if cache_resident { 64 * 1024 } else { size }, remaining);
                 let tag = (ops ^ offset ^ 0xfeed_beef).to_le_bytes();
                 let tag_len = core::cmp::min(tag.len(), len);
 
@@ -2988,10 +3118,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                     }
                 };
 
-                if let Err(e) = file.write_iobuffer_at(offset, io_buffer).await {
+                let result = file.write_iobuffer_at(offset, io_buffer).await;
+                if !matches!(result, Ok(written) if written == len) {
                     println!(
                         "[disk-bench] warm write failed size={} offset={}: {:?}",
-                        size, offset, e
+                        size, offset, result
                     );
                     let _ = file.close().await;
                     return None;
@@ -3002,15 +3133,16 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
             }
         }
 
-        for _ in 0..passes {
+        for pass in 0..passes {
+            let pass_len = (total_bytes - pass * bytes_per_pass).min(bytes_per_pass) as u64;
             let write_timer = Stopwatch::start();
             let mut offset = 0u64;
             let mut ops = 0u64;
 
-            while offset < bench_len {
-                let remaining = (bench_len - offset) as usize;
+            while offset < pass_len {
+                let remaining = (pass_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
-                let tag = (ops ^ offset).to_le_bytes();
+                let tag = (ops ^ offset ^ ((pass as u64 + 1) << 32)).to_le_bytes();
                 let tag_len = core::cmp::min(tag.len(), len);
 
                 let mut edit = match io_backing.create_bidirectional(0, len) {
@@ -3036,10 +3168,10 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                 };
 
                 let result = file.write_iobuffer_at(offset, io_buffer).await;
-                if let Err(e) = result {
+                if !matches!(result, Ok(written) if written == len) {
                     println!(
                         "[disk-bench] write failed size={} offset={}: {:?}",
-                        size, offset, e
+                        size, offset, result
                     );
                     let _ = file.close().await;
                     return None;
@@ -3055,6 +3187,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
             write_ops += ops;
             write_samples.push((pass_write_ns / ops.max(1) as u128) as u64);
 
+            let flush_timer = Stopwatch::start();
             if let Err(e) = file.flush().await {
                 println!(
                     "[disk-bench] post-write flush failed size={}: {:?}",
@@ -3063,14 +3196,16 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                 let _ = file.close().await;
                 return None;
             }
+            flush_ns += flush_timer.elapsed_nanos() as u128;
 
             let read_timer = Stopwatch::start();
             let mut offset = 0u64;
             let mut ops = 0u64;
             let mut checksum = 0u64;
+            let mut valid = true;
 
-            while offset < bench_len {
-                let remaining = (bench_len - offset) as usize;
+            while offset < pass_len {
+                let remaining = (pass_len - offset) as usize;
                 let len = core::cmp::min(size, remaining);
 
                 let io_buffer = match io_backing.create_from_device(0, len) {
@@ -3083,10 +3218,10 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                 };
 
                 let result = file.read_iobuffer_at(offset, io_buffer).await;
-                if let Err(e) = result {
+                if !matches!(result, Ok(read) if read == len) {
                     println!(
                         "[disk-bench] read failed size={} offset={}: {:?}",
-                        size, offset, e
+                        size, offset, result
                     );
                     let _ = file.close().await;
                     return None;
@@ -3095,10 +3230,13 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
                 let inspect = io_backing
                     .create_to_device(0, len)
                     .expect("completed read released its benchmark lease");
-                checksum ^= inspect
+                let bytes = inspect
                     .try_as_slice()
-                    .expect("benchmark backing is contiguous")[0]
-                    as u64;
+                    .expect("benchmark backing is contiguous");
+                let expected = (ops ^ offset ^ ((pass as u64 + 1) << 32)).to_le_bytes();
+                let tag_len = expected.len().min(len);
+                valid &= bytes[..tag_len] == expected[..tag_len];
+                checksum ^= bytes[0] as u64;
                 drop(inspect);
                 offset += len as u64;
                 ops += 1;
@@ -3107,6 +3245,11 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
             core::hint::black_box(checksum);
 
             let pass_read_ns = read_timer.elapsed_nanos() as u128;
+            if !valid {
+                println!("[disk-bench] read data mismatch size={}", size);
+                let _ = file.close().await;
+                return None;
+            }
             read_ns += pass_read_ns;
             read_bytes += offset;
             read_ops += ops;
@@ -3156,6 +3299,20 @@ pub async fn bench_c_drive_io_async(write_through: bool) -> Option<CDriveBenchRe
             write_ns_per_op: write_samples,
             read_ns_per_op: read_samples,
         });
+        if order_seed.is_some() {
+            println!(
+                "[disk-bench-sample] mode={} size={} file_bytes={} passes={} write_bytes={} write_ns={} read_bytes={} read_ns={} flush_ns={}",
+                mode,
+                size,
+                bytes_per_pass,
+                passes,
+                write_bytes,
+                write_ns,
+                read_bytes,
+                read_ns,
+                flush_ns,
+            );
+        }
     }
 
     if let Some((intercept, slope)) = lin_regress_overhead(&sizes, &write_ns_per_op) {

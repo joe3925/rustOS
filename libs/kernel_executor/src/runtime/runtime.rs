@@ -1,111 +1,218 @@
-use alloc::{boxed::Box, vec::Vec};
+use crate::platform::ExecutorPlatform;
+use crate::thread_state::BlockOnThreadState;
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, task::Wake, vec::Vec};
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use kernel_types::completion::{CompletionPermit, TaskCompletion, TaskOutcome, TaskToken};
+use crossbeam_queue::ArrayQueue;
+#[cfg(not(any(loom, feature = "loom")))]
+use futures_core::task::__internal::AtomicWaker;
+pub use kernel_sync::completion::TaskOutcome;
+use kernel_sync::completion::{CompletionPermit, TaskCompletion, TaskToken};
+#[cfg(any(loom, feature = "loom"))]
+use loom::future::AtomicWaker;
 
 pub use super::blocking::{BlockingJoin, spawn_blocking, spawn_blocking_many};
 
-use crate::future_arena::FutureAllocation;
-use crate::global_async::{ExecutorDomain, ExecutorDomainId, GlobalAsyncExecutor};
-use crate::platform::{Job, platform};
-use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::future_allocation::FutureAllocation;
+use crate::global_async::GlobalAsyncExecutor;
+use crate::platform::{Job, with_executor_local};
+use crate::sync::Mutex;
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED};
+use super::slab::slot::{RESULT_ABANDONED, RESULT_CLAIMED, TaskSlot};
 use super::slab::task_slab::{SlotHandle, TaskTable, get_task_table};
 
-pub(crate) fn submit_global_to_executor_domain(domain_id: ExecutorDomainId, ctx: usize) {
-    GlobalAsyncExecutor::global().enqueue_task_to_executor_domain(domain_id, ctx);
-}
-
-pub(crate) fn submit_blocking(trampoline: extern "C" fn(usize), ctx: usize) {
-    platform().submit_blocking(Job {
+pub(crate) fn submit_blocking<E: ExecutorPlatform>(trampoline: extern "C" fn(usize), ctx: usize) {
+    E::submit_blocking(Job {
         f: trampoline,
         a: ctx,
     });
 }
 
-pub(crate) fn submit_blocking_many(jobs: &[Job]) {
-    platform().submit_blocking_many(jobs);
+pub(crate) fn submit_blocking_many<E: ExecutorPlatform>(jobs: &[Job]) {
+    E::submit_blocking_many(jobs);
 }
 
-pub fn yield_now() {
-    let _suspend = crate::platform::ExecutorSuspendGuard::enter();
-    platform().yield_now();
+pub fn yield_now<E: ExecutorPlatform>() {
+    let _suspend = crate::platform::ExecutorSuspendGuard::<E>::enter();
+    E::yield_now();
 }
 
-pub extern "C" fn try_steal_blocking_one() -> bool {
-    let _suspend = crate::platform::ExecutorSuspendGuard::enter();
-    platform().try_steal_blocking_one()
+pub extern "C" fn try_steal_blocking_one<E: ExecutorPlatform>() -> bool {
+    let _suspend = crate::platform::ExecutorSuspendGuard::<E>::enter();
+    E::try_steal_blocking_one()
 }
 
 struct BlockOnWakeState {
     ready: AtomicBool,
+    thread_state: Option<Arc<BlockOnThreadState>>,
+    refs: AtomicUsize,
+    retired_next: AtomicUsize,
 }
 
-unsafe fn block_on_waker_clone(ptr: *const ()) -> RawWaker {
-    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
-    let cloned = Arc::clone(&arc);
-    RawWaker::new(Arc::into_raw(cloned) as *const (), &BLOCK_ON_WAKER_VTABLE)
-}
-
-unsafe fn block_on_waker_wake(ptr: *const ()) {
-    let arc = unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) };
-    arc.ready.store(true, Ordering::Release);
-}
-
-unsafe fn block_on_waker_wake_by_ref(ptr: *const ()) {
-    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
-    arc.ready.store(true, Ordering::Release);
-}
-
-unsafe fn block_on_waker_drop(ptr: *const ()) {
-    drop(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
-}
-
-static BLOCK_ON_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    block_on_waker_clone,
-    block_on_waker_wake,
-    block_on_waker_wake_by_ref,
-    block_on_waker_drop,
-);
-
-pub fn block_on<F>(future: F) -> F::Output
-where
-    F: Future,
-{
-    let _suspend = crate::platform::ExecutorSuspendGuard::enter();
-    let state = Arc::new(BlockOnWakeState {
-        ready: AtomicBool::new(false),
-    });
-
-    let raw = RawWaker::new(
-        Arc::into_raw(state.clone()) as *const (),
-        &BLOCK_ON_WAKER_VTABLE,
-    );
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-    let mut future = future;
-
+unsafe fn release_block_on_wake_state<E: ExecutorPlatform, const NOTIFY: bool>(
+    ptr: *mut BlockOnWakeState,
+) {
+    let state = unsafe { &*ptr };
+    if state.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    let retired = ptr.expose_provenance();
+    let mut head = GlobalAsyncExecutor::<E>::global()
+        .retired_block_on_states
+        .load(Ordering::Relaxed);
     loop {
-        let poll = unsafe { Pin::new_unchecked(&mut future) }.poll(&mut cx);
-        match poll {
-            Poll::Ready(v) => return v,
-            Poll::Pending => {}
-        }
-
-        if !state.ready.swap(false, Ordering::AcqRel) && !try_steal_blocking_one() {
-            yield_now();
+        state.retired_next.store(head, Ordering::Relaxed);
+        match GlobalAsyncExecutor::<E>::global().retired_block_on_states.compare_exchange(
+            head,
+            retired,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                if NOTIFY && head == 0 {
+                    GlobalAsyncExecutor::<E>::global().try_schedule::<true>();
+                }
+                return;
+            }
+            Err(actual) => head = actual,
         }
     }
 }
 
+pub(crate) fn has_retired_block_on_states<E: ExecutorPlatform>() -> bool {
+    GlobalAsyncExecutor::<E>::global()
+        .retired_block_on_states
+        .load(Ordering::Acquire)
+        != 0
+}
+
+#[cfg_attr(irq_check, irq::forbidden)]
+pub(crate) fn drain_retired_block_on_states<E: ExecutorPlatform>() {
+    drain_retired_join_wakers();
+    if !has_retired_block_on_states::<E>() {
+        return;
+    }
+    core::hint::cold_path();
+    let mut retired = GlobalAsyncExecutor::<E>::global()
+        .retired_block_on_states
+        .swap(0, Ordering::Acquire);
+    while retired != 0 {
+        let state = unsafe {
+            Box::from_raw(core::ptr::with_exposed_provenance_mut::<BlockOnWakeState>(
+                retired,
+            ))
+        };
+        retired = state.retired_next.load(Ordering::Relaxed);
+        drop(state);
+    }
+}
+
+#[cfg_attr(irq_check, irq::context)]
+unsafe fn block_on_waker_clone<E: ExecutorPlatform>(ptr: *const ()) -> RawWaker {
+    let state = unsafe { &*ptr.cast::<BlockOnWakeState>() };
+    let mut refs = state.refs.load(Ordering::Relaxed);
+    loop {
+        assert!(
+            refs < isize::MAX as usize,
+            "block_on waker reference count overflow"
+        );
+        match state
+            .refs
+            .compare_exchange(refs, refs + 1, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return RawWaker::new(ptr, &GlobalAsyncExecutor::<E>::BLOCK_ON_WAKER_VTABLE),
+            Err(actual) => refs = actual,
+        }
+    }
+}
+
+#[cfg_attr(irq_check, irq::context)]
+unsafe fn block_on_waker_wake<E: ExecutorPlatform>(ptr: *const ()) {
+    let ptr = ptr.cast::<BlockOnWakeState>().cast_mut();
+    let state = unsafe { &*ptr };
+    if let Some(thread_state) = &state.thread_state {
+        thread_state.mark_ready();
+    } else {
+        state.ready.store(true, Ordering::Release);
+    }
+    unsafe { release_block_on_wake_state::<E, true>(ptr) };
+}
+
+#[cfg_attr(irq_check, irq::context)]
+unsafe fn block_on_waker_wake_by_ref<E: ExecutorPlatform>(ptr: *const ()) {
+    let state = unsafe { &*ptr.cast::<BlockOnWakeState>() };
+    if let Some(thread_state) = &state.thread_state {
+        thread_state.mark_ready();
+    } else {
+        state.ready.store(true, Ordering::Release);
+    }
+}
+
+#[cfg_attr(irq_check, irq::context)]
+unsafe fn block_on_waker_drop<E: ExecutorPlatform>(ptr: *const ()) {
+    unsafe { release_block_on_wake_state::<E, true>(ptr.cast::<BlockOnWakeState>().cast_mut()) };
+}
+
+impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
+    const BLOCK_ON_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        block_on_waker_clone::<E>,
+        block_on_waker_wake::<E>,
+        block_on_waker_wake_by_ref::<E>,
+        block_on_waker_drop::<E>,
+    );
+}
+
+#[cfg_attr(irq_check, irq::forbidden)]
+pub fn block_on_waker<E: ExecutorPlatform>(thread_state: Option<Arc<BlockOnThreadState>>) -> Waker {
+    let ptr = Box::into_raw(Box::new(BlockOnWakeState {
+        ready: AtomicBool::new(false),
+        thread_state,
+        refs: AtomicUsize::new(1),
+        retired_next: AtomicUsize::new(0),
+    }));
+    let raw = RawWaker::new(ptr.cast(), &GlobalAsyncExecutor::<E>::BLOCK_ON_WAKER_VTABLE);
+    unsafe { Waker::from_raw(raw) }
+}
+
+pub fn block_on<E: ExecutorPlatform, F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    let _suspend = crate::platform::ExecutorSuspendGuard::<E>::enter();
+    let waker = block_on_waker::<E>(None);
+    let ptr = waker.data().cast::<BlockOnWakeState>().cast_mut();
+    let state = unsafe { &*ptr };
+    let output = {
+        let mut cx = Context::from_waker(&waker);
+        let mut future = future;
+
+        loop {
+            let poll = unsafe { Pin::new_unchecked(&mut future) }.poll(&mut cx);
+            drain_retired_block_on_states::<E>();
+            match poll {
+                Poll::Ready(v) => break v,
+                Poll::Pending => {}
+            }
+
+            if !state.ready.swap(false, Ordering::AcqRel) && !try_steal_blocking_one::<E>() {
+                yield_now::<E>();
+            }
+        }
+    };
+    let _waker = ManuallyDrop::new(waker);
+    unsafe { release_block_on_wake_state::<E, false>(ptr) };
+    drain_retired_block_on_states::<E>();
+    output
+}
+
 pub struct JoinStorage<T> {
-    output: UnsafeCell<MaybeUninit<T>>,
+    output: UnsafeCell<MaybeUninit<TaskOutcome<T>>>,
     _pin: core::marker::PhantomPinned,
 }
 
@@ -117,137 +224,140 @@ impl<T> JoinStorage<T> {
         }
     }
 
-    pub(crate) unsafe fn write(&self, output: T) { unsafe {
-        (*self.output.get()).write(output);
-    }}
+    pub(crate) unsafe fn write(&self, output: TaskOutcome<T>) {
+        unsafe {
+            (*self.output.get()).write(output);
+        }
+    }
 
-    unsafe fn take(&self) -> T { unsafe {
-        (*self.output.get()).assume_init_read()
-    }}
+    unsafe fn take(&self) -> TaskOutcome<T> {
+        unsafe { (*self.output.get()).assume_init_read() }
+    }
 
-    unsafe fn drop_output(&self) { unsafe {
-        (*self.output.get()).assume_init_drop();
-    }}
+    unsafe fn drop_output(&self) {
+        unsafe {
+            (*self.output.get()).assume_init_drop();
+        }
+    }
 }
 
 unsafe impl<T: Send> Send for JoinStorage<T> {}
 unsafe impl<T: Send> Sync for JoinStorage<T> {}
 
-pub fn spawn<'a, F, T>(storage: Pin<&'a mut JoinStorage<T>>, future: F) -> JoinHandle<'a, T>
+pub fn spawn<'a, E: ExecutorPlatform, F, T>(
+    storage: Pin<&'a mut JoinStorage<T>>,
+    future: F,
+) -> JoinHandle<'a, T, E>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    spawn_in_executor_domain(
-        crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN,
+    spawn_in_executor_domain::<E, _, _>(
+        E::default_domain(),
         storage,
         future,
     )
 }
 
-fn reserve_future<F>(
-    domain: &ExecutorDomain,
+#[inline(always)]
+fn reserve_future<E: ExecutorPlatform, F>(
+    slab: &'static TaskTable<E>,
+    local: &crate::platform::ExecutorThreadLocal<E>,
     future: F,
-) -> (FutureAllocation, &'static TaskTable, SlotHandle) {
-    let allocation = domain
-        .future_arena()
-        .allocate(core::mem::size_of::<F>(), core::mem::align_of::<F>())
-        .expect("future arena allocation failed");
-    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
-    let slab = get_task_table();
-    let slot_handle = match slab.allocate() {
-        Some(handle) => handle,
+    refs: u32,
+    layout: Layout,
+) -> (FutureAllocation, SlotHandle, &'static TaskSlot) {
+    let allocation = FutureAllocation::allocate(layout.size(), layout.align())
+        .expect("future heap allocation failed");
+    let (slot_handle, slot) = match slab.allocate_with_refs::<true>(refs, Some(local)) {
+        Some(reserved) => reserved,
         None => unsafe {
-            release_unpublished_future::<F>(domain, allocation);
+            allocation.release();
             panic!("task table allocation failed");
         },
     };
-    (allocation, slab, slot_handle)
+    unsafe { allocation.ptr.as_ptr().cast::<F>().write(future) };
+    (allocation, slot_handle, slot)
 }
 
-pub fn spawn_in_executor_domain<'a, F, T>(
-    domain_id: ExecutorDomainId,
+pub fn spawn_in_executor_domain<'a, E: ExecutorPlatform, F, T>(
+    domain: &crate::global_async::ExecutorDomain<E>,
     storage: Pin<&'a mut JoinStorage<T>>,
     future: F,
-) -> JoinHandle<'a, T>
+) -> JoinHandle<'a, T, E>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
     assert!(
-        !crate::platform::in_interrupt_context(),
+        !E::in_interrupt_context(),
         "attempted to spawn a task from interrupt context"
     );
-    GlobalAsyncExecutor::global()
-        .with_executor_domain(domain_id, |domain| {
-            let (allocation, slab, slot_handle) = reserve_future(domain, future);
-
-    let (shard_idx, local_idx, generation) = slot_handle.indices();
-
-    let slot = slab
-        .get_slot(shard_idx, local_idx, generation)
-        .expect("reserved task slot disappeared before initialization");
     let storage_ptr = unsafe { storage.get_unchecked_mut() as *mut JoinStorage<T> };
-    unsafe { slot.init_joinable::<F, T>(domain_id, allocation, storage_ptr) };
-    domain.retain_task();
+    let executor = GlobalAsyncExecutor::<E>::global();
+    with_executor_local::<E, _>(|local| {
+            let domain_id = domain.id();
+            let slab = executor.task_table.get().expect("task table not initialized");
+            let (allocation, slot_handle, slot) =
+                reserve_future::<E, _>(slab, local, future, 3, Layout::new::<F>());
 
-    slab.increment_ref(shard_idx, local_idx, generation);
-    slab.increment_ref(shard_idx, local_idx, generation);
+            let (shard_idx, local_idx, generation) = slot_handle.indices();
 
-    let encoded = slot_handle.encoded_ptr();
-    submit_global_to_executor_domain(domain_id, encoded);
+            unsafe { slot.init_joinable::<F, T, false>(domain_id, allocation, storage_ptr) };
+
+            let encoded = slot_handle.encoded_ptr();
+            executor.enqueue_task::<true, false, false>(domain, local, encoded, slot);
 
             JoinHandle {
                 shard_idx: shard_idx as u8,
                 local_idx: local_idx as u32,
                 generation,
                 consumed: false,
+                slot: Some(slot),
                 storage: storage_ptr,
                 _marker: PhantomData,
             }
         })
-        .expect("invalid executor domain")
 }
 
-pub struct JoinHandle<'a, T: Send + 'static> {
+pub struct JoinHandle<'a, T: Send + 'static, E: ExecutorPlatform> {
     shard_idx: u8,
     local_idx: u32,
     generation: u32,
     consumed: bool,
+    slot: Option<&'static TaskSlot>,
     storage: *mut JoinStorage<T>,
-    _marker: PhantomData<&'a mut JoinStorage<T>>,
+    _marker: PhantomData<(&'a mut JoinStorage<T>, fn() -> E)>,
 }
 
-unsafe impl<T: Send + 'static> Send for JoinHandle<'_, T> {}
+unsafe impl<T: Send + 'static, E: ExecutorPlatform> Send for JoinHandle<'_, T, E> {}
 
-impl<T: Send + 'static> Future for JoinHandle<'_, T> {
-    type Output = T;
+impl<T: Send + 'static, E: ExecutorPlatform> Future for JoinHandle<'_, T, E> {
+    type Output = TaskOutcome<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.consumed {
             panic!("JoinHandle polled after completion");
         }
-
-        let slab = get_task_table();
-
-        let Some(slot) = slab.get_slot(
-            this.shard_idx as usize,
-            this.local_idx as usize,
-            this.generation,
-        ) else {
-            panic!("JoinHandle slot freed prematurely");
+        let Some(slot) = this.slot else {
+            this.consumed = true;
+            return Poll::Ready(TaskOutcome::Cancelled);
         };
 
         if slot.is_completed() {
             let result = unsafe { (&*this.storage).take() };
 
-            slab.decrement_ref(
-                this.shard_idx as usize,
-                this.local_idx as usize,
-                this.generation,
-            );
+            unsafe {
+                get_task_table::<E>().decrement_owned_refs(
+                    slot,
+                    this.shard_idx as usize,
+                    this.local_idx as usize,
+                    this.generation,
+                    1,
+                );
+            }
 
             this.consumed = true;
             Poll::Ready(result)
@@ -257,11 +367,15 @@ impl<T: Send + 'static> Future for JoinHandle<'_, T> {
             if slot.is_completed() {
                 let result = unsafe { (&*this.storage).take() };
 
-                slab.decrement_ref(
-                    this.shard_idx as usize,
-                    this.local_idx as usize,
-                    this.generation,
-                );
+                unsafe {
+                    get_task_table::<E>().decrement_owned_refs(
+                        slot,
+                        this.shard_idx as usize,
+                        this.local_idx as usize,
+                        this.generation,
+                        1,
+                    );
+                }
 
                 this.consumed = true;
                 Poll::Ready(result)
@@ -272,136 +386,151 @@ impl<T: Send + 'static> Future for JoinHandle<'_, T> {
     }
 }
 
-impl<T: Send + 'static> Drop for JoinHandle<'_, T> {
+impl<T: Send + 'static, E: ExecutorPlatform> Drop for JoinHandle<'_, T, E> {
     fn drop(&mut self) {
-        if !self.consumed {
-            let slab = get_task_table();
-            if let Some(slot) = slab.get_slot(
-                self.shard_idx as usize,
-                self.local_idx as usize,
-                self.generation,
-            ) {
-                loop {
-                    let ptr = slot.result_ptr.load(Ordering::Acquire);
-                    if ptr == RESULT_ABANDONED {
-                        break;
+        if !self.consumed && let Some(slot) = self.slot {
+            let slab = get_task_table::<E>();
+            loop {
+                let ptr = slot.result_ptr.load(Ordering::Acquire);
+                if ptr == RESULT_ABANDONED {
+                    break;
+                }
+                if ptr == RESULT_CLAIMED {
+                    while !slot.is_completed() {
+                        core::hint::spin_loop();
                     }
-                    if ptr == RESULT_CLAIMED {
-                        while !slot.is_completed() {
-                            core::hint::spin_loop();
-                        }
-                        unsafe { (&*self.storage).drop_output() };
-                        break;
-                    }
-                    if slot
-                        .result_ptr
-                        .compare_exchange(
-                            ptr,
-                            RESULT_ABANDONED,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        break;
-                    }
+                    unsafe { (&*self.storage).drop_output() };
+                    break;
+                }
+                if slot
+                    .result_ptr
+                    .compare_exchange(
+                        ptr,
+                        RESULT_ABANDONED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
                 }
             }
-            slab.decrement_ref(
-                self.shard_idx as usize,
-                self.local_idx as usize,
-                self.generation,
-            );
+            unsafe {
+                slab.decrement_owned_refs(
+                    slot,
+                    self.shard_idx as usize,
+                    self.local_idx as usize,
+                    self.generation,
+                    1,
+                );
+            }
         }
     }
 }
 
-pub struct OwnedJoinHandle<T: Send + 'static> {
-    handle: JoinHandle<'static, T>,
-    _storage: Pin<Box<JoinStorage<T>>>,
+pub struct OwnedJoinHandle<T: Send + 'static, E: ExecutorPlatform> {
+    handle: JoinHandle<'static, T, E>,
 }
 
-impl<T: Send + 'static> Future for OwnedJoinHandle<T> {
-    type Output = T;
+impl<T: Send + 'static, E: ExecutorPlatform> Future for OwnedJoinHandle<T, E> {
+    type Output = TaskOutcome<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         unsafe { Pin::new_unchecked(&mut this.handle) }.poll(cx)
     }
 }
 
 #[doc(hidden)]
-pub fn spawn_join_owned<F, T>(future: F) -> OwnedJoinHandle<T>
+pub fn spawn_join_owned<E: ExecutorPlatform, F, T>(future: F) -> OwnedJoinHandle<T, E>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    spawn_join_owned_in_executor_domain(crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN, future)
+    spawn_join_owned_in_executor_domain::<E, _, _>(
+        E::default_domain(),
+        future,
+    )
 }
 
 #[doc(hidden)]
-pub fn spawn_join_owned_in_executor_domain<F, T>(
-    domain_id: ExecutorDomainId,
+pub fn spawn_join_owned_in_executor_domain<E: ExecutorPlatform, F, T>(
+    domain: &crate::global_async::ExecutorDomain<E>,
     future: F,
-) -> OwnedJoinHandle<T>
+) -> OwnedJoinHandle<T, E>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let mut storage = Box::pin(JoinStorage::new());
-    let storage_ref = unsafe {
-        core::mem::transmute::<Pin<&mut JoinStorage<T>>, Pin<&'static mut JoinStorage<T>>>(
-            storage.as_mut(),
-        )
-    };
-    let handle = spawn_in_executor_domain(domain_id, storage_ref, future);
-    OwnedJoinHandle {
-        handle,
-        _storage: storage,
-    }
+    assert!(
+        !E::in_interrupt_context(),
+        "attempted to spawn a task from interrupt context"
+    );
+    let executor = GlobalAsyncExecutor::<E>::global();
+    let handle = with_executor_local::<E, _>(|local| {
+        let slab = executor.task_table.get().expect("task table not initialized");
+        let layout = Layout::from_size_align(
+            core::mem::size_of::<F>().max(core::mem::size_of::<JoinStorage<T>>()),
+            core::mem::align_of::<F>().max(core::mem::align_of::<JoinStorage<T>>()),
+        ).expect("owned task layout overflow");
+        let (allocation, slot_handle, slot) =
+            reserve_future::<E, _>(slab, local, future, 3, layout.pad_to_align());
+        let storage = allocation.ptr.as_ptr().cast::<JoinStorage<T>>();
+        let (shard_idx, local_idx, generation) = slot_handle.indices();
+        unsafe { slot.init_joinable::<F, T, true>(domain.id(), allocation, storage) };
+        executor.enqueue_task::<true, false, false>(
+            domain, local, slot_handle.encoded_ptr(), slot,
+        );
+        JoinHandle {
+            shard_idx: shard_idx as u8,
+            local_idx: local_idx as u32,
+            generation,
+            consumed: false,
+            slot: Some(slot),
+            storage,
+            _marker: PhantomData,
+        }
+    });
+    OwnedJoinHandle { handle }
 }
 
-pub fn spawn_detached<F>(future: F)
+pub fn spawn_detached<E: ExecutorPlatform, F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    spawn_detached_in_executor_domain(crate::global_async::KERNEL_NORMAL_EXECUTOR_DOMAIN, future);
+    spawn_detached_in_executor_domain::<E, _>(
+        E::default_domain(),
+        future,
+    );
 }
 
-pub fn spawn_detached_in_executor_domain<F>(domain_id: ExecutorDomainId, future: F)
-where
+pub fn spawn_detached_in_executor_domain<E: ExecutorPlatform, F>(
+    domain: &crate::global_async::ExecutorDomain<E>,
+    future: F,
+) where
     F: Future<Output = ()> + Send + 'static,
 {
     assert!(
-        !crate::platform::in_interrupt_context(),
+        !E::in_interrupt_context(),
         "attempted to spawn a task from interrupt context"
     );
-    GlobalAsyncExecutor::global()
-        .with_executor_domain(domain_id, |domain| {
-            let (allocation, slab, slot_handle) = reserve_future(domain, future);
-            let (shard_idx, local_idx, generation) = slot_handle.indices();
-
-    let slot = slab
-        .get_slot(shard_idx, local_idx, generation)
-        .expect("reserved task slot disappeared before initialization");
-    unsafe { slot.init_detached::<F>(domain_id, allocation) };
-    domain.retain_task();
-
-    slab.increment_ref(shard_idx, local_idx, generation);
+    let executor = GlobalAsyncExecutor::<E>::global();
+    with_executor_local::<E, _>(|local| {
+            let domain_id = domain.id();
+            let slab = executor.task_table.get().expect("task table not initialized");
+            let (allocation, slot_handle, slot) =
+                reserve_future::<E, _>(slab, local, future, 2, Layout::new::<F>());
+            unsafe { slot.init_detached::<F>(domain_id, allocation) };
 
             let encoded = slot_handle.encoded_ptr();
-            submit_global_to_executor_domain(domain_id, encoded);
+            executor.enqueue_task::<true, true, false>(domain, local, encoded, slot);
         })
-        .expect("invalid executor domain")
 }
 
-unsafe fn release_unpublished_future<F>(
-    domain: &crate::global_async::ExecutorDomain,
-    allocation: FutureAllocation,
-) {
+unsafe fn release_unpublished_future<F>(allocation: FutureAllocation) {
     unsafe {
         core::ptr::drop_in_place(allocation.ptr.as_ptr().cast::<F>());
-        assert!(domain.future_arena().release(allocation));
+        allocation.release();
     }
 }
 
@@ -410,17 +539,142 @@ enum FutureSlot<F: Future> {
     Done(Option<F::Output>),
 }
 
+struct JoinAllReady {
+    ready: ArrayQueue<usize>,
+    waker: AtomicWaker,
+    closed: AtomicBool,
+}
+
+struct JoinAllWaker {
+    index: usize,
+    state: Arc<JoinAllReady>,
+    queued: AtomicBool,
+}
+
+struct RetiredJoinWakers {
+    pending: AtomicBool,
+    entries: Mutex<VecDeque<Arc<JoinAllWaker>>>,
+}
+
+#[cfg(not(any(loom, feature = "loom")))]
+static RETIRED_JOIN_WAKERS: RetiredJoinWakers = RetiredJoinWakers {
+    pending: AtomicBool::new(false),
+    entries: Mutex::new(VecDeque::new()),
+};
+
+#[cfg(any(loom, feature = "loom"))]
+loom::lazy_static! {
+    static ref RETIRED_JOIN_WAKERS: RetiredJoinWakers = RetiredJoinWakers {
+        pending: AtomicBool::new(false),
+        entries: Mutex::new(VecDeque::new()),
+    };
+}
+
+#[cfg_attr(irq_check, irq::forbidden)]
+fn drain_retired_join_wakers() {
+    if !RETIRED_JOIN_WAKERS.pending.load(Ordering::Acquire) {
+        return;
+    }
+
+    let released = {
+        let mut entries = RETIRED_JOIN_WAKERS.entries.lock();
+        let mut released = Vec::new();
+        let budget = entries.len().min(128);
+        for _ in 0..budget {
+            let waker = entries.pop_front().expect("retired join waker missing");
+            if Arc::strong_count(&waker) == 1 {
+                released.push(waker);
+            } else {
+                entries.push_back(waker);
+            }
+        }
+        RETIRED_JOIN_WAKERS
+            .pending
+            .store(!entries.is_empty(), Ordering::Release);
+        released
+    };
+    drop(released);
+}
+
+impl Wake for JoinAllWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.state.closed.load(Ordering::Acquire)
+            || self.queued.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        self.state
+            .ready
+            .push(self.index)
+            .expect("join ready queue full");
+        self.state.waker.wake();
+    }
+}
+
 pub struct JoinAll<F: Future> {
     slots: Vec<FutureSlot<F>>,
+    wakers: Vec<Arc<JoinAllWaker>>,
+    state: Arc<JoinAllReady>,
     remaining: usize,
 }
 
 impl<F: Future> JoinAll<F> {
     pub fn new(fs: Vec<F>) -> Self {
+        drain_retired_join_wakers();
         let remaining = fs.len();
         let slots = fs.into_iter().map(FutureSlot::Running).collect();
+        let state = Arc::new(JoinAllReady {
+            ready: ArrayQueue::new(remaining.max(1)),
+            waker: AtomicWaker::new(),
+            closed: AtomicBool::new(false),
+        });
+        let wakers = (0..remaining)
+            .map(|index| {
+                state.ready.push(index).expect("join ready queue full");
+                Arc::new(JoinAllWaker {
+                    index,
+                    state: state.clone(),
+                    queued: AtomicBool::new(true),
+                })
+            })
+            .collect();
 
-        Self { slots, remaining }
+        Self {
+            slots,
+            wakers,
+            state,
+            remaining,
+        }
+    }
+}
+
+impl<F: Future> Drop for JoinAll<F> {
+    #[cfg_attr(irq_check, irq::forbidden)]
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+        #[cfg(not(any(loom, feature = "loom")))]
+        self.state.waker.take();
+        #[cfg(any(loom, feature = "loom"))]
+        self.state.waker.take_waker();
+
+        self.slots.clear();
+        let mut outstanding = Vec::new();
+        for waker in self.wakers.drain(..) {
+            if Arc::strong_count(&waker) != 1 {
+                outstanding.push(waker);
+            }
+        }
+        if !outstanding.is_empty() {
+            let mut entries = RETIRED_JOIN_WAKERS.entries.lock();
+            entries.extend(outstanding);
+            RETIRED_JOIN_WAKERS.pending.store(true, Ordering::Release);
+        }
+        drain_retired_join_wakers();
     }
 }
 
@@ -434,14 +688,27 @@ impl<F: Future> Future for JoinAll<F> {
             return Poll::Ready(join_all_take_output(&mut this.slots));
         }
 
-        let mut i = 0usize;
-        while i < this.slots.len() {
+        #[cfg(not(any(loom, feature = "loom")))]
+        this.state.waker.register(cx.waker());
+        #[cfg(any(loom, feature = "loom"))]
+        this.state.waker.register_by_ref(cx.waker());
+
+        let budget = this.state.ready.len().min(128);
+        for _ in 0..budget {
+            let Some(i) = this.state.ready.pop() else {
+                break;
+            };
             let slot = &mut this.slots[i];
 
             if let FutureSlot::Running(fut) = slot {
+                let child = &this.wakers[i];
+                child.queued.swap(false, Ordering::AcqRel);
+                let waker = Waker::from(child.clone());
+                let mut child_cx = Context::from_waker(&waker);
                 let pinned = unsafe { Pin::new_unchecked(fut) };
 
-                if let Poll::Ready(result) = pinned.poll(cx) {
+                if let Poll::Ready(result) = pinned.poll(&mut child_cx) {
+                    child.queued.store(true, Ordering::Release);
                     *slot = FutureSlot::Done(Some(result));
                     this.remaining -= 1;
 
@@ -450,11 +717,11 @@ impl<F: Future> Future for JoinAll<F> {
                     }
                 }
             }
-
-            i += 1;
         }
 
-        cx.waker().wake_by_ref();
+        if !this.state.ready.is_empty() {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 }
@@ -532,76 +799,71 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnToPortError {
     InvalidDomain,
+    DomainClosing,
     InterruptContext,
     FutureAllocationFailed,
     TaskAllocationFailed,
 }
 
-pub fn try_spawn_to_port_in_executor_domain<F, P, T>(
-    domain_id: ExecutorDomainId,
-    future: F,
+pub fn try_spawn_to_port_in_executor_domain<E: ExecutorPlatform, F, P, T>(
+    domain: &crate::global_async::ExecutorDomain<E>,
+    make_future: impl FnOnce() -> F,
     completion_key: u64,
     permit: P,
+    poll_inline: bool,
+    on_spawn: impl FnOnce(TaskToken),
 ) -> Result<TaskToken, SpawnToPortError>
 where
     F: Future<Output = T> + Send + 'static,
     P: CompletionPermit<T>,
     T: Send + 'static,
 {
-    if crate::platform::in_interrupt_context() {
+    if E::in_interrupt_context() {
         return Err(SpawnToPortError::InterruptContext);
     }
-    GlobalAsyncExecutor::global()
-        .with_executor_domain(domain_id, |domain| {
-            let allocation = domain
-                .future_arena()
-                .allocate(
-                    core::mem::size_of::<PortFuture<F, P, T>>(),
-                    core::mem::align_of::<PortFuture<F, P, T>>(),
-                )
-                .ok_or(SpawnToPortError::FutureAllocationFailed)?;
-            unsafe {
-                allocation
-                    .ptr
-                    .as_ptr()
-                    .cast::<PortFuture<F, P, T>>()
-                    .write(PortFuture {
-                        future,
-                        permit: Some(permit),
-                        key: completion_key,
-                        token: 0,
-                        completed: false,
-                        _output: PhantomData,
-                    });
-            }
-            let slab = get_task_table();
-            let Some(handle) = slab.allocate() else {
-                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(domain, allocation) };
-                return Err(SpawnToPortError::TaskAllocationFailed);
-            };
-            let (shard, local, generation) = handle.indices();
-            let Some(token) = TaskToken::from_raw(handle.encoded_ptr()) else {
-                unsafe { release_unpublished_future::<PortFuture<F, P, T>>(domain, allocation) };
-                return Err(SpawnToPortError::TaskAllocationFailed);
-            };
-            unsafe { (*allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>()).token = token.raw() };
-            let slot = slab
-                .get_slot(shard, local, generation)
-                .expect("reserved task slot disappeared");
-            unsafe { slot.init_abortable::<PortFuture<F, P, T>>(domain_id, allocation) };
-            domain.retain_task();
-            slab.increment_ref(shard, local, generation);
-            submit_global_to_executor_domain(domain_id, handle.encoded_ptr());
-            Ok(token)
-        })
-        .ok_or(SpawnToPortError::InvalidDomain)?
+    let executor = GlobalAsyncExecutor::<E>::global();
+    let allocation = FutureAllocation::allocate(
+        core::mem::size_of::<PortFuture<F, P, T>>(),
+        core::mem::align_of::<PortFuture<F, P, T>>(),
+    )
+    .ok_or(SpawnToPortError::FutureAllocationFailed)?;
+    unsafe {
+        allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>().write(PortFuture {
+            future: make_future(),
+            permit: Some(permit),
+            key: completion_key,
+            token: 0,
+            completed: false,
+            _output: PhantomData,
+        });
+    }
+    let slab = executor.task_table.get().expect("task table not initialized");
+    let reserved = with_executor_local::<E, _>(|local| slab.allocate_with_refs::<true>(2, Some(local)));
+    let Some((handle, slot)) = reserved else {
+        unsafe { release_unpublished_future::<PortFuture<F, P, T>>(allocation) };
+        return Err(SpawnToPortError::TaskAllocationFailed);
+    };
+    let token = TaskToken::from_raw(handle.encoded_ptr()).expect("invalid reserved task token");
+    unsafe { (*allocation.ptr.as_ptr().cast::<PortFuture<F, P, T>>()).token = token.raw() };
+    unsafe { slot.init_detached::<PortFuture<F, P, T>>(crate::global_async::ExecutorDomainId::from_raw(0), allocation) };
+    on_spawn(token);
+    with_executor_local::<E, _>(|local| {
+        slot.domain_id.store(domain.id().raw(), Ordering::Release);
+        if poll_inline {
+            executor.enqueue_task::<true, true, false>(domain, local, handle.encoded_ptr(), slot);
+        } else {
+            executor.enqueue_task::<true, false, false>(domain, local, handle.encoded_ptr(), slot);
+        }
+    });
+    Ok(token)
 }
 
-pub fn abort_task(token: TaskToken) -> bool {
-    let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token.raw()) else {
+pub fn abort_task<E: ExecutorPlatform>(token: TaskToken) -> bool {
+    let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token.raw())
+    else {
         return false;
     };
-    let slab = get_task_table();
+    let slab = get_task_table::<E>();
     if !slab.increment_ref(shard, local, generation) {
         return false;
     }
@@ -609,8 +871,45 @@ pub fn abort_task(token: TaskToken) -> bool {
         .get_slot(shard, local, generation)
         .is_some_and(|slot| slot.request_abort());
     if result {
-        super::slab::ptr::enqueue_slab_task(shard, local, generation);
+        super::slab::ptr::enqueue_slab_task::<E>(shard, local, generation);
     }
-    slab.decrement_ref(shard, local, generation);
+    slab.decrement_ref::<false>(shard, local, generation);
     result
+}
+
+pub fn task_cancellation_guard<E: ExecutorPlatform>() -> crate::cancellation::TaskCancellationGuard {
+    let token = crate::platform::current_executor_context::<E>().map_or(0, |context| context.task_id);
+    if let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token) {
+        let table = get_task_table::<E>();
+        assert!(table.increment_ref(shard, local, generation));
+        let slot = table.get_slot(shard, local, generation).expect("cancellation task missing");
+        slot.cancellation_guards.fetch_add(1, Ordering::AcqRel);
+    }
+    crate::cancellation::TaskCancellationGuard {
+        token,
+        cancelled: task_cancellation_requested::<E>,
+        release: release_task_cancellation_guard::<E>,
+    }
+}
+
+extern "C" fn task_cancellation_requested<E: ExecutorPlatform>(token: usize) -> bool {
+    let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token) else {
+        return false;
+    };
+    get_task_table::<E>().get_slot(shard, local, generation)
+        .is_some_and(TaskSlot::cancellation_requested)
+}
+
+extern "C" fn release_task_cancellation_guard<E: ExecutorPlatform>(token: usize) {
+    let Some((shard, local, generation)) = super::slab::ptr::decode_slab_task_ptr(token) else {
+        return;
+    };
+    let table = get_task_table::<E>();
+    let slot = table.get_slot(shard, local, generation).expect("cancellation task missing");
+    let previous = slot.cancellation_guards.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous != 0);
+    if previous == 1 && slot.cancellation_requested() {
+        super::slab::ptr::enqueue_slab_task::<E>(shard, local, generation);
+    }
+    table.decrement_ref::<false>(shard, local, generation);
 }

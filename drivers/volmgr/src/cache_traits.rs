@@ -8,6 +8,8 @@ pub struct CacheConfig {
     pub capacity_blocks: usize,
     pub shards: usize,
     pub flush_parallelism: usize,
+    pub writeback_batch_bytes: usize,
+    pub stream_reuse_bytes: Option<usize>,
     pub write_allocate: bool,
     pub read_allocate: bool,
     pub direct_io_on_no_free_pages: bool,
@@ -52,7 +54,9 @@ impl CacheConfig {
         Self {
             capacity_blocks,
             shards: 16,
-            flush_parallelism: 4,
+            flush_parallelism: 2,
+            writeback_batch_bytes: 4 * 1024 * 1024,
+            stream_reuse_bytes: None,
             write_allocate: true,
             read_allocate: true,
             direct_io_on_no_free_pages: true,
@@ -91,6 +95,9 @@ impl<E: Clone> Clone for CacheError<E> {
 pub trait VolumeCacheBackend: Send + Sync + 'static {
     type Error: Send + Sync + core::fmt::Debug + 'static;
 
+    /// Exclusive byte limit for requests to this volume.
+    fn volume_len(&self) -> u64;
+
     fn read_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Read<'data>,
@@ -101,14 +108,14 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
         lba: u64,
         blocks: usize,
         buffer: IoBuffer<'buffer, 'buffer, FromDevice>,
-    ) -> AbiFuture<Result<usize, Self::Error>>;
+    ) -> impl core::future::Future<Output = Result<usize, Self::Error>> + Send;
 
     fn write_request<'a, 'req, 'data>(
         &'a self,
         req: &'a mut Write<'data>,
     ) -> AbiFuture<Result<(), Self::Error>>;
 
-    fn flush_device(&self) -> AbiFuture<Result<(), Self::Error>>;
+    fn flush_device<'a>(&'a self) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send + 'a;
 
     fn dma_map_cache(&self, backing: &mut IoBufferBacking) -> AbiFuture<Result<(), Self::Error>>;
 }

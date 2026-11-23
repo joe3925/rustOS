@@ -2,7 +2,6 @@ use super::super::cpu::platform_cpu_id;
 use super::super::gdt::PER_CPU_GDT;
 
 use crate::executable::program::{Message, UserHandle};
-use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::structs::io_request::request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
@@ -27,67 +26,49 @@ pub fn syscall_init() {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SyscallFrame {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
     pub r11: u64,
     pub r10: u64,
     pub r9: u64,
     pub r8: u64,
-    pub rdi: u64,
-    pub rsi: u64,
     pub rdx: u64,
     pub rcx: u64,
     pub rbx: u64,
-    pub rbp: u64,
     pub rax: u64,
 }
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_entry() -> ! {
     naked_asm!(
         "push rax",
-        "push rbp",
         "push rbx",
         "push rcx",
         "push rdx",
-        "push rsi",
-        "push rdi",
         "push r8",
         "push r9",
         "push r10",
         "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-
-        "mov  rbx, rsp",
-        "and  rsp, -16",
-        "sub  rsp, 32",
-        "mov  rcx, rbx",
+        "mov rbx, rsp",
         "cld",
+        "and rsp, -16",
+        "sub rsp, {entry_frame_size}",
+        "fxsave64 [rsp + {fpu_state_offset}]",
+        "mov  rcx, rbx",
         "call {handler}",
-        "mov  rsp, rbx",
-
-        "pop  r15",
-        "pop  r14",
-        "pop  r13",
-        "pop  r12",
+        "fxrstor64 [rsp + {fpu_state_offset}]",
+        "mov rsp, rbx",
         "pop  r11",
         "pop  r10",
         "pop  r9",
         "pop  r8",
-        "pop  rdi",
-        "pop  rsi",
         "pop  rdx",
         "pop  rcx",
         "pop  rbx",
-        "pop  rbp",
         "pop  rax",
 
         "sysretq",
 
+        entry_frame_size = const super::super::interrupts::entry::FPU_STATE_OFFSET
+            + core::mem::size_of::<super::super::scheduling::state::FpuState>(),
+        fpu_state_offset = const super::super::interrupts::entry::FPU_STATE_OFFSET,
         handler = sym syscall_handler,
     );
 }
@@ -143,7 +124,22 @@ make_wrapper!(
     *mut u8,
     usize
 );
-make_wrapper!(wrap_io_enqueue, sys_io_enqueue, UserHandle, *const UserIoOp);
+make_wrapper!(
+    wrap_io_enqueue,
+    sys_io_enqueue::<false>,
+    UserHandle,
+    *const UserIoOp,
+    *mut UserIoCompletion,
+    u64
+);
+make_wrapper!(
+    wrap_io_enqueue_wait,
+    sys_io_enqueue::<true>,
+    UserHandle,
+    *const UserIoOp,
+    *mut UserIoCompletion,
+    u64
+);
 make_wrapper!(
     wrap_io_enqueue_many,
     sys_io_enqueue_many,
@@ -233,11 +229,11 @@ const SYSCALL_TABLE: &[Handler] = &[
     wrap_executor_domain_create,
     wrap_executor_domain_configure,
     wrap_object_query,
+    wrap_io_enqueue_wait,
 ];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
-    let _fpu_guard = KernelFpuGuard::new();
     let num = frame.rax as usize;
     // stack args start immediately after the pushed register block
     let rest_ptr = unsafe { (frame as *const SyscallFrame).add(1) } as *const u64;

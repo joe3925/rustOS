@@ -6,7 +6,7 @@ use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
+use kernel_sync::locks::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
 use kernel_types::error::{
     DriverErrorKind, ErrorKind, FileErrorKind, KernelError, ResultErrorContext,
 };

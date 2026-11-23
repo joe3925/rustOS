@@ -1,17 +1,12 @@
 use crate::dma::DmaDeviceHandle;
-use alloc::collections::VecDeque;
 use core::cell::UnsafeCell;
-use core::mem::{ManuallyDrop, MaybeUninit};
-use core::ops::{Deref, DerefMut};
-use core::ptr::NonNull;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::Waker;
 
-use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use spin::Mutex;
 
 pub type IrqContextQuery = extern "C" fn() -> bool;
-pub type IrqInterruptsEnabled = extern "C" fn() -> bool;
-pub type IrqInterruptsSet = extern "C" fn();
 
 pub const MSI_REQUESTER_NONE: u32 = 0;
 pub const MSI_REQUESTER_PCI: u32 = 1;
@@ -186,61 +181,8 @@ pub struct MsiBinding {
 }
 
 static IRQ_CONTEXT_QUERY: AtomicUsize = AtomicUsize::new(0);
-static IRQ_INTERRUPTS_ENABLED: AtomicUsize = AtomicUsize::new(0);
-static IRQ_INTERRUPTS_DISABLE: AtomicUsize = AtomicUsize::new(0);
-static IRQ_INTERRUPTS_ENABLE: AtomicUsize = AtomicUsize::new(0);
-static IRQ_INTERRUPTS_ENABLE_AND_HLT: AtomicUsize = AtomicUsize::new(0);
-
 pub fn set_irq_context_query(query: IrqContextQuery) {
     IRQ_CONTEXT_QUERY.store(query as usize, Ordering::Release);
-}
-
-pub fn set_irq_interrupt_control(
-    enabled: IrqInterruptsEnabled,
-    disable: IrqInterruptsSet,
-    enable: IrqInterruptsSet,
-    enable_and_hlt: IrqInterruptsSet,
-) {
-    IRQ_INTERRUPTS_ENABLED.store(enabled as usize, Ordering::Release);
-    IRQ_INTERRUPTS_DISABLE.store(disable as usize, Ordering::Release);
-    IRQ_INTERRUPTS_ENABLE.store(enable as usize, Ordering::Release);
-    IRQ_INTERRUPTS_ENABLE_AND_HLT.store(enable_and_hlt as usize, Ordering::Release);
-}
-
-#[inline(always)]
-fn interrupts_enabled() -> bool {
-    let enabled = IRQ_INTERRUPTS_ENABLED.load(Ordering::Acquire);
-
-    if enabled == 0 {
-        return false;
-    }
-
-    let enabled: IrqInterruptsEnabled = unsafe { core::mem::transmute(enabled) };
-    enabled()
-}
-
-#[inline(always)]
-fn interrupts_disable() {
-    let disable = IRQ_INTERRUPTS_DISABLE.load(Ordering::Acquire);
-
-    if disable == 0 {
-        return;
-    }
-
-    let disable: IrqInterruptsSet = unsafe { core::mem::transmute(disable) };
-    disable();
-}
-
-#[inline(always)]
-fn interrupts_enable() {
-    let enable = IRQ_INTERRUPTS_ENABLE.load(Ordering::Acquire);
-
-    if enable == 0 {
-        return;
-    }
-
-    let enable: IrqInterruptsSet = unsafe { core::mem::transmute(enable) };
-    enable();
 }
 
 #[repr(C)]
@@ -574,13 +516,20 @@ impl WaiterSlot {
             (*self.result.get()).write(result);
         }
 
-        let waker = unsafe { (*self.waker.get()).clone() };
+        let waker = {
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe { (*self.waker.get()).clone() }
+        };
 
         self.word
             .store(waiter_word(WAITER_SIGNALED, ticket), Ordering::Release);
 
         if self.abandoned.swap(false, Ordering::AcqRel) {
             unsafe { self.cleanup_signaled(ticket) };
+            #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+            unsafe {
+                drop(waker);
+            }
             return None;
         }
 
@@ -604,6 +553,9 @@ impl WaiterSlot {
 
         unsafe {
             let _ = (*self.result.get()).assume_init_read();
+        }
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+        unsafe {
             let _ = (*self.waker.get()).take();
         }
 
@@ -661,6 +613,7 @@ impl WaiterSlot {
 
     #[inline]
     unsafe fn clear_waker_exclusive(&self) {
+        #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
         unsafe {
             let _ = (*self.waker.get()).take();
         }
@@ -725,124 +678,6 @@ impl WaiterSlot {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct WaiterPtr {
-    ptr: NonNull<Waiter>,
-}
-
-impl WaiterPtr {
-    pub fn new(waiter: &Waiter) -> Self {
-        Self {
-            ptr: NonNull::from(waiter),
-        }
-    }
-
-    pub unsafe fn from_raw(ptr: *mut Waiter) -> Self {
-        Self {
-            ptr: unsafe { NonNull::new_unchecked(ptr) },
-        }
-    }
-
-    pub fn as_ptr(self) -> *mut Waiter {
-        self.ptr.as_ptr()
-    }
-
-    pub unsafe fn as_ref<'a>(self) -> &'a Waiter {
-        unsafe { self.ptr.as_ref() }
-    }
-
-    pub fn ptr_eq(self, other: WaiterPtr) -> bool {
-        self.ptr == other.ptr
-    }
-}
-
-unsafe impl Send for WaiterPtr {}
-unsafe impl Sync for WaiterPtr {}
-
-#[repr(C)]
-pub struct Waiter {
-    pub waker: IrqSafeMutex<Option<Waker>>,
-    pub result: IrqSafeMutex<Option<IrqWaitResult>>,
-    pub enqueued: AtomicBool,
-}
-
-unsafe impl Send for Waiter {}
-unsafe impl Sync for Waiter {}
-
-impl Waiter {
-    pub const fn new() -> Self {
-        Self {
-            waker: IrqSafeMutex::new(None),
-            result: IrqSafeMutex::new(None),
-            enqueued: AtomicBool::new(false),
-        }
-    }
-
-    pub fn set_waker(&self, w: &Waker) {
-        let mut g = self.waker.lock();
-        let update = match g.as_ref() {
-            Some(existing) => !existing.will_wake(w),
-            None => true,
-        };
-
-        if update {
-            *g = Some(w.clone());
-        }
-    }
-
-    pub fn take_result(&self) -> Option<IrqWaitResult> {
-        self.result.lock().take()
-    }
-
-    pub fn store_result(&self, r: IrqWaitResult) {
-        *self.result.lock() = Some(r);
-    }
-
-    pub fn wake_by_ref(&self) {
-        let g = self.waker.lock();
-
-        if let Some(w) = g.as_ref() {
-            w.wake_by_ref();
-        }
-    }
-
-    pub fn clear(&self) {
-        self.enqueued.store(false, Ordering::Release);
-        *self.waker.lock() = None;
-        *self.result.lock() = None;
-    }
-}
-
-pub struct WaitState {
-    pub waiters: VecDeque<WaiterPtr>,
-    pub pending_signals: usize,
-    pub last_meta: IrqMeta,
-}
-
-impl WaitState {
-    pub const fn new() -> Self {
-        Self {
-            waiters: VecDeque::new(),
-            pending_signals: 0,
-            last_meta: IrqMeta::new(),
-        }
-    }
-
-    pub fn pop_waiter(&mut self) -> Option<WaiterPtr> {
-        self.waiters.pop_front()
-    }
-
-    pub fn push_waiter(&mut self, waiter: WaiterPtr) {
-        self.waiters.push_back(waiter);
-    }
-
-    pub fn remove_waiter(&mut self, target: WaiterPtr) -> bool {
-        let before = self.waiters.len();
-        self.waiters.retain(|w| !w.ptr_eq(target));
-        before != self.waiters.len()
-    }
-}
-
 #[repr(C)]
 pub struct IrqHandleInner {
     pub drop_hook: Mutex<Option<DropHook>>,
@@ -883,251 +718,171 @@ impl core::fmt::Debug for DropHook {
     }
 }
 
-pub struct IrqSafeMutex<T> {
-    inner: Mutex<T>,
-}
+impl IrqHandleInner {
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
 
-pub struct IrqSafeMutexGuard<'a, T> {
-    guard: ManuallyDrop<MutexGuard<'a, T>>,
-    restore_interrupts: bool,
-}
+    #[inline]
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
 
-impl<T> IrqSafeMutex<T> {
-    pub const fn new(value: T) -> Self {
-        Self {
-            inner: Mutex::new(value),
+        self.pending_signals.store(0, Ordering::Release);
+
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) = unsafe { slot.complete_claimed(ticket, IrqWaitResult::closed()) } {
+                waker.wake_by_ref();
+            }
         }
     }
 
-    #[inline(always)]
-    pub fn lock(&self) -> IrqSafeMutexGuard<'_, T> {
-        let restore_interrupts = interrupts_enabled();
-
-        loop {
-            if restore_interrupts {
-                interrupts_disable();
-            }
-
-            if let Some(guard) = self.inner.try_lock() {
-                return IrqSafeMutexGuard {
-                    guard: ManuallyDrop::new(guard),
-                    restore_interrupts,
-                };
-            }
-
-            core::hint::spin_loop();
-        }
+    #[inline]
+    pub fn signal_one(&self, meta: IrqMeta) {
+        let _ = self.signal_n(meta, 1);
     }
 
-    #[inline(always)]
-    pub fn try_lock(&self) -> Option<IrqSafeMutexGuard<'_, T>> {
-        let restore_interrupts = interrupts_enabled();
-
-        if restore_interrupts {
-            interrupts_disable();
+    #[inline]
+    pub fn ensure_signal_exactly_one(&self, meta: IrqMeta) {
+        if self.is_closed() {
+            return;
         }
 
-        match self.inner.try_lock() {
-            Some(guard) => Some(IrqSafeMutexGuard {
-                guard: ManuallyDrop::new(guard),
-                restore_interrupts,
-            }),
-            None => {
-                if restore_interrupts {
-                    interrupts_enable();
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
                 }
-
-                None
-            }
-        }
-    }
-}
-
-impl<'a, T> Deref for IrqSafeMutexGuard<'a, T> {
-    type Target = T;
-
-    #[inline(always)]
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<'a, T> DerefMut for IrqSafeMutexGuard<'a, T> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
-    }
-}
-
-impl<'a, T> Drop for IrqSafeMutexGuard<'a, T> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        unsafe {
-            ManuallyDrop::drop(&mut self.guard);
-        }
-
-        if self.restore_interrupts {
-            interrupts_enable();
-        }
-    }
-}
-
-pub struct IrqSafeRwLock<T> {
-    inner: RwLock<T>,
-}
-
-pub struct IrqSafeRwLockReadGuard<'a, T> {
-    guard: ManuallyDrop<RwLockReadGuard<'a, T>>,
-    restore_interrupts: bool,
-}
-
-pub struct IrqSafeRwLockWriteGuard<'a, T> {
-    guard: ManuallyDrop<RwLockWriteGuard<'a, T>>,
-    restore_interrupts: bool,
-}
-
-impl<T> IrqSafeRwLock<T> {
-    #[inline(always)]
-    pub const fn new(value: T) -> Self {
-        Self {
-            inner: RwLock::new(value),
-        }
-    }
-
-    #[inline(always)]
-    pub fn read(&self) -> IrqSafeRwLockReadGuard<'_, T> {
-        let restore_interrupts = interrupts_enabled();
-
-        loop {
-            if restore_interrupts {
-                interrupts_disable();
             }
 
-            if let Some(guard) = self.inner.try_read() {
-                return IrqSafeRwLockReadGuard {
-                    guard: ManuallyDrop::new(guard),
-                    restore_interrupts,
-                };
-            }
-
-            core::hint::spin_loop();
+            self.signal_phase.fetch_add(1, Ordering::AcqRel);
+            self.signal_active.fetch_sub(1, Ordering::AcqRel);
+            return;
         }
+
+        let _ = self
+            .pending_signals
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                if pending == 0 { Some(1) } else { Some(pending) }
+            });
+
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
     }
 
-    #[inline(always)]
-    pub fn try_read(&self) -> Option<IrqSafeRwLockReadGuard<'_, T>> {
-        let restore_interrupts = interrupts_enabled();
-
-        if restore_interrupts {
-            interrupts_disable();
+    #[inline]
+    pub fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
+        if n == 0 || self.is_closed() {
+            return 0;
         }
 
-        match self.inner.try_read() {
-            Some(guard) => Some(IrqSafeRwLockReadGuard {
-                guard: ManuallyDrop::new(guard),
-                restore_interrupts,
-            }),
-            None => {
-                if restore_interrupts {
-                    interrupts_enable();
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+
+        let mut signaled = 0;
+
+        for slot in &self.waiters {
+            if signaled == n {
+                break;
+            }
+
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
                 }
-
-                None
             }
+
+            signaled += 1;
         }
+
+        if signaled < n {
+            self.pending_signals
+                .fetch_add(n - signaled, Ordering::AcqRel);
+        }
+
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
+        signaled
     }
 
-    #[inline(always)]
-    pub fn write(&self) -> IrqSafeRwLockWriteGuard<'_, T> {
-        let restore_interrupts = interrupts_enabled();
-
-        loop {
-            if restore_interrupts {
-                interrupts_disable();
-            }
-
-            if let Some(guard) = self.inner.try_write() {
-                return IrqSafeRwLockWriteGuard {
-                    guard: ManuallyDrop::new(guard),
-                    restore_interrupts,
-                };
-            }
-
-            core::hint::spin_loop();
-        }
-    }
-
-    #[inline(always)]
-    pub fn try_write(&self) -> Option<IrqSafeRwLockWriteGuard<'_, T>> {
-        let restore_interrupts = interrupts_enabled();
-
-        if restore_interrupts {
-            interrupts_disable();
+    #[inline]
+    pub fn signal_all(&self, meta: IrqMeta) -> usize {
+        if self.is_closed() {
+            return 0;
         }
 
-        match self.inner.try_write() {
-            Some(guard) => Some(IrqSafeRwLockWriteGuard {
-                guard: ManuallyDrop::new(guard),
-                restore_interrupts,
-            }),
-            None => {
-                if restore_interrupts {
-                    interrupts_enable();
+        self.last_meta.store(meta, Ordering::Release);
+        self.signal_active.fetch_add(1, Ordering::AcqRel);
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+
+        let mut signaled = 0;
+
+        for slot in &self.waiters {
+            let Some(ticket) = slot.try_claim_for_signal() else {
+                continue;
+            };
+
+            if let Some(waker) =
+                unsafe { slot.complete_claimed(ticket, IrqWaitResult::ok_n(meta, 1)) }
+            {
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
+                unsafe {
+                    waker.wake_by_ref();
+                    drop(waker);
                 }
-
-                None
             }
-        }
-    }
-}
 
-impl<'a, T> Deref for IrqSafeRwLockReadGuard<'a, T> {
-    type Target = T;
-
-    #[inline(always)]
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<'a, T> Drop for IrqSafeRwLockReadGuard<'a, T> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        unsafe {
-            ManuallyDrop::drop(&mut self.guard);
+            signaled += 1;
         }
 
-        if self.restore_interrupts {
-            interrupts_enable();
-        }
-    }
-}
-
-impl<'a, T> Deref for IrqSafeRwLockWriteGuard<'a, T> {
-    type Target = T;
-
-    #[inline(always)]
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<'a, T> DerefMut for IrqSafeRwLockWriteGuard<'a, T> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
-    }
-}
-
-impl<'a, T> Drop for IrqSafeRwLockWriteGuard<'a, T> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        unsafe {
-            ManuallyDrop::drop(&mut self.guard);
+        if signaled == 0 {
+            self.pending_signals.fetch_add(1, Ordering::AcqRel);
         }
 
-        if self.restore_interrupts {
-            interrupts_enable();
+        self.signal_phase.fetch_add(1, Ordering::AcqRel);
+        self.signal_active.fetch_sub(1, Ordering::AcqRel);
+        signaled
+    }
+
+    #[inline]
+    pub fn cancel_waiter(&self, slot: usize) {
+        if let Some(waiter) = self.waiters.get(slot) {
+            waiter.cancel();
         }
+    }
+
+    pub fn set_user_ctx(&self, v: usize) {
+        self.user_ctx.store(v, Ordering::Release);
+    }
+
+    pub fn user_ctx(&self) -> usize {
+        self.user_ctx.load(Ordering::Acquire)
     }
 }

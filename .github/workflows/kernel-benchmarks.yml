@@ -15,11 +15,16 @@ permissions:
   actions: read
 
 env:
-  BENCH_ENV_VERSION: "2"
+  BENCH_ENV_VERSION: "5"
 
 jobs:
   benchmark:
-    if: github.event_name != 'workflow_dispatch' || inputs.accept_run_id == ''
+    if: >-
+      (github.event_name == 'push' &&
+       (contains(github.event.head_commit.message, '[bench]') ||
+        github.run_attempt > 1)) ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.accept_run_id == '')
     runs-on: [self-hosted, linux, x64, rustos-bench]
     timeout-minutes: 120
 
@@ -36,6 +41,18 @@ jobs:
         run: |
           sudo chmod 666 /dev/kvm
           ls -l /dev/kvm
+
+      - name: Check disk capacity
+        shell: bash
+        run: |
+          find "$RUNNER_TEMP" -maxdepth 1 -type d \( -name 'rustos-baselines-*' -o -name 'rustos-benchmark-source.*' \) -exec rm -rf -- {} +
+          rm -f -- "$RUNNER_TEMP/rustos-ci-seed.img"
+          available="$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -1)"
+          if (( available < 10 * 1024 * 1024 * 1024 )); then
+            echo "::error::Benchmarks require at least 10 GiB of free disk space before the build."
+            df -h "$GITHUB_WORKSPACE"
+            exit 1
+          fi
 
       - name: Verify benchmark host
         shell: bash
@@ -61,45 +78,13 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Install PGO tools
+        shell: bash
+        run: bash .github/scripts/prepare-pgo-tools.sh
+
       - name: Create C drive seed image
         shell: bash
-        run: |
-          image="$RUNNER_TEMP/rustos-ci-seed.img"
-          mount_dir="$RUNNER_TEMP/rustos-ci-mount"
-          loop_device=""
-
-          cleanup() {
-            if mountpoint -q "$mount_dir"; then
-              sudo umount "$mount_dir"
-            fi
-            if [[ -n "$loop_device" ]]; then
-              sudo losetup --detach "$loop_device"
-            fi
-          }
-          trap cleanup EXIT
-
-          truncate -s 2G "$image"
-          sgdisk --new=1:2048:0 --typecode=1:0700 --change-name=1:rustOS "$image"
-
-          loop_device="$(sudo losetup --find --show --partscan "$image")"
-          partition="${loop_device}p1"
-          for _ in {1..10}; do
-            [[ -b "$partition" ]] && break
-            sleep 0.2
-          done
-          [[ -b "$partition" ]]
-
-          sudo mkfs.vfat -F 32 -n RUSTOS "$partition"
-          mkdir -p "$mount_dir"
-          sudo mount "$partition" "$mount_dir"
-          sudo mkdir -p \
-            "$mount_dir/system/registry" \
-            "$mount_dir/system/toml" \
-            "$mount_dir/system/mod"
-          sync
-
-          cleanup
-          trap - EXIT
+        run: bash .github/scripts/create-ci-disk.sh --benchmark
 
       - name: Download trusted baseline and previous run
         id: baselines
@@ -109,7 +94,8 @@ jobs:
           BENCH_BRANCH: ${{ github.head_ref || github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          baseline_cache="$RUNNER_TEMP/rustos-baselines-$GITHUB_RUN_ID"
+          baseline_cache="$(mktemp -d "$RUNNER_TEMP/rustos-baselines-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")"
+          trap 'rm -rf -- "$baseline_cache"' EXIT
           mkdir -p "$baseline_cache" target/bench
 
           list_runs() {
@@ -135,6 +121,7 @@ jobs:
               if ! gh run download "$run_id" \
                 --name kernel-benchmark-anchor \
                 --dir "$run_dir"; then
+                rm -rf -- "$run_dir"
                 continue
               fi
 
@@ -145,16 +132,28 @@ jobs:
                 [[ "$(jq -r '.environment_version // empty' "$manifest")" == "$BENCH_ENV_VERSION" ]] &&
                 [[ "$(jq -r --arg default_branch "$DEFAULT_BRANCH" '.branch // $default_branch' "$manifest")" == "$baseline_branch" ]] &&
                 jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+                baseline_commit="$(jq -r '.commit // empty' "$manifest")"
+                if [[ -z "$baseline_commit" ]] || ! git merge-base --is-ancestor "$baseline_commit" "$GITHUB_SHA"; then
+                  rm -rf -- "$run_dir"
+                  continue
+                fi
                 acceptance="$(jq -r '.accepted_by_run' "$manifest")"
                 if [[ "$acceptance" =~ ^[0-9]+$ ]] && (( acceptance > best_acceptance )); then
+                  if [[ -n "$best_dir" ]]; then
+                    rm -rf -- "$best_dir"
+                  fi
                   best_acceptance="$acceptance"
                   best_dir="$run_dir"
                 fi
               fi
+              if [[ "$run_dir" != "$best_dir" ]]; then
+                rm -rf -- "$run_dir"
+              fi
             done < "$trusted_candidates"
             if [[ -n "$best_dir" ]]; then
-              mkdir -p target/bench/anchor
-              cp "$best_dir/"{manifest.json,results.json,boot.img} target/bench/anchor/
+              mkdir -p target/bench/anchor target/bench/trusted
+              cp -r "$best_dir/." target/bench/anchor/
+              cp "$best_dir/boot.img" target/bench/trusted/boot.img
               echo "trusted_available=true" >> "$GITHUB_OUTPUT"
               echo "trusted_run_id=$(jq -r '.run_id' "$best_dir/manifest.json")" >> "$GITHUB_OUTPUT"
               echo "trusted_commit=$(jq -r '.commit' "$best_dir/manifest.json")" >> "$GITHUB_OUTPUT"
@@ -167,19 +166,13 @@ jobs:
             list_runs "$DEFAULT_BRANCH" success |
               jq -r '.workflow_runs[] | [.id, .head_sha] | @tsv' > "$trusted_candidates"
             while IFS=$'\t' read -r run_id commit; do
+              [[ "$run_id" == "$GITHUB_RUN_ID" ]] && continue
+              git merge-base --is-ancestor "$commit" "$GITHUB_SHA" || continue
               run_dir="$baseline_cache/main-${run_id}"
-              mkdir -p "$run_dir"
-              if ! gh run download "$run_id" --name kernel-benchmarks --dir "$run_dir"; then
-                continue
-              fi
-              result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
-              boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
-              environment_version="$(find "$run_dir" -path '*/head/environment-version' -print -quit)"
-              if [[ -n "$result" && -n "$boot_image" && -n "$environment_version" ]] &&
-                [[ "$(<"$environment_version")" == "$BENCH_ENV_VERSION" ]] &&
-                jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
+              bash .github/scripts/restore-benchmark-source.sh "$commit" "$run_dir"
+              if [[ -f "$run_dir/boot.img" ]]; then
                 mkdir -p target/bench/trusted
-                cp "$boot_image" target/bench/trusted/boot.img
+                cp -r "$run_dir/." target/bench/trusted/
                 echo "trusted_available=true" >> "$GITHUB_OUTPUT"
                 echo "trusted_run_id=$run_id" >> "$GITHUB_OUTPUT"
                 echo "trusted_commit=$commit" >> "$GITHUB_OUTPUT"
@@ -196,89 +189,170 @@ jobs:
             [[ "$run_id" == "$GITHUB_RUN_ID" || "$commit" == "$GITHUB_SHA" ]] && continue
             git merge-base --is-ancestor "$commit" "$GITHUB_SHA" || continue
             run_dir="$baseline_cache/previous-${run_id}"
-            mkdir -p "$run_dir"
-            if ! gh run download "$run_id" \
-              --name kernel-benchmarks \
-              --dir "$run_dir"; then
-              continue
-            fi
-
-            result="$(find "$run_dir" -path '*/head/results.json' -print -quit)"
-            boot_image="$(find "$run_dir" -path '*/head/boot.img' -print -quit)"
-            environment_version="$(find "$run_dir" -path '*/head/environment-version' -print -quit)"
-            if [[ -n "$result" && -n "$boot_image" && -n "$environment_version" ]] &&
-              [[ "$(<"$environment_version")" == "$BENCH_ENV_VERSION" ]] &&
-              jq -e '.schema == "rustos.bench-run.v1" and (.runs | length > 0) and all(.runs[]; .complete and .status == "passed")' "$result" >/dev/null; then
-              cp "$boot_image" target/bench/previous-boot.img
+            bash .github/scripts/restore-benchmark-source.sh "$commit" "$run_dir"
+            if [[ -f "$run_dir/boot.img" ]]; then
+              mkdir -p target/bench/previous
+              cp -r "$run_dir/." target/bench/previous/
               echo "previous_available=true" >> "$GITHUB_OUTPUT"
               echo "previous_run_id=$run_id" >> "$GITHUB_OUTPUT"
+              echo "previous_commit=$commit" >> "$GITHUB_OUTPUT"
               break
             fi
           done < "$previous_candidates"
 
-      - name: Prepare default branch baseline when no artifact is available
+      - name: Restore earlier default branch source when no baseline run is available
         id: main-baseline
         if: steps.baselines.outputs.trusted_available != 'true' && github.ref_name != github.event.repository.default_branch
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          if ! commit="$(git merge-base "${GITHUB_SHA}^" "origin/$DEFAULT_BRANCH")"; then
+            echo "No earlier common commit is available for a default branch baseline."
+            exit 0
+          fi
+          bash .github/scripts/restore-benchmark-source.sh "$commit" target/bench/trusted
+          if [[ -f target/bench/trusted/boot.img ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          else
+            echo "The earlier default branch commit has no saved PGO image. Benchmark that commit to create one."
+          fi
+
+      - name: Build PGO benchmark image for proposed commit
+        env:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
         run: |
-          baseline_worktree="$RUNNER_TEMP/rustos-main-$GITHUB_RUN_ID"
-          baseline_image="$GITHUB_WORKSPACE/target/bench/trusted/boot.img"
-          git worktree add --detach "$baseline_worktree" "origin/$DEFAULT_BRANCH"
-          commit="$(git -C "$baseline_worktree" rev-parse HEAD)"
-          cd "$baseline_worktree"
           cargo run --release -p xtask -- bench \
-            --tag ci \
-            --prepare-only \
-            --export-boot-image "$baseline_image"
-          echo "available=true" >> "$GITHUB_OUTPUT"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          git -C "$GITHUB_WORKSPACE" worktree remove "$baseline_worktree"
+            --platform x86_64-uefi --profile release \
+            --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 1 \
+            --pgo --merge --pgo-output target/bench/training/profiles \
+            --output target/bench/training/results.json
+          RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- pgo \
+            --platform x86_64-uefi --profile release --kernel-feature kernel-bench \
+            --profiles target/bench/training/profiles
+          mkdir -p target/bench/head/profiles
+          cp target/rustos/x86_64-uefi/release/image/boot.img target/bench/head/boot.img
+          printf '%s\n' "$BENCH_ENV_VERSION" > target/bench/head/environment-version
+          cp target/bench/training/profiles/*.profdata target/bench/head/profiles/
+          jq --arg commit "$GITHUB_SHA" '. + {source_commit: $commit}' \
+            target/bench/training/profiles/profiles.json > target/bench/head/profiles/profiles.json
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg environment_version "$BENCH_ENV_VERSION" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --slurpfile profiles target/bench/head/profiles/profiles.json \
+            '{schema: 1, commit: $commit, environment_version: $environment_version,
+              run_id: $run_id, run_attempt: $run_attempt, compiler: $profiles[0].compiler,
+              platform: $profiles[0].platform, profile: $profiles[0].profile}' \
+            > target/bench/head/source.json
+          (
+            cd target/bench/head
+            sha256sum boot.img profiles/profiles.json profiles/*.profdata > checksums.sha256
+          )
 
-      - name: Benchmark proposed commit at 1, 2, and 4 vCPUs
+      - name: Save PGO profiles and image for proposed commit
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-benchmark-source-v${{ env.BENCH_ENV_VERSION }}-${{ github.sha }}
+          path: |
+            target/bench/head/boot.img
+            target/bench/head/environment-version
+            target/bench/head/source.json
+            target/bench/head/checksums.sha256
+            target/bench/head/profiles
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
+
+      - name: Restore PGO images for comparison commits
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRUSTED_COMMIT: ${{ steps.baselines.outputs.trusted_commit || steps.main-baseline.outputs.commit }}
+          PREVIOUS_COMMIT: ${{ steps.baselines.outputs.previous_commit }}
+        run: |
+          for variant in trusted previous; do
+            if [[ "$variant" == trusted ]]; then
+              commit="$TRUSTED_COMMIT"
+            else
+              commit="$PREVIOUS_COMMIT"
+            fi
+            [[ -n "$commit" ]] || continue
+            destination="target/bench/$variant"
+            if [[ "$commit" == "$GITHUB_SHA" ]]; then
+              mkdir -p "$destination"
+              cp -r target/bench/head/. "$destination/"
+            elif [[ "$variant" == trusted && -f target/bench/anchor/manifest.json ]]; then
+              bash .github/scripts/restore-benchmark-source.sh "$commit" "$destination"
+            fi
+            if [[ "$variant" == trusted && -f target/bench/anchor/manifest.json ]]; then
+              cp -r "$destination/." target/bench/anchor/
+            fi
+          done
+
+      - name: Benchmark existing images at 1, 2, and 4 vCPUs
         env:
           RUSTOS_DISK: ${{ runner.temp }}/rustos-ci-seed.img
           RUSTOS_DISK_FORMAT: raw
           TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available == 'true' || steps.main-baseline.outputs.available == 'true' }}
           PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
         run: |
-          cargo run --release -p xtask -- bench \
-            --tag ci \
-            --prepare-only \
-            --export-boot-image target/bench/head/boot.img
-          printf '%s\n' "$BENCH_ENV_VERSION" > target/bench/head/environment-version
-
           run_variant() {
             local variant="$1"
             local boot_image="$2"
+            local available
+            available="$(df -B1 --output=avail "$GITHUB_WORKSPACE" | tail -1)"
+            if (( available < 7 * 1024 * 1024 * 1024 )); then
+              echo "::error::Benchmarks require 7 GiB of free disk space for the 5 GiB image and runner output."
+              return 1
+            fi
             mkdir -p "target/bench/${variant}"
             cargo run --release -p xtask -- bench \
-              --cpus 1,2,4 \
+              --platform x86_64-uefi --profile release \
+              --launch qemu-x86_64-q35-ci --cpus 1,2,4 \
               --boot-image "$boot_image" \
               --boot-timeout-secs 120 \
               --output "target/bench/${variant}/results.json"
           }
 
+          dirty_bytes="$(sysctl -n vm.dirty_bytes)"
+          background_bytes="$(sysctl -n vm.dirty_background_bytes)"
+          if (( dirty_bytes > 0 )); then
+            restore_dirty="vm.dirty_bytes=$dirty_bytes"
+          else
+            restore_dirty="vm.dirty_ratio=$(sysctl -n vm.dirty_ratio)"
+          fi
+          if (( background_bytes > 0 )); then
+            restore_background="vm.dirty_background_bytes=$background_bytes"
+          else
+            restore_background="vm.dirty_background_ratio=$(sysctl -n vm.dirty_background_ratio)"
+          fi
+          trap 'sudo sysctl -w "$restore_dirty" "$restore_background"' EXIT
+          sudo sysctl -w \
+            vm.dirty_bytes=2147483648 \
+            vm.dirty_background_bytes=1073741824
+
           if [[ "$TRUSTED_AVAILABLE" == "true" ]]; then
-            if [[ -f target/bench/anchor/boot.img ]]; then
-              run_variant trusted target/bench/anchor/boot.img
-            else
-              run_variant trusted target/bench/trusted/boot.img
+            run_variant trusted target/bench/trusted/boot.img
+            if [[ -f target/bench/anchor/manifest.json ]]; then
+              cp target/bench/trusted/results.json target/bench/anchor/results.json
             fi
           fi
           run_variant head target/bench/head/boot.img
           if [[ "$PREVIOUS_AVAILABLE" == "true" ]]; then
-            run_variant previous target/bench/previous-boot.img
+            run_variant previous target/bench/previous/boot.img
           fi
 
       - name: Compare benchmark results
         shell: bash
         env:
           TRUSTED_AVAILABLE: ${{ steps.baselines.outputs.trusted_available == 'true' || steps.main-baseline.outputs.available == 'true' }}
-          TRUSTED_RUN_ID: ${{ steps.baselines.outputs.trusted_run_id || 'current default branch build' }}
+          TRUSTED_RUN_ID: ${{ steps.baselines.outputs.trusted_run_id || 'saved default branch source' }}
           TRUSTED_COMMIT: ${{ steps.baselines.outputs.trusted_commit || steps.main-baseline.outputs.commit }}
           PREVIOUS_AVAILABLE: ${{ steps.baselines.outputs.previous_available }}
           PREVIOUS_RUN_ID: ${{ steps.baselines.outputs.previous_run_id }}
@@ -308,7 +382,7 @@ jobs:
             {
               echo "## Against trusted baseline"
               echo
-              echo "No compatible baseline is available for this branch or the default branch. Dispatch this workflow on this branch with a completed run ID in \`accept_run_id\` to create one."
+              echo "No compatible baseline is available for this branch or the default branch. Set \`accept_run_id\` to a completed benchmark run from the current commit or an ancestor, with the current benchmark environment version."
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -341,11 +415,26 @@ jobs:
             target/bench/**/*.json
             target/bench/**/*.md
             target/bench/**/*.log
+            target/bench/**/*.profraw
             target/bench/head/boot.img
             target/bench/head/environment-version
+            target/bench/head/checksums.sha256
             !target/bench/baselines/**
             !target/bench/anchor/**
           if-no-files-found: warn
+          overwrite: true
+          retention-days: 14
+
+      - name: Upload PGO training diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-benchmark-pgo
+          path: |
+            target/bench/training/profiles
+            target/pgo-build/**/results.json
+          if-no-files-found: warn
+          overwrite: true
           retention-days: 14
 
       - name: Upload trusted benchmark baseline
@@ -355,7 +444,18 @@ jobs:
           name: kernel-benchmark-anchor
           path: target/bench/anchor
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 90
+
+      - name: Remove temporary benchmark files
+        if: always()
+        shell: bash
+        run: |
+          find "$RUNNER_TEMP" -maxdepth 1 -type d \( -name 'rustos-baselines-*' -o -name 'rustos-benchmark-source.*' \) -exec rm -rf -- {} +
+          rm -f -- "$RUNNER_TEMP/rustos-ci-seed.img"
+          if [[ -d target/bench ]]; then
+            find target/bench -type f -name 'system-*cpu.img' -delete
+          fi
 
   accept-baseline:
     if: github.event_name == 'workflow_dispatch' && inputs.accept_run_id != ''
@@ -410,6 +510,11 @@ jobs:
 
           cp "$result" target/bench/anchor/results.json
           cp "$boot_image" target/bench/anchor/boot.img
+          source_manifest="$(find selected-run -path '*/head/source.json' -print -quit)"
+          if [[ -n "$source_manifest" ]]; then
+            jq -e --arg commit "$source_commit" '.commit == $commit' "$source_manifest" >/dev/null
+            cp "$source_manifest" target/bench/anchor/source.json
+          fi
           jq -n \
             --arg run_id "$ACCEPT_RUN_ID" \
             --arg commit "$source_commit" \
@@ -433,4 +538,5 @@ jobs:
           name: kernel-benchmark-anchor
           path: target/bench/anchor
           if-no-files-found: error
+          overwrite: true
           retention-days: 90

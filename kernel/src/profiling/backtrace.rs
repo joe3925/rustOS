@@ -3,7 +3,7 @@ use core::sync::atomic::Ordering;
 use crate::arch::unwind::PeUnwindModule;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::platform::{ActivePlatform, UnwindPlatform};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::scheduler;
 use crate::scheduling::state::State;
 use crate::scheduling::task::TaskRef;
 use kernel_types::arch::VirtAddr;
@@ -75,7 +75,7 @@ impl core::fmt::Debug for Backtrace {
 
 impl Backtrace {
     pub fn capture() -> Self {
-        let task = SCHEDULER.get_current_task(crate::platform::current_cpu_id());
+        let task = scheduler().get_current_task(crate::platform::current_cpu_id());
         Self::capture_with_task(task.as_deref())
     }
 
@@ -130,48 +130,60 @@ impl Backtrace {
             let current_pc = trace.frames[trace.depth as usize - 1].ip;
             let current_address = current_pc.as_u64();
 
-            let unwind_module = if current_address >= kernel_start && current_address < kernel_end {
-                match kernel_module {
+            let step = if current_address >= kernel_start && current_address < kernel_end {
+                let unwind_module = match kernel_module {
                     Some(module) => Some(module),
                     None => {
                         trace.status |= BacktraceStatus::NO_UNWIND_INFO;
                         None
                     }
-                }
+                };
+                <ActivePlatform as UnwindPlatform>::unwind_next(
+                    &mut context,
+                    unwind_module,
+                    bounds,
+                )
             } else {
                 let pid = task
                     .and_then(|task| task.inner.try_read().map(|inner| inner.parent_pid))
                     .unwrap_or(0);
 
-                let program = PROGRAM_MANAGER.get(pid);
-
-                let module = program
-                    .as_ref()
-                    .and_then(|program| program.try_read())
-                    .and_then(|program| program.module_containing(current_pc));
-
-                match module.as_ref() {
-                    Some(module) => match module.try_read() {
-                        Some(module) => PeUnwindModule::from_module(&module),
-
-                        None => {
-                            trace.status |= BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE;
-                            None
+                let result = PROGRAM_MANAGER.try_with(pid, |program| {
+                    let program = program.ok_or(BacktraceStatus::UNKNOWN_FRAME)?;
+                    let modules = program
+                        .modules
+                        .try_read()
+                        .ok_or(BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE)?;
+                    for module in modules.iter() {
+                        let module = module
+                            .try_read()
+                            .ok_or(BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE)?;
+                        let start = module.image_base.as_u64();
+                        let Some(end) = start.checked_add(module.image_size) else {
+                            continue;
+                        };
+                        if current_address >= start && current_address < end {
+                            return Ok(<ActivePlatform as UnwindPlatform>::unwind_next(
+                                &mut context,
+                                PeUnwindModule::from_module(&module),
+                                bounds,
+                            ));
                         }
-                    },
-
-                    None => {
-                        trace.status |= BacktraceStatus::UNKNOWN_FRAME;
-                        None
+                    }
+                    Err(BacktraceStatus::UNKNOWN_FRAME)
+                });
+                match result.unwrap_or(Err(BacktraceStatus::MODULE_LOOKUP_UNAVAILABLE)) {
+                    Ok(step) => step,
+                    Err(status) => {
+                        trace.status |= status;
+                        <ActivePlatform as UnwindPlatform>::unwind_next(
+                            &mut context,
+                            None,
+                            bounds,
+                        )
                     }
                 }
             };
-
-            let step = <ActivePlatform as UnwindPlatform>::unwind_next(
-                &mut context,
-                unwind_module,
-                bounds,
-            );
 
             trace.status |= step.status;
 

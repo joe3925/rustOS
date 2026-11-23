@@ -1,3 +1,4 @@
+use crate::scheduling::runtime::runtime::KernelExecutorPlatform;
 extern crate rand_xoshiro;
 
 use crate::benchmarking::BenchWindow;
@@ -31,9 +32,8 @@ use crate::platform::{
 };
 use crate::profiling::backtrace::{self, Backtrace};
 use crate::registry::init as init_registry;
-use crate::scheduling::runtime::runtime::init_executor_platform;
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::{SCHEDULER, Scheduler, scheduler};
 use crate::scheduling::state::State;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
@@ -104,13 +104,25 @@ pub unsafe fn init() {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
         init_early_serial_mapping().expect("failed to map the early serial device");
-        initialize_bootstrap_provider();
-        reclaim_kernel_stub();
+        crate::console::PRINT_QUEUE
+            .call_once(|| crossbeam_queue::ArrayQueue::new(crate::console::PRINT_QUEUE_SLOTS));
+        crate::machine::MACHINE_INFO.call_once(crate::machine::MachineInfo::discover);
         Screen::clear_framebuffer();
         init_boot_processor();
+
+        // DMA discovery binds interrupts and queries the current CPU's interrupt state.
+        init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire));
         init_dma_manager();
         calibrate_boot_timer();
         TOTAL_TIME.call_once(Stopwatch::start);
+        let cpu_count = crate::machine::machine_info()
+            .cpu_topology()
+            .processors
+            .len();
+        SCHEDULER.call_once(|| Scheduler::new(cpu_count));
+        // The BSP owns CPU 0. Register it before APs can register their cores,
+        // since scheduler core registration requires contiguous CPU IDs.
+        scheduler().init_core(current_cpu_id());
         start_secondary_cpus()
             .unwrap_or_else(|error| panic!("secondary CPU startup failed: {:?}", error));
     }
@@ -118,13 +130,11 @@ pub unsafe fn init() {
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {
         spin_loop();
     }
-
-    init_current_cpu_local_state(CPU_ID.fetch_add(1, Ordering::Acquire));
+    crate::arch::debug_transport::RX_CONTEXT_READY.store(true, Ordering::Release);
 
     init_periodic_timer();
-    SCHEDULER.init_core(current_cpu_id());
     PANIC_RUNTIME_READY.store(true, Ordering::Release);
-    SCHEDULER.add_task(Task::new_kernel_mode(
+    scheduler().add_task(Task::new_kernel_mode(
         kernel_main,
         0,
         StackSize::Tiny,
@@ -141,12 +151,14 @@ pub unsafe fn init() {
 }
 pub extern "C" fn kernel_main(ctx: usize) {
     enable_mimalloc();
+    initialize_bootstrap_provider();
+    reclaim_kernel_stub();
+    crate::scheduling::scheduler::start_reaper();
     resize_bitmap_for_ram(boot_usable_bytes()).expect(&alloc::format!(
         "Failed to resize phys frame bitmap to capacity {}",
         boot_usable_bytes()
     ));
-    init_executor_platform();
-    GlobalAsyncExecutor::global().init(processor_count(), 1024);
+    GlobalAsyncExecutor::<KernelExecutorPlatform>::global().init(processor_count(), 1024);
     install_file_provider(ProviderKind::Bootstrap);
     #[cfg(feature = "kernel-self-tests")]
     test_kernel_tls_runtime();
@@ -158,7 +170,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
         kernel_address_space_root(),
         KERNEL_RANGE_MANAGER.clone(),
     );
-    program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
+    program.main_thread = Some(scheduler().get_current_task(current_cpu_id()).unwrap());
 
     program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
         title: "kernel.exe".into(),
@@ -171,7 +183,7 @@ pub extern "C" fn kernel_main(ctx: usize) {
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
 
-    spawn_detached(async move {
+    spawn_detached::<KernelExecutorPlatform, _>(async move {
         init_registry().await.expect("Failed to init registry");
         install_prepacked_drivers()
             .await
@@ -256,99 +268,103 @@ fn current_cpu_owns_panic() -> bool {
 }
 
 #[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
 pub extern "C" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
-    if !PANIC_RUNTIME_READY.load(Ordering::Acquire) {
-        let mut writer = EarlyPanicWriter;
-        let _ = writeln!(writer, "=== EARLY KERNEL PANIC [{}] ===", mod_name);
-        let _ = writeln!(writer, "{}", info);
-        halt_loop()
-    }
-
-    if !current_cpu_owns_panic() {
-        halt_loop()
-    }
-
-    if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
-        halt_loop()
-    }
-
-    let panic_in_interrupt = current_is_in_interrupt();
-    let panic_scheduler_cpu = current_cpu_id();
-
-    disable_interrupts();
-    let panic_task = SCHEDULER.try_get_current_task(panic_scheduler_cpu);
+    #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
     unsafe {
-        switch_address_space_root(kernel_address_space_root());
+        if !PANIC_RUNTIME_READY.load(Ordering::Acquire) {
+            let mut writer = EarlyPanicWriter;
+            let _ = writeln!(writer, "=== EARLY KERNEL PANIC [{}] ===", mod_name);
+            let _ = writeln!(writer, "{}", info);
+            halt_loop()
+        }
+
+        if !current_cpu_owns_panic() {
+            halt_loop()
+        }
+
+        if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
+            halt_loop()
+        }
+
+        let panic_in_interrupt = current_is_in_interrupt();
+        let panic_scheduler_cpu = current_cpu_id();
+
+        disable_interrupts();
+        let panic_task = scheduler().try_get_current_task(panic_scheduler_cpu);
+        unsafe {
+            switch_address_space_root(kernel_address_space_root());
+        }
+        let backtrace = if let Some(state) = PANIC_STATE.get() {
+            Backtrace::from_state(state, panic_task.as_deref())
+        } else {
+            Backtrace::capture_with_task(panic_task.as_deref())
+        };
+        println!("Panic-site backtrace status: {:?}", backtrace.status());
+        println!("Panic-site backtrace:");
+        for trace in backtrace.iter() {
+            println!("{:#X}", trace.instruction_pointer().as_u64());
+        }
+        crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
+
+        println!("=== KERNEL PANIC [{}] ===", mod_name);
+        println!("is in interrupt: {:#?}", panic_in_interrupt);
+        println!("{}", info);
+        println!("Panic-site backtrace:");
+        for trace in backtrace.iter() {
+            println!("{:#X}", trace.instruction_pointer().as_u64())
+        }
+        // let dump = dump_scheduler();
+        // println!("--- Running tasks at panic ---");
+        // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+        //     if let Some(task) = slot {
+        //         let name = unsafe { task_name_panic(task) };
+        //         println!(
+        //             "  CPU {}: \"{}\" (id={})",
+        //             cpu_id,
+        //             name,
+        //             task.id.load(Ordering::Relaxed)
+        //         );
+        //     } else {
+        //         println!("  CPU {}: <idle>", cpu_id);
+        //     }
+        // }
+        // println!("--- Tasks in run queue and ipi queue ---");
+        // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
+        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+        //     println!(
+        //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
+        //         cpu_id, some_count, queue.captured, queue.total_before_drain
+        //     );
+        // }
+
+        // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
+        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+        //     println!(
+        //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
+        //         cpu_id, some_count, queue.captured, queue.total_before_drain
+        //     );
+        // }
+        // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+        //     match task {
+        //         Some(task) => {
+        //             let stack_size = task.stack_size.load(Ordering::Acquire);
+        //             let guard_page = task.guard_page.load(Ordering::Acquire);
+
+        //             println!(
+        //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
+        //                 cpu_id, stack_size, guard_page
+        //             );
+        //         }
+        //         None => {
+        //             println!("  CPU {}: current_task=None", cpu_id);
+        //         }
+        //     }
+        // }
+        broadcast_panic_stop();
+
+        halt_loop()
     }
-    let backtrace = if let Some(state) = PANIC_STATE.get() {
-        Backtrace::from_state(state, panic_task.as_deref())
-    } else {
-        Backtrace::capture_with_task(panic_task.as_deref())
-    };
-    println!("Panic-site backtrace status: {:?}", backtrace.status());
-    println!("Panic-site backtrace:");
-    for trace in backtrace.iter() {
-        println!("{:#X}", trace.instruction_pointer().as_u64());
-    }
-    crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
-
-    println!("=== KERNEL PANIC [{}] ===", mod_name);
-    println!("is in interrupt: {:#?}", panic_in_interrupt);
-    println!("{}", info);
-    println!("Panic-site backtrace:");
-    for trace in backtrace.iter() {
-        println!("{:#X}", trace.instruction_pointer().as_u64())
-    }
-    // let dump = dump_scheduler();
-    // println!("--- Running tasks at panic ---");
-    // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-    //     if let Some(task) = slot {
-    //         let name = unsafe { task_name_panic(task) };
-    //         println!(
-    //             "  CPU {}: \"{}\" (id={})",
-    //             cpu_id,
-    //             name,
-    //             task.id.load(Ordering::Relaxed)
-    //         );
-    //     } else {
-    //         println!("  CPU {}: <idle>", cpu_id);
-    //     }
-    // }
-    // println!("--- Tasks in run queue and ipi queue ---");
-    // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
-    //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-    //     println!(
-    //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
-    //         cpu_id, some_count, queue.captured, queue.total_before_drain
-    //     );
-    // }
-
-    // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
-    //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-    //     println!(
-    //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
-    //         cpu_id, some_count, queue.captured, queue.total_before_drain
-    //     );
-    // }
-    // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-    //     match task {
-    //         Some(task) => {
-    //             let stack_size = task.stack_size.load(Ordering::Acquire);
-    //             let guard_page = task.guard_page.load(Ordering::Acquire);
-
-    //             println!(
-    //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
-    //                 cpu_id, stack_size, guard_page
-    //             );
-    //         }
-    //         None => {
-    //             println!("  CPU {}: current_task=None", cpu_id);
-    //         }
-    //     }
-    // }
-    broadcast_panic_stop();
-
-    halt_loop()
 }
 
 struct EarlyPanicWriter;
@@ -637,7 +653,7 @@ extern "C" fn kernel_tls_self_test_worker(_ctx: usize) {
 }
 
 pub fn test_kernel_tls_runtime() {
-    let current = SCHEDULER
+    let current = scheduler()
         .get_current_task(current_cpu_id())
         .expect("kernel TLS self-test requires a scheduled task");
     assert!(
@@ -662,7 +678,7 @@ pub fn test_kernel_tls_runtime() {
         );
     }
 
-    SCHEDULER.add_task(Task::new_kernel_mode(
+    scheduler().add_task(Task::new_kernel_mode(
         kernel_tls_self_test_worker,
         0,
         StackSize::Huge,
