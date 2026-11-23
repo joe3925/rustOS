@@ -186,7 +186,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             }
             return;
         }
-        self.inject_tasks(domain, &mut core::iter::once(task));
+        self.inject_task(domain, task);
         self.try_schedule::<false>();
     }
 
@@ -222,7 +222,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         let batch = unsafe { &mut *owned.batch.get() };
         if batch.local_task != 0 {
             let task = core::mem::take(&mut batch.local_task);
-            self.inject_tasks(domain, &mut core::iter::once(task));
+            self.inject_task(domain, task);
         }
         batch.local_runs = 0;
         owned.state.store(BATCH_EMPTY, Ordering::Release);
@@ -231,42 +231,129 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
         }
     }
 
+    #[inline(always)]
     fn inject_tasks<I: Iterator<Item = usize>>(&self, domain: &ExecutorDomain<E>, tasks: &mut I) {
         let Some(first) = tasks.next() else { return; };
-        let mut tail = unsafe { &*(first as *const crate::runtime::slab::slot::TaskSlot) };
-        let mut count = 1;
-        for task in tasks {
-            tail.ready_next.store(task, Ordering::Relaxed);
-            tail = unsafe { &*(task as *const crate::runtime::slab::slot::TaskSlot) };
-            count += 1;
-        }
-        tail.ready_next.store(0, Ordering::Relaxed);
-        E::with_scheduler_critical(|| {
-            let mut inject = domain.inject.lock();
-            if let Some(previous_tail) = inject.tail {
-                previous_tail.ready_next.store(first, Ordering::Relaxed);
-            } else {
-                inject.head = first;
+        if !E::in_interrupt_context() {
+            let mut tail = unsafe { &*(first as *const crate::runtime::slab::slot::TaskSlot) };
+            let mut count = 1;
+            for task in tasks {
+                tail.ready_next.store(task, Ordering::Relaxed);
+                tail = unsafe { &*(task as *const crate::runtime::slab::slot::TaskSlot) };
+                count += 1;
             }
-            inject.tail = Some(tail);
-            inject.len += count;
-            domain.inject_len.store(inject.len, Ordering::Release);
-        });
+            tail.ready_next.store(0, Ordering::Relaxed);
+            {
+                let mut inject = domain.inject.lock();
+                self.import_incoming(domain, &mut inject);
+                if let Some(previous) = inject.tail {
+                    previous.ready_next.store(first, Ordering::Relaxed);
+                } else {
+                    inject.head = first;
+                }
+                inject.tail = Some(tail);
+                inject.len += count;
+                domain.inject_len.store(inject.len, Ordering::Release);
+            }
+            self.runtime().domains.mark_ready(domain.id());
+            return;
+        }
+        let tail = unsafe { &*(first as *const crate::runtime::slab::slot::TaskSlot) };
+        let mut reversed = first;
+        for task in tasks {
+            let slot = unsafe { &*(task as *const crate::runtime::slab::slot::TaskSlot) };
+            slot.ready_next.store(reversed, Ordering::Relaxed);
+            reversed = task;
+        }
+        let mut head = domain.incoming.load(Ordering::Relaxed);
+        loop {
+            tail.ready_next.store(head, Ordering::Relaxed);
+            match domain.incoming.compare_exchange(
+                head, reversed, Ordering::Release, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => head = actual,
+            }
+        }
         self.runtime().domains.mark_ready(domain.id());
     }
 
+    #[inline(always)]
+    fn import_incoming(&self, domain: &ExecutorDomain<E>, inject: &mut crate::domain::Injection) {
+        let mut current = if domain.incoming.load(Ordering::Relaxed) != 0 {
+            domain.incoming.swap(0, Ordering::Acquire)
+        } else {
+            0
+        };
+        let tail = current;
+        let mut reversed = 0;
+        while current != 0 {
+            let slot = unsafe { &*(current as *const crate::runtime::slab::slot::TaskSlot) };
+            let next = slot.ready_next.load(Ordering::Relaxed);
+            slot.ready_next.store(reversed, Ordering::Relaxed);
+            reversed = current;
+            current = next;
+            inject.len += 1;
+        }
+        if tail != 0 {
+            if let Some(previous) = inject.tail {
+                previous.ready_next.store(reversed, Ordering::Relaxed);
+            } else {
+                inject.head = reversed;
+            }
+            inject.tail = Some(unsafe { &*(tail as *const crate::runtime::slab::slot::TaskSlot) });
+        }
+    }
+
+    #[inline(never)]
+    fn inject_task(&self, domain: &ExecutorDomain<E>, task: usize) {
+        let interrupt = E::in_interrupt_context();
+        let inject = if interrupt {
+            domain.inject.try_lock()
+                .filter(|_| domain.incoming.load(Ordering::Acquire) == 0)
+        } else {
+            Some(domain.inject.lock())
+        };
+        if let Some(mut inject) = inject {
+            if !interrupt {
+                self.import_incoming(domain, &mut inject);
+            }
+            let slot = unsafe { &*(task as *const crate::runtime::slab::slot::TaskSlot) };
+            slot.ready_next.store(0, Ordering::Relaxed);
+            if let Some(tail) = inject.tail {
+                tail.ready_next.store(task, Ordering::Relaxed);
+            } else {
+                inject.head = task;
+            }
+            inject.tail = Some(slot);
+            inject.len += 1;
+            domain.inject_len.store(inject.len, Ordering::Release);
+        } else {
+            self.inject_tasks(domain, &mut core::iter::once(task));
+            return;
+        }
+        self.runtime().domains.mark_ready(domain.id());
+    }
+
+    #[inline(never)]
     fn take_injected(
         &self,
         domain: &ExecutorDomain<E>,
         local: &crate::steal_queue::StealQueue<256>,
         limit: usize,
     ) -> Option<(usize, &'static crate::runtime::slab::slot::TaskSlot)> {
-        if domain.inject_len.load(Ordering::Acquire) == 0 {
+        if domain.inject_len.load(Ordering::Acquire) == 0
+            && domain.incoming.load(Ordering::Acquire) == 0 {
             return None;
         }
-        E::with_scheduler_critical(|| {
+        {
             let mut inject = domain.inject.lock();
-            let count = limit.min(inject.len);
+            self.import_incoming(domain, &mut inject);
+            let count = if limit > 1 {
+                (inject.len / domain.batches.len() + 1).min(limit).min(inject.len)
+            } else {
+                limit.min(inject.len)
+            };
             let mut first = None;
             for index in 0..count {
                 let task = inject.head;
@@ -285,7 +372,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             }
             domain.inject_len.store(inject.len, Ordering::Release);
             first
-        })
+        }
     }
 
     pub fn create_executor_domain(&self, config: ExecutorDomainConfig) -> Arc<ExecutorDomain<E>> {
@@ -540,8 +627,7 @@ impl<E: ExecutorPlatform> GlobalAsyncExecutor<E> {
             };
             if selected.is_none() {
                 let cap = owned.spawned.remaining_slots().min(128);
-                let count = (domain.inject_len.load(Ordering::Acquire) / domain.batches.len() + 1)
-                    .min(cap).max(1);
+                let count = cap.max(1);
                 selected = self.take_injected(domain, &owned.spawned, count).map(|(task, slot)| (task, Some(slot)));
             }
             if selected.is_none() {

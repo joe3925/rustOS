@@ -185,11 +185,13 @@ pub struct ExecutorDomainInfo {
     pub weight: usize,
 }
 
+#[repr(align(64))]
 pub struct ExecutorDomain<E: ExecutorPlatform> {
     id: ExecutorDomainId,
     pub(crate) batches: Box<[BatchSlot]>,
     pub(crate) inject: crate::sync::SchedulerMutex<Injection>,
     pub(crate) inject_len: AtomicUsize,
+    pub(crate) incoming: AtomicUsize,
     pub(crate) poll_time_ns: AtomicU64,
     pub(crate) service: AtomicU64,
     _platform: core::marker::PhantomData<fn() -> E>,
@@ -229,6 +231,7 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
             }).collect(),
             inject: crate::sync::SchedulerMutex::new(Injection { head: 0, tail: None, len: 0 }),
             inject_len: AtomicUsize::new(0),
+            incoming: AtomicUsize::new(0),
             poll_time_ns: AtomicU64::new(200_000 / 61),
             service: AtomicU64::new(0),
             _platform: core::marker::PhantomData,
@@ -256,7 +259,8 @@ impl<E: ExecutorPlatform> ExecutorDomain<E> {
     }
 
     pub(crate) fn has_queued_work(&self) -> bool {
-        self.inject_len.load(Ordering::Acquire) != 0
+        self.incoming.load(Ordering::Acquire) != 0
+            || self.inject_len.load(Ordering::Acquire) != 0
             || self.batches.iter().any(|batch| batch.spawned.has_work())
     }
 
@@ -698,7 +702,7 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
             let weight = domain.weight() as u64;
             return Some((domain, 0, weight));
         }
-        E::with_scheduler_critical(|| {
+        {
             let mut floor = self.selection.lock();
             let mut selected: Option<DomainBorrow<'_, E>> = None;
             let mut minimum = u64::MAX;
@@ -718,7 +722,7 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
             domain.service.fetch_max(minimum, Ordering::Relaxed);
             domain.service.fetch_add(reservation, Ordering::Relaxed);
             Some((domain, reservation, weight))
-        })
+        }
     }
 
     pub(crate) fn has_competition(&self, id: ExecutorDomainId) -> bool {
@@ -790,7 +794,7 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
                     let cleanup = unsafe { &mut *domain.cleanup.get() };
                     let table = crate::runtime::slab::task_slab::get_task_table::<E>();
                     let mut remaining = 256usize;
-                    let queues = 1 + domain.batches.len() * 2;
+                    let queues = 2 + domain.batches.len() * 2;
                     while remaining != 0 && (cleanup.queue_head != 0 || cleanup.queue_index < queues) {
                         if cleanup.queue_head == 0 {
                             let queue = cleanup.queue_index;
@@ -801,8 +805,10 @@ impl<E: ExecutorPlatform> ExecutorDomainTable<E> {
                                 inject.tail = None;
                                 inject.len = 0;
                                 domain.inject_len.store(0, Ordering::Release);
+                            } else if queue == 1 {
+                                cleanup.queue_head = domain.incoming.swap(0, Ordering::Acquire);
                             } else {
-                                let queue = queue - 1;
+                                let queue = queue - 2;
                                 let owned = &domain.batches[queue / 2];
                                 cleanup.queue_head = if queue % 2 == 0 {
                                     unsafe { core::mem::take(&mut (*owned.batch.get()).local_task) }

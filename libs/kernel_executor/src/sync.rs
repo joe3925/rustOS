@@ -27,6 +27,10 @@ impl<T> Mutex<T> {
         Self(loom::sync::Mutex::new(value))
     }
 
+    pub fn try_lock(&self) -> Option<loom::sync::MutexGuard<'_, T>> {
+        self.0.try_lock().ok()
+    }
+
     pub fn lock(&self) -> loom::sync::MutexGuard<'_, T> {
         self.0.lock().expect("loom mutex poisoned")
     }
@@ -86,6 +90,10 @@ pub(crate) struct SchedulerMutex<T>(std::sync::Mutex<T>);
 impl<T> SchedulerMutex<T> {
     pub(crate) fn new(value: T) -> Self {
         Self(std::sync::Mutex::new(value))
+    }
+
+    pub(crate) fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, T>> {
+        self.0.try_lock().ok()
     }
 
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, T> {

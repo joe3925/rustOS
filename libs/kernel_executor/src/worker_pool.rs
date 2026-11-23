@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering, fence};
 use crossbeam_queue::ArrayQueue;
 
@@ -36,11 +37,19 @@ impl<P: WorkerPlatform> Worker<P> {
     }
 }
 
+#[repr(align(64))]
+struct Sleepers {
+    indices: UnsafeCell<Vec<usize>>,
+    locked: AtomicBool,
+}
+
+unsafe impl Sync for Sleepers {}
+
 struct Shared<P: WorkerPlatform> {
     jobs: ArrayQueue<(extern "C" fn(usize), usize)>,
     idle: AtomicUsize,
     state: AtomicUsize,
-    sleepers: crate::sync::SchedulerMutex<Vec<usize>>,
+    sleepers: Sleepers,
     stopping: AtomicBool,
     workers: Box<[Worker<P>]>,
 }
@@ -74,7 +83,7 @@ impl<P: WorkerPlatform> RuntimePool<P> {
             jobs: ArrayQueue::new(capacity),
             idle: AtomicUsize::new(0),
             state: AtomicUsize::new(0),
-            sleepers: crate::sync::SchedulerMutex::new(Vec::with_capacity(workers)),
+            sleepers: Sleepers { indices: UnsafeCell::new(Vec::with_capacity(workers)), locked: AtomicBool::new(false) },
             stopping: AtomicBool::new(false),
             workers: (0..workers).map(|_| Worker {
                 registered: AtomicBool::new(false),
@@ -133,8 +142,11 @@ impl<P: WorkerPlatform> RuntimePool<P> {
         if idle_only && state / UNPARKED != 0 {
             return false;
         }
-        let notified = P::with_scheduler_critical(|| {
-            let mut sleepers = self.shared.sleepers.lock();
+        if self.shared.sleepers.locked.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        let notified = (|| {
+            let sleepers = unsafe { &mut *self.shared.sleepers.indices.get() };
             let state = self.shared.state.fetch_add(0, Ordering::SeqCst);
             if state & SEARCH_MASK != 0 || state / UNPARKED >= self.shared.workers.len()
                 || (idle_only && state / UNPARKED != 0)
@@ -147,7 +159,8 @@ impl<P: WorkerPlatform> RuntimePool<P> {
             self.shared.state.fetch_add(UNPARKED + 1, Ordering::SeqCst);
             self.shared.workers[index].searching.store(true, Ordering::Release);
             (Some(index), true)
-        });
+        })();
+        self.shared.sleepers.locked.swap(false, Ordering::AcqRel);
         if let Some(index) = notified.0 {
             self.shared.workers[index].wake();
         }
@@ -183,23 +196,31 @@ impl<P: WorkerPlatform> RuntimePool<P> {
         let index = P::worker_index();
         let worker = &self.shared.workers[index];
         worker.sleeping.store(1, Ordering::Release);
-        let last = P::with_scheduler_critical(|| {
-            let mut sleepers = self.shared.sleepers.lock();
+        if self.shared.sleepers.locked.swap(true, Ordering::AcqRel) {
+            worker.sleeping.store(0, Ordering::Release);
+            return true;
+        }
+        let last = {
+            let sleepers = unsafe { &mut *self.shared.sleepers.indices.get() };
             debug_assert!(!sleepers.contains(&index));
             debug_assert!(sleepers.len() < sleepers.capacity());
             let searching = worker.searching.swap(false, Ordering::Relaxed);
             let previous = self.shared.state.fetch_sub(UNPARKED + usize::from(searching), Ordering::SeqCst);
             sleepers.push(index);
             previous & SEARCH_MASK == usize::from(searching)
-        });
+        };
+        self.shared.sleepers.locked.swap(false, Ordering::AcqRel);
         let pending = last && work_pending();
-        let stopping = self.shared.stopping.load(Ordering::Acquire);
-        if last && pending {
+        if self.shared.stopping.load(Ordering::Acquire) {
+            worker.sleeping.store(0, Ordering::Release);
+            return false;
+        }
+        if pending {
             self.wake(false, self.shared.workers.len());
         }
-        if pending || stopping {
-            let removed = P::with_scheduler_critical(|| {
-                let mut sleepers = self.shared.sleepers.lock();
+        if pending && !self.shared.sleepers.locked.swap(true, Ordering::AcqRel) {
+            let removed = {
+                let sleepers = unsafe { &mut *self.shared.sleepers.indices.get() };
                 if let Some(position) = sleepers.iter().position(|&worker| worker == index) {
                     sleepers.swap_remove(position);
                     self.shared.state.fetch_add(UNPARKED, Ordering::SeqCst);
@@ -207,30 +228,17 @@ impl<P: WorkerPlatform> RuntimePool<P> {
                 } else {
                     false
                 }
-            });
-            if !removed {
-                worker.wait();
-            }
-            worker.sleeping.store(0, Ordering::Release);
-            return !stopping;
-        }
-        loop {
-            worker.wait();
-            let stopping = self.shared.stopping.load(Ordering::Acquire);
-            let parked = P::with_scheduler_critical(|| {
-                let mut sleepers = self.shared.sleepers.lock();
-                let position = sleepers.iter().position(|&worker| worker == index);
-                if stopping && let Some(position) = position {
-                    sleepers.swap_remove(position);
-                    self.shared.state.fetch_add(UNPARKED, Ordering::SeqCst);
-                }
-                position.is_some()
-            });
-            if stopping || !parked {
-                return !stopping;
+            };
+            self.shared.sleepers.locked.swap(false, Ordering::AcqRel);
+            if removed {
+                worker.sleeping.store(0, Ordering::Release);
+                return !self.shared.stopping.load(Ordering::Acquire);
             }
         }
+        worker.wait();
+        !self.shared.stopping.load(Ordering::Acquire)
     }
+
 }
 
 impl<P: WorkerPlatform> Drop for RuntimePool<P> {
