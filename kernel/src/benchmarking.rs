@@ -13,6 +13,10 @@ mod capture;
 mod correctness;
 #[cfg(feature = "kernel-bench")]
 mod heap;
+#[cfg(all(feature = "kernel-bench", target_arch = "x86_64"))]
+mod irq_wake;
+#[cfg(all(feature = "kernel-bench", target_arch = "x86_64"))]
+pub(crate) mod scheduler_wake;
 #[cfg(feature = "kernel-bench")]
 mod multi_file;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]

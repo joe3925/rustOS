@@ -29,11 +29,23 @@ pub(crate) const MAX_GSI: u8 = 64;
 
 #[cfg_attr(irq_check, irq::context)]
 #[unsafe(no_mangle)]
-extern "C" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
-    let _interrupt_guard = InterruptGuard::new();
-    let frame = unsafe { &mut *frame };
-    irq_dispatch(vector as u32, frame);
-    crate::platform::end_interrupt(vector);
+extern "C" fn irq_interrupt_handler_c(
+    vector: u8,
+    state: *mut crate::arch::x86::scheduling::state::State,
+) {
+    {
+        let _interrupt_guard = InterruptGuard::new();
+        let frame = unsafe { &mut *core::ptr::addr_of_mut!((*state).rip).cast::<InterruptStackFrame>() };
+        irq_dispatch(vector as u32, frame);
+        crate::platform::disable_interrupts();
+        crate::platform::end_interrupt(vector);
+    }
+    if crate::platform::current_percpu()
+        .local_schedule_pending
+        .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        unsafe { crate::scheduling::scheduler::schedule_idle_after_irq(state) };
+    }
 }
 
 macro_rules! gen_irq_stub {

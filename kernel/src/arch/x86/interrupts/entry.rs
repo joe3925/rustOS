@@ -76,31 +76,26 @@ macro_rules! x86_entry_fpu_restore {
 macro_rules! x86_interrupt_entry {
     ($(#[$attr:meta])* $vis:vis $entry:ident, $handler:path $(,)?) => {
         $crate::x86_interrupt_entry!(
-            @entry [$(#[$attr])*] $vis $entry, $handler, 0, "",
+            @entry [$(#[$attr])*] $vis $entry, $handler, 0, 1, "",
             "mov rcx, rbx\ncall {handler}\n", []
         );
     };
     ($(#[$attr:meta])* $vis:vis $entry:ident, $handler:path, eoi = $eoi:path $(,)?) => {
         $crate::x86_interrupt_entry!(
-            @entry [$(#[$attr])*] $vis $entry, $handler, 0, "",
+            @entry [$(#[$attr])*] $vis $entry, $handler, 0, 1, "",
             "mov rcx, rbx\ncall {handler}\ncall {eoi}\n", [eoi = sym $eoi,]
         );
     };
     ($(#[$attr:meta])* $vis:vis $entry:ident, $handler:path, vector = $vector:expr $(,)?) => {
         $crate::x86_interrupt_entry!(
-            @entry [$(#[$attr])*] $vis $entry, $handler, 0, "",
-            "mov ecx, {vector}\nlea rdx, [rbx + {hardware_frame_offset}]\ncall {handler}\n",
-            [
-                vector = const $vector,
-                hardware_frame_offset = const core::mem::offset_of!(
-                    $crate::arch::x86::scheduling::state::State, rip
-                ),
-            ]
+            @entry [$(#[$attr])*] $vis $entry, $handler, 0, 0, "",
+            "mov ecx, {vector}\nmov rdx, rbx\ncall {handler}\n",
+            [vector = const $vector,]
         );
     };
     ($(#[$attr:meta])* $vis:vis $entry:ident, $handler:path, idle_only = $eoi:path $(,)?) => {
         $crate::x86_interrupt_entry!(
-            @entry [$(#[$attr])*] $vis $entry, $handler, 0, "",
+            @entry [$(#[$attr])*] $vis $entry, $handler, 0, 1, "",
             r#"
             mov rax, {idle_upper}
             cmp [rbx + {r10_offset}], rax
@@ -130,13 +125,13 @@ macro_rules! x86_interrupt_entry {
     };
     ($(#[$attr:meta])* $vis:vis $entry:ident, $handler:path, no_error_code $(,)?) => {
         $crate::x86_interrupt_entry!(
-            @entry [$(#[$attr])*] $vis $entry, $handler, 1, "",
+            @entry [$(#[$attr])*] $vis $entry, $handler, 1, 1, "",
             "mov rcx, rbx\ncall {handler}\n", []
         );
     };
     ($(#[$attr:meta])* $vis:vis $entry:ident, $handler:path, error_code $(,)?) => {
         $crate::x86_interrupt_entry!(
-            @entry [$(#[$attr])*] $vis $entry, $handler, 1,
+            @entry [$(#[$attr])*] $vis $entry, $handler, 1, 1,
             r#"
             mov r13, [rsp + {hardware_frame_offset}]
             mov rax, [rsp + {hardware_frame_offset} + 8]
@@ -158,7 +153,7 @@ macro_rules! x86_interrupt_entry {
             ]
         );
     };
-    (@entry [$($attr:tt)*] $vis:vis $entry:ident, $handler:path, $early:literal,
+    (@entry [$($attr:tt)*] $vis:vis $entry:ident, $handler:path, $early:literal, $mask_on_return:literal,
         $normalize:literal, $call:literal, [$($operands:tt)*]) => {
         $($attr)*
         #[unsafe(naked)]
@@ -172,7 +167,7 @@ macro_rules! x86_interrupt_entry {
                 $normalize,
                 $crate::x86_entry_fpu_save!(1, $early),
                 $call,
-                "cli",
+                concat!(".if ", stringify!($mask_on_return), "\ncli\n.endif"),
                 $crate::x86_entry_fpu_restore!(),
                 "pop rax", "pop rcx", "pop rdx", "pop rbx",
                 "pop rbp", "pop rsi", "pop rdi", "pop r8",

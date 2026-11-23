@@ -42,6 +42,40 @@ pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     }
 
     let _guard = InterruptGuard::new();
+    #[cfg(feature = "kernel-bench")]
+    {
+        use crate::benchmarking::scheduler_wake::TRIGGER;
+        let pointer = TRIGGER.load(Ordering::Acquire);
+        if current_cpu_id() == 0 && !pointer.is_null() {
+            let sample = unsafe { &*pointer };
+            if crate::platform::ordered_cycle_counter() >= sample.deadline.load(Ordering::Relaxed)
+                && TRIGGER.compare_exchange(pointer, core::ptr::null_mut(), Ordering::AcqRel, Ordering::Relaxed).is_ok()
+            {
+                let gate = if sample.mode == 4 {
+                    Some(scheduler().try_core_scheduler(0).expect("scheduler probe cannot acquire gate"))
+                } else { None };
+                let before = scheduler().try_get_current_task(0).map(|task| task.task_id());
+                sample.requested.store(crate::platform::ordered_cycle_counter(), Ordering::Release);
+                assert!(crate::platform::send_ipi(sample.target.load(Ordering::Relaxed) as u32, sample.vector.load(Ordering::Relaxed) as u8));
+                if sample.mode == 3 || sample.mode == 4 {
+                    let deadline = crate::platform::ordered_cycle_counter() + crate::platform::cycle_counter_frequency_hz();
+                    crate::platform::enable_interrupts();
+                    while sample.finished.load(Ordering::Acquire) == 0 {
+                        if crate::platform::ordered_cycle_counter() >= deadline {
+                            crate::platform::disable_interrupts();
+                            panic!("nested IRQ wake did not complete");
+                        }
+                        core::hint::spin_loop();
+                    }
+                    crate::platform::disable_interrupts();
+                    assert!(current_is_in_interrupt());
+                    assert_eq!(scheduler().try_get_current_task(0).map(|task| task.task_id()), before, "nested IRQ switched the outer task");
+                    sample.nested_completed.store(true, Ordering::Release);
+                }
+                drop(gate);
+            }
+        }
+    }
     let Some(mut scheduling) = scheduler().try_local_scheduler() else {
         return;
     };

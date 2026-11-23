@@ -304,7 +304,15 @@ impl Scheduler {
     }
 
     pub(crate) fn kick_remote_core(&self, cpu: usize) {
-        if cpu == platform::current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+        let current = platform::current_percpu();
+        if cpu == *current.cpu_id.get().unwrap() {
+            if platform::current_is_in_interrupt() {
+                current.local_schedule_pending
+                    .store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+        if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return;
         }
 
@@ -630,6 +638,10 @@ impl Scheduler {
             .store(TaskHandle::ptr_eq(&next, &core.idle_task), Ordering::Release);
         core.current_task_id
             .store(next.task_id(), Ordering::Release);
+        #[cfg(all(feature = "kernel-bench", target_arch = "x86_64"))]
+        if crate::benchmarking::scheduler_wake::ORDER_TASK.load(Ordering::Acquire) == next.task_id() {
+            crate::benchmarking::scheduler_wake::ORDER_SELECTED.store(true, Ordering::Release);
+        }
         local.current = Some(next);
         if let Some(prev) = previous.as_ref() {
             if prev.sched_state() == SchedState::Terminated {
@@ -759,6 +771,25 @@ impl Scheduler {
 
     pub(crate) fn unregister_task_from_domain(&self, task: &TaskUpdate) {
         self.unregister_task(task);
+    }
+}
+
+#[unsafe(no_mangle)]
+#[cfg_attr(irq_check, irq::context)]
+#[inline(never)]
+pub(crate) unsafe extern "C" fn schedule_idle_after_irq(state: *mut State) {
+    if platform::current_is_in_interrupt() || !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    let pending = &platform::current_percpu().local_schedule_pending;
+    if !scheduler().cpu_is_idle(platform::current_cpu_id()) {
+        pending.store(false, Ordering::Relaxed);
+        return;
+    }
+    let _guard = InterruptGuard::new();
+    if let Some(mut local) = scheduler().try_local_scheduler() {
+        pending.store(false, Ordering::Relaxed);
+        unsafe { local.on_timer_tick(state) };
     }
 }
 

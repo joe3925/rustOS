@@ -53,7 +53,20 @@ impl WorkerPlatform for KernelExecutorPlatform {
     }
 
     fn signal(wait_handle: &Self::WaitHandle) {
-        scheduler().unpark(wait_handle.get().expect("runtime worker not initialized"));
+        let task = wait_handle.get().expect("runtime worker not initialized");
+        #[cfg(all(feature = "kernel-bench", target_arch = "x86_64"))]
+        if crate::platform::current_is_in_interrupt() {
+            use core::sync::atomic::Ordering;
+            let pointer = crate::benchmarking::scheduler_wake::ACTIVE_SIGNAL[crate::platform::current_cpu_id()]
+                .load(Ordering::Relaxed);
+            if let Some(sample) = unsafe { pointer.as_ref() } {
+                sample.signal_calls.fetch_add(1, Ordering::Relaxed);
+                sample.signal_task.store(task.task_id(), Ordering::Relaxed);
+                sample.signal_cpu.store(task.target_cpu(), Ordering::Relaxed);
+                sample.signal_state.store(task.sched_state() as usize, Ordering::Relaxed);
+            }
+        }
+        scheduler().unpark(task);
     }
 
     fn spawn_worker(index: usize, work: impl FnOnce() + Send + 'static) {

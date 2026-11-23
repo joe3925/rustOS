@@ -9,7 +9,8 @@ use spin::{Mutex, Once};
 #[repr(C, align(64))]
 pub struct PerCpu {
     pub is_in_interrupt: AtomicBool,
-    pub reserved_interrupt_pad: [u8; 7],
+    pub local_schedule_pending: AtomicBool,
+    pub reserved_interrupt_pad: [u8; 6],
     pub self_pointer: usize,
     pub mimalloc_heap: AtomicU64,
     pub reserved0: [u8; 0x40],
@@ -54,7 +55,8 @@ pub fn alloc_or_get_percpu(cpu_id: usize, platform_cpu_id: PlatformCpuId) -> &'s
 
     let percpu = Box::leak(Box::new(PerCpu {
         is_in_interrupt: AtomicBool::new(false),
-        reserved_interrupt_pad: [0; 7],
+        local_schedule_pending: AtomicBool::new(false),
+        reserved_interrupt_pad: [0; 6],
         self_pointer: 0,
         mimalloc_heap: AtomicU64::new(0),
         reserved0: [0; 0x40],

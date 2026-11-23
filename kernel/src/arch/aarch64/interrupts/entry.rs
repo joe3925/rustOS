@@ -323,9 +323,16 @@ extern "C" fn aarch64_irq_handler(frame: &mut InterruptFrame, _origin: u64) {
     } else {
         let _interrupt_guard = InterruptGuard::new();
         irq_dispatch(token.interrupt_id, frame);
+        crate::platform::disable_interrupts();
     }
 
     controller().end_interrupt(token);
+    if crate::platform::current_percpu()
+        .local_schedule_pending
+        .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        unsafe { crate::scheduling::scheduler::schedule_idle_after_irq(frame) };
+    }
 }
 
 #[unsafe(no_mangle)]

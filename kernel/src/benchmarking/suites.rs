@@ -48,6 +48,22 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
         3
     };
     vec![
+        #[cfg(target_arch = "x86_64")]
+        BenchSuiteDescriptor::new(
+            "scheduler.wake",
+            "IRQ return, parked wakes, nesting, and normal queue order",
+            vec!["irq".to_string(), "scheduler".to_string()],
+            super::scheduler_wake::suite,
+        )
+        .with_independent_boots(4),
+        #[cfg(target_arch = "x86_64")]
+        BenchSuiteDescriptor::new(
+            "irq.wake",
+            "APIC interrupt to shared IRQ waiter resume",
+            vec!["irq".to_string(), "executor".to_string()],
+            super::irq_wake::suite,
+        )
+        .with_independent_boots(5),
         BenchSuiteDescriptor::new(
             "heap.mimalloc",
             "Parallel mimalloc allocation and free",
