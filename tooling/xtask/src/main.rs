@@ -36,17 +36,16 @@ fn try_main() -> Result<(), String> {
 
     match cli.command {
         CliCommand::Build(options) => {
-            if options.pgo {
-                if options.kernel_features.iter().any(|feature| feature == "kernel-correctness") {
-                    return Err("build --pgo cannot be combined with kernel-correctness".to_string());
-                }
-                pgo::enable_generation();
-            }
             let platform = options
                 .platform
                 .as_deref()
                 .ok_or_else(|| "build requires --platform NAME|FILE".to_string())?;
             let plan = config::load_platform(&root, platform)?;
+            if options.pgo {
+                return pgo::execute(&root, &plan, options.release, options.offline,
+                    &options.kernel_features, options.pgo_profile.as_deref()).map(|_| ());
+            }
+
             build_platform(
                 &root,
                 &plan,
@@ -142,7 +141,6 @@ fn try_main() -> Result<(), String> {
             run_qemu(&root, &plan, &launch, &host, options, file_serial)
         }
         CliCommand::Bench(command) => bench::execute(&root, command),
-        CliCommand::Pgo(args) => pgo::execute(&root, args).map(|_| ()),
         CliCommand::Cargo(options) => {
             let platform = options
                 .platform
@@ -272,7 +270,6 @@ enum CliCommand {
         file_serial: Option<PathBuf>,
     },
     Bench(bench::BenchCommand),
-    Pgo(Vec<String>),
     Cargo(CargoOptions),
 }
 
@@ -285,6 +282,7 @@ struct CargoOptions {
 struct BuildOptions {
     release: bool,
     pgo: bool,
+    pgo_profile: Option<PathBuf>,
     offline: bool,
     platform: Option<String>,
     kernel_features: Vec<String>,
@@ -311,10 +309,6 @@ impl Cli {
         let mut args = args.into_iter().peekable();
 
         match args.peek().map(String::as_str) {
-            Some("pgo") => {
-                args.next();
-                Ok(Self { command: CliCommand::Pgo(args.collect()) })
-            }
             Some("build" | "irq-check") => {
                 let command = args.next().unwrap();
                 let mut release = false;
@@ -322,11 +316,16 @@ impl Cli {
                 let mut platform = None;
                 let mut kernel_features = Vec::new();
                 let mut pgo = false;
+                let mut pgo_profile = None;
 
                 while let Some(arg) = args.next() {
                     match arg.as_str() {
                         "--release" => release = true,
                         "--pgo" if command == "build" => pgo = true,
+                        "--pgo-profile" if command == "build" => {
+                            pgo_profile = Some(PathBuf::from(args.next().ok_or_else(||
+                                "--pgo-profile requires a directory".to_string())?));
+                        }
                         "--drivers" => {}
                         "--offline" => offline = true,
                         "--platform" => {
@@ -346,7 +345,10 @@ impl Cli {
                     }
                 }
 
-                let options = BuildOptions { release, pgo, offline, platform, kernel_features };
+                if pgo_profile.is_some() && !pgo {
+                    return Err("--pgo-profile requires --pgo".to_string());
+                }
+                let options = BuildOptions { release, pgo, pgo_profile, offline, platform, kernel_features };
                 Ok(Self { command: if command == "irq-check" {
                     CliCommand::IrqCheck(options)
                 } else { CliCommand::Build(options) } })
@@ -473,21 +475,19 @@ impl Cli {
 fn usage() -> String {
     [
         "usage:",
-        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--pgo] [--offline] [--kernel-feature NAME]",
+        "  cargo run -p xtask -- build --platform NAME|FILE [--release] [--pgo [--pgo-profile DIR]] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- irq-check --platform NAME|FILE [--release] [--offline] [--kernel-feature NAME]",
         "  cargo run -p xtask -- qemu --platform NAME|FILE --launch NAME|FILE [--host NAME|FILE] [--debug] [--detach] [--console-serial] [--file-serial PATH] [--dry-run] [--release] [--gdb-port PORT] [--lldb-meta]",
-        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--profile dev|release] [--cpus 1,2,4] [--suite NAME,NAME] [--tag TAG,TAG] [--pgo [--merge] [--pgo-output DIR]] [--boot-image FILE] [--export-boot-image FILE] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N] [--max-repetitions N] [--offline]",
+        "  cargo run -p xtask -- bench [--platform NAME] [--launch NAME] [--release|--debug] [--cpus 1,2,4] [--suite NAME,NAME] [--tag TAG,TAG] [--pgo [--merge] [--pgo-output DIR]] [--boot-image FILE] [--export-boot-image FILE] [--output FILE] [--boot-timeout-secs N] [--timeout-secs N] [--max-repetitions N] [--offline]",
         "  cargo run -p xtask -- bench compare --base FILE --head FILE [--output FILE]",
         "  cargo run -p xtask -- correctness [--cpus 1,2,4] [--suite NAME] [--tag TAG] [--output FILE]",
         "  cargo run -p xtask -- cargo --platform NAME|FILE kernel|drivers|stub -- CARGO_ARGS...",
-        "  cargo xtask pgo --platform NAME|FILE --profiles DIR [--profile dev|release] [--kernel-feature NAME] [--offline]",
         "  bench builds the selected platform/profile image before running; --boot-image skips building",
         "  build --kernel-feature kernel-bench creates a benchmark image; RUSTOS_BENCH_TAGS and RUSTOS_BENCH_SUITES select its benchmarks",
         "",
-        "  build always ignores profiles; build --pgo instruments the kernel and drivers",
+        "  build --pgo applies the latest merged profiles for the selected platform and build profile",
         "  bench --pgo builds an instrumented image and writes raw profiles; add --merge to merge them",
-        "  PGO defaults to five boots with 4 CPUs; --cpus and --max-repetitions override this",
-        "  pgo --profiles DIR builds using those merged profiles; it never runs benchmarks",
+        "  PGO defaults to one boot with 4 CPUs; --cpus and --max-repetitions override this",
         "environment:",
         "  RUSTOS_QEMU       QEMU executable name or path; overrides launch and host discovery",
         "  RUSTOS_FIRMWARE   direct firmware path; bypasses candidate discovery",

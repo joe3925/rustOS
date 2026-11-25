@@ -48,6 +48,27 @@ pub fn descriptors() -> Vec<BenchSuiteDescriptor> {
         3
     };
     vec![
+        BenchSuiteDescriptor::new(
+            "scheduler.dispatch",
+            "Kernel thread yields, preemption, CPU balance, priorities, and domains",
+            vec!["scheduler".to_string()],
+            super::scheduler::dispatch::suite,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
+            "scheduler.handoff",
+            "Kernel thread wake round trips, wake contention, and domain migration",
+            vec!["scheduler".to_string()],
+            super::scheduler::handoff::suite,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
+        BenchSuiteDescriptor::new(
+            "scheduler.lifecycle",
+            "Kernel thread construction, admission, first dispatch, and retirement",
+            vec!["scheduler".to_string()],
+            super::scheduler::lifecycle::suite,
+        )
+        .with_independent_boots(INDEPENDENT_BOOTS),
         #[cfg(target_arch = "x86_64")]
         BenchSuiteDescriptor::new(
             "scheduler.wake",

@@ -227,13 +227,13 @@ jobs:
           RUSTOS_DISK_FORMAT: raw
         run: |
           cargo run --release -p xtask -- bench \
-            --platform x86_64-uefi --profile release \
+            --platform x86_64-uefi --release \
             --launch qemu-x86_64-q35-ci --tag ci --cpus 4 --max-repetitions 1 \
             --pgo --merge --pgo-output target/bench/training/profiles \
             --output target/bench/training/results.json
-          RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- pgo \
-            --platform x86_64-uefi --profile release --kernel-feature kernel-bench \
-            --profiles target/bench/training/profiles
+          RUSTOS_BENCH_TAGS=ci cargo run --release -p xtask -- build --pgo \
+            --platform x86_64-uefi --release --kernel-feature kernel-bench \
+            --pgo-profile target/bench/training/profiles
           mkdir -p target/bench/head/profiles
           cp target/rustos/x86_64-uefi/release/image/boot.img target/bench/head/boot.img
           printf '%s\n' "$BENCH_ENV_VERSION" > target/bench/head/environment-version
@@ -313,7 +313,7 @@ jobs:
             fi
             mkdir -p "target/bench/${variant}"
             cargo run --release -p xtask -- bench \
-              --platform x86_64-uefi --profile release \
+              --platform x86_64-uefi --release \
               --launch qemu-x86_64-q35-ci --cpus 1,2,4 \
               --boot-image "$boot_image" \
               --boot-timeout-secs 120 \

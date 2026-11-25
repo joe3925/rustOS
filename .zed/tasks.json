@@ -137,4 +137,27 @@
     "cwd": "$ZED_WORKTREE_ROOT",
     "allow_concurrent_runs": false,
   },
+
+  {
+    "label": "benchmark and build aarch64 UEFI (release PGO)",
+    "command": "powershell",
+    "args": [
+      "-NoProfile",
+      "-Command",
+      "cargo xtask bench --platform aarch64-uefi --launch qemu-aarch64-virt-tcg --release --pgo --merge --output target/bench/aarch64-uefi/release/results.json; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo xtask build --platform aarch64-uefi --release --pgo; exit $LASTEXITCODE"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "benchmark and build x86_64 UEFI (release PGO)",
+    "command": "powershell",
+    "args": [
+      "-NoProfile",
+      "-Command",
+      "cargo xtask bench --platform x86_64-uefi --launch qemu-x86_64-q35-whpx --release --pgo --merge --output target/bench/x86_64-uefi/release/results.json; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo xtask build --platform x86_64-uefi --release --pgo; exit $LASTEXITCODE"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false
+  },
 ]

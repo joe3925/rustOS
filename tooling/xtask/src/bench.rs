@@ -131,13 +131,8 @@ impl BenchOptions {
                 "--pgo" if !correctness => pgo = true,
                 "--merge" if !correctness => merge = true,
                 "--pgo-output" if !correctness => pgo_output = Some(PathBuf::from(next_value(&mut args, "--pgo-output")?)),
-                "--profile" => {
-                    release = match next_value(&mut args, "--profile")?.as_str() {
-                        "release" => true,
-                        "dev" | "debug" => false,
-                        value => return Err(format!("Unsupported build profile `{value}`")),
-                    };
-                }
+                "--release" => release = true,
+                "--debug" => release = false,
                 "--platform" => {
                     platform = next_value(&mut args, "--platform")?;
                 }
@@ -225,7 +220,7 @@ impl BenchOptions {
             if !cpus_explicit {
                 cpus = vec![4];
             }
-            max_repetitions.get_or_insert(5);
+            max_repetitions.get_or_insert(1);
         }
 
         Ok(Self {
@@ -634,7 +629,7 @@ fn run_topology(
         if pgo && benchmark_started {
             if let Some(start) = events.iter().find(|event| event.kind == "run_start") {
                 if start.payload.get("pgo") != Some(&Value::Bool(true)) {
-                    selection_error = Some("bench --pgo requires an instrumented image with runtime PGO support; use build --pgo --kernel-feature kernel-bench first".to_string());
+                    selection_error = Some("bench --pgo requires an instrumented image with runtime PGO support; omit --boot-image to build an instrumented image".to_string());
                     let _ = child.kill();
                     break;
                 }
@@ -1569,20 +1564,20 @@ mod image_tests {
     }
 
     #[test]
-    fn pgo_defaults_to_five_training_boots_and_preserves_overrides() {
+    fn pgo_defaults_to_one_training_boot_and_preserves_overrides() {
         let normal = BenchOptions::parse(Vec::new(), false).unwrap();
         assert_eq!(normal.cpus, [1, 2, 4]);
         assert_eq!(normal.max_repetitions, None);
         let pgo = BenchOptions::parse(["--pgo"].map(str::to_string), false).unwrap();
         assert_eq!(pgo.cpus, [4]);
-        assert_eq!(pgo.max_repetitions, Some(5));
+        assert_eq!(pgo.max_repetitions, Some(1));
         for args in [
             vec!["--pgo", "--cpus", "1,4"],
             vec!["--cpus", "1,4", "--pgo"],
         ] {
             let options = BenchOptions::parse(args.into_iter().map(str::to_string), false).unwrap();
             assert_eq!(options.cpus, [1, 4]);
-            assert_eq!(options.max_repetitions, Some(5));
+            assert_eq!(options.max_repetitions, Some(1));
         }
         let options = BenchOptions::parse(
             ["--max-repetitions", "2", "--pgo"].map(str::to_string), false

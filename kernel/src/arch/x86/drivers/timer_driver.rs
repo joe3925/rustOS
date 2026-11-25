@@ -86,6 +86,8 @@ pub unsafe extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     unsafe { scheduling.on_timer_tick(state) };
     let dt = sw.elapsed_nanos() as usize;
     unsafe { TIMER_TIME_SCHED.get() }.fetch_add(dt, Ordering::Relaxed);
+    drop(scheduling);
+    scheduler().maybe_balance();
 }
 
 pub fn set_num_cores(n: usize) {

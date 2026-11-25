@@ -118,10 +118,30 @@ impl TaskHandle {
     }
 
     pub(crate) fn try_update(&self) -> Option<TaskUpdate> {
+        if !self.try_lock_update() {
+            return None;
+        }
+        Some(TaskUpdate {
+            task: self.clone(),
+            notify_cpu: None,
+        })
+    }
+
+    pub(crate) fn try_into_update(self) -> Result<TaskUpdate, Self> {
+        if !self.try_lock_update() {
+            return Err(self);
+        }
+        Ok(TaskUpdate {
+            task: self,
+            notify_cpu: None,
+        })
+    }
+
+    fn try_lock_update(&self) -> bool {
         let mut word = self.sched_state.load(Ordering::Acquire);
         loop {
             if word & SCHED_UPDATING != 0 {
-                return None;
+                return false;
             }
             match self.sched_state.compare_exchange(
                 word,
@@ -129,12 +149,7 @@ impl TaskHandle {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {
-                    return Some(TaskUpdate {
-                        task: self.clone(),
-                        notify_cpu: None,
-                    });
-                }
+                Ok(_) => return true,
                 Err(actual) => word = actual,
             }
         }
@@ -228,7 +243,7 @@ impl TaskUpdate {
     }
 
     pub(crate) fn with_class_state<T, R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        let binding = self.task.sched_binding.read();
+        let binding = unsafe { &*self.task.sched_binding.as_mut_ptr() };
         let ptr = binding.class_state();
         f(unsafe { ptr.cast::<T>().as_ref() })
     }
@@ -276,8 +291,14 @@ impl TaskUpdate {
     }
 }
 
-impl Drop for TaskUpdate {
-    fn drop(&mut self) {
+impl TaskUpdate {
+    pub(crate) fn into_handle(mut self) -> TaskHandle {
+        self.release_update();
+        let this = mem::ManuallyDrop::new(self);
+        unsafe { core::ptr::read(&this.task) }
+    }
+
+    fn release_update(&mut self) {
         let mut word = self.task.sched_state.load(Ordering::Acquire);
         loop {
             if word & SCHED_STATE_MASK == SchedState::Blocked as u8 && word & SCHED_PERMIT != 0 {
@@ -310,6 +331,12 @@ impl Drop for TaskUpdate {
         if let Some(cpu) = self.notify_cpu.take() {
             crate::scheduling::scheduler::scheduler().kick_remote_core(cpu);
         }
+    }
+}
+
+impl Drop for TaskUpdate {
+    fn drop(&mut self) {
+        self.release_update();
     }
 }
 

@@ -81,6 +81,8 @@ pub(super) unsafe fn handle_interrupt(state: *mut State) {
     if previous.is_some() {
         PER_CORE_SWITCHES[cpu_id].fetch_add(1, Ordering::Relaxed);
     }
+    drop(scheduling);
+    scheduler().maybe_balance();
 }
 
 impl TimerPlatform for Aarch64Platform {

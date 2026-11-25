@@ -22,6 +22,8 @@ mod multi_file;
 #[cfg(any(feature = "kernel-bench", feature = "kernel-correctness"))]
 mod runner;
 #[cfg(feature = "kernel-bench")]
+mod scheduler;
+#[cfg(feature = "kernel-bench")]
 mod spawn;
 #[cfg(feature = "kernel-bench")]
 mod suites;

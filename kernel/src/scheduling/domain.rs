@@ -110,7 +110,7 @@ pub trait DomainOps: Send + Sync {
         outcome: SwitchOutOutcome,
     );
 
-    fn pick_next(&self, access: &RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate>;
+    fn pick_next(&self, access: &mut RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate>;
 
     fn should_preempt(&self, task: &TaskUpdate) -> bool;
 
@@ -141,7 +141,7 @@ pub trait SchedulerClass: Send + Sync + 'static {
 
     fn pick_next(
         &self,
-        access: &RunQueueAccess<'_>,
+        access: &mut RunQueueAccess<'_>,
         cpu: &Self::CpuState,
         now_cycles: u64,
     ) -> Option<TaskUpdate>;
@@ -251,9 +251,10 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
         }
     }
 
-    fn pick_next(&self, access: &RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate> {
+    fn pick_next(&self, access: &mut RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate> {
+        let cpu_id = access.cpu_id();
         self.class
-            .pick_next(access, self.cpu_state(access.cpu_id()), now_cycles)
+            .pick_next(access, self.cpu_state(cpu_id), now_cycles)
     }
 
     fn should_preempt(&self, task: &TaskUpdate) -> bool {
@@ -267,12 +268,15 @@ impl<C: SchedulerClass> DomainOps for Domain<C> {
     }
 }
 
+#[repr(align(64))]
+pub struct DomainCursor(pub AtomicUsize);
+
 pub trait DomainAlgorithm: Send + Sync {
     fn pick_next(
         &self,
         domains: &[DomainEntry],
-        per_cpu_cursor: &[AtomicUsize],
-        access: &RunQueueAccess<'_>,
+        per_cpu_cursor: &[DomainCursor],
+        access: &mut RunQueueAccess<'_>,
         now_cycles: u64,
     ) -> Option<TaskUpdate>;
 }
@@ -283,8 +287,8 @@ impl DomainAlgorithm for RoundRobinDomainAlgorithm {
     fn pick_next(
         &self,
         domains: &[DomainEntry],
-        per_cpu_cursor: &[AtomicUsize],
-        access: &RunQueueAccess<'_>,
+        per_cpu_cursor: &[DomainCursor],
+        access: &mut RunQueueAccess<'_>,
         now_cycles: u64,
     ) -> Option<TaskUpdate> {
         let cpu_id = access.cpu_id();
@@ -296,19 +300,23 @@ impl DomainAlgorithm for RoundRobinDomainAlgorithm {
             .get(cpu_id)
             .unwrap_or_else(|| panic!("domain cursor missing for cpu {}", cpu_id));
 
-        let start = cursor.load(Ordering::Relaxed) % domains.len();
+        let mut idx = cursor.0.load(Ordering::Relaxed);
+        if idx >= domains.len() {
+            idx %= domains.len();
+        }
 
-        for offset in 0..domains.len() {
-            let idx = (start + offset) % domains.len();
+        for _ in 0..domains.len() {
             let domain = &domains[idx].ops;
-
-            if !domain.contains_cpu(cpu_id) {
-                continue;
+            idx += 1;
+            if idx == domains.len() {
+                idx = 0;
             }
 
-            if let Some(task) = domain.pick_next(access, now_cycles) {
-                cursor.store((idx + 1) % domains.len(), Ordering::Relaxed);
-                return Some(task);
+            if domain.contains_cpu(cpu_id) {
+                if let Some(task) = domain.pick_next(access, now_cycles) {
+                    cursor.0.store(idx, Ordering::Relaxed);
+                    return Some(task);
+                }
             }
         }
 
@@ -332,7 +340,7 @@ where
     A: DomainAlgorithm,
 {
     domains: Box<[DomainEntry]>,
-    per_cpu_cursor: Box<[AtomicUsize]>,
+    per_cpu_cursor: Box<[DomainCursor]>,
     algorithm: A,
 }
 
@@ -343,7 +351,7 @@ where
     pub fn new(domains: Box<[DomainEntry]>, cpu_count: usize) -> Self {
         let mut per_cpu_cursor = Vec::with_capacity(cpu_count);
         for _ in 0..cpu_count {
-            per_cpu_cursor.push(AtomicUsize::new(0));
+            per_cpu_cursor.push(DomainCursor(AtomicUsize::new(0)));
         }
 
         Self {
@@ -383,7 +391,7 @@ where
             .on_switch_out(task, cpu_id, now_cycles, outcome);
     }
 
-    pub fn pick_next(&self, access: &RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate> {
+    pub fn pick_next(&self, access: &mut RunQueueAccess<'_>, now_cycles: u64) -> Option<TaskUpdate> {
         self.algorithm
             .pick_next(&self.domains, &self.per_cpu_cursor, access, now_cycles)
     }

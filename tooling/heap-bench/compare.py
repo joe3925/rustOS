@@ -63,9 +63,9 @@ if args.kernel_report is None:
                     "--launch", "qemu-x86_64-q35-whpx", "--cpus", args.cpus, "--max-repetitions", "1",
                     "--suite", "heap.mimalloc", "--pgo", "--merge", "--pgo-output", profiles, "--output", out / "training.json", *offline],
                    cwd=root, check=True)
-    subprocess.run(["cargo", "run", *offline, "-p", "xtask", "--", "pgo",
-                    "--platform", "x86_64-uefi", "--profile", "release", "--kernel-feature", "kernel-bench",
-                    "--profiles", profiles, *offline], cwd=root, check=True, env=bench_env)
+    subprocess.run(["cargo", "run", *offline, "-p", "xtask", "--", "build", "--pgo",
+                    "--platform", "x86_64-uefi", "--release", "--kernel-feature", "kernel-bench",
+                    "--pgo-profile", profiles, *offline], cwd=root, check=True, env=bench_env)
     subprocess.run(["cargo", "run", *offline, "-p", "xtask", "--", "bench",
                     "--launch", "qemu-x86_64-q35-whpx", "--cpus", args.cpus,
                     "--boot-image", root / "target/rustos/x86_64-uefi/release/image/boot.img", "--output", kernel_path],

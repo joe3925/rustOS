@@ -1,4 +1,4 @@
-use crate::config::{self, BuildPlan};
+use crate::config::BuildPlan;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,8 +43,6 @@ pub fn configure(
 ) -> Result<bool, String> {
     let kernel = component == "kernel";
     let generate = GENERATE.load(Ordering::Relaxed);
-    // Only the explicit `pgo` command populates APPLY. Builds never read saved
-    // profile state or PGO environment variables.
     let profile = APPLY
         .get()
         .and_then(|profiles| profiles.get(&component.to_ascii_lowercase()))
@@ -419,53 +417,43 @@ pub fn collect(
 
 pub fn default_output(root: &Path, plan: &BuildPlan, release: bool) -> Result<PathBuf, String> {
     Ok(root
-        .join("target/pgo")
+        .join("target/rustos")
         .join(&plan.id)
         .join(crate::profile(release))
+        .join("pgo")
         .join(format!("run-{}", stamp()?)))
 }
 
-pub fn execute(root: &Path, args: Vec<String>) -> Result<PathBuf, String> {
-    let mut platform = None;
-    let mut profiles_dir = None;
-    let mut release = true;
-    let mut offline = false;
-    let mut features = Vec::new();
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                crate::bench::print_status!(
-                    "cargo xtask pgo --platform NAME --profiles DIR [--profile dev|release] [--kernel-feature NAME] [--offline]\nBuild using profiles collected by bench --pgo --merge. This command does not run benchmarks or merge profiles. Ordinary builds always ignore profiles."
-                );
-                return Ok(PathBuf::new());
-            }
-            "--offline" => offline = true,
-            "--platform" | "--profiles" | "--profile" | "--kernel-feature" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("{arg} requires a value"))?;
-                match arg.as_str() {
-                    "--platform" => platform = Some(value),
-                    "--profiles" => profiles_dir = Some(PathBuf::from(value)),
-                    "--kernel-feature" => features.push(value),
-                    "--profile" => {
-                        release = match value.as_str() {
-                            "release" => true,
-                            "dev" | "debug" => false,
-                            _ => return Err(format!("Unsupported profile `{value}`")),
-                        }
-                    }
-                    _ => unreachable!(),
+pub fn execute(
+    root: &Path,
+    plan: &BuildPlan,
+    release: bool,
+    offline: bool,
+    features: &[String],
+    profiles_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let directory = if let Some(directory) = profiles_dir {
+        directory.to_path_buf()
+    } else {
+        let parent = crate::artifact_root(root, plan, release).join("pgo");
+        let mut candidates = Vec::new();
+        if parent.is_dir() {
+            for entry in fs::read_dir(&parent).map_err(|error| error.to_string())? {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                let Some(stamp) = path.file_name().and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("run-"))
+                    .and_then(|stamp| stamp.parse::<u128>().ok()) else { continue };
+                let Ok(bytes) = fs::read(path.join("profiles.json")) else { continue };
+                let Ok(state) = serde_json::from_slice::<ProfileSet>(&bytes) else { continue };
+                if state.merged {
+                    candidates.push((stamp, path));
                 }
             }
-            _ => return Err(format!("Unknown pgo argument `{arg}`; use pgo --help")),
         }
-    }
-    let platform = platform.ok_or_else(|| "pgo requires --platform NAME".to_string())?;
-    let plan = config::load_platform(root, &platform)?;
-    let directory = profiles_dir
-        .ok_or_else(|| "pgo requires --profiles DIR from bench --pgo --merge".to_string())?;
+        candidates.sort_by_key(|(stamp, _)| *stamp);
+        candidates.pop().map(|(_, path)| path).ok_or_else(||
+            format!("No merged PGO profiles in {}. Run bench --pgo --merge first", parent.display()))?
+    };
     let directory = if directory.is_absolute() {
         directory
     } else {
@@ -541,6 +529,9 @@ pub fn execute(root: &Path, args: Vec<String>) -> Result<PathBuf, String> {
     let incoming = parent.join(format!("{}-pgo-incoming-{stamp}", crate::profile(release)));
     let backup = parent.join(format!("{}-pgo-previous-{stamp}", crate::profile(release)));
     copy_directory(&stage, &incoming)?;
+    if published.join("pgo").is_dir() {
+        copy_directory(&published.join("pgo"), &incoming.join("pgo"))?;
+    }
     let had_previous = published.exists();
     if had_previous {
         fs::rename(&published, &backup).map_err(|error| {

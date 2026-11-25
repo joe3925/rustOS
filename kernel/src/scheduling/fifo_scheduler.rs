@@ -1,3 +1,5 @@
+use crate::idt::interrupt_impl::InterruptGuard;
+use crate::platform;
 use crate::scheduling::domain::{
     CpuSet, Domain, DomainOps, EnqueueReason, KERNEL_DOMAIN_ID, SchedulerClass, SwitchOutOutcome,
     TaskSchedBinding,
@@ -6,7 +8,9 @@ use crate::scheduling::scheduler::{RunQueueAccess, scheduler};
 use crate::scheduling::state::SchedState;
 use crate::scheduling::task::{TaskHandle, TaskUpdate};
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_sync::queues::bounded_mpmc::BoundedMpmcQueue;
 use spin::Mutex;
@@ -49,21 +53,32 @@ impl FifoClass {
     }
 }
 
+#[repr(align(64))]
 pub struct FifoCpuState {
     cpu_id: usize,
-    run_queue: BoundedMpmcQueue<TaskHandle>,
+    run_queue: UnsafeCell<VecDeque<TaskHandle>>,
     inbound_queue: BoundedMpmcQueue<TaskHandle>,
     load: AtomicUsize,
 }
+
+unsafe impl Sync for FifoCpuState {}
 
 impl FifoCpuState {
     fn new(cpu_id: usize) -> Self {
         Self {
             cpu_id,
-            run_queue: BoundedMpmcQueue::new(RUNQ_CAP),
+            run_queue: UnsafeCell::new(VecDeque::with_capacity(RUNQ_CAP)),
             inbound_queue: BoundedMpmcQueue::new(RUNQ_CAP),
             load: AtomicUsize::new(0),
         }
+    }
+
+    fn run_queue<'a>(
+        &'a self,
+        access: &'a mut RunQueueAccess<'_>,
+    ) -> &'a mut VecDeque<TaskHandle> {
+        assert_eq!(access.cpu_id(), self.cpu_id);
+        unsafe { &mut *self.run_queue.get() }
     }
 }
 
@@ -82,6 +97,7 @@ pub fn build_fifo_domain(name: &'static str, cpus: CpuSet, cpu_count: usize) -> 
 }
 
 fn enqueue_inbound(cpu: usize, cpu_state: &FifoCpuState, task: &mut TaskUpdate) {
+    let _guard = (!platform::current_is_in_interrupt()).then(InterruptGuard::new);
     assert_eq!(cpu, cpu_state.cpu_id);
     cpu_state.load.fetch_add(1, Ordering::AcqRel);
     if cpu_state.inbound_queue.try_push((**task).clone()).is_err() {
@@ -92,40 +108,42 @@ fn enqueue_inbound(cpu: usize, cpu_state: &FifoCpuState, task: &mut TaskUpdate) 
     task.notify_after_update(cpu);
 }
 
-fn drain_inbound_to_runqueue(access: &RunQueueAccess<'_>, cpu: &FifoCpuState) {
-    assert_eq!(access.cpu_id(), cpu.cpu_id);
-    let available = RUNQ_CAP - cpu.run_queue.len();
+fn drain_inbound_to_runqueue(access: &mut RunQueueAccess<'_>, cpu: &FifoCpuState) {
+    let run_queue = cpu.run_queue(access);
+    let available = RUNQ_CAP - run_queue.len();
     for _ in 0..available {
         let Ok(task) = cpu.inbound_queue.try_pop_wait_free() else {
             break;
         };
-        if cpu.run_queue.try_push(task).is_err() {
-            panic!("run queue overflow on cpu {}", cpu.cpu_id);
-        }
+        run_queue.push_back(task);
     }
 }
 
 fn pop_queued_task(
-    access: &RunQueueAccess<'_>,
+    access: &mut RunQueueAccess<'_>,
     cpu: &FifoCpuState,
 ) -> Option<TaskUpdate> {
-    assert_eq!(access.cpu_id(), cpu.cpu_id);
-    let queued = cpu.run_queue.len();
+    let run_queue = cpu.run_queue(access);
+    let queued = run_queue.len();
     for allow_low in [false, true] {
         for _ in 0..queued {
-            let Ok(task) = cpu.run_queue.try_pop_wait_free() else {
+            let Some(task) = run_queue.pop_front() else {
                 return None;
             };
-            if let Some(update) = task.try_update() {
-                let priority = update.with_class_state(|state: &FifoTaskState| state.priority);
-                if allow_low || priority != FifoPriority::Low {
-                    cpu.load.fetch_sub(1, Ordering::Release);
-                    return Some(update);
+            let task = match task.try_into_update() {
+                Ok(update) => {
+                    if allow_low
+                        || update.with_class_state(|state: &FifoTaskState| state.priority)
+                            != FifoPriority::Low
+                    {
+                        cpu.load.fetch_sub(1, Ordering::Release);
+                        return Some(update);
+                    }
+                    update.into_handle()
                 }
-            }
-            if cpu.run_queue.try_push(task).is_err() {
-                panic!("run queue rotation overflow");
-            }
+                Err(task) => task,
+            };
+            run_queue.push_back(task);
         }
     }
     None
@@ -203,7 +221,7 @@ impl SchedulerClass for FifoClass {
     }
     fn pick_next(
         &self,
-        access: &RunQueueAccess<'_>,
+        access: &mut RunQueueAccess<'_>,
         cpu: &Self::CpuState,
         _now_cycles: u64,
     ) -> Option<TaskUpdate> {
@@ -241,10 +259,10 @@ impl SchedulerClass for FifoClass {
         _dst_cpu_id: usize,
         _dst_cpu: &Self::CpuState,
     ) -> Option<TaskUpdate> {
-        let access = scheduler().try_core_scheduler(src_cpu_id)?;
-        drain_inbound_to_runqueue(&access, src_cpu);
-        for _ in 0..src_cpu.run_queue.len() {
-            let task = pop_queued_task(&access, src_cpu)?;
+        let mut access = scheduler().try_core_scheduler(src_cpu_id)?;
+        drain_inbound_to_runqueue(&mut access, src_cpu);
+        for _ in 0..src_cpu.run_queue(&mut access).len() {
+            let task = pop_queued_task(&mut access, src_cpu)?;
             match task.sched_state() {
                 SchedState::Runnable => return Some(task),
                 SchedState::Terminated => scheduler().unregister_task_from_domain(&task),
@@ -273,10 +291,15 @@ impl SchedulerClass for FifoClass {
             return;
         };
 
-        self.last_balance_tick.store(now_tick, Ordering::Relaxed);
+        if now_tick.wrapping_sub(self.last_balance_tick.load(Ordering::Relaxed))
+            < BALANCE_INTERVAL_TICKS
+        {
+            return;
+        }
 
         let n = scheduler().num_cores();
         if n < 2 {
+            self.last_balance_tick.store(now_tick, Ordering::Relaxed);
             return;
         }
 
@@ -338,10 +361,11 @@ impl SchedulerClass for FifoClass {
             };
 
             let Some(mut task) = self.steal_one(max_idx, max_cpu, min_idx, min_cpu) else {
-                break;
+                return;
             };
 
             enqueue_inbound(min_idx, min_cpu, &mut task);
         }
+        self.last_balance_tick.store(now_tick, Ordering::Relaxed);
     }
 }

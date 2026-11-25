@@ -1,7 +1,9 @@
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::interrupt_impl::InterruptGuard;
 use crate::memory::heap::heap::mimalloc_thread_done;
-use crate::memory::paging::address_space::{kernel_address_space_root, switch_address_space_root};
+use crate::memory::paging::address_space::{
+    current_address_space_root, kernel_address_space_root, switch_address_space_root,
+};
 use crate::memory::paging::stack::StackSize;
 use crate::platform;
 use crate::scheduling::domain::{
@@ -11,7 +13,7 @@ use crate::scheduling::domain::{
 use crate::scheduling::fifo_scheduler::{FifoPriority, build_fifo_domain, fifo_task_sched_binding};
 use crate::scheduling::reclaim;
 use crate::scheduling::runtime::runtime::yield_now;
-use crate::scheduling::state::{FpuState, SchedState, State};
+use crate::scheduling::state::{SchedState, State};
 use crate::scheduling::task::Task;
 use crate::scheduling::task::TaskError;
 use crate::scheduling::task::TaskHandle;
@@ -41,6 +43,7 @@ pub enum TaskMigrationError {
     PendingMigration(u64),
 }
 
+#[repr(align(64))]
 pub struct CoreScheduler {
     scheduling: Mutex<SchedulerState>,
     current_task_id: AtomicU64,
@@ -66,24 +69,21 @@ impl RunQueueAccess<'_> {
 
 pub struct LocalScheduler<'a> {
     current: Option<TaskUpdate>,
-    return_fpu: Option<FpuState>,
     access: Option<RunQueueAccess<'a>>,
 }
 
 impl LocalScheduler<'_> {
-    pub(crate) unsafe fn on_timer_tick(&mut self, state: *mut State) -> Option<TaskHandle> {
+    pub(crate) unsafe fn on_timer_tick(&mut self, state: *mut State) -> Option<()> {
         unsafe { scheduler().schedule_next(self, state) }
     }
 }
 
 impl Drop for LocalScheduler<'_> {
     fn drop(&mut self) {
-        drop(self.current.take());
-        drop(self.access.take());
-        scheduler().maybe_balance();
-        if let Some(fpu) = self.return_fpu.as_ref() {
-            platform::restore_fpu_state(fpu);
+        if let Some(access) = self.access.as_mut() {
+            access.state.current = self.current.take().map(TaskUpdate::into_handle);
         }
+        drop(self.access.take());
     }
 }
 
@@ -367,26 +367,28 @@ impl Scheduler {
     }
 
     pub(crate) fn try_local_scheduler(&self) -> Option<LocalScheduler<'_>> {
-        if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+        if !KERNEL_INITIALIZED.load(Ordering::Acquire)
+            || platform::current_percpu()
+                .active_exception_fpu
+                .load(Ordering::Relaxed)
+                == 0
+        {
             return None;
         }
         let cpu_id = platform::current_cpu_id();
-        let access = self.try_core_scheduler(cpu_id)?;
-        let (current, return_fpu) = match access.state.current.as_ref() {
-            Some(task) => {
-                let update = task.try_update()?;
-                let fpu = {
-                    let mut inner = task.inner.try_write()?;
-                    inner.save_fpu_state();
-                    inner.fpu_state.clone()
-                };
-                (Some(update), Some(fpu))
-            }
-            None => (None, None),
+        let mut access = self.try_core_scheduler(cpu_id)?;
+        let current = match access.state.current.take() {
+            Some(task) => match task.try_into_update() {
+                Ok(update) => Some(update),
+                Err(task) => {
+                    access.state.current = Some(task);
+                    return None;
+                }
+            },
+            None => None,
         };
         Some(LocalScheduler {
             current,
-            return_fpu,
             access: Some(access),
         })
     }
@@ -476,20 +478,22 @@ impl Scheduler {
         &self,
         local: &mut LocalScheduler<'_>,
         state: *mut State,
-    ) -> Option<TaskHandle> {
+    ) -> Option<()> {
         let access = local.access.as_mut()?;
         let cpu_id = access.cpu_id();
         let core = self.core(cpu_id)?;
         let now_cycles = platform::cycle_counter();
-        let previous_handle = local.current.as_ref().map(|task| (**task).clone());
+        let previous_present = local.current.as_ref().map(|_| ());
+        let previous_is_idle = local
+            .current
+            .as_ref()
+            .is_some_and(|task| TaskHandle::ptr_eq(task, &core.idle_task));
         if let Some(previous) = local.current.as_ref() {
-            let mut inner = previous.inner.try_write()?;
-            unsafe { inner.update_from_context(state) };
             if previous.sched_state() == SchedState::Running
                 && !TaskHandle::ptr_eq(previous, &core.idle_task)
                 && !self.domains.should_preempt(previous.domain_id(), previous)
             {
-                return previous_handle;
+                return previous_present;
             }
         }
 
@@ -540,11 +544,16 @@ impl Scheduler {
                         Err(()) => None,
                     }
                 };
-                root.map(|root| (inner.context, inner.fpu_state.clone(), root, inner.parent_pid))
+                if root.is_some() {
+                    selected_context = Some(inner.context);
+                    selected_fpu = Some(inner.fpu_state.clone());
+                    selected_pid = inner.parent_pid;
+                }
+                root
             } else {
                 None
             };
-            let Some((context, fpu, root, pid)) = prepared else {
+            let Some(root) = prepared else {
                 let hint = candidate.target_cpu();
                 self.domains.enqueue(
                     candidate.domain_id(),
@@ -554,10 +563,7 @@ impl Scheduler {
                 );
                 continue;
             };
-            selected_context = Some(context);
-            selected_fpu = Some(fpu);
             selected_root = Some(root);
-            selected_pid = pid;
             selected = Some(candidate);
             break;
         }
@@ -571,11 +577,14 @@ impl Scheduler {
                     SchedState::Parking => previous.consume_permit(),
                     _ => false,
                 };
-                if resume && previous.set_sched_state(SchedState::Running) {
-                    return previous_handle;
+                if resume
+                    && (previous.sched_state() == SchedState::Running
+                        || previous.set_sched_state(SchedState::Running))
+                {
+                    return previous_present;
                 }
                 if TaskHandle::ptr_eq(previous, &core.idle_task) {
-                    return previous_handle;
+                    return previous_present;
                 }
             }
             let idle = core.idle_task.try_update()?;
@@ -590,9 +599,25 @@ impl Scheduler {
         }
 
         let mut next = selected.unwrap();
+        if let Some(previous) = local.current.as_ref() {
+            let Some(mut inner) = previous.inner.try_write() else {
+                if !TaskHandle::ptr_eq(&next, &core.idle_task) {
+                    let hint = next.target_cpu();
+                    self.domains.enqueue(
+                        next.domain_id(),
+                        &mut next,
+                        EnqueueReason::Preempted,
+                        hint,
+                    );
+                }
+                return None;
+            };
+            unsafe { inner.update_from_context(state) };
+            inner.save_fpu_state();
+        }
         if !next.set_sched_state(SchedState::Running) {
             self.handle_switch_out(&mut next, cpu_id, now_cycles, SwitchOutOutcome::Terminated);
-            return previous_handle;
+            return previous_present;
         }
 
         let mut previous = local.current.take();
@@ -626,14 +651,16 @@ impl Scheduler {
             }
         }
 
-        unsafe { switch_address_space_root(selected_root.unwrap()) };
+        let root = selected_root.unwrap();
+        if current_address_space_root() != root {
+            unsafe { switch_address_space_root(root) };
+        }
         self.restore_thread_local_storage(&next);
         if next.tls_thread_pointer.load(Ordering::Relaxed) != 0 {
             tls::CURRENT_PROCESS_ID.set(selected_pid);
         }
-        unsafe { platform::restore_task_context(&selected_context.unwrap(), state) };
-        local.return_fpu = selected_fpu;
-        access.state.current = Some((*next).clone());
+        unsafe { platform::restore_task_context(selected_context.as_ref().unwrap(), state) };
+        platform::restore_fpu_state(selected_fpu.as_ref().unwrap());
         core.current_is_idle
             .store(TaskHandle::ptr_eq(&next, &core.idle_task), Ordering::Release);
         core.current_task_id
@@ -649,7 +676,7 @@ impl Scheduler {
             }
         }
         drop(previous);
-        previous_handle.filter(|task| !TaskHandle::ptr_eq(task, &core.idle_task))
+        previous_present.filter(|_| !previous_is_idle)
     }
 
     fn handle_switch_out(
