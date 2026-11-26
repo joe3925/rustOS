@@ -41,7 +41,8 @@ impl Lapic {
     pub(crate) fn read(&self, offset: APICOffset) -> u32 {
         unsafe {
             if self.x2apic {
-                Msr::new(0x800 + (offset as u32 >> 4)).read() as u32
+                #[cfg_attr(irq_check, irq::trusted(unsafe))]
+                unsafe { Msr::new(0x800 + (offset as u32 >> 4)).read() as u32 }
             } else {
                 self.base_addr
                     .as_ptr::<u32>()
@@ -55,7 +56,8 @@ impl Lapic {
     pub(crate) fn write(&self, offset: APICOffset, value: u32) {
         unsafe {
             if self.x2apic {
-                Msr::new(0x800 + (offset as u32 >> 4)).write(value as u64);
+                #[cfg_attr(irq_check, irq::trusted(unsafe))]
+                unsafe { Msr::new(0x800 + (offset as u32 >> 4)).write(value as u64) };
             } else {
                 self.base_addr
                     .as_mut_ptr::<u32>()
@@ -129,7 +131,8 @@ impl LocalApic for Lapic {
         };
 
         if self.x2apic {
-            asm!(
+            #[cfg_attr(irq_check, irq::trusted(unsafe))]
+            unsafe { asm!(
                 "mfence",
                 "lfence",
                 "wrmsr",
@@ -137,9 +140,9 @@ impl LocalApic for Lapic {
                 in("eax") lo,
                 in("edx") hi,
                 options(nostack, preserves_flags),
-            );
+            ) };
         } else {
-            x86_64::instructions::interrupts::without_interrupts(|| {
+            crate::platform::with_interrupts_disabled(|| {
                 self.wait_for_delivery();
                 self.write(APICOffset::Icr2, hi << 24);
                 self.write(APICOffset::Icr1, lo);
