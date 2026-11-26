@@ -14,8 +14,7 @@ use crate::memory::paging::types::{
 use crate::platform::{AddressSpacePlatform, PageTableFrameAllocator, PagingPlatform};
 use crate::util::boot_info;
 
-use super::super::super::interrupts::apic::controller::APIC;
-use super::super::super::interrupts::apic::local::{IpiDest, IpiKind, LocalApic};
+use super::super::super::interrupts::apic::local::{IpiDest, IpiKind, LocalApic, LAPIC};
 use super::super::super::platform::X86Platform;
 use super::flags::page_flags_to_x86;
 use super::layout;
@@ -222,8 +221,8 @@ impl PagingPlatform for X86Platform {
 
     fn broadcast_tlb_shootdown() -> bool {
         unsafe {
-            if let Some(apic) = APIC.lock().as_ref() {
-                apic.lapic.send_ipi(
+            if let Some(lapic) = LAPIC.get() {
+                lapic.send_ipi(
                     IpiDest::AllExcludingSelf,
                     IpiKind::Fixed {
                         vector: super::super::super::idt::table::TLB_FLUSH_VECTOR,

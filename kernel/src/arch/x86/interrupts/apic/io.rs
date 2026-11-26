@@ -40,17 +40,13 @@ impl Ioapic {
         source >= self.gsi_base && source < self.gsi_base + self.entry_count
     }
 
-    pub fn unmask_irq_any_cpu(&self, source: u32, vector: u8, cpu_logical_mask: u8) {
+    pub fn unmask_irq(&self, source: u32, vector: u8, destination: u8) {
         let irq = source - self.gsi_base;
         let reg_low = 0x10 + (irq as u32) * 2;
         let reg_high = reg_low + 1;
 
-        const IOAPIC_DELIVERY_LOWEST: u32 = 1 << 8;
-        const IOAPIC_DEST_LOGICAL: u32 = 1 << 11;
-        const IOAPIC_MASKED: u32 = 1 << 16;
-
-        let low = (vector as u32) | IOAPIC_DELIVERY_LOWEST | IOAPIC_DEST_LOGICAL;
-        let high = (cpu_logical_mask as u32) << 24;
+        let low = vector as u32;
+        let high = (destination as u32) << 24;
 
         unsafe {
             let ioregsel = self.ptr();
@@ -60,7 +56,7 @@ impl Ioapic {
             iowin.write_volatile(high);
 
             ioregsel.write_volatile(reg_low);
-            iowin.write_volatile(low & !IOAPIC_MASKED);
+            iowin.write_volatile(low);
         }
     }
 

@@ -10,7 +10,7 @@ use crate::arch::x86::cpu::{current_is_in_interrupt, current_is_in_interrupt_ato
 use crate::arch::x86::platform::X86Platform;
 
 use super::apic::controller::APIC;
-use super::apic::local::{IpiDest, IpiKind, LocalApic, send_eoi};
+use super::apic::local::{IpiDest, IpiKind, LocalApic, LAPIC, send_eoi};
 
 impl InterruptPlatform for X86Platform {
     type InterruptFrame = InterruptStackFrame;
@@ -75,30 +75,9 @@ impl InterruptPlatform for X86Platform {
             return false;
         }
 
-        let in_interrupt =
-            current_is_in_interrupt_atomic().load(core::sync::atomic::Ordering::Acquire);
-
-        if in_interrupt {
-            let Some(apic) = APIC.try_lock() else {
-                return false;
-            };
-
-            if let Some(apic) = apic.as_ref() {
-                unsafe {
-                    apic.lapic.send_ipi(
-                        IpiDest::ApicId(target_platform_cpu_id as u8),
-                        IpiKind::Fixed { vector },
-                    );
-                }
-                return true;
-            }
-
-            return false;
-        }
-
         unsafe {
-            if let Some(apic) = APIC.lock().as_ref() {
-                apic.lapic.send_ipi(
+            if let Some(lapic) = LAPIC.get() {
+                lapic.send_ipi(
                     IpiDest::ApicId(target_platform_cpu_id as u8),
                     IpiKind::Fixed { vector },
                 );
@@ -111,8 +90,8 @@ impl InterruptPlatform for X86Platform {
 
     fn broadcast_panic_stop() {
         unsafe {
-            if let Some(apic) = APIC.lock().as_ref() {
-                apic.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi);
+            if let Some(lapic) = LAPIC.get() {
+                lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi);
             }
         }
     }

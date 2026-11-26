@@ -1,11 +1,12 @@
-use core::sync::atomic::{AtomicU64, Ordering};
-
-use x86_64::{PhysAddr, VirtAddr};
+use core::arch::asm;
 use kernel_types::memory::KernelMapping;
+use spin::Once;
+use x86_64::registers::model_specific::Msr;
+use x86_64::{PhysAddr, VirtAddr};
 
 use crate::arch::x86::timer::TIMER_FREQ;
 
-pub(crate) static LAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LAPIC: Once<Lapic> = Once::new();
 
 pub(crate) trait LocalApic {
     unsafe fn init(&self, logical_id: u8);
@@ -14,8 +15,9 @@ pub(crate) trait LocalApic {
 }
 
 pub(crate) struct Lapic {
-    pub(super) base_addr: VirtAddr,
+    base_addr: VirtAddr,
     mapping: KernelMapping,
+    x2apic: bool,
 }
 
 impl Lapic {
@@ -29,60 +31,85 @@ impl Lapic {
         Ok(Self {
             base_addr: mapping.address().into(),
             mapping,
+            x2apic: crate::arch::x86::cpu::get_cpu_info()
+                .get_feature_info()
+                .is_some_and(|features| features.has_x2apic()),
         })
     }
 
-    fn ptr(&self) -> *mut u32 {
-        self.base_addr.as_mut_ptr()
+    #[inline]
+    pub(crate) fn read(&self, offset: APICOffset) -> u32 {
+        unsafe {
+            if self.x2apic {
+                Msr::new(0x800 + (offset as u32 >> 4)).read() as u32
+            } else {
+                self.base_addr
+                    .as_ptr::<u32>()
+                    .add(offset as usize / 4)
+                    .read_volatile()
+            }
+        }
     }
 
-    pub(crate) unsafe fn wait_for_delivery(&self) { unsafe {
-        let icr1 = self.ptr().add(APICOffset::Icr1 as usize / 4);
-        while (icr1.read_volatile() & (1 << 12)) != 0 {
+    #[inline]
+    pub(crate) fn write(&self, offset: APICOffset, value: u32) {
+        unsafe {
+            if self.x2apic {
+                Msr::new(0x800 + (offset as u32 >> 4)).write(value as u64);
+            } else {
+                self.base_addr
+                    .as_mut_ptr::<u32>()
+                    .add(offset as usize / 4)
+                    .write_volatile(value);
+            }
+        }
+    }
+
+    pub(crate) unsafe fn wait_for_delivery(&self) {
+        if self.x2apic {
+            return;
+        }
+        while (self.read(APICOffset::Icr1) & (1 << 12)) != 0 {
             core::hint::spin_loop();
         }
-    }}
+    }
 }
 
 impl LocalApic for Lapic {
     unsafe fn init(&self, logical_id: u8) { unsafe {
-        let base = self.ptr();
+        let mut apic_base = Msr::new(0x1B);
+        let mut value = apic_base.read();
+        if value & (1 << 11) == 0 {
+            value |= 1 << 11;
+            apic_base.write(value);
+        }
+        if self.x2apic {
+            assert!(crate::arch::x86::cpu::get_cpu_info()
+                .get_feature_info()
+                .is_some_and(|features| features.has_x2apic()));
+            apic_base.write(value | (1 << 10));
+        }
 
-        let svr = base.add(APICOffset::Svr as usize / 4);
-        svr.write_volatile(svr.read_volatile() | 0x100);
-
-        base.add(APICOffset::Dfr as usize / 4)
-            .write_volatile(0xFFFF_FFFF);
-        base.add(APICOffset::Ldr as usize / 4)
-            .write_volatile((logical_id as u32) << 24);
-
-        base.add(APICOffset::Tpr as usize / 4).write_volatile(0);
+        self.write(APICOffset::Svr, self.read(APICOffset::Svr) | 0x100);
+        if !self.x2apic {
+            self.write(APICOffset::Dfr, 0xFFFF_FFFF);
+            self.write(APICOffset::Ldr, (logical_id as u32) << 24);
+        }
+        self.write(APICOffset::Tpr, 0);
     }}
 
     fn init_timer(&self) {
-        unsafe {
-            let base = self.ptr();
-            base.add(APICOffset::Svr as usize / 4)
-                .write_volatile(base.add(APICOffset::Svr as usize / 4).read_volatile() | 0x100);
-            base.add(APICOffset::LvtT as usize / 4)
-                .write_volatile(0x20 | (1 << 17));
-            base.add(APICOffset::Tdcr as usize / 4).write_volatile(0x3);
-            base.add(APICOffset::Ticr as usize / 4)
-                .write_volatile(TIMER_FREQ as u32);
-        }
+        self.write(APICOffset::Svr, self.read(APICOffset::Svr) | 0x100);
+        self.write(APICOffset::LvtT, 0x20 | (1 << 17));
+        self.write(APICOffset::Tdcr, 0x3);
+        self.write(APICOffset::Ticr, TIMER_FREQ as u32);
     }
 
     unsafe fn send_ipi(&self, dest: IpiDest, kind: IpiKind) { unsafe {
-        let base = self.ptr();
-        let icr1 = base.add(APICOffset::Icr1 as usize / 4);
-        let icr2 = base.add(APICOffset::Icr2 as usize / 4);
-
-        while (icr1.read_volatile() & (1 << 12)) != 0 {}
-
         let mut hi = 0u32;
         let shorthand = match dest {
             IpiDest::ApicId(id) => {
-                hi = (id as u32) << 24;
+                hi = id as u32;
                 0u32
             }
             IpiDest::SelfOnly => 0b01 << 18,
@@ -90,28 +117,34 @@ impl LocalApic for Lapic {
             IpiDest::AllExcludingSelf => 0b11 << 18,
         };
 
-        let mut lo = 0u32;
-        match kind {
-            IpiKind::Fixed { vector } => {
-                lo = (vector as u32);
-            }
-            IpiKind::Nmi => {
-                lo = 0b100 << 8;
-            }
-            IpiKind::InitAssert => {
-                lo = (0b101 << 8) | (1 << 14) | (1 << 15);
-            }
-            IpiKind::InitDeassert => {
-                lo = (0b101 << 8) | (1 << 15);
-            }
+        let lo = shorthand | match kind {
+            IpiKind::Fixed { vector } => vector as u32,
+            IpiKind::Nmi => 0b100 << 8,
+            IpiKind::InitAssert => (0b101 << 8) | (1 << 14) | (1 << 15),
+            IpiKind::InitDeassert => (0b101 << 8) | (1 << 15),
             IpiKind::Startup { vector_phys_addr } => {
                 let v = ((vector_phys_addr.as_u64() >> 12) & 0xFF) as u32;
-                lo = (0b110 << 8) | v;
+                (0b110 << 8) | v
             }
-        }
+        };
 
-        icr2.write_volatile(hi);
-        icr1.write_volatile(shorthand | lo);
+        if self.x2apic {
+            asm!(
+                "mfence",
+                "lfence",
+                "wrmsr",
+                in("ecx") 0x830u32,
+                in("eax") lo,
+                in("edx") hi,
+                options(nostack, preserves_flags),
+            );
+        } else {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                self.wait_for_delivery();
+                self.write(APICOffset::Icr2, hi << 24);
+                self.write(APICOffset::Icr1, lo);
+            });
+        }
     }}
 }
 #[allow(non_camel_case_types)]
@@ -203,10 +236,7 @@ pub(crate) enum IpiKind {
 
 #[unsafe(export_name = "x86_apic_send_eoi")]
 pub(crate) extern "C" fn send_eoi() {
-    let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
-    if base != 0 {
-        unsafe {
-            ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
-        }
+    if let Some(lapic) = LAPIC.get() {
+        lapic.write(APICOffset::Eoi, 0);
     }
 }

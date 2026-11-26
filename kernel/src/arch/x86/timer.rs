@@ -7,7 +7,7 @@ use crate::platform::TimerPlatform;
 
 use super::cpu;
 use super::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER, TIMER_TIME_SCHED};
-use super::interrupts::apic::local::{APICOffset, LAPIC_BASE_VA};
+use super::interrupts::apic::local::{APICOffset, LAPIC};
 use super::platform::X86Platform;
 use crate::structs::per_cpu_vec::PerCpuVec;
 
@@ -59,30 +59,18 @@ pub(crate) fn duration_to_tsc_cycles(d: Duration) -> u128 {
         / 1_000_000_000
 }
 
-#[inline]
-fn lapic() -> *mut u32 {
-    LAPIC_BASE_VA.load(Ordering::SeqCst) as *mut u32
-}
-#[inline]
-fn rd(off: APICOffset) -> u32 {
-    unsafe { lapic().add(off as usize / 4).read_volatile() }
-}
-#[inline]
-fn wr(off: APICOffset, v: u32) {
-    unsafe { lapic().add(off as usize / 4).write_volatile(v) }
-}
-
 pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
     assert!(window_ms > 0);
-    let saved_lvt = rd(APICOffset::LvtT);
-    let saved_ticr = rd(APICOffset::Ticr);
+    let lapic = LAPIC.get().expect("LAPIC is not initialized");
+    let saved_lvt = lapic.read(APICOffset::LvtT);
+    let saved_ticr = lapic.read(APICOffset::Ticr);
 
-    wr(APICOffset::LvtT, saved_lvt | (1 << 16));
-    wr(APICOffset::Ticr, u32::MAX);
+    lapic.write(APICOffset::LvtT, saved_lvt | (1 << 16));
+    lapic.write(APICOffset::Ticr, u32::MAX);
 
     wait_duration(Duration::from_millis(window_ms));
 
-    let cur = rd(APICOffset::Tccr) as u64;
+    let cur = lapic.read(APICOffset::Tccr) as u64;
     let dec = (u32::MAX as u64).saturating_sub(cur);
 
     let elapsed_ns = (window_ms as u128) * 1_000_000u128;
@@ -94,8 +82,8 @@ pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
 
     unsafe { APIC_TICKS_PER_NS.get() }.store(q32, Ordering::Relaxed);
 
-    wr(APICOffset::Ticr, saved_ticr);
-    wr(APICOffset::LvtT, saved_lvt);
+    lapic.write(APICOffset::Ticr, saved_ticr);
+    lapic.write(APICOffset::LvtT, saved_lvt);
 
     q32
 }
@@ -112,9 +100,10 @@ pub fn apic_ticr_for_ns(ns: u64) -> u32 {
 }
 
 pub fn apic_program_period_ns(ns: u64) {
-    let lvt = rd(APICOffset::LvtT);
-    wr(APICOffset::Ticr, apic_ticr_for_ns(ns));
-    wr(APICOffset::LvtT, lvt & !(1 << 16));
+    let lapic = LAPIC.get().expect("LAPIC is not initialized");
+    let lvt = lapic.read(APICOffset::LvtT);
+    lapic.write(APICOffset::Ticr, apic_ticr_for_ns(ns));
+    lapic.write(APICOffset::LvtT, lvt & !(1 << 16));
 }
 pub fn apic_program_period_ms(ms: u64) {
     if ms == 0 {

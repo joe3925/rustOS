@@ -4,7 +4,7 @@ use x86_64::PhysAddr;
 
 use crate::machine::MachineInterruptInfo;
 
-use super::local::LAPIC_BASE_VA;
+use super::local::LAPIC;
 use crate::arch::x86::cpu::{get_cpu_info, platform_cpu_id};
 
 use super::io::Ioapic;
@@ -36,7 +36,7 @@ pub(crate) static APIC: IrqSafeMutex<Option<ApicImpl>> = IrqSafeMutex::new(None)
 
 pub(crate) struct ApicImpl {
     pub(crate) apic_info: MachineInterruptInfo,
-    pub(crate) lapic: Lapic,
+    pub(crate) lapic: &'static Lapic,
     pub(crate) ioapics: Vec<Ioapic>,
 }
 
@@ -53,8 +53,6 @@ impl ApicImpl {
             .interrupt_info()
             .ok_or(NoACPI)?
             .clone();
-        let lapic = Lapic::new(PhysAddr::new(model.local_interrupt_controller_address))
-            .map_err(|_| BadInterruptModel)?;
         let mut ioapics = Vec::with_capacity(model.interrupt_controllers.len());
         for info in &model.interrupt_controllers {
             ioapics.push(
@@ -68,6 +66,14 @@ impl ApicImpl {
         if ioapics.is_empty() {
             return Err(BadInterruptModel);
         }
+        let lapic = LAPIC
+            .try_call_once(|| -> Result<Lapic, ()> {
+                let lapic = Lapic::new(PhysAddr::new(model.local_interrupt_controller_address))?;
+                unsafe { lapic.init(platform_cpu_id()) };
+                lapic.init_timer();
+                Ok(lapic)
+            })
+            .map_err(|_| BadInterruptModel)?;
 
         Ok(Self {
             apic_info: model,
@@ -80,7 +86,7 @@ impl ApicImpl {
         let Some(ioapic) = self.ioapics.iter().find(|ioapic| ioapic.owns(source)) else {
             return false;
         };
-        ioapic.unmask_irq_any_cpu(source, vector, destination);
+        ioapic.unmask_irq(source, vector, destination);
         true
     }
 
@@ -90,7 +96,6 @@ impl ApicImpl {
         }
     }
     pub(crate) fn init_apic_full() -> Result<(), ApicErrors> {
-        use core::sync::atomic::Ordering;
         use x86_64::instructions::interrupts;
 
         interrupts::disable();
@@ -102,13 +107,7 @@ impl ApicImpl {
 
         let apic = ApicImpl::new()?;
 
-        unsafe {
-            let logical_id = platform_cpu_id();
-            apic.lapic.init(logical_id);
-            apic.lapic.init_timer();
-            LAPIC_BASE_VA.store(apic.lapic.base_addr.as_u64(), Ordering::Release);
-            APIC.lock().replace(apic);
-        }
+        APIC.lock().replace(apic);
 
         interrupts::enable();
         Ok(())

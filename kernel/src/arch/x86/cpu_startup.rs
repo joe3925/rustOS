@@ -3,8 +3,8 @@ use alloc::boxed::Box;
 use super::drivers::timer_driver::set_num_cores;
 use super::gdt::PER_CPU_GDT;
 use super::idt::table::load_idt;
-use super::interrupts::apic::controller::{APIC, ApicImpl};
-use super::interrupts::apic::local::{IpiDest, IpiKind, LocalApic};
+use super::interrupts::apic::controller::ApicImpl;
+use super::interrupts::apic::local::{IpiDest, IpiKind, LocalApic, LAPIC};
 use super::syscalls::syscall::syscall_init;
 use super::timer::{
     APIC_START_PERIOD, apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns,
@@ -443,11 +443,9 @@ extern "C" fn ap_startup() -> ! {
         init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire));
 
         unsafe {
-            let mut guard = APIC.lock();
-            if let Some(apic) = guard.as_mut() {
-                apic.lapic.init(lapic_id as u8);
-                apic.lapic.init_timer();
-            }
+            let lapic = LAPIC.get().expect("LAPIC is not initialized");
+            lapic.init(lapic_id as u8);
+            lapic.init_timer();
         }
 
         syscall_init();

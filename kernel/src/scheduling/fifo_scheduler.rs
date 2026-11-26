@@ -8,7 +8,6 @@ use crate::scheduling::scheduler::{RunQueueAccess, scheduler};
 use crate::scheduling::state::SchedState;
 use crate::scheduling::task::{TaskHandle, TaskUpdate};
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -16,6 +15,7 @@ use kernel_sync::queues::bounded_mpmc::BoundedMpmcQueue;
 use spin::Mutex;
 
 pub const RUNQ_CAP: usize = 4096;
+const _: () = assert!(RUNQ_CAP.is_power_of_two());
 const BALANCE_INTERVAL_TICKS: usize = 150;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,10 +53,26 @@ impl FifoClass {
     }
 }
 
+struct FifoRunQueue {
+    slots: Box<[Option<TaskHandle>]>,
+    head: usize,
+    len: usize,
+}
+
+impl FifoRunQueue {
+    fn push_back(&mut self, task: TaskHandle) {
+        assert!(self.len < RUNQ_CAP);
+        let tail = (self.head + self.len) & (RUNQ_CAP - 1);
+        assert!(self.slots[tail].is_none());
+        self.slots[tail] = Some(task);
+        self.len += 1;
+    }
+}
+
 #[repr(align(64))]
 pub struct FifoCpuState {
     cpu_id: usize,
-    run_queue: UnsafeCell<VecDeque<TaskHandle>>,
+    run_queue: UnsafeCell<FifoRunQueue>,
     inbound_queue: BoundedMpmcQueue<TaskHandle>,
     load: AtomicUsize,
 }
@@ -67,7 +83,11 @@ impl FifoCpuState {
     fn new(cpu_id: usize) -> Self {
         Self {
             cpu_id,
-            run_queue: UnsafeCell::new(VecDeque::with_capacity(RUNQ_CAP)),
+            run_queue: UnsafeCell::new(FifoRunQueue {
+                slots: alloc::vec![None; RUNQ_CAP].into_boxed_slice(),
+                head: 0,
+                len: 0,
+            }),
             inbound_queue: BoundedMpmcQueue::new(RUNQ_CAP),
             load: AtomicUsize::new(0),
         }
@@ -76,7 +96,7 @@ impl FifoCpuState {
     fn run_queue<'a>(
         &'a self,
         access: &'a mut RunQueueAccess<'_>,
-    ) -> &'a mut VecDeque<TaskHandle> {
+    ) -> &'a mut FifoRunQueue {
         assert_eq!(access.cpu_id(), self.cpu_id);
         unsafe { &mut *self.run_queue.get() }
     }
@@ -110,7 +130,7 @@ fn enqueue_inbound(cpu: usize, cpu_state: &FifoCpuState, task: &mut TaskUpdate) 
 
 fn drain_inbound_to_runqueue(access: &mut RunQueueAccess<'_>, cpu: &FifoCpuState) {
     let run_queue = cpu.run_queue(access);
-    let available = RUNQ_CAP - run_queue.len();
+    let available = RUNQ_CAP - run_queue.len;
     for _ in 0..available {
         let Ok(task) = cpu.inbound_queue.try_pop_wait_free() else {
             break;
@@ -124,12 +144,15 @@ fn pop_queued_task(
     cpu: &FifoCpuState,
 ) -> Option<TaskUpdate> {
     let run_queue = cpu.run_queue(access);
-    let queued = run_queue.len();
+    let queued = run_queue.len;
     for allow_low in [false, true] {
         for _ in 0..queued {
-            let Some(task) = run_queue.pop_front() else {
+            if run_queue.len == 0 {
                 return None;
-            };
+            }
+            let task = run_queue.slots[run_queue.head].take().unwrap();
+            run_queue.head = (run_queue.head + 1) & (RUNQ_CAP - 1);
+            run_queue.len -= 1;
             let task = match task.try_into_update() {
                 Ok(update) => {
                     if allow_low
@@ -261,7 +284,7 @@ impl SchedulerClass for FifoClass {
     ) -> Option<TaskUpdate> {
         let mut access = scheduler().try_core_scheduler(src_cpu_id)?;
         drain_inbound_to_runqueue(&mut access, src_cpu);
-        for _ in 0..src_cpu.run_queue(&mut access).len() {
+        for _ in 0..src_cpu.run_queue(&mut access).len {
             let task = pop_queued_task(&mut access, src_cpu)?;
             match task.sched_state() {
                 SchedState::Runnable => return Some(task),
