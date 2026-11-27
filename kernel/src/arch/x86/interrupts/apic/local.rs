@@ -41,7 +41,7 @@ impl Lapic {
     pub(crate) fn read(&self, offset: APICOffset) -> u32 {
         unsafe {
             if self.x2apic {
-                #[cfg_attr(irq_check, irq::trusted(unsafe))]
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
                 unsafe { Msr::new(0x800 + (offset as u32 >> 4)).read() as u32 }
             } else {
                 self.base_addr
@@ -56,7 +56,7 @@ impl Lapic {
     pub(crate) fn write(&self, offset: APICOffset, value: u32) {
         unsafe {
             if self.x2apic {
-                #[cfg_attr(irq_check, irq::trusted(unsafe))]
+                #[cfg_attr(irq_check, irq::allow_incomplete(unsafe))]
                 unsafe { Msr::new(0x800 + (offset as u32 >> 4)).write(value as u64) };
             } else {
                 self.base_addr
